@@ -1,0 +1,48 @@
+[package]
+name = "hello-bevy" # [CHANGE]: Set your project name.
+version = "0.12.3"
+edition = "2021"
+description = "a bevy game template"
+exclude = ["assets", "wasm", ".data"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3 # Improves performance when developing, but slows down first compilation significantly
+debug = false # Disabled debug symbols for dependencies
+
+[features]
+dev = [
+    "bevy/file_watcher", # Enables hot reloading of assets
+    "bevy/dynamic_linking", # Enables dynamic linking for faster compilation
+]
+pixel_perfect = []
+resizable = []
+save_schedule = []
+mock_touch = []
+
+[dependencies]
+# The bevy engine <3
+# Default feautres are disabled because we are using audio from a different source (kira)
+# We also add trace_tracy for profiling
+bevy = { version = "0.12", default-features = false, features = [
+    "animation", "bevy_asset", "bevy_gilrs", "bevy_scene", "bevy_winit",
+    "bevy_core_pipeline", "bevy_pbr", "bevy_gltf", "bevy_render", "bevy_sprite",
+    "bevy_text", "bevy_ui", "multi-threaded", "png", "hdr", "x11", "bevy_gizmos",
+    "tonemapping_luts", "default_font", "webgl2", "serialize"
+]} 
+bevy_asset_loader = { version = "0.18", features = [ "progress_tracking" ] } # Better asset loader
+bevy_embedded_assets = { version = "0.9" } # Embed assets in binary
+bevy_kira_audio = { version =  "0.18" } # Improved audio library
+iyes_progress = { version = "0.10", features = [ "assets" ] } # Track loading and game state
+bevy-persistent = { version = "0.4", features = ["toml"] } # Persistent values (for saving)
+
+# Core
+rand = { version = "0.8" }
+serde = { version = "1.0", features = ["derive"] }
+
+# Debug
+bevy-inspector-egui = { version = "0.21" } # Inspector
+egui_dock = { version = "0.8" }
+egui-gizmo = { version = "0.12" }
