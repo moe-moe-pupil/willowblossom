@@ -2,7 +2,7 @@
 
 use bevy::prelude::*;
 use bevy_persistent::Persistent;
-use hello_bevy::{
+use willowblossom::{
     CoreAssets,
     GameOptions,
     GamePlugin,

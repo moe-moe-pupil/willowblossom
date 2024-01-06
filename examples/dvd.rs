@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevy_kira_audio::prelude::*;
 use bevy_persistent::Persistent;
-use hello_bevy::{
+use willowblossom::{
     CoreAssets,
     ExampleAssets,
     GameOptions,
