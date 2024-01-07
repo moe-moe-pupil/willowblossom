@@ -3,6 +3,7 @@ mod audio;
 mod camera;
 mod data;
 mod input;
+mod mirai;
 mod ui;
 
 use bevy::{
@@ -97,6 +98,7 @@ impl Plugin for GamePlugin {
             input::InputPlugin,
             audio::AudioPlugin,
             camera::CameraPlugin,
+            mirai::MiraiPlugin,
         ));
     }
 }
