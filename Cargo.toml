@@ -26,29 +26,32 @@ mock_touch = []
 # The bevy engine <3
 # Default feautres are disabled because we are using audio from a different source (kira)
 # We also add trace_tracy for profiling
-bevy = { version = "0.12", default-features = false, features = [
-    "animation",
-    "bevy_asset",
-    "bevy_gilrs",
-    "bevy_scene",
-    "bevy_winit",
-    "bevy_core_pipeline",
-    "bevy_pbr",
-    "bevy_gltf",
-    "bevy_render",
-    "bevy_sprite",
-    "bevy_text",
-    "bevy_ui",
-    "multi-threaded",
-    "png",
-    "hdr",
-    "x11",
-    "bevy_gizmos",
-    "tonemapping_luts",
-    "default_font",
-    "webgl2",
-    "serialize",
-] }
+bevy = { git = "https://github.com/bevyengine/bevy" }
+
+
+#  features = [
+#     "animation",
+#     "bevy_asset",
+#     "bevy_gilrs",
+#     "bevy_scene",
+#     "bevy_winit",
+#     "bevy_core_pipeline",
+#     "bevy_pbr",
+#     "bevy_gltf",
+#     "bevy_render",
+#     "bevy_sprite",
+#     "bevy_text",
+#     "bevy_ui",
+#     "multi-threaded",
+#     "png",
+#     "hdr",
+#     "x11",
+#     "bevy_gizmos",
+#     "tonemapping_luts",
+#     "default_font",
+#     "webgl2",
+#     "serialize",
+# ]
 bevy_asset_loader = { version = "0.18", features = [
     "progress_tracking",
 ] } # Better asset loader
@@ -79,3 +82,4 @@ futures-util = "0.3.30"
 tokio-tungstenite = "0.21.0"
 crossbeam-channel = "0.5.11"
 async-compat = "0.2.3"
+futures-lite = "2.2.0"

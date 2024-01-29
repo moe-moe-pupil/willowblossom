@@ -122,7 +122,7 @@ mod only_in_debug {
                 PostUpdate,
                 (update_inspector
                     .run_if(
-                        resource_exists::<DebugState>()
+                        resource_exists::<DebugState>
                             .and_then(|state: Res<DebugState>| state.inspector),
                     )
                     .before(EguiSet::ProcessOutput)
@@ -280,7 +280,7 @@ mod only_in_debug {
         time.set_relative_speed(time_speed);
     }
 
-    fn change_gizmo_mode(input: Res<Input<KeyCode>>, mut state: ResMut<DebugState>) {
+    fn change_gizmo_mode(input: Res<ButtonInput<KeyCode>>, mut state: ResMut<DebugState>) {
         for (key, mode) in [
             (KeyCode::R, GizmoMode::Rotate),
             (KeyCode::T, GizmoMode::Translate),
@@ -321,7 +321,7 @@ mod only_in_debug {
             return;
         };
 
-        let Some(fps) = diagnostics.get(FrameTimeDiagnosticsPlugin::FPS) else {
+        let Some(fps) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS) else {
             return;
         };
         text.sections[0].value = format!(

@@ -1,11 +1,10 @@
 mod bevy_tokio;
 
-use std::{
-    net::TcpStream,
-    time::Duration,
-};
+use std::panic::take_hook;
 
+use async_compat::Compat;
 use bevy::{
+    ecs::system::CommandQueue,
     prelude::*,
     tasks::{
         block_on,
@@ -15,40 +14,21 @@ use bevy::{
     },
     transform::commands,
 };
-use async_compat::Compat;
-use bevy_tokio::{
-    TaskContext,
-    TokioTasksPlugin,
-    TokioTasksRuntime,
-};
+use bevy_tokio::TokioTasksPlugin;
 use crossbeam_channel::{
     unbounded,
     Receiver as CBReceiver,
     Sender as CBSender,
 };
+use futures_lite::future;
 use futures_util::{
-    future,
-    pin_mut,
-    stream::{
-        SplitSink,
-        SplitStream,
-    },
     SinkExt,
     StreamExt,
 };
-use tokio::io::{
-    AsyncReadExt,
-    AsyncWriteExt,
-};
+use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::protocol::Message,
-    WebSocketStream,
-};
-use tungstenite::{
-    connect,
-    stream::MaybeTlsStream,
-    WebSocket,
 };
 
 #[derive(States, Debug, Default, Clone, Eq, PartialEq, Hash)]
@@ -59,129 +39,104 @@ pub enum ConnectionState {
 }
 
 #[derive(Resource)]
-struct MiraiIO {
-    read: CBReceiver<Message>,
-    write: CBSender<Message>,
-}
+struct MiraiIOReceiver(CBReceiver<Message>);
 
 #[derive(Resource)]
-struct MiraiSocket(WebSocket<MaybeTlsStream<TcpStream>>);
+struct MiraiIOSender(Sender<Message>);
 
-// custom implementation for unusual values
-impl Default for MiraiSocket {
-    fn default() -> Self {
-        let url = url::Url::parse("ws://localhost:5005/message").unwrap();
-        let (socket, response) = connect(url).unwrap();
-
-        println!("Connected to the server");
-        println!(
-            "Response HTTP code: {}",
-            response.status()
-        );
-        println!("Response contains the following headers:");
-        for (ref header, _value) in response.headers() {
-            println!("* {}", header);
-        }
-        MiraiSocket(socket)
-    }
-}
+#[derive(Resource)]
+struct MiraiTask(Task<CommandQueue>);
 
 pub struct MiraiPlugin;
 
 impl Plugin for MiraiPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(TokioTasksPlugin::default())
-            .add_state::<ConnectionState>()
+            .insert_state(ConnectionState::Disconnected)
             // .insert_resource(MiraiSocket { ..default() })
-            .add_systems(Startup, setup);
+            .add_systems(Startup, setup)
+            .add_systems(Update, handle_tasks.run_if(resource_exists::<MiraiTask>))
+            .add_systems(Update, (send_message.run_if(resource_exists::<MiraiIOSender>), message_system));
     }
 }
 
 fn setup(mut commands: Commands) {
     println!("start to setup");
-    let task_pool = IoTaskPool::get();
+    let thread_pool = AsyncComputeTaskPool::get();
     let (client_to_game_sender, client_to_game_receiver) = unbounded::<Message>();
-    task_pool
-        .spawn(Compat::new((hanlde_conneciton(
-            client_to_game_sender.clone(),
-        ))))
-        .detach();
-    commands.insert_resource(MiraiIO {
-        read: client_to_game_receiver,
-        write: client_to_game_sender,
-    });
+    let mirai_io = MiraiIOReceiver(client_to_game_receiver.clone());
+    let task = thread_pool.spawn(Compat::new(handle_connection(
+        client_to_game_sender.clone(),
+    )));
+    commands.insert_resource(mirai_io);
+    commands.insert_resource(MiraiTask(task));
 }
 
-fn print_type_of<T>(_: &T) { println!("{}", std::any::type_name::<T>()) }
+fn handle_tasks(mut commands: Commands, mut task: ResMut<MiraiTask>) {
+    if let Some(mut commands_queue) = block_on(future::poll_once(&mut task.0)) {
+        // append the returned command queue to have it execute later
+        commands.append(&mut commands_queue);
+    }
+}
 
-async fn hanlde_conneciton(client_to_game_sender: CBSender<Message>) -> Result<(), String> {
+async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> CommandQueue {
     let url = url::Url::parse("ws://localhost:5005/message").unwrap();
-    println!("connected");
+
     let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let (game_to_client_sender, mut game_to_client_receiver) = tokio::sync::mpsc::channel(100);
 
-    loop {
-        tokio::select! {
-            //Receive messages from the websocket
-            msg = ws_receiver.next() => {
-                match msg {
-                    Some(msg) => {
-                        let msg = msg.unwrap();
-                        println!("{}", msg);
-                        if msg.is_text() ||msg.is_binary() {
-                            client_to_game_sender.send(msg).expect("Could not send message");
-                        } else if msg.is_close() {
-                            break;
+    let mut command_queue = CommandQueue::default();
+    command_queue.push(move |world: &mut World| {
+        println!("work!!!");
+        world.insert_resource(MiraiIOSender(game_to_client_sender));
+        world.remove_resource::<MiraiTask>();
+    });
+    let task_pool = IoTaskPool::get();
+    let _ = task_pool.spawn(async move {
+        loop {
+            tokio::select! {
+                //Receive messages from the websocket
+                msg = ws_receiver.next() => {
+                    match msg {
+                        Some(msg) => {
+                            let msg = msg.unwrap();
+                            if msg.is_text() || msg.is_binary() {
+                                client_to_game_sender.send(msg).expect("Could not send message");
+                            } else if msg.is_close() {
+                                break;
+                            }
                         }
+                        None => break,
                     }
-                    None => break,
+                }
+                //Receive messages from the game
+                game_msg = game_to_client_receiver.recv() => {
+                    let game_msg = game_msg.unwrap();
+                    let _ = ws_sender.send(game_msg).await;
                 }
             }
-            //Receive messages from the game
-            game_msg = game_to_client_receiver.recv() => {
-                let game_msg = game_msg.unwrap();
-                let _ = ws_sender.send(Message::Text(game_msg)).await;
-            }
-
         }
+    }).detach();
+
+    command_queue
+}
+
+fn send_message(buttons: Res<ButtonInput<MouseButton>>, sender: Res<MiraiIOSender>) {
+    if buttons.just_pressed(MouseButton::Left) {
+        // Left button was pressed
+        let err = sender
+            .0
+            .try_send(Message::Text(
+                (r#"{"syncId":123,"command":"sendFriendMessage","subCommand":null,"content":{"target":1670426821,"messageChain":[{"type":"Plain","text":"你好~"}]}}"#)
+                .to_string(),
+            ))
+            .expect("can't send message");
     }
-    Ok(())
 }
 
-fn read_socket(runtime: ResMut<TokioTasksRuntime>) { runtime.spawn_background_task(async_tokio); }
-
-async fn async_read_socket(mut ctx: TaskContext) {
-    ctx.run_on_main_thread(move |ctx| {
-        let mut socket = ctx.world.get_resource_mut::<MiraiSocket>().unwrap();
-        if socket.0.can_read() {
-            let msg = socket.0.read().unwrap();
-            if msg.is_text() {
-                println!("received message {}", msg);
-            }
-        }
-    })
-    .await;
-}
-
-async fn async_tokio(mut ctx: TaskContext) {
-    let url = url::Url::parse("ws://localhost:5005/message").unwrap();
-
-    let (stdin_tx, stdin_rx) = futures_channel::mpsc::unbounded();
-
-    let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
-    println!("WebSocket handshake has been successfully completed");
-
-    let (write, read) = ws_stream.split();
-
-    let stdin_to_ws = stdin_rx.map(Ok).forward(write);
-    let ws_to_stdout = {
-        read.for_each(|message| async {
-            let data = message.unwrap();
-            println!("{}", data);
-        })
-    };
-
-    pin_mut!(stdin_to_ws, ws_to_stdout);
-    future::select(stdin_to_ws, ws_to_stdout).await;
+fn message_system(receiver: Res<MiraiIOReceiver>) {
+    if let Ok(msg) = receiver.0.try_recv() {
+        println!("{:?}", msg);
+    }
 }

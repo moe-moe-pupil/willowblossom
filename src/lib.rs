@@ -1,31 +1,9 @@
-mod assets;
-mod audio;
 mod camera;
-mod data;
-mod input;
 mod mirai;
-mod ui;
 
 use bevy::{
     asset::AssetMetaCheck,
     prelude::*,
-};
-
-// Exports for examples
-pub use crate::{
-    assets::{
-        CoreAssets,
-        ExampleAssets,
-    },
-    camera::GameCamera,
-    data::{
-        GameOptions,
-        Keybinds,
-    },
-    input::{
-        InputMovement,
-        KeyBind,
-    },
 };
 
 // [CHANGE]: Game title and resolution
@@ -91,14 +69,6 @@ impl Plugin for GamePlugin {
         app.add_plugins(DefaultPlugins.set(window_plugin).set(image_plugin));
 
         // Game
-        app.add_state::<GameState>().add_plugins((
-            assets::AssetLoaderPlugin,
-            ui::UIPlugin,
-            data::DataPlugin,
-            input::InputPlugin,
-            audio::AudioPlugin,
-            camera::CameraPlugin,
-            mirai::MiraiPlugin,
-        ));
+        app.add_plugins((camera::CameraPlugin, mirai::MiraiPlugin));
     }
 }
