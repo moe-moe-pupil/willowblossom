@@ -125,13 +125,13 @@ async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> Comm
 fn send_message(buttons: Res<ButtonInput<MouseButton>>, sender: Res<MiraiIOSender>) {
     if buttons.just_pressed(MouseButton::Left) {
         // Left button was pressed
-        let err = sender
-            .0
-            .try_send(Message::Text(
-                (r#"{"syncId":123,"command":"sendFriendMessage","subCommand":null,"content":{"target":1670426821,"messageChain":[{"type":"Plain","text":"你好~"}]}}"#)
-                .to_string(),
-            ))
-            .expect("can't send message");
+        // let err = sender
+        //     .0
+        //     .try_send(Message::Text(
+        //         (r#"{"syncId":123,"command":"sendFriendMessage","subCommand":null,"content":{"target":1670426821,"messageChain":[{"type":"Plain","text":"你好~"}]}}"#)
+        //         .to_string(),
+        //     ))
+        //     .expect("can't send message");
     }
 }
 

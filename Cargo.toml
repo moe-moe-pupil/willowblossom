@@ -26,7 +26,7 @@ mock_touch = []
 # The bevy engine <3
 # Default feautres are disabled because we are using audio from a different source (kira)
 # We also add trace_tracy for profiling
-bevy = { git = "https://github.com/bevyengine/bevy" }
+bevy = { version = "0.13.0"}
 
 
 #  features = [
@@ -52,15 +52,15 @@ bevy = { git = "https://github.com/bevyengine/bevy" }
 #     "webgl2",
 #     "serialize",
 # ]
-bevy_asset_loader = { version = "0.18", features = [
+bevy_asset_loader = { version = "0.20.0", features = [
     "progress_tracking",
 ] } # Better asset loader
-bevy_embedded_assets = { version = "0.9" } # Embed assets in binary
-bevy_kira_audio = { version = "0.18" } # Improved audio library
-iyes_progress = { version = "0.10", features = [
+bevy_embedded_assets = { version = "0.10" } # Embed assets in binary
+bevy_kira_audio = { version = "0.19" } # Improved audio library
+iyes_progress = { version = "0.11", features = [
     "assets",
 ] } # Track loading and game state
-bevy-persistent = { version = "0.4", features = [
+bevy-persistent = { version = "0.5", features = [
     "toml",
 ] } # Persistent values (for saving)
 
@@ -69,9 +69,9 @@ rand = { version = "0.8" }
 serde = { version = "1.0", features = ["derive"] }
 
 # Debug
-bevy-inspector-egui = { version = "0.21" } # Inspector
-egui_dock = { version = "0.8" }
-egui-gizmo = { version = "0.12" }
+bevy-inspector-egui = { version = "0.23.2" } # Inspector
+egui_dock = { version = "0.11.2" }
+egui-gizmo = { version = "0.16.0" }
 
 ## WebSocket
 url = "2.5.0"
@@ -83,3 +83,4 @@ tokio-tungstenite = "0.21.0"
 crossbeam-channel = "0.5.11"
 async-compat = "0.2.3"
 futures-lite = "2.2.0"
+bevy_egui = "0.25.0"

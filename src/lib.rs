@@ -1,5 +1,6 @@
 mod camera;
 mod mirai;
+mod ui;
 
 use bevy::{
     asset::AssetMetaCheck,
@@ -69,6 +70,6 @@ impl Plugin for GamePlugin {
         app.add_plugins(DefaultPlugins.set(window_plugin).set(image_plugin));
 
         // Game
-        app.add_plugins((camera::CameraPlugin, mirai::MiraiPlugin));
+        app.add_plugins((camera::CameraPlugin, mirai::MiraiPlugin, ui::UIPlugin));
     }
 }
