@@ -1,5 +1,12 @@
 use bevy::prelude::*;
-use bevy_egui::{egui, EguiContexts};
+use bevy_egui::{
+    egui,
+    EguiContexts,
+};
+use serde_json::json;
+use tungstenite::Message;
+
+use crate::mirai::MiraiIOSender;
 
 pub struct ImePlugin;
 
@@ -13,7 +20,7 @@ impl Plugin for ImePlugin {
 }
 
 fn reset_unused_ime(mut ime: ResMut<ImeManager>) {
-    //Make all ImeText unused before update
+    // Make all ImeText unused before update
     for i in &mut ime.ime_texts {
         i.is_used = false;
     }
@@ -21,7 +28,7 @@ fn reset_unused_ime(mut ime: ResMut<ImeManager>) {
 }
 
 fn listen_ime_events(
-    //ime look
+    // ime look
     mut events: EventReader<Ime>,
     mut ime: ResMut<ImeManager>,
     mut windows: Query<&mut Window>,
@@ -37,7 +44,7 @@ fn listen_ime_events(
 }
 
 fn clear_unused_ime(
-    //delete unused ImeText after update
+    // delete unused ImeText after update
     mut ime: ResMut<ImeManager>,
 ) {
     ime.ime_texts.retain(|i| i.is_used == true);
@@ -60,7 +67,7 @@ impl Default for ImeManager {
 impl ImeManager {
     /// ```
     /// let teo = ime.text_edit_singleline(&mut text, 200.0, ui, ctx);
-    /// if teo.response.changed(){
+    /// if teo.response.changed() {
     ///     println!("{:?}", text);
     /// }
     /// ```
@@ -70,6 +77,7 @@ impl ImeManager {
         width: f32,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
+        sender: &MiraiIOSender,
     ) -> egui::text_edit::TextEditOutput {
         if self.count >= self.ime_texts.len() {
             self.add();
@@ -89,7 +97,7 @@ impl ImeManager {
 
     /// ```
     /// let teo = ime.text_edit_multiline(&mut text, 200.0, ui, ctx);
-    /// if teo.response.changed(){
+    /// if teo.response.changed() {
     ///     println!("{:?}", text);
     /// }
     /// ```
@@ -99,6 +107,7 @@ impl ImeManager {
         width: f32,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
+        sender: &MiraiIOSender,
     ) -> egui::text_edit::TextEditOutput {
         if self.count >= self.ime_texts.len() {
             self.add();
@@ -111,10 +120,35 @@ impl ImeManager {
             ui,
             ctx,
         );
+        if self.ime_texts[self.count].is_focus && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
+            println!("{}", self.ime_texts[self.count].text);
+            let err = sender
+                .0
+                .try_send(Message::Text(
+                    json!({
+                        "syncId": 123,
+                        "command": "sendFriendMessage",
+                        "subCommand": null,
+                        "content": {
+                            "target": 1670426821,
+                            "messageChain": [
+                                {
+                                    "type": "Plain",
+                                    "text": self.ime_texts[self.count].text
+                                }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("can't send message");
+            self.ime_texts[self.count].text = "".to_string();
+        }
         self.ime_texts[self.count].id = teo.response.id.short_debug_format();
         self.count += 1;
         return teo;
     }
+
     /// ```
     /// let teo = ime.text_edit_multiline(&mut text, 200.0, ui, ctx);
     /// let id = teo.response.id.short_debug_format()
@@ -129,7 +163,7 @@ impl ImeManager {
     }
 
     fn add(&mut self) {
-        //add Ime
+        // add Ime
         let it = ImeText::new();
         self.ime_texts.push(it);
     }
@@ -139,7 +173,7 @@ impl ImeManager {
     }
 
     pub fn listen_ime_event(&mut self, event: &Ime) {
-        //ime event look
+        // ime event look
         for i in &mut self.ime_texts {
             i.listen_ime_event(event);
         }
@@ -187,9 +221,7 @@ impl Default for ImeText {
 }
 
 impl ImeText {
-    fn new() -> ImeText {
-        return ImeText::default();
-    }
+    fn new() -> ImeText { return ImeText::default(); }
 
     fn listen_ime_event(&mut self, event: &Ime) {
         if !self.is_focus {
@@ -201,7 +233,7 @@ impl ImeText {
                     self.ime_string = value.to_string();
                     self.ime_string_index = self.ime_string.chars().count();
                 }
-            }
+            },
             Ime::Commit { value, .. } => {
                 if value.is_empty() {
                     self.is_cursor_move = false;
@@ -227,13 +259,13 @@ impl ImeText {
                     self.is_ime_input = true;
                     self.ime_string = String::new();
                 }
-            }
+            },
             Ime::Enabled { .. } => {
                 self.is_ime = true;
-            }
+            },
             Ime::Disabled { .. } => {
                 self.is_ime = false;
-            }
+            },
             _ => (),
         }
     }
@@ -267,7 +299,7 @@ impl ImeText {
                     cnt += 1;
                 }
                 format!("{}{}{}", front, self.ime_string, back)
-            }
+            },
         };
 
         let mut teo = match self.edit_type {
@@ -288,7 +320,7 @@ impl ImeText {
             self.cursor_index = teo.cursor_range.unwrap().primary.ccursor.index;
         }
         if self.is_ime_input {
-            //respose.changed()=true
+            // respose.changed()=true
             teo.response.mark_changed();
         }
         if self.is_ime_input {
@@ -310,8 +342,12 @@ impl ImeText {
         }
         ui.ctx().output(|o| {
             self.screen_pos = Vec2::new(
-                o.ime.and_then(|p| Some(p.cursor_rect.right())).unwrap_or(0.0),
-                o.ime.and_then(|p| Some(p.cursor_rect.bottom())).unwrap_or(0.0),
+                o.ime
+                    .and_then(|p| Some(p.cursor_rect.right()))
+                    .unwrap_or(0.0),
+                o.ime
+                    .and_then(|p| Some(p.cursor_rect.bottom()))
+                    .unwrap_or(0.0),
             )
         });
         teo.state.clone().store(ctx, teo.response.id);
@@ -392,14 +428,14 @@ impl ImeText {
                 egui::text::LayoutJob {
                     sections: lss,
                     text: format!("{}{}{}", front, self.ime_string, back),
-                    break_on_newline: break_on_newline,
+                    break_on_newline,
                     wrap: egui::text::TextWrapping {
                         max_width: width,
                         ..Default::default()
                     },
                     ..Default::default()
                 }
-            }
+            },
         };
         return layout_job;
     }

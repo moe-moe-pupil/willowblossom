@@ -4684,6 +4684,7 @@ dependencies = [
  "iyes_progress",
  "rand",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tungstenite",

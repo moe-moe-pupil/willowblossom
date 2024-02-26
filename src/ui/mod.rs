@@ -3,6 +3,8 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use ime::*;
 
+use crate::mirai::MiraiIOSender;
+
 
 #[derive(Resource, Default)] 
 pub struct MyApp{
@@ -18,7 +20,7 @@ impl Plugin for UIPlugin {
             .add_plugins(ImePlugin)     
             .insert_resource(MyApp::default())
             .add_systems(Startup, setup_system)
-            .add_systems(Update, ui_system);
+            .add_systems(Update, ui_system.run_if(resource_exists::<MiraiIOSender>));
     }
 }
 
@@ -39,10 +41,11 @@ pub fn ui_system(
   mut contexts: EguiContexts, 
   mut app: ResMut<MyApp>, 
   mut ime: ResMut<ImeManager>, 
+  sender: Res<MiraiIOSender>
 ) {
   let ctx = contexts.ctx_mut();
   egui::CentralPanel::default().show(ctx, |ui| {
-      let _teo_s = ime.text_edit_singleline(&mut app.single_text, 400.0, ui, ctx);
-      let _teo_m = ime.text_edit_multiline(&mut app.multi_text, 400.0, ui, ctx);
+      let _teo_s = ime.text_edit_singleline(&mut app.single_text, 400.0, ui, ctx, sender.as_ref());
+      let _teo_m = ime.text_edit_multiline(&mut app.multi_text, 400.0, ui, ctx, sender.as_ref());
   });
 }

@@ -1,5 +1,3 @@
-mod bevy_tokio;
-
 use std::panic::take_hook;
 
 use async_compat::Compat;
@@ -14,7 +12,6 @@ use bevy::{
     },
     transform::commands,
 };
-use bevy_tokio::TokioTasksPlugin;
 use crossbeam_channel::{
     unbounded,
     Receiver as CBReceiver,
@@ -42,7 +39,7 @@ pub enum ConnectionState {
 struct MiraiIOReceiver(CBReceiver<Message>);
 
 #[derive(Resource)]
-struct MiraiIOSender(Sender<Message>);
+pub struct MiraiIOSender(pub Sender<Message>);
 
 #[derive(Resource)]
 struct MiraiTask(Task<CommandQueue>);
@@ -51,8 +48,7 @@ pub struct MiraiPlugin;
 
 impl Plugin for MiraiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(TokioTasksPlugin::default())
-            .insert_state(ConnectionState::Disconnected)
+        app.insert_state(ConnectionState::Disconnected)
             // .insert_resource(MiraiSocket { ..default() })
             .add_systems(Startup, setup)
             .add_systems(Update, handle_tasks.run_if(resource_exists::<MiraiTask>))
@@ -128,7 +124,8 @@ fn send_message(buttons: Res<ButtonInput<MouseButton>>, sender: Res<MiraiIOSende
         // let err = sender
         //     .0
         //     .try_send(Message::Text(
-        //         (r#"{"syncId":123,"command":"sendFriendMessage","subCommand":null,"content":{"target":1670426821,"messageChain":[{"type":"Plain","text":"你好~"}]}}"#)
+        //         (r#"{"syncId":123,"command":"sendFriendMessage","subCommand":null,"content":{"
+        // target":1670426821,"messageChain":[{"type":"Plain","text":"你好~"}]}}"#)
         //         .to_string(),
         //     ))
         //     .expect("can't send message");
