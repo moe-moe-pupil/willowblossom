@@ -44,8 +44,9 @@ pub fn ui_system(
   sender: Res<MiraiIOSender>
 ) {
   let ctx = contexts.ctx_mut();
-  egui::CentralPanel::default().show(ctx, |ui| {
-      let _teo_s = ime.text_edit_singleline(&mut app.single_text, 400.0, ui, ctx, sender.as_ref());
-      let _teo_m = ime.text_edit_multiline(&mut app.multi_text, 400.0, ui, ctx, sender.as_ref());
+  egui::TopBottomPanel::bottom("input_panel").show(ctx, |ui| {
+      ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+        let _teo_m = ime.text_edit_multiline(&mut app.multi_text, 400.0, ui, ctx, sender.as_ref());
+      })      
   });
 }
