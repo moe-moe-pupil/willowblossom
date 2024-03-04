@@ -120,7 +120,9 @@ impl ImeManager {
             ui,
             ctx,
         );
-        if self.ime_texts[self.count].is_focus && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
+        if self.ime_texts[self.count].is_focus
+            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
+        {
             println!("{}", self.ime_texts[self.count].text);
             let err = sender
                 .0
@@ -352,7 +354,7 @@ impl ImeText {
         });
         teo.state.clone().store(ctx, teo.response.id);
         *text = self.text.to_string();
-        return teo;
+        teo
     }
 
     fn get_layoutjob(&self, string: &str, width: f32) -> egui::text::LayoutJob {

@@ -10,7 +10,7 @@ use bevy::{
         IoTaskPool,
         Task,
     },
-    transform::commands,
+    utils::hashbrown::HashMap,
 };
 use crossbeam_channel::{
     unbounded,
@@ -21,6 +21,10 @@ use futures_lite::future;
 use futures_util::{
     SinkExt,
     StreamExt,
+};
+use serde::{
+    Deserialize,
+    Serialize,
 };
 use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::{
@@ -46,6 +50,68 @@ struct MiraiTask(Task<CommandQueue>);
 
 pub struct MiraiPlugin;
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiraiMessage {
+    sync_id: String,
+    pub data: MiraiMessageData,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Plain {
+    pub text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Image {
+    pub image: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Source {
+    id: u64,
+    time: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum MiraiMessageChainType {
+    Source(Source),
+    Plain(Plain),
+    Image(Image),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+enum MiraiMessageType {
+    FriendMessage,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiraiMessageChain {
+    #[serde(flatten)]
+    pub variant: MiraiMessageChainType,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiraiSender {
+    pub id: u64,
+    pub nickname: String,
+    pub remark: String,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiraiMessageData {
+    pub r#type: MiraiMessageType,
+    pub message_chain: Vec<MiraiMessageChain>,
+    pub sender: MiraiSender,
+}
+
+#[derive(Resource)]
+pub struct MiraiMessageManager {
+    pub messages: HashMap<String, MiraiMessage>,
+}
+
 impl Plugin for MiraiPlugin {
     fn build(&self, app: &mut App) {
         app.insert_state(ConnectionState::Disconnected)
@@ -64,6 +130,10 @@ fn setup(mut commands: Commands) {
     let task = thread_pool.spawn(Compat::new(handle_connection(
         client_to_game_sender.clone(),
     )));
+    let mut message_manager = MiraiMessageManager {
+        messages: HashMap::default(),
+    };
+    commands.insert_resource(message_manager);
     commands.insert_resource(mirai_io);
     commands.insert_resource(MiraiTask(task));
 }
@@ -132,8 +202,27 @@ fn send_message(buttons: Res<ButtonInput<MouseButton>>, sender: Res<MiraiIOSende
     }
 }
 
-fn message_system(receiver: Res<MiraiIOReceiver>) {
+fn message_system(receiver: Res<MiraiIOReceiver>, mut manager: ResMut<MiraiMessageManager>) {
     if let Ok(msg) = receiver.0.try_recv() {
-        println!("{:?}", msg);
+        println!("msg => {:?}", msg);
+        if let Ok(json) = serde_json::from_str::<MiraiMessage>(&msg.to_string()) {
+            println!("json => {:?}", json);
+            if manager
+                .messages
+                .contains_key(&json.data.sender.id.to_string())
+            {
+                manager
+                    .messages
+                    .get_mut(&json.data.sender.id.to_string())
+                    .unwrap()
+                    .data
+                    .message_chain
+                    .extend(json.data.message_chain)
+            } else {
+                manager
+                    .messages
+                    .insert(json.data.sender.id.to_string(), json);
+            }
+        }
     }
 }
