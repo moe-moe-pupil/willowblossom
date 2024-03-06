@@ -142,7 +142,7 @@ pub fn ui_system(
                 .cell_layout(egui::Layout::top_down(
                     egui::Align::LEFT,
                 ))
-                .column(Column::auto())
+                .column(Column::remainder())
                 .min_scrolled_height(0.0)
                 .body(|body| {
                     body.heterogeneous_rows(heights.into_iter(), |mut row| {
@@ -176,37 +176,6 @@ pub fn ui_system(
                         });
                     })
                 });
-            // egui::ScrollArea::vertical()
-            //     .stick_to_bottom(true)
-            //     .auto_shrink(false)
-            //     .show_rows(
-            //         ui,
-            //         150.0,
-            //         manager.messages.get_mut(target_message_key).unwrap().len(),
-            //         |ui, row_range| {
-            //             for row in row_range {
-            //                 let message =
-            //                     &manager.messages.get_mut(target_message_key).unwrap()[row];
-            //                 ui.label(message.data.sender.nickname.to_owned());
-            //                 for chain in &message.data.message_chain {
-            //                     match &chain.variant {
-            //                         MiraiMessageChainType::Plain(plain) => {
-            //                             let text = format!("{}", plain.text);
-            //                             ui.add(egui::Label::new(text));
-            //                         },
-            //                         MiraiMessageChainType::Source(_) => {},
-            //                         MiraiMessageChainType::Image(image) => {
-            //                             ui.add(
-            //                                 egui::Image::new(image.url.to_owned()).max_size(
-            //                                     bevy_egui::egui::Vec2 { x: 400.0, y: 200.0 },
-            //                                 ),
-            //                             );
-            //                         },
-            //                     }
-            //                 }
-            //             }
-            //         },
-            //     );
         });
     });
 }
