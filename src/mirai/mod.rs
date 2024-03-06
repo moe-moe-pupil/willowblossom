@@ -66,8 +66,17 @@ pub struct Plain {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Image {
-    pub image: String,
+    pub image_type: String,
+    pub url: String,
+    pub image_id: String,
+    pub path: Option<String>,
+    pub base64: Option<String>,
+    pub width: f32,
+    pub height: f32,
+    pub size: u64,
+    pub is_emoji: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,4 +1,6 @@
 mod ime;
+use std::cmp::min;
+
 use bevy::prelude::*;
 use bevy_egui::{
     egui,
@@ -6,6 +8,10 @@ use bevy_egui::{
     EguiPlugin,
 };
 use bevy_persistent::Persistent;
+use egui_extras::{
+    Column,
+    TableBuilder,
+};
 use ime::*;
 
 use crate::mirai::{
@@ -59,6 +65,39 @@ pub fn ui_system(
     mut manager: ResMut<Persistent<MiraiMessageManager>>,
 ) {
     let ctx = contexts.ctx_mut();
+    let mut total_rows = 0;
+    let target_message_key = "1670426821";
+    let mut heights: Vec<f32> = vec![];
+
+    for message in manager.messages.get_mut(target_message_key).unwrap() {
+        total_rows += 1;
+        let mut height: f32 = 32.0;
+        for chain in &message.data.message_chain {
+            match &chain.variant {
+                MiraiMessageChainType::Source(_) => {},
+                MiraiMessageChainType::Image(image) => {
+                    total_rows += 1;
+                    height += f32::min(image.height, 200.0);
+                },
+                _ => {
+                    height += 16.0;
+                    total_rows += 1;
+                },
+            };
+        }
+        heights.push(height)
+    }
+
+    egui_extras::install_image_loaders(&ctx);
+    egui::TopBottomPanel::top("top_panel")
+        .resizable(true)
+        .show(ctx, |ui| {
+            ui.label("Top resizeable panel");
+            ui.allocate_rect(
+                ui.available_rect_before_wrap(),
+                egui::Sense::hover(),
+            );
+        });
     egui::SidePanel::left("left_panel")
         .resizable(true)
         .show(ctx, |ui| {
@@ -77,57 +116,97 @@ pub fn ui_system(
                 egui::Sense::hover(),
             );
         });
-
-    egui::TopBottomPanel::top("top_panel")
-        .resizable(true)
-        .show(ctx, |ui| {
-            ui.label("Top resizeable panel");
-            ui.allocate_rect(
-                ui.available_rect_before_wrap(),
-                egui::Sense::hover(),
-            );
-        });
-    egui::TopBottomPanel::bottom("input_panel")
-        .resizable(true)
-        .show(ctx, |ui| {
-            ui.with_layout(
-                egui::Layout::bottom_up(egui::Align::Center),
-                |ui| {
-                    let _teo_m = ime.text_edit_multiline(
-                        &mut app.multi_text,
-                        ui.max_rect().width(),
-                        ui,
-                        ctx,
-                        sender.as_ref(),
-                        &mut manager,
-                    );
-                },
-            )
-        });
     egui::CentralPanel::default().show(ctx, |ui| {
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(true)
-            .show_rows(
-                ui,
-                200.0,
-                manager.messages.len(),
-                |ui, row_range| {
-                    for (id, messages) in &manager.messages {
-                        for message in messages {
+        egui::TopBottomPanel::bottom("input_panel")
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.with_layout(
+                    egui::Layout::bottom_up(egui::Align::Center),
+                    |ui| {
+                        let _teo_m = ime.text_edit_multiline(
+                            &mut app.multi_text,
+                            ui.max_rect().width(),
+                            ui,
+                            ctx,
+                            sender.as_ref(),
+                            &mut manager,
+                        );
+                    },
+                )
+            });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(false)
+                .auto_shrink(false)
+                .cell_layout(egui::Layout::top_down(
+                    egui::Align::LEFT,
+                ))
+                .column(Column::auto())
+                .min_scrolled_height(0.0)
+                .body(|body| {
+                    body.heterogeneous_rows(heights.into_iter(), |mut row| {
+                        let row_index = row.index();
+                        let message =
+                            &manager.messages.get_mut(target_message_key).unwrap()[row_index];
+                        row.col(|ui| {
                             ui.label(message.data.sender.nickname.to_owned());
                             for chain in &message.data.message_chain {
                                 match &chain.variant {
                                     MiraiMessageChainType::Plain(plain) => {
                                         let text = format!("{}", plain.text);
-                                        ui.label(text);
+                                        ui.add(egui::Label::new(text));
                                     },
                                     MiraiMessageChainType::Source(_) => {},
-                                    MiraiMessageChainType::Image(_) => todo!(),
+                                    MiraiMessageChainType::Image(image) => {
+                                        ui.add(
+                                            egui::Image::new(image.url.to_owned())
+                                                .max_size(bevy_egui::egui::Vec2 {
+                                                    x: 400.0,
+                                                    y: 200.0,
+                                                })
+                                                .fit_to_exact_size(bevy_egui::egui::Vec2 {
+                                                    x: image.width,
+                                                    y: image.height,
+                                                }),
+                                        );
+                                    },
                                 }
                             }
-                        }
-                    }
-                },
-            )
+                        });
+                    })
+                });
+            // egui::ScrollArea::vertical()
+            //     .stick_to_bottom(true)
+            //     .auto_shrink(false)
+            //     .show_rows(
+            //         ui,
+            //         150.0,
+            //         manager.messages.get_mut(target_message_key).unwrap().len(),
+            //         |ui, row_range| {
+            //             for row in row_range {
+            //                 let message =
+            //                     &manager.messages.get_mut(target_message_key).unwrap()[row];
+            //                 ui.label(message.data.sender.nickname.to_owned());
+            //                 for chain in &message.data.message_chain {
+            //                     match &chain.variant {
+            //                         MiraiMessageChainType::Plain(plain) => {
+            //                             let text = format!("{}", plain.text);
+            //                             ui.add(egui::Label::new(text));
+            //                         },
+            //                         MiraiMessageChainType::Source(_) => {},
+            //                         MiraiMessageChainType::Image(image) => {
+            //                             ui.add(
+            //                                 egui::Image::new(image.url.to_owned()).max_size(
+            //                                     bevy_egui::egui::Vec2 { x: 400.0, y: 200.0 },
+            //                                 ),
+            //                             );
+            //                         },
+            //                     }
+            //                 }
+            //             }
+            //         },
+            //     );
+        });
     });
 }
