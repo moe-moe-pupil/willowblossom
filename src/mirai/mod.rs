@@ -1,6 +1,8 @@
-use std::panic::take_hook;
+use std::path::Path;
 
 use async_compat::Compat;
+use bevy_persistent::prelude::*;
+extern crate dirs;
 use bevy::{
     ecs::system::CommandQueue,
     prelude::*,
@@ -17,6 +19,7 @@ use crossbeam_channel::{
     Receiver as CBReceiver,
     Sender as CBSender,
 };
+use dirs::state_dir;
 use futures_lite::future;
 use futures_util::{
     SinkExt,
@@ -53,7 +56,7 @@ pub struct MiraiPlugin;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MiraiMessage {
-    sync_id: String,
+    pub(crate) sync_id: String,
     pub data: MiraiMessageData,
 }
 
@@ -83,7 +86,7 @@ pub enum MiraiMessageChainType {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-enum MiraiMessageType {
+pub enum MiraiMessageType {
     FriendMessage,
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -107,9 +110,9 @@ pub struct MiraiMessageData {
     pub sender: MiraiSender,
 }
 
-#[derive(Resource)]
+#[derive(Resource, Serialize, Deserialize)]
 pub struct MiraiMessageManager {
-    pub messages: HashMap<String, MiraiMessage>,
+    pub messages: HashMap<String, Vec<MiraiMessage>>,
 }
 
 impl Plugin for MiraiPlugin {
@@ -130,10 +133,19 @@ fn setup(mut commands: Commands) {
     let task = thread_pool.spawn(Compat::new(handle_connection(
         client_to_game_sender.clone(),
     )));
-    let mut message_manager = MiraiMessageManager {
+    let message_manager = MiraiMessageManager {
         messages: HashMap::default(),
     };
-    commands.insert_resource(message_manager);
+    let config_dir = Path::new(".data").join("willowblossom");
+    commands.insert_resource(
+        Persistent::<MiraiMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(config_dir.join("messages.toml"))
+            .default(message_manager)
+            .build()
+            .expect("failed to init messages"),
+    );
     commands.insert_resource(mirai_io);
     commands.insert_resource(MiraiTask(task));
 }
@@ -202,7 +214,10 @@ fn send_message(buttons: Res<ButtonInput<MouseButton>>, sender: Res<MiraiIOSende
     }
 }
 
-fn message_system(receiver: Res<MiraiIOReceiver>, mut manager: ResMut<MiraiMessageManager>) {
+fn message_system(
+    receiver: Res<MiraiIOReceiver>,
+    mut manager: ResMut<Persistent<MiraiMessageManager>>,
+) {
     if let Ok(msg) = receiver.0.try_recv() {
         println!("msg => {:?}", msg);
         if let Ok(json) = serde_json::from_str::<MiraiMessage>(&msg.to_string()) {
@@ -215,14 +230,15 @@ fn message_system(receiver: Res<MiraiIOReceiver>, mut manager: ResMut<MiraiMessa
                     .messages
                     .get_mut(&json.data.sender.id.to_string())
                     .unwrap()
-                    .data
-                    .message_chain
-                    .extend(json.data.message_chain)
+                    .push(json)
             } else {
                 manager
                     .messages
-                    .insert(json.data.sender.id.to_string(), json);
+                    .insert(json.data.sender.id.to_string(), vec![
+                        json,
+                    ]);
             }
+            manager.persist().ok();
         }
     }
 }

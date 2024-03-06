@@ -9,7 +9,7 @@ use bevy::{
 
 // [CHANGE]: Game title and resolution
 pub const GAME_TITLE: &str = "Hello Bevy!";
-pub const INITIAL_RESOLUTION: Vec2 = Vec2::new(600., 600.);
+pub const INITIAL_RESOLUTION: Vec2 = Vec2::new(800., 600.);
 
 // Game state
 #[derive(States, Debug, Default, Clone, Eq, PartialEq, Hash)]
@@ -46,7 +46,6 @@ impl Plugin for GamePlugin {
             primary_window: Some(Window {
                 title: GAME_TITLE.into(),
                 resolution: INITIAL_RESOLUTION.into(),
-                resizable: false,
                 canvas: Some("#bevy".to_string()),
                 prevent_default_event_handling: false,
                 ..default()

@@ -5,14 +5,13 @@ use bevy_egui::{
     EguiContexts,
     EguiPlugin,
 };
+use bevy_persistent::Persistent;
 use ime::*;
 
 use crate::mirai::{
     MiraiIOSender,
-    MiraiMessageChain,
     MiraiMessageChainType,
     MiraiMessageManager,
-    Plain,
 };
 
 #[derive(Resource, Default)]
@@ -57,7 +56,7 @@ pub fn ui_system(
     mut app: ResMut<MyApp>,
     mut ime: ResMut<ImeManager>,
     sender: Res<MiraiIOSender>,
-    mut manager: ResMut<MiraiMessageManager>,
+    mut manager: ResMut<Persistent<MiraiMessageManager>>,
 ) {
     let ctx = contexts.ctx_mut();
     egui::SidePanel::left("left_panel")
@@ -78,32 +77,7 @@ pub fn ui_system(
                 egui::Sense::hover(),
             );
         });
-    egui::CentralPanel::default().show(ctx, |ui| {
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(true)
-            .show_rows(
-                ui,
-                200.0,
-                manager.messages.len(),
-                |ui, row_range| {
-                    for (id, message) in &manager.messages {
-                        for (chain) in &message.data.message_chain {
-                            match &chain.variant {
-                                MiraiMessageChainType::Plain(plain) => {
-                                    let text = format!(
-                                        "{}:\n {}",
-                                        message.data.sender.nickname, plain.text
-                                    );
-                                    ui.label(text);
-                                },
-                                MiraiMessageChainType::Source(_) => {},
-                                MiraiMessageChainType::Image(_) => todo!(),
-                            }
-                        }
-                    }
-                },
-            )
-    });
+
     egui::TopBottomPanel::top("top_panel")
         .resizable(true)
         .show(ctx, |ui| {
@@ -125,8 +99,35 @@ pub fn ui_system(
                         ui,
                         ctx,
                         sender.as_ref(),
+                        &mut manager,
                     );
                 },
             )
         });
+    egui::CentralPanel::default().show(ctx, |ui| {
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .show_rows(
+                ui,
+                200.0,
+                manager.messages.len(),
+                |ui, row_range| {
+                    for (id, messages) in &manager.messages {
+                        for message in messages {
+                            ui.label(message.data.sender.nickname.to_owned());
+                            for chain in &message.data.message_chain {
+                                match &chain.variant {
+                                    MiraiMessageChainType::Plain(plain) => {
+                                        let text = format!("{}", plain.text);
+                                        ui.label(text);
+                                    },
+                                    MiraiMessageChainType::Source(_) => {},
+                                    MiraiMessageChainType::Image(_) => todo!(),
+                                }
+                            }
+                        }
+                    }
+                },
+            )
+    });
 }
