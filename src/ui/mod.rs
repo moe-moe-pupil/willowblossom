@@ -142,6 +142,7 @@ pub fn ui_system(
                 .cell_layout(egui::Layout::top_down(
                     egui::Align::LEFT,
                 ))
+                .stick_to_bottom(true)
                 .column(Column::remainder())
                 .min_scrolled_height(0.0)
                 .body(|body| {
