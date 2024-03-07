@@ -1,9 +1,21 @@
 mod ime;
-use std::cmp::min;
+use std::{
+    cmp::min,
+    io::Cursor,
+};
 
-use bevy::prelude::*;
+use bevy::{
+    prelude::*,
+    render::render_resource::encase::rts_array::Length,
+    utils::HashMap,
+};
 use bevy_egui::{
-    egui,
+    egui::{
+        self,
+        ColorImage,
+        TextureHandle,
+        TextureOptions,
+    },
     EguiContexts,
     EguiPlugin,
 };
@@ -11,6 +23,11 @@ use bevy_persistent::Persistent;
 use egui_extras::{
     Column,
     TableBuilder,
+};
+use image::{
+    codecs::gif::GifDecoder,
+    io::Reader,
+    AnimationDecoder,
 };
 use ime::*;
 
@@ -28,6 +45,11 @@ pub struct MyApp {
 
 pub struct UIPlugin;
 
+#[derive(Resource)]
+pub struct GIFImages {
+    images: HashMap<String, Vec<(TextureHandle, u32)>>,
+}
+
 impl Plugin for UIPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(EguiPlugin)
@@ -41,7 +63,11 @@ impl Plugin for UIPlugin {
     }
 }
 
-pub fn setup_system(mut egui_context: EguiContexts, mut windows: Query<&mut Window>) {
+pub fn setup_system(
+    mut command: Commands,
+    mut egui_context: EguiContexts,
+    mut windows: Query<&mut Window>,
+) {
     let mut window = windows.single_mut();
     window.ime_enabled = true;
     let mut txt_font = egui::FontDefinitions::default();
@@ -55,6 +81,9 @@ pub fn setup_system(mut egui_context: EguiContexts, mut windows: Query<&mut Wind
     ));
     txt_font.font_data.insert("Meiryo".to_owned(), fd);
     egui_context.ctx_mut().set_fonts(txt_font);
+    command.insert_resource(GIFImages {
+        images: HashMap::default(),
+    })
 }
 
 pub fn ui_system(
@@ -62,7 +91,9 @@ pub fn ui_system(
     mut app: ResMut<MyApp>,
     mut ime: ResMut<ImeManager>,
     sender: Res<MiraiIOSender>,
+    time: Res<Time>,
     mut manager: ResMut<Persistent<MiraiMessageManager>>,
+    mut gif_images: ResMut<GIFImages>,
 ) {
     let ctx = contexts.ctx_mut();
     let mut total_rows = 0;
@@ -160,17 +191,81 @@ pub fn ui_system(
                                     },
                                     MiraiMessageChainType::Source(_) => {},
                                     MiraiMessageChainType::Image(image) => {
-                                        ui.add(
-                                            egui::Image::new(image.url.to_owned())
-                                                .max_size(bevy_egui::egui::Vec2 {
-                                                    x: 400.0,
-                                                    y: 200.0,
-                                                })
-                                                .fit_to_exact_size(bevy_egui::egui::Vec2 {
-                                                    x: image.width,
-                                                    y: image.height,
-                                                }),
-                                        );
+                                        if image.image_type == "GIF" {
+                                            if !gif_images.images.contains_key(&image.image_id) {
+                                                let img_bytes =
+                                                    reqwest::blocking::get(image.url.to_owned())
+                                                        .unwrap()
+                                                        .bytes()
+                                                        .unwrap();
+                                                let cursor = Cursor::new(img_bytes);
+                                                let decoder = GifDecoder::new(cursor).unwrap();
+
+                                                let frames = decoder
+                                                    .into_frames()
+                                                    .collect_frames()
+                                                    .expect("Can't decode frames");
+                                                gif_images.images.insert(
+                                                    image.image_id.to_owned(),
+                                                    frames
+                                                        .iter()
+                                                        .enumerate()
+                                                        .map(|(i, f)| {
+                                                            let handle = ctx.load_texture(
+                                                                format!("gif_frame_{i}"),
+                                                                ColorImage::from_rgba_unmultiplied(
+                                                                    [
+                                                                        f.buffer().width() as _,
+                                                                        f.buffer().height() as _,
+                                                                    ],
+                                                                    f.buffer(),
+                                                                ),
+                                                                TextureOptions::default(),
+                                                            );
+                                                            let (num, den) =
+                                                                f.delay().numer_denom_ms();
+                                                            (
+                                                                handle,
+                                                                (num as f32 * 1000.0 / den as f32)
+                                                                    .round()
+                                                                    as u32,
+                                                            )
+                                                        })
+                                                        .collect(),
+                                                );
+                                            }
+                                            let images = gif_images
+                                                .images
+                                                .get(&image.image_id.to_owned())
+                                                .unwrap();
+                                            let frame = ((time.elapsed_seconds()
+                                                / (images[0].1 as f32 / 500000.0))
+                                                as usize)
+                                                % images.len();
+                                            ui.add(
+                                                egui::Image::new(&images[frame].0)
+                                                    .max_size(bevy_egui::egui::Vec2 {
+                                                        x: 400.0,
+                                                        y: 200.0,
+                                                    })
+                                                    .fit_to_exact_size(bevy_egui::egui::Vec2 {
+                                                        x: image.width,
+                                                        y: image.height,
+                                                    }),
+                                            );
+                                        } else {
+                                            ui.add(
+                                                egui::Image::new(image.url.to_owned())
+                                                    .max_size(bevy_egui::egui::Vec2 {
+                                                        x: 400.0,
+                                                        y: 200.0,
+                                                    })
+                                                    .fit_to_exact_size(bevy_egui::egui::Vec2 {
+                                                        x: image.width,
+                                                        y: image.height,
+                                                    }),
+                                            );
+                                        }
                                     },
                                 }
                             }

@@ -1,6 +1,10 @@
-use std::path::Path;
+use std::{
+    io::Read,
+    path::Path,
+};
 
 use async_compat::Compat;
+use bevy_egui::egui::TextureHandle;
 use bevy_persistent::prelude::*;
 extern crate dirs;
 use bevy::{
@@ -25,6 +29,7 @@ use futures_util::{
     SinkExt,
     StreamExt,
 };
+use image::{codecs::gif::GifDecoder, AnimationDecoder, Frame};
 use serde::{
     Deserialize,
     Serialize,
