@@ -3,7 +3,7 @@ use std::{
     cmp::min,
     io::Cursor,
 };
-
+mod components;
 use bevy::{
     prelude::*,
     render::render_resource::encase::rts_array::Length,
@@ -14,7 +14,9 @@ use bevy_egui::{
         self,
         epaint::CircleShape,
         ColorImage,
+        ImageButton,
         Painter,
+        Pos2,
         Response,
         Sense,
         Stroke,
@@ -38,6 +40,7 @@ use image::{
 };
 use ime::*;
 
+use self::components::icon::Icon;
 use crate::mirai::{
     MiraiIOSender,
     MiraiMessageChainType,
@@ -138,18 +141,15 @@ pub fn ui_system(
     let mut heights: Vec<f32> = vec![];
     let willowbloosm_icon = egui::include_image!("../../assets/icons/willowbloosm.jpg");
     for message in manager.messages.get_mut(target_message_key).unwrap() {
-        total_rows += 1;
         let mut height: f32 = 32.0;
         for chain in &message.data.message_chain {
             match &chain.variant {
                 MiraiMessageChainType::Source(_) => {},
                 MiraiMessageChainType::Image(image) => {
-                    total_rows += 1;
                     height += f32::min(image.height, 200.0);
                 },
                 _ => {
                     height += 16.0;
-                    total_rows += 1;
                 },
             };
         }
@@ -159,9 +159,19 @@ pub fn ui_system(
     egui::SidePanel::left("party_panel")
         .exact_width(64.0)
         .show(ctx, |ui| {
-            ui.add_sized(
-                Vec2 { x: 64.0, y: 64.0 },
-                egui::Button::image(willowbloosm_icon),
+            ui.allocate_ui(
+                Vec2 { x: 48.0, y: 48.0 },
+                |ui| {
+                    ui.add(
+                        Icon::new(willowbloosm_icon, Vec2 {
+                            x: 48.0,
+                            y: 48.0,
+                        })
+                        .rounding(48.0)
+                        .uv([Pos2 { x: 0.0, y: 0.0 }, Pos2 { x: 1.0, y: 0.5 }]),
+                    )
+                }, /* egui::Button::image(willowbloosm_icon).
+                    * rounding(40.0), */
             )
         });
     egui::CentralPanel::default().show(ctx, |ui| {
