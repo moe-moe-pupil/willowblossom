@@ -162,14 +162,33 @@ pub fn ui_system(
             ui.allocate_ui(
                 Vec2 { x: 48.0, y: 48.0 },
                 |ui| {
-                    ui.add(
-                        Icon::new(willowbloosm_icon, Vec2 {
-                            x: 48.0,
-                            y: 48.0,
-                        })
-                        .rounding(48.0)
-                        .uv([Pos2 { x: 0.0, y: 0.0 }, Pos2 { x: 1.0, y: 0.5 }]),
-                    )
+                    if let Some(size) = egui::Image::new(egui::include_image!(
+                        "../../assets/icons/willowbloosm.jpg"
+                    ))
+                    .load_and_calc_size(ui, Vec2 { x: 48.0, y: 48.0 })
+                    {
+                        let aspect_ratio = size.x / size.y;
+                        ui.add(
+                            Icon::new(willowbloosm_icon, Vec2 {
+                                x: 48.0,
+                                y: 48.0,
+                            })
+                            .rounding(48.0)
+                            .uv([Pos2 { x: 0.0, y: 0.0 }, Pos2 {
+                                x: if aspect_ratio > 1.0 { 1.0 / aspect_ratio } else { 1.0 },
+                                y: if aspect_ratio > 1.0 { 1.0 } else { aspect_ratio },
+                            }]),
+                        )
+                    } else {
+                        ui.add(
+                            Icon::new(willowbloosm_icon, Vec2 {
+                                x: 48.0,
+                                y: 48.0,
+                            })
+                            .rounding(48.0)
+                            .uv([Pos2 { x: 0.0, y: 0.0 }, Pos2 { x: 1.0, y: 1.0 }]),
+                        )
+                    }
                 }, /* egui::Button::image(willowbloosm_icon).
                     * rounding(40.0), */
             )

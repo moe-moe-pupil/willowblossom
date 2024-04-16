@@ -87,7 +87,7 @@ impl<'a> Icon<'a> {
 }
 
 impl<'a> Widget for Icon<'a> {
-    fn ui(self, ui: &mut Ui) -> Response {
+    fn ui(mut self, ui: &mut Ui) -> Response {
         let padding = if self.frame {
             // so we can see that it is a button:
             Vec2::splat(ui.spacing().button_padding.x)
@@ -98,6 +98,7 @@ impl<'a> Widget for Icon<'a> {
         let available_size_for_image = ui.available_size() - 2.0 * padding;
         let tlr = self.image.load_for_size(ui.ctx(), available_size_for_image);
         let original_image_size = tlr.as_ref().ok().and_then(|t| t.size());
+
         let image_size = self.image.calc_size(
             available_size_for_image,
             original_image_size,
