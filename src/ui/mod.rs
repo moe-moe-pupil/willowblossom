@@ -41,10 +41,10 @@ use image::{
 use ime::*;
 
 use self::components::icon::Icon;
-use crate::mirai::{
-    MiraiIOSender,
-    MiraiMessageChainType,
-    MiraiMessageManager,
+use crate::napcat::{
+    NapcatIOSender,
+    NapcatMessageChainType,
+    NapcatMessageManager,
 };
 
 #[derive(Resource, Default)]
@@ -97,7 +97,7 @@ impl Plugin for UIPlugin {
             .add_systems(Startup, setup_system)
             .add_systems(
                 Update,
-                ui_system.run_if(resource_exists::<MiraiIOSender>),
+                ui_system.run_if(resource_exists::<NapcatIOSender>),
             );
     }
 }
@@ -111,7 +111,7 @@ pub fn setup_system(
     let mut window = windows.single_mut();
     window.ime_enabled = true;
     let mut txt_font = egui::FontDefinitions::default();
-    egui_extras::install_image_loaders(&ctx);
+    egui_extras::install_image_loaders(ctx);
     txt_font
         .families
         .get_mut(&egui::FontFamily::Proportional)
@@ -131,29 +131,31 @@ pub fn ui_system(
     mut contexts: EguiContexts,
     mut app: ResMut<MyApp>,
     mut ime: ResMut<ImeManager>,
-    sender: Res<MiraiIOSender>,
+    sender: Res<NapcatIOSender>,
     time: Res<Time>,
-    mut manager: ResMut<Persistent<MiraiMessageManager>>,
+    mut manager: ResMut<Persistent<NapcatMessageManager>>,
     mut gif_images: ResMut<GIFImages>,
 ) {
     let ctx = contexts.ctx_mut();
     let target_message_key = "1670426821";
     let mut heights: Vec<f32> = vec![];
     let willowbloosm_icon = egui::include_image!("../../assets/icons/willowbloosm.jpg");
-    for message in manager.messages.get_mut(target_message_key).unwrap() {
-        let mut height: f32 = 32.0;
-        for chain in &message.data.message_chain {
-            match &chain.variant {
-                MiraiMessageChainType::Source(_) => {},
-                MiraiMessageChainType::Image(image) => {
-                    height += f32::min(image.height, 200.0);
-                },
-                _ => {
-                    height += 16.0;
-                },
-            };
+    if let Some(messages) = manager.messages.get_mut(target_message_key) {
+        for message in messages {
+            let mut height: f32 = 32.0;
+            for chain in &message.data.message {
+                match &chain.variant {
+                    NapcatMessageChainType::Source(_) => {},
+                    NapcatMessageChainType::Image { data: image } => {
+                        height += 200.0;
+                    },
+                    _ => {
+                        height += 16.0;
+                    },
+                };
+            }
+            heights.push(height)
         }
-        heights.push(height)
     }
 
     egui::SidePanel::left("party_panel")
@@ -257,19 +259,21 @@ pub fn ui_system(
                                 &manager.messages.get_mut(target_message_key).unwrap()[row_index];
                             row.col(|ui| {
                                 ui.label(message.data.sender.nickname.to_owned());
-                                for chain in &message.data.message_chain {
+                                for chain in &message.data.message {
                                     match &chain.variant {
-                                        MiraiMessageChainType::Plain(plain) => {
-                                            let text = format!("{}", plain.text);
+                                        NapcatMessageChainType::Text { data: text_data } => {
+                                            let text = format!("{}", text_data.text);
                                             ui.add(egui::Label::new(text));
                                         },
-                                        MiraiMessageChainType::Source(_) => {},
-                                        MiraiMessageChainType::Image(image) => {
-                                            if image.image_type == "GIF" {
-                                                if !gif_images.images.contains_key(&image.image_id)
+                                        NapcatMessageChainType::Source(_) => {},
+                                        NapcatMessageChainType::Image { data: image_data } => {
+                                            if image_data.sub_type != 1 && false {
+                                                if !gif_images
+                                                    .images
+                                                    .contains_key(&image_data.file_id)
                                                 {
                                                     let img_bytes = reqwest::blocking::get(
-                                                        image.url.to_owned(),
+                                                        image_data.url.to_owned(),
                                                     )
                                                     .unwrap()
                                                     .bytes()
@@ -282,7 +286,7 @@ pub fn ui_system(
                                                         .collect_frames()
                                                         .expect("Can't decode frames");
                                                     gif_images.images.insert(
-                                                        image.image_id.to_owned(),
+                                                        image_data.file_id.to_owned(),
                                                         frames
                                                             .iter()
                                                             .enumerate()
@@ -313,7 +317,7 @@ pub fn ui_system(
                                                 }
                                                 let images = gif_images
                                                     .images
-                                                    .get(&image.image_id.to_owned())
+                                                    .get(&image_data.file_id.to_owned())
                                                     .unwrap();
                                                 let frame = ((time.elapsed_seconds()
                                                     / (images[0].1 as f32 / 500000.0))
@@ -326,21 +330,26 @@ pub fn ui_system(
                                                             y: 200.0,
                                                         })
                                                         .fit_to_exact_size(bevy_egui::egui::Vec2 {
-                                                            x: image.width,
-                                                            y: image.height,
+                                                            x: 200.0,
+                                                            y: 200.0,
                                                         }),
                                                 );
                                             } else {
                                                 ui.add(
-                                                    egui::Image::new(image.url.to_owned())
-                                                        .max_size(bevy_egui::egui::Vec2 {
-                                                            x: 400.0,
-                                                            y: 200.0,
-                                                        })
-                                                        .fit_to_exact_size(bevy_egui::egui::Vec2 {
-                                                            x: image.width,
-                                                            y: image.height,
-                                                        }),
+                                                    egui::Image::new(
+                                                        image_data
+                                                            .url
+                                                            .replace("https", "http")
+                                                            .to_owned(),
+                                                    )
+                                                    .max_size(bevy_egui::egui::Vec2 {
+                                                        x: 400.0,
+                                                        y: 200.0,
+                                                    })
+                                                    .fit_to_exact_size(bevy_egui::egui::Vec2 {
+                                                        x: 200.0,
+                                                        y: 200.0,
+                                                    }),
                                                 );
                                             }
                                         },

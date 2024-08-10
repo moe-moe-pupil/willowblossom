@@ -1,5 +1,5 @@
 mod camera;
-mod mirai;
+mod napcat;
 mod ui;
 
 use bevy::{
@@ -25,9 +25,6 @@ pub struct GamePlugin;
 
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
-        // Fix web builds for now
-        app.insert_resource(AssetMetaCheck::Never);
-
         // Release only plugins (embedded assets)
         #[cfg(not(debug_assertions))]
         {
@@ -69,6 +66,6 @@ impl Plugin for GamePlugin {
         app.add_plugins(DefaultPlugins.set(window_plugin).set(image_plugin));
 
         // Game
-        app.add_plugins((camera::CameraPlugin, mirai::MiraiPlugin, ui::UIPlugin));
+        app.add_plugins((camera::CameraPlugin, napcat::NapcatPlugin, ui::UIPlugin));
     }
 }

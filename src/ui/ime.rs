@@ -1,4 +1,7 @@
-use std::{cmp::min, fmt::Pointer};
+use std::{
+    cmp::min,
+    fmt::Pointer,
+};
 
 use bevy::prelude::*;
 use bevy_egui::egui;
@@ -6,15 +9,9 @@ use bevy_persistent::Persistent;
 use serde_json::json;
 use tungstenite::Message;
 
-use crate::mirai::{
-    MiraiIOSender,
-    MiraiMessage,
-    MiraiMessageChain,
-    MiraiMessageChainType,
-    MiraiMessageData,
-    MiraiMessageManager,
-    MiraiSender,
-    Plain,
+use crate::napcat::{
+    NapcatIOSender,
+    NapcatMessageManager,
 };
 
 pub struct ImePlugin;
@@ -86,7 +83,7 @@ impl ImeManager {
         width: f32,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        sender: &MiraiIOSender,
+        sender: &NapcatIOSender,
     ) -> egui::text_edit::TextEditOutput {
         if self.count >= self.ime_texts.len() {
             self.add();
@@ -116,8 +113,8 @@ impl ImeManager {
         width: f32,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        sender: &MiraiIOSender,
-        manager: &mut Persistent<MiraiMessageManager>,
+        sender: &NapcatIOSender,
+        manager: &mut Persistent<NapcatMessageManager>,
     ) -> egui::text_edit::TextEditOutput {
         if self.count >= self.ime_texts.len() {
             self.add();
@@ -155,36 +152,35 @@ impl ImeManager {
                     .to_string(),
                 ))
                 .expect("can't send message");
-            let bot_qq = 3432505351;
-            let new_message = MiraiMessage {
-                sync_id: "-1".to_string(),
-                data: MiraiMessageData {
-                    r#type: crate::mirai::MiraiMessageType::FriendMessage,
-                    message_chain: vec![MiraiMessageChain {
-                        variant: MiraiMessageChainType::Plain(Plain {
-                            text: self.ime_texts[self.count].text.to_owned(),
-                        }),
-                    }],
-                    sender: MiraiSender {
-                        id: bot_qq,
-                        nickname: "小号骰娘".to_string(),
-                        remark: "小号骰娘".to_string(),
-                    },
-                },
-            };
-            self.ime_texts[self.count].text = "".to_string();
-            if manager.messages.contains_key(&target_qq.to_string()) {
-                manager
-                    .messages
-                    .get_mut(&target_qq.to_string())
-                    .unwrap()
-                    .push(new_message)
-            } else {
-                manager
-                    .messages
-                    .insert(target_qq.to_string(), vec![new_message]);
-            }
-            manager.persist().ok();
+            // let bot_qq = 3432505351;
+            // let new_message = NapcatMessage {
+            //     data: NapcatMessageData {
+            //         message_type: crate::napcat::NapcatMessageType::Private,
+            //         message: vec![NapcatMessageChain {
+            //             variant: NapcatMessageChainType::Text(Text {
+            //                 data:{text: self.ime_texts[self.count].text.to_owned()},
+            //             }),
+            //         }],
+            //         sender: NapcatSender {
+            //             user_id: bot_qq,
+            //             nickname: "小号骰娘".to_string(),
+            //         },
+            //         time: '',
+            //     },
+            // };
+            // self.ime_texts[self.count].text = "".to_string();
+            // if manager.messages.contains_key(&target_qq.to_string()) {
+            //     manager
+            //         .messages
+            //         .get_mut(&target_qq.to_string())
+            //         .unwrap()
+            //         .push(new_message)
+            // } else {
+            //     manager
+            //         .messages
+            //         .insert(target_qq.to_string(), vec![new_message]);
+            // }
+            // manager.persist().ok();
         }
         self.ime_texts[self.count].id = teo.response.id.short_debug_format();
         self.count += 1;
@@ -351,14 +347,16 @@ impl ImeText {
                 .show(ui),
             _ => egui::TextEdit::multiline(&mut tmp_text)
                 .desired_width(width)
-                .desired_rows(
-                    min(20, (ui.max_rect().height()
+                .desired_rows(min(
+                    20,
+                    (ui.max_rect().height()
                         / ui.style()
                             .text_styles
                             .get(&egui::TextStyle::Body)
                             .unwrap()
-                            .size).floor() as usize),
-                )
+                            .size)
+                        .floor() as usize,
+                ))
                 .layouter(&mut lyt)
                 .show(ui),
         };

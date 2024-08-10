@@ -172,14 +172,16 @@ impl<'a> Widget for Icon<'a> {
                 stroke,
             );
         }
+        let ctx = ui.ctx();
+        let src = self.image.source(ctx);
         match tlr {
             Ok(TexturePoll::Ready { .. }) => response,
             Ok(TexturePoll::Pending { .. }) => {
-                let uri = self.image.source().uri().unwrap_or("image");
+                let uri = src.uri().unwrap_or("image");
                 response.on_hover_text(format!("Loading {uri}…"))
             },
             Err(err) => {
-                let uri = self.image.source().uri().unwrap_or("image");
+                let uri = src.uri().unwrap_or("image");
                 response.on_hover_text(format!("Failed loading {uri}: {err}"))
             },
         }

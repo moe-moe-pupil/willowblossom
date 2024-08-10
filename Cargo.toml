@@ -26,7 +26,7 @@ mock_touch = []
 # The bevy engine <3
 # Default feautres are disabled because we are using audio from a different source (kira)
 # We also add trace_tracy for profiling
-bevy = { version = "0.13.0" }
+bevy = { version = "0.14.1" }
 
 
 #  features = [
@@ -52,15 +52,15 @@ bevy = { version = "0.13.0" }
 #     "webgl2",
 #     "serialize",
 # ]
-bevy_asset_loader = { version = "0.20.0", features = [
+bevy_asset_loader = { version = "0.21.0", features = [
     "progress_tracking",
 ] } # Better asset loader
-bevy_embedded_assets = { version = "0.10" } # Embed assets in binary
-bevy_kira_audio = { version = "0.19" } # Improved audio library
-iyes_progress = { version = "0.11", features = [
+bevy_embedded_assets = { version = "0.11.0" } # Embed assets in binary
+bevy_kira_audio = { version = "0.20.0" } # Improved audio library
+iyes_progress = { version = "0.12.0", features = [
     "assets",
 ] } # Track loading and game state
-bevy-persistent = { version = "0.5", features = [
+bevy-persistent = { version = "0.6.0", features = [
     "toml",
     "all",
 ] } # Persistent values (for saving)
@@ -70,23 +70,23 @@ rand = { version = "0.8" }
 serde = { version = "1.0", features = ["derive"] }
 
 # Debug
-bevy-inspector-egui = { version = "0.23.2" } # Inspector
-egui_dock = { version = "0.11.2" }
+bevy-inspector-egui = { version = "0.25.1" } # Inspector
+egui_dock = { version = "0.13.0" }
 egui-gizmo = { version = "0.16.0" }
 
 ## WebSocket
 url = "2.5.0"
-tungstenite = "0.21.0"
+tungstenite = "0.23.0"
 tokio = { version = "1.35.1", features = ["full"] }
 futures-channel = "0.3.30"
 futures-util = "0.3.30"
-tokio-tungstenite = "0.21.0"
+tokio-tungstenite = "0.23.1"
 crossbeam-channel = "0.5.11"
 async-compat = "0.2.3"
 futures-lite = "2.2.0"
-bevy_egui = "0.25.0"
+bevy_egui = "0.28.0"
 serde_json = "1.0.114"
 dirs = "5.0.1"
-egui_extras = { version = "*", features = ["all_loaders"] }
-image = { version = "0.24" }
-reqwest = { version = "0.11.24", features = ["blocking", "json"] }
+egui_extras = { version = "0.28.0", features = ["all_loaders"] }
+image = { version = "0.25.2", features = ["jpeg", "png"] }
+reqwest = { version = "0.12.5", features = ["blocking", "json"] }
