@@ -136,15 +136,16 @@ impl ImeManager {
                 .0
                 .try_send(Message::Text(
                     json!({
-                        "syncId": 123,
-                        "command": "sendFriendMessage",
-                        "subCommand": null,
-                        "content": {
-                            "target": target_qq,
-                            "messageChain": [
+                        "action": "send_private_msg",
+                        "params": {
+                            "user_id": target_qq,
+                            "message_type": "private",
+                            "message": [
                                 {
-                                    "type": "Plain",
-                                    "text": self.ime_texts[self.count].text
+                                    "type": "text",
+                                    "data": {
+                                        "text": self.ime_texts[self.count].text
+                                    }
                                 }
                             ]
                         }
@@ -152,35 +153,7 @@ impl ImeManager {
                     .to_string(),
                 ))
                 .expect("can't send message");
-            // let bot_qq = 3432505351;
-            // let new_message = NapcatMessage {
-            //     data: NapcatMessageData {
-            //         message_type: crate::napcat::NapcatMessageType::Private,
-            //         message: vec![NapcatMessageChain {
-            //             variant: NapcatMessageChainType::Text(Text {
-            //                 data:{text: self.ime_texts[self.count].text.to_owned()},
-            //             }),
-            //         }],
-            //         sender: NapcatSender {
-            //             user_id: bot_qq,
-            //             nickname: "小号骰娘".to_string(),
-            //         },
-            //         time: '',
-            //     },
-            // };
-            // self.ime_texts[self.count].text = "".to_string();
-            // if manager.messages.contains_key(&target_qq.to_string()) {
-            //     manager
-            //         .messages
-            //         .get_mut(&target_qq.to_string())
-            //         .unwrap()
-            //         .push(new_message)
-            // } else {
-            //     manager
-            //         .messages
-            //         .insert(target_qq.to_string(), vec![new_message]);
-            // }
-            // manager.persist().ok();
+            self.ime_texts[self.count].text = "".to_string();
         }
         self.ime_texts[self.count].id = teo.response.id.short_debug_format();
         self.count += 1;

@@ -95,7 +95,8 @@ pub struct Source {
 pub enum NapcatMessageChainType {
     Source(Source),
     Text { data: TextData },
-    Image { data: ImageData },
+    // TODO: support image
+    // Image { data: ImageData },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,6 +120,9 @@ pub struct NapcatMessageData {
     pub time: u64,
     pub message_type: NapcatMessageType,
     pub message: Vec<NapcatMessageChain>,
+    pub self_id: u64,
+    pub user_id: u64,
+    pub target_id: Option<u64>,
     pub sender: NapcatSender,
 }
 
@@ -133,7 +137,7 @@ impl Plugin for NapcatPlugin {
             // .insert_resource(NapcatSocket { ..default() })
             .add_systems(Startup, setup)
             .add_systems(Update, handle_tasks.run_if(resource_exists::<NapcatTask>))
-            .add_systems(Update, (send_message.run_if(resource_exists::<NapcatIOSender>), message_system));
+            .add_systems(Update, message_system);
     }
 }
 
@@ -178,7 +182,6 @@ async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> Comm
 
     let mut command_queue = CommandQueue::default();
     command_queue.push(move |world: &mut World| {
-        println!("work!!!");
         world.insert_resource(NapcatIOSender(game_to_client_sender));
         world.remove_resource::<NapcatTask>();
     });
@@ -212,20 +215,6 @@ async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> Comm
     command_queue
 }
 
-fn send_message(buttons: Res<ButtonInput<MouseButton>>, sender: Res<NapcatIOSender>) {
-    if buttons.just_pressed(MouseButton::Left) {
-        // Left button was pressed
-        // let err = sender
-        //     .0
-        //     .try_send(Message::Text(
-        //         (r#"{"syncId":123,"command":"sendFriendMessage","subCommand":null,"content":{"
-        // target":1670426821,"messageChain":[{"type":"Plain","text":"你好~"}]}}"#)
-        //         .to_string(),
-        //     ))
-        //     .expect("can't send message");
-    }
-}
-
 fn message_system(
     receiver: Res<NapcatIOReceiver>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
@@ -235,21 +224,28 @@ fn message_system(
         let json_res = serde_json::from_str::<NapcatMessage>(&msg.to_string());
         if let Ok(json) = json_res {
             println!("json => {:?}", json);
+            let target_id = if json.data.user_id == json.data.self_id {
+                json.data.target_id.unwrap()
+            } else {
+                json.data.user_id
+            };
+
             if manager
                 .messages
-                .contains_key(&json.data.sender.user_id.to_string())
+                .contains_key(&target_id.to_string())
             {
                 manager
                     .messages
-                    .get_mut(&json.data.sender.user_id.to_string())
+                    .get_mut(&target_id.to_string())
                     .unwrap()
                     .push(json)
             } else {
                 manager.messages.insert(
-                    json.data.sender.user_id.to_string(),
+                    target_id.to_string(),
                     vec![json],
                 );
             }
+
             manager.persist().ok();
         } else {
             dbg!(json_res.err());
