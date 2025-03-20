@@ -118,10 +118,8 @@ pub fn setup_system(
         .get_mut(&egui::FontFamily::Proportional)
         .unwrap()
         .insert(0, "Meiryo".to_owned());
-    let fd = egui::FontData::from_static(include_bytes!(
-        "C:/Windows/Fonts/simkai.ttf"
-    ));
-    txt_font.font_data.insert("Meiryo".to_owned(), fd);
+    let fd = egui::FontData::from_static(include_bytes!("../../assets/fonts/AlibabaHealthFont.ttf"));
+    txt_font.font_data.insert("Meiryo".to_owned(), fd.into());
     egui_context.ctx_mut().set_fonts(txt_font);
     command.insert_resource(GIFImages {
         images: HashMap::default(),

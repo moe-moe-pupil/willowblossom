@@ -113,7 +113,7 @@ impl<'a> Widget for Icon<'a> {
                 let selection = ui.visuals().selection;
                 (
                     Vec2::ZERO,
-                    self.image.image_options().rounding,
+                    self.image.image_options().corner_radius,
                     selection.bg_fill,
                     selection.stroke,
                 )
@@ -122,7 +122,7 @@ impl<'a> Widget for Icon<'a> {
                 let expansion = Vec2::splat(visuals.expansion);
                 (
                     expansion,
-                    self.image.image_options().rounding,
+                    self.image.image_options().corner_radius,
                     visuals.weak_bg_fill,
                     visuals.bg_stroke,
                 )
@@ -170,6 +170,7 @@ impl<'a> Widget for Icon<'a> {
                 rect.expand2(expansion),
                 rounding,
                 stroke,
+                bevy_egui::egui::StrokeKind::Outside
             );
         }
         let ctx = ui.ctx();

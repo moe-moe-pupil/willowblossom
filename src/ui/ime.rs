@@ -150,7 +150,7 @@ impl ImeManager {
                             ]
                         }
                     })
-                    .to_string(),
+                    .to_string().into(),
                 ))
                 .expect("can't send message");
             self.ime_texts[self.count].text = "".to_string();
