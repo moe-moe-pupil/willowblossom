@@ -127,6 +127,7 @@ impl ImeManager {
             ui,
             ctx,
         );
+
         if self.ime_texts[self.count].is_focus
             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
         {
@@ -150,7 +151,8 @@ impl ImeManager {
                             ]
                         }
                     })
-                    .to_string().into(),
+                    .to_string()
+                    .into(),
                 ))
                 .expect("can't send message");
             self.ime_texts[self.count].text = "".to_string();
@@ -239,42 +241,46 @@ impl ImeText {
             return;
         }
         match event {
-            Ime::Preedit { value, cursor, .. } if cursor.is_some() => {
-                if self.is_focus {
-                    self.ime_string = value.to_string();
-                    self.ime_string_index = self.ime_string.chars().count();
+            Ime::Preedit { value, cursor, .. }  => {
+                if cursor.is_some() {
+                    // if self.is_focus {
+                    //     self.ime_string = value.to_string();
+                    //     self.ime_string_index = self.ime_string.chars().count();
+                    // }
+                } else {
+                    self.is_ime = false;
                 }
             },
             Ime::Commit { value, .. } => {
                 if value.is_empty() {
                     self.is_cursor_move = false;
                 }
-                if self.is_focus {
-                    let tmp = value.to_string();
-                    if self.text.chars().count() == self.cursor_index {
-                        self.text.push_str(&tmp);
-                    } else {
-                        let mut front = String::new();
-                        let mut back = String::new();
-                        let mut cnt = 0;
-                        for c in self.text.chars() {
-                            if cnt < self.cursor_index {
-                                front.push_str(&c.to_string());
-                            } else {
-                                back.push_str(&c.to_string());
-                            }
-                            cnt += 1;
-                        }
-                        self.text = format!("{}{}{}", front, tmp, back);
-                    }
-                    self.is_ime_input = true;
-                    self.ime_string = String::new();
-                }
+                // if self.is_focus {
+                //     let tmp = value.to_string();
+                //     if self.text.chars().count() == self.cursor_index {
+                //         self.text.push_str(&tmp);
+                //     } else {
+                //         let mut front = String::new();
+                //         let mut back = String::new();
+                //         let mut cnt = 0;
+                //         for c in self.text.chars() {
+                //             if cnt < self.cursor_index {
+                //                 front.push_str(&c.to_string());
+                //             } else {
+                //                 back.push_str(&c.to_string());
+                //             }
+                //             cnt += 1;
+                //         }
+                //         self.text = format!("{}{}{}", front, tmp, back);
+                //     }
+                //     self.is_ime_input = true;
+                //     self.ime_string = String::new();
+                // }
             },
             Ime::Enabled { .. } => {
                 self.is_ime = true;
             },
-            Ime::Disabled { .. } => {
+            Ime::Disabled {.. } => {
                 self.is_ime = false;
             },
             _ => (),
