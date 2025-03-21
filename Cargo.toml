@@ -60,7 +60,7 @@ tokio-tungstenite = "0.26.2"
 crossbeam-channel = "0.5.14"
 async-compat = "0.2.4"
 futures-lite = "2.6.0"
-bevy_egui = "0.33.0"
+bevy_egui = {git = "https://github.com/moe-moe-pupil/bevy_egui", branch = "main", features = ["persistence"]}
 serde_json = "1.0.140"
 dirs = "6.0.0"
 egui_extras = { version = "0.31.1", features = ["all_loaders"] }

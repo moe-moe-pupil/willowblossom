@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_compat::Compat;
-use bevy_egui::egui::TextureHandle;
+use bevy_egui::egui::{Memory, TextureHandle};
 use bevy_persistent::prelude::*;
 extern crate dirs;
 use bevy::{
