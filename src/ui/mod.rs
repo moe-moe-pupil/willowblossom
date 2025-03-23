@@ -14,12 +14,15 @@ use bevy_egui::{
     egui::{
         self,
         epaint::CircleShape,
+        Align2,
         ColorImage,
+        Id,
         ImageButton,
         Layout,
         Memory,
         Painter,
         Pos2,
+        Rect,
         Response,
         Sense,
         Stroke,
@@ -130,7 +133,7 @@ pub fn setup_system(
 ) {
     let ctx = egui_context.ctx_mut();
     let config_dir = Path::new(".data").join("willowblossom");
-    let mut cached_memory = Persistent::<CachedMemory>::builder()
+    let cached_memory = Persistent::<CachedMemory>::builder()
         .name("ui_memory")
         .format(StorageFormat::Ron)
         .path(config_dir.join("ui_memory.ron"))
@@ -139,11 +142,10 @@ pub fn setup_system(
         })
         .build()
         .expect("failed to init messages");
-
-    cached_memory.ui_memory.options.zoom_factor = 1.0;
     command.insert_resource(cached_memory);
     let mut window = windows.single_mut();
     window.ime_enabled = true;
+    dbg!(window.physical_size());
     let mut txt_font = egui::FontDefinitions::default();
     egui_extras::install_image_loaders(ctx);
     txt_font
@@ -176,16 +178,12 @@ pub fn ui_system(
     sender: Res<NapcatIOSender>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
     mut cached_memory: ResMut<Persistent<CachedMemory>>,
-    mut commands: Commands,
+    mut has_run_once: Local<bool>,
 ) {
     let ctx = contexts.ctx_mut();
-    ctx.memory_mut(|m| {
-        cached_memory.ui_memory = m.clone();
-    });
-    cached_memory.persist().ok();
     let target_message_key = "1670426821";
     let mut heights: Vec<f32> = vec![];
-    let willowbloosm_icon = egui::include_image!("../../assets/icons/willowbloosm.jpg");
+
     if let Some(messages) = manager.messages.get_mut(target_message_key) {
         for message in messages {
             let mut height: f32 = 32.0;
@@ -205,206 +203,105 @@ pub fn ui_system(
         }
     }
 
-    egui::CentralPanel::default().show(ctx, |_| {
-        egui::TopBottomPanel::top("top_panel")
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.allocate_rect(
-                    ui.available_rect_before_wrap(),
-                    egui::Sense::hover(),
-                );
-            });
-
-        egui::SidePanel::right("right_panel")
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.label("Right resizeable panel");
-                ui.allocate_rect(
-                    ui.available_rect_before_wrap(),
-                    egui::Sense::hover(),
-                );
-            });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::Window::new("Window")
-                .vscroll(true)
-                .open(&mut true)
-                .constrain_to(ui.max_rect())
-                .show(ctx, |ui| {
-                    TableBuilder::new(ui)
-                        .striped(true)
-                        .resizable(false)
-                        .auto_shrink(false)
-                        .cell_layout(egui::Layout::top_down(
-                            egui::Align::LEFT,
-                        ))
-                        .stick_to_bottom(true)
-                        .column(Column::remainder())
-                        .min_scrolled_height(0.0)
-                        .body(|body| {
-                            body.heterogeneous_rows(heights.into_iter(), |mut row| {
-                                let row_index = row.index();
-                                let message =
-                                    &manager.messages.get_mut(target_message_key).unwrap()
-                                        [row_index];
-                                row.col(|ui: &mut egui::Ui| {
-                                    ui.with_layout(
-                                        if message.data.self_id == message.data.user_id {
-                                            egui::Layout::top_down(egui::Align::RIGHT)
-                                        } else {
-                                            egui::Layout::top_down(egui::Align::LEFT)
-                                        },
-                                        |ui| {
-                                            ui.label(message.data.sender.nickname.to_owned());
-                                            for chain in &message.data.message {
-                                                match &chain.variant {
-                                                    NapcatMessageChainType::Text {
-                                                        data: text_data,
-                                                    } => {
-                                                        let text = format!("{}", text_data.text);
-                                                        ui.add(egui::Label::new(text));
-                                                    },
-                                                    NapcatMessageChainType::Source(_) => {},
-                                                    // TODO: Support images
-                                                    // NapcatMessageChainType::Image { data:
-                                                    // image_data
-                                                    // } => {
-                                                    //     if image_data.sub_type != 1 && false
-                                                    // {
-                                                    //         if !gif_images
-                                                    //             .images
-                                                    //
-                                                    // .contains_key(&image_data.file_id)
-                                                    //         {
-                                                    //             let img_bytes =
-                                                    // reqwest::blocking::get(
-                                                    //
-                                                    // image_data.url.to_owned(),
-                                                    //             )
-                                                    //             .unwrap()
-                                                    //             .bytes()
-                                                    //             .unwrap();
-                                                    //             let cursor =
-                                                    // Cursor::new(img_bytes);
-                                                    //             let decoder =
-                                                    // GifDecoder::new(cursor).unwrap();
-
-                                                    //             let frames = decoder
-                                                    //                 .into_frames()
-                                                    //                 .collect_frames()
-                                                    //                 .expect("Can't decode
-                                                    // frames");
-                                                    //             gif_images.images.insert(
-                                                    //
-                                                    // image_data.file_id.to_owned(),
-                                                    //                 frames
-                                                    //                     .iter()
-                                                    //                     .enumerate()
-                                                    //                     .map(|(i, f)| {
-                                                    //                         let handle =
-                                                    // ctx.load_texture(
-                                                    //
-                                                    // format!("gif_frame_{i}"),
-                                                    //
-                                                    // ColorImage::from_rgba_unmultiplied(
-                                                    //                             [
-                                                    //
-                                                    // f.buffer().width() as _,
-                                                    //
-                                                    // f.buffer().height() as _,
-                                                    //                             ],
-                                                    //                             f.buffer(),
-                                                    //                         ),
-                                                    //
-                                                    // TextureOptions::default(),
-                                                    //                     );
-                                                    //                         let (num, den) =
-                                                    //
-                                                    // f.delay().numer_denom_ms();
-                                                    //                         (
-                                                    //                             handle,
-                                                    //                             (num as f32 *
-                                                    // 1000.0
-                                                    //                                 / den as
-                                                    // f32)
-                                                    //                                 .round()
-                                                    //                                 as u32,
-                                                    //                         )
-                                                    //                     })
-                                                    //                     .collect(),
-                                                    //             );
-                                                    //         }
-                                                    //         let images = gif_images
-                                                    //             .images
-                                                    //
-                                                    // .get(&image_data.file_id.to_owned())
-                                                    //             .unwrap();
-                                                    //         let frame =
-                                                    // ((time.elapsed_seconds()
-                                                    //             / (images[0].1 as f32 /
-                                                    // 500000.0))
-                                                    //             as usize)
-                                                    //             % images.len();
-                                                    //         ui.add(
-                                                    //
-                                                    // egui::Image::new(&images[frame].0)
-                                                    //
-                                                    // .max_size(bevy_egui::egui::Vec2 {
-                                                    //                     x: 400.0,
-                                                    //                     y: 200.0,
-                                                    //                 })
-                                                    //
-                                                    // .fit_to_exact_size(bevy_egui::egui::Vec2
-                                                    // {
-                                                    // x: 200.0,
-                                                    //                     y: 200.0,
-                                                    //                 }),
-                                                    //         );
-                                                    //     } else {
-                                                    //         ui.add(
-                                                    //             egui::Image::new(
-                                                    //                 image_data
-                                                    //                     .url
-                                                    //                     .replace("https",
-                                                    // "http")
-                                                    //                     .to_owned(),
-                                                    //             )
-                                                    //
-                                                    // .max_size(bevy_egui::egui::Vec2 {
-                                                    //                 x: 400.0,
-                                                    //                 y: 200.0,
-                                                    //             })
-                                                    //
-                                                    // .fit_to_exact_size(bevy_egui::egui::Vec2
-                                                    // {
-                                                    //                 x: 200.0,
-                                                    //                 y: 200.0,
-                                                    //             }),
-                                                    //         );
-                                                    //     }
-                                                    // },
-                                                }
-                                            }
-                                        },
-                                    );
-                                });
-                            })
-                        });
-
-                    ui.with_layout(
-                        egui::Layout::bottom_up(egui::Align::Center),
-                        |ui| {
-                            let _teo_m = ime.text_edit_multiline(
-                                &mut app.multi_text,
-                                ui.max_rect().width(),
-                                ui,
-                                ctx,
-                                sender.as_ref(),
-                                &mut manager,
-                            );
-                        },
-                    );
-                });
+    egui::TopBottomPanel::top("top_panel")
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.allocate_rect(
+                ui.available_rect_before_wrap(),
+                egui::Sense::hover(),
+            );
         });
+
+    egui::SidePanel::right("right_panel")
+        .resizable(true)
+        .show(ctx, |ui| {
+            ui.label("Right resizeable panel");
+            ui.allocate_rect(
+                ui.available_rect_before_wrap(),
+                egui::Sense::hover(),
+            );
+        });
+    egui::CentralPanel::default().show(ctx, |ui| {
+        let id = egui::Id::new(target_message_key);
+
+        let mut default_rect: Rect = Rect::from_pos(Pos2::new(0.0, 0.0));
+        if !*has_run_once {
+            ctx.memory(|m| {
+                if let Some(rect) = m.area_rect(id) {
+                    default_rect = rect;
+                }
+            });
+            *has_run_once = true
+        }
+
+        egui::Window::new("Window")
+            .vscroll(true)
+            .open(&mut true)
+            .id(id)
+            .constrain_to(ui.max_rect())
+            .default_rect(default_rect)
+            .show(ctx, |ui| {
+                let width = ui.max_rect().width();
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(false)
+                    .auto_shrink(true)
+                    .cell_layout(egui::Layout::top_down(
+                        egui::Align::LEFT,
+                    ))
+                    .stick_to_bottom(true)
+                    .column(Column::exact(width))
+                    .min_scrolled_height(0.0)
+                    .body(|body| {
+                        body.heterogeneous_rows(heights.into_iter(), |mut row| {
+                            let row_index = row.index();
+                            let message =
+                                &manager.messages.get_mut(target_message_key).unwrap()[row_index];
+                            row.col(|ui: &mut egui::Ui| {
+                                ui.with_layout(
+                                    if message.data.self_id == message.data.user_id {
+                                        egui::Layout::top_down(egui::Align::RIGHT)
+                                    } else {
+                                        egui::Layout::top_down(egui::Align::LEFT)
+                                    },
+                                    |ui| {
+                                        ui.label(message.data.sender.nickname.to_owned());
+                                        for chain in &message.data.message {
+                                            match &chain.variant {
+                                                NapcatMessageChainType::Text {
+                                                    data: text_data,
+                                                } => {
+                                                    let text = format!("{}", text_data.text);
+                                                    ui.label(text);
+                                                },
+                                                NapcatMessageChainType::Source(_) => {},
+                                                // TODO: Support images
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                        })
+                    });
+
+                ui.with_layout(
+                    egui::Layout::bottom_up(egui::Align::Center),
+                    |ui| {
+                        let _teo_m = ime.text_edit_multiline(
+                            &mut app.multi_text,
+                            ui.max_rect().width(),
+                            ui,
+                            ctx,
+                            sender.as_ref(),
+                            &mut manager,
+                        );
+                    },
+                );
+            });     
     });
+
+    ctx.memory(|m| {
+        cached_memory.ui_memory = m.clone();
+    });
+    cached_memory.persist().ok();
 }
