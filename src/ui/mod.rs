@@ -297,6 +297,8 @@ pub fn ui_system(
                         );
                     },
                 );
+            }, |ui| {
+                dbg!(ui.max_rect());
             });     
     });
 
