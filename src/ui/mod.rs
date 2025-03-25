@@ -182,26 +182,6 @@ pub fn ui_system(
 ) {
     let ctx = contexts.ctx_mut();
     let target_message_key = "1670426821";
-    let mut heights: Vec<f32> = vec![];
-
-    if let Some(messages) = manager.messages.get_mut(target_message_key) {
-        for message in messages {
-            let mut height: f32 = 32.0;
-            for chain in &message.data.message {
-                match &chain.variant {
-                    NapcatMessageChainType::Source(_) => {},
-                    // TODO: Support images
-                    // NapcatMessageChainType::Image { data: image } => {
-                    //     height += 200.0;
-                    // },
-                    _ => {
-                        height += 32.0;
-                    },
-                };
-            }
-            heights.push(height)
-        }
-    }
 
     egui::TopBottomPanel::top("top_panel")
         .resizable(false)
@@ -221,83 +201,119 @@ pub fn ui_system(
                 egui::Sense::hover(),
             );
         });
+        
     egui::CentralPanel::default().show(ctx, |ui| {
-        let id = egui::Id::new(target_message_key);
-
-        let mut default_rect: Rect = Rect::from_pos(Pos2::new(0.0, 0.0));
-        if !*has_run_once {
-            ctx.memory(|m| {
-                if let Some(rect) = m.area_rect(id) {
-                    default_rect = rect;
-                }
-            });
-            *has_run_once = true
-        }
-
-        egui::Window::new("Window")
+        let mut group_rect= Rect::from_pos(Pos2::new(-1.0, -1.0));
+        egui::Window::new("讨论组")
             .vscroll(true)
             .open(&mut true)
-            .id(id)
             .constrain_to(ui.max_rect())
-            .default_rect(default_rect)
             .show(ctx, |ui| {
-                let width = ui.max_rect().width();
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(false)
-                    .auto_shrink(true)
-                    .cell_layout(egui::Layout::top_down(
-                        egui::Align::LEFT,
-                    ))
-                    .stick_to_bottom(true)
-                    .column(Column::exact(width))
-                    .min_scrolled_height(0.0)
-                    .body(|body| {
-                        body.heterogeneous_rows(heights.into_iter(), |mut row| {
-                            let row_index = row.index();
-                            let message =
-                                &manager.messages.get_mut(target_message_key).unwrap()[row_index];
-                            row.col(|ui: &mut egui::Ui| {
-                                ui.with_layout(
-                                    if message.data.self_id == message.data.user_id {
-                                        egui::Layout::top_down(egui::Align::RIGHT)
-                                    } else {
-                                        egui::Layout::top_down(egui::Align::LEFT)
-                                    },
-                                    |ui| {
-                                        ui.label(message.data.sender.nickname.to_owned());
-                                        for chain in &message.data.message {
-                                            match &chain.variant {
-                                                NapcatMessageChainType::Text {
-                                                    data: text_data,
-                                                } => {
-                                                    let text = format!("{}", text_data.text);
-                                                    ui.label(text);
-                                                },
-                                                NapcatMessageChainType::Source(_) => {},
-                                                // TODO: Support images
-                                            }
-                                        }
-                                    },
-                                );
-                            });
-                        })
-                    });
+                group_rect = ui.max_rect();
+            });
 
-                ui.with_layout(
-                    egui::Layout::bottom_up(egui::Align::Center),
-                    |ui| {
-                        let _teo_m = ime.text_edit_multiline(
-                            &mut app.multi_text,
-                            ui.max_rect().width(),
-                            ui,
-                            ctx,
-                            sender.as_ref(),
-                            &mut manager,
-                        );
-                    },
-                );
-            });     
+        if let Some(messages) = manager.messages.get_mut(target_message_key) {
+            let id = egui::Id::new(target_message_key);
+
+            let mut default_rect: Rect = Rect::from_pos(Pos2::new(0.0, 0.0));
+            if !*has_run_once {
+                ctx.memory(|m| {
+                    if let Some(rect) = m.area_rect(id) {
+                        default_rect = rect;
+                    }
+                });
+                *has_run_once = true
+            }
+            let mut heights: Vec<f32> = vec![];
+            let mut nickname = "";
+            for message in messages {
+                let mut height: f32 = 32.0;
+                for chain in &message.data.message {
+                    match &chain.variant {
+                        NapcatMessageChainType::Source(_) => {},
+                        // TODO: Support images
+                        // NapcatMessageChainType::Image { data: image } => {
+                        //     height += 200.0;
+                        // },
+                        _ => {
+                            height += 32.0;
+                        },
+                    };
+                }
+
+                if &message.data.sender.user_id.to_string() == target_message_key {
+                    nickname = &message.data.sender.nickname;
+                }
+
+                heights.push(height)
+            }
+
+            egui::Window::new(nickname)
+                .vscroll(true)
+                .open(&mut true)
+                .id(id)
+                .constrain_to(ui.max_rect())                
+                .show(ctx, |ui| {
+                    let width = ui.max_rect().width();
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(false)
+                        .auto_shrink(true)
+                        .cell_layout(egui::Layout::top_down(
+                            egui::Align::LEFT,
+                        ))
+                        .stick_to_bottom(true)
+                        .column(Column::exact(width))
+                        .min_scrolled_height(0.0)
+                        .body(|body| {
+                            body.heterogeneous_rows(heights.into_iter(), |mut row| {
+                                let row_index = row.index();
+                                let message =
+                                    &manager.messages.get_mut(target_message_key).unwrap()
+                                        [row_index];
+                                row.col(|ui: &mut egui::Ui| {
+                                    ui.with_layout(
+                                        if message.data.self_id == message.data.user_id {
+                                            egui::Layout::top_down(egui::Align::RIGHT)
+                                        } else {
+                                            egui::Layout::top_down(egui::Align::LEFT)
+                                        },
+                                        |ui| {
+                                            ui.label(message.data.sender.nickname.to_owned());
+                                            for chain in &message.data.message {
+                                                match &chain.variant {
+                                                    NapcatMessageChainType::Text {
+                                                        data: text_data,
+                                                    } => {
+                                                        let text = format!("{}", text_data.text);
+                                                        ui.label(text);
+                                                    },
+                                                    NapcatMessageChainType::Source(_) => {},
+                                                    // TODO: Support images
+                                                }
+                                            }
+                                        },
+                                    );
+                                });
+                            })
+                        });
+
+                    ui.with_layout(
+                        egui::Layout::bottom_up(egui::Align::Center),
+                        |ui| {
+                            let _teo_m = ime.text_edit_multiline(
+                                &mut app.multi_text,
+                                ui.max_rect().width(),
+                                ui,
+                                ctx,
+                                sender.as_ref(),
+                                &mut manager,
+                            );
+                        },
+                    );
+                    dbg!(group_rect.contains_rect(ui.max_rect()));
+                });
+        }
     });
 
     ctx.memory(|m| {

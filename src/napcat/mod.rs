@@ -4,7 +4,10 @@ use std::{
 };
 
 use async_compat::Compat;
-use bevy_egui::egui::{Memory, TextureHandle};
+use bevy_egui::egui::{
+    Memory,
+    TextureHandle,
+};
 use bevy_persistent::prelude::*;
 extern crate dirs;
 use bevy::{
@@ -220,35 +223,28 @@ fn message_system(
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
 ) {
     if let Ok(msg) = receiver.0.try_recv() {
-        println!("msg => {:?}", msg);
         let json_res = serde_json::from_str::<NapcatMessage>(&msg.to_string());
         if let Ok(json) = json_res {
-            println!("json => {:?}", json);
+            dbg!(&json);
             let target_id = if json.data.user_id == json.data.self_id {
                 json.data.target_id.unwrap()
             } else {
                 json.data.user_id
             };
 
-            if manager
-                .messages
-                .contains_key(&target_id.to_string())
-            {
+            if manager.messages.contains_key(&target_id.to_string()) {
                 manager
                     .messages
                     .get_mut(&target_id.to_string())
                     .unwrap()
                     .push(json)
             } else {
-                manager.messages.insert(
-                    target_id.to_string(),
-                    vec![json],
-                );
+                manager.messages.insert(target_id.to_string(), vec![json]);
             }
 
             manager.persist().ok();
         } else {
-            dbg!(json_res.err());
+            // dbg!(json_res.err());
         }
     }
 }
