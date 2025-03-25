@@ -5,8 +5,7 @@ use std::{
 
 use async_compat::Compat;
 use bevy_egui::egui::{
-    Memory,
-    TextureHandle,
+    self, Memory, Modifiers, TextureHandle, Ui
 };
 use bevy_persistent::prelude::*;
 extern crate dirs;
@@ -129,9 +128,16 @@ pub struct NapcatMessageData {
     pub sender: NapcatSender,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatGroup {
+    pub members: Vec<u64>,
+}
+
+
 #[derive(Resource, Serialize, Deserialize)]
 pub struct NapcatMessageManager {
     pub messages: HashMap<String, Vec<NapcatMessage>>,
+    pub groups: HashMap<String, Vec<ChatGroup>>
 }
 
 impl Plugin for NapcatPlugin {
@@ -144,6 +150,7 @@ impl Plugin for NapcatPlugin {
     }
 }
 
+
 fn setup(mut commands: Commands) {
     println!("start to setup");
     let thread_pool = AsyncComputeTaskPool::get();
@@ -154,6 +161,7 @@ fn setup(mut commands: Commands) {
     )));
     let message_manager = NapcatMessageManager {
         messages: HashMap::default(),
+        groups: HashMap::default(),
     };
     let config_dir = Path::new(".data").join("willowblossom");
     commands.insert_resource(

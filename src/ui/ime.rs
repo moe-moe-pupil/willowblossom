@@ -83,7 +83,6 @@ impl ImeManager {
         width: f32,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        sender: &NapcatIOSender,
     ) -> egui::text_edit::TextEditOutput {
         if self.count >= self.ime_texts.len() {
             self.add();
@@ -107,7 +106,7 @@ impl ImeManager {
     ///     println!("{:?}", text);
     /// }
     /// ```
-    pub fn text_edit_multiline(
+    pub fn chat_input_multiline(
         &mut self,
         text: &mut String,
         width: f32,

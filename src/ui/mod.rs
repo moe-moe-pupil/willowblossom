@@ -7,19 +7,18 @@ use std::{
 mod components;
 use bevy::{
     prelude::*,
-    render::render_resource::encase::rts_array::Length,
     utils::HashMap,
 };
 use bevy_egui::{
     egui::{
         self,
         epaint::CircleShape,
-        Align2,
-        ColorImage,
+        menu,
         Id,
-        ImageButton,
         Layout,
         Memory,
+        Modal,
+        Modifiers,
         Painter,
         Pos2,
         Rect,
@@ -27,7 +26,7 @@ use bevy_egui::{
         Sense,
         Stroke,
         TextureHandle,
-        TextureOptions,
+        Ui,
         Vec2,
         Widget,
     },
@@ -42,18 +41,14 @@ use egui_extras::{
     Column,
     TableBuilder,
 };
-use image::{
-    codecs::gif::GifDecoder,
-    io::Reader,
-    AnimationDecoder,
-};
 use ime::*;
 use serde::{
     Deserialize,
     Serialize,
 };
+use serde_json::json;
+use tungstenite::Message;
 
-use self::components::icon::Icon;
 use crate::napcat::{
     NapcatIOSender,
     NapcatMessageChainType,
@@ -67,7 +62,6 @@ pub struct MyApp {
 }
 
 pub struct UIPlugin;
-
 #[derive(Resource)]
 pub struct GIFImages {
     images: HashMap<String, Vec<(TextureHandle, u32)>>,
@@ -85,6 +79,31 @@ pub struct CachedMemory {
 
 impl CircleImageButton {
     pub fn new(image: egui::TextureId, size: f32) -> Self { Self { image, size } }
+}
+
+fn file_menu_button(ui: &mut Ui, new_chat_group_modal_open: &mut bool) {
+    let new_chat_group_shortcup = egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::G);
+
+    // NOTE: we must check the shortcuts OUTSIDE of the actual "File" menu,
+    // or else they would only be checked if the "File" menu was actually open!
+
+    if ui.input_mut(|i| i.consume_shortcut(&new_chat_group_shortcup)) {
+        *new_chat_group_modal_open = true
+    }
+
+    ui.menu_button("Edit", |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+
+        if ui
+            .add(
+                egui::Button::new("New Chat Group")
+                    .shortcut_text(ui.ctx().format_shortcut(&new_chat_group_shortcup)),
+            )
+            .clicked()
+        {
+            *new_chat_group_modal_open = true
+        }
+    });
 }
 
 impl Widget for CircleImageButton {
@@ -179,17 +198,56 @@ pub fn ui_system(
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
     mut cached_memory: ResMut<Persistent<CachedMemory>>,
     mut has_run_once: Local<bool>,
+    mut new_chat_group_modal_string_open: Local<(String, bool)>,
+    mut chat_input_msgs: Local<HashMap<String, String>>,
 ) {
     let ctx = contexts.ctx_mut();
     let target_message_key = "1670426821";
+    let reset_data = |new_chat_group_modal_string_bool: &mut Local<'_, (String, bool)>| {
+        new_chat_group_modal_string_bool.0 = "".to_owned();
+        new_chat_group_modal_string_bool.1 = false;
+    };
+
+    if new_chat_group_modal_string_open.1 {
+        let modal = Modal::new(Id::new("New Chat Group")).show(ctx, |ui| {
+            ui.set_width(250.0);
+
+            ui.heading("New Chat Group");
+            ui.label("Name:");
+            ui.text_edit_singleline(&mut new_chat_group_modal_string_open.0);
+
+            egui::Sides::new().show(
+                ui,
+                |_ui| {},
+                |ui| {
+                    if ui.button("Save").clicked() {
+                        manager.groups.insert(
+                            new_chat_group_modal_string_open.0.clone(),
+                            vec![],
+                        );
+                        reset_data(&mut new_chat_group_modal_string_open);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        reset_data(&mut new_chat_group_modal_string_open);
+                    }
+                },
+            );
+        });
+
+        if modal.should_close() {
+            reset_data(&mut new_chat_group_modal_string_open);
+        }
+    }
 
     egui::TopBottomPanel::top("top_panel")
         .resizable(false)
         .show(ctx, |ui| {
-            ui.allocate_rect(
-                ui.available_rect_before_wrap(),
-                egui::Sense::hover(),
-            );
+            menu::bar(ui, |ui| {
+                file_menu_button(
+                    ui,
+                    &mut new_chat_group_modal_string_open.1,
+                );
+            });
         });
 
     egui::SidePanel::right("right_panel")
@@ -204,20 +262,23 @@ pub fn ui_system(
 
     egui::CentralPanel::default().show(ctx, |ui| {
         let mut group_rect = Rect::from_pos(Pos2::new(-1.0, -1.0));
-        egui::Window::new("讨论组")
-            .vscroll(true)
-            .open(&mut true)
-            .constrain_to(ui.max_rect())
-            .show(
-                ctx,
-                |ui| {
-                    group_rect = ui.max_rect();
-                },
-                |ui| {},
-            );
+        for (k, v) in &manager.groups {
+            egui::Window::new(format!("讨论组: {}", k))
+                .vscroll(true)
+                .open(&mut true)
+                .constrain_to(ui.max_rect())
+                .id(Id::new(k))
+                .show(
+                    ctx,
+                    |ui| {
+                        group_rect = ui.max_rect();
+                    },
+                    |ui| {},
+                );
+        }
 
-        if let Some(messages) = manager.messages.get_mut(target_message_key) {
-            let id = egui::Id::new(target_message_key);
+        for (target_id, messages) in &manager.messages {
+            let id = egui::Id::new(target_id);
 
             let mut default_rect: Rect = Rect::from_pos(Pos2::new(0.0, 0.0));
             if !*has_run_once {
@@ -245,7 +306,7 @@ pub fn ui_system(
                     };
                 }
 
-                if &message.data.sender.user_id.to_string() == target_message_key {
+                if message.data.sender.user_id.to_string() == *target_id {
                     nickname = &message.data.sender.nickname;
                 }
 
@@ -274,9 +335,7 @@ pub fn ui_system(
                             .body(|body| {
                                 body.heterogeneous_rows(heights.into_iter(), |mut row| {
                                     let row_index = row.index();
-                                    let message =
-                                        &manager.messages.get_mut(target_message_key).unwrap()
-                                            [row_index];
+                                    let message = &messages[row_index];
                                     row.col(|ui: &mut egui::Ui| {
                                         ui.with_layout(
                                             if message.data.self_id == message.data.user_id {
@@ -308,19 +367,61 @@ pub fn ui_system(
                         ui.with_layout(
                             egui::Layout::bottom_up(egui::Align::Center),
                             |ui| {
-                                let _teo_m = ime.text_edit_multiline(
-                                    &mut app.multi_text,
-                                    ui.max_rect().width(),
-                                    ui,
-                                    ctx,
-                                    sender.as_ref(),
-                                    &mut manager,
-                                );
+                                if !chat_input_msgs.contains_key(target_id) {
+                                    chat_input_msgs.insert(target_id.to_string(), String::new());
+                                }
+                                let text = chat_input_msgs.get_mut(target_id).unwrap();
+                                let input_box = egui::TextEdit::multiline(text)
+                                    .desired_width(width)
+                                    .desired_rows(min(
+                                        20,
+                                        (ui.max_rect().height()
+                                            / ui.style()
+                                                .text_styles
+                                                .get(&egui::TextStyle::Body)
+                                                .unwrap()
+                                                .size)
+                                            .floor()
+                                            as usize,
+                                    ))
+                                    .show(ui)
+                                    .response;
+
+                                if input_box.has_focus()
+                                    && ui.input(|i| {
+                                        i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
+                                    })
+                                {
+                                    sender
+                                        .0
+                                        .try_send(Message::Text(
+                                            json!({
+                                                "action": "send_private_msg",
+                                                "params": {
+                                                    "user_id": target_id,
+                                                    "message_type": "private",
+                                                    "message": [
+                                                        {
+                                                            "type": "text",
+                                                            "data": {
+                                                                "text": text
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            })
+                                            .to_string()
+                                            .into(),
+                                        ))
+                                        .expect("can't send message");
+                                    text.clear();
+                                }
                             },
                         );
+                    },
+                    |ui| {
                         dbg!(group_rect.contains_rect(ui.max_rect()));
                     },
-                    |ui| {},
                 );
         }
     });
