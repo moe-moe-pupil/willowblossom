@@ -54,13 +54,6 @@ use crate::napcat::{
     NapcatMessageChainType,
     NapcatMessageManager,
 };
-
-#[derive(Resource, Default)]
-pub struct MyApp {
-    single_text: String,
-    multi_text: String,
-}
-
 pub struct UIPlugin;
 #[derive(Resource)]
 pub struct GIFImages {
@@ -130,7 +123,6 @@ impl Plugin for UIPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(EguiPlugin)
             .add_plugins(ImePlugin)
-            .insert_resource(MyApp::default())
             .add_systems(Startup, setup_system)
             .add_systems(
                 Update,
@@ -192,7 +184,6 @@ pub fn load_ui_memory(
 
 pub fn ui_system(
     mut contexts: EguiContexts,
-    mut app: ResMut<MyApp>,
     mut ime: ResMut<ImeManager>,
     sender: Res<NapcatIOSender>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
@@ -371,51 +362,14 @@ pub fn ui_system(
                                     chat_input_msgs.insert(target_id.to_string(), String::new());
                                 }
                                 let text = chat_input_msgs.get_mut(target_id).unwrap();
-                                let input_box = egui::TextEdit::multiline(text)
-                                    .desired_width(width)
-                                    .desired_rows(min(
-                                        20,
-                                        (ui.max_rect().height()
-                                            / ui.style()
-                                                .text_styles
-                                                .get(&egui::TextStyle::Body)
-                                                .unwrap()
-                                                .size)
-                                            .floor()
-                                            as usize,
-                                    ))
-                                    .show(ui)
-                                    .response;
 
-                                if input_box.has_focus()
-                                    && ui.input(|i| {
-                                        i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
-                                    })
-                                {
-                                    sender
-                                        .0
-                                        .try_send(Message::Text(
-                                            json!({
-                                                "action": "send_private_msg",
-                                                "params": {
-                                                    "user_id": target_id,
-                                                    "message_type": "private",
-                                                    "message": [
-                                                        {
-                                                            "type": "text",
-                                                            "data": {
-                                                                "text": text
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            })
-                                            .to_string()
-                                            .into(),
-                                        ))
-                                        .expect("can't send message");
-                                    text.clear();
-                                }
+                                let _teo_m = ime.chat_input_multiline(
+                                    text,
+                                    ui.max_rect().width(),
+                                    ui,
+                                    ctx,
+                                    sender.as_ref(),
+                                );
                             },
                         );
                     },

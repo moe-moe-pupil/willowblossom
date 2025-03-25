@@ -113,7 +113,6 @@ impl ImeManager {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         sender: &NapcatIOSender,
-        manager: &mut Persistent<NapcatMessageManager>,
     ) -> egui::text_edit::TextEditOutput {
         if self.count >= self.ime_texts.len() {
             self.add();
