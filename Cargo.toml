@@ -63,6 +63,6 @@ futures-lite = "2.6.0"
 bevy_egui = {git = "https://github.com/moe-moe-pupil/bevy_egui", branch = "main", features = ["persistence"]}
 serde_json = "1.0.140"
 dirs = "6.0.0"
-egui_extras = { version = "0.31.1", features = ["all_loaders"] }
+egui_extras = {  git = "https://github.com/moe-moe-pupil/egui", branch = "patch-0.31.1", features = ["all_loaders"] }
 image = { version = "0.25.5", features = ["jpeg", "png"] }
 reqwest = { version = "0.12.14", features = ["blocking", "json"] }

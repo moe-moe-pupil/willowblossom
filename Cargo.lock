@@ -469,7 +469,7 @@ dependencies = [
  "bevy_window",
  "bytemuck",
  "disqualified",
- "egui 0.31.1",
+ "egui 0.31.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "fuzzy-matcher",
  "image",
  "smallvec",
@@ -814,7 +814,7 @@ dependencies = [
  "bevy_winit",
  "bytemuck",
  "crossbeam-channel",
- "egui 0.31.1",
+ "egui 0.31.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "encase",
  "image",
  "js-sys",
@@ -829,7 +829,7 @@ dependencies = [
 [[package]]
 name = "bevy_egui"
 version = "0.33.0"
-source = "git+https://github.com/moe-moe-pupil/bevy_egui?branch=main#29edbfb038524803130172689aac895d8d8918f5"
+source = "git+https://github.com/moe-moe-pupil/bevy_egui?branch=main#e33a6ae8f536f7c3e7304fa1c74dc64fd0939df8"
 dependencies = [
  "arboard",
  "bevy_app",
@@ -849,7 +849,7 @@ dependencies = [
  "bevy_winit",
  "bytemuck",
  "crossbeam-channel",
- "egui 0.31.1",
+ "egui 0.31.1 (git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1)",
  "encase",
  "image",
  "js-sys",
@@ -2310,7 +2310,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc4feb366740ded31a004a0e4452fbf84e80ef432ecf8314c485210229672fd1"
 dependencies = [
  "bytemuck",
- "emath 0.31.1",
+ "emath 0.31.1 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "ecolor"
+version = "0.31.1"
+source = "git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1#6424fe0d742a2621707cdac276cca2f8b059dd95"
+dependencies = [
+ "bytemuck",
+ "emath 0.31.1 (git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1)",
  "serde",
 ]
 
@@ -2331,11 +2340,24 @@ version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25dd34cec49ab55d85ebf70139cb1ccd29c977ef6b6ba4fe85489d6877ee9ef3"
 dependencies = [
+ "ahash",
+ "bitflags 2.9.0",
+ "emath 0.31.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "epaint 0.31.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "nohash-hasher",
+ "profiling",
+]
+
+[[package]]
+name = "egui"
+version = "0.31.1"
+source = "git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1#6424fe0d742a2621707cdac276cca2f8b059dd95"
+dependencies = [
  "accesskit",
  "ahash",
  "bitflags 2.9.0",
- "emath 0.31.1",
- "epaint 0.31.1",
+ "emath 0.31.1 (git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1)",
+ "epaint 0.31.1 (git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1)",
  "nohash-hasher",
  "profiling",
  "ron",
@@ -2360,18 +2382,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea7536fb0243aea55c1ca123a41a18253e16520d427a7213da584b9e2cb3973"
 dependencies = [
  "duplicate",
- "egui 0.31.1",
+ "egui 0.31.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "paste",
 ]
 
 [[package]]
 name = "egui_extras"
 version = "0.31.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "624659a2e972a46f4d5f646557906c55f1cd5a0836eddbe610fdf1afba1b4226"
+source = "git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1#6424fe0d742a2621707cdac276cca2f8b059dd95"
 dependencies = [
  "ahash",
- "egui 0.31.1",
+ "egui 0.31.1 (git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1)",
  "ehttp",
  "enum-map",
  "image",
@@ -2412,6 +2433,14 @@ name = "emath"
 version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e4cadcff7a5353ba72b7fea76bf2122b5ebdbc68e8155aa56dfdea90083fe1b"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "emath"
+version = "0.31.1"
+source = "git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1#6424fe0d742a2621707cdac276cca2f8b059dd95"
 dependencies = [
  "bytemuck",
  "serde",
@@ -2513,9 +2542,25 @@ dependencies = [
  "ab_glyph",
  "ahash",
  "bytemuck",
- "ecolor 0.31.1",
- "emath 0.31.1",
- "epaint_default_fonts",
+ "ecolor 0.31.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "emath 0.31.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "epaint_default_fonts 0.31.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "nohash-hasher",
+ "parking_lot",
+ "profiling",
+]
+
+[[package]]
+name = "epaint"
+version = "0.31.1"
+source = "git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1#6424fe0d742a2621707cdac276cca2f8b059dd95"
+dependencies = [
+ "ab_glyph",
+ "ahash",
+ "bytemuck",
+ "ecolor 0.31.1 (git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1)",
+ "emath 0.31.1 (git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1)",
+ "epaint_default_fonts 0.31.1 (git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1)",
  "nohash-hasher",
  "parking_lot",
  "profiling",
@@ -2527,6 +2572,11 @@ name = "epaint_default_fonts"
 version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc7e7a64c02cf7a5b51e745a9e45f60660a286f151c238b9d397b3e923f5082f"
+
+[[package]]
+name = "epaint_default_fonts"
+version = "0.31.1"
+source = "git+https://github.com/moe-moe-pupil/egui?branch=patch-0.31.1#6424fe0d742a2621707cdac276cca2f8b059dd95"
 
 [[package]]
 name = "equivalent"
@@ -4846,7 +4896,7 @@ version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
- "zerocopy 0.8.23",
+ "zerocopy 0.8.24",
 ]
 
 [[package]]
@@ -4979,7 +5029,7 @@ checksum = "3779b94aeb87e8bd4e834cee3650289ee9e0d5677f976ecdb6d219e5f4f6cd94"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.3",
- "zerocopy 0.8.23",
+ "zerocopy 0.8.24",
 ]
 
 [[package]]
@@ -7840,11 +7890,11 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.23"
+version = "0.8.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd97444d05a4328b90e75e503a34bad781f14e28a823ad3557f0750df1ebcbc6"
+checksum = "2586fea28e186957ef732a5f8b3be2da217d65c5969d4b1e17f973ebbe876879"
 dependencies = [
- "zerocopy-derive 0.8.23",
+ "zerocopy-derive 0.8.24",
 ]
 
 [[package]]
@@ -7860,9 +7910,9 @@ dependencies = [
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.23"
+version = "0.8.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6352c01d0edd5db859a63e2605f4ea3183ddbd15e2c4a9e7d32184df75e4f154"
+checksum = "a996a8f63c5c4448cd959ac1bab0aaa3306ccfd060472f85943ee0750f0169be"
 dependencies = [
  "proc-macro2",
  "quote",

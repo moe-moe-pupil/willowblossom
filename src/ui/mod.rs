@@ -201,16 +201,20 @@ pub fn ui_system(
                 egui::Sense::hover(),
             );
         });
-        
+
     egui::CentralPanel::default().show(ctx, |ui| {
-        let mut group_rect= Rect::from_pos(Pos2::new(-1.0, -1.0));
+        let mut group_rect = Rect::from_pos(Pos2::new(-1.0, -1.0));
         egui::Window::new("讨论组")
             .vscroll(true)
             .open(&mut true)
             .constrain_to(ui.max_rect())
-            .show(ctx, |ui| {
-                group_rect = ui.max_rect();
-            });
+            .show(
+                ctx,
+                |ui| {
+                    group_rect = ui.max_rect();
+                },
+                |ui| {},
+            );
 
         if let Some(messages) = manager.messages.get_mut(target_message_key) {
             let id = egui::Id::new(target_message_key);
@@ -252,67 +256,72 @@ pub fn ui_system(
                 .vscroll(true)
                 .open(&mut true)
                 .id(id)
-                .constrain_to(ui.max_rect())                
-                .show(ctx, |ui| {
-                    let width = ui.max_rect().width();
-                    TableBuilder::new(ui)
-                        .striped(true)
-                        .resizable(false)
-                        .auto_shrink(true)
-                        .cell_layout(egui::Layout::top_down(
-                            egui::Align::LEFT,
-                        ))
-                        .stick_to_bottom(true)
-                        .column(Column::exact(width))
-                        .min_scrolled_height(0.0)
-                        .body(|body| {
-                            body.heterogeneous_rows(heights.into_iter(), |mut row| {
-                                let row_index = row.index();
-                                let message =
-                                    &manager.messages.get_mut(target_message_key).unwrap()
-                                        [row_index];
-                                row.col(|ui: &mut egui::Ui| {
-                                    ui.with_layout(
-                                        if message.data.self_id == message.data.user_id {
-                                            egui::Layout::top_down(egui::Align::RIGHT)
-                                        } else {
-                                            egui::Layout::top_down(egui::Align::LEFT)
-                                        },
-                                        |ui| {
-                                            ui.label(message.data.sender.nickname.to_owned());
-                                            for chain in &message.data.message {
-                                                match &chain.variant {
-                                                    NapcatMessageChainType::Text {
-                                                        data: text_data,
-                                                    } => {
-                                                        let text = format!("{}", text_data.text);
-                                                        ui.label(text);
-                                                    },
-                                                    NapcatMessageChainType::Source(_) => {},
-                                                    // TODO: Support images
+                .constrain_to(ui.max_rect())
+                .show(
+                    ctx,
+                    |ui| {
+                        let width = ui.max_rect().width();
+                        TableBuilder::new(ui)
+                            .striped(true)
+                            .resizable(false)
+                            .auto_shrink(true)
+                            .cell_layout(egui::Layout::top_down(
+                                egui::Align::LEFT,
+                            ))
+                            .stick_to_bottom(true)
+                            .column(Column::exact(width))
+                            .min_scrolled_height(0.0)
+                            .body(|body| {
+                                body.heterogeneous_rows(heights.into_iter(), |mut row| {
+                                    let row_index = row.index();
+                                    let message =
+                                        &manager.messages.get_mut(target_message_key).unwrap()
+                                            [row_index];
+                                    row.col(|ui: &mut egui::Ui| {
+                                        ui.with_layout(
+                                            if message.data.self_id == message.data.user_id {
+                                                egui::Layout::top_down(egui::Align::RIGHT)
+                                            } else {
+                                                egui::Layout::top_down(egui::Align::LEFT)
+                                            },
+                                            |ui| {
+                                                ui.label(message.data.sender.nickname.to_owned());
+                                                for chain in &message.data.message {
+                                                    match &chain.variant {
+                                                        NapcatMessageChainType::Text {
+                                                            data: text_data,
+                                                        } => {
+                                                            let text =
+                                                                format!("{}", text_data.text);
+                                                            ui.label(text);
+                                                        },
+                                                        NapcatMessageChainType::Source(_) => {},
+                                                        // TODO: Support images
+                                                    }
                                                 }
-                                            }
-                                        },
-                                    );
-                                });
-                            })
-                        });
+                                            },
+                                        );
+                                    });
+                                })
+                            });
 
-                    ui.with_layout(
-                        egui::Layout::bottom_up(egui::Align::Center),
-                        |ui| {
-                            let _teo_m = ime.text_edit_multiline(
-                                &mut app.multi_text,
-                                ui.max_rect().width(),
-                                ui,
-                                ctx,
-                                sender.as_ref(),
-                                &mut manager,
-                            );
-                        },
-                    );
-                    dbg!(group_rect.contains_rect(ui.max_rect()));
-                });
+                        ui.with_layout(
+                            egui::Layout::bottom_up(egui::Align::Center),
+                            |ui| {
+                                let _teo_m = ime.text_edit_multiline(
+                                    &mut app.multi_text,
+                                    ui.max_rect().width(),
+                                    ui,
+                                    ctx,
+                                    sender.as_ref(),
+                                    &mut manager,
+                                );
+                            },
+                        );
+                        dbg!(group_rect.contains_rect(ui.max_rect()));
+                    },
+                    |ui| {},
+                );
         }
     });
 
