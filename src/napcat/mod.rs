@@ -5,7 +5,11 @@ use std::{
 
 use async_compat::Compat;
 use bevy_egui::egui::{
-    self, Memory, Modifiers, TextureHandle, Ui
+    self,
+    Memory,
+    Modifiers,
+    TextureHandle,
+    Ui,
 };
 use bevy_persistent::prelude::*;
 extern crate dirs;
@@ -64,14 +68,14 @@ struct NapcatTask(Task<CommandQueue>);
 
 pub struct NapcatPlugin;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct NapcatMessage {
     #[serde(flatten)]
     pub data: NapcatMessageData,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TextData {
     pub text: String,
 }
@@ -85,13 +89,13 @@ pub struct ImageData {
     pub file_size: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Source {
     id: u64,
     time: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum NapcatMessageChainType {
@@ -101,23 +105,23 @@ pub enum NapcatMessageChainType {
     // Image { data: ImageData },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum NapcatMessageType {
     Private,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct NapcatMessageChain {
     #[serde(flatten)]
     pub variant: NapcatMessageChainType,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NapcatSender {
     pub user_id: u64,
     pub nickname: String,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NapcatMessageData {
     pub time: u64,
     pub message_type: NapcatMessageType,
@@ -128,16 +132,15 @@ pub struct NapcatMessageData {
     pub sender: NapcatSender,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatGroup {
-    pub members: Vec<u64>,
+    pub members: Vec<String>,
 }
-
 
 #[derive(Resource, Serialize, Deserialize)]
 pub struct NapcatMessageManager {
     pub messages: HashMap<String, Vec<NapcatMessage>>,
-    pub groups: HashMap<String, Vec<ChatGroup>>
+    pub groups: HashMap<String, ChatGroup>,
 }
 
 impl Plugin for NapcatPlugin {
@@ -149,7 +152,6 @@ impl Plugin for NapcatPlugin {
             .add_systems(Update, message_system);
     }
 }
-
 
 fn setup(mut commands: Commands) {
     println!("start to setup");

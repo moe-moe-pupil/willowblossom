@@ -50,6 +50,7 @@ use serde_json::json;
 use tungstenite::Message;
 
 use crate::napcat::{
+    ChatGroup,
     NapcatIOSender,
     NapcatMessageChainType,
     NapcatMessageManager,
@@ -193,7 +194,7 @@ pub fn ui_system(
     mut chat_input_msgs: Local<HashMap<String, String>>,
 ) {
     let ctx = contexts.ctx_mut();
-    let target_message_key = "1670426821";
+    let mut group_rects = HashMap::default();
     let reset_data = |new_chat_group_modal_string_bool: &mut Local<'_, (String, bool)>| {
         new_chat_group_modal_string_bool.0 = "".to_owned();
         new_chat_group_modal_string_bool.1 = false;
@@ -214,7 +215,7 @@ pub fn ui_system(
                     if ui.button("Save").clicked() {
                         manager.groups.insert(
                             new_chat_group_modal_string_open.0.clone(),
-                            vec![],
+                            ChatGroup { members: vec![] },
                         );
                         reset_data(&mut new_chat_group_modal_string_open);
                     }
@@ -252,8 +253,7 @@ pub fn ui_system(
         });
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        let mut group_rect = Rect::from_pos(Pos2::new(-1.0, -1.0));
-        for (k, v) in &manager.groups {
+        for (k, v) in &mut manager.groups {
             egui::Window::new(format!("讨论组: {}", k))
                 .vscroll(true)
                 .open(&mut true)
@@ -262,15 +262,14 @@ pub fn ui_system(
                 .show(
                     ctx,
                     |ui| {
-                        group_rect = ui.max_rect();
+                        group_rects.insert(k.clone(), ui.max_rect());
                     },
                     |ui| {},
                 );
         }
 
-        for (target_id, messages) in &manager.messages {
+        for (target_id, messages) in &manager.messages.clone() {
             let id = egui::Id::new(target_id);
-
             let mut default_rect: Rect = Rect::from_pos(Pos2::new(0.0, 0.0));
             if !*has_run_once {
                 ctx.memory(|m| {
@@ -303,12 +302,23 @@ pub fn ui_system(
 
                 heights.push(height)
             }
+            let mut rect = ui.max_rect();
+            let mut target_ids = vec![target_id.clone()];
 
+            for (group_k, group) in &manager.groups {
+                if group.members.contains(target_id) {
+                    if let Some(target_rect) = group_rects.get(group_k) {
+                        rect = *target_rect;
+                    }
+                    target_ids = group.members.clone();
+                    break;
+                }
+            }
             egui::Window::new(nickname)
                 .vscroll(true)
                 .open(&mut true)
                 .id(id)
-                .constrain_to(ui.max_rect())
+                .constrain_to(rect)
                 .show(
                     ctx,
                     |ui| {
@@ -362,19 +372,31 @@ pub fn ui_system(
                                     chat_input_msgs.insert(target_id.to_string(), String::new());
                                 }
                                 let text = chat_input_msgs.get_mut(target_id).unwrap();
-
+                                dbg!(&target_ids);
                                 let _teo_m = ime.chat_input_multiline(
                                     text,
                                     ui.max_rect().width(),
                                     ui,
                                     ctx,
                                     sender.as_ref(),
+                                    target_ids
                                 );
                             },
                         );
                     },
                     |ui| {
-                        dbg!(group_rect.contains_rect(ui.max_rect()));
+                        let layer_id = egui::LayerId::new(egui::Order::Middle, id);
+                        ui.ctx().move_to_top(layer_id);
+                        for (k, rect) in &mut group_rects {
+                            let inside = rect.contains_rect(ui.max_rect());
+                            dbg!(inside);
+                            if inside {
+                                let members = &mut manager.groups.get_mut(k).unwrap().members;
+                                if !members.contains(target_id) {
+                                    members.push(target_id.to_string());
+                                }
+                            }
+                        }
                     },
                 );
         }

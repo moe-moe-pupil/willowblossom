@@ -113,6 +113,7 @@ impl ImeManager {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         sender: &NapcatIOSender,
+        target_ids: Vec<String>,
     ) -> egui::text_edit::TextEditOutput {
         if self.count >= self.ime_texts.len() {
             self.add();
@@ -130,8 +131,8 @@ impl ImeManager {
             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
         {
             println!("{}", self.ime_texts[self.count].text);
-            let target_qq = 1670426821;
-            let err = sender
+            for target_qq in target_ids {
+                let err = sender
                 .0
                 .try_send(Message::Text(
                     json!({
@@ -153,6 +154,8 @@ impl ImeManager {
                     .into(),
                 ))
                 .expect("can't send message");
+            }
+
             self.ime_texts[self.count].text = "".to_string();
         }
         self.ime_texts[self.count].id = teo.response.id.short_debug_format();
