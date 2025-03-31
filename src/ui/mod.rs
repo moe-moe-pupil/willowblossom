@@ -432,11 +432,11 @@ pub fn ui_system(
             }
 
             let (nickname, heights) = get_nickname_heights(target_id.clone(), &messages);
-            let mut rect = ui.max_rect();
-            let mut target_ids = vec![target_id.clone()];
+            let rect = ui.max_rect();
+            let target_ids = vec![target_id.clone()];
 
             let mut  should_continue = false;
-            for (group_k, group) in &manager.groups {
+            for (_, group) in &manager.groups {
                 if group.members.contains(&target_id) {
                     should_continue = true;
                 }
