@@ -14,6 +14,8 @@ use bevy_egui::{
         self,
         epaint::CircleShape,
         menu,
+        text_edit::TextEditOutput,
+        Context,
         Id,
         Layout,
         Memory,
@@ -52,6 +54,7 @@ use tungstenite::Message;
 use crate::napcat::{
     ChatGroup,
     NapcatIOSender,
+    NapcatMessage,
     NapcatMessageChainType,
     NapcatMessageManager,
 };
@@ -183,6 +186,132 @@ pub fn load_ui_memory(
     ctx.memory_mut(|m| *m = cached_memory.ui_memory.clone());
 }
 
+fn chat_window(
+    nickname: &str,
+    id: Id,
+    rect: Rect,
+    ctx: &Context,
+    heights: Vec<f32>,
+    messages: &Vec<NapcatMessage>,
+    sender: &NapcatIOSender,
+    target_id: String,
+    chat_input_msgs: &mut Local<HashMap<String, String>>,
+    target_ids: Vec<String>,
+    ime: &mut ResMut<ImeManager>,
+    group_rects: &HashMap<String, Rect>,
+    manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+) {
+    egui::Window::new(nickname)
+        .vscroll(true)
+        .open(&mut true)
+        .id(id)
+        .constrain_to(rect)
+        .show(
+            ctx,
+            |ui| {
+                let width = ui.max_rect().width();
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(false)
+                    .auto_shrink(true)
+                    .cell_layout(egui::Layout::top_down(
+                        egui::Align::LEFT,
+                    ))
+                    .stick_to_bottom(true)
+                    .column(Column::exact(width))
+                    .min_scrolled_height(0.0)
+                    .body(|body| {
+                        body.heterogeneous_rows(heights.into_iter(), |mut row| {
+                            let row_index = row.index();
+                            let message = &messages[row_index];
+                            row.col(|ui: &mut egui::Ui| {
+                                ui.with_layout(
+                                    if message.data.self_id == message.data.user_id {
+                                        egui::Layout::top_down(egui::Align::RIGHT)
+                                    } else {
+                                        egui::Layout::top_down(egui::Align::LEFT)
+                                    },
+                                    |ui| {
+                                        ui.label(&message.data.sender.nickname);
+                                        for chain in &message.data.message {
+                                            match &chain.variant {
+                                                NapcatMessageChainType::Text {
+                                                    data: text_data,
+                                                } => {
+                                                    let text = format!("{}", text_data.text);
+                                                    ui.label(&text);
+                                                },
+                                                NapcatMessageChainType::Source(_) => {},
+                                                // TODO: Support images
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                        })
+                    });
+
+                ui.with_layout(
+                    egui::Layout::bottom_up(egui::Align::Center),
+                    |ui| {
+                        if !chat_input_msgs.contains_key(&target_id) {
+                            chat_input_msgs.insert(target_id.clone(), String::new());
+                        }
+                        let text = chat_input_msgs.get_mut(&target_id).unwrap();
+                        dbg!(&target_ids);
+                        let _teo_m = ime.chat_input_multiline(
+                            text,
+                            ui.max_rect().width(),
+                            ui,
+                            ctx,
+                            sender,
+                            target_ids,
+                        );
+                    },
+                );
+            },
+            |ui| {
+                for (k, rect) in group_rects {
+                    let inside = rect.contains_rect(ui.max_rect());
+                    dbg!(inside);
+                    if inside {
+                        let members = &mut manager.groups.get_mut(k).unwrap().members;
+                        if !members.contains(&target_id.to_owned()) {
+                            members.push(target_id.to_string());
+                        }
+                    }
+                }
+            },
+        );
+}
+
+pub fn get_nickname_heights(target_id: String, messages: &Vec<NapcatMessage>) -> (&str, Vec<f32>) {
+    let mut nickname = "";
+    let mut heights: Vec<f32> = vec![];
+    for message in messages {
+        let mut height: f32 = 32.0;
+        for chain in &message.data.message {
+            match &chain.variant {
+                NapcatMessageChainType::Source(_) => {},
+                // TODO: Support images
+                // NapcatMessageChainType::Image { data: image } => {
+                //     height += 200.0;
+                // },
+                _ => {
+                    height += 32.0;
+                },
+            };
+        }
+
+        if message.data.sender.user_id.to_string() == *target_id {
+            nickname = &message.data.sender.nickname;
+        }
+        heights.push(height)
+    }
+
+    (nickname, heights)
+}
+
 pub fn ui_system(
     mut contexts: EguiContexts,
     mut ime: ResMut<ImeManager>,
@@ -214,7 +343,7 @@ pub fn ui_system(
                 |ui| {
                     if ui.button("Save").clicked() {
                         manager.groups.insert(
-                            new_chat_group_modal_string_open.0.clone(),
+                            new_chat_group_modal_string_open.0.to_owned(),
                             ChatGroup { members: vec![] },
                         );
                         reset_data(&mut new_chat_group_modal_string_open);
@@ -253,23 +382,45 @@ pub fn ui_system(
         });
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        for (k, v) in &mut manager.groups {
+        for (k, v) in &manager.groups.clone() {
             egui::Window::new(format!("讨论组: {}", k))
                 .vscroll(true)
                 .open(&mut true)
                 .constrain_to(ui.max_rect())
                 .id(Id::new(k))
+                .order(egui::Order::Background)
                 .show(
                     ctx,
                     |ui| {
                         group_rects.insert(k.clone(), ui.max_rect());
+                        for member_id in &v.members {
+                            let messages = manager.messages.get(member_id).unwrap().clone();
+                            let (nickname, heights) =
+                                get_nickname_heights(member_id.clone(), &messages);
+                            let id = egui::Id::new(member_id);
+                            chat_window(
+                                nickname,
+                                id,
+                                ui.max_rect(),
+                                ctx,
+                                heights,
+                                &messages,
+                                sender.as_ref(),
+                                member_id.clone(),
+                                &mut chat_input_msgs,
+                                v.members.clone(),
+                                &mut ime,
+                                &group_rects,
+                                &mut manager,
+                            );
+                        }
                     },
                     |ui| {},
                 );
         }
 
-        for (target_id, messages) in &manager.messages.clone() {
-            let id = egui::Id::new(target_id);
+        for (target_id, messages) in manager.messages.clone() {
+            let id = egui::Id::new(&target_id);
             let mut default_rect: Rect = Rect::from_pos(Pos2::new(0.0, 0.0));
             if !*has_run_once {
                 ctx.memory(|m| {
@@ -279,126 +430,37 @@ pub fn ui_system(
                 });
                 *has_run_once = true
             }
-            let mut heights: Vec<f32> = vec![];
-            let mut nickname = "";
-            for message in messages {
-                let mut height: f32 = 32.0;
-                for chain in &message.data.message {
-                    match &chain.variant {
-                        NapcatMessageChainType::Source(_) => {},
-                        // TODO: Support images
-                        // NapcatMessageChainType::Image { data: image } => {
-                        //     height += 200.0;
-                        // },
-                        _ => {
-                            height += 32.0;
-                        },
-                    };
-                }
 
-                if message.data.sender.user_id.to_string() == *target_id {
-                    nickname = &message.data.sender.nickname;
-                }
-
-                heights.push(height)
-            }
+            let (nickname, heights) = get_nickname_heights(target_id.clone(), &messages);
             let mut rect = ui.max_rect();
             let mut target_ids = vec![target_id.clone()];
 
+            let mut  should_continue = false;
             for (group_k, group) in &manager.groups {
-                if group.members.contains(target_id) {
-                    if let Some(target_rect) = group_rects.get(group_k) {
-                        rect = *target_rect;
-                    }
-                    target_ids = group.members.clone();
-                    break;
+                if group.members.contains(&target_id) {
+                    should_continue = true;
                 }
             }
-            egui::Window::new(nickname)
-                .vscroll(true)
-                .open(&mut true)
-                .id(id)
-                .constrain_to(rect)
-                .show(
-                    ctx,
-                    |ui| {
-                        let width = ui.max_rect().width();
-                        TableBuilder::new(ui)
-                            .striped(true)
-                            .resizable(false)
-                            .auto_shrink(true)
-                            .cell_layout(egui::Layout::top_down(
-                                egui::Align::LEFT,
-                            ))
-                            .stick_to_bottom(true)
-                            .column(Column::exact(width))
-                            .min_scrolled_height(0.0)
-                            .body(|body| {
-                                body.heterogeneous_rows(heights.into_iter(), |mut row| {
-                                    let row_index = row.index();
-                                    let message = &messages[row_index];
-                                    row.col(|ui: &mut egui::Ui| {
-                                        ui.with_layout(
-                                            if message.data.self_id == message.data.user_id {
-                                                egui::Layout::top_down(egui::Align::RIGHT)
-                                            } else {
-                                                egui::Layout::top_down(egui::Align::LEFT)
-                                            },
-                                            |ui| {
-                                                ui.label(message.data.sender.nickname.to_owned());
-                                                for chain in &message.data.message {
-                                                    match &chain.variant {
-                                                        NapcatMessageChainType::Text {
-                                                            data: text_data,
-                                                        } => {
-                                                            let text =
-                                                                format!("{}", text_data.text);
-                                                            ui.label(text);
-                                                        },
-                                                        NapcatMessageChainType::Source(_) => {},
-                                                        // TODO: Support images
-                                                    }
-                                                }
-                                            },
-                                        );
-                                    });
-                                })
-                            });
 
-                        ui.with_layout(
-                            egui::Layout::bottom_up(egui::Align::Center),
-                            |ui| {
-                                if !chat_input_msgs.contains_key(target_id) {
-                                    chat_input_msgs.insert(target_id.to_string(), String::new());
-                                }
-                                let text = chat_input_msgs.get_mut(target_id).unwrap();
-                                dbg!(&target_ids);
-                                let _teo_m = ime.chat_input_multiline(
-                                    text,
-                                    ui.max_rect().width(),
-                                    ui,
-                                    ctx,
-                                    sender.as_ref(),
-                                    target_ids
-                                );
-                            },
-                        );
-                    },
-                    |ui| {
-                        let layer_id = egui::LayerId::new(egui::Order::Middle, id);
-                        ui.ctx().move_to_top(layer_id);
-                        for (k, rect) in &mut group_rects {
-                            let inside = rect.contains_rect(ui.max_rect());
-                            dbg!(inside);
-                            if inside {
-                                let members = &mut manager.groups.get_mut(k).unwrap().members;
-                                if !members.contains(target_id) {
-                                    members.push(target_id.to_string());
-                                }
-                            }
-                        }
-                    },
-                );
+            if should_continue {
+                continue;
+            }
+            
+            chat_window(
+                nickname,
+                id,
+                rect,
+                ctx,
+                heights,
+                &messages,
+                sender.as_ref(),
+                target_id,
+                &mut chat_input_msgs,
+                target_ids,
+                &mut ime,
+                &group_rects,
+                &mut manager,
+            );
         }
     });
 
