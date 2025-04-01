@@ -1,6 +1,7 @@
 mod camera;
 mod napcat;
 mod ui;
+mod deepseek;
 
 use bevy::{
     asset::AssetMetaCheck,
