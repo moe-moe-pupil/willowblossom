@@ -434,14 +434,7 @@ pub fn ui_system(
             let rect = ui.max_rect();
             let target_ids = vec![target_id.clone()];
 
-            let mut  should_continue = false;
-            for (_, group) in &manager.groups {
-                if group.members.contains(&target_id) {
-                    should_continue = true;
-                }
-            }
-
-            if should_continue {
+            if manager.groups.values().any(|group| group.members.contains(&target_id)) {
                 continue;
             }
             
