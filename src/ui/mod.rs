@@ -194,7 +194,7 @@ fn chat_window(
     heights: Vec<f32>,
     messages: &Vec<NapcatMessage>,
     sender: &NapcatIOSender,
-    target_id: String,
+    target_id: &str,
     chat_input_msgs: &mut Local<HashMap<String, String>>,
     target_ids: Vec<String>,
     ime: &mut ResMut<ImeManager>,
@@ -254,11 +254,10 @@ fn chat_window(
                 ui.with_layout(
                     egui::Layout::bottom_up(egui::Align::Center),
                     |ui| {
-                        if !chat_input_msgs.contains_key(&target_id) {
-                            chat_input_msgs.insert(target_id.clone(), String::new());
+                        if !chat_input_msgs.contains_key(target_id) {
+                            chat_input_msgs.insert(target_id.to_owned(), String::new());
                         }
-                        let text = chat_input_msgs.get_mut(&target_id).unwrap();
-                        dbg!(&target_ids);
+                        let text = chat_input_msgs.get_mut(target_id).unwrap();
                         let _teo_m = ime.chat_input_multiline(
                             text,
                             ui.max_rect().width(),
@@ -406,9 +405,9 @@ pub fn ui_system(
                                 heights,
                                 &messages,
                                 sender.as_ref(),
-                                member_id.clone(),
+                                member_id,
                                 &mut chat_input_msgs,
-                                v.members.clone(),
+                                vec![member_id.to_string()],
                                 &mut ime,
                                 &group_rects,
                                 &mut manager,
@@ -454,7 +453,7 @@ pub fn ui_system(
                 heights,
                 &messages,
                 sender.as_ref(),
-                target_id,
+                &target_id,
                 &mut chat_input_msgs,
                 target_ids,
                 &mut ime,
