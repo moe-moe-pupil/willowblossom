@@ -361,19 +361,46 @@ impl ImeText {
         width: f32,
         autocompletion_text_len: &str,
     ) -> egui::text::LayoutJob {
-        let layout_job = match self.text.len() {
-            0 | 1 => match self.edit_type {
-                EditType::SingleLine => egui::text::LayoutJob::simple_singleline(
-                    string.into(),
-                    egui::FontId::default(),
-                    egui::Color32::WHITE,
-                ),
-                _ => egui::text::LayoutJob::simple(
-                    string.into(),
-                    egui::FontId::default(),
-                    egui::Color32::WHITE,
-                    width,
-                ),
+        let layout_job = match self.is_ime {
+            false => {
+                let mut lss: Vec<egui::text::LayoutSection> = vec![];
+                let mut f_cnt = 0;
+                let mut b_cnt = 0;
+                b_cnt = b_cnt + string.len();
+                let ls_string = egui::text::LayoutSection {
+                    leading_space: 0.0,
+                    byte_range: f_cnt..b_cnt,
+                    format: egui::TextFormat {
+                        color: egui::Color32::WHITE,
+                        ..Default::default()
+                    },
+                };
+                lss.push(ls_string);
+
+                f_cnt = b_cnt;
+                b_cnt = b_cnt + autocompletion_text_len.len();
+                let ls_autocompletion = egui::text::LayoutSection {
+                    leading_space: 0.0,
+                    byte_range: f_cnt..b_cnt,
+                    format: egui::TextFormat {
+                        color: egui::Color32::GRAY,
+                        ..Default::default()
+                    },
+                };
+                lss.push(ls_autocompletion);
+
+                egui::text::LayoutJob {
+                    sections: lss,
+                    text: format!(
+                        "{}{}",
+                        string, autocompletion_text_len
+                    ),
+                    wrap: egui::text::TextWrapping {
+                        max_width: width,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
             },
             _ => {
                 let mut front = String::new();
