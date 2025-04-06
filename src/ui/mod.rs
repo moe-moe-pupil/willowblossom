@@ -3,6 +3,7 @@ use std::{
     cmp::min,
     io::Cursor,
     path::Path,
+    time::Duration,
 };
 mod components;
 use bevy::{
@@ -51,17 +52,28 @@ use serde::{
 use serde_json::json;
 use tungstenite::Message;
 
-use crate::napcat::{
-    ChatGroup,
-    NapcatIOSender,
-    NapcatMessage,
-    NapcatMessageChainType,
-    NapcatMessageManager,
+use crate::{
+    deepseek::{
+        self, DeepseekIOSender, DeepseekManager, DeepseekPlugin
+    },
+    napcat::{
+        ChatGroup,
+        NapcatIOSender,
+        NapcatMessage,
+        NapcatMessageChainType,
+        NapcatMessageManager,
+    },
 };
 pub struct UIPlugin;
 #[derive(Resource)]
 pub struct GIFImages {
     images: HashMap<String, Vec<(TextureHandle, u32)>>,
+}
+
+#[derive(Resource)]
+pub struct AutoCompletionTime {
+    /// track when the bomb should explode (non-repeating timer)
+    pub timer: Timer,
 }
 
 pub struct CircleImageButton {
@@ -127,6 +139,7 @@ impl Plugin for UIPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(EguiPlugin)
             .add_plugins(ImePlugin)
+            .add_plugins(DeepseekPlugin)
             .add_systems(Startup, setup_system)
             .add_systems(
                 Update,
@@ -136,6 +149,7 @@ impl Plugin for UIPlugin {
                 Update,
                 ui_system
                     .run_if(resource_exists::<NapcatIOSender>)
+                    .run_if(resource_exists::<DeepseekIOSender>)
                     .after(load_ui_memory),
             );
     }
@@ -158,9 +172,11 @@ pub fn setup_system(
         .build()
         .expect("failed to init messages");
     command.insert_resource(cached_memory);
+    command.insert_resource(AutoCompletionTime {
+        timer: Timer::new(Duration::from_secs(5), TimerMode::Once),
+    });
     let mut window = windows.single_mut();
     window.ime_enabled = true;
-    dbg!(window.physical_size());
     let mut txt_font = egui::FontDefinitions::default();
     egui_extras::install_image_loaders(ctx);
     txt_font
@@ -193,13 +209,16 @@ fn chat_window(
     ctx: &Context,
     heights: Vec<f32>,
     messages: &Vec<NapcatMessage>,
-    sender: &NapcatIOSender,
+    napcat_sender: &NapcatIOSender,
+    deepseek_sender: &DeepseekIOSender,
     target_id: &str,
     chat_input_msgs: &mut Local<HashMap<String, String>>,
     target_ids: Vec<String>,
     ime: &mut ResMut<ImeManager>,
     group_rects: &HashMap<String, Rect>,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+    auto_completion_timer: &mut Timer,
+    deepseek_manager: &mut DeepseekManager,
 ) {
     egui::Window::new(nickname)
         .vscroll(true)
@@ -257,22 +276,33 @@ fn chat_window(
                         if !chat_input_msgs.contains_key(target_id) {
                             chat_input_msgs.insert(target_id.to_owned(), String::new());
                         }
+
                         let text = chat_input_msgs.get_mut(target_id).unwrap();
                         let _teo_m = ime.chat_input_multiline(
                             text,
                             ui.max_rect().width(),
                             ui,
                             ctx,
-                            sender,
+                            napcat_sender,
                             target_ids,
+                            &mut deepseek_manager.last_fim_response,
                         );
+                        if _teo_m.response.has_focus() && auto_completion_timer.finished() {
+                            auto_completion_timer.reset();
+                            if deepseek_manager.last_post_text != *text {
+                                deepseek_manager.last_post_text = text.to_string();
+                                let err = deepseek_sender
+                                .0
+                                .try_send(Message::Text(text.to_owned().into()))
+                                .expect("can't send message to deepseek");
+                            }
+                        }
                     },
                 );
             },
             |ui| {
                 for (k, rect) in group_rects {
                     let inside = rect.contains_rect(ui.max_rect());
-                    dbg!(inside);
                     if inside {
                         let members = &mut manager.groups.get_mut(k).unwrap().members;
                         if !members.contains(&target_id.to_owned()) {
@@ -314,14 +344,21 @@ pub fn get_nickname_heights(target_id: String, messages: &Vec<NapcatMessage>) ->
 pub fn ui_system(
     mut contexts: EguiContexts,
     mut ime: ResMut<ImeManager>,
-    sender: Res<NapcatIOSender>,
+    napcat_sender: Res<NapcatIOSender>,
+    deepseek_sender: Res<DeepseekIOSender>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
     mut cached_memory: ResMut<Persistent<CachedMemory>>,
     mut has_run_once: Local<bool>,
     mut new_chat_group_modal_string_open: Local<(String, bool)>,
     mut chat_input_msgs: Local<HashMap<String, String>>,
+    time: Res<Time>,
+    mut auto_completion_time: ResMut<AutoCompletionTime>,
+    mut deepseek_manager: ResMut<DeepseekManager>,
 ) {
+    auto_completion_time.timer.tick(time.delta());
+
     let ctx = contexts.ctx_mut();
+
     let mut group_rects = HashMap::default();
     let reset_data = |new_chat_group_modal_string_bool: &mut Local<'_, (String, bool)>| {
         new_chat_group_modal_string_bool.0 = "".to_owned();
@@ -404,13 +441,16 @@ pub fn ui_system(
                                 ctx,
                                 heights,
                                 &messages,
-                                sender.as_ref(),
+                                &napcat_sender,
+                                &deepseek_sender,
                                 member_id,
                                 &mut chat_input_msgs,
                                 vec![member_id.to_string()],
                                 &mut ime,
                                 &group_rects,
                                 &mut manager,
+                                &mut auto_completion_time.timer,
+                                &mut deepseek_manager
                             );
                         }
                     },
@@ -434,10 +474,14 @@ pub fn ui_system(
             let rect = ui.max_rect();
             let target_ids = vec![target_id.clone()];
 
-            if manager.groups.values().any(|group| group.members.contains(&target_id)) {
+            if manager
+                .groups
+                .values()
+                .any(|group| group.members.contains(&target_id))
+            {
                 continue;
             }
-            
+
             chat_window(
                 nickname,
                 id,
@@ -445,13 +489,16 @@ pub fn ui_system(
                 ctx,
                 heights,
                 &messages,
-                sender.as_ref(),
+                &napcat_sender,
+                &deepseek_sender,
                 &target_id,
                 &mut chat_input_msgs,
                 target_ids,
                 &mut ime,
                 &group_rects,
                 &mut manager,
+                &mut auto_completion_time.timer,
+                &mut deepseek_manager
             );
         }
     });

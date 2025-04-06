@@ -4,15 +4,22 @@ use std::{
 };
 
 use bevy::prelude::*;
-use bevy_egui::egui;
+use bevy_egui::egui::{
+    self,
+    Color32,
+    FontSelection,
+    Pos2,
+    TextWrapMode,
+    WidgetText,
+};
 use bevy_persistent::Persistent;
 use serde_json::json;
 use tungstenite::Message;
 
-use crate::napcat::{
+use crate::{deepseek::filter_control_characters, napcat::{
     NapcatIOSender,
     NapcatMessageManager,
-};
+}};
 
 pub struct ImePlugin;
 
@@ -72,35 +79,6 @@ impl Default for ImeManager {
 }
 impl ImeManager {
     /// ```
-    /// let teo = ime.text_edit_singleline(&mut text, 200.0, ui, ctx);
-    /// if teo.response.changed() {
-    ///     println!("{:?}", text);
-    /// }
-    /// ```
-    pub fn text_edit_singleline(
-        &mut self,
-        text: &mut String,
-        width: f32,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-    ) -> egui::text_edit::TextEditOutput {
-        if self.count >= self.ime_texts.len() {
-            self.add();
-            self.ime_texts[self.count].text = text.to_string();
-        }
-        let teo = self.ime_texts[self.count].get_text_edit_output(
-            width,
-            text,
-            EditType::SingleLine,
-            ui,
-            ctx,
-        );
-        self.ime_texts[self.count].id = teo.response.id.short_debug_format();
-        self.count += 1;
-        return teo;
-    }
-
-    /// ```
     /// let teo = ime.text_edit_multiline(&mut text, 200.0, ui, ctx);
     /// if teo.response.changed() {
     ///     println!("{:?}", text);
@@ -114,6 +92,7 @@ impl ImeManager {
         ctx: &egui::Context,
         sender: &NapcatIOSender,
         target_ids: Vec<String>,
+        autocompletion_text: &mut String,
     ) -> egui::text_edit::TextEditOutput {
         if self.count >= self.ime_texts.len() {
             self.add();
@@ -125,35 +104,43 @@ impl ImeManager {
             EditType::MultiLine,
             ui,
             ctx,
+            autocompletion_text,
         );
 
+        if self.ime_texts[self.count].is_focus && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+            self.ime_texts[self.count].text += autocompletion_text;
+            self.ime_texts[self.count].text = filter_control_characters(&self.ime_texts[self.count].text);
+            *autocompletion_text = "".to_owned();
+            teo.cursor_range.unwrap().primary.ccursor.index = self.ime_texts[self.count].text.len();
+        }
+        
         if self.ime_texts[self.count].is_focus
             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
         {
             println!("{}", self.ime_texts[self.count].text);
             for target_qq in target_ids {
                 let err = sender
-                .0
-                .try_send(Message::Text(
-                    json!({
-                        "action": "send_private_msg",
-                        "params": {
-                            "user_id": target_qq,
-                            "message_type": "private",
-                            "message": [
-                                {
-                                    "type": "text",
-                                    "data": {
-                                        "text": self.ime_texts[self.count].text
+                    .0
+                    .try_send(Message::Text(
+                        json!({
+                            "action": "send_private_msg",
+                            "params": {
+                                "user_id": target_qq,
+                                "message_type": "private",
+                                "message": [
+                                    {
+                                        "type": "text",
+                                        "data": {
+                                            "text": self.ime_texts[self.count].text
+                                        }
                                     }
-                                }
-                            ]
-                        }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .expect("can't send message");
+                                ]
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .expect("can't send message");
             }
 
             self.ime_texts[self.count].text = "".to_string();
@@ -242,7 +229,7 @@ impl ImeText {
             return;
         }
         match event {
-            Ime::Preedit { value, cursor, .. }  => {
+            Ime::Preedit { value, cursor, .. } => {
                 if cursor.is_some() {
                     // if self.is_focus {
                     //     self.ime_string = value.to_string();
@@ -260,7 +247,7 @@ impl ImeText {
             Ime::Enabled { .. } => {
                 self.is_ime = true;
             },
-            Ime::Disabled {.. } => {
+            Ime::Disabled { .. } => {
                 self.is_ime = false;
             },
             _ => (),
@@ -274,11 +261,16 @@ impl ImeText {
         edit_type: EditType,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
+        autocompletion_text_len: &str,
     ) -> egui::text_edit::TextEditOutput {
         self.edit_type = edit_type;
         self.is_used = true;
         let mut lyt = |ui: &egui::Ui, string: &str, wrap_width: f32| {
-            let loj = self.get_layoutjob(string, wrap_width);
+            let loj = self.get_layoutjob(
+                string,
+                wrap_width,
+                autocompletion_text_len,
+            );
             ui.fonts(|f| f.layout_job(loj))
         };
         let mut tmp_text = match self.ime_string.len() {
@@ -287,7 +279,7 @@ impl ImeText {
                 let mut front = String::new();
                 let mut back = String::new();
                 let mut cnt = 0;
-                for c in self.text.chars() {
+                for c in text.chars() {
                     if cnt < self.cursor_index {
                         front.push_str(&c.to_string());
                     } else {
@@ -317,6 +309,7 @@ impl ImeText {
                         .floor() as usize,
                 ))
                 .layouter(&mut lyt)
+                .lock_focus(true)
                 .show(ui),
         };
         self.is_focus = teo.response.has_focus();
@@ -355,16 +348,21 @@ impl ImeText {
                 o.ime
                     .and_then(|p| Some(p.cursor_rect.bottom()))
                     .unwrap_or(0.0),
-            )
+            );
         });
         teo.state.clone().store(ctx, teo.response.id);
         *text = self.text.to_string();
         teo
     }
 
-    fn get_layoutjob(&self, string: &str, width: f32) -> egui::text::LayoutJob {
-        let layout_job = match self.is_ime {
-            false => match self.edit_type {
+    fn get_layoutjob(
+        &self,
+        string: &str,
+        width: f32,
+        autocompletion_text_len: &str,
+    ) -> egui::text::LayoutJob {
+        let layout_job = match self.text.len() {
+            0 | 1 => match self.edit_type {
                 EditType::SingleLine => egui::text::LayoutJob::simple_singleline(
                     string.into(),
                     egui::FontId::default(),
@@ -403,8 +401,8 @@ impl ImeText {
                     },
                 };
                 lss.push(ls_front);
-                f_cnt = b_cnt;
 
+                f_cnt = b_cnt;
                 b_cnt = b_cnt + self.ime_string.len();
                 let ls_text = egui::text::LayoutSection {
                     leading_space: 0.0,
@@ -416,8 +414,20 @@ impl ImeText {
                     },
                 };
                 lss.push(ls_text);
-                f_cnt = b_cnt;
 
+                f_cnt = b_cnt;
+                b_cnt = b_cnt + autocompletion_text_len.len();
+                let ls_autocompletion = egui::text::LayoutSection {
+                    leading_space: 0.0,
+                    byte_range: f_cnt..b_cnt,
+                    format: egui::TextFormat {
+                        color: egui::Color32::GRAY,
+                        ..Default::default()
+                    },
+                };
+                lss.push(ls_autocompletion);
+
+                f_cnt = b_cnt;
                 b_cnt = b_cnt + back.len();
                 let ls_back = egui::text::LayoutSection {
                     leading_space: 0.0,
@@ -434,7 +444,10 @@ impl ImeText {
                 };
                 egui::text::LayoutJob {
                     sections: lss,
-                    text: format!("{}{}{}", front, self.ime_string, back),
+                    text: format!(
+                        "{}{}{}{}",
+                        front, self.ime_string, autocompletion_text_len, back
+                    ),
                     break_on_newline,
                     wrap: egui::text::TextWrapping {
                         max_width: width,

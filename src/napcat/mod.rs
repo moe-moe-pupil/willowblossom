@@ -29,25 +29,22 @@ use crossbeam_channel::{
     Receiver as CBReceiver,
     Sender as CBSender,
 };
-use dirs::state_dir;
+
 use futures_lite::future;
 use futures_util::{
     SinkExt,
     StreamExt,
 };
-use image::{
-    codecs::gif::GifDecoder,
-    AnimationDecoder,
-    Frame,
-};
-use serde::{
-    Deserialize,
-    Serialize,
-};
+
 use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::protocol::Message,
+};
+
+use serde::{
+    Deserialize,
+    Serialize,
 };
 
 #[derive(States, Debug, Default, Clone, Eq, PartialEq, Hash)]
@@ -154,13 +151,15 @@ impl Plugin for NapcatPlugin {
 }
 
 fn setup(mut commands: Commands) {
-    println!("start to setup");
     let thread_pool = AsyncComputeTaskPool::get();
     let (client_to_game_sender, client_to_game_receiver) = unbounded::<Message>();
     let napcat_io = NapcatIOReceiver(client_to_game_receiver.clone());
     let task = thread_pool.spawn(Compat::new(handle_connection(
         client_to_game_sender.clone(),
     )));
+    commands.insert_resource(napcat_io);
+    commands.insert_resource(NapcatTask(task));
+
     let message_manager = NapcatMessageManager {
         messages: HashMap::default(),
         groups: HashMap::default(),
@@ -175,8 +174,6 @@ fn setup(mut commands: Commands) {
             .build()
             .expect("failed to init messages"),
     );
-    commands.insert_resource(napcat_io);
-    commands.insert_resource(NapcatTask(task));
 }
 
 fn handle_tasks(mut commands: Commands, mut task: ResMut<NapcatTask>) {

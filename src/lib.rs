@@ -4,12 +4,11 @@ mod ui;
 mod deepseek;
 
 use bevy::{
-    asset::AssetMetaCheck,
     prelude::*, window::WindowResolution,
 };
 
 // [CHANGE]: Game title and resolution
-pub const GAME_TITLE: &str = "Hello Bevy!";
+pub const GAME_TITLE: &str = "willow blossom";
 
 // Game state
 #[derive(States, Debug, Default, Clone, Eq, PartialEq, Hash)]
