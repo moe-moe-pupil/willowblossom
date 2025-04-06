@@ -31,7 +31,7 @@ use bevy_egui::{
         TextureHandle,
         Ui,
         Vec2,
-        Widget,
+        Widget, WidgetText,
     },
     EguiContexts,
     EguiPlugin,
@@ -207,7 +207,7 @@ fn chat_window(
     id: Id,
     rect: Rect,
     ctx: &Context,
-    heights: Vec<f32>,
+    lens: Vec<usize>,
     messages: &Vec<NapcatMessage>,
     napcat_sender: &NapcatIOSender,
     deepseek_sender: &DeepseekIOSender,
@@ -220,6 +220,8 @@ fn chat_window(
     auto_completion_timer: &mut Timer,
     deepseek_manager: &mut DeepseekManager,
 ) {
+    //TODO: find the way to get the real font_height correctly
+    let font_height = 64.0;
     egui::Window::new(nickname)
         .vscroll(true)
         .open(&mut true)
@@ -240,7 +242,7 @@ fn chat_window(
                     .column(Column::exact(width))
                     .min_scrolled_height(0.0)
                     .body(|body| {
-                        body.heterogeneous_rows(heights.into_iter(), |mut row| {
+                        body.heterogeneous_rows(lens.iter().map(|len| 48.0 + *len as f32 * font_height / width), |mut row| {
                             let row_index = row.index();
                             let message = &messages[row_index];
                             row.col(|ui: &mut egui::Ui| {
@@ -258,7 +260,7 @@ fn chat_window(
                                                     data: text_data,
                                                 } => {
                                                     let text = format!("{}", text_data.text);
-                                                    ui.label(&text);
+                                                    ui.add(bevy_egui::egui::Label::new(&text).wrap());
                                                 },
                                                 NapcatMessageChainType::Source(_) => {},
                                                 // TODO: Support images
@@ -314,31 +316,32 @@ fn chat_window(
         );
 }
 
-pub fn get_nickname_heights(target_id: String, messages: &Vec<NapcatMessage>) -> (&str, Vec<f32>) {
+pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&str, Vec<usize>) {
     let mut nickname = "";
-    let mut heights: Vec<f32> = vec![];
+    let mut lens: Vec<usize> = vec![];
     for message in messages {
-        let mut height: f32 = 32.0;
+        let mut len: usize = 0;
         for chain in &message.data.message {
             match &chain.variant {
                 NapcatMessageChainType::Source(_) => {},
+                NapcatMessageChainType::Text { data  } => {
+                    len += data.text.len();
+                },
                 // TODO: Support images
                 // NapcatMessageChainType::Image { data: image } => {
                 //     height += 200.0;
                 // },
-                _ => {
-                    height += 32.0;
-                },
+                _ => {},
             };
         }
 
         if message.data.sender.user_id.to_string() == *target_id {
             nickname = &message.data.sender.nickname;
         }
-        heights.push(height)
+        lens.push(len)
     }
 
-    (nickname, heights)
+    (nickname, lens)
 }
 
 pub fn ui_system(
@@ -432,7 +435,7 @@ pub fn ui_system(
                         for member_id in &v.members {
                             let messages = manager.messages.get(member_id).unwrap().clone();
                             let (nickname, heights) =
-                                get_nickname_heights(member_id.clone(), &messages);
+                                get_nickname_lens(member_id.clone(), &messages);
                             let id = egui::Id::new(member_id);
                             chat_window(
                                 nickname,
@@ -470,8 +473,8 @@ pub fn ui_system(
                 *has_run_once = true
             }
 
-            let (nickname, heights) = get_nickname_heights(target_id.clone(), &messages);
             let rect = ui.max_rect();
+            let (nickname, heights) = get_nickname_lens(target_id.clone(), &messages);
             let target_ids = vec![target_id.clone()];
 
             if manager
