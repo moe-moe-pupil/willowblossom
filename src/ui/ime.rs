@@ -16,10 +16,13 @@ use bevy_persistent::Persistent;
 use serde_json::json;
 use tungstenite::Message;
 
-use crate::{deepseek::filter_control_characters, napcat::{
-    NapcatIOSender,
-    NapcatMessageManager,
-}};
+use crate::{
+    deepseek::filter_control_characters,
+    napcat::{
+        NapcatIOSender,
+        NapcatMessageManager,
+    },
+};
 
 pub struct ImePlugin;
 
@@ -108,12 +111,24 @@ impl ImeManager {
         );
 
         if self.ime_texts[self.count].is_focus && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
-            self.ime_texts[self.count].text += autocompletion_text;
-            self.ime_texts[self.count].text = filter_control_characters(&self.ime_texts[self.count].text);
+            let cursor_idx = teo.cursor_range.unwrap().primary.ccursor.index;
+            // Find the byte index corresponding to the 4th character
+            let byte_index = self.ime_texts[self.count]
+                .text
+                .char_indices()
+                .nth(cursor_idx)
+                .map(|(idx, _)| idx)
+                .unwrap_or(self.ime_texts[self.count].text.len());
+            self.ime_texts[self.count]
+                .text
+                .insert_str(byte_index, autocompletion_text);
+            self.ime_texts[self.count].text =
+                filter_control_characters(&self.ime_texts[self.count].text);
             *autocompletion_text = "".to_owned();
-            teo.cursor_range.unwrap().primary.ccursor.index = self.ime_texts[self.count].text.len();
+
+            teo.cursor_range.unwrap().primary.ccursor.index += autocompletion_text.chars().count();
         }
-        
+
         if self.ime_texts[self.count].is_focus
             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
         {
@@ -364,10 +379,22 @@ impl ImeText {
         let layout_job = match self.is_ime {
             false => {
                 let mut lss: Vec<egui::text::LayoutSection> = vec![];
+                let mut front = String::new();
+                let mut back = String::new();
+                let mut cnt = 0;
+                for c in string.chars() {
+                    if cnt < self.cursor_index {
+                        front.push_str(&c.to_string());
+                    } else {
+                        back.push_str(&c.to_string());
+                    }
+                    cnt += 1;
+                }
+
                 let mut f_cnt = 0;
                 let mut b_cnt = 0;
-                b_cnt = b_cnt + string.len();
-                let ls_string = egui::text::LayoutSection {
+                b_cnt = b_cnt + front.len();
+                let ls_front = egui::text::LayoutSection {
                     leading_space: 0.0,
                     byte_range: f_cnt..b_cnt,
                     format: egui::TextFormat {
@@ -375,7 +402,7 @@ impl ImeText {
                         ..Default::default()
                     },
                 };
-                lss.push(ls_string);
+                lss.push(ls_front);
 
                 f_cnt = b_cnt;
                 b_cnt = b_cnt + autocompletion_text_len.len();
@@ -389,11 +416,23 @@ impl ImeText {
                 };
                 lss.push(ls_autocompletion);
 
+                f_cnt = b_cnt;
+                b_cnt = b_cnt + back.len();
+                let ls_back = egui::text::LayoutSection {
+                    leading_space: 0.0,
+                    byte_range: f_cnt..b_cnt,
+                    format: egui::TextFormat {
+                        color: egui::Color32::WHITE,
+                        ..Default::default()
+                    },
+                };
+                lss.push(ls_back);
+
                 egui::text::LayoutJob {
                     sections: lss,
                     text: format!(
-                        "{}{}",
-                        string, autocompletion_text_len
+                        "{}{}{}",
+                        front, autocompletion_text_len, back
                     ),
                     wrap: egui::text::TextWrapping {
                         max_width: width,

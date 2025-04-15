@@ -61,8 +61,7 @@ pub fn filter_control_characters(input: &str) -> String {
 }
 
 impl DeepseekManager {
-    pub fn post_fim(text: &str) -> String {
-      return String::new();
+    pub fn post_fim(text: &str, suffix: &str) -> String {
         let preload_text = format!(
             r#"{{
         "model": "deepseek-chat",
@@ -70,16 +69,17 @@ impl DeepseekManager {
         "echo": false,
         "frequency_penalty": 0,
         "logprobs": 0,
-        "max_tokens": 100,
+        "max_tokens": 20,
         "presence_penalty": 0,
         "stop": null,
         "stream": false,
         "stream_options": null,
-        "suffix": null,
+        "suffix": "{}",
         "temperature": 1.3,
         "top_p": 1
       }}"#,
-            filter_control_characters(text)
+            filter_control_characters(text),
+            filter_control_characters(suffix)
         );
 
         dbg!(&preload_text);
@@ -186,7 +186,9 @@ async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> Comm
                     game_msg = game_to_deepseek_receiver.recv() => {
                         let game_msg = game_msg.unwrap();
                         if let Message::Text(text) = game_msg {
-                          client_to_game_sender.send(DeepseekManager::post_fim(&text).into()).expect("Could not send message");
+                          let str:&str = &text;
+                          let v:Vec<&str> = str.split('|').collect();
+                          client_to_game_sender.send(DeepseekManager::post_fim(&v[0], &v[1]).into()).expect("Could not send message");
                         }
                     }
                 }

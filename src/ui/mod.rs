@@ -2,6 +2,7 @@ mod ime;
 use std::{
     cmp::min,
     io::Cursor,
+    ops::Sub,
     path::Path,
     time::Duration,
 };
@@ -31,7 +32,8 @@ use bevy_egui::{
         TextureHandle,
         Ui,
         Vec2,
-        Widget, WidgetText,
+        Widget,
+        WidgetText,
     },
     EguiContexts,
     EguiPlugin,
@@ -54,7 +56,10 @@ use tungstenite::Message;
 
 use crate::{
     deepseek::{
-        self, DeepseekIOSender, DeepseekManager, DeepseekPlugin
+        self,
+        DeepseekIOSender,
+        DeepseekManager,
+        DeepseekPlugin,
     },
     napcat::{
         ChatGroup,
@@ -220,7 +225,7 @@ fn chat_window(
     auto_completion_timer: &mut Timer,
     deepseek_manager: &mut DeepseekManager,
 ) {
-    //TODO: find the way to get the real font_height correctly
+    // TODO: find the way to get the real font_height correctly
     let font_height = 64.0;
     egui::Window::new(nickname)
         .vscroll(true)
@@ -242,34 +247,41 @@ fn chat_window(
                     .column(Column::exact(width))
                     .min_scrolled_height(0.0)
                     .body(|body| {
-                        body.heterogeneous_rows(lens.iter().map(|len| 48.0 + *len as f32 * font_height / width), |mut row| {
-                            let row_index = row.index();
-                            let message = &messages[row_index];
-                            row.col(|ui: &mut egui::Ui| {
-                                ui.with_layout(
-                                    if message.data.self_id == message.data.user_id {
-                                        egui::Layout::top_down(egui::Align::RIGHT)
-                                    } else {
-                                        egui::Layout::top_down(egui::Align::LEFT)
-                                    },
-                                    |ui| {
-                                        ui.label(&message.data.sender.nickname);
-                                        for chain in &message.data.message {
-                                            match &chain.variant {
-                                                NapcatMessageChainType::Text {
-                                                    data: text_data,
-                                                } => {
-                                                    let text = format!("{}", text_data.text);
-                                                    ui.add(bevy_egui::egui::Label::new(&text).wrap());
-                                                },
-                                                NapcatMessageChainType::Source(_) => {},
-                                                // TODO: Support images
+                        body.heterogeneous_rows(
+                            lens.iter()
+                                .map(|len| 48.0 + *len as f32 * font_height / width),
+                            |mut row| {
+                                let row_index = row.index();
+                                let message = &messages[row_index];
+                                row.col(|ui: &mut egui::Ui| {
+                                    ui.with_layout(
+                                        if message.data.self_id == message.data.user_id {
+                                            egui::Layout::top_down(egui::Align::RIGHT)
+                                        } else {
+                                            egui::Layout::top_down(egui::Align::LEFT)
+                                        },
+                                        |ui| {
+                                            ui.label(&message.data.sender.nickname);
+                                            for chain in &message.data.message {
+                                                match &chain.variant {
+                                                    NapcatMessageChainType::Text {
+                                                        data: text_data,
+                                                    } => {
+                                                        let text = format!("{}", text_data.text);
+                                                        ui.add(
+                                                            bevy_egui::egui::Label::new(&text)
+                                                                .wrap(),
+                                                        );
+                                                    },
+                                                    NapcatMessageChainType::Source(_) => {},
+                                                    // TODO: Support images
+                                                }
                                             }
-                                        }
-                                    },
-                                );
-                            });
-                        })
+                                        },
+                                    );
+                                });
+                            },
+                        )
                     });
 
                 ui.with_layout(
@@ -280,7 +292,8 @@ fn chat_window(
                         }
 
                         let text = chat_input_msgs.get_mut(target_id).unwrap();
-                        let _teo_m = ime.chat_input_multiline(
+                        let mut text_to_deepseek = text.clone();
+                        let teo_m = ime.chat_input_multiline(
                             text,
                             ui.max_rect().width(),
                             ui,
@@ -289,14 +302,30 @@ fn chat_window(
                             target_ids,
                             &mut deepseek_manager.last_fim_response,
                         );
-                        if _teo_m.response.has_focus() && auto_completion_timer.finished() {
-                            auto_completion_timer.reset();
-                            if deepseek_manager.last_post_text != *text {
-                                deepseek_manager.last_post_text = text.to_string();
-                                let err = deepseek_sender
-                                .0
-                                .try_send(Message::Text(text.to_owned().into()))
-                                .expect("can't send message to deepseek");
+
+                        if teo_m.response.has_focus() {
+                            let cursor_idx = teo_m.cursor_range.unwrap().primary.ccursor.index;
+                            if cursor_idx <= text_to_deepseek.chars().count() {
+                                // Find the byte index corresponding to the 4th character
+                                let byte_index = text_to_deepseek
+                                    .char_indices()
+                                    .nth(cursor_idx)
+                                    .map(|(idx, _)| idx)
+                                    .unwrap_or(text_to_deepseek.len());
+
+                                // Insert the character at the correct byte index
+                                text_to_deepseek.insert(byte_index, '|');
+                                if deepseek_manager.last_post_text != *text_to_deepseek {
+                                    deepseek_manager.last_fim_response = "".to_string();
+                                    if auto_completion_timer.finished() {       
+                                        deepseek_manager.last_post_text = text_to_deepseek.to_string();
+                                        let err = deepseek_sender
+                                            .0
+                                            .try_send(Message::Text(text_to_deepseek.into()))
+                                            .expect("can't send message to deepseek");
+                                        auto_completion_timer.reset();
+                                    }
+                                }
                             }
                         }
                     },
@@ -324,7 +353,7 @@ pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&
         for chain in &message.data.message {
             match &chain.variant {
                 NapcatMessageChainType::Source(_) => {},
-                NapcatMessageChainType::Text { data  } => {
+                NapcatMessageChainType::Text { data } => {
                     len += data.text.len();
                 },
                 // TODO: Support images
@@ -453,7 +482,7 @@ pub fn ui_system(
                                 &group_rects,
                                 &mut manager,
                                 &mut auto_completion_time.timer,
-                                &mut deepseek_manager
+                                &mut deepseek_manager,
                             );
                         }
                     },
@@ -501,7 +530,7 @@ pub fn ui_system(
                 &group_rects,
                 &mut manager,
                 &mut auto_completion_time.timer,
-                &mut deepseek_manager
+                &mut deepseek_manager,
             );
         }
     });
