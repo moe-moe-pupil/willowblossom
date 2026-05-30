@@ -1,27 +1,19 @@
 mod ime;
 use std::{
-    cmp::min,
-    io::Cursor,
-    ops::Sub,
+    collections::HashMap,
     path::Path,
     time::Duration,
 };
 mod components;
-use std::collections::HashMap;
 
-use bevy::{
-    prelude::*,
-    utils::HashMap,
-};
+use bevy::prelude::*;
 use bevy_egui::{
     egui::{
         self,
         epaint::CircleShape,
         menu,
-        text_edit::TextEditOutput,
         Context,
         Id,
-        Layout,
         Memory,
         Modal,
         Modifiers,
@@ -35,7 +27,6 @@ use bevy_egui::{
         Ui,
         Vec2,
         Widget,
-        WidgetText,
     },
     EguiContexts,
     EguiPlugin,
@@ -43,10 +34,6 @@ use bevy_egui::{
 use bevy_persistent::{
     Persistent,
     StorageFormat,
-};
-use egui_extras::{
-    Column,
-    TableBuilder,
 };
 use ime::*;
 use serde::{
@@ -184,10 +171,11 @@ pub fn setup_system(
     command.insert_resource(AutoCompletionTime {
         timer: Timer::new(Duration::from_secs(5), TimerMode::Once),
     });
-    let mut window = windows.single_mut();
+    let Ok(mut window) = windows.single_mut() else {
+        return;
+    };
     window.ime_enabled = true;
     let mut txt_font = egui::FontDefinitions::default();
-    egui_extras::install_image_loaders(ctx);
     txt_font
         .families
         .get_mut(&egui::FontFamily::Proportional)
@@ -238,117 +226,97 @@ fn chat_window(
         .open(&mut true)
         .id(id)
         .constrain_to(rect)
-        .show(
-            ctx,
-            |ui| {
-                let width = ui.max_rect().width();
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(false)
-                    .auto_shrink(true)
-                    .cell_layout(egui::Layout::top_down(
-                        egui::Align::LEFT,
-                    ))
-                    .stick_to_bottom(true)
-                    .column(Column::exact(width))
-                    .min_scrolled_height(0.0)
-                    .body(|body| {
-                        body.heterogeneous_rows(
-                            lens.iter()
-                                .map(|len| 48.0 + *len as f32 * font_height / width),
-                            |mut row| {
-                                let row_index = row.index();
-                                let message = &messages[row_index];
-                                row.col(|ui: &mut egui::Ui| {
-                                    ui.with_layout(
-                                        if message.data.self_id == message.data.user_id {
-                                            egui::Layout::top_down(egui::Align::RIGHT)
-                                        } else {
-                                            egui::Layout::top_down(egui::Align::LEFT)
-                                        },
-                                        |ui| {
-                                            ui.label(&message.data.sender.nickname);
-                                            for chain in &message.data.message {
-                                                match &chain.variant {
-                                                    NapcatMessageChainType::Text {
-                                                        data: text_data,
-                                                    } => {
-                                                        let text = format!("{}", text_data.text);
-                                                        ui.add(
-                                                            bevy_egui::egui::Label::new(&text)
-                                                                .wrap(),
-                                                        );
-                                                    },
-                                                    NapcatMessageChainType::Source(_) => {},
-                                                    // TODO: Support images
-                                                }
-                                            }
-                                        },
-                                    );
-                                });
+        .show(ctx, |ui| {
+            let width = ui.max_rect().width();
+            egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for (message, len) in messages.iter().zip(lens.iter()) {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(
+                                width,
+                                48.0 + *len as f32 * font_height / width,
+                            ),
+                            if message.data.self_id == message.data.user_id {
+                                egui::Layout::top_down(egui::Align::RIGHT)
+                            } else {
+                                egui::Layout::top_down(egui::Align::LEFT)
                             },
-                        )
-                    });
-
-                ui.with_layout(
-                    egui::Layout::bottom_up(egui::Align::Center),
-                    |ui| {
-                        if !chat_input_msgs.contains_key(target_id) {
-                            chat_input_msgs.insert(target_id.to_owned(), String::new());
-                        }
-
-                        let text = chat_input_msgs.get_mut(target_id).unwrap();
-                        let mut text_to_deepseek = text.clone();
-                        let teo_m = ime.chat_input_multiline(
-                            text,
-                            ui.max_rect().width(),
-                            ui,
-                            ctx,
-                            napcat_sender,
-                            target_ids,
-                            &mut deepseek_manager.last_fim_response,
-                        );
-
-                        if teo_m.response.has_focus() {
-                            let cursor_idx = teo_m.cursor_range.unwrap().primary.ccursor.index;
-                            if cursor_idx <= text_to_deepseek.chars().count() {
-                                // Find the byte index corresponding to the 4th character
-                                let byte_index = text_to_deepseek
-                                    .char_indices()
-                                    .nth(cursor_idx)
-                                    .map(|(idx, _)| idx)
-                                    .unwrap_or(text_to_deepseek.len());
-
-                                // Insert the character at the correct byte index
-                                text_to_deepseek.insert(byte_index, '|');
-                                if deepseek_manager.last_post_text != *text_to_deepseek {
-                                    deepseek_manager.last_fim_response = "".to_string();
-                                    if auto_completion_timer.finished() {       
-                                        deepseek_manager.last_post_text = text_to_deepseek.to_string();
-                                        let err = deepseek_sender
-                                            .0
-                                            .try_send(Message::Text(text_to_deepseek.into()))
-                                            .expect("can't send message to deepseek");
-                                        auto_completion_timer.reset();
+                            |ui| {
+                                ui.label(&message.data.sender.nickname);
+                                for chain in &message.data.message {
+                                    match &chain.variant {
+                                        NapcatMessageChainType::Text { data: text_data } => {
+                                            let text = format!("{}", text_data.text);
+                                            ui.add(egui::Label::new(&text).wrap());
+                                        },
+                                        NapcatMessageChainType::Source(_) => {},
+                                        // TODO: Support images
                                     }
+                                }
+                            },
+                        );
+                    }
+                });
+
+            ui.with_layout(
+                egui::Layout::bottom_up(egui::Align::Center),
+                |ui| {
+                    if !chat_input_msgs.contains_key(target_id) {
+                        chat_input_msgs.insert(target_id.to_owned(), String::new());
+                    }
+
+                    let text = chat_input_msgs.get_mut(target_id).unwrap();
+                    let mut text_to_deepseek = text.clone();
+                    let teo_m = ime.chat_input_multiline(
+                        text,
+                        ui.max_rect().width(),
+                        ui,
+                        ctx,
+                        napcat_sender,
+                        target_ids,
+                        &mut deepseek_manager.last_fim_response,
+                    );
+
+                    if teo_m.response.has_focus() {
+                        let cursor_idx = teo_m.cursor_range.unwrap().primary.index;
+                        if cursor_idx <= text_to_deepseek.chars().count() {
+                            // Find the byte index corresponding to the 4th character
+                            let byte_index = text_to_deepseek
+                                .char_indices()
+                                .nth(cursor_idx)
+                                .map(|(idx, _)| idx)
+                                .unwrap_or(text_to_deepseek.len());
+
+                            // Insert the character at the correct byte index
+                            text_to_deepseek.insert(byte_index, '|');
+                            if deepseek_manager.last_post_text != *text_to_deepseek {
+                                deepseek_manager.last_fim_response = "".to_string();
+                                if auto_completion_timer.is_finished() {
+                                    deepseek_manager.last_post_text = text_to_deepseek.to_string();
+                                    let err = deepseek_sender
+                                        .0
+                                        .try_send(Message::Text(text_to_deepseek.into()))
+                                        .expect("can't send message to deepseek");
+                                    auto_completion_timer.reset();
                                 }
                             }
                         }
-                    },
-                );
-            },
-            |ui| {
-                for (k, rect) in group_rects {
-                    let inside = rect.contains_rect(ui.max_rect());
-                    if inside {
-                        let members = &mut manager.groups.get_mut(k).unwrap().members;
-                        if !members.contains(&target_id.to_owned()) {
-                            members.push(target_id.to_string());
-                        }
+                    }
+                },
+            );
+        })
+        .map(|response| {
+            for (k, rect) in group_rects {
+                let inside = rect.contains_rect(response.response.rect);
+                if inside {
+                    let members = &mut manager.groups.get_mut(k).unwrap().members;
+                    if !members.contains(&target_id.to_owned()) {
+                        members.push(target_id.to_string());
                     }
                 }
-            },
-        );
+            }
+        });
 }
 
 pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&str, Vec<usize>) {
@@ -395,7 +363,9 @@ pub fn ui_system(
 ) {
     auto_completion_time.timer.tick(time.delta());
 
-    let ctx = contexts.ctx_mut();
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
 
     let mut group_rects = HashMap::default();
     let reset_data = |new_chat_group_modal_string_bool: &mut Local<'_, (String, bool)>| {
@@ -463,37 +433,34 @@ pub fn ui_system(
                 .constrain_to(ui.max_rect())
                 .id(Id::new(k))
                 .order(egui::Order::Background)
-                .show(
-                    ctx,
-                    |ui| {
-                        group_rects.insert(k.clone(), ui.max_rect());
-                        for member_id in &v.members {
-                            let messages = manager.messages.get(member_id).unwrap().clone();
-                            let (nickname, heights) =
-                                get_nickname_lens(member_id.clone(), &messages);
-                            let id = egui::Id::new(member_id);
-                            chat_window(
-                                nickname,
-                                id,
-                                ui.max_rect(),
-                                ctx,
-                                heights,
-                                &messages,
-                                &napcat_sender,
-                                &deepseek_sender,
-                                member_id,
-                                &mut chat_input_msgs,
-                                vec![member_id.to_string()],
-                                &mut ime,
-                                &group_rects,
-                                &mut manager,
-                                &mut auto_completion_time.timer,
-                                &mut deepseek_manager,
-                            );
-                        }
-                    },
-                    |ui| {},
-                );
+                .show(ctx, |ui| {
+                    group_rects.insert(k.clone(), ui.max_rect());
+                    for member_id in &v.members {
+                        let Some(messages) = manager.messages.get(member_id).cloned() else {
+                            continue;
+                        };
+                        let (nickname, heights) = get_nickname_lens(member_id.clone(), &messages);
+                        let id = egui::Id::new(member_id);
+                        chat_window(
+                            nickname,
+                            id,
+                            ui.max_rect(),
+                            ctx,
+                            heights,
+                            &messages,
+                            &napcat_sender,
+                            &deepseek_sender,
+                            member_id,
+                            &mut chat_input_msgs,
+                            vec![member_id.to_string()],
+                            &mut ime,
+                            &group_rects,
+                            &mut manager,
+                            &mut auto_completion_time.timer,
+                            &mut deepseek_manager,
+                        );
+                    }
+                });
         }
 
         for (target_id, messages) in manager.messages.clone() {

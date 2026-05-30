@@ -110,7 +110,7 @@ impl ImeManager {
         );
 
         if self.ime_texts[self.count].is_focus && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
-            let cursor_idx = teo.cursor_range.unwrap().primary.ccursor.index;
+            let cursor_idx = teo.cursor_range.unwrap().primary.index;
             // Find the byte index corresponding to the 4th character
             let byte_index = self.ime_texts[self.count]
                 .text
@@ -124,8 +124,6 @@ impl ImeManager {
             self.ime_texts[self.count].text =
                 filter_control_characters(&self.ime_texts[self.count].text);
             *autocompletion_text = "".to_owned();
-
-            teo.cursor_range.unwrap().primary.ccursor.index += autocompletion_text.chars().count();
         }
 
         if self.ime_texts[self.count].is_focus
@@ -278,13 +276,13 @@ impl ImeText {
     ) -> egui::text_edit::TextEditOutput {
         self.edit_type = edit_type;
         self.is_used = true;
-        let mut lyt = |ui: &egui::Ui, string: &str, wrap_width: f32| {
+        let mut lyt = |ui: &egui::Ui, string: &dyn egui::TextBuffer, wrap_width: f32| {
             let loj = self.get_layoutjob(
-                string,
+                string.as_str(),
                 wrap_width,
                 autocompletion_text_len,
             );
-            ui.fonts(|f| f.layout_job(loj))
+            ui.fonts_mut(|f| f.layout_job(loj))
         };
         let mut tmp_text = match self.ime_string.len() {
             0 => self.text.to_string(),

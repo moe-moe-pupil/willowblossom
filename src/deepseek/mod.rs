@@ -14,7 +14,6 @@ use bevy::{
         IoTaskPool,
         Task,
     },
-    utils::hashbrown::HashMap,
 };
 use crossbeam_channel::{
     unbounded,
