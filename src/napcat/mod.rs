@@ -5,8 +5,11 @@ use std::{
 
 use async_compat::Compat;
 use bevy_egui::egui::{
+    self,
     Memory,
+    Modifiers,
     TextureHandle,
+    Ui,
 };
 use bevy_persistent::prelude::*;
 extern crate dirs;
@@ -27,25 +30,22 @@ use crossbeam_channel::{
     Receiver as CBReceiver,
     Sender as CBSender,
 };
-use dirs::state_dir;
+
 use futures_lite::future;
 use futures_util::{
     SinkExt,
     StreamExt,
 };
-use image::{
-    codecs::gif::GifDecoder,
-    AnimationDecoder,
-    Frame,
-};
-use serde::{
-    Deserialize,
-    Serialize,
-};
+
 use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::protocol::Message,
+};
+
+use serde::{
+    Deserialize,
+    Serialize,
 };
 
 #[derive(States, Debug, Default, Clone, Eq, PartialEq, Hash)]
@@ -66,14 +66,14 @@ struct NapcatTask(Task<CommandQueue>);
 
 pub struct NapcatPlugin;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct NapcatMessage {
     #[serde(flatten)]
     pub data: NapcatMessageData,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TextData {
     pub text: String,
 }
@@ -87,13 +87,13 @@ pub struct ImageData {
     pub file_size: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Source {
     id: u64,
     time: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum NapcatMessageChainType {
@@ -103,23 +103,23 @@ pub enum NapcatMessageChainType {
     // Image { data: ImageData },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum NapcatMessageType {
     Private,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct NapcatMessageChain {
     #[serde(flatten)]
     pub variant: NapcatMessageChainType,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NapcatSender {
     pub user_id: u64,
     pub nickname: String,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NapcatMessageData {
     pub time: u64,
     pub message_type: NapcatMessageType,
@@ -130,9 +130,15 @@ pub struct NapcatMessageData {
     pub sender: NapcatSender,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatGroup {
+    pub members: Vec<String>,
+}
+
 #[derive(Resource, Serialize, Deserialize)]
 pub struct NapcatMessageManager {
     pub messages: HashMap<String, Vec<NapcatMessage>>,
+    pub groups: HashMap<String, ChatGroup>,
 }
 
 impl Plugin for NapcatPlugin {
@@ -146,15 +152,18 @@ impl Plugin for NapcatPlugin {
 }
 
 fn setup(mut commands: Commands) {
-    println!("start to setup");
     let thread_pool = AsyncComputeTaskPool::get();
     let (client_to_game_sender, client_to_game_receiver) = unbounded::<Message>();
     let napcat_io = NapcatIOReceiver(client_to_game_receiver.clone());
     let task = thread_pool.spawn(Compat::new(handle_connection(
         client_to_game_sender.clone(),
     )));
+    commands.insert_resource(napcat_io);
+    commands.insert_resource(NapcatTask(task));
+
     let message_manager = NapcatMessageManager {
         messages: HashMap::default(),
+        groups: HashMap::default(),
     };
     let config_dir = Path::new(".data").join("willowblossom");
     commands.insert_resource(
@@ -166,8 +175,6 @@ fn setup(mut commands: Commands) {
             .build()
             .expect("failed to init messages"),
     );
-    commands.insert_resource(napcat_io);
-    commands.insert_resource(NapcatTask(task));
 }
 
 fn handle_tasks(mut commands: Commands, mut task: ResMut<NapcatTask>) {

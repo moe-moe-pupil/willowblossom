@@ -62,6 +62,7 @@ bevy_egui = { version = "=0.39.0", features = ["serde"] }
 egui = { version = "=0.33.3", features = ["persistence"] }
 serde_json = "1.0.150"
 dirs = "6.0.0"
-egui_extras = { version = "0.33.3", features = ["all_loaders"] }
-image = { version = "0.25.10", features = ["jpeg", "png"] }
-reqwest = { version = "0.13.4", features = ["blocking", "json"] }
+egui_extras = {  git = "https://github.com/moe-moe-pupil/egui", branch = "patch-0.31.1", features = ["all_loaders"] }
+image = { version = "0.25.5", features = ["jpeg", "png"] }
+reqwest = { version = "0.12.14", features = ["blocking", "json"] }
+curl = "0.4.47"
