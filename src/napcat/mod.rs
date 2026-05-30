@@ -138,6 +138,7 @@ pub struct ChatGroup {
 #[derive(Resource, Serialize, Deserialize)]
 pub struct NapcatMessageManager {
     pub messages: HashMap<String, Vec<NapcatMessage>>,
+    #[serde(default)]
     pub groups: HashMap<String, ChatGroup>,
 }
 

@@ -183,11 +183,16 @@ async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> Comm
                 tokio::select! {
                     //Receive messages from the game
                     game_msg = game_to_deepseek_receiver.recv() => {
-                        let game_msg = game_msg.unwrap();
+                        let Some(game_msg) = game_msg else {
+                            break;
+                        };
                         if let Message::Text(text) = game_msg {
-                          let str:&str = &text;
-                          let v:Vec<&str> = str.split('|').collect();
-                          client_to_game_sender.send(DeepseekManager::post_fim(&v[0], &v[1]).into()).expect("Could not send message");
+                            let Some((prefix, suffix)) = text.split_once('|') else {
+                                continue;
+                            };
+                            client_to_game_sender
+                                .send(DeepseekManager::post_fim(prefix, suffix).into())
+                                .expect("Could not send message");
                         }
                     }
                 }
