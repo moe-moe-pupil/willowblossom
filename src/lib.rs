@@ -4,7 +4,8 @@ mod ui;
 
 use bevy::{
     asset::AssetMetaCheck,
-    prelude::*, window::WindowResolution,
+    prelude::*,
+    window::WindowResolution,
 };
 
 // [CHANGE]: Game title and resolution
@@ -41,7 +42,7 @@ impl Plugin for GamePlugin {
         let mut window_plugin = WindowPlugin {
             primary_window: Some(Window {
                 title: GAME_TITLE.into(),
-                resolution: WindowResolution::new(800.0, 600.0),                
+                resolution: WindowResolution::new(800, 600),
                 canvas: Some("#bevy".to_string()),
                 ..default()
             }),
@@ -64,6 +65,10 @@ impl Plugin for GamePlugin {
         app.add_plugins(DefaultPlugins.set(window_plugin).set(image_plugin));
 
         // Game
-        app.add_plugins((camera::CameraPlugin, napcat::NapcatPlugin, ui::UIPlugin));
+        app.add_plugins((
+            camera::CameraPlugin,
+            napcat::NapcatPlugin,
+            ui::UIPlugin,
+        ));
     }
 }

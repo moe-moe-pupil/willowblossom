@@ -1,0 +1,4 @@
+interface:
+  display_name: "Willowblossom TRPG Access"
+  short_description: "Repo rules for private TRPG bot context"
+  default_prompt: "Use $willowblossom-trpg-access to add or review private party and character access behavior in willowblossom."

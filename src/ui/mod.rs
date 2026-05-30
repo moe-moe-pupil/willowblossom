@@ -5,10 +5,11 @@ use std::{
     path::Path,
 };
 mod components;
+use std::collections::HashMap;
+
 use bevy::{
     prelude::*,
     render::render_resource::encase::rts_array::Length,
-    utils::HashMap,
 };
 use bevy_egui::{
     egui::{
@@ -109,7 +110,7 @@ impl Widget for CircleImageButton {
 
 impl Plugin for UIPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(EguiPlugin)
+        app.add_plugins(EguiPlugin::default())
             .add_plugins(ImePlugin)
             .insert_resource(MyApp::default())
             .add_systems(Startup, setup_system)
@@ -131,7 +132,9 @@ pub fn setup_system(
     mut egui_context: EguiContexts,
     mut windows: Query<&mut Window>,
 ) {
-    let ctx = egui_context.ctx_mut();
+    let Ok(ctx) = egui_context.ctx_mut() else {
+        return;
+    };
     let config_dir = Path::new(".data").join("willowblossom");
     let cached_memory = Persistent::<CachedMemory>::builder()
         .name("ui_memory")
@@ -143,7 +146,9 @@ pub fn setup_system(
         .build()
         .expect("failed to init messages");
     command.insert_resource(cached_memory);
-    let mut window = windows.single_mut();
+    let Ok(mut window) = windows.single_mut() else {
+        return;
+    };
     window.ime_enabled = true;
     dbg!(window.physical_size());
     let mut txt_font = egui::FontDefinitions::default();
@@ -157,7 +162,7 @@ pub fn setup_system(
         "../../assets/fonts/AlibabaHealthFont.ttf"
     ));
     txt_font.font_data.insert("Meiryo".to_owned(), fd.into());
-    egui_context.ctx_mut().set_fonts(txt_font);
+    ctx.set_fonts(txt_font);
     command.insert_resource(GIFImages {
         images: HashMap::default(),
     })
@@ -167,7 +172,9 @@ pub fn load_ui_memory(
     mut egui_context: EguiContexts,
     cached_memory: ResMut<Persistent<CachedMemory>>,
 ) {
-    let ctx = egui_context.ctx_mut();
+    let Ok(ctx) = egui_context.ctx_mut() else {
+        return;
+    };
     ctx.memory_mut(|m| *m = cached_memory.ui_memory.clone());
 }
 
@@ -180,7 +187,9 @@ pub fn ui_system(
     mut cached_memory: ResMut<Persistent<CachedMemory>>,
     mut has_run_once: Local<bool>,
 ) {
-    let ctx = contexts.ctx_mut();
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
     let target_message_key = "1670426821";
 
     egui::TopBottomPanel::top("top_panel")
@@ -201,9 +210,9 @@ pub fn ui_system(
                 egui::Sense::hover(),
             );
         });
-        
+
     egui::CentralPanel::default().show(ctx, |ui| {
-        let mut group_rect= Rect::from_pos(Pos2::new(-1.0, -1.0));
+        let mut group_rect = Rect::from_pos(Pos2::new(-1.0, -1.0));
         egui::Window::new("讨论组")
             .vscroll(true)
             .open(&mut true)
@@ -252,7 +261,7 @@ pub fn ui_system(
                 .vscroll(true)
                 .open(&mut true)
                 .id(id)
-                .constrain_to(ui.max_rect())                
+                .constrain_to(ui.max_rect())
                 .show(ctx, |ui| {
                     let width = ui.max_rect().width();
                     TableBuilder::new(ui)

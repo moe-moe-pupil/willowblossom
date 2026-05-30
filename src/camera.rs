@@ -27,16 +27,16 @@ pub struct GameCamera;
 // ·······
 
 fn init_camera(mut cmd: Commands, mut cam: Query<&mut Camera, With<GameCamera>>) {
-    if let Ok(mut cam) = cam.get_single_mut() {
+    if let Ok(mut cam) = cam.single_mut() {
         cam.is_active = true;
     } else {
         // TODO: Option for 3d camera
-        cmd.spawn((Camera2dBundle::default(), GameCamera));
+        cmd.spawn((Camera2d, GameCamera));
     }
 }
 
 fn pause_camera(mut cam: Query<&mut Camera, With<GameCamera>>) {
-    if let Ok(mut cam) = cam.get_single_mut() {
+    if let Ok(mut cam) = cam.single_mut() {
         cam.is_active = false;
     }
 }

@@ -10,6 +10,8 @@ use bevy_egui::egui::{
 };
 use bevy_persistent::prelude::*;
 extern crate dirs;
+use std::collections::HashMap;
+
 use bevy::{
     ecs::world::CommandQueue,
     prelude::*,
@@ -19,7 +21,6 @@ use bevy::{
         IoTaskPool,
         Task,
     },
-    utils::hashbrown::HashMap,
 };
 use crossbeam_channel::{
     unbounded,

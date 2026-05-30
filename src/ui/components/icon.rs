@@ -106,7 +106,7 @@ impl<'a> Widget for Icon<'a> {
 
         let padded_size = image_size + 2.0 * padding;
         let (rect, response) = ui.allocate_exact_size(self.size, self.sense);
-        response.widget_info(|| WidgetInfo::new(WidgetType::ImageButton));
+        response.widget_info(|| WidgetInfo::new(WidgetType::Button));
 
         if ui.is_rect_visible(rect) {
             let (expansion, rounding, fill, stroke) = if self.selected {
@@ -170,7 +170,7 @@ impl<'a> Widget for Icon<'a> {
                 rect.expand2(expansion),
                 rounding,
                 stroke,
-                bevy_egui::egui::StrokeKind::Outside
+                bevy_egui::egui::StrokeKind::Outside,
             );
         }
         let ctx = ui.ctx();

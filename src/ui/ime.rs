@@ -1,9 +1,9 @@
-use std::{
-    cmp::min,
-    fmt::Pointer,
-};
+use std::cmp::min;
 
-use bevy::prelude::*;
+use bevy::{
+    prelude::*,
+    window::Ime,
+};
 use bevy_egui::egui;
 use bevy_persistent::Persistent;
 use serde_json::json;
@@ -35,14 +35,16 @@ fn reset_unused_ime(mut ime: ResMut<ImeManager>) {
 
 fn listen_ime_events(
     // ime look
-    mut events: EventReader<Ime>,
+    mut events: MessageReader<Ime>,
     mut ime: ResMut<ImeManager>,
     mut windows: Query<&mut Window>,
 ) {
     for event in events.read() {
         ime.listen_ime_event(event);
     }
-    let mut window = windows.single_mut();
+    let Ok(mut window) = windows.single_mut() else {
+        return;
+    };
     window.ime_position = ime
         .get_focused_text()
         .and_then(|text| Some(text.screen_pos))
@@ -241,7 +243,7 @@ impl ImeText {
             return;
         }
         match event {
-            Ime::Preedit { value, cursor, .. }  => {
+            Ime::Preedit { value, cursor, .. } => {
                 if cursor.is_some() {
                     // if self.is_focus {
                     //     self.ime_string = value.to_string();
@@ -259,10 +261,9 @@ impl ImeText {
             Ime::Enabled { .. } => {
                 self.is_ime = true;
             },
-            Ime::Disabled {.. } => {
+            Ime::Disabled { .. } => {
                 self.is_ime = false;
             },
-            _ => (),
         }
     }
 
@@ -276,9 +277,9 @@ impl ImeText {
     ) -> egui::text_edit::TextEditOutput {
         self.edit_type = edit_type;
         self.is_used = true;
-        let mut lyt = |ui: &egui::Ui, string: &str, wrap_width: f32| {
-            let loj = self.get_layoutjob(string, wrap_width);
-            ui.fonts(|f| f.layout_job(loj))
+        let mut lyt = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+            let loj = self.get_layoutjob(text.as_str(), wrap_width);
+            ui.fonts_mut(|f| f.layout_job(loj))
         };
         let mut tmp_text = match self.ime_string.len() {
             0 => self.text.to_string(),
@@ -323,7 +324,7 @@ impl ImeText {
             self.text = tmp_text.to_string();
         }
         if teo.cursor_range.is_some() {
-            self.cursor_index = teo.cursor_range.unwrap().primary.ccursor.index;
+            self.cursor_index = teo.cursor_range.unwrap().primary.index;
         }
         if self.is_ime_input {
             // respose.changed()=true
@@ -336,11 +337,8 @@ impl ImeText {
                 for _ in 0..self.ime_string_index {
                     res_cursor = teo.galley.cursor_right_one_character(&res_cursor);
                 }
-                let cr = egui::text_selection::CursorRange {
-                    primary: res_cursor,
-                    secondary: res_cursor,
-                };
-                teo.state.cursor.set_range(Some(cr));
+                let cr = egui::text_selection::CCursorRange::one(res_cursor);
+                teo.state.cursor.set_char_range(Some(cr));
             }
         }
         if !self.is_cursor_move {
