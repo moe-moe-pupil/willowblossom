@@ -104,7 +104,11 @@ pub struct Source {
 #[serde(rename_all = "snake_case")]
 pub enum NapcatMessageChainType {
     Source(Source),
-    Text { data: TextData },
+    Text {
+        data: TextData,
+    },
+    #[serde(other)]
+    Unsupported,
     // TODO: support image
     // Image { data: ImageData },
 }
@@ -126,10 +130,33 @@ pub struct NapcatSender {
     pub user_id: u64,
     pub nickname: String,
 }
+
+fn deserialize_message_chains<'de, D>(deserializer: D) -> Result<Vec<NapcatMessageChain>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MessageChains {
+        Segments(Vec<NapcatMessageChain>),
+        Text(String),
+    }
+
+    match MessageChains::deserialize(deserializer)? {
+        MessageChains::Segments(segments) => Ok(segments),
+        MessageChains::Text(text) => Ok(vec![NapcatMessageChain {
+            variant: NapcatMessageChainType::Text {
+                data: TextData { text },
+            },
+        }]),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NapcatMessageData {
     pub time: u64,
     pub message_type: NapcatMessageType,
+    #[serde(deserialize_with = "deserialize_message_chains")]
     pub message: Vec<NapcatMessageChain>,
     pub self_id: u64,
     pub user_id: u64,
@@ -296,7 +323,7 @@ fn message_system(
     receiver: Res<NapcatIOReceiver>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
 ) {
-    if let Ok(msg) = receiver.0.try_recv() {
+    while let Ok(msg) = receiver.0.try_recv() {
         let json_res = serde_json::from_str::<NapcatMessage>(&msg.to_string());
         if let Ok(json) = json_res {
             dbg!(&json);
@@ -311,19 +338,82 @@ fn message_system(
                 NapcatMessageType::Group => json.data.group_id.unwrap_or(json.data.user_id),
             };
 
-            if manager.messages.contains_key(&target_id.to_string()) {
-                manager
-                    .messages
-                    .get_mut(&target_id.to_string())
-                    .unwrap()
-                    .push(json)
-            } else {
-                manager.messages.insert(target_id.to_string(), vec![json]);
-            }
+            manager
+                .messages
+                .entry(target_id.to_string())
+                .or_default()
+                .push(json);
 
-            manager.persist().ok();
+            if let Err(err) = manager.persist() {
+                eprintln!("failed to persist NapCat messages: {err}");
+            }
         } else {
-            eprintln!("NapCat websocket response: {}", msg);
+            eprintln!(
+                "NapCat websocket response was not a persisted chat message: {}; parse error: {:?}",
+                msg,
+                json_res.err()
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_group_message_with_unsupported_segments() {
+        let message = serde_json::from_str::<NapcatMessage>(
+            r#"{
+                "time": 1780132600,
+                "message_type": "group",
+                "message": [
+                    { "type": "at", "data": { "qq": "123" } },
+                    { "type": "text", "data": { "text": "hello group" } }
+                ],
+                "self_id": 3432505351,
+                "user_id": 1670426821,
+                "group_id": 123456,
+                "sender": {
+                    "user_id": 1670426821,
+                    "nickname": "tester"
+                }
+            }"#,
+        )
+        .expect("group message should parse");
+
+        assert_eq!(message.data.message.len(), 2);
+        assert!(matches!(
+            message.data.message[0].variant,
+            NapcatMessageChainType::Unsupported
+        ));
+        assert!(matches!(
+            message.data.message[1].variant,
+            NapcatMessageChainType::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_string_message_payload() {
+        let message = serde_json::from_str::<NapcatMessage>(
+            r#"{
+                "time": 1780132600,
+                "message_type": "group",
+                "message": "plain group text",
+                "self_id": 3432505351,
+                "user_id": 1670426821,
+                "group_id": 123456,
+                "sender": {
+                    "user_id": 1670426821,
+                    "nickname": "tester"
+                }
+            }"#,
+        )
+        .expect("string message should parse");
+
+        let NapcatMessageChainType::Text { data } = &message.data.message[0].variant else {
+            panic!("string payload should become a text segment");
+        };
+        assert_eq!(data.text, "plain group text");
     }
 }

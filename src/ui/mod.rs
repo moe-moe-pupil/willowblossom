@@ -42,12 +42,23 @@ use serde::{
 };
 use tokio_tungstenite::tungstenite::protocol::Message;
 
+const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
+const CHAT_WINDOW_MIN_SIZE: Vec2 = Vec2::new(260.0, 260.0);
+const GROUP_CHAT_MAX_HEIGHT: f32 = 720.0;
+const GROUP_CHAT_MIN_HEIGHT: f32 = 140.0;
+const GROUP_CHAT_SEPARATOR_HEIGHT: f32 = 10.0;
+const GROUP_MEMBER_CHAT_SIZE: Vec2 = Vec2::new(320.0, 420.0);
+const GROUP_MEMBER_CHAT_MAX_SIZE: Vec2 = Vec2::new(480.0, 620.0);
+const GROUP_MEMBER_RESIZE_HANDLE_SIZE: f32 = 16.0;
+const GROUP_BROADCAST_INPUT_ROWS: usize = 3;
+
 use crate::{
     deepseek::{
         DeepseekIOSender,
         DeepseekManager,
         DeepseekPlugin,
         DeepseekRequest,
+        DeepseekSummaryBlock,
     },
     napcat::{
         ChatGroup,
@@ -231,12 +242,12 @@ pub fn configure_ui_fonts(mut egui_context: EguiContexts, mut fonts_configured: 
 
 pub fn load_ui_memory(
     mut egui_context: EguiContexts,
-    cached_memory: ResMut<Persistent<CachedMemory>>,
+    _cached_memory: ResMut<Persistent<CachedMemory>>,
 ) {
     let Ok(ctx) = egui_context.ctx_mut() else {
         return;
     };
-    ctx.memory_mut(|m| *m = cached_memory.ui_memory.clone());
+    ctx.memory_mut(|m| *m = Memory::default());
 }
 
 fn chat_window(
@@ -244,7 +255,7 @@ fn chat_window(
     id: Id,
     rect: Rect,
     ctx: &Context,
-    lens: Vec<usize>,
+    _lens: Vec<usize>,
     messages: &Vec<NapcatMessage>,
     napcat_sender: Option<&NapcatIOSender>,
     target_id: &str,
@@ -254,91 +265,245 @@ fn chat_window(
     group_rects: &HashMap<String, Rect>,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
 ) {
-    // TODO: find the way to get the real font_height correctly
-    let font_height = 64.0;
-    let input_height = 84.0;
-    egui::Window::new(nickname)
-        .open(&mut true)
+    let mut window_open = true;
+    let response = egui::Window::new(nickname)
+        .open(&mut window_open)
         .id(id)
         .constrain_to(rect)
+        .default_size(CHAT_WINDOW_SIZE)
+        .min_size(CHAT_WINDOW_MIN_SIZE)
+        .max_height(GROUP_CHAT_MAX_HEIGHT)
         .show(ctx, |ui| {
-            let width = ui.available_width();
-            let message_height =
-                (ui.available_height() - input_height - ui.spacing().item_spacing.y).max(0.0);
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(message_height)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for (message, len) in messages.iter().zip(lens.iter()) {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(
-                                width,
-                                48.0 + *len as f32 * font_height / width,
-                            ),
-                            if message.data.self_id == message.data.user_id {
-                                egui::Layout::top_down(egui::Align::RIGHT)
-                            } else {
-                                egui::Layout::top_down(egui::Align::LEFT)
-                            },
+            chat_body_ui(
+                ui,
+                ctx,
+                messages,
+                napcat_sender,
+                target_id,
+                chat_input_msgs,
+                targets,
+                ime,
+                None,
+            );
+        });
+
+    if let Some(response) = response {
+        if let Some(drop_pos) = ctx.input(|input| input.pointer.latest_pos()) {
+            if response.response.dragged() {
+                if let Some((_, preview_rect)) =
+                    group_rects.iter().find(|(_, rect)| rect.contains(drop_pos))
+                {
+                    draw_drop_preview(ctx, *preview_rect);
+                }
+            }
+        }
+
+        if !response.response.drag_stopped() {
+            return;
+        }
+
+        let Some(drop_pos) = ctx.input(|input| input.pointer.latest_pos()) else {
+            return;
+        };
+
+        for (k, rect) in group_rects {
+            if rect.contains(drop_pos) {
+                let Some(members) = manager.groups.get_mut(k).map(|group| &mut group.members)
+                else {
+                    continue;
+                };
+                if !members.contains(&target_id.to_owned()) {
+                    members.push(target_id.to_string());
+                    manager.persist().ok();
+                }
+            }
+        }
+    }
+}
+
+fn chat_body_ui(
+    ui: &mut Ui,
+    ctx: &Context,
+    messages: &Vec<NapcatMessage>,
+    napcat_sender: Option<&NapcatIOSender>,
+    target_id: &str,
+    chat_input_msgs: &mut Local<HashMap<String, String>>,
+    targets: Vec<NapcatSendTarget>,
+    ime: &mut ResMut<ImeManager>,
+    desired_height: Option<f32>,
+) {
+    ui.vertical(|ui| {
+        if !chat_input_msgs.contains_key(target_id) {
+            chat_input_msgs.insert(target_id.to_owned(), String::new());
+        }
+
+        let input_height = ui.spacing().interact_size.y * 3.0 + ui.spacing().item_spacing.y * 2.0;
+        let available_height = desired_height.unwrap_or_else(|| ui.available_height());
+        let message_height =
+            (available_height - input_height - ui.spacing().item_spacing.y).max(0.0);
+
+        let message_width = ui.available_width();
+        ui.allocate_ui(
+            egui::vec2(message_width, message_height),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt((target_id, "messages"))
+                    .min_scrolled_width(message_width)
+                    .max_height(message_height)
+                    .min_scrolled_height(message_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width(message_width);
+                        ui.set_width(message_width);
+                        ui.with_layout(
+                            egui::Layout::top_down(egui::Align::LEFT),
                             |ui| {
-                                ui.label(&message.data.sender.nickname);
-                                for chain in &message.data.message {
-                                    match &chain.variant {
-                                        NapcatMessageChainType::Text { data: text_data } => {
-                                            let text = format!("{}", text_data.text);
-                                            ui.add(egui::Label::new(&text).wrap());
-                                        },
-                                        NapcatMessageChainType::Source(_) => {},
-                                        // TODO: Support images
-                                    }
+                                for message in messages {
+                                    message_row_ui(ui, message, message_width);
+                                    ui.add_space(ui.spacing().item_spacing.y);
                                 }
                             },
                         );
-                    }
-                });
+                    });
+            },
+        );
 
-            ui.allocate_ui_with_layout(
-                egui::vec2(width, input_height),
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    if !chat_input_msgs.contains_key(target_id) {
-                        chat_input_msgs.insert(target_id.to_owned(), String::new());
-                    }
-
-                    let text = chat_input_msgs.get_mut(target_id).unwrap();
-                    let Some(napcat_sender) = napcat_sender else {
-                        ui.add_enabled(
-                            false,
-                            egui::TextEdit::multiline(text)
-                                .desired_width(ui.available_width())
-                                .desired_rows(3),
-                        );
-                        return;
-                    };
-                    let _ = ime.chat_input_multiline(
-                        target_id,
-                        text,
-                        ui.available_width(),
-                        ui,
-                        ctx,
-                        napcat_sender,
-                        targets,
-                    );
-                },
+        ui.add_space(ui.spacing().item_spacing.y);
+        let text = chat_input_msgs.get_mut(target_id).unwrap();
+        if let Some(napcat_sender) = napcat_sender {
+            let _ = ime.chat_input_multiline(
+                target_id,
+                text,
+                ui.available_width(),
+                3,
+                ui,
+                ctx,
+                napcat_sender,
+                targets,
             );
-        })
-        .map(|response| {
-            for (k, rect) in group_rects {
-                let inside = rect.contains_rect(response.response.rect);
-                if inside {
-                    let members = &mut manager.groups.get_mut(k).unwrap().members;
-                    if !members.contains(&target_id.to_owned()) {
-                        members.push(target_id.to_string());
-                    }
-                }
+        } else {
+            ui.add_enabled(
+                false,
+                egui::TextEdit::multiline(text)
+                    .desired_width(ui.available_width())
+                    .desired_rows(3),
+            );
+        }
+    });
+}
+
+fn group_broadcast_input_ui(
+    ui: &mut Ui,
+    ctx: &Context,
+    group_name: &str,
+    members: &[String],
+    messages: &HashMap<String, Vec<NapcatMessage>>,
+    napcat_sender: Option<&NapcatIOSender>,
+    chat_input_msgs: &mut Local<HashMap<String, String>>,
+    ime: &mut ResMut<ImeManager>,
+) {
+    let input_id = format!("group:{group_name}:broadcast");
+    chat_input_msgs
+        .entry(input_id.clone())
+        .or_insert_with(String::new);
+
+    ui.separator();
+    let text = chat_input_msgs.get_mut(&input_id).unwrap();
+    let targets = members
+        .iter()
+        .filter_map(|member_id| {
+            if !matches!(
+                messages
+                    .get(member_id)
+                    .and_then(|messages| messages.first())
+                    .map(|message| &message.data.message_type),
+                Some(NapcatMessageType::Private)
+            ) {
+                return None;
             }
-        });
+
+            match member_id.parse::<u64>() {
+                Ok(user_id) => Some(NapcatSendTarget::Private(user_id)),
+                Err(_) => {
+                    eprintln!("invalid NapCat group member id: {member_id}");
+                    None
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let enabled = napcat_sender.is_some() && !targets.is_empty();
+    if let Some(napcat_sender) = napcat_sender.filter(|_| enabled) {
+        let _ = ime.chat_input_multiline(
+            &input_id,
+            text,
+            ui.available_width(),
+            GROUP_BROADCAST_INPUT_ROWS,
+            ui,
+            ctx,
+            napcat_sender,
+            targets,
+        );
+    } else {
+        ui.add_enabled(
+            false,
+            egui::TextEdit::multiline(text)
+                .desired_width(ui.available_width())
+                .desired_rows(GROUP_BROADCAST_INPUT_ROWS),
+        );
+    }
+}
+
+fn message_row_ui(ui: &mut Ui, message: &NapcatMessage, row_width: f32) {
+    let is_self = message.data.self_id == message.data.user_id;
+    let max_message_width = if row_width < 120.0 {
+        row_width
+    } else {
+        (row_width * 0.72).clamp(120.0, row_width)
+    };
+    let margin_width = (row_width - max_message_width).max(0.0);
+
+    ui.horizontal_top(|ui| {
+        ui.set_width(row_width);
+        if is_self {
+            ui.add_space(margin_width);
+            ui.vertical(|ui| {
+                ui.set_width(max_message_width);
+                ui.set_max_width(max_message_width);
+                ui.with_layout(
+                    egui::Layout::top_down(egui::Align::RIGHT),
+                    |ui| {
+                        message_text_ui(ui, message);
+                    },
+                );
+            });
+        } else {
+            ui.vertical(|ui| {
+                ui.set_width(max_message_width);
+                ui.set_max_width(max_message_width);
+                message_text_ui(ui, message);
+            });
+            ui.add_space(margin_width);
+        }
+    });
+}
+
+fn message_text_ui(ui: &mut Ui, message: &NapcatMessage) {
+    ui.label(&message.data.sender.nickname);
+    for chain in &message.data.message {
+        match &chain.variant {
+            NapcatMessageChainType::Text { data: text_data } => {
+                ui.add(
+                    egui::Label::new(text_data.text.trim())
+                        .wrap()
+                        .selectable(false),
+                );
+            },
+            NapcatMessageChainType::Source(_) => {},
+            NapcatMessageChainType::Unsupported => {},
+            // TODO: Support images
+        }
+    }
 }
 
 pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&str, Vec<usize>) {
@@ -352,11 +517,11 @@ pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&
                 NapcatMessageChainType::Text { data } => {
                     len += data.text.len();
                 },
+                NapcatMessageChainType::Unsupported => {},
                 // TODO: Support images
                 // NapcatMessageChainType::Image { data: image } => {
                 //     height += 200.0;
                 // },
-                _ => {},
             };
         }
 
@@ -367,6 +532,192 @@ pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&
     }
 
     (nickname, lens)
+}
+
+fn target_display_name(target_id: &str, messages: Option<&Vec<NapcatMessage>>) -> String {
+    messages
+        .map(|messages| get_nickname_lens(target_id.to_owned(), messages).0)
+        .filter(|nickname| !nickname.is_empty())
+        .unwrap_or(target_id)
+        .to_owned()
+}
+
+fn chat_group_title(
+    group_name: &str,
+    group: &ChatGroup,
+    messages: &HashMap<String, Vec<NapcatMessage>>,
+) -> String {
+    let member_names = group
+        .members
+        .iter()
+        .map(|member_id| target_display_name(member_id, messages.get(member_id)))
+        .collect::<Vec<_>>();
+
+    if member_names.is_empty() {
+        format!("讨论组: {}", group_name)
+    } else {
+        format!(
+            "讨论组: {}: {}",
+            group_name,
+            member_names.join(", ")
+        )
+    }
+}
+
+fn group_chat_inner_size(member_count: usize, max_rect: Rect) -> Vec2 {
+    let broadcast_input_height = 96.0;
+    let desired_height = if member_count == 0 {
+        GROUP_CHAT_MIN_HEIGHT + broadcast_input_height
+    } else {
+        member_count as f32 * GROUP_MEMBER_CHAT_SIZE.y
+            + member_count.saturating_sub(1) as f32 * GROUP_CHAT_SEPARATOR_HEIGHT
+            + broadcast_input_height
+    };
+
+    egui::vec2(
+        (GROUP_MEMBER_CHAT_SIZE.x + 48.0)
+            .min(max_rect.width())
+            .max(CHAT_WINDOW_MIN_SIZE.x),
+        desired_height
+            .min(GROUP_CHAT_MAX_HEIGHT)
+            .min(max_rect.height())
+            .max(GROUP_CHAT_MIN_HEIGHT),
+    )
+}
+
+fn draw_drop_preview(ctx: &Context, rect: Rect) {
+    let rect = rect.shrink(4.0);
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        Id::new("chat_drop_preview"),
+    ));
+    let fill = egui::Color32::from_rgba_unmultiplied(60, 210, 120, 28);
+    let stroke = Stroke::new(
+        2.0,
+        egui::Color32::from_rgb(70, 220, 130),
+    );
+
+    painter.rect_filled(rect, 4.0, fill);
+    paint_dotted_line(
+        &painter,
+        rect.left_top(),
+        rect.right_top(),
+        stroke,
+    );
+    paint_dotted_line(
+        &painter,
+        rect.right_top(),
+        rect.right_bottom(),
+        stroke,
+    );
+    paint_dotted_line(
+        &painter,
+        rect.right_bottom(),
+        rect.left_bottom(),
+        stroke,
+    );
+    paint_dotted_line(
+        &painter,
+        rect.left_bottom(),
+        rect.left_top(),
+        stroke,
+    );
+}
+
+fn paint_dotted_line(painter: &Painter, start: Pos2, end: Pos2, stroke: Stroke) {
+    let line = end - start;
+    let length = line.length();
+    if length <= 0.0 {
+        return;
+    }
+
+    let direction = line / length;
+    let dash = 7.0;
+    let gap = 5.0;
+    let mut offset = 0.0;
+
+    while offset < length {
+        let segment_end = (offset + dash).min(length);
+        painter.line_segment(
+            [start + direction * offset, start + direction * segment_end],
+            stroke,
+        );
+        offset += dash + gap;
+    }
+}
+
+fn resizable_chat_pane(
+    ui: &mut Ui,
+    ctx: &Context,
+    group_id: &str,
+    member_id: &str,
+    pane_size: &mut Vec2,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    let available = ui.available_size();
+    let min_size = egui::vec2(
+        CHAT_WINDOW_MIN_SIZE.x.min(available.x.max(1.0)),
+        CHAT_WINDOW_MIN_SIZE.y.min(available.y.max(1.0)),
+    );
+    let max_size = egui::vec2(
+        GROUP_MEMBER_CHAT_MAX_SIZE
+            .x
+            .min(available.x.max(min_size.x)),
+        GROUP_MEMBER_CHAT_MAX_SIZE
+            .y
+            .min(available.y.max(min_size.y)),
+    );
+    pane_size.x = pane_size.x.clamp(min_size.x, max_size.x);
+    pane_size.y = pane_size.y.clamp(min_size.y, max_size.y);
+
+    let (rect, _) = ui.allocate_exact_size(*pane_size, Sense::hover());
+    let mut pane_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(
+                egui::Align::LEFT,
+            )),
+    );
+    add_contents(&mut pane_ui);
+
+    let handle_size = Vec2::splat(GROUP_MEMBER_RESIZE_HANDLE_SIZE);
+    let handle_rect = Rect::from_min_size(
+        rect.right_bottom() - handle_size,
+        handle_size,
+    );
+    let handle_id = Id::new((
+        group_id,
+        member_id,
+        "manual_chat_pane_resize",
+    ));
+    let handle_response = ui.interact(handle_rect, handle_id, Sense::drag());
+    if handle_response.dragged() {
+        *pane_size += handle_response.drag_delta();
+        pane_size.x = pane_size.x.clamp(min_size.x, max_size.x);
+        pane_size.y = pane_size.y.clamp(min_size.y, max_size.y);
+        ctx.request_repaint();
+    }
+
+    let stroke = ui.style().interact(&handle_response).fg_stroke;
+    let painter = ui.painter();
+    for offset in [4.0, 8.0, 12.0] {
+        painter.line_segment(
+            [
+                egui::pos2(
+                    handle_rect.right() - offset,
+                    handle_rect.bottom(),
+                ),
+                egui::pos2(
+                    handle_rect.right(),
+                    handle_rect.bottom() - offset,
+                ),
+            ],
+            stroke,
+        );
+    }
+    if handle_response.hovered() || handle_response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+    }
 }
 
 fn player_text_lines(messages: &[NapcatMessage]) -> Vec<String> {
@@ -381,6 +732,7 @@ fn player_text_lines(messages: &[NapcatMessage]) -> Vec<String> {
                 .filter_map(|chain| match &chain.variant {
                     NapcatMessageChainType::Text { data } => Some(data.text.trim()),
                     NapcatMessageChainType::Source(_) => None,
+                    NapcatMessageChainType::Unsupported => None,
                 })
                 .filter(|text| !text.is_empty())
                 .collect::<Vec<_>>()
@@ -411,7 +763,11 @@ fn queue_summary_if_needed(
     }
 
     if let Some(summary) = deepseek_manager.summaries.get(target_id) {
-        if summary.pending || summary.message_count == message_count {
+        if summary
+            .blocks
+            .iter()
+            .any(|block| block.message_count == message_count)
+        {
             return;
         }
     }
@@ -447,26 +803,28 @@ fn queue_summary_if_needed(
 
     match send_result {
         Ok(()) => {
-            deepseek_manager.summaries.insert(
-                target_id.to_owned(),
-                crate::deepseek::DeepseekSummary {
+            deepseek_manager
+                .summaries
+                .entry(target_id.to_owned())
+                .or_default()
+                .upsert_block(DeepseekSummaryBlock {
                     latest: String::new(),
                     message_count,
                     pending: true,
                     error: None,
-                },
-            );
+                });
         },
         Err(error) => {
-            deepseek_manager.summaries.insert(
-                target_id.to_owned(),
-                crate::deepseek::DeepseekSummary {
+            deepseek_manager
+                .summaries
+                .entry(target_id.to_owned())
+                .or_default()
+                .upsert_block(DeepseekSummaryBlock {
                     latest: String::new(),
                     message_count,
                     pending: false,
                     error: Some(error),
-                },
-            );
+                });
         },
     }
 }
@@ -502,15 +860,24 @@ fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: 
 
             ui.group(|ui| {
                 ui.label(format!(
-                    "{} / {} 条",
-                    nickname, summary.message_count
+                    "{} / {} 个总结",
+                    nickname,
+                    summary.blocks.len()
                 ));
-                if summary.pending {
-                    ui.label("总结中...");
-                } else if let Some(error) = &summary.error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
-                } else {
-                    ui.label(summary.latest.trim());
+                for block in &summary.blocks {
+                    let start = block.message_count.saturating_sub(4);
+                    ui.separator();
+                    ui.label(format!(
+                        "{}-{} 条",
+                        start, block.message_count
+                    ));
+                    if block.pending {
+                        ui.label("总结中...");
+                    } else if let Some(error) = &block.error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    } else {
+                        ui.label(block.latest.trim());
+                    }
                 }
             });
         }
@@ -529,6 +896,7 @@ pub fn ui_system(
     mut has_run_once: Local<bool>,
     mut new_chat_group_modal_string_open: Local<(String, bool)>,
     mut chat_input_msgs: Local<HashMap<String, String>>,
+    mut group_member_sizes: Local<HashMap<(String, String), Vec2>>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -570,6 +938,7 @@ pub fn ui_system(
                             new_chat_group_modal_string_open.0.to_owned(),
                             ChatGroup { members: vec![] },
                         );
+                        manager.persist().ok();
                         reset_data(&mut new_chat_group_modal_string_open);
                     }
                     if ui.button("Cancel").clicked() {
@@ -609,14 +978,17 @@ pub fn ui_system(
 
     egui::CentralPanel::default().show(ctx, |ui| {
         for (k, v) in &manager.groups.clone() {
-            egui::Window::new(format!("讨论组: {}", k))
-                .vscroll(true)
+            let group_title = chat_group_title(&k, v, &manager.messages);
+            let group_size = group_chat_inner_size(v.members.len(), ui.max_rect());
+            let response = egui::Window::new(group_title)
                 .open(&mut true)
                 .constrain_to(ui.max_rect())
                 .id(Id::new(k))
-                .order(egui::Order::Background)
+                .default_pos(ui.max_rect().left_top() + egui::vec2(12.0, 12.0))
+                .default_size(group_size)
+                .min_size(CHAT_WINDOW_MIN_SIZE)
+                .max_size(ui.max_rect().size())
                 .show(ctx, |ui| {
-                    group_rects.insert(k.clone(), ui.max_rect());
                     for member_id in &v.members {
                         let Some(messages) = manager.messages.get(member_id).cloned() else {
                             continue;
@@ -627,25 +999,81 @@ pub fn ui_system(
                             deepseek_sender,
                             &mut deepseek_manager,
                         );
-                        let (nickname, heights) = get_nickname_lens(member_id.clone(), &messages);
-                        let id = egui::Id::new(member_id);
-                        chat_window(
-                            nickname,
-                            id,
-                            ui.max_rect(),
+
+                        let pane_key = (k.clone(), member_id.clone());
+                        let mut pane_size = *group_member_sizes
+                            .entry(pane_key.clone())
+                            .or_insert(GROUP_MEMBER_CHAT_SIZE);
+                        resizable_chat_pane(
+                            ui,
                             ctx,
-                            heights,
-                            &messages,
-                            napcat_sender,
+                            k,
                             member_id,
-                            &mut chat_input_msgs,
-                            targets_for_messages(member_id, &messages),
-                            &mut ime,
-                            &group_rects,
-                            &mut manager,
+                            &mut pane_size,
+                            |ui| {
+                                chat_body_ui(
+                                    ui,
+                                    ctx,
+                                    &messages,
+                                    napcat_sender,
+                                    member_id,
+                                    &mut chat_input_msgs,
+                                    targets_for_messages(member_id, &messages),
+                                    &mut ime,
+                                    None,
+                                );
+                            },
                         );
+                        group_member_sizes.insert(pane_key, pane_size);
+                        if member_id != v.members.last().unwrap_or(member_id) {
+                            ui.add_space(GROUP_CHAT_SEPARATOR_HEIGHT * 0.5);
+                            ui.separator();
+                            ui.add_space(GROUP_CHAT_SEPARATOR_HEIGHT * 0.5);
+                        }
                     }
+
+                    group_broadcast_input_ui(
+                        ui,
+                        ctx,
+                        &k,
+                        &v.members,
+                        &manager.messages,
+                        napcat_sender,
+                        &mut chat_input_msgs,
+                        &mut ime,
+                    );
                 });
+
+            if let Some(response) = response {
+                group_rects.insert(k.clone(), response.response.rect);
+                if v.members.len() == 1 {
+                    let member_id = v.members[0].clone();
+                    let button_size = egui::vec2(52.0, 22.0);
+                    let button_pos = egui::pos2(
+                        response.response.rect.right() - button_size.x - 8.0,
+                        response.response.rect.top() + 34.0,
+                    );
+                    egui::Area::new(Id::new((
+                        k,
+                        member_id.as_str(),
+                        "leave_group_overlay",
+                    )))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(button_pos)
+                    .show(ctx, |ui| {
+                        if ui
+                            .add_sized(button_size, egui::Button::new("离开"))
+                            .on_hover_text("离开讨论组")
+                            .clicked()
+                        {
+                            if let Some(group) = manager.groups.get_mut(k) {
+                                group.members.retain(|id| id != &member_id);
+                                manager.persist().ok();
+                            }
+                        }
+                    });
+                }
+            }
         }
 
         for (target_id, messages) in manager.messages.clone() {

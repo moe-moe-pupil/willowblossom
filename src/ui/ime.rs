@@ -1,7 +1,4 @@
-use std::{
-    cmp::min,
-    collections::HashMap,
-};
+use std::collections::HashMap;
 
 use bevy::prelude::*;
 use bevy_egui::egui;
@@ -101,6 +98,7 @@ impl ImeManager {
         target_id: &str,
         text: &mut String,
         width: f32,
+        desired_rows: usize,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         sender: &NapcatIOSender,
@@ -116,6 +114,7 @@ impl ImeManager {
             width,
             text,
             EditType::MultiLine,
+            desired_rows,
             ui,
             ctx,
             "",
@@ -366,6 +365,7 @@ impl ImeText {
         width: f32,
         text: &mut String,
         edit_type: EditType,
+        desired_rows: usize,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         autocompletion_text_len: &str,
@@ -405,16 +405,7 @@ impl ImeText {
                 .show(ui),
             _ => egui::TextEdit::multiline(&mut tmp_text)
                 .desired_width(width)
-                .desired_rows(min(
-                    20,
-                    (ui.max_rect().height()
-                        / ui.style()
-                            .text_styles
-                            .get(&egui::TextStyle::Body)
-                            .unwrap()
-                            .size)
-                        .floor() as usize,
-                ))
+                .desired_rows(desired_rows)
                 .layouter(&mut lyt)
                 .lock_focus(true)
                 .show(ui),

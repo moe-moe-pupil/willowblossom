@@ -56,10 +56,30 @@ pub struct DeepseekManager {
 
 #[derive(Debug, Default, Clone)]
 pub struct DeepseekSummary {
+    pub blocks: Vec<DeepseekSummaryBlock>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DeepseekSummaryBlock {
     pub latest: String,
     pub message_count: usize,
     pub pending: bool,
     pub error: Option<String>,
+}
+
+impl DeepseekSummary {
+    pub fn upsert_block(&mut self, block: DeepseekSummaryBlock) {
+        if let Some(existing) = self
+            .blocks
+            .iter_mut()
+            .find(|existing| existing.message_count == block.message_count)
+        {
+            *existing = block;
+        } else {
+            self.blocks.push(block);
+            self.blocks.sort_by_key(|block| block.message_count);
+        }
+    }
 }
 
 const SUMMARY_SYSTEM_PROMPT: &str = "\
@@ -399,7 +419,9 @@ fn message_system(
             }) => {
                 deepseek_manager
                     .summaries
-                    .insert(target_id, DeepseekSummary {
+                    .entry(target_id)
+                    .or_default()
+                    .upsert_block(DeepseekSummaryBlock {
                         latest: text,
                         message_count,
                         pending: false,
@@ -413,7 +435,9 @@ fn message_system(
             }) => {
                 deepseek_manager
                     .summaries
-                    .insert(target_id, DeepseekSummary {
+                    .entry(target_id)
+                    .or_default()
+                    .upsert_block(DeepseekSummaryBlock {
                         latest: String::new(),
                         message_count,
                         pending: false,
