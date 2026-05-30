@@ -2,7 +2,6 @@ mod ime;
 use std::{
     collections::HashMap,
     path::Path,
-    time::Duration,
 };
 mod components;
 
@@ -30,6 +29,7 @@ use bevy_egui::{
     },
     EguiContexts,
     EguiPlugin,
+    EguiPrimaryContextPass,
 };
 use bevy_persistent::{
     Persistent,
@@ -40,15 +40,14 @@ use serde::{
     Deserialize,
     Serialize,
 };
-use serde_json::json;
-use tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::{
     deepseek::{
-        self,
         DeepseekIOSender,
         DeepseekManager,
         DeepseekPlugin,
+        DeepseekRequest,
     },
     napcat::{
         ChatGroup,
@@ -56,18 +55,14 @@ use crate::{
         NapcatMessage,
         NapcatMessageChainType,
         NapcatMessageManager,
+        NapcatMessageType,
+        NapcatSendManager,
     },
 };
 pub struct UIPlugin;
 #[derive(Resource)]
 pub struct GIFImages {
     images: HashMap<String, Vec<(TextureHandle, u32)>>,
-}
-
-#[derive(Resource)]
-pub struct AutoCompletionTime {
-    /// track when the bomb should explode (non-repeating timer)
-    pub timer: Timer,
 }
 
 pub struct CircleImageButton {
@@ -136,27 +131,23 @@ impl Plugin for UIPlugin {
             .add_plugins(DeepseekPlugin)
             .add_systems(Startup, setup_system)
             .add_systems(
-                Update,
+                EguiPrimaryContextPass,
                 load_ui_memory.run_if(resource_added::<Persistent<CachedMemory>>),
             )
             .add_systems(
-                Update,
+                EguiPrimaryContextPass,
+                configure_ui_fonts.after(load_ui_memory),
+            )
+            .add_systems(
+                EguiPrimaryContextPass,
                 ui_system
-                    .run_if(resource_exists::<NapcatIOSender>)
-                    .run_if(resource_exists::<DeepseekIOSender>)
+                    .run_if(resource_exists::<Persistent<CachedMemory>>)
                     .after(load_ui_memory),
             );
     }
 }
 
-pub fn setup_system(
-    mut command: Commands,
-    mut egui_context: EguiContexts,
-    mut windows: Query<&mut Window>,
-) {
-    let Ok(ctx) = egui_context.ctx_mut() else {
-        return;
-    };
+pub fn setup_system(mut command: Commands, mut windows: Query<&mut Window>) {
     let config_dir = Path::new(".data").join("willowblossom");
     let cached_memory = Persistent::<CachedMemory>::builder()
         .name("ui_memory")
@@ -165,30 +156,77 @@ pub fn setup_system(
         .default(CachedMemory {
             ui_memory: Memory::default(),
         })
+        .revertible(true)
+        .revert_to_default_on_deserialization_errors(true)
         .build()
-        .expect("failed to init messages");
+        .expect("failed to init ui memory");
     command.insert_resource(cached_memory);
-    command.insert_resource(AutoCompletionTime {
-        timer: Timer::new(Duration::from_secs(5), TimerMode::Once),
+    command.insert_resource(GIFImages {
+        images: HashMap::default(),
     });
+
     let Ok(mut window) = windows.single_mut() else {
         return;
     };
     window.ime_enabled = true;
-    let mut txt_font = egui::FontDefinitions::default();
-    txt_font
+}
+
+pub fn configure_ui_fonts(mut egui_context: EguiContexts, mut fonts_configured: Local<bool>) {
+    if *fonts_configured {
+        return;
+    }
+
+    let Ok(ctx) = egui_context.ctx_mut() else {
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "cjk".to_owned(),
+        egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/AlibabaHealthFont.ttf"
+        ))
+        .into(),
+    );
+    fonts
         .families
-        .get_mut(&egui::FontFamily::Proportional)
-        .unwrap()
-        .insert(0, "Meiryo".to_owned());
-    let fd = egui::FontData::from_static(include_bytes!(
-        "../../assets/fonts/AlibabaHealthFont.ttf"
-    ));
-    txt_font.font_data.insert("Meiryo".to_owned(), fd.into());
-    ctx.set_fonts(txt_font);
-    command.insert_resource(GIFImages {
-        images: HashMap::default(),
-    })
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "cjk".to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "cjk".to_owned());
+
+    let mut style = (*ctx.style()).clone();
+    style.text_styles = [
+        (
+            egui::TextStyle::Heading,
+            egui::FontId::new(18.0, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Body,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Monospace,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Button,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Small,
+            egui::FontId::new(10.0, egui::FontFamily::Proportional),
+        ),
+    ]
+    .into();
+
+    ctx.set_fonts(fonts);
+    ctx.set_style(style);
+    *fonts_configured = true;
 }
 
 pub fn load_ui_memory(
@@ -208,28 +246,29 @@ fn chat_window(
     ctx: &Context,
     lens: Vec<usize>,
     messages: &Vec<NapcatMessage>,
-    napcat_sender: &NapcatIOSender,
-    deepseek_sender: &DeepseekIOSender,
+    napcat_sender: Option<&NapcatIOSender>,
     target_id: &str,
     chat_input_msgs: &mut Local<HashMap<String, String>>,
-    target_ids: Vec<String>,
+    targets: Vec<NapcatSendTarget>,
     ime: &mut ResMut<ImeManager>,
     group_rects: &HashMap<String, Rect>,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
-    auto_completion_timer: &mut Timer,
-    deepseek_manager: &mut DeepseekManager,
 ) {
     // TODO: find the way to get the real font_height correctly
     let font_height = 64.0;
+    let input_height = 84.0;
     egui::Window::new(nickname)
-        .vscroll(true)
         .open(&mut true)
         .id(id)
         .constrain_to(rect)
         .show(ctx, |ui| {
-            let width = ui.max_rect().width();
+            let width = ui.available_width();
+            let message_height =
+                (ui.available_height() - input_height - ui.spacing().item_spacing.y).max(0.0);
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
+                .max_height(message_height)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for (message, len) in messages.iter().zip(lens.iter()) {
                         ui.allocate_ui_with_layout(
@@ -259,50 +298,33 @@ fn chat_window(
                     }
                 });
 
-            ui.with_layout(
-                egui::Layout::bottom_up(egui::Align::Center),
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, input_height),
+                egui::Layout::top_down(egui::Align::Center),
                 |ui| {
                     if !chat_input_msgs.contains_key(target_id) {
                         chat_input_msgs.insert(target_id.to_owned(), String::new());
                     }
 
                     let text = chat_input_msgs.get_mut(target_id).unwrap();
-                    let mut text_to_deepseek = text.clone();
-                    let teo_m = ime.chat_input_multiline(
+                    let Some(napcat_sender) = napcat_sender else {
+                        ui.add_enabled(
+                            false,
+                            egui::TextEdit::multiline(text)
+                                .desired_width(ui.available_width())
+                                .desired_rows(3),
+                        );
+                        return;
+                    };
+                    let _ = ime.chat_input_multiline(
+                        target_id,
                         text,
-                        ui.max_rect().width(),
+                        ui.available_width(),
                         ui,
                         ctx,
                         napcat_sender,
-                        target_ids,
-                        &mut deepseek_manager.last_fim_response,
+                        targets,
                     );
-
-                    if teo_m.response.has_focus() {
-                        let cursor_idx = teo_m.cursor_range.unwrap().primary.index;
-                        if cursor_idx <= text_to_deepseek.chars().count() {
-                            // Find the byte index corresponding to the 4th character
-                            let byte_index = text_to_deepseek
-                                .char_indices()
-                                .nth(cursor_idx)
-                                .map(|(idx, _)| idx)
-                                .unwrap_or(text_to_deepseek.len());
-
-                            // Insert the character at the correct byte index
-                            text_to_deepseek.insert(byte_index, '|');
-                            if deepseek_manager.last_post_text != *text_to_deepseek {
-                                deepseek_manager.last_fim_response = "".to_string();
-                                if auto_completion_timer.is_finished() {
-                                    deepseek_manager.last_post_text = text_to_deepseek.to_string();
-                                    let err = deepseek_sender
-                                        .0
-                                        .try_send(Message::Text(text_to_deepseek.into()))
-                                        .expect("can't send message to deepseek");
-                                    auto_completion_timer.reset();
-                                }
-                            }
-                        }
-                    }
                 },
             );
         })
@@ -347,25 +369,183 @@ pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&
     (nickname, lens)
 }
 
+fn player_text_lines(messages: &[NapcatMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.data.user_id != message.data.self_id)
+        .filter_map(|message| {
+            let text = message
+                .data
+                .message
+                .iter()
+                .filter_map(|chain| match &chain.variant {
+                    NapcatMessageChainType::Text { data } => Some(data.text.trim()),
+                    NapcatMessageChainType::Source(_) => None,
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            if text.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "{}: {}",
+                    message.data.sender.nickname, text
+                ))
+            }
+        })
+        .collect()
+}
+
+fn queue_summary_if_needed(
+    target_id: &str,
+    messages: &[NapcatMessage],
+    deepseek_sender: Option<&DeepseekIOSender>,
+    deepseek_manager: &mut DeepseekManager,
+) {
+    let lines = player_text_lines(messages);
+    let message_count = lines.len();
+    if message_count == 0 || message_count % 5 != 0 {
+        return;
+    }
+
+    if let Some(summary) = deepseek_manager.summaries.get(target_id) {
+        if summary.pending || summary.message_count == message_count {
+            return;
+        }
+    }
+
+    let Some(deepseek_sender) = deepseek_sender else {
+        return;
+    };
+
+    let request = DeepseekRequest::Summary {
+        target_id: target_id.to_owned(),
+        message_count,
+        text: lines
+            .iter()
+            .rev()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+
+    let send_result = serde_json::to_string(&request)
+        .map(|request| Message::Text(request.into()))
+        .map_err(|err| err.to_string())
+        .and_then(|request| {
+            deepseek_sender
+                .0
+                .try_send(request)
+                .map_err(|err| err.to_string())
+        });
+
+    match send_result {
+        Ok(()) => {
+            deepseek_manager.summaries.insert(
+                target_id.to_owned(),
+                crate::deepseek::DeepseekSummary {
+                    latest: String::new(),
+                    message_count,
+                    pending: true,
+                    error: None,
+                },
+            );
+        },
+        Err(error) => {
+            deepseek_manager.summaries.insert(
+                target_id.to_owned(),
+                crate::deepseek::DeepseekSummary {
+                    latest: String::new(),
+                    message_count,
+                    pending: false,
+                    error: Some(error),
+                },
+            );
+        },
+    }
+}
+
+fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: &DeepseekManager) {
+    ui.heading("DeepSeek 总结");
+    ui.separator();
+
+    if deepseek_manager.summaries.is_empty() {
+        ui.label("暂无总结");
+        ui.allocate_rect(
+            ui.available_rect_before_wrap(),
+            egui::Sense::hover(),
+        );
+        return;
+    }
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        let mut summaries = deepseek_manager.summaries.iter().collect::<Vec<_>>();
+        summaries.sort_by_key(|(target_id, _)| target_id.as_str());
+
+        for (target_id, summary) in summaries {
+            let nickname = manager
+                .messages
+                .get(target_id)
+                .map(|messages| {
+                    get_nickname_lens(target_id.to_string(), messages)
+                        .0
+                        .to_owned()
+                })
+                .filter(|nickname| !nickname.is_empty())
+                .unwrap_or_else(|| target_id.to_string());
+
+            ui.group(|ui| {
+                ui.label(format!(
+                    "{} / {} 条",
+                    nickname, summary.message_count
+                ));
+                if summary.pending {
+                    ui.label("总结中...");
+                } else if let Some(error) = &summary.error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                } else {
+                    ui.label(summary.latest.trim());
+                }
+            });
+        }
+    });
+}
+
 pub fn ui_system(
     mut contexts: EguiContexts,
     mut ime: ResMut<ImeManager>,
-    napcat_sender: Res<NapcatIOSender>,
-    deepseek_sender: Res<DeepseekIOSender>,
+    napcat_sender: Option<Res<NapcatIOSender>>,
+    deepseek_sender: Option<Res<DeepseekIOSender>>,
+    mut deepseek_manager: ResMut<DeepseekManager>,
+    mut send_manager: ResMut<NapcatSendManager>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
     mut cached_memory: ResMut<Persistent<CachedMemory>>,
     mut has_run_once: Local<bool>,
     mut new_chat_group_modal_string_open: Local<(String, bool)>,
     mut chat_input_msgs: Local<HashMap<String, String>>,
-    time: Res<Time>,
-    mut auto_completion_time: ResMut<AutoCompletionTime>,
-    mut deepseek_manager: ResMut<DeepseekManager>,
 ) {
-    auto_completion_time.timer.tick(time.delta());
-
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
+    let napcat_sender = napcat_sender.as_deref();
+    let deepseek_sender = deepseek_sender.as_deref();
+    for (target_id, pending_text) in ime.apply_send_results(send_manager.results.drain(..)) {
+        if let Some(text) = chat_input_msgs.get_mut(&target_id) {
+            let should_clear = match pending_text.as_deref() {
+                Some(pending_text) => text.trim() == pending_text,
+                None => true,
+            };
+            if should_clear {
+                text.clear();
+            }
+        }
+    }
 
     let mut group_rects = HashMap::default();
     let reset_data = |new_chat_group_modal_string_bool: &mut Local<'_, (String, bool)>| {
@@ -418,11 +598,13 @@ pub fn ui_system(
     egui::SidePanel::right("right_panel")
         .resizable(true)
         .show(ctx, |ui| {
-            ui.label("Right resizeable panel");
-            ui.allocate_rect(
-                ui.available_rect_before_wrap(),
-                egui::Sense::hover(),
-            );
+            if napcat_sender.is_none() {
+                ui.label("NapCat websocket not connected");
+            }
+            if deepseek_sender.is_none() {
+                ui.label("Deepseek worker not ready");
+            }
+            summary_panel(ui, &manager, &deepseek_manager);
         });
 
     egui::CentralPanel::default().show(ctx, |ui| {
@@ -439,6 +621,12 @@ pub fn ui_system(
                         let Some(messages) = manager.messages.get(member_id).cloned() else {
                             continue;
                         };
+                        queue_summary_if_needed(
+                            member_id,
+                            &messages,
+                            deepseek_sender,
+                            &mut deepseek_manager,
+                        );
                         let (nickname, heights) = get_nickname_lens(member_id.clone(), &messages);
                         let id = egui::Id::new(member_id);
                         chat_window(
@@ -448,16 +636,13 @@ pub fn ui_system(
                             ctx,
                             heights,
                             &messages,
-                            &napcat_sender,
-                            &deepseek_sender,
+                            napcat_sender,
                             member_id,
                             &mut chat_input_msgs,
-                            vec![member_id.to_string()],
+                            targets_for_messages(member_id, &messages),
                             &mut ime,
                             &group_rects,
                             &mut manager,
-                            &mut auto_completion_time.timer,
-                            &mut deepseek_manager,
                         );
                     }
                 });
@@ -477,7 +662,13 @@ pub fn ui_system(
 
             let rect = ui.max_rect();
             let (nickname, heights) = get_nickname_lens(target_id.clone(), &messages);
-            let target_ids = vec![target_id.clone()];
+            let targets = targets_for_messages(&target_id, &messages);
+            queue_summary_if_needed(
+                &target_id,
+                &messages,
+                deepseek_sender,
+                &mut deepseek_manager,
+            );
 
             if manager
                 .groups
@@ -494,16 +685,13 @@ pub fn ui_system(
                 ctx,
                 heights,
                 &messages,
-                &napcat_sender,
-                &deepseek_sender,
+                napcat_sender,
                 &target_id,
                 &mut chat_input_msgs,
-                target_ids,
+                targets,
                 &mut ime,
                 &group_rects,
                 &mut manager,
-                &mut auto_completion_time.timer,
-                &mut deepseek_manager,
             );
         }
     });
@@ -511,5 +699,16 @@ pub fn ui_system(
     ctx.memory(|m| {
         cached_memory.ui_memory = m.clone();
     });
-    cached_memory.persist().ok();
+}
+
+fn targets_for_messages(target_id: &str, messages: &[NapcatMessage]) -> Vec<NapcatSendTarget> {
+    let Ok(target_id) = target_id.parse::<u64>() else {
+        eprintln!("invalid NapCat target id: {target_id}");
+        return Vec::new();
+    };
+
+    match messages.first().map(|message| &message.data.message_type) {
+        Some(NapcatMessageType::Group) => vec![NapcatSendTarget::Group(target_id)],
+        _ => vec![NapcatSendTarget::Private(target_id)],
+    }
 }

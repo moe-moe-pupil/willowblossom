@@ -1,27 +1,26 @@
-use std::cmp::min;
+use std::{
+    cmp::min,
+    collections::HashMap,
+};
 
 use bevy::prelude::*;
-use bevy_egui::egui::{
-    self,
-    Color32,
-    FontSelection,
-    Pos2,
-    TextWrapMode,
-    WidgetText,
-};
-use bevy_persistent::Persistent;
+use bevy_egui::egui;
 use serde_json::json;
 use tungstenite::Message;
 
-use crate::{
-    deepseek::filter_control_characters,
-    napcat::{
-        NapcatIOSender,
-        NapcatMessageManager,
-    },
+use crate::napcat::{
+    NapcatIOSender,
+    NapcatOutboundMessage,
+    NapcatSendResult,
 };
 
 pub struct ImePlugin;
+
+#[derive(Clone, Debug)]
+pub enum NapcatSendTarget {
+    Private(u64),
+    Group(u64),
+}
 
 impl Plugin for ImePlugin {
     fn build(&self, app: &mut App) {
@@ -70,12 +69,23 @@ fn clear_unused_ime(
 pub struct ImeManager {
     count: usize,
     ime_texts: Vec<ImeText>,
+    next_send_request_id: u64,
+    send_states: HashMap<String, ChatInputSendState>,
+}
+
+#[derive(Debug, Default)]
+struct ChatInputSendState {
+    pending_request_ids: Vec<u64>,
+    pending_text: Option<String>,
+    error: Option<String>,
 }
 impl Default for ImeManager {
     fn default() -> ImeManager {
         ImeManager {
             count: 0,
             ime_texts: Vec::new(),
+            next_send_request_id: 1,
+            send_states: HashMap::new(),
         }
     }
 }
@@ -88,78 +98,162 @@ impl ImeManager {
     /// ```
     pub fn chat_input_multiline(
         &mut self,
+        target_id: &str,
         text: &mut String,
         width: f32,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         sender: &NapcatIOSender,
-        target_ids: Vec<String>,
-        autocompletion_text: &mut String,
+        targets: Vec<NapcatSendTarget>,
     ) -> egui::text_edit::TextEditOutput {
         if self.count >= self.ime_texts.len() {
             self.add();
             self.ime_texts[self.count].text = text.to_string();
         }
+        self.ime_texts[self.count].target_id = target_id.to_owned();
+        let text_before_edit = self.ime_texts[self.count].text.clone();
         let teo = self.ime_texts[self.count].get_text_edit_output(
             width,
             text,
             EditType::MultiLine,
             ui,
             ctx,
-            autocompletion_text,
+            "",
         );
+        let send_on_enter = teo.response.has_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
 
-        if self.ime_texts[self.count].is_focus && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
-            let cursor_idx = teo.cursor_range.unwrap().primary.index;
-            // Find the byte index corresponding to the 4th character
-            let byte_index = self.ime_texts[self.count]
-                .text
-                .char_indices()
-                .nth(cursor_idx)
-                .map(|(idx, _)| idx)
-                .unwrap_or(self.ime_texts[self.count].text.len());
-            self.ime_texts[self.count]
-                .text
-                .insert_str(byte_index, autocompletion_text);
-            self.ime_texts[self.count].text =
-                filter_control_characters(&self.ime_texts[self.count].text);
-            *autocompletion_text = "".to_owned();
+        if send_on_enter {
+            ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            });
+            self.ime_texts[self.count].text = text_before_edit;
+            *text = self.ime_texts[self.count].text.clone();
         }
 
-        if self.ime_texts[self.count].is_focus
-            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
-        {
-            println!("{}", self.ime_texts[self.count].text);
-            for target_qq in target_ids {
-                let err = sender
-                    .0
-                    .try_send(Message::Text(
-                        json!({
-                            "action": "send_private_msg",
-                            "params": {
-                                "user_id": target_qq,
-                                "message_type": "private",
-                                "message": [
-                                    {
-                                        "type": "text",
-                                        "data": {
-                                            "text": self.ime_texts[self.count].text
-                                        }
-                                    }
-                                ]
-                            }
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .expect("can't send message");
+        let send_state = self.send_states.entry(target_id.to_owned()).or_default();
+        if send_state.pending_request_ids.is_empty() {
+            if let Some(error) = &send_state.error {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+        } else {
+            ui.label("发送中...");
+        }
+
+        if send_on_enter {
+            if !send_state.pending_request_ids.is_empty() {
+                self.ime_texts[self.count].id = teo.response.id.short_debug_format();
+                self.count += 1;
+                return teo;
             }
 
-            self.ime_texts[self.count].text = "".to_string();
+            let message_text = self.ime_texts[self.count].text.trim().to_owned();
+            if message_text.is_empty() {
+                self.ime_texts[self.count].text.clear();
+                *text = String::new();
+                self.count += 1;
+                return teo;
+            }
+
+            if targets.is_empty() {
+                send_state.error = Some("no valid NapCat target for outbound message".to_owned());
+                self.ime_texts[self.count].id = teo.response.id.short_debug_format();
+                self.count += 1;
+                return teo;
+            }
+
+            let mut pending_request_ids = Vec::new();
+            send_state.error = None;
+            for target in targets {
+                let (action, id_key, id) = match target {
+                    NapcatSendTarget::Private(user_id) => ("send_private_msg", "user_id", user_id),
+                    NapcatSendTarget::Group(group_id) => ("send_group_msg", "group_id", group_id),
+                };
+                let request_id = self.next_send_request_id;
+                self.next_send_request_id += 1;
+                let message = Message::Text(
+                    json!({
+                        "action": action,
+                        "params": {
+                            id_key: id,
+                            "message": [
+                                {
+                                    "type": "text",
+                                    "data": {
+                                        "text": message_text
+                                    }
+                                }
+                            ]
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                );
+
+                if let Err(err) = sender.0.try_send(NapcatOutboundMessage {
+                    request_id,
+                    target_id: target_id.to_owned(),
+                    message,
+                }) {
+                    send_state.error = Some(format!(
+                        "failed to queue NapCat websocket message: {err}"
+                    ));
+                    break;
+                }
+                pending_request_ids.push(request_id);
+            }
+
+            if send_state.error.is_none() {
+                send_state.pending_request_ids = pending_request_ids;
+                send_state.pending_text = Some(message_text);
+            } else if !pending_request_ids.is_empty() {
+                send_state.pending_request_ids = pending_request_ids;
+                send_state.pending_text = Some(message_text);
+            }
         }
         self.ime_texts[self.count].id = teo.response.id.short_debug_format();
         self.count += 1;
         return teo;
+    }
+
+    pub fn apply_send_results(
+        &mut self,
+        results: impl IntoIterator<Item = NapcatSendResult>,
+    ) -> Vec<(String, Option<String>)> {
+        let mut sent_targets = Vec::new();
+        for result in results {
+            let Some(state) = self.send_states.get_mut(&result.target_id) else {
+                continue;
+            };
+            state
+                .pending_request_ids
+                .retain(|request_id| *request_id != result.request_id);
+            if let Some(error) = result.error {
+                state.error = Some(error);
+                state.pending_text = None;
+            } else if state.pending_request_ids.is_empty() {
+                state.error = None;
+                let pending_text = state.pending_text.take();
+                sent_targets.push((
+                    result.target_id.clone(),
+                    pending_text.clone(),
+                ));
+                if let Some(text) = self
+                    .ime_texts
+                    .iter_mut()
+                    .find(|text| text.target_id == result.target_id)
+                {
+                    let should_clear = match pending_text.as_deref() {
+                        Some(pending_text) => text.text.trim() == pending_text,
+                        None => true,
+                    };
+                    if should_clear {
+                        text.text.clear();
+                    }
+                }
+            }
+        }
+        sent_targets
     }
 
     /// ```
@@ -202,6 +296,7 @@ enum EditType {
 #[derive(Debug)]
 struct ImeText {
     id: String,
+    target_id: String,
     screen_pos: Vec2,
     text: String,
     ime_string: String,
@@ -218,6 +313,7 @@ impl Default for ImeText {
     fn default() -> Self {
         ImeText {
             id: String::new(),
+            target_id: String::new(),
             text: String::new(),
             ime_string: String::new(),
             ime_string_index: 0,

@@ -10,7 +10,8 @@ pub struct CameraPlugin;
 
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(OnEnter(GameState::Play), init_camera)
+        app.add_systems(Startup, init_camera)
+            .add_systems(OnEnter(GameState::Play), init_camera)
             .add_systems(OnExit(GameState::Play), pause_camera);
     }
 }

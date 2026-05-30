@@ -1,10 +1,12 @@
 mod camera;
+mod deepseek;
 mod napcat;
 mod ui;
-mod deepseek;
 
 use bevy::{
-    prelude::*, window::WindowResolution,
+    log::LogPlugin,
+    prelude::*,
+    window::WindowResolution,
 };
 
 // [CHANGE]: Game title and resolution
@@ -61,7 +63,15 @@ impl Plugin for GamePlugin {
         #[cfg(feature = "pixel_perfect")]
         let image_plugin = ImagePlugin::default_nearest();
 
-        app.add_plugins(DefaultPlugins.set(window_plugin).set(image_plugin));
+        app.add_plugins(
+            DefaultPlugins
+                .set(LogPlugin {
+                    filter: "wgpu=error,naga=warn,bevy_persistent=warn".to_string(),
+                    ..default()
+                })
+                .set(window_plugin)
+                .set(image_plugin),
+        );
 
         // Game
         app.add_plugins((

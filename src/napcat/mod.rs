@@ -1,51 +1,38 @@
 use std::{
-    io::Read,
+    collections::HashMap,
     path::Path,
+    thread,
+    time::Duration,
 };
 
-use async_compat::Compat;
-use bevy_egui::egui::{
-    self,
-    Memory,
-    Modifiers,
-    TextureHandle,
-    Ui,
-};
 use bevy_persistent::prelude::*;
 extern crate dirs;
-use std::collections::HashMap;
 
-use bevy::{
-    ecs::world::CommandQueue,
-    prelude::*,
-    tasks::{
-        block_on,
-        AsyncComputeTaskPool,
-        IoTaskPool,
-        Task,
-    },
-};
+use bevy::prelude::*;
 use crossbeam_channel::{
     unbounded,
     Receiver as CBReceiver,
     Sender as CBSender,
 };
-
-use futures_lite::future;
 use futures_util::{
     SinkExt,
     StreamExt,
 };
-
-use tokio::sync::mpsc::Sender;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::protocol::Message,
-};
-
 use serde::{
     Deserialize,
     Serialize,
+};
+use tokio::{
+    runtime::Builder,
+    sync::mpsc::{
+        Receiver,
+        Sender,
+    },
+    time::sleep,
+};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::protocol::Message,
 };
 
 #[derive(States, Debug, Default, Clone, Eq, PartialEq, Hash)]
@@ -59,10 +46,29 @@ pub enum ConnectionState {
 struct NapcatIOReceiver(CBReceiver<Message>);
 
 #[derive(Resource)]
-pub struct NapcatIOSender(pub Sender<Message>);
+struct NapcatSendResultReceiver(CBReceiver<NapcatSendResult>);
 
 #[derive(Resource)]
-struct NapcatTask(Task<CommandQueue>);
+pub struct NapcatIOSender(pub Sender<NapcatOutboundMessage>);
+
+#[derive(Debug)]
+pub struct NapcatOutboundMessage {
+    pub request_id: u64,
+    pub target_id: String,
+    pub message: Message,
+}
+
+#[derive(Debug, Clone)]
+pub struct NapcatSendResult {
+    pub request_id: u64,
+    pub target_id: String,
+    pub error: Option<String>,
+}
+
+#[derive(Resource, Default)]
+pub struct NapcatSendManager {
+    pub results: Vec<NapcatSendResult>,
+}
 
 pub struct NapcatPlugin;
 
@@ -107,6 +113,7 @@ pub enum NapcatMessageChainType {
 #[serde(rename_all = "snake_case")]
 pub enum NapcatMessageType {
     Private,
+    Group,
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -126,6 +133,7 @@ pub struct NapcatMessageData {
     pub message: Vec<NapcatMessageChain>,
     pub self_id: u64,
     pub user_id: u64,
+    pub group_id: Option<u64>,
     pub target_id: Option<u64>,
     pub sender: NapcatSender,
 }
@@ -147,20 +155,26 @@ impl Plugin for NapcatPlugin {
         app.insert_state(ConnectionState::Disconnected)
             // .insert_resource(NapcatSocket { ..default() })
             .add_systems(Startup, setup)
-            .add_systems(Update, handle_tasks.run_if(resource_exists::<NapcatTask>))
-            .add_systems(Update, message_system);
+            .add_systems(Update, message_system)
+            .add_systems(Update, send_result_system);
     }
 }
 
 fn setup(mut commands: Commands) {
-    let thread_pool = AsyncComputeTaskPool::get();
     let (client_to_game_sender, client_to_game_receiver) = unbounded::<Message>();
+    let (game_to_client_sender, game_to_client_receiver) = tokio::sync::mpsc::channel(100);
+    let (send_result_sender, send_result_receiver) = unbounded::<NapcatSendResult>();
     let napcat_io = NapcatIOReceiver(client_to_game_receiver.clone());
-    let task = thread_pool.spawn(Compat::new(handle_connection(
+    let napcat_send_results = NapcatSendResultReceiver(send_result_receiver);
+    spawn_napcat_connection(
         client_to_game_sender.clone(),
-    )));
+        game_to_client_receiver,
+        send_result_sender,
+    );
     commands.insert_resource(napcat_io);
-    commands.insert_resource(NapcatTask(task));
+    commands.insert_resource(napcat_send_results);
+    commands.insert_resource(NapcatIOSender(game_to_client_sender));
+    commands.insert_resource(NapcatSendManager::default());
 
     let message_manager = NapcatMessageManager {
         messages: HashMap::default(),
@@ -178,53 +192,104 @@ fn setup(mut commands: Commands) {
     );
 }
 
-fn handle_tasks(mut commands: Commands, mut task: ResMut<NapcatTask>) {
-    if let Some(mut commands_queue) = block_on(future::poll_once(&mut task.0)) {
-        // append the returned command queue to have it execute later
-        commands.append(&mut commands_queue);
-    }
+fn spawn_napcat_connection(
+    client_to_game_sender: CBSender<Message>,
+    game_to_client_receiver: Receiver<NapcatOutboundMessage>,
+    send_result_sender: CBSender<NapcatSendResult>,
+) {
+    thread::Builder::new()
+        .name("napcat-websocket".to_owned())
+        .spawn(move || {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create NapCat Tokio runtime");
+            runtime.block_on(run_napcat_connection(
+                client_to_game_sender,
+                game_to_client_receiver,
+                send_result_sender,
+            ));
+        })
+        .expect("failed to spawn NapCat websocket thread");
 }
 
-async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> CommandQueue {
-    let (ws_stream, _) = connect_async("ws://localhost:3001")
-        .await
-        .expect("Failed to connect");
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    let (game_to_client_sender, mut game_to_client_receiver) = tokio::sync::mpsc::channel(100);
+async fn run_napcat_connection(
+    client_to_game_sender: CBSender<Message>,
+    mut game_to_client_receiver: Receiver<NapcatOutboundMessage>,
+    send_result_sender: CBSender<NapcatSendResult>,
+) {
+    const NAPCAT_WS_URL: &str = "ws://localhost:3001";
 
-    let mut command_queue = CommandQueue::default();
-    command_queue.push(move |world: &mut World| {
-        world.insert_resource(NapcatIOSender(game_to_client_sender));
-        world.remove_resource::<NapcatTask>();
-    });
-    let task_pool = IoTaskPool::get();
-    let _ = task_pool.spawn(async move {
+    loop {
+        let (ws_stream, _) = match connect_async(NAPCAT_WS_URL).await {
+            Ok(connection) => connection,
+            Err(err) => {
+                eprintln!("failed to connect NapCat websocket: {err}");
+                sleep(Duration::from_secs(2)).await;
+                continue;
+            },
+        };
+
+        eprintln!("connected to NapCat websocket at {NAPCAT_WS_URL}");
+        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
         loop {
             tokio::select! {
                 //Receive messages from the websocket
                 msg = ws_receiver.next() => {
                     match msg {
-                        Some(msg) => {
-                            let msg = msg.unwrap();
+                        Some(Ok(msg)) => {
                             if msg.is_text() || msg.is_binary() {
-                                client_to_game_sender.send(msg).expect("Could not send message");
+                                if client_to_game_sender.send(msg).is_err() {
+                                    return;
+                                }
                             } else if msg.is_close() {
                                 break;
                             }
                         }
+                        Some(Err(err)) => {
+                            eprintln!("NapCat websocket receive error: {err}");
+                            break;
+                        },
                         None => break,
                     }
                 }
                 //Receive messages from the game
-                game_msg = game_to_client_receiver.recv() => {
-                    let game_msg = game_msg.unwrap();
-                    let _ = ws_sender.send(game_msg).await;
+                outbound = game_to_client_receiver.recv() => {
+                    let Some(outbound) = outbound else {
+                        return;
+                    };
+                    if let Err(err) = ws_sender.send(outbound.message.clone()).await {
+                        let error = format!("NapCat websocket send error: {err}");
+                        eprintln!("{error}");
+                        let _ = send_result_sender.send(NapcatSendResult {
+                            request_id: outbound.request_id,
+                            target_id: outbound.target_id,
+                            error: Some(error),
+                        });
+                        break;
+                    }
+                    let _ = send_result_sender.send(NapcatSendResult {
+                        request_id: outbound.request_id,
+                        target_id: outbound.target_id,
+                        error: None,
+                    });
+                    eprintln!("sent NapCat websocket message");
                 }
             }
         }
-    }).detach();
 
-    command_queue
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn send_result_system(
+    receiver: Res<NapcatSendResultReceiver>,
+    mut send_manager: ResMut<NapcatSendManager>,
+) {
+    while let Ok(result) = receiver.0.try_recv() {
+        send_manager.results.push(result);
+    }
 }
 
 fn message_system(
@@ -235,10 +300,15 @@ fn message_system(
         let json_res = serde_json::from_str::<NapcatMessage>(&msg.to_string());
         if let Ok(json) = json_res {
             dbg!(&json);
-            let target_id = if json.data.user_id == json.data.self_id {
-                json.data.target_id.unwrap()
-            } else {
-                json.data.user_id
+            let target_id = match json.data.message_type {
+                NapcatMessageType::Private => {
+                    if json.data.user_id == json.data.self_id {
+                        json.data.target_id.unwrap_or(json.data.user_id)
+                    } else {
+                        json.data.user_id
+                    }
+                },
+                NapcatMessageType::Group => json.data.group_id.unwrap_or(json.data.user_id),
             };
 
             if manager.messages.contains_key(&target_id.to_string()) {
@@ -253,7 +323,7 @@ fn message_system(
 
             manager.persist().ok();
         } else {
-            // dbg!(json_res.err());
+            eprintln!("NapCat websocket response: {}", msg);
         }
     }
 }
