@@ -36,6 +36,11 @@ use tokio_tungstenite::{
     tungstenite::protocol::Message,
 };
 
+use crate::scene::{
+    SceneCaptureRequest,
+    SceneCaptureRequests,
+};
+
 #[derive(States, Debug, Default, Clone, Eq, PartialEq, Hash)]
 pub enum ConnectionState {
     #[default]
@@ -335,6 +340,7 @@ fn message_system(
     receiver: Res<NapcatIOReceiver>,
     sender: Option<Res<NapcatIOSender>>,
     mut auto_forward_ids: ResMut<NapcatAutoForwardRequestIds>,
+    mut scene_capture_requests: Option<ResMut<SceneCaptureRequests>>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
 ) {
     while let Ok(msg) = receiver.0.try_recv() {
@@ -354,6 +360,13 @@ fn message_system(
             let target_id = target_id.to_string();
 
             let auto_forward = auto_forward_request(&manager, &json, &target_id);
+            if is_scene_capture_command(&json) && json.data.user_id != json.data.self_id {
+                if let Some(scene_capture_requests) = scene_capture_requests.as_deref_mut() {
+                    scene_capture_requests.requests.push(SceneCaptureRequest {
+                        user_id: json.data.user_id,
+                    });
+                }
+            }
 
             manager
                 .messages
@@ -405,6 +418,25 @@ fn message_system(
             );
         }
     }
+}
+
+fn is_scene_capture_command(message: &NapcatMessage) -> bool {
+    let text = message_text(message);
+    matches!(text.trim(), "#观察" | "#gc")
+}
+
+fn message_text(message: &NapcatMessage) -> String {
+    message
+        .data
+        .message
+        .iter()
+        .filter_map(|chain| match &chain.variant {
+            NapcatMessageChainType::Text { data } => Some(data.text.as_str()),
+            NapcatMessageChainType::Source(_) => None,
+            NapcatMessageChainType::Unsupported => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 struct AutoForwardRequest {

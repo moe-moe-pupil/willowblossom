@@ -252,12 +252,12 @@ pub fn configure_ui_fonts(mut egui_context: EguiContexts, mut fonts_configured: 
 
 pub fn load_ui_memory(
     mut egui_context: EguiContexts,
-    _cached_memory: ResMut<Persistent<CachedMemory>>,
+    cached_memory: Res<Persistent<CachedMemory>>,
 ) {
     let Ok(ctx) = egui_context.ctx_mut() else {
         return;
     };
-    ctx.memory_mut(|m| *m = Memory::default());
+    ctx.memory_mut(|m| *m = cached_memory.ui_memory.clone());
 }
 
 fn chat_window(
@@ -1271,9 +1271,25 @@ pub fn ui_system(
             }
         });
 
+    let should_persist_ui_memory = ctx.input(|input| {
+        input.pointer.any_released()
+            || input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Copy
+                        | egui::Event::Cut
+                        | egui::Event::Paste(_)
+                        | egui::Event::Text(_)
+                        | egui::Event::Key { .. }
+                )
+            })
+    });
     ctx.memory(|m| {
         cached_memory.ui_memory = m.clone();
     });
+    if should_persist_ui_memory {
+        cached_memory.persist().ok();
+    }
 }
 
 fn targets_for_messages(target_id: &str, messages: &[NapcatMessage]) -> Vec<NapcatSendTarget> {
