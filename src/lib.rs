@@ -1,6 +1,7 @@
 mod camera;
 mod deepseek;
 mod napcat;
+pub mod rule_engine;
 mod scene;
 mod ui;
 
@@ -11,7 +12,7 @@ use bevy::{
 };
 
 // [CHANGE]: Game title and resolution
-pub const GAME_TITLE: &str = "willow blossom";
+pub const GAME_TITLE: &str = "柳絮，只是另一个跑团软件";
 
 // Game state
 #[derive(States, Debug, Default, Clone, Eq, PartialEq, Hash)]
@@ -78,6 +79,7 @@ impl Plugin for GamePlugin {
         app.add_plugins((
             camera::CameraPlugin,
             napcat::NapcatPlugin,
+            rule_engine::RuleEnginePlugin,
             scene::ScenePreviewPlugin,
             ui::UIPlugin,
         ));

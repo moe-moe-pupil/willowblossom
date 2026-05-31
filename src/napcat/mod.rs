@@ -1,5 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{
+        HashMap,
+        HashSet,
+    },
     path::Path,
     thread,
     time::Duration,
@@ -181,13 +184,210 @@ pub struct ChatGroup {
     pub members: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ChatTargetMetadata {
+    #[serde(default)]
+    pub display_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct CharacterStatus {
+    #[serde(default, rename = "str")]
+    pub str_: i32,
+    #[serde(default)]
+    pub agi: i32,
+    #[serde(default)]
+    pub dex: i32,
+    #[serde(default)]
+    pub vit: i32,
+    #[serde(default, rename = "int")]
+    pub int_: i32,
+    #[serde(default)]
+    pub wis: i32,
+    #[serde(default)]
+    pub k: i32,
+    #[serde(default)]
+    pub cha: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PlayerCharacter {
+    #[serde(default)]
+    pub inited: bool,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub nickname: String,
+    #[serde(default)]
+    pub image: String,
+    #[serde(default = "default_character_hp")]
+    pub hp: f32,
+    #[serde(default = "default_character_hp")]
+    pub max_hp: f32,
+    #[serde(default)]
+    pub hp_regen: f32,
+    #[serde(default)]
+    pub mp: f32,
+    #[serde(default)]
+    pub max_mp: f32,
+    #[serde(default)]
+    pub mp_regen: f32,
+    #[serde(default = "default_character_level")]
+    pub level: i32,
+    #[serde(default)]
+    pub exp: i32,
+    #[serde(default = "default_character_speed")]
+    pub speed: f32,
+    #[serde(default = "default_modifier")]
+    pub damage_dealt_modifier: f32,
+    #[serde(default = "default_modifier")]
+    pub healing_dealt_modifier: f32,
+    #[serde(default = "default_modifier")]
+    pub damage_taken_modifier: f32,
+    #[serde(default = "default_modifier")]
+    pub healing_taken_modifier: f32,
+    #[serde(default)]
+    pub status: CharacterStatus,
+    #[serde(default)]
+    pub extra_status: CharacterStatus,
+}
+
+impl Default for PlayerCharacter {
+    fn default() -> Self {
+        Self {
+            inited: false,
+            name: String::new(),
+            nickname: String::new(),
+            image: String::new(),
+            hp: default_character_hp(),
+            max_hp: default_character_hp(),
+            hp_regen: 0.0,
+            mp: 0.0,
+            max_mp: 0.0,
+            mp_regen: 0.0,
+            level: default_character_level(),
+            exp: 0,
+            speed: default_character_speed(),
+            damage_dealt_modifier: default_modifier(),
+            healing_dealt_modifier: default_modifier(),
+            damage_taken_modifier: default_modifier(),
+            healing_taken_modifier: default_modifier(),
+            status: CharacterStatus::default(),
+            extra_status: CharacterStatus::default(),
+        }
+    }
+}
+
+fn default_character_hp() -> f32 { 5.0 }
+
+fn default_character_level() -> i32 { 1 }
+
+fn default_character_speed() -> f32 { 3.0 }
+
+fn default_modifier() -> f32 { 1.0 }
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct TrpgGroup {
+    #[serde(default)]
+    pub players: Vec<String>,
+    #[serde(default)]
+    pub group_chats: Vec<String>,
+}
+
 #[derive(Resource, Serialize, Deserialize)]
 pub struct NapcatMessageManager {
     pub messages: HashMap<String, Vec<NapcatMessage>>,
     #[serde(default)]
+    pub chat_targets: HashMap<String, ChatTargetMetadata>,
+    #[serde(default)]
+    pub player_characters: HashMap<String, PlayerCharacter>,
+    #[serde(default)]
+    pub trpg_groups: HashMap<String, TrpgGroup>,
+    #[serde(default)]
     pub groups: HashMap<String, ChatGroup>,
     #[serde(default)]
     pub read_message_counts: HashMap<String, usize>,
+    #[serde(default)]
+    pub summarized_message_counts: HashMap<String, usize>,
+    #[serde(default)]
+    pub open_chat_targets: HashSet<String>,
+    #[serde(default)]
+    pub pending_chat_targets: HashSet<String>,
+}
+
+impl NapcatMessageManager {
+    pub fn migrate_chat_window_state(&mut self) -> bool {
+        if !self.open_chat_targets.is_empty() || !self.pending_chat_targets.is_empty() {
+            return false;
+        }
+
+        if self.messages.is_empty() {
+            return false;
+        }
+
+        self.open_chat_targets.extend(self.messages.keys().cloned());
+        true
+    }
+
+    pub fn sync_chat_targets(&mut self) -> bool {
+        let mut changed = false;
+        for target_id in self.messages.keys() {
+            if !self.chat_targets.contains_key(target_id) {
+                self.chat_targets.insert(
+                    target_id.clone(),
+                    ChatTargetMetadata::default(),
+                );
+                changed = true;
+            }
+            if is_private_message_target(self.messages.get(target_id))
+                && !self.player_characters.contains_key(target_id)
+            {
+                self.player_characters.insert(
+                    target_id.clone(),
+                    PlayerCharacter::default(),
+                );
+                changed = true;
+            }
+        }
+        let character_len = self.player_characters.len();
+        self.player_characters
+            .retain(|target_id, _| is_private_message_target(self.messages.get(target_id)));
+        changed |= character_len != self.player_characters.len();
+
+        for group in self.trpg_groups.values_mut() {
+            let player_len = group.players.len();
+            group
+                .players
+                .retain(|target_id| self.messages.contains_key(target_id));
+            changed |= player_len != group.players.len();
+
+            let group_chat_len = group.group_chats.len();
+            group
+                .group_chats
+                .retain(|target_id| self.messages.contains_key(target_id));
+            changed |= group_chat_len != group.group_chats.len();
+        }
+        changed
+    }
+
+    pub fn register_incoming_target(&mut self, target_id: &str, is_new_target: bool) {
+        self.chat_targets.entry(target_id.to_owned()).or_default();
+
+        if !is_new_target || self.open_chat_targets.contains(target_id) {
+            return;
+        }
+
+        self.pending_chat_targets.insert(target_id.to_owned());
+    }
+}
+
+fn is_private_message_target(messages: Option<&Vec<NapcatMessage>>) -> bool {
+    matches!(
+        messages
+            .and_then(|messages| messages.first())
+            .map(|message| &message.data.message_type),
+        Some(NapcatMessageType::Private)
+    )
 }
 
 impl Plugin for NapcatPlugin {
@@ -221,8 +421,14 @@ fn setup(mut commands: Commands) {
 
     let message_manager = NapcatMessageManager {
         messages: HashMap::default(),
+        chat_targets: HashMap::default(),
+        player_characters: HashMap::default(),
+        trpg_groups: HashMap::default(),
         groups: HashMap::default(),
         read_message_counts: HashMap::default(),
+        summarized_message_counts: HashMap::default(),
+        open_chat_targets: HashSet::default(),
+        pending_chat_targets: HashSet::default(),
     };
     let config_dir = Path::new(".data").join("willowblossom");
     commands.insert_resource(
@@ -358,6 +564,8 @@ fn message_system(
                 NapcatMessageType::Group => json.data.group_id.unwrap_or(json.data.user_id),
             };
             let target_id = target_id.to_string();
+            let is_new_target = !manager.messages.contains_key(&target_id);
+            let is_incoming_message = json.data.user_id != json.data.self_id;
 
             let auto_forward = auto_forward_request(&manager, &json, &target_id);
             if is_scene_capture_command(&json) && json.data.user_id != json.data.self_id {
@@ -373,6 +581,10 @@ fn message_system(
                 .entry(target_id.clone())
                 .or_default()
                 .push(json);
+            manager.chat_targets.entry(target_id.clone()).or_default();
+            if is_incoming_message {
+                manager.register_incoming_target(&target_id, is_new_target);
+            }
 
             if let Err(err) = manager.persist() {
                 eprintln!("failed to persist NapCat messages: {err}");
@@ -526,6 +738,44 @@ fn is_auto_forward_quote(character: char) -> bool {
 mod tests {
     use super::*;
 
+    fn empty_manager() -> NapcatMessageManager {
+        NapcatMessageManager {
+            messages: HashMap::default(),
+            chat_targets: HashMap::default(),
+            player_characters: HashMap::default(),
+            trpg_groups: HashMap::default(),
+            groups: HashMap::default(),
+            read_message_counts: HashMap::default(),
+            summarized_message_counts: HashMap::default(),
+            open_chat_targets: HashSet::default(),
+            pending_chat_targets: HashSet::default(),
+        }
+    }
+
+    fn test_message(message_type: NapcatMessageType) -> NapcatMessage {
+        NapcatMessage {
+            data: NapcatMessageData {
+                time: 1780132600,
+                message_type,
+                message: vec![NapcatMessageChain {
+                    variant: NapcatMessageChainType::Text {
+                        data: TextData {
+                            text: "hello".to_owned(),
+                        },
+                    },
+                }],
+                self_id: 1,
+                user_id: 2,
+                group_id: None,
+                target_id: None,
+                sender: NapcatSender {
+                    user_id: 2,
+                    nickname: "tester".to_owned(),
+                },
+            },
+        }
+    }
+
     #[test]
     fn parses_group_message_with_unsupported_segments() {
         let message = serde_json::from_str::<NapcatMessage>(
@@ -643,5 +893,66 @@ mod tests {
         .expect("private message should parse");
 
         assert_eq!(quoted_auto_forward_text(&message), None);
+    }
+
+    #[test]
+    fn new_incoming_target_waits_for_chat_window_approval() {
+        let mut manager = empty_manager();
+
+        manager.register_incoming_target("12345", true);
+
+        assert!(manager.pending_chat_targets.contains("12345"));
+        assert!(!manager.open_chat_targets.contains("12345"));
+    }
+
+    #[test]
+    fn existing_message_targets_migrate_to_open_chat_windows() {
+        let mut manager = empty_manager();
+        manager.messages.insert("12345".to_owned(), Vec::new());
+
+        assert!(manager.migrate_chat_window_state());
+        assert!(manager.open_chat_targets.contains("12345"));
+        assert!(manager.pending_chat_targets.is_empty());
+    }
+
+    #[test]
+    fn message_targets_sync_to_editable_chat_metadata() {
+        let mut manager = empty_manager();
+        manager.messages.insert("12345".to_owned(), Vec::new());
+
+        assert!(manager.sync_chat_targets());
+        assert!(manager.chat_targets.contains_key("12345"));
+        assert!(!manager.sync_chat_targets());
+    }
+
+    #[test]
+    fn private_message_targets_sync_to_player_characters() {
+        let mut manager = empty_manager();
+        manager.messages.insert("player-1".to_owned(), vec![
+            test_message(NapcatMessageType::Private),
+        ]);
+        manager.messages.insert("group-1".to_owned(), vec![
+            test_message(NapcatMessageType::Group),
+        ]);
+
+        assert!(manager.sync_chat_targets());
+        assert!(manager.player_characters.contains_key("player-1"));
+        assert!(!manager.player_characters.contains_key("group-1"));
+        assert!(!manager.sync_chat_targets());
+    }
+
+    #[test]
+    fn chat_target_sync_prunes_missing_trpg_group_members() {
+        let mut manager = empty_manager();
+        manager.messages.insert("player-1".to_owned(), Vec::new());
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec!["player-1".to_owned(), "missing-player".to_owned()],
+            group_chats: vec!["missing-group".to_owned()],
+        });
+
+        assert!(manager.sync_chat_targets());
+        let group = manager.trpg_groups.get("table").unwrap();
+        assert_eq!(group.players, vec!["player-1"]);
+        assert!(group.group_chats.is_empty());
     }
 }

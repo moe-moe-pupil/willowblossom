@@ -1,11 +1,18 @@
 mod ime;
 use std::{
-    collections::HashMap,
+    collections::{
+        HashMap,
+        HashSet,
+    },
     hash::{
         Hash,
         Hasher,
     },
     path::Path,
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
+    },
 };
 mod components;
 
@@ -61,6 +68,7 @@ const GROUP_MEMBER_WINDOW_SIDE_GAP: f32 = 14.0;
 const GROUP_MEMBER_WINDOW_TOP_GAP: f32 = 58.0;
 const GROUP_MEMBER_WINDOW_BOTTOM_GAP: f32 = GROUP_BROADCAST_INPUT_HEIGHT + 7.0;
 const GROUP_MEMBER_WINDOW_MAX_SIZE: Vec2 = Vec2::new(520.0, 620.0);
+const CHAT_AUTO_SCROLL_THRESHOLD: f32 = 48.0;
 
 use crate::{
     deepseek::{
@@ -71,19 +79,39 @@ use crate::{
         DeepseekSummaryBlock,
     },
     napcat::{
+        CharacterStatus,
         ChatGroup,
         NapcatIOSender,
         NapcatMessage,
+        NapcatMessageChain,
         NapcatMessageChainType,
+        NapcatMessageData,
         NapcatMessageManager,
         NapcatMessageType,
         NapcatSendManager,
+        NapcatSender,
+        PlayerCharacter,
+        TextData,
+        TrpgGroup,
     },
+    GAME_TITLE,
 };
 pub struct UIPlugin;
 #[derive(Resource)]
 pub struct GIFImages {
     images: HashMap<String, Vec<(TextureHandle, u32)>>,
+}
+
+#[derive(Default)]
+pub(crate) struct ChatScrollState {
+    message_count: usize,
+    near_bottom: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct TrpgGroupSettingsState {
+    open: bool,
+    new_group_name: String,
 }
 
 pub struct CircleImageButton {
@@ -100,7 +128,11 @@ impl CircleImageButton {
     pub fn new(image: egui::TextureId, size: f32) -> Self { Self { image, size } }
 }
 
-fn file_menu_button(ui: &mut Ui, new_chat_group_modal_open: &mut bool) {
+fn file_menu_button(
+    ui: &mut Ui,
+    new_chat_group_modal_open: &mut bool,
+    trpg_group_settings_open: &mut bool,
+) {
     let new_chat_group_shortcup = egui::KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::G);
 
     // NOTE: we must check the shortcuts OUTSIDE of the actual "File" menu,
@@ -121,6 +153,11 @@ fn file_menu_button(ui: &mut Ui, new_chat_group_modal_open: &mut bool) {
             .clicked()
         {
             *new_chat_group_modal_open = true
+        }
+
+        if ui.button("Player / Group Pools").clicked() {
+            *trpg_group_settings_open = true;
+            ui.close();
         }
     });
 }
@@ -168,7 +205,7 @@ impl Plugin for UIPlugin {
     }
 }
 
-pub fn setup_system(mut command: Commands, mut windows: Query<&mut Window>) {
+pub fn setup_system(mut command: Commands) {
     let config_dir = Path::new(".data").join("willowblossom");
     let cached_memory = Persistent::<CachedMemory>::builder()
         .name("ui_memory")
@@ -185,11 +222,6 @@ pub fn setup_system(mut command: Commands, mut windows: Query<&mut Window>) {
     command.insert_resource(GIFImages {
         images: HashMap::default(),
     });
-
-    let Ok(mut window) = windows.single_mut() else {
-        return;
-    };
-    window.ime_enabled = true;
 }
 
 pub fn configure_ui_fonts(mut egui_context: EguiContexts, mut fonts_configured: Local<bool>) {
@@ -272,6 +304,7 @@ fn chat_window(
     chat_input_msgs: &mut Local<HashMap<String, String>>,
     targets: Vec<NapcatSendTarget>,
     ime: &mut ResMut<ImeManager>,
+    chat_scroll_states: &mut Local<HashMap<String, ChatScrollState>>,
     group_rects: &HashMap<String, Rect>,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
     current_group: Option<&str>,
@@ -335,7 +368,6 @@ fn chat_window(
         .max_size(max_window_size)
         .max_height(GROUP_CHAT_MAX_HEIGHT);
     if current_group.is_some() {
-        window = window.order(egui::Order::Foreground);
         if let Some(delta) = group_delta {
             if let Some(member_rect) = ctx.memory(|memory| memory.area_rect(window_id)) {
                 window = window.current_pos(member_rect.min + delta);
@@ -368,12 +400,25 @@ fn chat_window(
             chat_input_msgs,
             targets,
             ime,
+            chat_scroll_states,
             None,
         );
     });
 
+    if let Some(group_name) = current_group {
+        ctx.set_sublayer(
+            egui::LayerId::new(egui::Order::Middle, Id::new(group_name)),
+            egui::LayerId::new(egui::Order::Middle, window_id),
+        );
+    }
+
     if current_group.is_some() && !window_open {
         leave_group = true;
+    }
+    if current_group.is_none() && !window_open {
+        manager.open_chat_targets.remove(target_id);
+        manager.persist().ok();
+        return;
     }
     if let Some(group_name) = current_group {
         if leave_group {
@@ -499,6 +544,7 @@ fn chat_body_ui(
     chat_input_msgs: &mut Local<HashMap<String, String>>,
     targets: Vec<NapcatSendTarget>,
     ime: &mut ResMut<ImeManager>,
+    chat_scroll_states: &mut Local<HashMap<String, ChatScrollState>>,
     desired_height: Option<f32>,
 ) {
     ui.vertical(|ui| {
@@ -515,22 +561,40 @@ fn chat_body_ui(
         ui.allocate_ui(
             egui::vec2(message_width, message_height),
             |ui| {
-                egui::ScrollArea::vertical()
+                let scroll_state = chat_scroll_states
+                    .entry(target_id.to_owned())
+                    .or_insert_with(|| ChatScrollState {
+                        message_count: messages.len(),
+                        near_bottom: true,
+                    });
+                let should_stick_to_bottom =
+                    messages.len() > scroll_state.message_count && scroll_state.near_bottom;
+                let mut scroll_area = egui::ScrollArea::vertical()
                     .id_salt((target_id, "messages"))
                     .max_height(message_height)
                     .min_scrolled_height(message_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.with_layout(
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                for message in messages {
-                                    message_row_ui(ui, message, message_width);
-                                    ui.add_space(ui.spacing().item_spacing.y);
-                                }
-                            },
-                        );
-                    });
+                    .auto_shrink([false, false]);
+                if should_stick_to_bottom {
+                    scroll_area = scroll_area.stick_to_bottom(true);
+                }
+
+                let output = scroll_area.show(ui, |ui| {
+                    ui.with_layout(
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            for message in messages {
+                                message_row_ui(ui, message, message_width);
+                                ui.add_space(ui.spacing().item_spacing.y);
+                            }
+                        },
+                    );
+                });
+
+                let max_scroll_y = (output.content_size.y - output.inner_rect.height()).max(0.0);
+                let distance_to_bottom = (max_scroll_y - output.state.offset.y).max(0.0);
+                scroll_state.message_count = messages.len();
+                scroll_state.near_bottom =
+                    should_stick_to_bottom || distance_to_bottom <= CHAT_AUTO_SCROLL_THRESHOLD;
             },
         );
 
@@ -732,7 +796,7 @@ pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&
     (nickname, lens)
 }
 
-fn target_display_name(target_id: &str, messages: Option<&Vec<NapcatMessage>>) -> String {
+fn target_default_display_name(target_id: &str, messages: Option<&Vec<NapcatMessage>>) -> String {
     messages
         .map(|messages| get_nickname_lens(target_id.to_owned(), messages).0)
         .filter(|nickname| !nickname.is_empty())
@@ -740,19 +804,30 @@ fn target_display_name(target_id: &str, messages: Option<&Vec<NapcatMessage>>) -
         .to_owned()
 }
 
-fn chat_group_title(
-    group_name: &str,
-    group: &ChatGroup,
-    messages: &HashMap<String, Vec<NapcatMessage>>,
-) -> String {
+fn target_display_name(manager: &NapcatMessageManager, target_id: &str) -> String {
+    manager
+        .chat_targets
+        .get(target_id)
+        .map(|metadata| metadata.display_name.trim())
+        .filter(|display_name| !display_name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            target_default_display_name(
+                target_id,
+                manager.messages.get(target_id),
+            )
+        })
+}
+
+fn chat_group_title(group_name: &str, group: &ChatGroup, manager: &NapcatMessageManager) -> String {
     let member_names = group
         .members
         .iter()
-        .map(|member_id| target_display_name(member_id, messages.get(member_id)))
+        .map(|member_id| target_display_name(manager, member_id))
         .collect::<Vec<_>>();
 
     if member_names.is_empty() {
-        format!("讨论组: {}", group_name)
+        format!("讨论组: {group_name}")
     } else {
         format!(
             "讨论组: {}: {}",
@@ -905,46 +980,68 @@ fn paint_dotted_line(painter: &Painter, start: Pos2, end: Pos2, stroke: Stroke) 
     }
 }
 
-fn player_text_lines(messages: &[NapcatMessage]) -> Vec<String> {
-    messages
+struct PlayerTextLine {
+    player_message_count: usize,
+    text: String,
+    summary_eligible: bool,
+}
+
+fn player_text_lines(messages: &[NapcatMessage]) -> Vec<PlayerTextLine> {
+    let mut player_message_count = 0;
+    let mut lines = Vec::new();
+
+    for message in messages
         .iter()
         .filter(|message| message.data.user_id != message.data.self_id)
-        .filter_map(|message| {
-            let text = message
-                .data
-                .message
-                .iter()
-                .filter_map(|chain| match &chain.variant {
-                    NapcatMessageChainType::Text { data } => Some(data.text.trim()),
-                    NapcatMessageChainType::Source(_) => None,
-                    NapcatMessageChainType::Unsupported => None,
-                })
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
+    {
+        let text = message
+            .data
+            .message
+            .iter()
+            .filter_map(|chain| match &chain.variant {
+                NapcatMessageChainType::Text { data } => Some(data.text.trim()),
+                NapcatMessageChainType::Source(_) => None,
+                NapcatMessageChainType::Unsupported => None,
+            })
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
 
-            if text.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "{}: {}",
-                    message.data.sender.nickname, text
-                ))
-            }
-        })
-        .collect()
+        if text.is_empty() {
+            continue;
+        }
+
+        player_message_count += 1;
+        lines.push(PlayerTextLine {
+            player_message_count,
+            summary_eligible: !matches!(text.trim(), "#观察" | "#gc"),
+            text: format!(
+                "{}: {}",
+                message.data.sender.nickname, text
+            ),
+        });
+    }
+
+    lines
 }
 
 fn queue_summary_if_needed(
     target_id: &str,
     messages: &[NapcatMessage],
+    summarized_message_count: usize,
     deepseek_sender: Option<&DeepseekIOSender>,
     deepseek_manager: &mut DeepseekManager,
-) {
+) -> bool {
     let lines = player_text_lines(messages);
-    let message_count = lines.len();
-    if message_count == 0 || message_count % 5 != 0 {
-        return;
+    let message_count = lines
+        .last()
+        .map(|line| line.player_message_count)
+        .unwrap_or_default();
+    if message_count == 0 || message_count < summarized_message_count + 5 {
+        return false;
+    }
+    if summarized_message_count >= message_count {
+        return false;
     }
 
     if let Some(summary) = deepseek_manager.summaries.get(target_id) {
@@ -953,27 +1050,30 @@ fn queue_summary_if_needed(
             .iter()
             .any(|block| block.message_count == message_count)
         {
-            return;
+            return false;
         }
     }
 
     let Some(deepseek_sender) = deepseek_sender else {
-        return;
+        return false;
     };
+
+    let text = lines
+        .iter()
+        .filter(|line| {
+            line.player_message_count > summarized_message_count && line.summary_eligible
+        })
+        .map(|line| line.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        return false;
+    }
 
     let request = DeepseekRequest::Summary {
         target_id: target_id.to_owned(),
         message_count,
-        text: lines
-            .iter()
-            .rev()
-            .take(5)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n"),
+        text,
     };
 
     let send_result = serde_json::to_string(&request)
@@ -998,6 +1098,7 @@ fn queue_summary_if_needed(
                     pending: true,
                     error: None,
                 });
+            true
         },
         Err(error) => {
             deepseek_manager
@@ -1010,8 +1111,41 @@ fn queue_summary_if_needed(
                     pending: false,
                     error: Some(error),
                 });
+            true
         },
     }
+}
+
+fn sync_summarized_message_counts(
+    manager: &mut NapcatMessageManager,
+    deepseek_manager: &DeepseekManager,
+) -> bool {
+    let mut changed = false;
+
+    for (target_id, summary) in &deepseek_manager.summaries {
+        let latest_summarized_count = summary
+            .blocks
+            .iter()
+            .filter(|block| !block.pending && block.error.is_none())
+            .map(|block| block.message_count)
+            .max()
+            .unwrap_or_default();
+
+        if latest_summarized_count == 0 {
+            continue;
+        }
+
+        let entry = manager
+            .summarized_message_counts
+            .entry(target_id.clone())
+            .or_default();
+        if *entry < latest_summarized_count {
+            *entry = latest_summarized_count;
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: &DeepseekManager) {
@@ -1069,26 +1203,774 @@ fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: 
     });
 }
 
+fn pending_chat_requests_window(
+    ctx: &Context,
+    manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+) {
+    if manager.pending_chat_targets.is_empty() {
+        return;
+    }
+
+    let mut pending_targets = manager
+        .pending_chat_targets
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    pending_targets.sort();
+
+    let mut changed = false;
+    egui::Window::new("New chat requests")
+        .id(Id::new("pending_chat_requests_window"))
+        .default_pos(Pos2::new(16.0, 48.0))
+        .default_size(Vec2::new(300.0, 120.0))
+        .resizable(false)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.label("NapCat received messages from chats that do not have windows yet.");
+            ui.separator();
+
+            for target_id in pending_targets {
+                let display_name = target_display_name(manager, &target_id);
+                ui.horizontal(|ui| {
+                    ui.label(display_name);
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.button("Create chat").clicked() {
+                                manager.open_chat_targets.insert(target_id.clone());
+                                manager.pending_chat_targets.remove(&target_id);
+                                changed = true;
+                            }
+                        },
+                    );
+                });
+            }
+        });
+
+    if changed {
+        manager.persist().ok();
+    }
+}
+
+fn chat_target_kind(messages: Option<&Vec<NapcatMessage>>) -> &'static str {
+    match messages.and_then(|messages| messages.first()) {
+        Some(message)
+            if matches!(
+                message.data.message_type,
+                NapcatMessageType::Group
+            ) =>
+        {
+            "群"
+        },
+        Some(_) => "私聊",
+        None => "聊天",
+    }
+}
+
+fn is_group_chat_target(manager: &NapcatMessageManager, target_id: &str) -> bool {
+    matches!(
+        manager
+            .messages
+            .get(target_id)
+            .and_then(|messages| messages.first())
+            .map(|message| &message.data.message_type),
+        Some(NapcatMessageType::Group)
+    )
+}
+
+fn sorted_pool_targets(manager: &NapcatMessageManager, group_chats: bool) -> Vec<String> {
+    let mut targets = manager
+        .messages
+        .keys()
+        .filter(|target_id| is_group_chat_target(manager, target_id) == group_chats)
+        .cloned()
+        .collect::<Vec<_>>();
+    targets.sort_by(|a, b| target_display_name(manager, a).cmp(&target_display_name(manager, b)));
+    targets
+}
+
+fn trpg_group_member_count(group: &TrpgGroup) -> usize {
+    group.players.len() + group.group_chats.len()
+}
+
+fn chat_list_panel(
+    ui: &mut Ui,
+    manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+    edit_target: &mut Option<String>,
+    edit_name: &mut String,
+) {
+    ui.heading("TRPG Groups");
+    ui.add_space(4.0);
+
+    let mut trpg_group_names = manager.trpg_groups.keys().cloned().collect::<Vec<_>>();
+    trpg_group_names.sort();
+    if trpg_group_names.is_empty() {
+        ui.label("No TRPG groups.");
+    } else {
+        let mut changed = false;
+        for group_name in trpg_group_names {
+            let Some(group) = manager.trpg_groups.get(&group_name).cloned() else {
+                continue;
+            };
+            let unread_count = group
+                .players
+                .iter()
+                .chain(group.group_chats.iter())
+                .map(|target_id| target_unread_count(manager, target_id))
+                .sum::<usize>();
+
+            ui.group(|ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(&group_name);
+                    if unread_count > 0 {
+                        ui.label(format!("({unread_count})"));
+                    }
+                });
+                ui.small(format!(
+                    "{} players, {} group chats",
+                    group.players.len(),
+                    group.group_chats.len()
+                ));
+                if ui.button("Open workspace").clicked() {
+                    for target_id in group.players.iter().chain(group.group_chats.iter()) {
+                        manager.open_chat_targets.insert(target_id.clone());
+                        manager.pending_chat_targets.remove(target_id);
+                    }
+                    changed = true;
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if changed {
+            manager.persist().ok();
+        }
+    }
+
+    ui.separator();
+    ui.heading("Chats");
+    ui.add_space(4.0);
+
+    if manager.messages.is_empty() {
+        ui.label("No saved chats yet.");
+        return;
+    }
+
+    let mut targets = manager.messages.keys().cloned().collect::<Vec<_>>();
+    targets.sort_by(|a, b| {
+        let a_time = manager
+            .messages
+            .get(a)
+            .and_then(|messages| messages.last())
+            .map(|message| message.data.time)
+            .unwrap_or_default();
+        let b_time = manager
+            .messages
+            .get(b)
+            .and_then(|messages| messages.last())
+            .map(|message| message.data.time)
+            .unwrap_or_default();
+        b_time.cmp(&a_time).then_with(|| a.cmp(b))
+    });
+
+    let mut changed = false;
+    egui::ScrollArea::vertical()
+        .id_salt("chat_list_panel_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for target_id in targets {
+                let display_name = target_display_name(manager, &target_id);
+                let unread_count = target_unread_count(manager, &target_id);
+                let is_open = manager.open_chat_targets.contains(&target_id);
+                let is_editing = edit_target.as_deref() == Some(target_id.as_str());
+
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(is_open, display_name)
+                            .on_hover_text(&target_id)
+                            .clicked()
+                        {
+                            manager.open_chat_targets.insert(target_id.clone());
+                            manager.pending_chat_targets.remove(&target_id);
+                            changed = true;
+                        }
+
+                        if unread_count > 0 {
+                            ui.label(format!("({unread_count})"));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.small(chat_target_kind(
+                            manager.messages.get(&target_id),
+                        ));
+                        ui.small(&target_id);
+                    });
+
+                    if is_editing {
+                        ui.text_edit_singleline(edit_name);
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                manager
+                                    .chat_targets
+                                    .entry(target_id.clone())
+                                    .or_default()
+                                    .display_name = edit_name.trim().to_owned();
+                                *edit_target = None;
+                                edit_name.clear();
+                                changed = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                *edit_target = None;
+                                edit_name.clear();
+                            }
+                            if ui.button("Clear").clicked() {
+                                if let Some(metadata) = manager.chat_targets.get_mut(&target_id) {
+                                    metadata.display_name.clear();
+                                }
+                                *edit_target = None;
+                                edit_name.clear();
+                                changed = true;
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui.button("Edit").clicked() {
+                                *edit_target = Some(target_id.clone());
+                                *edit_name = manager
+                                    .chat_targets
+                                    .get(&target_id)
+                                    .map(|metadata| metadata.display_name.clone())
+                                    .filter(|name| !name.trim().is_empty())
+                                    .unwrap_or_else(|| target_display_name(manager, &target_id));
+                            }
+                            let close_label = if is_open { "Close" } else { "Open" };
+                            if ui.button(close_label).clicked() {
+                                if is_open {
+                                    manager.open_chat_targets.remove(&target_id);
+                                } else {
+                                    manager.open_chat_targets.insert(target_id.clone());
+                                    manager.pending_chat_targets.remove(&target_id);
+                                }
+                                changed = true;
+                            }
+                        });
+                    }
+                });
+                ui.add_space(4.0);
+            }
+        });
+
+    if changed {
+        manager.persist().ok();
+    }
+}
+
+fn set_target_membership(targets: &mut Vec<String>, target_id: &str, selected: bool) {
+    if selected {
+        if !targets.iter().any(|existing| existing == target_id) {
+            targets.push(target_id.to_owned());
+        }
+    } else {
+        targets.retain(|existing| existing != target_id);
+    }
+}
+
+fn character_editor_ui(
+    ui: &mut Ui,
+    character: &mut PlayerCharacter,
+    chat_display_name: &str,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        changed |= ui.checkbox(&mut character.inited, "Initialized").changed();
+        if ui.button("Use chat name").clicked() {
+            character.nickname = chat_display_name.to_owned();
+            changed = true;
+        }
+        if ui.button("Reset").clicked() {
+            *character = PlayerCharacter::default();
+            changed = true;
+        }
+    });
+
+    ui.columns(2, |columns| {
+        columns[0].label("Character name");
+        changed |= columns[0]
+            .text_edit_singleline(&mut character.name)
+            .changed();
+        columns[1].label("Nickname");
+        changed |= columns[1]
+            .text_edit_singleline(&mut character.nickname)
+            .changed();
+    });
+    ui.label("Image URL");
+    changed |= ui.text_edit_singleline(&mut character.image).changed();
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "HP Status: {}",
+            character_hp_status(character.hp, character.max_hp)
+        ));
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.level)
+                    .range(1..=999)
+                    .prefix("Lv "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.exp)
+                    .range(0..=999_999)
+                    .prefix("Exp "),
+            )
+            .changed();
+    });
+    ui.horizontal(|ui| {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.hp)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("HP "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.max_hp)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("/ "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.hp_regen)
+                    .range(-9999.0..=9999.0)
+                    .speed(0.1)
+                    .prefix("Reg "),
+            )
+            .changed();
+    });
+    ui.horizontal(|ui| {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.mp)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("MP "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.max_mp)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("/ "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.mp_regen)
+                    .range(-9999.0..=9999.0)
+                    .speed(0.1)
+                    .prefix("Reg "),
+            )
+            .changed();
+    });
+    ui.horizontal(|ui| {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.speed)
+                    .range(0.0..=9999.0)
+                    .speed(0.1)
+                    .prefix("Speed "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.damage_dealt_modifier)
+                    .range(0.0..=99.0)
+                    .speed(0.01)
+                    .prefix("DMG "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.damage_taken_modifier)
+                    .range(0.0..=99.0)
+                    .speed(0.01)
+                    .prefix("Taken "),
+            )
+            .changed();
+    });
+    ui.horizontal(|ui| {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.healing_dealt_modifier)
+                    .range(0.0..=99.0)
+                    .speed(0.01)
+                    .prefix("Heal "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.healing_taken_modifier)
+                    .range(0.0..=99.0)
+                    .speed(0.01)
+                    .prefix("Heal taken "),
+            )
+            .changed();
+    });
+
+    ui.separator();
+    ui.label("Base status");
+    changed |= character_status_editor_ui(
+        ui,
+        &mut character.status,
+        &character.extra_status,
+    );
+    ui.label("Extra status");
+    changed |= character_status_editor_ui(
+        ui,
+        &mut character.extra_status,
+        &CharacterStatus::default(),
+    );
+
+    if character.max_hp < 0.0 {
+        character.max_hp = 0.0;
+        changed = true;
+    }
+    if character.hp > character.max_hp {
+        character.hp = character.max_hp;
+        changed = true;
+    }
+    if character.mp > character.max_mp {
+        character.mp = character.max_mp;
+        changed = true;
+    }
+
+    changed
+}
+
+fn character_status_editor_ui(
+    ui: &mut Ui,
+    status: &mut CharacterStatus,
+    extra_status: &CharacterStatus,
+) -> bool {
+    let mut changed = false;
+    egui::Grid::new(ui.next_auto_id())
+        .num_columns(4)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            changed |= status_value_ui(
+                ui,
+                "STR",
+                &mut status.str_,
+                extra_status.str_,
+            );
+            changed |= status_value_ui(
+                ui,
+                "AGI",
+                &mut status.agi,
+                extra_status.agi,
+            );
+            changed |= status_value_ui(
+                ui,
+                "DEX",
+                &mut status.dex,
+                extra_status.dex,
+            );
+            changed |= status_value_ui(
+                ui,
+                "VIT",
+                &mut status.vit,
+                extra_status.vit,
+            );
+            ui.end_row();
+            changed |= status_value_ui(
+                ui,
+                "INT",
+                &mut status.int_,
+                extra_status.int_,
+            );
+            changed |= status_value_ui(
+                ui,
+                "WIS",
+                &mut status.wis,
+                extra_status.wis,
+            );
+            changed |= status_value_ui(ui, "K", &mut status.k, extra_status.k);
+            changed |= status_value_ui(
+                ui,
+                "CHA",
+                &mut status.cha,
+                extra_status.cha,
+            );
+            ui.end_row();
+        });
+    changed
+}
+
+fn status_value_ui(ui: &mut Ui, label: &str, value: &mut i32, extra: i32) -> bool {
+    let response = ui.add(
+        egui::DragValue::new(value)
+            .range(-999..=999)
+            .prefix(format!("{label} ")),
+    );
+    if extra != 0 {
+        ui.small(format!("+{extra}={}", *value + extra));
+    } else {
+        ui.small("");
+    }
+    response.changed()
+}
+
+fn character_hp_status(hp: f32, max_hp: f32) -> &'static str {
+    if max_hp <= 0.0 {
+        return "濒死";
+    }
+    if hp > max_hp * 0.8 {
+        "无伤"
+    } else if hp > max_hp * 0.6 {
+        "轻伤"
+    } else if hp > max_hp * 0.4 {
+        "中伤"
+    } else if hp > max_hp * 0.05 {
+        "重伤"
+    } else {
+        "濒死"
+    }
+}
+
+fn trpg_group_settings_window(
+    ctx: &Context,
+    manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+    state: &mut TrpgGroupSettingsState,
+) {
+    if !state.open {
+        return;
+    }
+
+    let player_targets = sorted_pool_targets(manager, false);
+    let group_chat_targets = sorted_pool_targets(manager, true);
+    let mut changed = false;
+    let mut group_to_delete = None;
+
+    egui::Window::new("Player / Group Pools")
+        .id(Id::new("trpg_group_settings_window"))
+        .open(&mut state.open)
+        .default_size(Vec2::new(620.0, 520.0))
+        .min_width(420.0)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("TRPG group");
+                ui.text_edit_singleline(&mut state.new_group_name);
+                if ui.button("Create").clicked() {
+                    let name = state.new_group_name.trim();
+                    if !name.is_empty() {
+                        manager.trpg_groups.entry(name.to_owned()).or_default();
+                        state.new_group_name.clear();
+                        changed = true;
+                    }
+                }
+            });
+
+            ui.separator();
+            ui.columns(2, |columns| {
+                columns[0].heading("Player Pool");
+                if player_targets.is_empty() {
+                    columns[0].label("No private player chats yet.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("player_pool_settings")
+                        .max_height(140.0)
+                        .show(&mut columns[0], |ui| {
+                            for target_id in &player_targets {
+                                ui.horizontal(|ui| {
+                                    ui.label(target_display_name(manager, target_id));
+                                    ui.small(target_id);
+                                });
+                            }
+                        });
+                }
+
+                columns[1].heading("Group Chat Pool");
+                if group_chat_targets.is_empty() {
+                    columns[1].label("No QQ group chats yet.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("group_chat_pool_settings")
+                        .max_height(140.0)
+                        .show(&mut columns[1], |ui| {
+                            for target_id in &group_chat_targets {
+                                ui.horizontal(|ui| {
+                                    ui.label(target_display_name(manager, target_id));
+                                    ui.small(target_id);
+                                });
+                            }
+                        });
+                }
+            });
+
+            ui.separator();
+            ui.heading("Player Characters");
+            if player_targets.is_empty() {
+                ui.label("No private player chats yet.");
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("player_character_settings")
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for target_id in &player_targets {
+                            let display_name = target_display_name(manager, target_id);
+                            let character = manager
+                                .player_characters
+                                .entry(target_id.clone())
+                                .or_default();
+                            ui.collapsing(
+                                format!("{display_name} ({target_id})"),
+                                |ui| {
+                                    changed |= character_editor_ui(ui, character, &display_name);
+                                },
+                            );
+                        }
+                    });
+            }
+
+            ui.separator();
+            ui.heading("TRPG Group Membership");
+
+            let mut group_names = manager.trpg_groups.keys().cloned().collect::<Vec<_>>();
+            group_names.sort();
+            if group_names.is_empty() {
+                ui.label("Create a TRPG group, then assign players and group chats to it.");
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .id_salt("trpg_group_membership_settings")
+                .show(ui, |ui| {
+                    for group_name in group_names {
+                        let Some(snapshot) = manager.trpg_groups.get(&group_name).cloned() else {
+                            continue;
+                        };
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.heading(&group_name);
+                                ui.small(format!(
+                                    "{} targets",
+                                    trpg_group_member_count(&snapshot)
+                                ));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("Delete").clicked() {
+                                            group_to_delete = Some(group_name.clone());
+                                        }
+                                    },
+                                );
+                            });
+
+                            ui.columns(2, |columns| {
+                                columns[0].label("Players");
+                                for target_id in &player_targets {
+                                    let mut selected = snapshot.players.contains(target_id);
+                                    if columns[0]
+                                        .checkbox(
+                                            &mut selected,
+                                            target_display_name(manager, target_id),
+                                        )
+                                        .on_hover_text(target_id)
+                                        .changed()
+                                    {
+                                        if let Some(group) =
+                                            manager.trpg_groups.get_mut(&group_name)
+                                        {
+                                            set_target_membership(
+                                                &mut group.players,
+                                                target_id,
+                                                selected,
+                                            );
+                                            changed = true;
+                                        }
+                                    }
+                                }
+
+                                columns[1].label("Group Chats");
+                                for target_id in &group_chat_targets {
+                                    let mut selected = snapshot.group_chats.contains(target_id);
+                                    if columns[1]
+                                        .checkbox(
+                                            &mut selected,
+                                            target_display_name(manager, target_id),
+                                        )
+                                        .on_hover_text(target_id)
+                                        .changed()
+                                    {
+                                        if let Some(group) =
+                                            manager.trpg_groups.get_mut(&group_name)
+                                        {
+                                            set_target_membership(
+                                                &mut group.group_chats,
+                                                target_id,
+                                                selected,
+                                            );
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
+        });
+
+    if let Some(group_name) = group_to_delete {
+        manager.trpg_groups.remove(&group_name);
+        changed = true;
+    }
+
+    if changed {
+        manager.persist().ok();
+    }
+}
+
 pub fn ui_system(
     mut contexts: EguiContexts,
     mut ime: ResMut<ImeManager>,
     napcat_sender: Option<Res<NapcatIOSender>>,
     deepseek_sender: Option<Res<DeepseekIOSender>>,
-    mut deepseek_manager: ResMut<DeepseekManager>,
+    mut deepseek_manager: ResMut<Persistent<DeepseekManager>>,
     mut send_manager: ResMut<NapcatSendManager>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
     mut cached_memory: ResMut<Persistent<CachedMemory>>,
     mut has_run_once: Local<bool>,
     mut new_chat_group_modal_string_open: Local<(String, bool)>,
     mut chat_input_msgs: Local<HashMap<String, String>>,
+    mut chat_scroll_states: Local<HashMap<String, ChatScrollState>>,
     mut previous_group_rects: Local<HashMap<String, Rect>>,
+    mut chat_list_edit_target: Local<Option<String>>,
+    mut chat_list_edit_name: Local<String>,
+    mut trpg_group_settings: Local<TrpgGroupSettingsState>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
+    if manager.migrate_chat_window_state() || manager.sync_chat_targets() {
+        manager.persist().ok();
+    }
     let napcat_sender = napcat_sender.as_deref();
     let deepseek_sender = deepseek_sender.as_deref();
-    for (target_id, pending_text) in ime.apply_send_results(send_manager.results.drain(..)) {
+    let mut sent_message_added = false;
+    for (target_id, pending_text, sent_targets) in
+        ime.apply_send_results(send_manager.results.drain(..))
+    {
         if let Some(text) = chat_input_msgs.get_mut(&target_id) {
             let should_clear = match pending_text.as_deref() {
                 Some(pending_text) => text.trim() == pending_text,
@@ -1097,6 +1979,18 @@ pub fn ui_system(
             if should_clear {
                 text.clear();
             }
+        }
+        if let Some(pending_text) = pending_text {
+            for target in sent_targets {
+                if append_local_sent_message(&mut manager, target, &pending_text) {
+                    sent_message_added = true;
+                }
+            }
+        }
+    }
+    if sent_message_added {
+        if let Err(err) = manager.persist() {
+            eprintln!("failed to persist local sent NapCat message: {err}");
         }
     }
 
@@ -1140,6 +2034,12 @@ pub fn ui_system(
         }
     }
 
+    trpg_group_settings_window(
+        ctx,
+        &mut manager,
+        &mut trpg_group_settings,
+    );
+
     egui::TopBottomPanel::top("top_panel")
         .resizable(false)
         .show(ctx, |ui| {
@@ -1147,6 +2047,7 @@ pub fn ui_system(
                 file_menu_button(
                     ui,
                     &mut new_chat_group_modal_string_open.1,
+                    &mut trpg_group_settings.open,
                 );
             });
         });
@@ -1160,14 +2061,37 @@ pub fn ui_system(
             if deepseek_sender.is_none() {
                 ui.label("Deepseek worker not ready");
             }
+            let summary_markers_changed =
+                sync_summarized_message_counts(&mut manager, &deepseek_manager);
+            if summary_markers_changed {
+                if let Err(err) = manager.persist() {
+                    eprintln!("failed to persist summarized message markers: {err}");
+                }
+            }
+
             summary_panel(ui, &manager, &deepseek_manager);
+        });
+
+    egui::SidePanel::left("chat_list_panel")
+        .resizable(true)
+        .default_width(220.0)
+        .width_range(160.0..=340.0)
+        .show(ctx, |ui| {
+            chat_list_panel(
+                ui,
+                &mut manager,
+                &mut chat_list_edit_target,
+                &mut chat_list_edit_name,
+            );
         });
 
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(ctx, |ui| {
+            pending_chat_requests_window(ctx, &mut manager);
+
             for (k, v) in &manager.groups.clone() {
-                let group_title = chat_group_title(&k, v, &manager.messages);
+                let group_title = chat_group_title(&k, v, &manager);
                 let unread_count = chat_group_unread_count(&manager, v);
                 let group_size = group_chat_inner_size(v.members.len(), ui.max_rect());
                 let response = egui::Window::new(group_title)
@@ -1212,7 +2136,15 @@ pub fn ui_system(
             }
             *previous_group_rects = latest_group_rects;
 
-            for (target_id, messages) in manager.messages.clone() {
+            let mut visible_targets: HashSet<String> = manager.open_chat_targets.clone();
+            for group in manager.groups.values() {
+                visible_targets.extend(group.members.iter().cloned());
+            }
+
+            for target_id in visible_targets {
+                let Some(messages) = manager.messages.get(&target_id).cloned() else {
+                    continue;
+                };
                 let id = egui::Id::new(&target_id);
                 let mut default_rect: Rect = Rect::from_pos(Pos2::new(0.0, 0.0));
                 if !*has_run_once {
@@ -1238,18 +2170,37 @@ pub fn ui_system(
                 } else {
                     ui.max_rect()
                 };
-                let (nickname, heights) = get_nickname_lens(target_id.clone(), &messages);
+                let (_nickname, heights) = get_nickname_lens(target_id.clone(), &messages);
+                let window_title = if matches!(
+                    messages.first().map(|message| &message.data.message_type),
+                    Some(NapcatMessageType::Group)
+                ) {
+                    GAME_TITLE.to_owned()
+                } else {
+                    target_display_name(&manager, &target_id)
+                };
                 let targets = targets_for_messages(&target_id, &messages);
                 let unread_count = target_unread_count(&manager, &target_id);
-                queue_summary_if_needed(
+                let summarized_message_count = manager
+                    .summarized_message_counts
+                    .get(&target_id)
+                    .copied()
+                    .unwrap_or_default();
+                let summary_request_changed = queue_summary_if_needed(
                     &target_id,
                     &messages,
+                    summarized_message_count,
                     deepseek_sender,
                     &mut deepseek_manager,
                 );
+                if summary_request_changed {
+                    if let Err(err) = deepseek_manager.persist() {
+                        eprintln!("failed to persist DeepSeek summary request: {err}");
+                    }
+                }
 
                 chat_window(
-                    nickname,
+                    &window_title,
                     id,
                     rect,
                     ctx,
@@ -1260,6 +2211,7 @@ pub fn ui_system(
                     &mut chat_input_msgs,
                     targets,
                     &mut ime,
+                    &mut chat_scroll_states,
                     &group_rects,
                     &mut manager,
                     current_group.as_deref(),
@@ -1302,4 +2254,62 @@ fn targets_for_messages(target_id: &str, messages: &[NapcatMessage]) -> Vec<Napc
         Some(NapcatMessageType::Group) => vec![NapcatSendTarget::Group(target_id)],
         _ => vec![NapcatSendTarget::Private(target_id)],
     }
+}
+
+fn append_local_sent_message(
+    manager: &mut NapcatMessageManager,
+    target: NapcatSendTarget,
+    text: &str,
+) -> bool {
+    let (target_id, message_type, group_id, recipient_id) = match target {
+        NapcatSendTarget::Private(user_id) => (
+            user_id.to_string(),
+            NapcatMessageType::Private,
+            None,
+            Some(user_id),
+        ),
+        NapcatSendTarget::Group(group_id) => (
+            group_id.to_string(),
+            NapcatMessageType::Group,
+            Some(group_id),
+            None,
+        ),
+    };
+
+    let Some(existing_messages) = manager.messages.get(&target_id) else {
+        return false;
+    };
+    let Some(existing_message) = existing_messages.first() else {
+        return false;
+    };
+
+    let self_id = existing_message.data.self_id;
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let message = NapcatMessage {
+        data: NapcatMessageData {
+            time,
+            message_type,
+            message: vec![NapcatMessageChain {
+                variant: NapcatMessageChainType::Text {
+                    data: TextData {
+                        text: text.to_owned(),
+                    },
+                },
+            }],
+            self_id,
+            user_id: self_id,
+            group_id,
+            target_id: recipient_id,
+            sender: NapcatSender {
+                user_id: self_id,
+                nickname: "GM".to_owned(),
+            },
+        },
+    };
+
+    manager.messages.entry(target_id).or_default().push(message);
+    true
 }

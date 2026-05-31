@@ -103,14 +103,26 @@ mod only_in_debug {
             .add_systems(
                 Update,
                 (
-                    toggle_inspector.run_if(input_just_pressed(KeyCode::I)),
-                    toggle_pause.run_if(input_just_pressed(KeyCode::P)),
+                    toggle_inspector.run_if(
+                        input_just_pressed(KeyCode::I)
+                            .and(egui_allows_keyboard_shortcuts),
+                    ),
+                    toggle_pause.run_if(
+                        input_just_pressed(KeyCode::P)
+                            .and(egui_allows_keyboard_shortcuts),
+                    ),
                     (
                         update_fps_text,
                         update_speed_text,
                         update_ui_node,
-                        change_time_speed::<1>.run_if(input_pressed(KeyCode::BracketRight)),
-                        change_time_speed::<-1>.run_if(input_pressed(KeyCode::BracketLeft)),
+                        change_time_speed::<1>.run_if(
+                            input_pressed(KeyCode::BracketRight)
+                                .and(egui_allows_keyboard_shortcuts),
+                        ),
+                        change_time_speed::<-1>.run_if(
+                            input_pressed(KeyCode::BracketLeft)
+                                .and(egui_allows_keyboard_shortcuts),
+                        ),
                         change_gizmo_mode,
                     )
                         .run_if(on_real_timer(Duration::from_millis(
@@ -201,6 +213,13 @@ mod only_in_debug {
     // Systems
     // ·······
 
+    fn egui_allows_keyboard_shortcuts(mut contexts: EguiContexts) -> bool {
+        contexts
+            .ctx_mut()
+            .map(|ctx| !ctx.wants_keyboard_input())
+            .unwrap_or(true)
+    }
+
     fn init_egui(mut ctx: EguiContexts) {
         let ctx = ctx.ctx_mut();
 
@@ -280,7 +299,15 @@ mod only_in_debug {
         time.set_relative_speed(time_speed);
     }
 
-    fn change_gizmo_mode(input: Res<ButtonInput<KeyCode>>, mut state: ResMut<DebugState>) {
+    fn change_gizmo_mode(
+        mut contexts: EguiContexts,
+        input: Res<ButtonInput<KeyCode>>,
+        mut state: ResMut<DebugState>,
+    ) {
+        if !egui_allows_keyboard_shortcuts(contexts.reborrow()) {
+            return;
+        }
+
         for (key, mode) in [
             (KeyCode::R, GizmoMode::Rotate),
             (KeyCode::T, GizmoMode::Translate),

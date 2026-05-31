@@ -5,7 +5,10 @@ use std::{
 
 use bevy::{
     asset::RenderAssetUsages,
-    camera::RenderTarget,
+    camera::{
+        visibility::RenderLayers,
+        RenderTarget,
+    },
     input::mouse::MouseMotion,
     prelude::*,
     render::{
@@ -48,6 +51,8 @@ use crate::{
 };
 
 pub struct ScenePreviewPlugin;
+
+const SCENE_GIZMO_RENDER_LAYER: usize = 1;
 
 #[derive(Resource, Clone, Default)]
 pub struct TrpgVoxelWorld;
@@ -261,8 +266,13 @@ fn starter_scene_voxel(position: IVec3, _previous: Option<WorldVoxel<u8>>) -> Wo
 fn setup_scene_preview(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
+    mut gizmo_config: ResMut<GizmoConfigStore>,
     mut player_cameras: ResMut<PlayerSceneCameras>,
 ) {
+    for (_, config, _) in gizmo_config.iter_mut() {
+        config.render_layers = RenderLayers::layer(SCENE_GIZMO_RENDER_LAYER);
+    }
+
     let config_dir = Path::new(".data").join("willowblossom");
     let voxel_scene_store = Persistent::<VoxelSceneStore>::builder()
         .name("voxel_scene")
@@ -301,6 +311,7 @@ fn setup_scene_preview(
         },
         Transform::from_xyz(18.0, 16.0, 18.0).looking_at(Vec3::ZERO, Vec3::Y),
         VoxelWorldCamera::<TrpgVoxelWorld>::default(),
+        RenderLayers::from_layers(&[0, SCENE_GIZMO_RENDER_LAYER]),
         GameCamera,
         FreeCamera,
     ));
@@ -353,8 +364,8 @@ fn capture_camera_panel(
     mut editor: ResMut<SceneCaptureEditorState>,
     mut player_cameras: ResMut<PlayerSceneCameras>,
     mut store: Option<ResMut<Persistent<VoxelSceneStore>>>,
-    free_camera: Query<
-        &Transform,
+    mut free_camera: Query<
+        &mut Transform,
         (
             With<FreeCamera>,
             Without<PlayerCaptureCamera>,
@@ -389,8 +400,8 @@ fn capture_camera_panel(
                     if let Ok(user_id) = editor.new_user_id.trim().parse::<u64>() {
                         if !player_cameras.cameras.contains_key(&user_id) {
                             let transform = free_camera
-                                .single()
-                                .copied()
+                                .single_mut()
+                                .map(|transform| *transform)
                                 .unwrap_or_else(|_| default_capture_camera_transform());
                             spawn_player_capture_camera(
                                 &mut commands,
@@ -440,9 +451,14 @@ fn capture_camera_panel(
 
             ui.horizontal(|ui| {
                 if ui.button("Use current view").clicked() {
-                    if let Ok(free_transform) = free_camera.single() {
+                    if let Ok(free_transform) = free_camera.single_mut() {
                         *transform = *free_transform;
                         transform_changed = true;
+                    }
+                }
+                if ui.button("View from player").clicked() {
+                    if let Ok(mut free_transform) = free_camera.single_mut() {
+                        *free_transform = *transform;
                     }
                 }
                 if ui.button("Reset").clicked() {

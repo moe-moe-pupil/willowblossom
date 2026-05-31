@@ -3,6 +3,7 @@ use std::{
     env,
     fs,
     io::Read,
+    path::Path,
 };
 
 use async_compat::Compat;
@@ -19,6 +20,10 @@ use bevy::{
         IoTaskPool,
         Task,
     },
+};
+use bevy_persistent::{
+    Persistent,
+    StorageFormat,
 };
 use crossbeam_channel::{
     unbounded,
@@ -49,23 +54,31 @@ pub struct DeepseekIOSender(pub Sender<Message>);
 #[derive(Resource)]
 struct DeepseekTask(Task<CommandQueue>);
 
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Serialize, Deserialize)]
 pub struct DeepseekManager {
+    #[serde(default)]
     pub last_post_text: String,
+    #[serde(default)]
     pub last_fim_response: String,
+    #[serde(default)]
     pub summaries: HashMap<String, DeepseekSummary>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DeepseekSummary {
+    #[serde(default)]
     pub blocks: Vec<DeepseekSummaryBlock>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DeepseekSummaryBlock {
+    #[serde(default)]
     pub latest: String,
+    #[serde(default)]
     pub message_count: usize,
+    #[serde(default)]
     pub pending: bool,
+    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -88,6 +101,8 @@ const SUMMARY_SYSTEM_PROMPT: &str = "\
 你是TRPG聊天记录整理器，只整理输入中已经明确发生或明确说过的内容。
 禁止解释你的任务，禁止提到“聊天记录”“上下文”“我会”“总结如下”等元话语。
 禁止推测、创作剧情、补全动机、决定行动结果、扮演旁白或NPC。
+如果输入是测试、工具反馈或闲聊，也要客观整理玩家明确说出的事实、问题和待处理事项。
+只有输入中完全没有可整理内容时，才允许三行都写“无”。
 输出必须短，使用下面三行格式；没有对应内容就写“无”：
 事件：...
 决定/线索：...
@@ -364,7 +379,16 @@ struct ChatMessage {
 }
 
 pub fn setup(mut commands: Commands) {
-    commands.insert_resource(DeepseekManager::default());
+    let config_dir = Path::new(".data").join("willowblossom");
+    commands.insert_resource(
+        Persistent::<DeepseekManager>::builder()
+            .name("deepseek_summaries")
+            .format(StorageFormat::Toml)
+            .path(config_dir.join("deepseek_summaries.toml"))
+            .default(DeepseekManager::default())
+            .build()
+            .expect("failed to init DeepSeek summaries"),
+    );
     let thread_pool = AsyncComputeTaskPool::get();
     let (client_to_game_sender, client_to_game_receiver) = unbounded::<Message>();
     let napcat_io = DeepseekIOReceiver(client_to_game_receiver.clone());
@@ -451,9 +475,10 @@ async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> Comm
 
 fn message_system(
     receiver: Res<DeepseekIOReceiver>,
-    mut deepseek_manager: ResMut<DeepseekManager>,
+    mut deepseek_manager: ResMut<Persistent<DeepseekManager>>,
 ) {
-    if let Ok(msg) = receiver.0.try_recv() {
+    let mut changed = false;
+    while let Ok(msg) = receiver.0.try_recv() {
         let text = msg.to_string();
         match serde_json::from_str::<DeepseekResponse>(&text) {
             Ok(DeepseekResponse::Summary {
@@ -471,6 +496,7 @@ fn message_system(
                         pending: false,
                         error: None,
                     });
+                changed = true;
             },
             Ok(DeepseekResponse::Error {
                 target_id,
@@ -487,13 +513,22 @@ fn message_system(
                         pending: false,
                         error: Some(text),
                     });
+                changed = true;
             },
             Ok(DeepseekResponse::Fim { text }) => {
                 deepseek_manager.last_fim_response = text;
+                changed = true;
             },
             Err(_) => {
                 deepseek_manager.last_fim_response = text;
+                changed = true;
             },
+        }
+    }
+
+    if changed {
+        if let Err(err) = deepseek_manager.persist() {
+            eprintln!("failed to persist DeepSeek summaries: {err}");
         }
     }
 }
