@@ -27,7 +27,9 @@ use bevy::{
 };
 use bevy_egui::{
     egui,
+    input::EguiWantsInput,
     EguiContexts,
+    EguiPostUpdateSet,
     EguiPrimaryContextPass,
 };
 use bevy_persistent::{
@@ -215,13 +217,19 @@ impl Plugin for ScenePreviewPlugin {
         .add_systems(
             Update,
             (
-                free_camera_system,
-                edit_voxel_world_system,
                 scene_capture_request_system,
                 draw_capture_camera_gizmos,
             ),
         )
         .add_systems(Update, apply_saved_voxel_edits)
+        .add_systems(
+            PostUpdate,
+            (
+                free_camera_system,
+                edit_voxel_world_system,
+            )
+                .after(EguiPostUpdateSet::ProcessOutput),
+        )
         .add_systems(
             EguiPrimaryContextPass,
             (voxel_editor_panel, capture_camera_panel),
@@ -534,7 +542,7 @@ fn capture_camera_panel(
 }
 
 fn free_camera_system(
-    mut contexts: EguiContexts,
+    egui_wants_input: Res<EguiWantsInput>,
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
@@ -545,12 +553,10 @@ fn free_camera_system(
     let Ok(mut transform) = cameras.single_mut() else {
         return;
     };
-    let wants_keyboard_input = contexts
-        .ctx_mut()
-        .map(|ctx| ctx.wants_keyboard_input())
-        .unwrap_or(false);
+    let wants_pointer_input = egui_wants_input.wants_any_pointer_input();
+    let wants_keyboard_input = egui_wants_input.wants_any_keyboard_input();
 
-    if mouse_buttons.pressed(MouseButton::Right) {
+    if mouse_buttons.pressed(MouseButton::Right) && !wants_pointer_input {
         let delta = mouse_motion.read().fold(Vec2::ZERO, |acc, event| {
             acc + event.delta
         });
@@ -640,7 +646,7 @@ fn draw_capture_camera_gizmos(
 }
 
 fn edit_voxel_world_system(
-    mut contexts: EguiContexts,
+    egui_wants_input: Res<EguiWantsInput>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_info: Query<(&Camera, &GlobalTransform), With<VoxelWorldCamera<TrpgVoxelWorld>>>,
@@ -651,11 +657,7 @@ fn edit_voxel_world_system(
     if !editor.enabled || !mouse_buttons.just_pressed(MouseButton::Left) {
         return;
     }
-    if contexts
-        .ctx_mut()
-        .map(|ctx| ctx.is_using_pointer())
-        .unwrap_or(false)
-    {
+    if egui_wants_input.wants_any_pointer_input() {
         return;
     }
 

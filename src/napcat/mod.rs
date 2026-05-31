@@ -98,12 +98,16 @@ pub struct TextData {
     pub text: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ImageData {
+    #[serde(default)]
     #[serde(rename = "subType")]
     pub sub_type: usize,
+    #[serde(default)]
     pub url: String,
+    #[serde(default)]
     pub file_id: String,
+    #[serde(default)]
     pub file_size: String,
 }
 
@@ -121,10 +125,11 @@ pub enum NapcatMessageChainType {
     Text {
         data: TextData,
     },
+    Image {
+        data: ImageData,
+    },
     #[serde(other)]
     Unsupported,
-    // TODO: support image
-    // Image { data: ImageData },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -220,6 +225,12 @@ pub struct PlayerCharacter {
     pub nickname: String,
     #[serde(default)]
     pub image: String,
+    #[serde(default)]
+    pub creation_step: CharacterCreationStep,
+    #[serde(default = "default_status_points")]
+    pub status_points: i32,
+    #[serde(default = "default_exchange_points")]
+    pub exchange_points: i32,
     #[serde(default = "default_character_hp")]
     pub hp: f32,
     #[serde(default = "default_character_hp")]
@@ -250,6 +261,8 @@ pub struct PlayerCharacter {
     pub status: CharacterStatus,
     #[serde(default)]
     pub extra_status: CharacterStatus,
+    #[serde(default)]
+    pub skill_notes: Vec<String>,
 }
 
 impl Default for PlayerCharacter {
@@ -259,6 +272,9 @@ impl Default for PlayerCharacter {
             name: String::new(),
             nickname: String::new(),
             image: String::new(),
+            creation_step: CharacterCreationStep::Normal,
+            status_points: default_status_points(),
+            exchange_points: default_exchange_points(),
             hp: default_character_hp(),
             max_hp: default_character_hp(),
             hp_regen: 0.0,
@@ -274,6 +290,98 @@ impl Default for PlayerCharacter {
             healing_taken_modifier: default_modifier(),
             status: CharacterStatus::default(),
             extra_status: CharacterStatus::default(),
+            skill_notes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CharacterCreationStep {
+    #[default]
+    Normal,
+    Str,
+    Agi,
+    Dex,
+    Vit,
+    Int,
+    Wis,
+    K,
+    Cha,
+    ConfirmStatus,
+    Skill,
+    ConfirmSkill,
+    Image,
+    Nickname,
+}
+
+impl CharacterCreationStep {
+    fn status_key(self) -> Option<StatusKey> {
+        match self {
+            CharacterCreationStep::Str => Some(StatusKey::Str),
+            CharacterCreationStep::Agi => Some(StatusKey::Agi),
+            CharacterCreationStep::Dex => Some(StatusKey::Dex),
+            CharacterCreationStep::Vit => Some(StatusKey::Vit),
+            CharacterCreationStep::Int => Some(StatusKey::Int),
+            CharacterCreationStep::Wis => Some(StatusKey::Wis),
+            CharacterCreationStep::K => Some(StatusKey::K),
+            CharacterCreationStep::Cha => Some(StatusKey::Cha),
+            _ => None,
+        }
+    }
+
+    fn next_status_step(self) -> Self {
+        match self {
+            CharacterCreationStep::Str => CharacterCreationStep::Agi,
+            CharacterCreationStep::Agi => CharacterCreationStep::Dex,
+            CharacterCreationStep::Dex => CharacterCreationStep::Vit,
+            CharacterCreationStep::Vit => CharacterCreationStep::Int,
+            CharacterCreationStep::Int => CharacterCreationStep::Wis,
+            CharacterCreationStep::Wis => CharacterCreationStep::K,
+            CharacterCreationStep::K => CharacterCreationStep::Cha,
+            CharacterCreationStep::Cha => CharacterCreationStep::ConfirmStatus,
+            _ => self,
+        }
+    }
+
+    fn previous_status_step(self) -> Option<Self> {
+        match self {
+            CharacterCreationStep::Agi => Some(CharacterCreationStep::Str),
+            CharacterCreationStep::Dex => Some(CharacterCreationStep::Agi),
+            CharacterCreationStep::Vit => Some(CharacterCreationStep::Dex),
+            CharacterCreationStep::Int => Some(CharacterCreationStep::Vit),
+            CharacterCreationStep::Wis => Some(CharacterCreationStep::Int),
+            CharacterCreationStep::K => Some(CharacterCreationStep::Wis),
+            CharacterCreationStep::Cha => Some(CharacterCreationStep::K),
+            CharacterCreationStep::ConfirmStatus => Some(CharacterCreationStep::Cha),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StatusKey {
+    Str,
+    Agi,
+    Dex,
+    Vit,
+    Int,
+    Wis,
+    K,
+    Cha,
+}
+
+impl StatusKey {
+    fn zh(self) -> &'static str {
+        match self {
+            StatusKey::Str => "力量",
+            StatusKey::Agi => "敏捷",
+            StatusKey::Dex => "灵巧",
+            StatusKey::Vit => "体质",
+            StatusKey::Int => "智力",
+            StatusKey::Wis => "智慧",
+            StatusKey::K => "知识",
+            StatusKey::Cha => "魅力",
         }
     }
 }
@@ -285,6 +393,10 @@ fn default_character_level() -> i32 { 1 }
 fn default_character_speed() -> f32 { 3.0 }
 
 fn default_modifier() -> f32 { 1.0 }
+
+fn default_status_points() -> i32 { 5 }
+
+fn default_exchange_points() -> i32 { 6 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct TrpgGroup {
@@ -566,8 +678,18 @@ fn message_system(
             let target_id = target_id.to_string();
             let is_new_target = !manager.messages.contains_key(&target_id);
             let is_incoming_message = json.data.user_id != json.data.self_id;
+            let incoming_user_id = json.data.user_id;
 
             let auto_forward = auto_forward_request(&manager, &json, &target_id);
+            let character_creation_response = if is_incoming_message
+                && matches!(
+                    json.data.message_type,
+                    NapcatMessageType::Private
+                ) {
+                handle_character_creation_message(&mut manager, &json, &target_id)
+            } else {
+                None
+            };
             if is_scene_capture_command(&json) && json.data.user_id != json.data.self_id {
                 if let Some(scene_capture_requests) = scene_capture_requests.as_deref_mut() {
                     scene_capture_requests.requests.push(SceneCaptureRequest {
@@ -590,36 +712,26 @@ fn message_system(
                 eprintln!("failed to persist NapCat messages: {err}");
             }
 
+            if let (Some(sender), Some(response)) = (
+                sender.as_deref(),
+                character_creation_response,
+            ) {
+                queue_private_text_response(
+                    sender,
+                    &mut auto_forward_ids,
+                    incoming_user_id,
+                    response,
+                );
+            }
+
             if let (Some(sender), Some(auto_forward)) = (sender.as_deref(), auto_forward) {
                 for user_id in auto_forward.recipients {
-                    let request_id = auto_forward_ids.next_request_id;
-                    auto_forward_ids.next_request_id += 1;
-                    let message = Message::Text(
-                        json!({
-                            "action": "send_private_msg",
-                            "params": {
-                                "user_id": user_id,
-                                "message": [
-                                    {
-                                        "type": "text",
-                                        "data": {
-                                            "text": auto_forward.text
-                                        }
-                                    }
-                                ]
-                            }
-                        })
-                        .to_string()
-                        .into(),
+                    queue_private_text_response(
+                        sender,
+                        &mut auto_forward_ids,
+                        user_id,
+                        auto_forward.text.clone(),
                     );
-
-                    if let Err(err) = sender.0.try_send(NapcatOutboundMessage {
-                        request_id,
-                        target_id: user_id.to_string(),
-                        message,
-                    }) {
-                        eprintln!("failed to queue NapCat auto-forward message: {err}");
-                    }
                 }
             }
         } else {
@@ -632,9 +744,309 @@ fn message_system(
     }
 }
 
+fn queue_private_text_response(
+    sender: &NapcatIOSender,
+    auto_forward_ids: &mut NapcatAutoForwardRequestIds,
+    user_id: u64,
+    text: String,
+) {
+    let request_id = auto_forward_ids.next_request_id;
+    auto_forward_ids.next_request_id += 1;
+    let message = Message::Text(
+        json!({
+            "action": "send_private_msg",
+            "params": {
+                "user_id": user_id,
+                "message": [
+                    {
+                        "type": "text",
+                        "data": {
+                            "text": text
+                        }
+                    }
+                ]
+            }
+        })
+        .to_string()
+        .into(),
+    );
+
+    if let Err(err) = sender.0.try_send(NapcatOutboundMessage {
+        request_id,
+        target_id: user_id.to_string(),
+        message,
+    }) {
+        eprintln!("failed to queue NapCat private text response: {err}");
+    }
+}
+
 fn is_scene_capture_command(message: &NapcatMessage) -> bool {
     let text = message_text(message);
     matches!(text.trim(), "#观察" | "#gc")
+}
+
+fn handle_character_creation_message(
+    manager: &mut NapcatMessageManager,
+    message: &NapcatMessage,
+    target_id: &str,
+) -> Option<String> {
+    let text = message_text(message).trim().to_owned();
+    let image_reference = message_image_reference(message);
+    let current_step = manager
+        .player_characters
+        .get(target_id)
+        .map(|character| character.creation_step)
+        .unwrap_or_default();
+    let nickname_taken = current_step == CharacterCreationStep::Nickname
+        && !text.is_empty()
+        && manager.player_characters.iter().any(|(other_id, other)| {
+            other_id != target_id && other.inited && other.nickname == text
+        });
+    let character = manager
+        .player_characters
+        .entry(target_id.to_owned())
+        .or_insert_with(PlayerCharacter::default);
+
+    if is_exchange_command(&text) {
+        if character.inited {
+            return Some("你已经有完成的角色卡了，如需修改请联系GM在角色编辑器中调整。".to_owned());
+        }
+        if character.creation_step != CharacterCreationStep::Normal {
+            return Some(character_creation_prompt(character));
+        }
+
+        *character = PlayerCharacter::default();
+        character.name = message.data.sender.nickname.clone();
+        character.creation_step = CharacterCreationStep::Str;
+        return Some(format!(
+            "你还没有角色卡呢，接下来会开始建卡。\n你拥有{}点属性点，请将它分配到力量/敏捷/灵巧/体质/智力/智慧/知识/魅力上。\n请直接输入数字来增加当前属性；输入【..】退回上一个属性。\n{}",
+            character.status_points,
+            character_creation_prompt(character)
+        ));
+    }
+
+    if character.inited || character.creation_step == CharacterCreationStep::Normal {
+        return None;
+    }
+
+    if matches!(
+        text.as_str(),
+        ".." | ".。" | "。." | "。。"
+    ) {
+        return Some(character_creation_back(character));
+    }
+    if matches!(text.as_str(), "." | "。") {
+        return Some(character_creation_next(character));
+    }
+
+    if let Some(status_key) = character.creation_step.status_key() {
+        let Ok(points) = text.parse::<i32>() else {
+            return Some(format!(
+                "请输入0到{}之间的数字来分配{}。",
+                character.status_points,
+                status_key.zh()
+            ));
+        };
+        if points < 0 || points > character.status_points {
+            return Some(format!(
+                "输入不合法。你剩余{}点属性点，但试图投入{}点。",
+                character.status_points, points
+            ));
+        }
+        set_character_status_value(
+            &mut character.status,
+            status_key,
+            points,
+        );
+        character.status_points -= points;
+        if character.status_points <= 0 {
+            character.creation_step = CharacterCreationStep::ConfirmStatus;
+            return Some(character_status_confirmation(character));
+        }
+        character.creation_step = character.creation_step.next_status_step();
+        return Some(character_creation_prompt(character));
+    }
+
+    match character.creation_step {
+        CharacterCreationStep::Skill => {
+            character.skill_notes.push(text);
+            Some(format!(
+                "技能兑换数据已录入，目前记录{}条。继续发送技能，或输入【.】结束技能录入。",
+                character.skill_notes.len()
+            ))
+        },
+        CharacterCreationStep::Image => {
+            let image = image_reference.unwrap_or(text);
+            if image.is_empty() {
+                return Some(
+                    "请发送人物立绘图片，或发送图片链接；如果暂时没有，输入【.】跳过。".to_owned(),
+                );
+            }
+            character.image = image;
+            character.creation_step = CharacterCreationStep::Nickname;
+            Some(character_creation_prompt(character))
+        },
+        CharacterCreationStep::Nickname => {
+            if text.is_empty() {
+                return Some("角色名不能为空，请重新输入。".to_owned());
+            }
+            if nickname_taken {
+                return Some(format!(
+                    "很抱歉，「{text}」昵称已经被人使用了，请更换一个昵称。"
+                ));
+            }
+            character.nickname = text;
+            character.inited = true;
+            character.creation_step = CharacterCreationStep::Normal;
+            update_character_from_status(character);
+            Some(format!(
+                "是吗？「{}」真是个好名字呢，我十分期待您以后的表现。\n——兑换结束——",
+                character.nickname
+            ))
+        },
+        _ => None,
+    }
+}
+
+fn is_exchange_command(text: &str) -> bool { matches!(text.trim(), ".兑换" | "。兑换") }
+
+fn character_creation_next(character: &mut PlayerCharacter) -> String {
+    match character.creation_step {
+        CharacterCreationStep::ConfirmStatus => {
+            character.creation_step = CharacterCreationStep::Skill;
+            "属性数据已录入。\n现在是技能兑换，请按你的技能描述发送文本；输入【.】可以跳过或结束技能录入。".to_owned()
+        },
+        CharacterCreationStep::Skill => {
+            character.creation_step = CharacterCreationStep::ConfirmSkill;
+            character_creation_next(character)
+        },
+        CharacterCreationStep::ConfirmSkill => {
+            character.creation_step = CharacterCreationStep::Image;
+            "技能数据已录入。现在请发送人物立绘图片链接；如果暂时没有，输入【.】跳过。".to_owned()
+        },
+        CharacterCreationStep::Image => {
+            character.creation_step = CharacterCreationStep::Nickname;
+            "图片已跳过。\n最后，请告诉我你的角色名，兑换即将结束。".to_owned()
+        },
+        CharacterCreationStep::Nickname => "请直接发送角色名完成建卡。".to_owned(),
+        _ => character_creation_prompt(character),
+    }
+}
+
+fn character_creation_back(character: &mut PlayerCharacter) -> String {
+    if let Some(previous_step) = character.creation_step.previous_status_step() {
+        character.creation_step = previous_step;
+        if let Some(status_key) = previous_step.status_key() {
+            let previous_value = get_character_status_value(&character.status, status_key);
+            character.status_points += previous_value;
+            set_character_status_value(&mut character.status, status_key, 0);
+        }
+        character_creation_prompt(character)
+    } else {
+        "当前步骤不能退回。".to_owned()
+    }
+}
+
+fn character_creation_prompt(character: &PlayerCharacter) -> String {
+    if let Some(status_key) = character.creation_step.status_key() {
+        return format!(
+            "当前{}:「{}」 剩余属性点:「{}」",
+            status_key.zh(),
+            get_character_status_value(&character.status, status_key),
+            character.status_points
+        );
+    }
+
+    match character.creation_step {
+        CharacterCreationStep::ConfirmStatus => character_status_confirmation(character),
+        CharacterCreationStep::Skill => {
+            format!(
+                "现在是技能兑换。你还剩余{}分，请发送技能描述；输入【.】结束技能录入。",
+                character.exchange_points
+            )
+        },
+        CharacterCreationStep::ConfirmSkill => "技能数据已录入，输入【.】继续。".to_owned(),
+        CharacterCreationStep::Image => "请发送人物立绘图片链接；输入【.】跳过。".to_owned(),
+        CharacterCreationStep::Nickname => "最后，请告诉我你的角色名。".to_owned(),
+        CharacterCreationStep::Normal => "未处于建卡流程。输入【.兑换】开始。".to_owned(),
+        _ => "请继续当前建卡步骤。".to_owned(),
+    }
+}
+
+fn character_status_confirmation(character: &PlayerCharacter) -> String {
+    format!(
+        "属性兑换全部完成，输入【.】确认；输入【..】退回上一步。\n{}",
+        format_character_status(character)
+    )
+}
+
+fn format_character_status(character: &PlayerCharacter) -> String {
+    [
+        StatusKey::Str,
+        StatusKey::Agi,
+        StatusKey::Dex,
+        StatusKey::Vit,
+        StatusKey::Int,
+        StatusKey::Wis,
+        StatusKey::K,
+        StatusKey::Cha,
+    ]
+    .iter()
+    .map(|status_key| {
+        format!(
+            "{}:「{}」",
+            status_key.zh(),
+            get_character_status_value(&character.status, *status_key)
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn get_character_status_value(status: &CharacterStatus, status_key: StatusKey) -> i32 {
+    match status_key {
+        StatusKey::Str => status.str_,
+        StatusKey::Agi => status.agi,
+        StatusKey::Dex => status.dex,
+        StatusKey::Vit => status.vit,
+        StatusKey::Int => status.int_,
+        StatusKey::Wis => status.wis,
+        StatusKey::K => status.k,
+        StatusKey::Cha => status.cha,
+    }
+}
+
+fn set_character_status_value(status: &mut CharacterStatus, status_key: StatusKey, value: i32) {
+    match status_key {
+        StatusKey::Str => status.str_ = value,
+        StatusKey::Agi => status.agi = value,
+        StatusKey::Dex => status.dex = value,
+        StatusKey::Vit => status.vit = value,
+        StatusKey::Int => status.int_ = value,
+        StatusKey::Wis => status.wis = value,
+        StatusKey::K => status.k = value,
+        StatusKey::Cha => status.cha = value,
+    }
+}
+
+fn update_character_from_status(character: &mut PlayerCharacter) {
+    let total_str = character.status.str_ + character.extra_status.str_;
+    let total_agi = character.status.agi + character.extra_status.agi;
+    let total_dex = character.status.dex + character.extra_status.dex;
+    let total_vit = character.status.vit + character.extra_status.vit;
+    let total_int = character.status.int_ + character.extra_status.int_;
+    let total_wis = character.status.wis + character.extra_status.wis;
+
+    character.max_hp = (5 + character.level * 5 + total_str + total_vit * 3).max(1) as f32;
+    character.hp = character.max_hp;
+    character.hp_regen = total_vit.max(0) as f32;
+    character.max_mp = (total_int * 5) as f32 + total_wis as f32 * 2.5;
+    character.mp = character.max_mp.max(0.0);
+    character.mp_regen = total_wis.max(0) as f32;
+    character.speed = 3.0
+        + total_str.max(0) as f32 * 0.5
+        + total_agi.max(0) as f32
+        + total_dex.max(0) as f32 * 0.5;
 }
 
 fn message_text(message: &NapcatMessage) -> String {
@@ -645,10 +1057,26 @@ fn message_text(message: &NapcatMessage) -> String {
         .filter_map(|chain| match &chain.variant {
             NapcatMessageChainType::Text { data } => Some(data.text.as_str()),
             NapcatMessageChainType::Source(_) => None,
+            NapcatMessageChainType::Image { .. } => None,
             NapcatMessageChainType::Unsupported => None,
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn message_image_reference(message: &NapcatMessage) -> Option<String> {
+    message.data.message.iter().find_map(|chain| {
+        let NapcatMessageChainType::Image { data } = &chain.variant else {
+            return None;
+        };
+        if !data.url.trim().is_empty() {
+            Some(data.url.trim().to_owned())
+        } else if !data.file_id.trim().is_empty() {
+            Some(data.file_id.trim().to_owned())
+        } else {
+            None
+        }
+    })
 }
 
 struct AutoForwardRequest {
@@ -753,6 +1181,10 @@ mod tests {
     }
 
     fn test_message(message_type: NapcatMessageType) -> NapcatMessage {
+        test_message_with_text(message_type, "hello")
+    }
+
+    fn test_message_with_text(message_type: NapcatMessageType, text: &str) -> NapcatMessage {
         NapcatMessage {
             data: NapcatMessageData {
                 time: 1780132600,
@@ -760,7 +1192,34 @@ mod tests {
                 message: vec![NapcatMessageChain {
                     variant: NapcatMessageChainType::Text {
                         data: TextData {
-                            text: "hello".to_owned(),
+                            text: text.to_owned(),
+                        },
+                    },
+                }],
+                self_id: 1,
+                user_id: 2,
+                group_id: None,
+                target_id: None,
+                sender: NapcatSender {
+                    user_id: 2,
+                    nickname: "tester".to_owned(),
+                },
+            },
+        }
+    }
+
+    fn test_private_image(url: &str) -> NapcatMessage {
+        NapcatMessage {
+            data: NapcatMessageData {
+                time: 1780132600,
+                message_type: NapcatMessageType::Private,
+                message: vec![NapcatMessageChain {
+                    variant: NapcatMessageChainType::Image {
+                        data: ImageData {
+                            sub_type: 0,
+                            url: url.to_owned(),
+                            file_id: String::new(),
+                            file_size: String::new(),
                         },
                     },
                 }],
@@ -939,6 +1398,76 @@ mod tests {
         assert!(manager.player_characters.contains_key("player-1"));
         assert!(!manager.player_characters.contains_key("group-1"));
         assert!(!manager.sync_chat_targets());
+    }
+
+    #[test]
+    fn private_exchange_command_runs_character_creation_workflow() {
+        let mut manager = empty_manager();
+        let target_id = "2";
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            target_id,
+        )
+        .unwrap();
+        assert!(response.contains("开始建卡"));
+        assert_eq!(
+            manager.player_characters[target_id].creation_step,
+            CharacterCreationStep::Str
+        );
+
+        for value in ["2", "1", "1", "1"] {
+            handle_character_creation_message(
+                &mut manager,
+                &test_message_with_text(NapcatMessageType::Private, value),
+                target_id,
+            );
+        }
+        let character = manager.player_characters.get(target_id).unwrap();
+        assert_eq!(
+            character.creation_step,
+            CharacterCreationStep::ConfirmStatus
+        );
+        assert_eq!(character.status.str_, 2);
+        assert_eq!(character.status.vit, 1);
+
+        for value in [".", "."] {
+            handle_character_creation_message(
+                &mut manager,
+                &test_message_with_text(NapcatMessageType::Private, value),
+                target_id,
+            );
+        }
+        handle_character_creation_message(
+            &mut manager,
+            &test_private_image("https://example.test/pc.png"),
+            target_id,
+        );
+        assert_eq!(
+            manager.player_characters[target_id].creation_step,
+            CharacterCreationStep::Nickname
+        );
+        assert_eq!(
+            manager.player_characters[target_id].image,
+            "https://example.test/pc.png"
+        );
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "柳生"),
+            target_id,
+        )
+        .unwrap();
+        let character = manager.player_characters.get(target_id).unwrap();
+        assert!(response.contains("兑换结束"));
+        assert!(character.inited);
+        assert_eq!(character.nickname, "柳生");
+        assert_eq!(
+            character.creation_step,
+            CharacterCreationStep::Normal
+        );
+        assert_eq!(character.max_hp, 15.0);
     }
 
     #[test]

@@ -79,6 +79,7 @@ use crate::{
         DeepseekSummaryBlock,
     },
     napcat::{
+        CharacterCreationStep,
         CharacterStatus,
         ChatGroup,
         NapcatIOSender,
@@ -761,9 +762,12 @@ fn message_text_ui(ui: &mut Ui, message: &NapcatMessage) {
                         .selectable(false),
                 );
             },
+            NapcatMessageChainType::Image { data } => {
+                let label = if data.url.trim().is_empty() { "[image]" } else { "[image url]" };
+                ui.label(label);
+            },
             NapcatMessageChainType::Source(_) => {},
             NapcatMessageChainType::Unsupported => {},
-            // TODO: Support images
         }
     }
 }
@@ -779,11 +783,10 @@ pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&
                 NapcatMessageChainType::Text { data } => {
                     len += data.text.len();
                 },
+                NapcatMessageChainType::Image { .. } => {
+                    len += 12;
+                },
                 NapcatMessageChainType::Unsupported => {},
-                // TODO: Support images
-                // NapcatMessageChainType::Image { data: image } => {
-                //     height += 200.0;
-                // },
             };
         }
 
@@ -1001,6 +1004,7 @@ fn player_text_lines(messages: &[NapcatMessage]) -> Vec<PlayerTextLine> {
             .filter_map(|chain| match &chain.variant {
                 NapcatMessageChainType::Text { data } => Some(data.text.trim()),
                 NapcatMessageChainType::Source(_) => None,
+                NapcatMessageChainType::Image { .. } => None,
                 NapcatMessageChainType::Unsupported => None,
             })
             .filter(|text| !text.is_empty())
@@ -1485,6 +1489,21 @@ fn character_editor_ui(
     let mut changed = false;
     ui.horizontal(|ui| {
         changed |= ui.checkbox(&mut character.inited, "Initialized").changed();
+        egui::ComboBox::from_label("Workflow")
+            .selected_text(character_creation_step_label(
+                character.creation_step,
+            ))
+            .show_ui(ui, |ui| {
+                for (step, label) in character_creation_step_options() {
+                    changed |= ui
+                        .selectable_value(
+                            &mut character.creation_step,
+                            step,
+                            label,
+                        )
+                        .changed();
+                }
+            });
         if ui.button("Use chat name").clicked() {
             character.nickname = chat_display_name.to_owned();
             changed = true;
@@ -1510,6 +1529,20 @@ fn character_editor_ui(
 
     ui.separator();
     ui.horizontal(|ui| {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.status_points)
+                    .range(0..=999)
+                    .prefix("Status pts "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.exchange_points)
+                    .range(0..=999)
+                    .prefix("Exchange pts "),
+            )
+            .changed();
         ui.label(format!(
             "HP Status: {}",
             character_hp_status(character.hp, character.max_hp)
@@ -1639,6 +1672,16 @@ fn character_editor_ui(
         &mut character.extra_status,
         &CharacterStatus::default(),
     );
+    if !character.skill_notes.is_empty() {
+        ui.separator();
+        ui.label(format!(
+            "Skill notes: {}",
+            character.skill_notes.len()
+        ));
+        for note in &character.skill_notes {
+            ui.small(note);
+        }
+    }
 
     if character.max_hp < 0.0 {
         character.max_hp = 0.0;
@@ -1654,6 +1697,41 @@ fn character_editor_ui(
     }
 
     changed
+}
+
+fn character_creation_step_options() -> [(CharacterCreationStep, &'static str); 14] {
+    [
+        (CharacterCreationStep::Normal, "Normal"),
+        (CharacterCreationStep::Str, "STR"),
+        (CharacterCreationStep::Agi, "AGI"),
+        (CharacterCreationStep::Dex, "DEX"),
+        (CharacterCreationStep::Vit, "VIT"),
+        (CharacterCreationStep::Int, "INT"),
+        (CharacterCreationStep::Wis, "WIS"),
+        (CharacterCreationStep::K, "K"),
+        (CharacterCreationStep::Cha, "CHA"),
+        (
+            CharacterCreationStep::ConfirmStatus,
+            "Confirm status",
+        ),
+        (CharacterCreationStep::Skill, "Skill"),
+        (
+            CharacterCreationStep::ConfirmSkill,
+            "Confirm skill",
+        ),
+        (CharacterCreationStep::Image, "Image"),
+        (
+            CharacterCreationStep::Nickname,
+            "Nickname",
+        ),
+    ]
+}
+
+fn character_creation_step_label(step: CharacterCreationStep) -> &'static str {
+    character_creation_step_options()
+        .iter()
+        .find_map(|(candidate, label)| (*candidate == step).then_some(*label))
+        .unwrap_or("Unknown")
 }
 
 fn character_status_editor_ui(
@@ -2156,12 +2234,16 @@ pub fn ui_system(
                     *has_run_once = true
                 }
 
-                let current_group = manager.groups.iter().find_map(|(group_name, group)| {
-                    group
-                        .members
-                        .contains(&target_id)
-                        .then_some(group_name.clone())
-                });
+                let current_group = if manager.open_chat_targets.contains(&target_id) {
+                    None
+                } else {
+                    manager.groups.iter().find_map(|(group_name, group)| {
+                        group
+                            .members
+                            .contains(&target_id)
+                            .then_some(group_name.clone())
+                    })
+                };
                 let rect = if let Some(group_name) = current_group.as_deref() {
                     let Some(rect) = group_rects.get(group_name).copied() else {
                         continue;
