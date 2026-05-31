@@ -4,6 +4,7 @@ dist
 graphs
 .vscode
 .data
+.env
 .envrc
 capture*
 *.tracy

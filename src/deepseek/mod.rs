@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    env,
+    fs,
     io::Read,
 };
 
@@ -91,10 +93,52 @@ const SUMMARY_SYSTEM_PROMPT: &str = "\
 决定/线索：...
 待跟进：...";
 
+const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
+
 pub fn filter_control_characters(input: &str) -> String {
     input.chars()
       .filter(|&c| !c.is_control()) // Filter out control characters
       .collect() // Collect the remaining characters into a new String
+}
+
+fn deepseek_api_key() -> Result<String, String> {
+    env::var(DEEPSEEK_API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| env_file_value(DEEPSEEK_API_KEY_ENV))
+        .ok_or_else(|| format!("{DEEPSEEK_API_KEY_ENV} is not set"))
+}
+
+fn env_file_value(key: &str) -> Option<String> {
+    let env_file = fs::read_to_string(".env").ok()?;
+    for line in env_file.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value.to_owned());
+    }
+
+    None
+}
+
+fn deepseek_authorization_header() -> Result<String, String> {
+    Ok(format!(
+        "Authorization: Bearer {}",
+        deepseek_api_key()?
+    ))
 }
 
 impl DeepseekManager {
@@ -131,7 +175,7 @@ impl DeepseekManager {
             .map_err(|err| err.to_string())?;
         list.append("Accept: application/json")
             .map_err(|err| err.to_string())?;
-        list.append("Authorization: Bearer sk-04a95ae20ae24481a1908ba93be69de5")
+        list.append(&deepseek_authorization_header()?)
             .map_err(|err| err.to_string())?;
         easy.http_headers(list).map_err(|err| err.to_string())?;
         easy.post(true).map_err(|err| err.to_string())?;
@@ -205,7 +249,7 @@ impl DeepseekManager {
             .map_err(|err| err.to_string())?;
         list.append("Accept: application/json")
             .map_err(|err| err.to_string())?;
-        list.append("Authorization: Bearer sk-04a95ae20ae24481a1908ba93be69de5")
+        list.append(&deepseek_authorization_header()?)
             .map_err(|err| err.to_string())?;
         easy.http_headers(list).map_err(|err| err.to_string())?;
         easy.post(true).map_err(|err| err.to_string())?;
@@ -455,6 +499,7 @@ fn message_system(
 }
 
 #[test]
+#[ignore = "calls the live DeepSeek API"]
 pub fn arrogance_ship() {
     let mut data = r#"{
   "model": "deepseek-chat",
@@ -480,7 +525,7 @@ pub fn arrogance_ship() {
     let mut list = List::new();
     list.append("Content-Type: application/json").unwrap();
     list.append("Accept: application/json").unwrap();
-    list.append("Authorization: Bearer sk-04a95ae20ae24481a1908ba93be69de5")
+    list.append(&deepseek_authorization_header().unwrap())
         .unwrap();
     easy.http_headers(list).unwrap();
     easy.post(true).unwrap();
