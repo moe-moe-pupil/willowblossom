@@ -1,9 +1,15 @@
 mod ime;
 use std::{
     collections::HashMap,
+    hash::{
+        Hash,
+        Hasher,
+    },
     path::Path,
 };
 mod components;
+
+use std::collections::hash_map::DefaultHasher;
 
 use bevy::prelude::*;
 use bevy_egui::{
@@ -44,13 +50,17 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
 const CHAT_WINDOW_MIN_SIZE: Vec2 = Vec2::new(260.0, 260.0);
+const CHAT_WINDOW_MAX_SIZE: Vec2 = Vec2::new(720.0, 720.0);
 const GROUP_CHAT_MAX_HEIGHT: f32 = 720.0;
 const GROUP_CHAT_MIN_HEIGHT: f32 = 140.0;
 const GROUP_CHAT_SEPARATOR_HEIGHT: f32 = 10.0;
 const GROUP_MEMBER_CHAT_SIZE: Vec2 = Vec2::new(320.0, 420.0);
-const GROUP_MEMBER_CHAT_MAX_SIZE: Vec2 = Vec2::new(480.0, 620.0);
-const GROUP_MEMBER_RESIZE_HANDLE_SIZE: f32 = 16.0;
+const GROUP_BROADCAST_INPUT_HEIGHT: f32 = 96.0;
 const GROUP_BROADCAST_INPUT_ROWS: usize = 3;
+const GROUP_MEMBER_WINDOW_SIDE_GAP: f32 = 14.0;
+const GROUP_MEMBER_WINDOW_TOP_GAP: f32 = 58.0;
+const GROUP_MEMBER_WINDOW_BOTTOM_GAP: f32 = GROUP_BROADCAST_INPUT_HEIGHT + 7.0;
+const GROUP_MEMBER_WINDOW_MAX_SIZE: Vec2 = Vec2::new(520.0, 620.0);
 
 use crate::{
     deepseek::{
@@ -264,30 +274,134 @@ fn chat_window(
     ime: &mut ResMut<ImeManager>,
     group_rects: &HashMap<String, Rect>,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+    current_group: Option<&str>,
+    group_delta: Option<Vec2>,
+    unread_count: usize,
 ) {
     let mut window_open = true;
-    let response = egui::Window::new(nickname)
-        .open(&mut window_open)
-        .id(id)
-        .constrain_to(rect)
-        .default_size(CHAT_WINDOW_SIZE)
-        .min_size(CHAT_WINDOW_MIN_SIZE)
-        .max_height(GROUP_CHAT_MAX_HEIGHT)
-        .show(ctx, |ui| {
-            chat_body_ui(
-                ui,
-                ctx,
-                messages,
-                napcat_sender,
+    let mut leave_group = false;
+    let constraint_rect =
+        if current_group.is_some() { group_member_constraint_rect(rect) } else { rect };
+    let window_min_size = egui::vec2(
+        CHAT_WINDOW_MIN_SIZE.x.min(constraint_rect.width().max(1.0)),
+        CHAT_WINDOW_MIN_SIZE
+            .y
+            .min(constraint_rect.height().max(1.0)),
+    );
+    let max_window_size = if current_group.is_some() {
+        egui::vec2(
+            GROUP_MEMBER_WINDOW_MAX_SIZE
+                .x
+                .min(constraint_rect.width())
+                .max(window_min_size.x),
+            GROUP_MEMBER_WINDOW_MAX_SIZE
+                .y
+                .min(constraint_rect.height())
+                .max(window_min_size.y),
+        )
+    } else {
+        egui::vec2(
+            CHAT_WINDOW_MAX_SIZE
+                .x
+                .min(constraint_rect.width())
+                .max(window_min_size.x),
+            CHAT_WINDOW_MAX_SIZE
+                .y
+                .min(constraint_rect.height())
+                .max(window_min_size.y),
+        )
+    };
+    let window_id = current_group
+        .map(|group_name| {
+            Id::new((
+                group_name,
                 target_id,
-                chat_input_msgs,
-                targets,
-                ime,
-                None,
-            );
+                "group_member_chat_window_v2",
+            ))
+        })
+        .unwrap_or_else(|| {
+            Id::new((
+                id,
+                target_id,
+                "standalone_chat_window_v2",
+            ))
         });
+    let mut window = egui::Window::new(nickname)
+        .open(&mut window_open)
+        .id(window_id)
+        .constrain_to(constraint_rect)
+        .default_size(CHAT_WINDOW_SIZE)
+        .min_size(window_min_size)
+        .max_size(max_window_size)
+        .max_height(GROUP_CHAT_MAX_HEIGHT);
+    if current_group.is_some() {
+        window = window.order(egui::Order::Foreground);
+        if let Some(delta) = group_delta {
+            if let Some(member_rect) = ctx.memory(|memory| memory.area_rect(window_id)) {
+                window = window.current_pos(member_rect.min + delta);
+            }
+        }
+        window = window.default_pos(group_member_default_pos(
+            constraint_rect,
+            target_id,
+        ));
+    }
+    let response = window.show(ctx, |ui| {
+        if current_group.is_some() {
+            ui.horizontal(|ui| {
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui.button("离开").on_hover_text("离开讨论组").clicked() {
+                            leave_group = true;
+                        }
+                    },
+                );
+            });
+        }
+        chat_body_ui(
+            ui,
+            ctx,
+            messages,
+            napcat_sender,
+            target_id,
+            chat_input_msgs,
+            targets,
+            ime,
+            None,
+        );
+    });
+
+    if current_group.is_some() && !window_open {
+        leave_group = true;
+    }
+    if let Some(group_name) = current_group {
+        if leave_group {
+            if let Some(group) = manager.groups.get_mut(group_name) {
+                group.members.retain(|member_id| member_id != target_id);
+                manager.persist().ok();
+            }
+            return;
+        }
+    }
 
     if let Some(response) = response {
+        if current_group.is_none() {
+            paint_unread_badge(
+                ctx,
+                response.response.rect,
+                unread_count,
+            );
+        }
+
+        if window_received_focus(ctx, &response.response) {
+            mark_target_read(manager, target_id, messages.len());
+        }
+
+        if current_group.is_some() {
+            return;
+        }
+
         if let Some(drop_pos) = ctx.input(|input| input.pointer.latest_pos()) {
             if response.response.dragged() {
                 if let Some((_, preview_rect)) =
@@ -321,6 +435,61 @@ fn chat_window(
     }
 }
 
+fn window_received_focus(ctx: &Context, response: &Response) -> bool {
+    response.contains_pointer() && ctx.input(|input| input.pointer.any_pressed())
+}
+
+fn mark_target_read(
+    manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+    target_id: &str,
+    message_count: usize,
+) {
+    let current_read_count = manager
+        .read_message_counts
+        .get(target_id)
+        .copied()
+        .unwrap_or_default();
+    if current_read_count >= message_count {
+        return;
+    }
+
+    manager
+        .read_message_counts
+        .insert(target_id.to_owned(), message_count);
+    manager.persist().ok();
+}
+
+fn group_member_constraint_rect(rect: Rect) -> Rect {
+    let min = egui::pos2(
+        rect.left() + GROUP_MEMBER_WINDOW_SIDE_GAP,
+        rect.top() + GROUP_MEMBER_WINDOW_TOP_GAP,
+    );
+    let max = egui::pos2(
+        rect.right() - GROUP_MEMBER_WINDOW_SIDE_GAP,
+        rect.bottom() - GROUP_MEMBER_WINDOW_BOTTOM_GAP,
+    );
+
+    if max.x > min.x + CHAT_WINDOW_MIN_SIZE.x && max.y > min.y + CHAT_WINDOW_MIN_SIZE.y {
+        Rect::from_min_max(min, max)
+    } else {
+        rect.shrink2(egui::vec2(
+            GROUP_MEMBER_WINDOW_SIDE_GAP.min(rect.width() * 0.25),
+            GROUP_MEMBER_WINDOW_SIDE_GAP.min(rect.height() * 0.25),
+        ))
+    }
+}
+
+fn group_member_default_pos(rect: Rect, target_id: &str) -> Pos2 {
+    let mut hasher = DefaultHasher::new();
+    target_id.hash(&mut hasher);
+    let hash = hasher.finish();
+    let x_slots = ((rect.width() - CHAT_WINDOW_SIZE.x).max(0.0) / 36.0).floor() as u64 + 1;
+    let y_slots = ((rect.height() - CHAT_WINDOW_SIZE.y).max(0.0) / 36.0).floor() as u64 + 1;
+    let x = rect.left() + 12.0 + (hash % x_slots) as f32 * 36.0;
+    let y = rect.top() + 12.0 + ((hash / 17) % y_slots) as f32 * 36.0;
+    egui::pos2(x, y)
+}
+
 fn chat_body_ui(
     ui: &mut Ui,
     ctx: &Context,
@@ -348,13 +517,10 @@ fn chat_body_ui(
             |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt((target_id, "messages"))
-                    .min_scrolled_width(message_width)
                     .max_height(message_height)
                     .min_scrolled_height(message_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.set_min_width(message_width);
-                        ui.set_width(message_width);
                         ui.with_layout(
                             egui::Layout::top_down(egui::Align::LEFT),
                             |ui| {
@@ -451,6 +617,38 @@ fn group_broadcast_input_ui(
                 .desired_width(ui.available_width())
                 .desired_rows(GROUP_BROADCAST_INPUT_ROWS),
         );
+    }
+}
+
+fn group_drop_area_ui(ui: &mut Ui, group_name: &str, members: &[String]) {
+    let body_height =
+        (ui.available_height() - GROUP_BROADCAST_INPUT_HEIGHT - ui.spacing().item_spacing.y)
+            .max(GROUP_CHAT_MIN_HEIGHT);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), body_height),
+        Sense::hover(),
+    );
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(
+                1.0,
+                ui.visuals().widgets.noninteractive.bg_stroke.color,
+            ),
+            egui::epaint::StrokeKind::Inside,
+        );
+        if members.is_empty() {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("拖入聊天到讨论组 {group_name}"),
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().weak_text_color(),
+            );
+        }
     }
 }
 
@@ -564,14 +762,41 @@ fn chat_group_title(
     }
 }
 
+fn target_unread_count(manager: &NapcatMessageManager, target_id: &str) -> usize {
+    let read_count = manager
+        .read_message_counts
+        .get(target_id)
+        .copied()
+        .unwrap_or_default();
+
+    manager
+        .messages
+        .get(target_id)
+        .map(|messages| {
+            messages
+                .iter()
+                .skip(read_count)
+                .filter(|message| message.data.user_id != message.data.self_id)
+                .count()
+        })
+        .unwrap_or_default()
+}
+
+fn chat_group_unread_count(manager: &NapcatMessageManager, group: &ChatGroup) -> usize {
+    group
+        .members
+        .iter()
+        .map(|member_id| target_unread_count(manager, member_id))
+        .sum()
+}
+
 fn group_chat_inner_size(member_count: usize, max_rect: Rect) -> Vec2 {
-    let broadcast_input_height = 96.0;
     let desired_height = if member_count == 0 {
-        GROUP_CHAT_MIN_HEIGHT + broadcast_input_height
+        GROUP_CHAT_MIN_HEIGHT + GROUP_BROADCAST_INPUT_HEIGHT
     } else {
         member_count as f32 * GROUP_MEMBER_CHAT_SIZE.y
             + member_count.saturating_sub(1) as f32 * GROUP_CHAT_SEPARATOR_HEIGHT
-            + broadcast_input_height
+            + GROUP_BROADCAST_INPUT_HEIGHT
     };
 
     egui::vec2(
@@ -624,6 +849,40 @@ fn draw_drop_preview(ctx: &Context, rect: Rect) {
     );
 }
 
+fn paint_unread_badge(ctx: &Context, window_rect: Rect, unread_count: usize) {
+    if unread_count == 0 {
+        return;
+    }
+
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        Id::new((
+            "unread_badge",
+            window_rect.min.x.to_bits(),
+            window_rect.min.y.to_bits(),
+        )),
+    ));
+    let badge_text = if unread_count > 99 { "99+".to_owned() } else { unread_count.to_string() };
+    let radius = if unread_count > 99 { 11.0 } else { 9.0 };
+    let center = Pos2::new(
+        window_rect.right() - 18.0,
+        window_rect.top() + 16.0,
+    );
+
+    painter.circle_filled(
+        center,
+        radius,
+        egui::Color32::from_rgb(235, 55, 55),
+    );
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        badge_text,
+        egui::FontId::proportional(10.0),
+        egui::Color32::WHITE,
+    );
+}
+
 fn paint_dotted_line(painter: &Painter, start: Pos2, end: Pos2, stroke: Stroke) {
     let line = end - start;
     let length = line.length();
@@ -643,80 +902,6 @@ fn paint_dotted_line(painter: &Painter, start: Pos2, end: Pos2, stroke: Stroke) 
             stroke,
         );
         offset += dash + gap;
-    }
-}
-
-fn resizable_chat_pane(
-    ui: &mut Ui,
-    ctx: &Context,
-    group_id: &str,
-    member_id: &str,
-    pane_size: &mut Vec2,
-    add_contents: impl FnOnce(&mut Ui),
-) {
-    let available = ui.available_size();
-    let min_size = egui::vec2(
-        CHAT_WINDOW_MIN_SIZE.x.min(available.x.max(1.0)),
-        CHAT_WINDOW_MIN_SIZE.y.min(available.y.max(1.0)),
-    );
-    let max_size = egui::vec2(
-        GROUP_MEMBER_CHAT_MAX_SIZE
-            .x
-            .min(available.x.max(min_size.x)),
-        GROUP_MEMBER_CHAT_MAX_SIZE
-            .y
-            .min(available.y.max(min_size.y)),
-    );
-    pane_size.x = pane_size.x.clamp(min_size.x, max_size.x);
-    pane_size.y = pane_size.y.clamp(min_size.y, max_size.y);
-
-    let (rect, _) = ui.allocate_exact_size(*pane_size, Sense::hover());
-    let mut pane_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(rect)
-            .layout(egui::Layout::top_down(
-                egui::Align::LEFT,
-            )),
-    );
-    add_contents(&mut pane_ui);
-
-    let handle_size = Vec2::splat(GROUP_MEMBER_RESIZE_HANDLE_SIZE);
-    let handle_rect = Rect::from_min_size(
-        rect.right_bottom() - handle_size,
-        handle_size,
-    );
-    let handle_id = Id::new((
-        group_id,
-        member_id,
-        "manual_chat_pane_resize",
-    ));
-    let handle_response = ui.interact(handle_rect, handle_id, Sense::drag());
-    if handle_response.dragged() {
-        *pane_size += handle_response.drag_delta();
-        pane_size.x = pane_size.x.clamp(min_size.x, max_size.x);
-        pane_size.y = pane_size.y.clamp(min_size.y, max_size.y);
-        ctx.request_repaint();
-    }
-
-    let stroke = ui.style().interact(&handle_response).fg_stroke;
-    let painter = ui.painter();
-    for offset in [4.0, 8.0, 12.0] {
-        painter.line_segment(
-            [
-                egui::pos2(
-                    handle_rect.right() - offset,
-                    handle_rect.bottom(),
-                ),
-                egui::pos2(
-                    handle_rect.right(),
-                    handle_rect.bottom() - offset,
-                ),
-            ],
-            stroke,
-        );
-    }
-    if handle_response.hovered() || handle_response.dragged() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
     }
 }
 
@@ -896,7 +1081,7 @@ pub fn ui_system(
     mut has_run_once: Local<bool>,
     mut new_chat_group_modal_string_open: Local<(String, bool)>,
     mut chat_input_msgs: Local<HashMap<String, String>>,
-    mut group_member_sizes: Local<HashMap<(String, String), Vec2>>,
+    mut previous_group_rects: Local<HashMap<String, Rect>>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -915,7 +1100,9 @@ pub fn ui_system(
         }
     }
 
-    let mut group_rects = HashMap::default();
+    let mut group_rects: HashMap<String, Rect> = HashMap::default();
+    let mut group_deltas: HashMap<String, Vec2> = HashMap::default();
+    let mut latest_group_rects: HashMap<String, Rect> = HashMap::default();
     let reset_data = |new_chat_group_modal_string_bool: &mut Local<'_, (String, bool)>| {
         new_chat_group_modal_string_bool.0 = "".to_owned();
         new_chat_group_modal_string_bool.1 = false;
@@ -976,153 +1163,113 @@ pub fn ui_system(
             summary_panel(ui, &manager, &deepseek_manager);
         });
 
-    egui::CentralPanel::default().show(ctx, |ui| {
-        for (k, v) in &manager.groups.clone() {
-            let group_title = chat_group_title(&k, v, &manager.messages);
-            let group_size = group_chat_inner_size(v.members.len(), ui.max_rect());
-            let response = egui::Window::new(group_title)
-                .open(&mut true)
-                .constrain_to(ui.max_rect())
-                .id(Id::new(k))
-                .default_pos(ui.max_rect().left_top() + egui::vec2(12.0, 12.0))
-                .default_size(group_size)
-                .min_size(CHAT_WINDOW_MIN_SIZE)
-                .max_size(ui.max_rect().size())
-                .show(ctx, |ui| {
-                    for member_id in &v.members {
-                        let Some(messages) = manager.messages.get(member_id).cloned() else {
-                            continue;
-                        };
-                        queue_summary_if_needed(
-                            member_id,
-                            &messages,
-                            deepseek_sender,
-                            &mut deepseek_manager,
-                        );
-
-                        let pane_key = (k.clone(), member_id.clone());
-                        let mut pane_size = *group_member_sizes
-                            .entry(pane_key.clone())
-                            .or_insert(GROUP_MEMBER_CHAT_SIZE);
-                        resizable_chat_pane(
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE)
+        .show(ctx, |ui| {
+            for (k, v) in &manager.groups.clone() {
+                let group_title = chat_group_title(&k, v, &manager.messages);
+                let unread_count = chat_group_unread_count(&manager, v);
+                let group_size = group_chat_inner_size(v.members.len(), ui.max_rect());
+                let response = egui::Window::new(group_title)
+                    .open(&mut true)
+                    .constrain_to(ui.max_rect())
+                    .id(Id::new(k))
+                    .default_pos(ui.max_rect().left_top() + egui::vec2(12.0, 12.0))
+                    .default_size(group_size)
+                    .min_size(CHAT_WINDOW_MIN_SIZE)
+                    .max_size(ui.max_rect().size())
+                    .show(ctx, |ui| {
+                        group_drop_area_ui(ui, &k, &v.members);
+                        group_broadcast_input_ui(
                             ui,
                             ctx,
-                            k,
-                            member_id,
-                            &mut pane_size,
-                            |ui| {
-                                chat_body_ui(
-                                    ui,
-                                    ctx,
-                                    &messages,
-                                    napcat_sender,
-                                    member_id,
-                                    &mut chat_input_msgs,
-                                    targets_for_messages(member_id, &messages),
-                                    &mut ime,
-                                    None,
-                                );
-                            },
+                            &k,
+                            &v.members,
+                            &manager.messages,
+                            napcat_sender,
+                            &mut chat_input_msgs,
+                            &mut ime,
                         );
-                        group_member_sizes.insert(pane_key, pane_size);
-                        if member_id != v.members.last().unwrap_or(member_id) {
-                            ui.add_space(GROUP_CHAT_SEPARATOR_HEIGHT * 0.5);
-                            ui.separator();
-                            ui.add_space(GROUP_CHAT_SEPARATOR_HEIGHT * 0.5);
-                        }
-                    }
+                    });
 
-                    group_broadcast_input_ui(
-                        ui,
+                if let Some(response) = response {
+                    paint_unread_badge(
                         ctx,
-                        &k,
-                        &v.members,
-                        &manager.messages,
-                        napcat_sender,
-                        &mut chat_input_msgs,
-                        &mut ime,
+                        response.response.rect,
+                        unread_count,
                     );
-                });
-
-            if let Some(response) = response {
-                group_rects.insert(k.clone(), response.response.rect);
-                if v.members.len() == 1 {
-                    let member_id = v.members[0].clone();
-                    let button_size = egui::vec2(52.0, 22.0);
-                    let button_pos = egui::pos2(
-                        response.response.rect.right() - button_size.x - 8.0,
-                        response.response.rect.top() + 34.0,
-                    );
-                    egui::Area::new(Id::new((
-                        k,
-                        member_id.as_str(),
-                        "leave_group_overlay",
-                    )))
-                    .order(egui::Order::Foreground)
-                    .fixed_pos(button_pos)
-                    .show(ctx, |ui| {
-                        if ui
-                            .add_sized(button_size, egui::Button::new("离开"))
-                            .on_hover_text("离开讨论组")
-                            .clicked()
-                        {
-                            if let Some(group) = manager.groups.get_mut(k) {
-                                group.members.retain(|id| id != &member_id);
-                                manager.persist().ok();
+                    if response.inner.is_some() {
+                        if let Some(previous_rect) = previous_group_rects.get(k) {
+                            let delta = response.response.rect.min - previous_rect.min;
+                            if delta.length_sq() > 0.0 {
+                                group_deltas.insert(k.clone(), delta);
                             }
                         }
-                    });
+                        latest_group_rects.insert(k.clone(), response.response.rect);
+                        group_rects.insert(k.clone(), response.response.rect);
+                    }
                 }
             }
-        }
+            *previous_group_rects = latest_group_rects;
 
-        for (target_id, messages) in manager.messages.clone() {
-            let id = egui::Id::new(&target_id);
-            let mut default_rect: Rect = Rect::from_pos(Pos2::new(0.0, 0.0));
-            if !*has_run_once {
-                ctx.memory(|m| {
-                    if let Some(rect) = m.area_rect(id) {
-                        default_rect = rect;
-                    }
+            for (target_id, messages) in manager.messages.clone() {
+                let id = egui::Id::new(&target_id);
+                let mut default_rect: Rect = Rect::from_pos(Pos2::new(0.0, 0.0));
+                if !*has_run_once {
+                    ctx.memory(|m| {
+                        if let Some(rect) = m.area_rect(id) {
+                            default_rect = rect;
+                        }
+                    });
+                    *has_run_once = true
+                }
+
+                let current_group = manager.groups.iter().find_map(|(group_name, group)| {
+                    group
+                        .members
+                        .contains(&target_id)
+                        .then_some(group_name.clone())
                 });
-                *has_run_once = true
+                let rect = if let Some(group_name) = current_group.as_deref() {
+                    let Some(rect) = group_rects.get(group_name).copied() else {
+                        continue;
+                    };
+                    rect
+                } else {
+                    ui.max_rect()
+                };
+                let (nickname, heights) = get_nickname_lens(target_id.clone(), &messages);
+                let targets = targets_for_messages(&target_id, &messages);
+                let unread_count = target_unread_count(&manager, &target_id);
+                queue_summary_if_needed(
+                    &target_id,
+                    &messages,
+                    deepseek_sender,
+                    &mut deepseek_manager,
+                );
+
+                chat_window(
+                    nickname,
+                    id,
+                    rect,
+                    ctx,
+                    heights,
+                    &messages,
+                    napcat_sender,
+                    &target_id,
+                    &mut chat_input_msgs,
+                    targets,
+                    &mut ime,
+                    &group_rects,
+                    &mut manager,
+                    current_group.as_deref(),
+                    current_group
+                        .as_deref()
+                        .and_then(|group_name| group_deltas.get(group_name).copied()),
+                    unread_count,
+                );
             }
-
-            let rect = ui.max_rect();
-            let (nickname, heights) = get_nickname_lens(target_id.clone(), &messages);
-            let targets = targets_for_messages(&target_id, &messages);
-            queue_summary_if_needed(
-                &target_id,
-                &messages,
-                deepseek_sender,
-                &mut deepseek_manager,
-            );
-
-            if manager
-                .groups
-                .values()
-                .any(|group| group.members.contains(&target_id))
-            {
-                continue;
-            }
-
-            chat_window(
-                nickname,
-                id,
-                rect,
-                ctx,
-                heights,
-                &messages,
-                napcat_sender,
-                &target_id,
-                &mut chat_input_msgs,
-                targets,
-                &mut ime,
-                &group_rects,
-                &mut manager,
-            );
-        }
-    });
+        });
 
     ctx.memory(|m| {
         cached_memory.ui_memory = m.clone();

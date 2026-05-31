@@ -22,6 +22,7 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use serde_json::json;
 use tokio::{
     runtime::Builder,
     sync::mpsc::{
@@ -68,6 +69,11 @@ pub struct NapcatSendResult {
 #[derive(Resource, Default)]
 pub struct NapcatSendManager {
     pub results: Vec<NapcatSendResult>,
+}
+
+#[derive(Resource)]
+struct NapcatAutoForwardRequestIds {
+    next_request_id: u64,
 }
 
 pub struct NapcatPlugin;
@@ -175,6 +181,8 @@ pub struct NapcatMessageManager {
     pub messages: HashMap<String, Vec<NapcatMessage>>,
     #[serde(default)]
     pub groups: HashMap<String, ChatGroup>,
+    #[serde(default)]
+    pub read_message_counts: HashMap<String, usize>,
 }
 
 impl Plugin for NapcatPlugin {
@@ -202,10 +210,14 @@ fn setup(mut commands: Commands) {
     commands.insert_resource(napcat_send_results);
     commands.insert_resource(NapcatIOSender(game_to_client_sender));
     commands.insert_resource(NapcatSendManager::default());
+    commands.insert_resource(NapcatAutoForwardRequestIds {
+        next_request_id: 1_000_000,
+    });
 
     let message_manager = NapcatMessageManager {
         messages: HashMap::default(),
         groups: HashMap::default(),
+        read_message_counts: HashMap::default(),
     };
     let config_dir = Path::new(".data").join("willowblossom");
     commands.insert_resource(
@@ -321,6 +333,8 @@ fn send_result_system(
 
 fn message_system(
     receiver: Res<NapcatIOReceiver>,
+    sender: Option<Res<NapcatIOSender>>,
+    mut auto_forward_ids: ResMut<NapcatAutoForwardRequestIds>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
 ) {
     while let Ok(msg) = receiver.0.try_recv() {
@@ -337,15 +351,51 @@ fn message_system(
                 },
                 NapcatMessageType::Group => json.data.group_id.unwrap_or(json.data.user_id),
             };
+            let target_id = target_id.to_string();
+
+            let auto_forward = auto_forward_request(&manager, &json, &target_id);
 
             manager
                 .messages
-                .entry(target_id.to_string())
+                .entry(target_id.clone())
                 .or_default()
                 .push(json);
 
             if let Err(err) = manager.persist() {
                 eprintln!("failed to persist NapCat messages: {err}");
+            }
+
+            if let (Some(sender), Some(auto_forward)) = (sender.as_deref(), auto_forward) {
+                for user_id in auto_forward.recipients {
+                    let request_id = auto_forward_ids.next_request_id;
+                    auto_forward_ids.next_request_id += 1;
+                    let message = Message::Text(
+                        json!({
+                            "action": "send_private_msg",
+                            "params": {
+                                "user_id": user_id,
+                                "message": [
+                                    {
+                                        "type": "text",
+                                        "data": {
+                                            "text": auto_forward.text
+                                        }
+                                    }
+                                ]
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    );
+
+                    if let Err(err) = sender.0.try_send(NapcatOutboundMessage {
+                        request_id,
+                        target_id: user_id.to_string(),
+                        message,
+                    }) {
+                        eprintln!("failed to queue NapCat auto-forward message: {err}");
+                    }
+                }
             }
         } else {
             eprintln!(
@@ -355,6 +405,89 @@ fn message_system(
             );
         }
     }
+}
+
+struct AutoForwardRequest {
+    recipients: Vec<u64>,
+    text: String,
+}
+
+fn auto_forward_request(
+    manager: &NapcatMessageManager,
+    message: &NapcatMessage,
+    target_id: &str,
+) -> Option<AutoForwardRequest> {
+    if !matches!(
+        message.data.message_type,
+        NapcatMessageType::Private
+    ) || message.data.user_id == message.data.self_id
+    {
+        return None;
+    }
+
+    let text = quoted_auto_forward_text(message)?;
+    let recipients = manager
+        .groups
+        .values()
+        .find(|group| group.members.iter().any(|member_id| member_id == target_id))?
+        .members
+        .iter()
+        .filter(|member_id| member_id.as_str() != target_id)
+        .filter_map(|member_id| {
+            let is_private_member = matches!(
+                manager
+                    .messages
+                    .get(member_id)
+                    .and_then(|messages| messages.first())
+                    .map(|message| &message.data.message_type),
+                Some(NapcatMessageType::Private)
+            );
+            if !is_private_member {
+                return None;
+            }
+            member_id.parse::<u64>().ok()
+        })
+        .collect::<Vec<_>>();
+
+    if recipients.is_empty() {
+        return None;
+    }
+
+    Some(AutoForwardRequest {
+        recipients,
+        text: format!(
+            "{}: {}",
+            message.data.sender.nickname, text
+        ),
+    })
+}
+
+fn quoted_auto_forward_text(message: &NapcatMessage) -> Option<String> {
+    let mut text = String::new();
+    for chain in &message.data.message {
+        if let NapcatMessageChainType::Text { data } = &chain.variant {
+            text.push_str(&data.text);
+        }
+    }
+
+    let text = text.trim();
+    let mut indexed_chars = text.char_indices();
+    let (_, start_quote) = indexed_chars.next()?;
+    let (end_quote_index, end_quote) = indexed_chars.next_back()?;
+    if !is_auto_forward_quote(start_quote) || !is_auto_forward_quote(end_quote) {
+        return None;
+    }
+
+    let inner = text[start_quote.len_utf8()..end_quote_index].trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_owned())
+    }
+}
+
+fn is_auto_forward_quote(character: char) -> bool {
+    matches!(character, '"' | '“' | '”' | '＂')
 }
 
 #[cfg(test)]
@@ -415,5 +548,68 @@ mod tests {
             panic!("string payload should become a text segment");
         };
         assert_eq!(data.text, "plain group text");
+    }
+
+    #[test]
+    fn detects_auto_forward_text_with_mixed_quote_styles() {
+        let message = serde_json::from_str::<NapcatMessage>(
+            r#"{
+                "time": 1780132600,
+                "message_type": "private",
+                "message": "“hello players\"",
+                "self_id": 3432505351,
+                "user_id": 1670426821,
+                "sender": {
+                    "user_id": 1670426821,
+                    "nickname": "tester"
+                }
+            }"#,
+        )
+        .expect("private message should parse");
+
+        assert_eq!(
+            quoted_auto_forward_text(&message),
+            Some("hello players".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_auto_forward_text_without_strict_boundary_quotes() {
+        let message = serde_json::from_str::<NapcatMessage>(
+            r#"{
+                "time": 1780132600,
+                "message_type": "private",
+                "message": "say \"hello players\"",
+                "self_id": 3432505351,
+                "user_id": 1670426821,
+                "sender": {
+                    "user_id": 1670426821,
+                    "nickname": "tester"
+                }
+            }"#,
+        )
+        .expect("private message should parse");
+
+        assert_eq!(quoted_auto_forward_text(&message), None);
+    }
+
+    #[test]
+    fn rejects_single_quote_character_as_auto_forward_text() {
+        let message = serde_json::from_str::<NapcatMessage>(
+            r#"{
+                "time": 1780132600,
+                "message_type": "private",
+                "message": "\"",
+                "self_id": 3432505351,
+                "user_id": 1670426821,
+                "sender": {
+                    "user_id": 1670426821,
+                    "nickname": "tester"
+                }
+            }"#,
+        )
+        .expect("private message should parse");
+
+        assert_eq!(quoted_auto_forward_text(&message), None);
     }
 }

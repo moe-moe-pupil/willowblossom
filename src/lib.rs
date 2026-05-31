@@ -1,6 +1,7 @@
 mod camera;
 mod deepseek;
 mod napcat;
+mod scene;
 mod ui;
 
 use bevy::{
@@ -77,6 +78,7 @@ impl Plugin for GamePlugin {
         app.add_plugins((
             camera::CameraPlugin,
             napcat::NapcatPlugin,
+            scene::ScenePreviewPlugin,
             ui::UIPlugin,
         ));
     }

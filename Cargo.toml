@@ -66,3 +66,4 @@ egui_extras = {  git = "https://github.com/moe-moe-pupil/egui", branch = "patch-
 image = { version = "0.25.5", features = ["jpeg", "png"] }
 reqwest = { version = "0.12.14", features = ["blocking", "json"] }
 curl = "0.4.47"
+bevy_voxel_world = "0.15.0"
