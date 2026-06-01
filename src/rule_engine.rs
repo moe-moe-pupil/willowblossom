@@ -1,4 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{
+    HashMap,
+    HashSet,
+    VecDeque,
+};
 
 use bevy::prelude::*;
 use bevy_egui::{
@@ -66,9 +70,20 @@ pub enum ValueExpr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DamageType {
+    Cursed,
+    Diseased,
+    Bleed,
+    Range,
+    Poisoning,
     Physical,
     Magical,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealType {
+    Instant,
+    OverTime,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +102,115 @@ pub struct Character {
     pub damage_taken_modifier: f32,
     pub healing_dealt_modifier: f32,
     pub healing_taken_modifier: f32,
+}
+
+#[derive(Component, Debug, Clone)]
+pub struct Combatant {
+    pub id: String,
+    pub name: String,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub mp: f32,
+    pub max_mp: f32,
+    pub hp_regen: f32,
+    pub mp_regen: f32,
+}
+
+#[derive(Component, Debug, Clone, Default, PartialEq)]
+pub struct StatusBlock {
+    pub str_: i32,
+    pub agi: i32,
+    pub dex: i32,
+    pub vit: i32,
+    pub int_: i32,
+    pub wis: i32,
+    pub k: i32,
+    pub cha: i32,
+}
+
+#[derive(Component, Debug, Clone)]
+pub struct CombatModifiers {
+    pub damage_dealt: f32,
+    pub damage_taken: f32,
+    pub healing_dealt: f32,
+    pub healing_taken: f32,
+}
+
+#[derive(Component, Debug, Clone)]
+pub struct BaseCombatant(pub Combatant);
+
+#[derive(Component, Debug, Clone)]
+pub struct BaseStatusBlock(pub StatusBlock);
+
+#[derive(Component, Debug, Clone)]
+pub struct BaseCombatModifiers(pub CombatModifiers);
+
+#[derive(Component, Debug, Clone)]
+pub struct BuffOwner {
+    pub target: Entity,
+}
+
+#[derive(Component, Debug, Clone)]
+pub struct ActiveBuff {
+    pub name: String,
+    pub priority: i32,
+    pub turns_remaining: i32,
+    pub source_id: String,
+    pub beneficial: bool,
+}
+
+#[derive(Component, Debug, Clone)]
+pub struct BuffEffects(pub Vec<BuffEffect>);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuffSpec {
+    pub name: String,
+    pub priority: i32,
+    pub turns_remaining: i32,
+    pub source_id: String,
+    pub beneficial: bool,
+    pub effects: Vec<BuffEffect>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuffEffect {
+    pub field: BuffField,
+    pub value: BuffValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuffField {
+    Hp,
+    Mp,
+    MaxHp,
+    MaxMp,
+    HpRegen,
+    MpRegen,
+    Status(StatusKey),
+    DamageDealtModifier,
+    DamageTakenModifier,
+    HealingDealtModifier,
+    HealingTakenModifier,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKey {
+    Str,
+    Agi,
+    Dex,
+    Vit,
+    Int,
+    Wis,
+    K,
+    Cha,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BuffValue {
+    Add(f32),
+    AddPercent(f32),
+    Set(f32),
+    SetPercentOfBase(f32),
 }
 
 #[derive(Debug, Clone)]
@@ -109,11 +233,28 @@ pub enum RuleEvent {
     },
 }
 
-#[derive(Debug, Default, Clone)]
 pub struct RuleEngine {
+    ecs_world: World,
+    entity_by_id: HashMap<String, Entity>,
     pub characters: HashMap<String, Character>,
     pub rules: Vec<Rule>,
     pub log: Vec<String>,
+    event_queue: VecDeque<RuleEvent>,
+    resolving_events: bool,
+}
+
+impl Default for RuleEngine {
+    fn default() -> Self {
+        Self {
+            ecs_world: World::new(),
+            entity_by_id: HashMap::new(),
+            characters: HashMap::new(),
+            rules: Vec::new(),
+            log: Vec::new(),
+            event_queue: VecDeque::new(),
+            resolving_events: false,
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -122,6 +263,7 @@ pub struct RuleEngineState {
     rule_input: String,
     parse_preview: String,
     attack_amount: f32,
+    panel_open: bool,
 }
 
 impl Default for RuleEngineState {
@@ -144,7 +286,34 @@ impl Default for RuleEngineState {
             rule_input,
             parse_preview,
             attack_amount: 3.0,
+            panel_open: true,
         }
+    }
+}
+
+impl RuleEngineState {
+    pub fn open_panel(&mut self) { self.panel_open = true; }
+
+    pub fn sync_character(
+        &mut self,
+        owner_id: &str,
+        name: &str,
+        hp: f32,
+        max_hp: f32,
+        damage_dealt_modifier: f32,
+        damage_taken_modifier: f32,
+        healing_dealt_modifier: f32,
+        healing_taken_modifier: f32,
+        rules: Vec<RuleAst>,
+    ) {
+        let mut character = Character::new(owner_id, name, max_hp.max(0.0));
+        character.hp = hp.clamp(0.0, character.max_hp);
+        character.damage_dealt_modifier = damage_dealt_modifier;
+        character.damage_taken_modifier = damage_taken_modifier;
+        character.healing_dealt_modifier = healing_dealt_modifier;
+        character.healing_taken_modifier = healing_taken_modifier;
+        self.engine.add_character(character);
+        self.engine.replace_rules_for_owner(owner_id, rules);
     }
 }
 
@@ -247,6 +416,11 @@ impl ValueExpr {
 impl DamageType {
     fn explain(self) -> &'static str {
         match self {
+            DamageType::Cursed => "诅咒",
+            DamageType::Diseased => "疾病",
+            DamageType::Bleed => "流血",
+            DamageType::Range => "远程",
+            DamageType::Poisoning => "中毒",
             DamageType::Physical => "物理",
             DamageType::Magical => "魔法",
             DamageType::None => "无类型",
@@ -256,7 +430,54 @@ impl DamageType {
 
 impl RuleEngine {
     pub fn add_character(&mut self, character: Character) {
-        self.characters.insert(character.id.clone(), character);
+        self.upsert_character_entity(&character);
+        let character_id = character.id.clone();
+        self.characters.insert(character_id.clone(), character);
+        self.recompute_character_from_buffs(&character_id);
+    }
+
+    fn upsert_character_entity(&mut self, character: &Character) {
+        let combatant = Combatant {
+            id: character.id.clone(),
+            name: character.name.clone(),
+            hp: character.hp,
+            max_hp: character.max_hp,
+            mp: 0.0,
+            max_mp: 0.0,
+            hp_regen: 0.0,
+            mp_regen: 0.0,
+        };
+        let modifiers = CombatModifiers {
+            damage_dealt: character.damage_dealt_modifier,
+            damage_taken: character.damage_taken_modifier,
+            healing_dealt: character.healing_dealt_modifier,
+            healing_taken: character.healing_taken_modifier,
+        };
+
+        if let Some(entity) = self.entity_by_id.get(&character.id).copied() {
+            let mut entity_mut = self.ecs_world.entity_mut(entity);
+            entity_mut.insert((
+                combatant.clone(),
+                BaseCombatant(combatant),
+                StatusBlock::default(),
+                BaseStatusBlock(StatusBlock::default()),
+                modifiers.clone(),
+                BaseCombatModifiers(modifiers),
+            ));
+        } else {
+            let entity = self
+                .ecs_world
+                .spawn((
+                    combatant.clone(),
+                    BaseCombatant(combatant),
+                    StatusBlock::default(),
+                    BaseStatusBlock(StatusBlock::default()),
+                    modifiers.clone(),
+                    BaseCombatModifiers(modifiers),
+                ))
+                .id();
+            self.entity_by_id.insert(character.id.clone(), entity);
+        }
     }
 
     pub fn add_rule(&mut self, owner_id: impl Into<String>, ast: RuleAst) {
@@ -266,9 +487,141 @@ impl RuleEngine {
         });
     }
 
-    pub fn replace_rules_for_owner(&mut self, owner_id: &str, ast: RuleAst) {
+    pub fn replace_rule_for_owner(&mut self, owner_id: &str, ast: RuleAst) {
+        self.replace_rules_for_owner(owner_id, vec![ast]);
+    }
+
+    pub fn replace_rules_for_owner(&mut self, owner_id: &str, asts: Vec<RuleAst>) {
         self.rules.retain(|rule| rule.owner_id != owner_id);
-        self.add_rule(owner_id, ast);
+        for ast in asts {
+            self.add_rule(owner_id, ast);
+        }
+    }
+
+    pub fn clear_rules_for_owner(&mut self, owner_id: &str) {
+        self.rules.retain(|rule| rule.owner_id != owner_id);
+    }
+
+    pub fn give_buff(&mut self, target_id: &str, spec: BuffSpec) -> bool {
+        let Some(target) = self.entity_by_id.get(target_id).copied() else {
+            return false;
+        };
+
+        self.ecs_world.spawn((
+            BuffOwner { target },
+            ActiveBuff {
+                name: spec.name,
+                priority: spec.priority,
+                turns_remaining: spec.turns_remaining,
+                source_id: spec.source_id,
+                beneficial: spec.beneficial,
+            },
+            BuffEffects(spec.effects),
+        ));
+        self.recompute_character_from_buffs(target_id);
+        true
+    }
+
+    pub fn advance_turn(&mut self) {
+        let mut expired = Vec::new();
+        let mut changed_targets = HashSet::new();
+        let mut query = self
+            .ecs_world
+            .query::<(Entity, &BuffOwner, &mut ActiveBuff)>();
+        for (entity, owner, mut buff) in query.iter_mut(&mut self.ecs_world) {
+            buff.turns_remaining -= 1;
+            changed_targets.insert(owner.target);
+            if buff.turns_remaining <= 0 {
+                expired.push(entity);
+            }
+        }
+        for entity in expired {
+            let _ = self.ecs_world.despawn(entity);
+        }
+        let changed_ids = self
+            .entity_by_id
+            .iter()
+            .filter_map(|(id, entity)| changed_targets.contains(entity).then(|| id.clone()))
+            .collect::<Vec<_>>();
+        for id in changed_ids {
+            self.recompute_character_from_buffs(&id);
+        }
+    }
+
+    pub fn active_buff_names(&mut self, target_id: &str) -> Vec<String> {
+        let Some(target) = self.entity_by_id.get(target_id).copied() else {
+            return Vec::new();
+        };
+        let mut buffs = self
+            .ecs_world
+            .query::<(&BuffOwner, &ActiveBuff)>()
+            .iter(&self.ecs_world)
+            .filter(|(owner, _)| owner.target == target)
+            .map(|(_, buff)| (buff.priority, buff.name.clone()))
+            .collect::<Vec<_>>();
+        buffs.sort_by_key(|(priority, _)| *priority);
+        buffs.into_iter().map(|(_, name)| name).collect()
+    }
+
+    fn recompute_character_from_buffs(&mut self, character_id: &str) {
+        let Some(entity) = self.entity_by_id.get(character_id).copied() else {
+            return;
+        };
+        let Ok((base_combatant, base_status, base_modifiers)) = self
+            .ecs_world
+            .query::<(
+                &BaseCombatant,
+                &BaseStatusBlock,
+                &BaseCombatModifiers,
+            )>()
+            .get(&self.ecs_world, entity)
+        else {
+            return;
+        };
+
+        let mut combatant = base_combatant.0.clone();
+        let mut status = base_status.0.clone();
+        let mut modifiers = base_modifiers.0.clone();
+        let mut effects = self
+            .ecs_world
+            .query::<(&BuffOwner, &ActiveBuff, &BuffEffects)>()
+            .iter(&self.ecs_world)
+            .filter(|(owner, buff, _)| owner.target == entity && buff.turns_remaining > 0)
+            .map(|(_, buff, effects)| (buff.priority, effects.0.clone()))
+            .collect::<Vec<_>>();
+        effects.sort_by_key(|(priority, _)| *priority);
+
+        for (_, effects) in effects {
+            for effect in effects {
+                apply_buff_effect(
+                    &mut combatant,
+                    &mut status,
+                    &mut modifiers,
+                    &effect,
+                );
+            }
+        }
+
+        combatant.max_hp = combatant.max_hp.max(0.0);
+        combatant.hp = combatant.hp.clamp(0.0, combatant.max_hp);
+        combatant.max_mp = combatant.max_mp.max(0.0);
+        combatant.mp = combatant.mp.clamp(0.0, combatant.max_mp);
+
+        let mut entity_mut = self.ecs_world.entity_mut(entity);
+        entity_mut.insert((
+            combatant.clone(),
+            status,
+            modifiers.clone(),
+        ));
+
+        if let Some(character) = self.characters.get_mut(character_id) {
+            character.hp = combatant.hp;
+            character.max_hp = combatant.max_hp;
+            character.damage_dealt_modifier = modifiers.damage_dealt;
+            character.damage_taken_modifier = modifiers.damage_taken;
+            character.healing_dealt_modifier = modifiers.healing_dealt;
+            character.healing_taken_modifier = modifiers.healing_taken;
+        }
     }
 
     pub fn attack(
@@ -290,8 +643,10 @@ impl RuleEngine {
             .unwrap_or(1.0);
         let final_damage = (amount * source_modifier * target_modifier).max(0.0);
 
+        let mut hp_update = None;
         if let Some(target) = self.characters.get_mut(target_id) {
             target.hp = (target.hp - final_damage).max(0.0);
+            hp_update = Some((target.hp, target.max_hp));
             self.log.push(format!(
                 "{}受到{}点伤害，生命值变为 {}/{}",
                 target.name,
@@ -300,19 +655,23 @@ impl RuleEngine {
                 format_number(target.max_hp)
             ));
         }
+        if let Some((hp, max_hp)) = hp_update {
+            self.sync_character_hp_to_ecs(target_id, hp, max_hp);
+        }
 
-        self.resolve_event(RuleEvent::DamageTaken {
+        self.queue_event(RuleEvent::DamageTaken {
             source_id: source_id.to_owned(),
             target_id: target_id.to_owned(),
             amount: final_damage,
             damage_type,
         });
-        self.resolve_event(RuleEvent::DamageDealt {
+        self.queue_event(RuleEvent::DamageDealt {
             source_id: source_id.to_owned(),
             target_id: target_id.to_owned(),
             amount: final_damage,
             damage_type,
         });
+        self.resolve_queued_events();
     }
 
     pub fn heal(&mut self, source_id: &str, target_id: &str, amount: f32) {
@@ -328,8 +687,10 @@ impl RuleEngine {
             .unwrap_or(1.0);
         let final_heal = (amount * source_modifier * target_modifier).max(0.0);
 
+        let mut hp_update = None;
         if let Some(target) = self.characters.get_mut(target_id) {
             target.hp = (target.hp + final_heal).min(target.max_hp);
+            hp_update = Some((target.hp, target.max_hp));
             self.log.push(format!(
                 "{}回复{}点生命值，生命值变为 {}/{}",
                 target.name,
@@ -338,9 +699,39 @@ impl RuleEngine {
                 format_number(target.max_hp)
             ));
         }
+        if let Some((hp, max_hp)) = hp_update {
+            self.sync_character_hp_to_ecs(target_id, hp, max_hp);
+        }
     }
 
     pub fn resolve_event(&mut self, event: RuleEvent) {
+        self.queue_event(event);
+        self.resolve_queued_events();
+    }
+
+    fn queue_event(&mut self, event: RuleEvent) { self.event_queue.push_back(event); }
+
+    fn resolve_queued_events(&mut self) {
+        if self.resolving_events {
+            return;
+        }
+
+        self.resolving_events = true;
+        let mut resolved_events = 0;
+        while let Some(event) = self.event_queue.pop_front() {
+            resolved_events += 1;
+            if resolved_events > 128 {
+                self.event_queue.clear();
+                self.log
+                    .push("规则解析停止：触发次数过多，可能存在循环规则。".to_owned());
+                break;
+            }
+            self.resolve_event_now(event);
+        }
+        self.resolving_events = false;
+    }
+
+    fn resolve_event_now(&mut self, event: RuleEvent) {
         let matched_rules = self
             .rules
             .iter()
@@ -394,6 +785,86 @@ impl RuleEngine {
                 );
             },
         }
+    }
+
+    fn sync_character_hp_to_ecs(&mut self, character_id: &str, hp: f32, max_hp: f32) {
+        let Some(entity) = self.entity_by_id.get(character_id).copied() else {
+            return;
+        };
+
+        if let Some(mut combatant) = self.ecs_world.get_mut::<Combatant>(entity) {
+            combatant.hp = hp;
+            combatant.max_hp = max_hp;
+        }
+        if let Some(mut base) = self.ecs_world.get_mut::<BaseCombatant>(entity) {
+            base.0.hp = hp;
+            base.0.max_hp = max_hp;
+        }
+    }
+}
+
+fn apply_buff_effect(
+    combatant: &mut Combatant,
+    status: &mut StatusBlock,
+    modifiers: &mut CombatModifiers,
+    effect: &BuffEffect,
+) {
+    match effect.field {
+        BuffField::Hp => apply_f32(&mut combatant.hp, effect.value),
+        BuffField::Mp => apply_f32(&mut combatant.mp, effect.value),
+        BuffField::MaxHp => apply_f32(&mut combatant.max_hp, effect.value),
+        BuffField::MaxMp => apply_f32(&mut combatant.max_mp, effect.value),
+        BuffField::HpRegen => apply_f32(&mut combatant.hp_regen, effect.value),
+        BuffField::MpRegen => apply_f32(&mut combatant.mp_regen, effect.value),
+        BuffField::DamageDealtModifier => apply_f32(
+            &mut modifiers.damage_dealt,
+            effect.value,
+        ),
+        BuffField::DamageTakenModifier => apply_f32(
+            &mut modifiers.damage_taken,
+            effect.value,
+        ),
+        BuffField::HealingDealtModifier => apply_f32(
+            &mut modifiers.healing_dealt,
+            effect.value,
+        ),
+        BuffField::HealingTakenModifier => apply_f32(
+            &mut modifiers.healing_taken,
+            effect.value,
+        ),
+        BuffField::Status(key) => apply_i32(
+            status_value_mut(status, key),
+            effect.value,
+        ),
+    }
+}
+
+fn apply_f32(target: &mut f32, value: BuffValue) {
+    let base = *target;
+    match value {
+        BuffValue::Add(delta) => *target += delta,
+        BuffValue::AddPercent(percent) => *target *= 1.0 + percent / 100.0,
+        BuffValue::Set(new_value) => *target = new_value,
+        BuffValue::SetPercentOfBase(percent) => *target = base * percent / 100.0,
+    }
+}
+
+fn apply_i32(target: &mut i32, value: BuffValue) {
+    let mut float_value = *target as f32;
+    apply_f32(&mut float_value, value);
+    *target = float_value.round() as i32;
+}
+
+fn status_value_mut(status: &mut StatusBlock, key: StatusKey) -> &mut i32 {
+    match key {
+        StatusKey::Str => &mut status.str_,
+        StatusKey::Agi => &mut status.agi,
+        StatusKey::Dex => &mut status.dex,
+        StatusKey::Vit => &mut status.vit,
+        StatusKey::Int => &mut status.int_,
+        StatusKey::Wis => &mut status.wis,
+        StatusKey::K => &mut status.k,
+        StatusKey::Cha => &mut status.cha,
     }
 }
 
@@ -484,7 +955,14 @@ fn parse_actions(text: &str) -> Result<Vec<Action>, String> {
 }
 
 fn action_clause(text: &str) -> &str {
-    for marker in ["则", "时", "，", ","] {
+    if let Some(trigger_end) = trigger_end_index(text) {
+        let tail = text[trigger_end..].trim_start_matches(['，', ',', '；', ';', '则', '时']);
+        if contains_action_word(tail) {
+            return tail;
+        }
+    }
+
+    for marker in ["则", "，", ",", "；", ";"] {
         if let Some((_, tail)) = text.split_once(marker) {
             if contains_action_word(tail) {
                 return tail;
@@ -492,6 +970,20 @@ fn action_clause(text: &str) -> &str {
         }
     }
     text
+}
+
+fn trigger_end_index(text: &str) -> Option<usize> {
+    [
+        "受到伤害",
+        "承受伤害",
+        "受伤害",
+        "造成伤害",
+        "释放技能",
+        "技能释放",
+    ]
+    .iter()
+    .filter_map(|event| text.find(event).map(|index| index + event.len()))
+    .min()
 }
 
 fn contains_action_word(text: &str) -> bool {
@@ -505,7 +997,7 @@ fn parse_action_target(clause: &str, default_target: ActorRef) -> ActorRef {
         ActorRef::Target
     } else if clause.contains("来源") || clause.contains("攻击者") {
         ActorRef::Source
-    } else if clause.contains("自己") || clause.contains("自身") || clause.contains("你") {
+    } else if clause.contains("自己") {
         ActorRef::SelfActor
     } else {
         default_target
@@ -513,9 +1005,19 @@ fn parse_action_target(clause: &str, default_target: ActorRef) -> ActorRef {
 }
 
 fn parse_damage_type(clause: &str) -> DamageType {
-    if clause.contains("物理") {
+    if clause.contains("诅咒") {
+        DamageType::Cursed
+    } else if clause.contains("疾病") {
+        DamageType::Diseased
+    } else if clause.contains("流血") {
+        DamageType::Bleed
+    } else if clause.contains("远程") {
+        DamageType::Range
+    } else if clause.contains("中毒") {
+        DamageType::Poisoning
+    } else if clause.contains("物理") {
         DamageType::Physical
-    } else if clause.contains("魔法") || clause.contains("法术") {
+    } else if clause.contains("魔法") {
         DamageType::Magical
     } else {
         DamageType::None
@@ -571,14 +1073,16 @@ fn normalize_rule_text(input: &str) -> String {
     input
         .trim()
         .replace(' ', "")
-        .replace('\n', "")
+        .replace("\r\n", "，")
+        .replace('\n', "，")
+        .replace('\r', "，")
         .replace("每当", "当")
         .replace("无论何时", "当")
 }
 
 fn rule_matches(rule: &Rule, event: &RuleEvent) -> bool {
     let expected_actor = match rule.ast.trigger.subject {
-        ActorRef::SelfActor => Some(rule.owner_id.as_str()),
+        ActorRef::SelfActor => event_primary_actor_id(event),
         ActorRef::Source => event_source_id(event),
         ActorRef::Target => event_target_id(event),
     };
@@ -600,6 +1104,15 @@ fn rule_matches(rule: &Rule, event: &RuleEvent) -> bool {
             RuleEvent::SkillCast { .. }
         )
     )
+}
+
+fn event_primary_actor_id(event: &RuleEvent) -> Option<&str> {
+    match event {
+        RuleEvent::DamageTaken { target_id, .. } => Some(target_id),
+        RuleEvent::DamageDealt { source_id, .. } | RuleEvent::SkillCast { source_id, .. } => {
+            Some(source_id)
+        },
+    }
 }
 
 fn resolve_actor(actor: ActorRef, owner_id: &str, event: &RuleEvent) -> Option<String> {
@@ -668,56 +1181,158 @@ fn rule_engine_panel(mut contexts: EguiContexts, mut state: ResMut<RuleEngineSta
         return;
     };
 
+    if !state.panel_open {
+        return;
+    }
+
+    let mut panel_open = state.panel_open;
+    let mut close_requested = false;
+
     egui::Window::new("Rule Engine")
         .default_pos(egui::pos2(12.0, 430.0))
         .default_width(360.0)
         .resizable(true)
+        .open(&mut panel_open)
         .show(ctx, |ui| {
-            ui.label("中文规则");
-            ui.text_edit_multiline(&mut state.rule_input);
-            ui.horizontal(|ui| {
-                if ui.button("Parse").clicked() {
-                    match parse_rule(&state.rule_input) {
-                        Ok(ast) => {
-                            state.parse_preview = ast.explain();
-                            state.engine.replace_rules_for_owner("alice", ast);
-                        },
-                        Err(err) => state.parse_preview = err,
-                    }
-                }
-                if ui.button("Enemy Attack").clicked() {
-                    let attack_amount = state.attack_amount;
-                    state.engine.attack(
-                        "enemy",
-                        "alice",
-                        attack_amount,
-                        DamageType::Physical,
-                    );
-                }
-                if ui.button("Reset").clicked() {
-                    *state = RuleEngineState::default();
-                }
-            });
-            ui.add(egui::Slider::new(&mut state.attack_amount, 0.0..=20.0).text("Damage"));
-            ui.separator();
-            ui.label(&state.parse_preview);
-            ui.separator();
-            if let Some(character) = state.engine.characters.get("alice") {
-                ui.label(format!(
-                    "{} HP: {}/{}",
-                    character.name,
-                    format_number(character.hp),
-                    format_number(character.max_hp)
-                ));
-            }
             egui::ScrollArea::vertical()
-                .max_height(140.0)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for line in state.engine.log.iter().rev().take(12) {
-                        ui.label(line);
+                    ui.label("中文规则");
+                    let rule_response = ui.add(
+                        egui::TextEdit::multiline(&mut state.rule_input)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if rule_response.changed() {
+                        parse_owner_rule(&mut state, "alice");
                     }
+                    ui.horizontal(|ui| {
+                        if ui.button("Parse").clicked() {
+                            parse_owner_rule(&mut state, "alice");
+                        }
+                        if ui.button("Enemy Attack").clicked() {
+                            let attack_amount = state.attack_amount;
+                            state.engine.attack(
+                                "enemy",
+                                "alice",
+                                attack_amount,
+                                DamageType::Physical,
+                            );
+                        }
+                        if ui.button("Reset").clicked() {
+                            *state = RuleEngineState::default();
+                        }
+                        if ui.button("Clear Log").clicked() {
+                            state.engine.log.clear();
+                        }
+                        if ui.button("Close").clicked() {
+                            close_requested = true;
+                        }
+                    });
+                    ui.add(egui::Slider::new(&mut state.attack_amount, 0.0..=20.0).text("Damage"));
+                    ui.separator();
+                    ui.label(&state.parse_preview);
+                    ui.collapsing("Available Words", |ui| {
+                        rule_words(ui);
+                    });
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        character_hp(ui, &state.engine, "alice");
+                        ui.separator();
+                        character_hp(ui, &state.engine, "enemy");
+                    });
+                    ui.separator();
+                    ui.label("Log");
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in state.engine.log.iter().rev().take(40) {
+                                ui.label(line);
+                            }
+                        });
                 });
         });
+
+    state.panel_open = panel_open && !close_requested;
+}
+
+fn parse_owner_rule(state: &mut RuleEngineState, owner_id: &str) {
+    match parse_rule(&state.rule_input) {
+        Ok(ast) => {
+            state.parse_preview = ast.explain();
+            state.engine.replace_rule_for_owner(owner_id, ast);
+        },
+        Err(err) => {
+            state.parse_preview = err;
+            state.engine.clear_rules_for_owner(owner_id);
+        },
+    }
+}
+
+fn character_hp(ui: &mut egui::Ui, engine: &RuleEngine, id: &str) {
+    if let Some(character) = engine.characters.get(id) {
+        ui.label(format!(
+            "{} HP: {}/{}",
+            character.name,
+            format_number(character.hp),
+            format_number(character.max_hp)
+        ));
+    }
+}
+
+fn rule_words(ui: &mut egui::Ui) {
+    egui::Grid::new("rule_engine_words")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label("Trigger starters");
+            ui.label("每当, 当, 无论何时");
+            ui.end_row();
+
+            ui.label("Trigger subject");
+            ui.label("自己, 目标, 来源, 攻击者");
+            ui.end_row();
+
+            ui.label("Trigger events");
+            ui.label("受到伤害, 造成伤害, 释放技能");
+            ui.end_row();
+
+            ui.label("Action markers");
+            ui.label("则, 时");
+            ui.end_row();
+
+            ui.label("Heal actions");
+            ui.label("回复, 点生命值");
+            ui.end_row();
+
+            ui.label("Damage actions");
+            ui.label("造成, 点伤害");
+            ui.end_row();
+
+            ui.label("Action target");
+            ui.label("自己, 目标, 来源, 攻击者");
+            ui.end_row();
+
+            ui.label("Values");
+            ui.label("数字, 本次伤害");
+            ui.end_row();
+
+            ui.label("Damage types");
+            ui.label("物理, 魔法, 远程, 诅咒, 疾病, 流血, 中毒");
+            ui.end_row();
+
+            ui.label("Separators");
+            ui.label("， , ； ;");
+            ui.end_row();
+        });
+
+    ui.add_space(6.0);
+    ui.label("Examples:");
+    ui.monospace("每当自己受到伤害，回复2点生命值");
+    ui.monospace("当自己受到伤害，则对攻击者造成本次伤害点物理伤害");
+    ui.monospace("当自己造成伤害，回复自己1点生命值");
 }
 
 #[cfg(test)]
@@ -769,6 +1384,165 @@ mod tests {
     }
 
     #[test]
+    fn parses_multiple_actions_split_by_commas_or_lines() {
+        let ast = parse_rule("每当自己受到伤害，回复2点生命值\n回复2点生命值").unwrap();
+
+        assert_eq!(ast.actions, vec![
+            Action::Heal {
+                target: ActorRef::SelfActor,
+                amount: ValueExpr::Number(2.0),
+            },
+            Action::Heal {
+                target: ActorRef::SelfActor,
+                amount: ValueExpr::Number(2.0),
+            },
+        ]);
+        assert_eq!(
+            ast.explain(),
+            "触发：每当自己受到伤害。\n动作：回复2点生命值给自己。\n动作：回复2点生命值给自己。"
+        );
+    }
+
+    #[test]
+    fn multiple_actions_run_in_order() {
+        let mut engine = RuleEngine::default();
+        let mut alice = Character::new("alice", "自己", 10.0);
+        alice.hp = 8.0;
+        engine.add_character(alice);
+        engine.add_character(Character::new("enemy", "敌人", 10.0));
+        engine.add_rule(
+            "alice",
+            parse_rule("每当自己受到伤害，回复2点生命值，回复2点生命值").unwrap(),
+        );
+
+        engine.attack(
+            "enemy",
+            "alice",
+            3.0,
+            DamageType::Physical,
+        );
+
+        assert_eq!(
+            engine.characters.get("alice").unwrap().hp,
+            9.0
+        );
+        assert_eq!(
+            engine
+                .log
+                .iter()
+                .filter(|line| line.contains("规则触发"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn damage_taken_rule_does_not_trigger_from_other_target_damage() {
+        let mut engine = RuleEngine::default();
+        engine.add_character(Character::new("alice", "自己", 10.0));
+        engine.add_character(Character::new("enemy", "敌人", 10.0));
+        engine.add_rule(
+            "alice",
+            parse_rule("每当自己受到伤害，回复2点生命值").unwrap(),
+        );
+
+        engine.attack(
+            "alice",
+            "enemy",
+            3.0,
+            DamageType::Physical,
+        );
+
+        assert_eq!(
+            engine.characters.get("alice").unwrap().hp,
+            10.0
+        );
+        assert_eq!(
+            engine.characters.get("enemy").unwrap().hp,
+            7.0
+        );
+        assert_eq!(
+            engine
+                .log
+                .iter()
+                .filter(|line| line.contains("规则触发"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn repeated_heals_then_retaliation_damage_run_once() {
+        let mut engine = RuleEngine::default();
+        engine.add_character(Character::new("alice", "自己", 10.0));
+        engine.add_character(Character::new("enemy", "敌人", 10.0));
+        engine.add_rule(
+            "alice",
+            parse_rule("每当自己受到伤害，回复2点生命值，回复2点生命值，回复2点生命值，回复2点生命值，回复2点生命值，对攻击者造成本次伤害点物理伤害").unwrap(),
+        );
+
+        engine.attack(
+            "enemy",
+            "alice",
+            3.0,
+            DamageType::Physical,
+        );
+
+        assert_eq!(
+            engine.characters.get("alice").unwrap().hp,
+            10.0
+        );
+        assert_eq!(
+            engine.characters.get("enemy").unwrap().hp,
+            7.0
+        );
+        assert_eq!(
+            engine
+                .log
+                .iter()
+                .filter(|line| line.contains("规则触发"))
+                .count(),
+            6
+        );
+        assert!(!engine.log.iter().any(|line| line.contains("触发次数过多")));
+    }
+
+    #[test]
+    fn invalid_rule_text_can_deactivate_owner_rules() {
+        let mut engine = RuleEngine::default();
+        engine.add_rule(
+            "alice",
+            parse_rule("每当自己受到伤害，回复2点生命值").unwrap(),
+        );
+
+        assert_eq!(engine.rules.len(), 1);
+        assert!(parse_rule("每当自己未知事件，回复2点生命值").is_err());
+        engine.clear_rules_for_owner("alice");
+
+        assert!(engine.rules.is_empty());
+    }
+
+    #[test]
+    fn queued_resolution_stops_recursive_damage_rules() {
+        let mut engine = RuleEngine::default();
+        engine.add_character(Character::new("alice", "自己", 10.0));
+        engine.add_character(Character::new("enemy", "敌人", 10.0));
+        engine.add_rule(
+            "alice",
+            parse_rule("每当自己造成伤害，对目标造成1点物理伤害").unwrap(),
+        );
+
+        engine.attack(
+            "alice",
+            "enemy",
+            1.0,
+            DamageType::Physical,
+        );
+
+        assert!(engine.log.iter().any(|line| line.contains("触发次数过多")));
+    }
+
+    #[test]
     fn healing_is_capped_at_max_hp() {
         let mut engine = RuleEngine::default();
         engine.add_character(Character::new("alice", "自己", 10.0));
@@ -801,5 +1575,88 @@ mod tests {
             engine.characters.get("alice").unwrap().hp,
             6.0
         );
+    }
+
+    #[test]
+    fn ecs_buff_modifier_affects_damage_then_expires() {
+        let mut engine = RuleEngine::default();
+        engine.add_character(Character::new("alice", "自己", 10.0));
+        engine.add_character(Character::new("enemy", "敌人", 10.0));
+
+        assert!(engine.give_buff("alice", BuffSpec {
+            name: "Guard".to_owned(),
+            priority: 0,
+            turns_remaining: 1,
+            source_id: "alice".to_owned(),
+            beneficial: true,
+            effects: vec![BuffEffect {
+                field: BuffField::DamageTakenModifier,
+                value: BuffValue::Set(0.5),
+            }],
+        }));
+
+        engine.attack(
+            "enemy",
+            "alice",
+            4.0,
+            DamageType::Physical,
+        );
+        assert_eq!(
+            engine.characters.get("alice").unwrap().hp,
+            8.0
+        );
+        assert_eq!(engine.active_buff_names("alice"), vec![
+            "Guard".to_owned()
+        ]);
+
+        engine.advance_turn();
+        engine.attack(
+            "enemy",
+            "alice",
+            4.0,
+            DamageType::Physical,
+        );
+        assert_eq!(
+            engine.characters.get("alice").unwrap().hp,
+            4.0
+        );
+        assert!(engine.active_buff_names("alice").is_empty());
+    }
+
+    #[test]
+    fn ecs_buff_recomputes_from_base_in_priority_order() {
+        let mut engine = RuleEngine::default();
+        engine.add_character(Character::new("alice", "自己", 10.0));
+
+        engine.give_buff("alice", BuffSpec {
+            name: "Brittle".to_owned(),
+            priority: 10,
+            turns_remaining: 2,
+            source_id: "enemy".to_owned(),
+            beneficial: false,
+            effects: vec![BuffEffect {
+                field: BuffField::MaxHp,
+                value: BuffValue::Add(-3.0),
+            }],
+        });
+        engine.give_buff("alice", BuffSpec {
+            name: "Bless".to_owned(),
+            priority: 0,
+            turns_remaining: 2,
+            source_id: "alice".to_owned(),
+            beneficial: true,
+            effects: vec![BuffEffect {
+                field: BuffField::MaxHp,
+                value: BuffValue::Add(5.0),
+            }],
+        });
+
+        let alice = engine.characters.get("alice").unwrap();
+        assert_eq!(alice.max_hp, 12.0);
+        assert_eq!(alice.hp, 10.0);
+        assert_eq!(engine.active_buff_names("alice"), vec![
+            "Bless".to_owned(),
+            "Brittle".to_owned(),
+        ]);
     }
 }

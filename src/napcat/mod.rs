@@ -1,9 +1,18 @@
 use std::{
     collections::{
+        hash_map::DefaultHasher,
         HashMap,
         HashSet,
     },
-    path::Path,
+    fs,
+    hash::{
+        Hash,
+        Hasher,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     thread,
     time::Duration,
 };
@@ -104,11 +113,15 @@ pub struct ImageData {
     #[serde(rename = "subType")]
     pub sub_type: usize,
     #[serde(default)]
+    pub file: String,
+    #[serde(default)]
     pub url: String,
     #[serde(default)]
     pub file_id: String,
     #[serde(default)]
     pub file_size: String,
+    #[serde(default)]
+    pub local_path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -262,6 +275,8 @@ pub struct PlayerCharacter {
     #[serde(default)]
     pub extra_status: CharacterStatus,
     #[serde(default)]
+    pub skill_names: Vec<String>,
+    #[serde(default)]
     pub skill_notes: Vec<String>,
 }
 
@@ -290,6 +305,7 @@ impl Default for PlayerCharacter {
             healing_taken_modifier: default_modifier(),
             status: CharacterStatus::default(),
             extra_status: CharacterStatus::default(),
+            skill_names: Vec::new(),
             skill_notes: Vec::new(),
         }
     }
@@ -341,20 +357,6 @@ impl CharacterCreationStep {
             CharacterCreationStep::K => CharacterCreationStep::Cha,
             CharacterCreationStep::Cha => CharacterCreationStep::ConfirmStatus,
             _ => self,
-        }
-    }
-
-    fn previous_status_step(self) -> Option<Self> {
-        match self {
-            CharacterCreationStep::Agi => Some(CharacterCreationStep::Str),
-            CharacterCreationStep::Dex => Some(CharacterCreationStep::Agi),
-            CharacterCreationStep::Vit => Some(CharacterCreationStep::Dex),
-            CharacterCreationStep::Int => Some(CharacterCreationStep::Vit),
-            CharacterCreationStep::Wis => Some(CharacterCreationStep::Int),
-            CharacterCreationStep::K => Some(CharacterCreationStep::Wis),
-            CharacterCreationStep::Cha => Some(CharacterCreationStep::K),
-            CharacterCreationStep::ConfirmStatus => Some(CharacterCreationStep::Cha),
-            _ => None,
         }
     }
 }
@@ -430,6 +432,10 @@ pub struct NapcatMessageManager {
 impl NapcatMessageManager {
     pub fn migrate_chat_window_state(&mut self) -> bool {
         if !self.open_chat_targets.is_empty() || !self.pending_chat_targets.is_empty() {
+            return false;
+        }
+
+        if !self.chat_targets.is_empty() {
             return false;
         }
 
@@ -663,8 +669,9 @@ fn message_system(
 ) {
     while let Ok(msg) = receiver.0.try_recv() {
         let json_res = serde_json::from_str::<NapcatMessage>(&msg.to_string());
-        if let Ok(json) = json_res {
+        if let Ok(mut json) = json_res {
             dbg!(&json);
+            cache_message_images(&mut json);
             let target_id = match json.data.message_type {
                 NapcatMessageType::Private => {
                     if json.data.user_id == json.data.self_id {
@@ -742,6 +749,56 @@ fn message_system(
             );
         }
     }
+}
+
+fn cache_message_images(message: &mut NapcatMessage) {
+    for chain in &mut message.data.message {
+        let NapcatMessageChainType::Image { data } = &mut chain.variant else {
+            continue;
+        };
+        if !data.local_path.trim().is_empty() || data.url.trim().is_empty() {
+            continue;
+        }
+
+        match cache_remote_image(data.url.trim()) {
+            Ok(path) => data.local_path = path.to_string_lossy().to_string(),
+            Err(err) => eprintln!(
+                "failed to cache NapCat image {}: {err}",
+                data.url
+            ),
+        }
+    }
+}
+
+fn cache_remote_image(url: &str) -> Result<PathBuf, String> {
+    let response = reqwest::blocking::get(url).map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+
+    let bytes = response.bytes().map_err(|err| err.to_string())?;
+    let format = image::guess_format(&bytes).map_err(|err| err.to_string())?;
+    let extension = match format {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Jpeg => "jpg",
+        image::ImageFormat::Gif => "gif",
+        image::ImageFormat::WebP => "webp",
+        image::ImageFormat::Bmp => "bmp",
+        _ => "img",
+    };
+
+    let mut hasher = DefaultHasher::new();
+    url.hash(&mut hasher);
+    let cache_dir = Path::new(".data").join("willowblossom").join("image_cache");
+    fs::create_dir_all(&cache_dir).map_err(|err| err.to_string())?;
+    let path = cache_dir.join(format!(
+        "{:016x}.{extension}",
+        hasher.finish()
+    ));
+    if !path.exists() {
+        fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+    }
+    Ok(path)
 }
 
 fn queue_private_text_response(
@@ -869,6 +926,7 @@ fn handle_character_creation_message(
 
     match character.creation_step {
         CharacterCreationStep::Skill => {
+            character.skill_names.push(String::new());
             character.skill_notes.push(text);
             Some(format!(
                 "技能兑换数据已录入，目前记录{}条。继续发送技能，或输入【.】结束技能录入。",
@@ -934,17 +992,11 @@ fn character_creation_next(character: &mut PlayerCharacter) -> String {
 }
 
 fn character_creation_back(character: &mut PlayerCharacter) -> String {
-    if let Some(previous_step) = character.creation_step.previous_status_step() {
-        character.creation_step = previous_step;
-        if let Some(status_key) = previous_step.status_key() {
-            let previous_value = get_character_status_value(&character.status, status_key);
-            character.status_points += previous_value;
-            set_character_status_value(&mut character.status, status_key, 0);
-        }
+    reset_character_status_phase(character);
+    format!(
+        "已退回属性兑换第一步，属性点已全部返还。\n{}",
         character_creation_prompt(character)
-    } else {
-        "当前步骤不能退回。".to_owned()
-    }
+    )
 }
 
 fn character_creation_prompt(character: &PlayerCharacter) -> String {
@@ -1027,6 +1079,12 @@ fn set_character_status_value(status: &mut CharacterStatus, status_key: StatusKe
         StatusKey::K => status.k = value,
         StatusKey::Cha => status.cha = value,
     }
+}
+
+fn reset_character_status_phase(character: &mut PlayerCharacter) {
+    character.creation_step = CharacterCreationStep::Str;
+    character.status_points = default_status_points();
+    character.status = CharacterStatus::default();
 }
 
 fn update_character_from_status(character: &mut PlayerCharacter) {
@@ -1217,9 +1275,11 @@ mod tests {
                     variant: NapcatMessageChainType::Image {
                         data: ImageData {
                             sub_type: 0,
+                            file: String::new(),
                             url: url.to_owned(),
                             file_id: String::new(),
                             file_size: String::new(),
+                            local_path: String::new(),
                         },
                     },
                 }],
@@ -1375,6 +1435,20 @@ mod tests {
     }
 
     #[test]
+    fn synced_message_targets_do_not_reopen_after_all_windows_closed() {
+        let mut manager = empty_manager();
+        manager.messages.insert("12345".to_owned(), Vec::new());
+        manager.chat_targets.insert(
+            "12345".to_owned(),
+            ChatTargetMetadata::default(),
+        );
+
+        assert!(!manager.migrate_chat_window_state());
+        assert!(manager.open_chat_targets.is_empty());
+        assert!(manager.pending_chat_targets.is_empty());
+    }
+
+    #[test]
     fn message_targets_sync_to_editable_chat_metadata() {
         let mut manager = empty_manager();
         manager.messages.insert("12345".to_owned(), Vec::new());
@@ -1468,6 +1542,49 @@ mod tests {
             CharacterCreationStep::Normal
         );
         assert_eq!(character.max_hp, 15.0);
+    }
+
+    #[test]
+    fn character_creation_back_resets_status_phase_and_refunds_points() {
+        let mut manager = empty_manager();
+        let target_id = "2";
+
+        handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            target_id,
+        );
+        for value in ["5"] {
+            handle_character_creation_message(
+                &mut manager,
+                &test_message_with_text(NapcatMessageType::Private, value),
+                target_id,
+            );
+        }
+        assert_eq!(
+            manager.player_characters[target_id].creation_step,
+            CharacterCreationStep::ConfirmStatus
+        );
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".."),
+            target_id,
+        )
+        .unwrap();
+        let character = manager.player_characters.get(target_id).unwrap();
+
+        assert!(response.contains("属性点已全部返还"));
+        assert_eq!(
+            character.creation_step,
+            CharacterCreationStep::Str
+        );
+        assert_eq!(
+            character.status_points,
+            default_status_points()
+        );
+        assert_eq!(character.status.str_, 0);
+        assert_eq!(character.status.cha, 0);
     }
 
     #[test]

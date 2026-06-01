@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moonberry Rewrite Reference"
+  short_description: "Map old Moonberry behavior into Willowblossom."
+  default_prompt: "Use the Moonberry rewrite reference skill to preserve old Moonberry TRPG behavior while implementing the feature in Willowblossom."

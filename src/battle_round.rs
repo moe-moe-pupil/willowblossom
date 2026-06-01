@@ -1,0 +1,882 @@
+use std::{
+    collections::{
+        hash_map::DefaultHasher,
+        HashMap,
+    },
+    hash::{
+        Hash,
+        Hasher,
+    },
+    path::Path,
+};
+
+use bevy::prelude::*;
+use bevy_egui::{
+    egui,
+    EguiContexts,
+    EguiPrimaryContextPass,
+};
+use bevy_persistent::{
+    Persistent,
+    StorageFormat,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+
+use crate::napcat::{
+    NapcatMessageManager,
+    PlayerCharacter,
+    TrpgGroup,
+};
+
+pub struct BattleRoundPlugin;
+
+impl Plugin for BattleRoundPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<BattleRoundUiState>()
+            .add_systems(Startup, setup_battle_round_store)
+            .add_systems(Update, sync_battle_round_entities)
+            .add_systems(
+                EguiPrimaryContextPass,
+                battle_round_panel,
+            );
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct BattleRoundUiState {
+    panel_open: bool,
+    new_encounter_name: String,
+    selected_group: String,
+}
+
+impl BattleRoundUiState {
+    pub fn open_panel(&mut self) { self.panel_open = true; }
+}
+
+#[derive(Resource, Serialize, Deserialize, Default)]
+pub struct BattleRoundStore {
+    #[serde(default)]
+    pub encounters: HashMap<String, BattleEncounter>,
+    #[serde(default)]
+    pub active_encounter_id: Option<String>,
+    #[serde(default = "default_next_encounter_index")]
+    next_encounter_index: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BattleEncounter {
+    pub name: String,
+    #[serde(default)]
+    pub trpg_group: Option<String>,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default = "default_true")]
+    pub sort_by_turn: bool,
+    #[serde(default)]
+    pub negative_enabled: bool,
+    #[serde(default)]
+    pub round: u32,
+    #[serde(default)]
+    pub participants: Vec<BattleParticipantSnapshot>,
+}
+
+impl Default for BattleEncounter {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            trpg_group: None,
+            active: true,
+            sort_by_turn: true,
+            negative_enabled: false,
+            round: 0,
+            participants: Vec::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BattleParticipantSnapshot {
+    pub target_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub turn: u32,
+    #[serde(default = "default_true")]
+    pub alive: bool,
+    #[serde(default)]
+    pub negative_layers: u32,
+    #[serde(default)]
+    pub pending_negative: bool,
+    #[serde(default)]
+    pub hp: f32,
+    #[serde(default)]
+    pub max_hp: f32,
+    #[serde(default)]
+    pub mp: f32,
+    #[serde(default)]
+    pub max_mp: f32,
+    #[serde(default)]
+    pub hp_regen: f32,
+    #[serde(default)]
+    pub mp_regen: f32,
+}
+
+#[derive(Component, Debug, Clone)]
+pub struct BattleEncounterEntity {
+    pub id: String,
+    pub name: String,
+    pub active: bool,
+    pub round: u32,
+    pub negative_enabled: bool,
+}
+
+#[derive(Component, Debug, Clone)]
+pub struct BattleParticipantEntity {
+    pub encounter_id: String,
+    pub target_id: String,
+    pub display_name: String,
+}
+
+#[derive(Component, Debug, Clone, Copy)]
+pub struct TurnCounter {
+    pub current: u32,
+}
+
+#[derive(Component, Debug, Clone, Copy)]
+pub struct BattlePresence {
+    pub alive: bool,
+    pub negative_layers: u32,
+    pub pending_negative: bool,
+}
+
+#[derive(Component, Debug, Clone, Copy)]
+pub struct BattleVitals {
+    pub hp: f32,
+    pub max_hp: f32,
+    pub mp: f32,
+    pub max_mp: f32,
+    pub hp_regen: f32,
+    pub mp_regen: f32,
+}
+
+#[derive(Component)]
+struct BattleRoundRuntime;
+
+fn default_next_encounter_index() -> u64 { 1 }
+
+fn default_true() -> bool { true }
+
+fn setup_battle_round_store(mut commands: Commands) {
+    let config_dir = Path::new(".data").join("willowblossom");
+    commands.insert_resource(
+        Persistent::<BattleRoundStore>::builder()
+            .name("battle_rounds")
+            .format(StorageFormat::Toml)
+            .path(config_dir.join("battle_rounds.toml"))
+            .default(BattleRoundStore::default())
+            .revertible(true)
+            .revert_to_default_on_deserialization_errors(true)
+            .build()
+            .expect("failed to init battle round store"),
+    );
+}
+
+fn sync_battle_round_entities(
+    mut commands: Commands,
+    store: Option<Res<Persistent<BattleRoundStore>>>,
+    existing: Query<Entity, With<BattleRoundRuntime>>,
+    mut last_signature: Local<u64>,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let signature = battle_store_signature(&store);
+    if *last_signature == signature {
+        return;
+    }
+
+    for entity in &existing {
+        commands.entity(entity).despawn();
+    }
+
+    for (encounter_id, encounter) in &store.encounters {
+        commands.spawn((
+            BattleRoundRuntime,
+            BattleEncounterEntity {
+                id: encounter_id.clone(),
+                name: encounter.name.clone(),
+                active: encounter.active,
+                round: encounter.round,
+                negative_enabled: encounter.negative_enabled,
+            },
+        ));
+
+        for participant in &encounter.participants {
+            commands.spawn((
+                BattleRoundRuntime,
+                BattleParticipantEntity {
+                    encounter_id: encounter_id.clone(),
+                    target_id: participant.target_id.clone(),
+                    display_name: participant.display_name.clone(),
+                },
+                TurnCounter {
+                    current: participant.turn,
+                },
+                BattlePresence {
+                    alive: participant.alive,
+                    negative_layers: participant.negative_layers,
+                    pending_negative: participant.pending_negative,
+                },
+                BattleVitals {
+                    hp: participant.hp,
+                    max_hp: participant.max_hp,
+                    mp: participant.mp,
+                    max_mp: participant.max_mp,
+                    hp_regen: participant.hp_regen,
+                    mp_regen: participant.mp_regen,
+                },
+            ));
+        }
+    }
+
+    *last_signature = signature;
+}
+
+fn battle_store_signature(store: &BattleRoundStore) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    store.active_encounter_id.hash(&mut hasher);
+    store.next_encounter_index.hash(&mut hasher);
+    let mut encounter_ids = store.encounters.keys().collect::<Vec<_>>();
+    encounter_ids.sort();
+    for encounter_id in encounter_ids {
+        encounter_id.hash(&mut hasher);
+        let encounter = &store.encounters[encounter_id];
+        encounter.name.hash(&mut hasher);
+        encounter.trpg_group.hash(&mut hasher);
+        encounter.active.hash(&mut hasher);
+        encounter.sort_by_turn.hash(&mut hasher);
+        encounter.negative_enabled.hash(&mut hasher);
+        encounter.round.hash(&mut hasher);
+        for participant in &encounter.participants {
+            participant.target_id.hash(&mut hasher);
+            participant.display_name.hash(&mut hasher);
+            participant.turn.hash(&mut hasher);
+            participant.alive.hash(&mut hasher);
+            participant.negative_layers.hash(&mut hasher);
+            participant.pending_negative.hash(&mut hasher);
+            participant.hp.to_bits().hash(&mut hasher);
+            participant.max_hp.to_bits().hash(&mut hasher);
+            participant.mp.to_bits().hash(&mut hasher);
+            participant.max_mp.to_bits().hash(&mut hasher);
+            participant.hp_regen.to_bits().hash(&mut hasher);
+            participant.mp_regen.to_bits().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn battle_round_panel(
+    mut contexts: EguiContexts,
+    mut ui_state: ResMut<BattleRoundUiState>,
+    mut store: Option<ResMut<Persistent<BattleRoundStore>>>,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    encounters: Query<&BattleEncounterEntity>,
+    participants: Query<(
+        &BattleParticipantEntity,
+        &TurnCounter,
+        &BattlePresence,
+        &BattleVitals,
+    )>,
+) {
+    if !ui_state.panel_open {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    let Some(store) = store.as_deref_mut() else {
+        return;
+    };
+    let Some(manager) = manager.as_deref() else {
+        return;
+    };
+
+    let mut panel_open = ui_state.panel_open;
+    let mut changed = false;
+    let mut close_requested = false;
+
+    egui::Window::new("战斗轮")
+        .default_pos(egui::pos2(390.0, 430.0))
+        .default_width(480.0)
+        .resizable(true)
+        .open(&mut panel_open)
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    changed |= create_encounter_ui(ui, &mut ui_state, store, manager);
+                    ui.separator();
+
+                    let mut encounter_rows = encounters.iter().collect::<Vec<_>>();
+                    encounter_rows
+                        .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+
+                    if encounter_rows.is_empty() {
+                        ui.label("No battle rounds yet.");
+                    }
+
+                    for encounter_entity in encounter_rows {
+                        changed |= encounter_ui(
+                            ui,
+                            store,
+                            manager,
+                            encounter_entity,
+                            &participants,
+                        );
+                        ui.add_space(6.0);
+                    }
+
+                    ui.separator();
+                    if ui.button("Close").clicked() {
+                        close_requested = true;
+                    }
+                });
+        });
+
+    ui_state.panel_open = panel_open && !close_requested;
+    if changed {
+        store.persist().ok();
+    }
+}
+
+fn create_encounter_ui(
+    ui: &mut egui::Ui,
+    ui_state: &mut BattleRoundUiState,
+    store: &mut BattleRoundStore,
+    manager: &NapcatMessageManager,
+) -> bool {
+    let mut changed = false;
+    let mut group_names = manager.trpg_groups.keys().cloned().collect::<Vec<_>>();
+    group_names.sort();
+    if ui_state.selected_group.is_empty() {
+        if let Some(first_group) = group_names.first() {
+            ui_state.selected_group = first_group.clone();
+        }
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("TRPG group");
+        egui::ComboBox::from_id_salt("battle_round_group_select")
+            .selected_text(if ui_state.selected_group.is_empty() {
+                "No group"
+            } else {
+                ui_state.selected_group.as_str()
+            })
+            .show_ui(ui, |ui| {
+                for group_name in &group_names {
+                    ui.selectable_value(
+                        &mut ui_state.selected_group,
+                        group_name.clone(),
+                        group_name,
+                    );
+                }
+            });
+        ui.label("Name");
+        ui.text_edit_singleline(&mut ui_state.new_encounter_name);
+        if ui.button("Create").clicked() {
+            let group_name = ui_state.selected_group.trim();
+            if let Some(group) = manager.trpg_groups.get(group_name) {
+                let name = if ui_state.new_encounter_name.trim().is_empty() {
+                    group_name.to_owned()
+                } else {
+                    ui_state.new_encounter_name.trim().to_owned()
+                };
+                let encounter_id = store.create_encounter_from_group(
+                    name,
+                    group_name.to_owned(),
+                    group,
+                    manager,
+                );
+                store.active_encounter_id = Some(encounter_id);
+                ui_state.new_encounter_name.clear();
+                changed = true;
+            }
+        }
+    });
+
+    changed
+}
+
+fn encounter_ui(
+    ui: &mut egui::Ui,
+    store: &mut BattleRoundStore,
+    manager: &NapcatMessageManager,
+    encounter_entity: &BattleEncounterEntity,
+    participants: &Query<(
+        &BattleParticipantEntity,
+        &TurnCounter,
+        &BattlePresence,
+        &BattleVitals,
+    )>,
+) -> bool {
+    let mut changed = false;
+    let encounter_id = encounter_entity.id.as_str();
+    let mut remove = false;
+    if !store.encounters.contains_key(encounter_id) {
+        return false;
+    }
+
+    ui.group(|ui| {
+        ui.set_width(ui.available_width());
+        let sort_by_turn = {
+            let encounter = store
+                .encounters
+                .get_mut(encounter_id)
+                .expect("encounter existence checked");
+            ui.horizontal_wrapped(|ui| {
+                ui.heading(&encounter_entity.name);
+                ui.small(format!(
+                    "Round {}",
+                    encounter_entity.round
+                ));
+                ui.small(if encounter_entity.active { "Active" } else { "Downtime" });
+                if encounter_entity.negative_enabled {
+                    ui.small("消极 on");
+                }
+                changed |= ui.checkbox(&mut encounter.active, "Active").changed();
+                changed |= ui
+                    .checkbox(&mut encounter.negative_enabled, "消极")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut encounter.sort_by_turn, "Sort")
+                    .on_hover_text("Sort participants by turn count.")
+                    .changed();
+                if ui.button("Refresh players").clicked() {
+                    changed |= refresh_encounter_players(encounter, manager);
+                }
+                if ui.button("Delete").clicked() {
+                    remove = true;
+                }
+            });
+            encounter.sort_by_turn
+        };
+
+        let mut rows = participants
+            .iter()
+            .filter(|(participant, ..)| participant.encounter_id == encounter_id)
+            .collect::<Vec<_>>();
+        if sort_by_turn {
+            rows.sort_by(|a, b| {
+                a.1.current
+                    .cmp(&b.1.current)
+                    .then_with(|| a.0.display_name.cmp(&b.0.display_name))
+            });
+        } else {
+            rows.sort_by(|a, b| a.0.display_name.cmp(&b.0.display_name));
+        }
+
+        for (participant, turn, presence, vitals) in rows {
+            changed |= participant_ui(
+                ui,
+                encounter_id,
+                participant,
+                turn,
+                presence,
+                vitals,
+                store,
+            );
+        }
+    });
+
+    if remove {
+        store.encounters.remove(encounter_id);
+        if store.active_encounter_id.as_deref() == Some(encounter_id) {
+            store.active_encounter_id = None;
+        }
+        changed = true;
+    }
+
+    changed
+}
+
+fn participant_ui(
+    ui: &mut egui::Ui,
+    encounter_id: &str,
+    participant: &BattleParticipantEntity,
+    turn: &TurnCounter,
+    presence: &BattlePresence,
+    vitals: &BattleVitals,
+    store: &mut BattleRoundStore,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(&participant.display_name);
+        ui.small(&participant.target_id);
+        ui.label(format!("Turn {}", turn.current));
+        ui.label(format!(
+            "HP {}/{} (+{}) MP {}/{} (+{})",
+            format_number(vitals.hp),
+            format_number(vitals.max_hp),
+            format_number(vitals.hp_regen),
+            format_number(vitals.mp),
+            format_number(vitals.max_mp),
+            format_number(vitals.mp_regen)
+        ));
+        if !presence.alive {
+            ui.colored_label(egui::Color32::RED, "Down");
+        }
+        if presence.pending_negative {
+            ui.colored_label(egui::Color32::YELLOW, "消极待处理");
+        }
+        if presence.negative_layers > 0 {
+            ui.label(format!(
+                "消极 {}",
+                presence.negative_layers
+            ));
+        }
+        if ui.button("Next").clicked() {
+            changed |= store.advance_participant(
+                encounter_id,
+                &participant.target_id,
+                false,
+            );
+        }
+        if ui.button("Rest").clicked() {
+            changed |= store.advance_participant(
+                encounter_id,
+                &participant.target_id,
+                true,
+            );
+        }
+        if ui.button("Skip + 消极").clicked() {
+            changed |= store.skip_negative_participant(encounter_id, &participant.target_id);
+        }
+    });
+    changed
+}
+
+impl BattleRoundStore {
+    fn create_encounter_from_group(
+        &mut self,
+        name: String,
+        group_name: String,
+        group: &TrpgGroup,
+        manager: &NapcatMessageManager,
+    ) -> String {
+        let encounter_id = format!("battle-{}", self.next_encounter_index);
+        self.next_encounter_index += 1;
+        let participants = group
+            .players
+            .iter()
+            .filter_map(|target_id| {
+                manager
+                    .player_characters
+                    .get(target_id)
+                    .filter(|character| character.inited)
+                    .map(|character| participant_from_character(target_id, character, manager))
+            })
+            .collect::<Vec<_>>();
+
+        self.encounters
+            .insert(encounter_id.clone(), BattleEncounter {
+                name,
+                trpg_group: Some(group_name),
+                active: true,
+                sort_by_turn: true,
+                negative_enabled: false,
+                round: 0,
+                participants,
+            });
+        encounter_id
+    }
+
+    fn advance_participant(&mut self, encounter_id: &str, target_id: &str, resume: bool) -> bool {
+        let Some(encounter) = self.encounters.get_mut(encounter_id) else {
+            return false;
+        };
+        let Some(participant) = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == target_id)
+        else {
+            return false;
+        };
+
+        if resume {
+            participant.hp = participant.max_hp;
+            participant.mp = participant.max_mp;
+            participant.alive = true;
+        } else if participant.alive {
+            if !encounter.active {
+                participant.hp = (participant.hp + participant.hp_regen).min(participant.max_hp);
+            }
+            participant.mp = (participant.mp + participant.mp_regen).min(participant.max_mp);
+        }
+        participant.turn += 1;
+        participant.pending_negative = false;
+        encounter.round = encounter
+            .participants
+            .iter()
+            .filter(|participant| participant.alive)
+            .map(|participant| participant.turn)
+            .min()
+            .unwrap_or_default();
+
+        if encounter.negative_enabled {
+            mark_negative_candidates(encounter);
+        }
+        true
+    }
+
+    fn skip_negative_participant(&mut self, encounter_id: &str, target_id: &str) -> bool {
+        let Some(encounter) = self.encounters.get_mut(encounter_id) else {
+            return false;
+        };
+        let Some(participant) = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == target_id)
+        else {
+            return false;
+        };
+        participant.negative_layers += 1;
+        let _ = participant;
+        self.advance_participant(encounter_id, target_id, false)
+    }
+}
+
+fn refresh_encounter_players(
+    encounter: &mut BattleEncounter,
+    manager: &NapcatMessageManager,
+) -> bool {
+    let Some(group_name) = encounter.trpg_group.as_deref() else {
+        return false;
+    };
+    let Some(group) = manager.trpg_groups.get(group_name) else {
+        return false;
+    };
+
+    let before_signature = encounter_participants_signature(&encounter.participants);
+    encounter
+        .participants
+        .retain(|participant| group.players.contains(&participant.target_id));
+    for target_id in &group.players {
+        let Some(character) = manager
+            .player_characters
+            .get(target_id)
+            .filter(|character| character.inited)
+        else {
+            continue;
+        };
+        if let Some(participant) = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == *target_id)
+        {
+            participant.display_name = character_display_name(target_id, character, manager);
+            participant.max_hp = character.max_hp;
+            participant.max_mp = character.max_mp;
+            participant.hp_regen = character.hp_regen;
+            participant.mp_regen = character.mp_regen;
+            participant.hp = participant.hp.min(participant.max_hp);
+            participant.mp = participant.mp.min(participant.max_mp);
+            participant.alive = participant.hp > 0.0;
+        } else {
+            encounter.participants.push(participant_from_character(
+                target_id, character, manager,
+            ));
+        }
+    }
+    before_signature != encounter_participants_signature(&encounter.participants)
+}
+
+fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for participant in participants {
+        participant.target_id.hash(&mut hasher);
+        participant.display_name.hash(&mut hasher);
+        participant.alive.hash(&mut hasher);
+        participant.hp.to_bits().hash(&mut hasher);
+        participant.max_hp.to_bits().hash(&mut hasher);
+        participant.mp.to_bits().hash(&mut hasher);
+        participant.max_mp.to_bits().hash(&mut hasher);
+        participant.hp_regen.to_bits().hash(&mut hasher);
+        participant.mp_regen.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn participant_from_character(
+    target_id: &str,
+    character: &PlayerCharacter,
+    manager: &NapcatMessageManager,
+) -> BattleParticipantSnapshot {
+    BattleParticipantSnapshot {
+        target_id: target_id.to_owned(),
+        display_name: character_display_name(target_id, character, manager),
+        turn: 0,
+        alive: character.hp > 0.0,
+        negative_layers: 0,
+        pending_negative: false,
+        hp: character.hp,
+        max_hp: character.max_hp,
+        mp: character.mp,
+        max_mp: character.max_mp,
+        hp_regen: character.hp_regen,
+        mp_regen: character.mp_regen,
+    }
+}
+
+fn character_display_name(
+    target_id: &str,
+    character: &PlayerCharacter,
+    manager: &NapcatMessageManager,
+) -> String {
+    if !character.nickname.trim().is_empty() {
+        return character.nickname.trim().to_owned();
+    }
+    if !character.name.trim().is_empty() {
+        return character.name.trim().to_owned();
+    }
+    manager
+        .chat_targets
+        .get(target_id)
+        .map(|metadata| metadata.display_name.trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(target_id)
+        .to_owned()
+}
+
+fn mark_negative_candidates(encounter: &mut BattleEncounter) {
+    for participant in &mut encounter.participants {
+        participant.pending_negative = false;
+    }
+
+    let alive_count = encounter
+        .participants
+        .iter()
+        .filter(|participant| participant.alive)
+        .count();
+    if alive_count < 2 {
+        return;
+    }
+
+    let min_turn = encounter
+        .participants
+        .iter()
+        .filter(|participant| participant.alive)
+        .map(|participant| participant.turn)
+        .min()
+        .unwrap_or_default();
+    let lagging_count = encounter
+        .participants
+        .iter()
+        .filter(|participant| participant.alive && participant.turn == min_turn)
+        .count();
+    let advanced_count = alive_count - lagging_count;
+    let half = alive_count.div_ceil(2);
+    if advanced_count < half {
+        return;
+    }
+
+    for participant in &mut encounter.participants {
+        if participant.alive && participant.turn == min_turn {
+            participant.pending_negative = true;
+        }
+    }
+}
+
+fn format_number(value: f32) -> String {
+    if value.fract().abs() < f32::EPSILON {
+        format!("{}", value as i32)
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn participant(id: &str, turn: u32) -> BattleParticipantSnapshot {
+        BattleParticipantSnapshot {
+            target_id: id.to_owned(),
+            display_name: id.to_owned(),
+            turn,
+            alive: true,
+            negative_layers: 0,
+            pending_negative: false,
+            hp: 10.0,
+            max_hp: 10.0,
+            mp: 0.0,
+            max_mp: 10.0,
+            hp_regen: 1.0,
+            mp_regen: 1.0,
+        }
+    }
+
+    #[test]
+    fn half_party_advance_marks_lagging_participants_negative() {
+        let mut encounter = BattleEncounter {
+            name: "test".to_owned(),
+            negative_enabled: true,
+            participants: vec![
+                participant("a", 1),
+                participant("b", 1),
+                participant("c", 0),
+                participant("d", 0),
+            ],
+            ..Default::default()
+        };
+
+        mark_negative_candidates(&mut encounter);
+
+        assert!(!encounter.participants[0].pending_negative);
+        assert!(!encounter.participants[1].pending_negative);
+        assert!(encounter.participants[2].pending_negative);
+        assert!(encounter.participants[3].pending_negative);
+    }
+
+    #[test]
+    fn active_battle_turn_suppresses_hp_regen_but_keeps_mp_regen() {
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                active: true,
+                participants: vec![participant("a", 0)],
+                ..Default::default()
+            });
+        store.encounters.get_mut("battle").unwrap().participants[0].hp = 5.0;
+
+        assert!(store.advance_participant("battle", "a", false));
+
+        let participant = &store.encounters["battle"].participants[0];
+        assert_eq!(participant.turn, 1);
+        assert_eq!(participant.hp, 5.0);
+        assert_eq!(participant.mp, 1.0);
+    }
+
+    #[test]
+    fn rest_advance_restores_vitals() {
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0)],
+                ..Default::default()
+            });
+        store.encounters.get_mut("battle").unwrap().participants[0].hp = 1.0;
+
+        assert!(store.advance_participant("battle", "a", true));
+
+        let participant = &store.encounters["battle"].participants[0];
+        assert_eq!(participant.hp, 10.0);
+        assert_eq!(participant.mp, 10.0);
+        assert!(participant.alive);
+    }
+}
