@@ -14,7 +14,11 @@ use std::{
         PathBuf,
     },
     thread,
-    time::Duration,
+    time::{
+        Duration,
+        SystemTime,
+        UNIX_EPOCH,
+    },
 };
 
 use bevy_persistent::prelude::*;
@@ -34,7 +38,10 @@ use serde::{
     Deserialize,
     Serialize,
 };
-use serde_json::json;
+use serde_json::{
+    json,
+    Value,
+};
 use tokio::{
     runtime::Builder,
     sync::mpsc::{
@@ -48,9 +55,12 @@ use tokio_tungstenite::{
     tungstenite::protocol::Message,
 };
 
-use crate::scene::{
-    SceneCaptureRequest,
-    SceneCaptureRequests,
+use crate::{
+    rule_engine::BuffSpec,
+    scene::{
+        SceneCaptureRequest,
+        SceneCaptureRequests,
+    },
 };
 
 #[derive(States, Debug, Default, Clone, Eq, PartialEq, Hash)]
@@ -91,6 +101,12 @@ pub struct NapcatSendManager {
 #[derive(Resource)]
 struct NapcatAutoForwardRequestIds {
     next_request_id: u64,
+}
+
+#[derive(Resource)]
+struct NapcatGroupInfoRequests {
+    next_request_id: u64,
+    pending_group_ids: HashSet<String>,
 }
 
 pub struct NapcatPlugin;
@@ -193,6 +209,8 @@ pub struct NapcatMessageData {
     pub self_id: u64,
     pub user_id: u64,
     pub group_id: Option<u64>,
+    #[serde(default)]
+    pub group_name: Option<String>,
     pub target_id: Option<u64>,
     pub sender: NapcatSender,
 }
@@ -206,6 +224,8 @@ pub struct ChatGroup {
 pub struct ChatTargetMetadata {
     #[serde(default)]
     pub display_name: String,
+    #[serde(default)]
+    pub automatic_name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -278,6 +298,12 @@ pub struct PlayerCharacter {
     pub skill_names: Vec<String>,
     #[serde(default)]
     pub skill_notes: Vec<String>,
+    #[serde(default)]
+    pub skill_mp_costs: Vec<f32>,
+    #[serde(default)]
+    pub skill_cooldown_turns: Vec<u32>,
+    #[serde(default)]
+    pub active_buffs: Vec<BuffSpec>,
 }
 
 impl Default for PlayerCharacter {
@@ -307,6 +333,9 @@ impl Default for PlayerCharacter {
             extra_status: CharacterStatus::default(),
             skill_names: Vec::new(),
             skill_notes: Vec::new(),
+            skill_mp_costs: Vec::new(),
+            skill_cooldown_turns: Vec::new(),
+            active_buffs: Vec::new(),
         }
     }
 }
@@ -406,6 +435,103 @@ pub struct TrpgGroup {
     pub players: Vec<String>,
     #[serde(default)]
     pub group_chats: Vec<String>,
+    #[serde(default)]
+    pub world_turn: u32,
+    #[serde(default)]
+    pub player_turns: HashMap<String, TrpgPlayerTurnState>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct TrpgPlayerTurnState {
+    #[serde(default)]
+    pub turns_passed: u32,
+    #[serde(default)]
+    pub acted: bool,
+    #[serde(default)]
+    pub skipped: bool,
+}
+
+impl TrpgGroup {
+    pub fn sync_turn_players(&mut self) -> bool {
+        let before_len = self.player_turns.len();
+        self.player_turns
+            .retain(|target_id, _| self.players.contains(target_id));
+        let mut changed = before_len != self.player_turns.len();
+
+        for target_id in &self.players {
+            if !self.player_turns.contains_key(target_id) {
+                self.player_turns.insert(
+                    target_id.clone(),
+                    TrpgPlayerTurnState::default(),
+                );
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn mark_player_acted(&mut self, target_id: &str) -> bool {
+        self.mark_player_turn(target_id, true)
+    }
+
+    pub fn mark_player_skipped(&mut self, target_id: &str) -> bool {
+        self.mark_player_turn(target_id, false)
+    }
+
+    pub fn reset_current_turn(&mut self) -> bool {
+        let mut changed = false;
+        for turn in self.player_turns.values_mut() {
+            if turn.acted || turn.skipped {
+                turn.acted = false;
+                turn.skipped = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn advance_world_turn(&mut self) -> bool {
+        self.sync_turn_players();
+        self.world_turn += 1;
+        for turn in self.player_turns.values_mut() {
+            turn.turns_passed += 1;
+            turn.acted = false;
+            turn.skipped = false;
+        }
+        true
+    }
+
+    fn mark_player_turn(&mut self, target_id: &str, acted: bool) -> bool {
+        if !self.players.iter().any(|player_id| player_id == target_id) {
+            return false;
+        }
+
+        self.sync_turn_players();
+        let Some(turn) = self.player_turns.get_mut(target_id) else {
+            return false;
+        };
+        if acted {
+            turn.acted = true;
+            turn.skipped = false;
+        } else {
+            turn.acted = false;
+            turn.skipped = true;
+        }
+
+        if self.all_players_finished_turn() {
+            self.advance_world_turn();
+        }
+        true
+    }
+
+    fn all_players_finished_turn(&self) -> bool {
+        !self.players.is_empty()
+            && self.players.iter().all(|target_id| {
+                self.player_turns
+                    .get(target_id)
+                    .is_some_and(|turn| turn.acted || turn.skipped)
+            })
+    }
 }
 
 #[derive(Resource, Serialize, Deserialize)]
@@ -417,6 +543,8 @@ pub struct NapcatMessageManager {
     pub player_characters: HashMap<String, PlayerCharacter>,
     #[serde(default)]
     pub trpg_groups: HashMap<String, TrpgGroup>,
+    #[serde(default)]
+    pub current_trpg_group: Option<String>,
     #[serde(default)]
     pub groups: HashMap<String, ChatGroup>,
     #[serde(default)]
@@ -484,6 +612,22 @@ impl NapcatMessageManager {
                 .group_chats
                 .retain(|target_id| self.messages.contains_key(target_id));
             changed |= group_chat_len != group.group_chats.len();
+
+            changed |= group.sync_turn_players();
+        }
+        if self
+            .current_trpg_group
+            .as_ref()
+            .is_some_and(|group_name| !self.trpg_groups.contains_key(group_name))
+        {
+            self.current_trpg_group = None;
+            changed = true;
+        }
+        if self.current_trpg_group.is_none() && self.trpg_groups.len() == 1 {
+            if let Some(group_name) = self.trpg_groups.keys().next().cloned() {
+                self.current_trpg_group = Some(group_name);
+                changed = true;
+            }
         }
         changed
     }
@@ -496,6 +640,21 @@ impl NapcatMessageManager {
         }
 
         self.pending_chat_targets.insert(target_id.to_owned());
+    }
+
+    pub fn set_automatic_target_name(&mut self, target_id: &str, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() || name == target_id {
+            return false;
+        }
+
+        let metadata = self.chat_targets.entry(target_id.to_owned()).or_default();
+        if metadata.automatic_name.trim() == name {
+            return false;
+        }
+
+        metadata.automatic_name = name.to_owned();
+        true
     }
 }
 
@@ -514,6 +673,7 @@ impl Plugin for NapcatPlugin {
             // .insert_resource(NapcatSocket { ..default() })
             .add_systems(Startup, setup)
             .add_systems(Update, message_system)
+            .add_systems(Update, request_missing_group_info_system)
             .add_systems(Update, send_result_system);
     }
 }
@@ -536,12 +696,17 @@ fn setup(mut commands: Commands) {
     commands.insert_resource(NapcatAutoForwardRequestIds {
         next_request_id: 1_000_000,
     });
+    commands.insert_resource(NapcatGroupInfoRequests {
+        next_request_id: 2_000_000,
+        pending_group_ids: HashSet::default(),
+    });
 
     let message_manager = NapcatMessageManager {
         messages: HashMap::default(),
         chat_targets: HashMap::default(),
         player_characters: HashMap::default(),
         trpg_groups: HashMap::default(),
+        current_trpg_group: None,
         groups: HashMap::default(),
         read_message_counts: HashMap::default(),
         summarized_message_counts: HashMap::default(),
@@ -660,10 +825,146 @@ fn send_result_system(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct NapcatActionResponse {
+    #[serde(default)]
+    data: Option<NapcatActionResponseData>,
+    #[serde(default)]
+    echo: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NapcatActionResponseData {
+    #[serde(default)]
+    group_id: Option<Value>,
+    #[serde(default)]
+    group_name: Option<String>,
+}
+
+fn request_missing_group_info_system(
+    sender: Option<Res<NapcatIOSender>>,
+    mut group_info_requests: ResMut<NapcatGroupInfoRequests>,
+    manager: Res<Persistent<NapcatMessageManager>>,
+) {
+    let Some(sender) = sender.as_deref() else {
+        return;
+    };
+
+    for (target_id, messages) in &manager.messages {
+        if !matches!(
+            messages.first().map(|message| &message.data.message_type),
+            Some(NapcatMessageType::Group)
+        ) {
+            continue;
+        }
+
+        let has_name = manager
+            .chat_targets
+            .get(target_id)
+            .map(|metadata| !metadata.automatic_name.trim().is_empty())
+            .unwrap_or_default();
+        if has_name || group_info_requests.pending_group_ids.contains(target_id) {
+            continue;
+        }
+
+        let Ok(group_id) = target_id.parse::<u64>() else {
+            continue;
+        };
+        queue_group_info_request(
+            sender,
+            &mut group_info_requests,
+            group_id,
+        );
+    }
+}
+
+fn queue_group_info_request(
+    sender: &NapcatIOSender,
+    group_info_requests: &mut NapcatGroupInfoRequests,
+    group_id: u64,
+) {
+    let target_id = group_id.to_string();
+    let request_id = group_info_requests.next_request_id;
+    group_info_requests.next_request_id += 1;
+    let message = Message::Text(
+        json!({
+            "action": "get_group_info",
+            "params": {
+                "group_id": group_id,
+                "no_cache": false
+            },
+            "echo": format!("group-info:{target_id}")
+        })
+        .to_string()
+        .into(),
+    );
+
+    match sender.0.try_send(NapcatOutboundMessage {
+        request_id,
+        target_id: target_id.clone(),
+        message,
+    }) {
+        Ok(()) => {
+            group_info_requests.pending_group_ids.insert(target_id);
+        },
+        Err(err) => eprintln!("failed to queue NapCat group info request: {err}"),
+    }
+}
+
+fn apply_group_info_response(
+    response: &NapcatActionResponse,
+    manager: &mut NapcatMessageManager,
+    group_info_requests: &mut NapcatGroupInfoRequests,
+) -> bool {
+    let Some(target_id) = response_group_target_id(response) else {
+        return false;
+    };
+    group_info_requests.pending_group_ids.remove(&target_id);
+
+    let Some(group_name) = response
+        .data
+        .as_ref()
+        .and_then(|data| data.group_name.as_deref())
+    else {
+        return false;
+    };
+
+    manager.set_automatic_target_name(&target_id, group_name)
+}
+
+fn response_group_target_id(response: &NapcatActionResponse) -> Option<String> {
+    if let Some(group_id) = response
+        .data
+        .as_ref()
+        .and_then(|data| data.group_id.as_ref())
+        .and_then(value_to_target_id)
+    {
+        return Some(group_id);
+    }
+
+    response
+        .echo
+        .as_deref()
+        .and_then(|echo| echo.strip_prefix("group-info:"))
+        .map(str::to_owned)
+}
+
+fn value_to_target_id(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(number) => number.as_u64().map(|number| number.to_string()),
+        Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        },
+        _ => None,
+    }
+}
+
 fn message_system(
     receiver: Res<NapcatIOReceiver>,
     sender: Option<Res<NapcatIOSender>>,
     mut auto_forward_ids: ResMut<NapcatAutoForwardRequestIds>,
+    mut group_info_requests: ResMut<NapcatGroupInfoRequests>,
     mut scene_capture_requests: Option<ResMut<SceneCaptureRequests>>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
 ) {
@@ -711,24 +1012,40 @@ fn message_system(
                 .or_default()
                 .push(json);
             manager.chat_targets.entry(target_id.clone()).or_default();
+            let group_name = manager
+                .messages
+                .get(&target_id)
+                .and_then(|messages| messages.last())
+                .and_then(|message| message.data.group_name.as_deref())
+                .map(str::to_owned);
+            if let Some(group_name) = group_name {
+                manager.set_automatic_target_name(&target_id, &group_name);
+            }
             if is_incoming_message {
                 manager.register_incoming_target(&target_id, is_new_target);
             }
 
-            if let Err(err) = manager.persist() {
-                eprintln!("failed to persist NapCat messages: {err}");
-            }
-
             if let (Some(sender), Some(response)) = (
                 sender.as_deref(),
-                character_creation_response,
+                character_creation_response.as_deref(),
             ) {
-                queue_private_text_response(
+                if queue_private_text_response(
                     sender,
                     &mut auto_forward_ids,
                     incoming_user_id,
-                    response,
-                );
+                    response.to_owned(),
+                ) {
+                    append_local_private_text_response(
+                        &mut manager,
+                        &target_id,
+                        incoming_user_id,
+                        response,
+                    );
+                }
+            }
+
+            if let Err(err) = manager.persist() {
+                eprintln!("failed to persist NapCat messages: {err}");
             }
 
             if let (Some(sender), Some(auto_forward)) = (sender.as_deref(), auto_forward) {
@@ -742,11 +1059,24 @@ fn message_system(
                 }
             }
         } else {
-            eprintln!(
-                "NapCat websocket response was not a persisted chat message: {}; parse error: {:?}",
-                msg,
-                json_res.err()
-            );
+            let response_res = serde_json::from_str::<NapcatActionResponse>(&msg.to_string());
+            if let Ok(response) = response_res {
+                if apply_group_info_response(
+                    &response,
+                    &mut manager,
+                    &mut group_info_requests,
+                ) {
+                    if let Err(err) = manager.persist() {
+                        eprintln!("failed to persist NapCat group info: {err}");
+                    }
+                }
+            } else {
+                eprintln!(
+                    "NapCat websocket response was not a persisted chat message: {}; parse error: {:?}",
+                    msg,
+                    json_res.err()
+                );
+            }
         }
     }
 }
@@ -806,7 +1136,7 @@ fn queue_private_text_response(
     auto_forward_ids: &mut NapcatAutoForwardRequestIds,
     user_id: u64,
     text: String,
-) {
+) -> bool {
     let request_id = auto_forward_ids.next_request_id;
     auto_forward_ids.next_request_id += 1;
     let message = Message::Text(
@@ -834,12 +1164,67 @@ fn queue_private_text_response(
         message,
     }) {
         eprintln!("failed to queue NapCat private text response: {err}");
+        false
+    } else {
+        true
     }
+}
+
+fn append_local_private_text_response(
+    manager: &mut NapcatMessageManager,
+    target_id: &str,
+    recipient_id: u64,
+    text: &str,
+) {
+    let Some(self_id) = manager
+        .messages
+        .get(target_id)
+        .and_then(|messages| messages.first())
+        .map(|message| message.data.self_id)
+    else {
+        return;
+    };
+
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let message = NapcatMessage {
+        data: NapcatMessageData {
+            time,
+            message_type: NapcatMessageType::Private,
+            message: vec![NapcatMessageChain {
+                variant: NapcatMessageChainType::Text {
+                    data: TextData {
+                        text: text.to_owned(),
+                    },
+                },
+            }],
+            self_id,
+            user_id: self_id,
+            group_id: None,
+            group_name: None,
+            target_id: Some(recipient_id),
+            sender: NapcatSender {
+                user_id: self_id,
+                nickname: "GM".to_owned(),
+            },
+        },
+    };
+
+    manager
+        .messages
+        .entry(target_id.to_owned())
+        .or_default()
+        .push(message);
 }
 
 fn is_scene_capture_command(message: &NapcatMessage) -> bool {
     let text = message_text(message);
-    matches!(text.trim(), "#观察" | "#gc")
+    matches!(
+        text.trim(),
+        "#观察" | "#gc" | ".观察" | ".gc"
+    )
 }
 
 fn handle_character_creation_message(
@@ -992,11 +1377,44 @@ fn character_creation_next(character: &mut PlayerCharacter) -> String {
 }
 
 fn character_creation_back(character: &mut PlayerCharacter) -> String {
-    reset_character_status_phase(character);
-    format!(
-        "已退回属性兑换第一步，属性点已全部返还。\n{}",
-        character_creation_prompt(character)
-    )
+    if character.creation_step.status_key().is_some()
+        || character.creation_step == CharacterCreationStep::ConfirmStatus
+    {
+        reset_character_status_phase(character);
+        return format!(
+            "已退回属性兑换第一步，属性点已全部返还。\n{}",
+            character_creation_prompt(character)
+        );
+    }
+
+    match character.creation_step {
+        CharacterCreationStep::Skill | CharacterCreationStep::ConfirmSkill => {
+            reset_character_status_phase(character);
+            format!(
+                "已退回属性兑换第一步，属性点已全部返还。\n{}",
+                character_creation_prompt(character)
+            )
+        },
+        CharacterCreationStep::Image => {
+            character.creation_step = CharacterCreationStep::Skill;
+            "已退回技能兑换。请继续发送技能描述；输入【.】结束技能录入。".to_owned()
+        },
+        CharacterCreationStep::Nickname => {
+            character.creation_step = CharacterCreationStep::Image;
+            character.image.clear();
+            "已退回图片录入。请发送人物立绘图片链接；如果暂时没有，输入【.】跳过。".to_owned()
+        },
+        CharacterCreationStep::Normal => "未处于建卡流程。输入【.兑换】开始。".to_owned(),
+        CharacterCreationStep::ConfirmStatus
+        | CharacterCreationStep::Str
+        | CharacterCreationStep::Agi
+        | CharacterCreationStep::Dex
+        | CharacterCreationStep::Vit
+        | CharacterCreationStep::Int
+        | CharacterCreationStep::Wis
+        | CharacterCreationStep::K
+        | CharacterCreationStep::Cha => unreachable!("status steps return before match"),
+    }
 }
 
 fn character_creation_prompt(character: &PlayerCharacter) -> String {
@@ -1127,7 +1545,9 @@ fn message_image_reference(message: &NapcatMessage) -> Option<String> {
         let NapcatMessageChainType::Image { data } = &chain.variant else {
             return None;
         };
-        if !data.url.trim().is_empty() {
+        if !data.local_path.trim().is_empty() {
+            Some(data.local_path.trim().to_owned())
+        } else if !data.url.trim().is_empty() {
             Some(data.url.trim().to_owned())
         } else if !data.file_id.trim().is_empty() {
             Some(data.file_id.trim().to_owned())
@@ -1230,6 +1650,7 @@ mod tests {
             chat_targets: HashMap::default(),
             player_characters: HashMap::default(),
             trpg_groups: HashMap::default(),
+            current_trpg_group: None,
             groups: HashMap::default(),
             read_message_counts: HashMap::default(),
             summarized_message_counts: HashMap::default(),
@@ -1257,6 +1678,7 @@ mod tests {
                 self_id: 1,
                 user_id: 2,
                 group_id: None,
+                group_name: None,
                 target_id: None,
                 sender: NapcatSender {
                     user_id: 2,
@@ -1286,12 +1708,24 @@ mod tests {
                 self_id: 1,
                 user_id: 2,
                 group_id: None,
+                group_name: None,
                 target_id: None,
                 sender: NapcatSender {
                     user_id: 2,
                     nickname: "tester".to_owned(),
                 },
             },
+        }
+    }
+
+    #[test]
+    fn scene_capture_command_accepts_hash_and_dot_aliases() {
+        for command in ["#观察", "#gc", ".观察", ".gc"] {
+            let message = test_message_with_text(NapcatMessageType::Private, command);
+            assert!(
+                is_scene_capture_command(&message),
+                "{command} should trigger capture"
+            );
         }
     }
 
@@ -1459,6 +1893,38 @@ mod tests {
     }
 
     #[test]
+    fn group_info_response_updates_automatic_chat_name() {
+        let mut manager = empty_manager();
+        let mut requests = NapcatGroupInfoRequests {
+            next_request_id: 2_000_000,
+            pending_group_ids: HashSet::from(["976886808".to_owned()]),
+        };
+        let response = serde_json::from_str::<NapcatActionResponse>(
+            r#"{
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "group_id": 976886808,
+                    "group_name": "柳絮，只是另一个跑团软件"
+                },
+                "echo": "group-info:976886808"
+            }"#,
+        )
+        .expect("group info response should parse");
+
+        assert!(apply_group_info_response(
+            &response,
+            &mut manager,
+            &mut requests
+        ));
+        assert_eq!(
+            manager.chat_targets["976886808"].automatic_name,
+            "柳絮，只是另一个跑团软件"
+        );
+        assert!(!requests.pending_group_ids.contains("976886808"));
+    }
+
+    #[test]
     fn private_message_targets_sync_to_player_characters() {
         let mut manager = empty_manager();
         manager.messages.insert("player-1".to_owned(), vec![
@@ -1545,6 +2011,32 @@ mod tests {
     }
 
     #[test]
+    fn local_private_text_response_is_appended_as_self_message() {
+        let mut manager = empty_manager();
+        let target_id = "2";
+        manager.messages.insert(target_id.to_owned(), vec![
+            test_message_with_text(NapcatMessageType::Private, ".兑换"),
+        ]);
+
+        append_local_private_text_response(&mut manager, target_id, 2, "兑换回复");
+
+        let messages = manager.messages.get(target_id).unwrap();
+        assert_eq!(messages.len(), 2);
+        let response = &messages[1];
+        assert!(matches!(
+            response.data.message_type,
+            NapcatMessageType::Private
+        ));
+        assert_eq!(
+            response.data.user_id,
+            response.data.self_id
+        );
+        assert_eq!(response.data.target_id, Some(2));
+        assert_eq!(response.data.sender.nickname, "GM");
+        assert_eq!(message_text(response), "兑换回复");
+    }
+
+    #[test]
     fn character_creation_back_resets_status_phase_and_refunds_points() {
         let mut manager = empty_manager();
         let target_id = "2";
@@ -1588,17 +2080,175 @@ mod tests {
     }
 
     #[test]
+    fn character_creation_back_from_nickname_returns_to_image_phase() {
+        let mut manager = empty_manager();
+        let target_id = "2";
+
+        handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            target_id,
+        );
+        for value in ["2", "1", "1", "1", ".", "."] {
+            handle_character_creation_message(
+                &mut manager,
+                &test_message_with_text(NapcatMessageType::Private, value),
+                target_id,
+            );
+        }
+        handle_character_creation_message(
+            &mut manager,
+            &test_private_image("https://example.test/pc.png"),
+            target_id,
+        );
+        assert_eq!(
+            manager.player_characters[target_id].creation_step,
+            CharacterCreationStep::Nickname
+        );
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".."),
+            target_id,
+        )
+        .unwrap();
+        let character = manager.player_characters.get(target_id).unwrap();
+
+        assert!(response.contains("图片录入"));
+        assert_eq!(
+            character.creation_step,
+            CharacterCreationStep::Image
+        );
+        assert!(character.image.is_empty());
+    }
+
+    #[test]
+    fn character_creation_back_from_image_returns_to_skill_phase() {
+        let mut manager = empty_manager();
+        let target_id = "2";
+
+        handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            target_id,
+        );
+        for value in ["2", "1", "1", "1", ".", "."] {
+            handle_character_creation_message(
+                &mut manager,
+                &test_message_with_text(NapcatMessageType::Private, value),
+                target_id,
+            );
+        }
+        assert_eq!(
+            manager.player_characters[target_id].creation_step,
+            CharacterCreationStep::Image
+        );
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".."),
+            target_id,
+        )
+        .unwrap();
+        let character = manager.player_characters.get(target_id).unwrap();
+
+        assert!(response.contains("技能兑换"));
+        assert_eq!(
+            character.creation_step,
+            CharacterCreationStep::Skill
+        );
+    }
+
+    #[test]
     fn chat_target_sync_prunes_missing_trpg_group_members() {
         let mut manager = empty_manager();
         manager.messages.insert("player-1".to_owned(), Vec::new());
         manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
             players: vec!["player-1".to_owned(), "missing-player".to_owned()],
             group_chats: vec!["missing-group".to_owned()],
+            ..Default::default()
         });
 
         assert!(manager.sync_chat_targets());
         let group = manager.trpg_groups.get("table").unwrap();
         assert_eq!(group.players, vec!["player-1"]);
         assert!(group.group_chats.is_empty());
+        assert!(group.player_turns.contains_key("player-1"));
+        assert!(!group.player_turns.contains_key("missing-player"));
+    }
+
+    #[test]
+    fn chat_target_sync_selects_only_trpg_group_as_current() {
+        let mut manager = empty_manager();
+        manager
+            .trpg_groups
+            .insert("table".to_owned(), TrpgGroup::default());
+
+        assert!(manager.sync_chat_targets());
+        assert_eq!(
+            manager.current_trpg_group.as_deref(),
+            Some("table")
+        );
+    }
+
+    #[test]
+    fn chat_target_sync_clears_deleted_current_group() {
+        let mut manager = empty_manager();
+        manager.current_trpg_group = Some("deleted".to_owned());
+        manager
+            .trpg_groups
+            .insert("table".to_owned(), TrpgGroup::default());
+
+        assert!(manager.sync_chat_targets());
+        assert_eq!(
+            manager.current_trpg_group.as_deref(),
+            Some("table")
+        );
+    }
+
+    #[test]
+    fn trpg_group_advances_world_turn_after_all_players_finish() {
+        let mut group = TrpgGroup {
+            players: vec!["a".to_owned(), "b".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(group.mark_player_acted("a"));
+        assert_eq!(group.world_turn, 0);
+        assert!(group.player_turns["a"].acted);
+        assert!(!group.player_turns["b"].acted);
+
+        assert!(group.mark_player_skipped("b"));
+        assert_eq!(group.world_turn, 1);
+        assert_eq!(group.player_turns["a"].turns_passed, 1);
+        assert_eq!(group.player_turns["b"].turns_passed, 1);
+        assert!(!group.player_turns["a"].acted);
+        assert!(!group.player_turns["b"].skipped);
+    }
+
+    #[test]
+    fn trpg_group_rejects_turn_action_for_non_member() {
+        let mut group = TrpgGroup {
+            players: vec!["a".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(!group.mark_player_acted("missing"));
+        assert_eq!(group.world_turn, 0);
+        assert!(group.player_turns.is_empty());
+    }
+
+    #[test]
+    fn trpg_group_manual_advance_counts_all_current_players() {
+        let mut group = TrpgGroup {
+            players: vec!["a".to_owned(), "b".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(group.advance_world_turn());
+
+        assert_eq!(group.world_turn, 1);
+        assert_eq!(group.player_turns["a"].turns_passed, 1);
+        assert_eq!(group.player_turns["b"].turns_passed, 1);
     }
 }

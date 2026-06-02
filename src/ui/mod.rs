@@ -45,6 +45,7 @@ use bevy_egui::{
         Widget,
     },
     EguiContexts,
+    EguiGlobalSettings,
     EguiPlugin,
     EguiPrimaryContextPass,
 };
@@ -62,6 +63,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
 const CHAT_WINDOW_MIN_SIZE: Vec2 = Vec2::new(260.0, 260.0);
 const CHAT_WINDOW_MAX_SIZE: Vec2 = Vec2::new(720.0, 720.0);
+const GROUP_CHAT_MAX_WIDTH: f32 = 520.0;
 const GROUP_CHAT_MAX_HEIGHT: f32 = 720.0;
 const GROUP_CHAT_MIN_HEIGHT: f32 = 140.0;
 const GROUP_CHAT_SEPARATOR_HEIGHT: f32 = 10.0;
@@ -108,10 +110,15 @@ use crate::{
     },
     rule_engine::{
         parse_rule,
+        BuffEffect,
+        BuffField,
+        BuffKind,
+        BuffSpec,
+        BuffValue,
         RuleAst,
         RuleEngineState,
+        StatusKey,
     },
-    GAME_TITLE,
 };
 pub struct UIPlugin;
 #[derive(Resource)]
@@ -129,6 +136,7 @@ pub(crate) struct ChatScrollState {
 pub(crate) struct TrpgGroupSettingsState {
     open: bool,
     new_group_name: String,
+    focused_group_name: Option<String>,
     pending_character_delete: Option<String>,
 }
 
@@ -136,7 +144,33 @@ pub(crate) struct TrpgGroupSettingsState {
 pub(crate) struct CharacterEditState {
     unlocked_status_targets: HashSet<String>,
     gm_status_drafts: HashMap<String, CharacterStatus>,
+    buff_drafts: HashMap<String, BuffDraft>,
     pending_character_reset: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct BuffDraft {
+    name: String,
+    kind: BuffKind,
+    priority: i32,
+    turns_remaining: i32,
+    beneficial: bool,
+    field: BuffField,
+    value: BuffValue,
+}
+
+impl Default for BuffDraft {
+    fn default() -> Self {
+        Self {
+            name: "New buff".to_owned(),
+            kind: BuffKind::Magic,
+            priority: 0,
+            turns_remaining: 1,
+            beneficial: true,
+            field: BuffField::DamageTakenModifier,
+            value: BuffValue::Set(0.5),
+        }
+    }
 }
 
 #[derive(SystemParam)]
@@ -244,6 +278,10 @@ impl Widget for CircleImageButton {
 impl Plugin for UIPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(EguiPlugin::default())
+            .insert_resource(EguiGlobalSettings {
+                auto_create_primary_context: false,
+                ..default()
+            })
             .add_plugins(ImePlugin)
             .add_plugins(DeepseekPlugin)
             .add_systems(Startup, setup_system)
@@ -349,7 +387,9 @@ pub fn load_ui_memory(
     let Ok(ctx) = egui_context.ctx_mut() else {
         return;
     };
-    ctx.memory_mut(|m| *m = cached_memory.ui_memory.clone());
+    let mut memory = cached_memory.ui_memory.clone();
+    memory.reset_areas();
+    ctx.memory_mut(|m| *m = memory);
 }
 
 fn chat_window(
@@ -967,18 +1007,30 @@ fn target_default_display_name(target_id: &str, messages: Option<&Vec<NapcatMess
 }
 
 fn target_display_name(manager: &NapcatMessageManager, target_id: &str) -> String {
-    manager
+    if let Some(display_name) = manager
         .chat_targets
         .get(target_id)
         .map(|metadata| metadata.display_name.trim())
-        .filter(|display_name| !display_name.is_empty())
+        .filter(|display_name| !display_name.is_empty() && *display_name != target_id)
         .map(str::to_owned)
-        .unwrap_or_else(|| {
-            target_default_display_name(
-                target_id,
-                manager.messages.get(target_id),
-            )
-        })
+    {
+        return display_name;
+    }
+
+    if let Some(automatic_name) = manager
+        .chat_targets
+        .get(target_id)
+        .map(|metadata| metadata.automatic_name.trim())
+        .filter(|automatic_name| !automatic_name.is_empty())
+        .map(str::to_owned)
+    {
+        return automatic_name;
+    }
+
+    target_default_display_name(
+        target_id,
+        manager.messages.get(target_id),
+    )
 }
 
 fn chat_group_title(group_name: &str, group: &ChatGroup, manager: &NapcatMessageManager) -> String {
@@ -1044,6 +1096,17 @@ fn group_chat_inner_size(member_count: usize, max_rect: Rect) -> Vec2 {
             .min(GROUP_CHAT_MAX_HEIGHT)
             .min(max_rect.height())
             .max(GROUP_CHAT_MIN_HEIGHT),
+    )
+}
+
+fn group_chat_max_size(max_rect: Rect) -> Vec2 {
+    egui::vec2(
+        GROUP_CHAT_MAX_WIDTH
+            .min(max_rect.width())
+            .max(CHAT_WINDOW_MIN_SIZE.x),
+        GROUP_CHAT_MAX_HEIGHT
+            .min(max_rect.height())
+            .max(CHAT_WINDOW_MIN_SIZE.y),
     )
 }
 
@@ -1177,7 +1240,10 @@ fn player_text_lines(messages: &[NapcatMessage]) -> Vec<PlayerTextLine> {
         player_message_count += 1;
         lines.push(PlayerTextLine {
             player_message_count,
-            summary_eligible: !matches!(text.trim(), "#观察" | "#gc"),
+            summary_eligible: !matches!(
+                text.trim(),
+                "#观察" | "#gc" | ".观察" | ".gc"
+            ),
             text: format!(
                 "{}: {}",
                 message.data.sender.nickname, text
@@ -1461,6 +1527,7 @@ fn chat_list_panel(
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
     edit_target: &mut Option<String>,
     edit_name: &mut String,
+    trpg_group_settings: &mut TrpgGroupSettingsState,
 ) {
     ui.heading("TRPG Groups");
     ui.add_space(4.0);
@@ -1470,7 +1537,6 @@ fn chat_list_panel(
     if trpg_group_names.is_empty() {
         ui.label("No TRPG groups.");
     } else {
-        let mut changed = false;
         for group_name in trpg_group_names {
             let Some(group) = manager.trpg_groups.get(&group_name).cloned() else {
                 continue;
@@ -1491,22 +1557,17 @@ fn chat_list_panel(
                     }
                 });
                 ui.small(format!(
-                    "{} players, {} group chats",
+                    "{} players, {} group chats, turn {}",
                     group.players.len(),
-                    group.group_chats.len()
+                    group.group_chats.len(),
+                    group.world_turn
                 ));
                 if ui.button("Open workspace").clicked() {
-                    for target_id in group.players.iter().chain(group.group_chats.iter()) {
-                        manager.open_chat_targets.insert(target_id.clone());
-                        manager.pending_chat_targets.remove(target_id);
-                    }
-                    changed = true;
+                    trpg_group_settings.open = true;
+                    trpg_group_settings.focused_group_name = Some(group_name.clone());
                 }
             });
             ui.add_space(4.0);
-        }
-        if changed {
-            manager.persist().ok();
         }
     }
 
@@ -1880,6 +1941,7 @@ fn character_editor_ui(
                         *character = PlayerCharacter::default();
                         edit_state.unlocked_status_targets.remove(target_id);
                         edit_state.gm_status_drafts.remove(target_id);
+                        edit_state.buff_drafts.remove(target_id);
                         edit_state.pending_character_reset = None;
                         changed = true;
                     }
@@ -2054,6 +2116,14 @@ fn character_editor_ui(
         status_unlocked,
     );
     ui.separator();
+    changed |= character_buff_editor_ui(
+        ui,
+        target_id,
+        character,
+        edit_state,
+        rule_engine_state,
+    );
+    ui.separator();
     changed |= character_skill_editor_ui(
         ui,
         target_id,
@@ -2086,16 +2156,7 @@ fn character_skill_editor_ui(
     let mut changed = false;
     let mut remove_index = None;
 
-    if character.skill_names.len() < character.skill_notes.len() {
-        character.skill_names.resize(
-            character.skill_notes.len(),
-            String::new(),
-        );
-        changed = true;
-    } else if character.skill_names.len() > character.skill_notes.len() {
-        character.skill_names.truncate(character.skill_notes.len());
-        changed = true;
-    }
+    changed |= normalize_character_skill_fields(character);
 
     ui.horizontal(|ui| {
         ui.label(format!(
@@ -2109,17 +2170,14 @@ fn character_skill_editor_ui(
         {
             character.skill_names.push(String::new());
             character.skill_notes.push(String::new());
+            character.skill_mp_costs.push(0.0);
+            character.skill_cooldown_turns.push(0);
             changed = true;
         }
     });
 
-    for (index, (name, note)) in character
-        .skill_names
-        .iter_mut()
-        .zip(character.skill_notes.iter_mut())
-        .enumerate()
-    {
-        let validation = parse_skill_note(note);
+    for index in 0..character.skill_names.len() {
+        let validation = parse_skill_note(&character.skill_notes[index]);
         ui.horizontal(|ui| {
             let width = (ui.available_width() - 28.0).clamp(160.0, CHARACTER_FIELD_MAX_WIDTH);
             ui.vertical(|ui| {
@@ -2127,13 +2185,31 @@ fn character_skill_editor_ui(
                     ui.label("Spell name");
                     changed |= ui
                         .add(
-                            egui::TextEdit::singleline(name)
+                            egui::TextEdit::singleline(&mut character.skill_names[index])
                                 .desired_width((width - 78.0).max(82.0)),
                         )
                         .changed();
                 });
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut character.skill_mp_costs[index])
+                                .range(0.0..=9999.0)
+                                .speed(1.0)
+                                .prefix("MP "),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut character.skill_cooldown_turns[index])
+                                .range(0..=999)
+                                .speed(1)
+                                .prefix("Cooldown "),
+                        )
+                        .changed();
+                });
                 let response = ui.add(
-                    egui::TextEdit::multiline(note)
+                    egui::TextEdit::multiline(&mut character.skill_notes[index])
                         .desired_rows(2)
                         .desired_width(width),
                 );
@@ -2167,11 +2243,46 @@ fn character_skill_editor_ui(
     if let Some(index) = remove_index {
         character.skill_names.remove(index);
         character.skill_notes.remove(index);
+        character.skill_mp_costs.remove(index);
+        character.skill_cooldown_turns.remove(index);
         changed = true;
     }
 
     sync_character_skill_rules(target_id, character, rule_engine_state);
 
+    changed
+}
+
+fn normalize_character_skill_fields(character: &mut PlayerCharacter) -> bool {
+    let mut changed = false;
+    let skill_count = character
+        .skill_names
+        .len()
+        .max(character.skill_notes.len())
+        .max(character.skill_mp_costs.len())
+        .max(character.skill_cooldown_turns.len());
+    if character.skill_names.len() != skill_count {
+        character.skill_names.resize(skill_count, String::new());
+        changed = true;
+    }
+    if character.skill_notes.len() != skill_count {
+        character.skill_notes.resize(skill_count, String::new());
+        changed = true;
+    }
+    if character.skill_mp_costs.len() != skill_count {
+        character.skill_mp_costs.resize(skill_count, 0.0);
+        changed = true;
+    }
+    if character.skill_cooldown_turns.len() != skill_count {
+        character.skill_cooldown_turns.resize(skill_count, 0);
+        changed = true;
+    }
+    for cost in &mut character.skill_mp_costs {
+        if *cost < 0.0 {
+            *cost = 0.0;
+            changed = true;
+        }
+    }
     changed
 }
 
@@ -2473,6 +2584,290 @@ fn character_hp_status(hp: f32, max_hp: f32) -> &'static str {
     }
 }
 
+fn character_buff_editor_ui(
+    ui: &mut Ui,
+    target_id: &str,
+    character: &mut PlayerCharacter,
+    edit_state: &mut CharacterEditState,
+    rule_engine_state: &mut RuleEngineState,
+) -> bool {
+    let mut changed = false;
+    let mut remove_index = None;
+
+    sync_character_buffs(target_id, character, rule_engine_state);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!(
+            "Active buffs: {}",
+            character.active_buffs.len()
+        ));
+        let active_names = rule_engine_state.active_buff_names(target_id);
+        if !active_names.is_empty() {
+            ui.small(active_names.join(", "));
+        }
+    });
+
+    for (index, buff) in character.active_buffs.iter_mut().enumerate() {
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui.text_edit_singleline(&mut buff.name).changed();
+                changed |= buff_kind_combo(ui, &mut buff.kind);
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut buff.turns_remaining)
+                            .range(1..=999)
+                            .prefix("Turns "),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut buff.priority)
+                            .range(-999..=999)
+                            .prefix("Priority "),
+                    )
+                    .changed();
+                changed |= ui.checkbox(&mut buff.beneficial, "Beneficial").changed();
+                if ui.button("Remove").clicked() {
+                    remove_index = Some(index);
+                }
+            });
+            for effect in &buff.effects {
+                ui.small(format_buff_effect(effect));
+            }
+        });
+    }
+
+    if let Some(index) = remove_index {
+        character.active_buffs.remove(index);
+        changed = true;
+    }
+
+    let draft = edit_state
+        .buff_drafts
+        .entry(target_id.to_owned())
+        .or_default();
+    ui.collapsing("Give buff", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Name");
+            ui.text_edit_singleline(&mut draft.name);
+            buff_kind_combo(ui, &mut draft.kind);
+            ui.add(
+                egui::DragValue::new(&mut draft.turns_remaining)
+                    .range(1..=999)
+                    .prefix("Turns "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut draft.priority)
+                    .range(-999..=999)
+                    .prefix("Priority "),
+            );
+            ui.checkbox(&mut draft.beneficial, "Beneficial");
+        });
+        ui.horizontal_wrapped(|ui| {
+            buff_field_combo(ui, &mut draft.field);
+            buff_value_ui(ui, &mut draft.value);
+        });
+        if ui.button("Apply buff").clicked() {
+            let name = draft.name.trim();
+            character.active_buffs.push(BuffSpec {
+                name: if name.is_empty() { "Unnamed buff".to_owned() } else { name.to_owned() },
+                kind: draft.kind,
+                priority: draft.priority,
+                turns_remaining: draft.turns_remaining.max(1),
+                source_id: "gm".to_owned(),
+                beneficial: draft.beneficial,
+                effects: vec![BuffEffect {
+                    field: draft.field,
+                    value: draft.value,
+                }],
+            });
+            changed = true;
+        }
+    });
+
+    if changed {
+        sync_character_buffs(target_id, character, rule_engine_state);
+    }
+    changed
+}
+
+fn buff_kind_combo(ui: &mut Ui, kind: &mut BuffKind) -> bool {
+    let mut changed = false;
+    egui::ComboBox::from_label("Type")
+        .selected_text(buff_kind_label(*kind))
+        .show_ui(ui, |ui| {
+            for candidate in buff_kind_options() {
+                changed |= ui
+                    .selectable_value(
+                        kind,
+                        candidate,
+                        buff_kind_label(candidate),
+                    )
+                    .changed();
+            }
+        });
+    changed
+}
+
+fn sync_character_buffs(
+    target_id: &str,
+    character: &PlayerCharacter,
+    rule_engine_state: &mut RuleEngineState,
+) {
+    sync_character_skill_rules(target_id, character, rule_engine_state);
+    rule_engine_state.replace_character_buffs(
+        target_id,
+        character.active_buffs.clone(),
+    );
+}
+
+fn buff_kind_options() -> [BuffKind; 6] {
+    [
+        BuffKind::Magic,
+        BuffKind::Curse,
+        BuffKind::Disease,
+        BuffKind::Bleed,
+        BuffKind::Poison,
+        BuffKind::None,
+    ]
+}
+
+fn buff_kind_label(kind: BuffKind) -> &'static str {
+    match kind {
+        BuffKind::None => "无",
+        BuffKind::Magic => "魔法",
+        BuffKind::Physical => "无",
+        BuffKind::Curse => "诅咒",
+        BuffKind::Disease => "疾病",
+        BuffKind::Bleed => "流血",
+        BuffKind::Range => "无",
+        BuffKind::Poison => "中毒",
+    }
+}
+
+fn buff_field_combo(ui: &mut Ui, field: &mut BuffField) {
+    egui::ComboBox::from_label("Field")
+        .selected_text(buff_field_label(*field))
+        .show_ui(ui, |ui| {
+            for candidate in buff_field_options() {
+                ui.selectable_value(
+                    field,
+                    candidate,
+                    buff_field_label(candidate),
+                );
+            }
+        });
+}
+
+fn buff_value_ui(ui: &mut Ui, value: &mut BuffValue) {
+    let mut mode = match value {
+        BuffValue::Add(_) => 0,
+        BuffValue::AddPercent(_) => 1,
+        BuffValue::Set(_) => 2,
+        BuffValue::SetPercentOfBase(_) => 3,
+    };
+    egui::ComboBox::from_label("Value")
+        .selected_text(buff_value_mode_label(mode))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut mode, 0, "Add");
+            ui.selectable_value(&mut mode, 1, "Add %");
+            ui.selectable_value(&mut mode, 2, "Set");
+            ui.selectable_value(&mut mode, 3, "Set % base");
+        });
+
+    let mut amount = match *value {
+        BuffValue::Add(amount)
+        | BuffValue::AddPercent(amount)
+        | BuffValue::Set(amount)
+        | BuffValue::SetPercentOfBase(amount) => amount,
+    };
+    ui.add(
+        egui::DragValue::new(&mut amount)
+            .speed(0.1)
+            .range(-9999.0..=9999.0),
+    );
+    *value = match mode {
+        0 => BuffValue::Add(amount),
+        1 => BuffValue::AddPercent(amount),
+        2 => BuffValue::Set(amount),
+        _ => BuffValue::SetPercentOfBase(amount),
+    };
+}
+
+fn buff_field_options() -> [BuffField; 18] {
+    [
+        BuffField::Hp,
+        BuffField::Mp,
+        BuffField::MaxHp,
+        BuffField::MaxMp,
+        BuffField::HpRegen,
+        BuffField::MpRegen,
+        BuffField::Status(StatusKey::Str),
+        BuffField::Status(StatusKey::Agi),
+        BuffField::Status(StatusKey::Dex),
+        BuffField::Status(StatusKey::Vit),
+        BuffField::Status(StatusKey::Int),
+        BuffField::Status(StatusKey::Wis),
+        BuffField::Status(StatusKey::K),
+        BuffField::Status(StatusKey::Cha),
+        BuffField::DamageDealtModifier,
+        BuffField::DamageTakenModifier,
+        BuffField::HealingDealtModifier,
+        BuffField::HealingTakenModifier,
+    ]
+}
+
+fn buff_field_label(field: BuffField) -> &'static str {
+    match field {
+        BuffField::Hp => "HP",
+        BuffField::Mp => "MP",
+        BuffField::MaxHp => "Max HP",
+        BuffField::MaxMp => "Max MP",
+        BuffField::HpRegen => "HP regen",
+        BuffField::MpRegen => "MP regen",
+        BuffField::Status(StatusKey::Str) => "STR",
+        BuffField::Status(StatusKey::Agi) => "AGI",
+        BuffField::Status(StatusKey::Dex) => "DEX",
+        BuffField::Status(StatusKey::Vit) => "VIT",
+        BuffField::Status(StatusKey::Int) => "INT",
+        BuffField::Status(StatusKey::Wis) => "WIS",
+        BuffField::Status(StatusKey::K) => "K",
+        BuffField::Status(StatusKey::Cha) => "CHA",
+        BuffField::DamageDealtModifier => "Damage dealt",
+        BuffField::DamageTakenModifier => "Damage taken",
+        BuffField::HealingDealtModifier => "Healing dealt",
+        BuffField::HealingTakenModifier => "Healing taken",
+    }
+}
+
+fn buff_value_mode_label(mode: i32) -> &'static str {
+    match mode {
+        0 => "Add",
+        1 => "Add %",
+        2 => "Set",
+        _ => "Set % base",
+    }
+}
+
+fn format_buff_effect(effect: &BuffEffect) -> String {
+    let value = match effect.value {
+        BuffValue::Add(amount) => format!("+{}", format_character_number(amount)),
+        BuffValue::AddPercent(amount) => format!("+{}%", format_character_number(amount)),
+        BuffValue::Set(amount) => format!("={}", format_character_number(amount)),
+        BuffValue::SetPercentOfBase(amount) => {
+            format!(
+                "{}% base",
+                format_character_number(amount)
+            )
+        },
+    };
+    format!(
+        "{} {}",
+        buff_field_label(effect.field),
+        value
+    )
+}
+
 fn trpg_group_settings_window(
     ctx: &Context,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
@@ -2489,6 +2884,9 @@ fn trpg_group_settings_window(
     let mut changed = false;
     let mut group_to_delete = None;
     let mut character_to_delete = None;
+    let mut turn_action: Option<(String, String, bool)> = None;
+    let mut turn_reset: Option<String> = None;
+    let mut turn_advance: Option<String> = None;
 
     egui::Window::new("Player / Group Pools")
         .id(Id::new("trpg_group_settings_window"))
@@ -2503,6 +2901,9 @@ fn trpg_group_settings_window(
                     let name = state.new_group_name.trim();
                     if !name.is_empty() {
                         manager.trpg_groups.entry(name.to_owned()).or_default();
+                        if manager.current_trpg_group.is_none() {
+                            manager.current_trpg_group = Some(name.to_owned());
+                        }
                         state.new_group_name.clear();
                         changed = true;
                     }
@@ -2609,6 +3010,34 @@ fn trpg_group_settings_window(
                 return;
             }
 
+            let mut current_group = manager.current_trpg_group.clone().unwrap_or_default();
+            egui::ComboBox::from_label("Current TRPG group")
+                .selected_text(if current_group.is_empty() {
+                    "None"
+                } else {
+                    current_group.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut current_group,
+                        String::new(),
+                        "None",
+                    );
+                    for group_name in &group_names {
+                        ui.selectable_value(
+                            &mut current_group,
+                            group_name.clone(),
+                            group_name,
+                        );
+                    }
+                });
+            let next_current_group = (!current_group.is_empty()).then_some(current_group);
+            if manager.current_trpg_group != next_current_group {
+                manager.current_trpg_group = next_current_group;
+                changed = true;
+            }
+            ui.add_space(6.0);
+
             egui::ScrollArea::vertical()
                 .id_salt("trpg_group_membership_settings")
                 .show(ui, |ui| {
@@ -2616,13 +3045,14 @@ fn trpg_group_settings_window(
                         let Some(snapshot) = manager.trpg_groups.get(&group_name).cloned() else {
                             continue;
                         };
-                        ui.group(|ui| {
+                        let group_response = ui.group(|ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
                                 ui.heading(&group_name);
                                 ui.small(format!(
-                                    "{} targets",
-                                    trpg_group_member_count(&snapshot)
+                                    "{} targets, world turn {}",
+                                    trpg_group_member_count(&snapshot),
+                                    snapshot.world_turn
                                 ));
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -2633,6 +3063,55 @@ fn trpg_group_settings_window(
                                     },
                                 );
                             });
+
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Advance turn").clicked() {
+                                    turn_advance = Some(group_name.clone());
+                                }
+                                if ui.button("Reset actions").clicked() {
+                                    turn_reset = Some(group_name.clone());
+                                }
+                            });
+
+                            if snapshot.players.is_empty() {
+                                ui.small("No players in this TRPG turn group.");
+                            } else {
+                                ui.label("Turn status");
+                                for target_id in &snapshot.players {
+                                    let turn = snapshot.player_turns.get(target_id);
+                                    let turns_passed =
+                                        turn.map(|turn| turn.turns_passed).unwrap_or_default();
+                                    let acted = turn.map(|turn| turn.acted).unwrap_or_default();
+                                    let skipped = turn.map(|turn| turn.skipped).unwrap_or_default();
+                                    let status = if acted {
+                                        "acted"
+                                    } else if skipped {
+                                        "skipped"
+                                    } else {
+                                        "waiting"
+                                    };
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(target_display_name(manager, target_id));
+                                        ui.small(format!("{} turns", turns_passed));
+                                        ui.small(status);
+                                        if ui.button("Action").clicked() {
+                                            turn_action = Some((
+                                                group_name.clone(),
+                                                target_id.clone(),
+                                                true,
+                                            ));
+                                        }
+                                        if ui.button("Skip").clicked() {
+                                            turn_action = Some((
+                                                group_name.clone(),
+                                                target_id.clone(),
+                                                false,
+                                            ));
+                                        }
+                                    });
+                                }
+                                ui.separator();
+                            }
 
                             ui.columns(2, |columns| {
                                 columns[0].label("Players");
@@ -2654,6 +3133,7 @@ fn trpg_group_settings_window(
                                                 target_id,
                                                 selected,
                                             );
+                                            group.sync_turn_players();
                                             changed = true;
                                         }
                                     }
@@ -2684,13 +3164,42 @@ fn trpg_group_settings_window(
                                 }
                             });
                         });
+                        if state.focused_group_name.as_deref() == Some(group_name.as_str()) {
+                            group_response
+                                .response
+                                .scroll_to_me(Some(egui::Align::Center));
+                            state.focused_group_name = None;
+                        }
                         ui.add_space(6.0);
                     }
                 });
         });
 
+    if let Some((group_name, target_id, acted)) = turn_action {
+        if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
+            changed |= if acted {
+                group.mark_player_acted(&target_id)
+            } else {
+                group.mark_player_skipped(&target_id)
+            };
+        }
+    }
+    if let Some(group_name) = turn_reset {
+        if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
+            changed |= group.reset_current_turn();
+        }
+    }
+    if let Some(group_name) = turn_advance {
+        if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
+            changed |= group.advance_world_turn();
+        }
+    }
+
     if let Some(group_name) = group_to_delete {
         manager.trpg_groups.remove(&group_name);
+        if manager.current_trpg_group.as_deref() == Some(group_name.as_str()) {
+            manager.current_trpg_group = None;
+        }
         changed = true;
     }
     if let Some(target_id) = character_to_delete {
@@ -2871,6 +3380,7 @@ pub fn ui_system(
                 &mut manager,
                 chat_list_edit_target,
                 chat_list_edit_name,
+                trpg_group_settings,
             );
         });
 
@@ -2879,18 +3389,24 @@ pub fn ui_system(
         .show(ctx, |ui| {
             pending_chat_requests_window(ctx, &mut manager);
 
+            let mut closed_group_names = Vec::new();
             for (k, v) in &manager.groups.clone() {
                 let group_title = chat_group_title(&k, v, &manager);
                 let unread_count = chat_group_unread_count(&manager, v);
                 let group_size = group_chat_inner_size(v.members.len(), ui.max_rect());
+                let group_max_size = group_chat_max_size(ui.max_rect());
+                let mut group_open = true;
                 let response = egui::Window::new(group_title)
-                    .open(&mut true)
+                    .open(&mut group_open)
                     .constrain_to(ui.max_rect())
-                    .id(Id::new(k))
+                    .id(Id::new((
+                        k.as_str(),
+                        "chat_group_window_v2",
+                    )))
                     .default_pos(ui.max_rect().left_top() + egui::vec2(12.0, 12.0))
                     .default_size(group_size)
                     .min_size(CHAT_WINDOW_MIN_SIZE)
-                    .max_size(ui.max_rect().size())
+                    .max_size(group_max_size)
                     .show(ctx, |ui| {
                         group_drop_area_ui(ui, &k, &v.members);
                         group_broadcast_input_ui(
@@ -2904,6 +3420,11 @@ pub fn ui_system(
                             &mut ime,
                         );
                     });
+
+                if !group_open {
+                    closed_group_names.push(k.clone());
+                    continue;
+                }
 
                 if let Some(response) = response {
                     paint_unread_badge(
@@ -2921,6 +3442,15 @@ pub fn ui_system(
                         latest_group_rects.insert(k.clone(), response.response.rect);
                         group_rects.insert(k.clone(), response.response.rect);
                     }
+                }
+            }
+            if !closed_group_names.is_empty() {
+                for group_name in &closed_group_names {
+                    manager.groups.remove(group_name);
+                    previous_group_rects.remove(group_name);
+                }
+                if let Err(err) = manager.persist() {
+                    eprintln!("failed to persist closed chat groups: {err}");
                 }
             }
             **previous_group_rects = latest_group_rects;
@@ -2964,14 +3494,7 @@ pub fn ui_system(
                     ui.max_rect()
                 };
                 let (_nickname, heights) = get_nickname_lens(target_id.clone(), &messages);
-                let window_title = if matches!(
-                    messages.first().map(|message| &message.data.message_type),
-                    Some(NapcatMessageType::Group)
-                ) {
-                    GAME_TITLE.to_owned()
-                } else {
-                    target_display_name(&manager, &target_id)
-                };
+                let window_title = target_display_name(&manager, &target_id);
                 let targets = targets_for_messages(&target_id, &messages);
                 let unread_count = target_unread_count(&manager, &target_id);
                 let summarized_message_count = manager
@@ -3097,6 +3620,7 @@ fn append_local_sent_message(
             self_id,
             user_id: self_id,
             group_id,
+            group_name: None,
             target_id: recipient_id,
             sender: NapcatSender {
                 user_id: self_id,

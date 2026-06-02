@@ -2,6 +2,7 @@ mod battle_round;
 mod camera;
 mod deepseek;
 mod napcat;
+pub mod planet;
 pub mod rule_engine;
 mod scene;
 mod ui;
@@ -15,6 +16,7 @@ use bevy::{
         PrimaryWindow,
         WindowMoved,
         WindowPosition,
+        WindowResizeConstraints,
         WindowResized,
         WindowResolution,
     },
@@ -32,8 +34,9 @@ use serde::{
 pub const GAME_TITLE: &str = "柳絮，只是另一个跑团软件";
 const DEFAULT_WINDOW_WIDTH: u32 = 800;
 const DEFAULT_WINDOW_HEIGHT: u32 = 600;
-const MIN_WINDOW_WIDTH: u32 = 320;
-const MIN_WINDOW_HEIGHT: u32 = 240;
+const MIN_WINDOW_WIDTH: u32 = 800;
+const MIN_WINDOW_HEIGHT: u32 = 600;
+const WINDOWS_MINIMIZED_POSITION: i32 = -30_000;
 
 #[derive(Resource, Serialize, Deserialize)]
 struct AppSettings {
@@ -80,13 +83,16 @@ impl AppSettings {
     }
 
     fn window_position(&self) -> Option<IVec2> {
-        Some(IVec2::new(
-            self.window_x?,
-            self.window_y?,
-        ))
+        let position = IVec2::new(self.window_x?, self.window_y?);
+
+        is_restorable_window_position(position).then_some(position)
     }
 
     fn set_window_position(&mut self, position: IVec2) -> bool {
+        if !is_restorable_window_position(position) {
+            return self.clear_window_position();
+        }
+
         let changed = self.window_x != Some(position.x) || self.window_y != Some(position.y);
 
         if changed {
@@ -96,6 +102,34 @@ impl AppSettings {
 
         changed
     }
+
+    fn normalize(&mut self) -> bool {
+        let mut changed = false;
+        changed |= self.set_window_size(self.window_width, self.window_height);
+
+        if let Some(position) = self.window_position() {
+            changed |= self.set_window_position(position);
+        } else if self.window_x.is_some() || self.window_y.is_some() {
+            changed |= self.clear_window_position();
+        }
+
+        changed
+    }
+
+    fn clear_window_position(&mut self) -> bool {
+        let changed = self.window_x.is_some() || self.window_y.is_some();
+
+        if changed {
+            self.window_x = None;
+            self.window_y = None;
+        }
+
+        changed
+    }
+}
+
+fn is_restorable_window_position(position: IVec2) -> bool {
+    position.x > WINDOWS_MINIMIZED_POSITION && position.y > WINDOWS_MINIMIZED_POSITION
 }
 
 fn default_window_width() -> u32 { DEFAULT_WINDOW_WIDTH }
@@ -142,7 +176,12 @@ impl Plugin for GamePlugin {
         }
 
         // Default plugins
-        let app_settings = load_app_settings();
+        let mut app_settings = load_app_settings();
+        if app_settings.normalize() {
+            if let Err(err) = app_settings.persist() {
+                eprintln!("failed to normalize app window settings: {err}");
+            }
+        }
         let (window_width, window_height) = app_settings.window_size();
 
         #[allow(unused_mut)]
@@ -150,6 +189,11 @@ impl Plugin for GamePlugin {
             primary_window: Some(Window {
                 title: GAME_TITLE.into(),
                 resolution: WindowResolution::new(window_width, window_height),
+                resize_constraints: WindowResizeConstraints {
+                    min_width: MIN_WINDOW_WIDTH as f32,
+                    min_height: MIN_WINDOW_HEIGHT as f32,
+                    ..default()
+                },
                 position: app_settings
                     .window_position()
                     .map(WindowPosition::At)

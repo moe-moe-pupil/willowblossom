@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bevy Query Conflicts"
+  short_description: "Prevent and fix Bevy ECS query access conflicts."
+  default_prompt: "Use this skill when editing Bevy ECS systems or fixing error B0001 query conflicts."

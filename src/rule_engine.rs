@@ -10,6 +10,10 @@ use bevy_egui::{
     EguiContexts,
     EguiPrimaryContextPass,
 };
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
 pub struct RuleEnginePlugin;
 
@@ -45,14 +49,25 @@ pub enum EventKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Heal {
-        target: ActorRef,
+        target: TargetSelector,
         amount: ValueExpr,
     },
     Damage {
-        target: ActorRef,
+        target: TargetSelector,
         amount: ValueExpr,
         damage_type: DamageType,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TargetSelector {
+    pub actor: ActorRef,
+    pub area: Option<AreaSelector>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AreaSelector {
+    pub radius_meters: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +168,7 @@ pub struct BuffOwner {
 #[derive(Component, Debug, Clone)]
 pub struct ActiveBuff {
     pub name: String,
+    pub kind: BuffKind,
     pub priority: i32,
     pub turns_remaining: i32,
     pub source_id: String,
@@ -162,9 +178,11 @@ pub struct ActiveBuff {
 #[derive(Component, Debug, Clone)]
 pub struct BuffEffects(pub Vec<BuffEffect>);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuffSpec {
     pub name: String,
+    #[serde(default)]
+    pub kind: BuffKind,
     pub priority: i32,
     pub turns_remaining: i32,
     pub source_id: String,
@@ -172,13 +190,28 @@ pub struct BuffSpec {
     pub effects: Vec<BuffEffect>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuffKind {
+    #[default]
+    #[serde(alias = "normal")]
+    None,
+    Magic,
+    Physical,
+    Curse,
+    Disease,
+    Bleed,
+    Range,
+    Poison,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuffEffect {
     pub field: BuffField,
     pub value: BuffValue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BuffField {
     Hp,
     Mp,
@@ -193,7 +226,7 @@ pub enum BuffField {
     HealingTakenModifier,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StatusKey {
     Str,
     Agi,
@@ -205,7 +238,7 @@ pub enum StatusKey {
     Cha,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum BuffValue {
     Add(f32),
     AddPercent(f32),
@@ -272,7 +305,7 @@ impl Default for RuleEngineState {
         engine.add_character(Character::new("alice", "自己", 10.0));
         engine.add_character(Character::new("enemy", "敌人", 10.0));
 
-        let rule_input = "每当自己受到伤害，回复2点生命值".to_owned();
+        let rule_input = "每当自己受到伤害时，回复2点生命值".to_owned();
         let parse_preview = match parse_rule(&rule_input) {
             Ok(ast) => {
                 engine.add_rule("alice", ast.clone());
@@ -314,6 +347,18 @@ impl RuleEngineState {
         character.healing_taken_modifier = healing_taken_modifier;
         self.engine.add_character(character);
         self.engine.replace_rules_for_owner(owner_id, rules);
+    }
+
+    pub fn replace_character_buffs(&mut self, target_id: &str, buffs: Vec<BuffSpec>) {
+        self.engine.replace_buffs_for_target(target_id, buffs);
+    }
+
+    pub fn active_buff_names(&mut self, target_id: &str) -> Vec<String> {
+        self.engine.active_buff_names(target_id)
+    }
+
+    pub fn cast_skill(&mut self, source_id: &str, target_ids: impl IntoIterator<Item = String>) {
+        self.engine.cast_skill(source_id, target_ids);
     }
 }
 
@@ -362,6 +407,27 @@ impl ActorRef {
             ActorRef::SelfActor => "自己",
             ActorRef::Source => "伤害来源",
             ActorRef::Target => "目标",
+        }
+    }
+}
+
+impl TargetSelector {
+    pub fn single(actor: ActorRef) -> Self { Self { actor, area: None } }
+
+    fn explain(self) -> String {
+        match self.area {
+            Some(area) => {
+                let radius = area
+                    .radius_meters
+                    .map(|radius| format!("{}米内", format_number(radius)))
+                    .unwrap_or_default();
+                format!(
+                    "周围{}的{}",
+                    radius,
+                    self.actor.explain()
+                )
+            },
+            None => self.actor.explain().to_owned(),
         }
     }
 }
@@ -511,6 +577,7 @@ impl RuleEngine {
             BuffOwner { target },
             ActiveBuff {
                 name: spec.name,
+                kind: spec.kind,
                 priority: spec.priority,
                 turns_remaining: spec.turns_remaining,
                 source_id: spec.source_id,
@@ -520,6 +587,26 @@ impl RuleEngine {
         ));
         self.recompute_character_from_buffs(target_id);
         true
+    }
+
+    pub fn replace_buffs_for_target(&mut self, target_id: &str, buffs: Vec<BuffSpec>) {
+        let Some(target) = self.entity_by_id.get(target_id).copied() else {
+            return;
+        };
+
+        let expired = self
+            .ecs_world
+            .query::<(Entity, &BuffOwner)>()
+            .iter(&self.ecs_world)
+            .filter_map(|(entity, owner)| (owner.target == target).then_some(entity))
+            .collect::<Vec<_>>();
+        for entity in expired {
+            let _ = self.ecs_world.despawn(entity);
+        }
+        for buff in buffs {
+            self.give_buff(target_id, buff);
+        }
+        self.recompute_character_from_buffs(target_id);
     }
 
     pub fn advance_turn(&mut self) {
@@ -709,6 +796,13 @@ impl RuleEngine {
         self.resolve_queued_events();
     }
 
+    pub fn cast_skill(&mut self, source_id: &str, target_ids: impl IntoIterator<Item = String>) {
+        self.resolve_event(RuleEvent::SkillCast {
+            source_id: source_id.to_owned(),
+            target_ids: target_ids.into_iter().collect(),
+        });
+    }
+
     fn queue_event(&mut self, event: RuleEvent) { self.event_queue.push_back(event); }
 
     fn resolve_queued_events(&mut self) {
@@ -749,40 +843,40 @@ impl RuleEngine {
     fn apply_action(&mut self, owner_id: &str, event: &RuleEvent, action: Action) {
         match action {
             Action::Heal { target, amount } => {
-                let Some(target_id) = resolve_actor(target, owner_id, event) else {
-                    return;
-                };
+                let target_ids = resolve_targets(target, owner_id, event);
                 let source_id = owner_id.to_owned();
                 self.log.push(format!(
                     "规则触发：{} -> {}",
                     rule_event_name(event),
                     action.explain()
                 ));
-                self.heal(
-                    &source_id,
-                    &target_id,
-                    amount.eval(event),
-                );
+                for target_id in target_ids {
+                    self.heal(
+                        &source_id,
+                        &target_id,
+                        amount.eval(event),
+                    );
+                }
             },
             Action::Damage {
                 target,
                 amount,
                 damage_type,
             } => {
-                let Some(target_id) = resolve_actor(target, owner_id, event) else {
-                    return;
-                };
+                let target_ids = resolve_targets(target, owner_id, event);
                 self.log.push(format!(
                     "规则触发：{} -> {}",
                     rule_event_name(event),
                     action.explain()
                 ));
-                self.attack(
-                    owner_id,
-                    &target_id,
-                    amount.eval(event),
-                    damage_type,
-                );
+                for target_id in target_ids {
+                    self.attack(
+                        owner_id,
+                        &target_id,
+                        amount.eval(event),
+                        damage_type,
+                    );
+                }
             },
         }
     }
@@ -873,6 +967,32 @@ pub fn parse_rule(input: &str) -> Result<RuleAst, String> {
     if normalized.is_empty() {
         return Err("规则为空".to_owned());
     }
+    if is_active_skill_rule(&normalized) {
+        let actions = parse_actions(&normalized)?;
+        if actions.is_empty() {
+            return Err("没有找到可执行动作，例如：造成4点物理伤害".to_owned());
+        }
+
+        return Ok(RuleAst {
+            raw: input.to_owned(),
+            trigger: Trigger {
+                subject: ActorRef::SelfActor,
+                event: EventKind::SkillCast,
+            },
+            actions,
+        });
+    }
+    if !normalized.starts_with("每当") {
+        return Err("规则必须以“每当”开头".to_owned());
+    }
+    let Some(trigger_end) = trigger_end_index(&normalized) else {
+        return Err("没有识别到触发条件；目前支持“受到伤害 / 造成伤害 / 释放技能”".to_owned());
+    };
+    if !normalized[trigger_end..].starts_with('时') {
+        return Err(
+            "触发条件后必须使用“时”连接动作，例如：每当自己受到伤害时，回复2点生命值".to_owned(),
+        );
+    }
 
     let trigger = parse_trigger(&normalized)?;
     let actions = parse_actions(&normalized)?;
@@ -885,6 +1005,12 @@ pub fn parse_rule(input: &str) -> Result<RuleAst, String> {
         trigger,
         actions,
     })
+}
+
+fn is_active_skill_rule(text: &str) -> bool {
+    ["主动使用", "主动技能", "使用技能", "施放技能", "释放技能"]
+        .iter()
+        .any(|starter| text.starts_with(starter))
 }
 
 fn parse_trigger(text: &str) -> Result<Trigger, String> {
@@ -932,7 +1058,7 @@ fn parse_actions(text: &str) -> Result<Vec<Action>, String> {
         {
             if clause.contains("回复") || clause.contains("恢复") || clause.contains("治疗") {
                 actions.push(Action::Heal {
-                    target: parse_action_target(clause, ActorRef::SelfActor),
+                    target: parse_target_selector(clause, ActorRef::SelfActor),
                     amount,
                 });
             }
@@ -943,7 +1069,7 @@ fn parse_actions(text: &str) -> Result<Vec<Action>, String> {
         {
             if clause.contains("伤害") {
                 actions.push(Action::Damage {
-                    target: parse_action_target(clause, ActorRef::Target),
+                    target: parse_target_selector(clause, ActorRef::Target),
                     amount,
                     damage_type: parse_damage_type(clause),
                 });
@@ -956,13 +1082,13 @@ fn parse_actions(text: &str) -> Result<Vec<Action>, String> {
 
 fn action_clause(text: &str) -> &str {
     if let Some(trigger_end) = trigger_end_index(text) {
-        let tail = text[trigger_end..].trim_start_matches(['，', ',', '；', ';', '则', '时']);
+        let tail = text[trigger_end..].trim_start_matches(['，', ',', '；', ';', '时']);
         if contains_action_word(tail) {
             return tail;
         }
     }
 
-    for marker in ["则", "，", ",", "；", ";"] {
+    for marker in ["时", "，", ",", "；", ";"] {
         if let Some((_, tail)) = text.split_once(marker) {
             if contains_action_word(tail) {
                 return tail;
@@ -990,6 +1116,33 @@ fn contains_action_word(text: &str) -> bool {
     ["回复", "恢复", "治疗", "造成", "给予"]
         .iter()
         .any(|word| text.contains(word))
+}
+
+fn parse_target_selector(clause: &str, default_target: ActorRef) -> TargetSelector {
+    TargetSelector {
+        actor: parse_action_target(clause, default_target),
+        area: parse_area_selector(clause),
+    }
+}
+
+fn parse_area_selector(clause: &str) -> Option<AreaSelector> {
+    if !(clause.contains("周围")
+        || clause.contains("范围")
+        || clause.contains("半径")
+        || clause.contains("米内")
+        || clause.contains("米范围"))
+    {
+        return None;
+    }
+
+    Some(AreaSelector {
+        radius_meters: parse_radius_meters(clause),
+    })
+}
+
+fn parse_radius_meters(clause: &str) -> Option<f32> {
+    let meter_index = clause.find('米')?;
+    parse_trailing_number(&clause[..meter_index])
 }
 
 fn parse_action_target(clause: &str, default_target: ActorRef) -> ActorRef {
@@ -1076,8 +1229,6 @@ fn normalize_rule_text(input: &str) -> String {
         .replace("\r\n", "，")
         .replace('\n', "，")
         .replace('\r', "，")
-        .replace("每当", "当")
-        .replace("无论何时", "当")
 }
 
 fn rule_matches(rule: &Rule, event: &RuleEvent) -> bool {
@@ -1121,6 +1272,22 @@ fn resolve_actor(actor: ActorRef, owner_id: &str, event: &RuleEvent) -> Option<S
         ActorRef::Source => event_source_id(event).map(ToOwned::to_owned),
         ActorRef::Target => event_target_id(event).map(ToOwned::to_owned),
     }
+}
+
+fn resolve_targets(selector: TargetSelector, owner_id: &str, event: &RuleEvent) -> Vec<String> {
+    if selector.area.is_some() {
+        if let RuleEvent::SkillCast { target_ids, .. } = event {
+            return target_ids
+                .iter()
+                .filter(|target_id| target_id.as_str() != owner_id)
+                .cloned()
+                .collect();
+        }
+    }
+
+    resolve_actor(selector.actor, owner_id, event)
+        .into_iter()
+        .collect()
 }
 
 fn event_source_id(event: &RuleEvent) -> Option<&str> {
@@ -1247,7 +1414,8 @@ fn rule_engine_panel(mut contexts: EguiContexts, mut state: ResMut<RuleEngineSta
                         .max_height(180.0)
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
-                            for line in state.engine.log.iter().rev().take(40) {
+                            let start = state.engine.log.len().saturating_sub(40);
+                            for line in state.engine.log.iter().skip(start) {
                                 ui.label(line);
                             }
                         });
@@ -1288,7 +1456,7 @@ fn rule_words(ui: &mut egui::Ui) {
         .striped(true)
         .show(ui, |ui| {
             ui.label("Trigger starters");
-            ui.label("每当, 当, 无论何时");
+            ui.label("每当, 主动使用, 主动技能, 使用技能, 施放技能");
             ui.end_row();
 
             ui.label("Trigger subject");
@@ -1300,7 +1468,7 @@ fn rule_words(ui: &mut egui::Ui) {
             ui.end_row();
 
             ui.label("Action markers");
-            ui.label("则, 时");
+            ui.label("时");
             ui.end_row();
 
             ui.label("Heal actions");
@@ -1312,7 +1480,7 @@ fn rule_words(ui: &mut egui::Ui) {
             ui.end_row();
 
             ui.label("Action target");
-            ui.label("自己, 目标, 来源, 攻击者");
+            ui.label("自己, 目标, 来源, 攻击者, 周围N米");
             ui.end_row();
 
             ui.label("Values");
@@ -1330,9 +1498,10 @@ fn rule_words(ui: &mut egui::Ui) {
 
     ui.add_space(6.0);
     ui.label("Examples:");
-    ui.monospace("每当自己受到伤害，回复2点生命值");
-    ui.monospace("当自己受到伤害，则对攻击者造成本次伤害点物理伤害");
-    ui.monospace("当自己造成伤害，回复自己1点生命值");
+    ui.monospace("每当自己受到伤害时，回复2点生命值");
+    ui.monospace("每当自己受到伤害时，对攻击者造成本次伤害点物理伤害");
+    ui.monospace("每当自己造成伤害时，回复自己1点生命值");
+    ui.monospace("主动使用对周围3米内的目标造成4点物理伤害");
 }
 
 #[cfg(test)]
@@ -1341,7 +1510,7 @@ mod tests {
 
     #[test]
     fn parses_damage_taken_heal_rule() {
-        let ast = parse_rule("每当自己受到伤害，回复2点生命值").unwrap();
+        let ast = parse_rule("每当自己受到伤害时，回复2点生命值").unwrap();
 
         assert_eq!(
             ast.trigger.event,
@@ -1349,7 +1518,7 @@ mod tests {
         );
         assert_eq!(ast.trigger.subject, ActorRef::SelfActor);
         assert_eq!(ast.actions, vec![Action::Heal {
-            target: ActorRef::SelfActor,
+            target: TargetSelector::single(ActorRef::SelfActor),
             amount: ValueExpr::Number(2.0),
         }]);
         assert_eq!(
@@ -1359,13 +1528,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_hidden_starters_and_action_markers() {
+        assert!(parse_rule("当自己受到伤害时，回复2点生命值").is_err());
+        assert!(parse_rule("无论何时自己受到伤害时，回复2点生命值").is_err());
+        assert!(parse_rule("每当自己受到伤害则回复2点生命值").is_err());
+        assert!(parse_rule("每当自己受到伤害，回复2点生命值").is_err());
+    }
+
+    #[test]
     fn damage_taken_rule_runs_after_attack() {
         let mut engine = RuleEngine::default();
         engine.add_character(Character::new("alice", "自己", 10.0));
         engine.add_character(Character::new("enemy", "敌人", 10.0));
         engine.add_rule(
             "alice",
-            parse_rule("每当自己受到伤害，回复2点生命值").unwrap(),
+            parse_rule("每当自己受到伤害时，回复2点生命值").unwrap(),
         );
 
         engine.attack(
@@ -1384,22 +1561,100 @@ mod tests {
     }
 
     #[test]
+    fn damage_taken_rule_applies_damage_before_healing() {
+        let mut engine = RuleEngine::default();
+        engine.add_character(Character::new("alice", "自己", 10.0));
+        engine.add_character(Character::new("enemy", "敌人", 10.0));
+        engine.add_rule(
+            "alice",
+            parse_rule("每当自己受到伤害时，回复3点生命值").unwrap(),
+        );
+
+        engine.attack(
+            "enemy",
+            "alice",
+            3.0,
+            DamageType::Physical,
+        );
+
+        assert_eq!(
+            engine.characters.get("alice").unwrap().hp,
+            10.0
+        );
+        assert!(engine.log[0].contains("自己受到3点伤害"));
+        assert!(engine.log[1].contains("规则触发：受到3点物理伤害"));
+        assert!(engine.log[2].contains("自己回复3点生命值"));
+    }
+
+    #[test]
     fn parses_multiple_actions_split_by_commas_or_lines() {
-        let ast = parse_rule("每当自己受到伤害，回复2点生命值\n回复2点生命值").unwrap();
+        let ast = parse_rule("每当自己受到伤害时，回复2点生命值\n回复2点生命值").unwrap();
 
         assert_eq!(ast.actions, vec![
             Action::Heal {
-                target: ActorRef::SelfActor,
+                target: TargetSelector::single(ActorRef::SelfActor),
                 amount: ValueExpr::Number(2.0),
             },
             Action::Heal {
-                target: ActorRef::SelfActor,
+                target: TargetSelector::single(ActorRef::SelfActor),
                 amount: ValueExpr::Number(2.0),
             },
         ]);
         assert_eq!(
             ast.explain(),
             "触发：每当自己受到伤害。\n动作：回复2点生命值给自己。\n动作：回复2点生命值给自己。"
+        );
+    }
+
+    #[test]
+    fn parses_active_area_damage_skill() {
+        let ast = parse_rule("主动使用对周围3米内的目标造成4点物理伤害").unwrap();
+
+        assert_eq!(ast.trigger.event, EventKind::SkillCast);
+        assert_eq!(ast.trigger.subject, ActorRef::SelfActor);
+        assert_eq!(ast.actions, vec![Action::Damage {
+            target: TargetSelector {
+                actor: ActorRef::Target,
+                area: Some(AreaSelector {
+                    radius_meters: Some(3.0),
+                }),
+            },
+            amount: ValueExpr::Number(4.0),
+            damage_type: DamageType::Physical,
+        }]);
+        assert_eq!(
+            ast.explain(),
+            "触发：每当自己释放技能。\n动作：对周围3米内的目标造成4点物理伤害。"
+        );
+    }
+
+    #[test]
+    fn active_area_damage_skill_hits_skill_cast_targets() {
+        let mut engine = RuleEngine::default();
+        engine.add_character(Character::new("alice", "自己", 10.0));
+        engine.add_character(Character::new("enemy_a", "敌人A", 10.0));
+        engine.add_character(Character::new("enemy_b", "敌人B", 10.0));
+        engine.add_rule(
+            "alice",
+            parse_rule("主动使用对周围3米内的目标造成4点物理伤害").unwrap(),
+        );
+
+        engine.cast_skill("alice", vec![
+            "enemy_a".to_owned(),
+            "enemy_b".to_owned(),
+        ]);
+
+        assert_eq!(
+            engine.characters.get("enemy_a").unwrap().hp,
+            6.0
+        );
+        assert_eq!(
+            engine.characters.get("enemy_b").unwrap().hp,
+            6.0
+        );
+        assert_eq!(
+            engine.characters.get("alice").unwrap().hp,
+            10.0
         );
     }
 
@@ -1412,7 +1667,7 @@ mod tests {
         engine.add_character(Character::new("enemy", "敌人", 10.0));
         engine.add_rule(
             "alice",
-            parse_rule("每当自己受到伤害，回复2点生命值，回复2点生命值").unwrap(),
+            parse_rule("每当自己受到伤害时，回复2点生命值，回复2点生命值").unwrap(),
         );
 
         engine.attack(
@@ -1443,7 +1698,7 @@ mod tests {
         engine.add_character(Character::new("enemy", "敌人", 10.0));
         engine.add_rule(
             "alice",
-            parse_rule("每当自己受到伤害，回复2点生命值").unwrap(),
+            parse_rule("每当自己受到伤害时，回复2点生命值").unwrap(),
         );
 
         engine.attack(
@@ -1478,7 +1733,7 @@ mod tests {
         engine.add_character(Character::new("enemy", "敌人", 10.0));
         engine.add_rule(
             "alice",
-            parse_rule("每当自己受到伤害，回复2点生命值，回复2点生命值，回复2点生命值，回复2点生命值，回复2点生命值，对攻击者造成本次伤害点物理伤害").unwrap(),
+            parse_rule("每当自己受到伤害时，回复2点生命值，回复2点生命值，回复2点生命值，回复2点生命值，回复2点生命值，对攻击者造成本次伤害点物理伤害").unwrap(),
         );
 
         engine.attack(
@@ -1512,11 +1767,11 @@ mod tests {
         let mut engine = RuleEngine::default();
         engine.add_rule(
             "alice",
-            parse_rule("每当自己受到伤害，回复2点生命值").unwrap(),
+            parse_rule("每当自己受到伤害时，回复2点生命值").unwrap(),
         );
 
         assert_eq!(engine.rules.len(), 1);
-        assert!(parse_rule("每当自己未知事件，回复2点生命值").is_err());
+        assert!(parse_rule("每当自己未知事件时，回复2点生命值").is_err());
         engine.clear_rules_for_owner("alice");
 
         assert!(engine.rules.is_empty());
@@ -1529,7 +1784,7 @@ mod tests {
         engine.add_character(Character::new("enemy", "敌人", 10.0));
         engine.add_rule(
             "alice",
-            parse_rule("每当自己造成伤害，对目标造成1点物理伤害").unwrap(),
+            parse_rule("每当自己造成伤害时，对目标造成1点物理伤害").unwrap(),
         );
 
         engine.attack(
@@ -1585,6 +1840,7 @@ mod tests {
 
         assert!(engine.give_buff("alice", BuffSpec {
             name: "Guard".to_owned(),
+            kind: BuffKind::Magic,
             priority: 0,
             turns_remaining: 1,
             source_id: "alice".to_owned(),
@@ -1630,6 +1886,7 @@ mod tests {
 
         engine.give_buff("alice", BuffSpec {
             name: "Brittle".to_owned(),
+            kind: BuffKind::Disease,
             priority: 10,
             turns_remaining: 2,
             source_id: "enemy".to_owned(),
@@ -1641,6 +1898,7 @@ mod tests {
         });
         engine.give_buff("alice", BuffSpec {
             name: "Bless".to_owned(),
+            kind: BuffKind::Magic,
             priority: 0,
             turns_remaining: 2,
             source_id: "alice".to_owned(),
@@ -1658,5 +1916,40 @@ mod tests {
             "Bless".to_owned(),
             "Brittle".to_owned(),
         ]);
+    }
+
+    #[test]
+    fn replacing_buffs_for_target_does_not_duplicate_persisted_buffs() {
+        let mut engine = RuleEngine::default();
+        engine.add_character(Character::new("alice", "自己", 10.0));
+        let buffs = vec![BuffSpec {
+            name: "Guard".to_owned(),
+            kind: BuffKind::Magic,
+            priority: 0,
+            turns_remaining: 2,
+            source_id: "gm".to_owned(),
+            beneficial: true,
+            effects: vec![BuffEffect {
+                field: BuffField::DamageTakenModifier,
+                value: BuffValue::Set(0.5),
+            }],
+        }];
+
+        engine.replace_buffs_for_target("alice", buffs.clone());
+        engine.replace_buffs_for_target("alice", buffs);
+
+        assert_eq!(engine.active_buff_names("alice"), vec![
+            "Guard".to_owned()
+        ]);
+        engine.attack(
+            "enemy",
+            "alice",
+            4.0,
+            DamageType::Physical,
+        );
+        assert_eq!(
+            engine.characters.get("alice").unwrap().hp,
+            8.0
+        );
     }
 }
