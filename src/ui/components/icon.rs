@@ -178,12 +178,12 @@ impl<'a> Widget for Icon<'a> {
         match tlr {
             Ok(TexturePoll::Ready { .. }) => response,
             Ok(TexturePoll::Pending { .. }) => {
-                let uri = src.uri().unwrap_or("image");
-                response.on_hover_text(format!("Loading {uri}…"))
+                let uri = src.uri().unwrap_or("图片");
+                response.on_hover_text(format!("正在加载{uri}..."))
             },
             Err(err) => {
-                let uri = src.uri().unwrap_or("image");
-                response.on_hover_text(format!("Failed loading {uri}: {err}"))
+                let uri = src.uri().unwrap_or("图片");
+                response.on_hover_text(format!("加载{uri}失败：{err}"))
             },
         }
     }

@@ -125,7 +125,7 @@ impl ImeManager {
             }
 
             if targets.is_empty() {
-                send_state.error = Some("no valid NapCat target for outbound message".to_owned());
+                send_state.error = Some("没有可发送的NapCat目标".to_owned());
                 return teo;
             }
 
@@ -163,7 +163,7 @@ impl ImeManager {
                     message,
                 }) {
                     send_state.error = Some(format!(
-                        "failed to queue NapCat websocket message: {err}"
+                        "NapCat websocket消息入队失败：{err}"
                     ));
                     break;
                 }

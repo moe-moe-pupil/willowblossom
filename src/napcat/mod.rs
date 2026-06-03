@@ -303,7 +303,11 @@ pub struct PlayerCharacter {
     #[serde(default)]
     pub skill_cooldown_turns: Vec<u32>,
     #[serde(default)]
+    pub skill_last_cast_turns: HashMap<String, u32>,
+    #[serde(default)]
     pub active_buffs: Vec<BuffSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buff_base_stats: Option<CharacterBuffBaseStats>,
 }
 
 impl Default for PlayerCharacter {
@@ -335,7 +339,38 @@ impl Default for PlayerCharacter {
             skill_notes: Vec::new(),
             skill_mp_costs: Vec::new(),
             skill_cooldown_turns: Vec::new(),
+            skill_last_cast_turns: HashMap::new(),
             active_buffs: Vec::new(),
+            buff_base_stats: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+pub struct CharacterBuffBaseStats {
+    #[serde(default = "default_character_hp")]
+    pub hp: f32,
+    #[serde(default = "default_character_hp")]
+    pub max_hp: f32,
+    #[serde(default = "default_modifier")]
+    pub damage_dealt_modifier: f32,
+    #[serde(default = "default_modifier")]
+    pub damage_taken_modifier: f32,
+    #[serde(default = "default_modifier")]
+    pub healing_dealt_modifier: f32,
+    #[serde(default = "default_modifier")]
+    pub healing_taken_modifier: f32,
+}
+
+impl CharacterBuffBaseStats {
+    pub fn from_character(character: &PlayerCharacter) -> Self {
+        Self {
+            hp: character.hp,
+            max_hp: character.max_hp,
+            damage_dealt_modifier: character.damage_dealt_modifier,
+            damage_taken_modifier: character.damage_taken_modifier,
+            healing_dealt_modifier: character.healing_dealt_modifier,
+            healing_taken_modifier: character.healing_taken_modifier,
         }
     }
 }
@@ -490,6 +525,23 @@ impl TrpgGroup {
         changed
     }
 
+    pub fn set_player_turns_passed(&mut self, target_id: &str, turns_passed: u32) -> bool {
+        if !self.players.iter().any(|player_id| player_id == target_id) {
+            return false;
+        }
+
+        self.sync_turn_players();
+        let Some(turn) = self.player_turns.get_mut(target_id) else {
+            return false;
+        };
+        if turn.turns_passed == turns_passed {
+            return false;
+        }
+
+        turn.turns_passed = turns_passed;
+        true
+    }
+
     pub fn advance_world_turn(&mut self) -> bool {
         self.sync_turn_players();
         self.world_turn += 1;
@@ -506,10 +558,16 @@ impl TrpgGroup {
             return false;
         }
 
-        self.sync_turn_players();
+        let sync_changed = self.sync_turn_players();
         let Some(turn) = self.player_turns.get_mut(target_id) else {
-            return false;
+            return sync_changed;
         };
+        let already_set =
+            if acted { turn.acted && !turn.skipped } else { !turn.acted && turn.skipped };
+        if already_set {
+            return sync_changed;
+        }
+
         if acted {
             turn.acted = true;
             turn.skipped = false;
@@ -1505,7 +1563,7 @@ fn reset_character_status_phase(character: &mut PlayerCharacter) {
     character.status = CharacterStatus::default();
 }
 
-fn update_character_from_status(character: &mut PlayerCharacter) {
+pub fn update_character_from_status(character: &mut PlayerCharacter) {
     let total_str = character.status.str_ + character.extra_status.str_;
     let total_agi = character.status.agi + character.extra_status.agi;
     let total_dex = character.status.dex + character.extra_status.dex;
@@ -2011,6 +2069,29 @@ mod tests {
     }
 
     #[test]
+    fn character_stats_are_derived_from_status_and_level() {
+        let mut character = PlayerCharacter::default();
+        character.level = 2;
+        character.status.str_ = 2;
+        character.status.vit = 3;
+        character.status.int_ = 1;
+        character.status.wis = 2;
+        character.extra_status.agi = 1;
+        character.extra_status.dex = 2;
+        character.extra_status.vit = 1;
+
+        update_character_from_status(&mut character);
+
+        assert_eq!(character.max_hp, 29.0);
+        assert_eq!(character.hp, 29.0);
+        assert_eq!(character.hp_regen, 4.0);
+        assert_eq!(character.max_mp, 10.0);
+        assert_eq!(character.mp, 10.0);
+        assert_eq!(character.mp_regen, 2.0);
+        assert_eq!(character.speed, 6.0);
+    }
+
+    #[test]
     fn local_private_text_response_is_appended_as_self_message() {
         let mut manager = empty_manager();
         let target_id = "2";
@@ -2227,6 +2308,21 @@ mod tests {
     }
 
     #[test]
+    fn trpg_group_turn_action_is_idempotent() {
+        let mut group = TrpgGroup {
+            players: vec!["a".to_owned(), "b".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(group.mark_player_acted("a"));
+        assert!(!group.mark_player_acted("a"));
+        assert_eq!(group.world_turn, 0);
+        assert!(group.player_turns["a"].acted);
+        assert!(!group.player_turns["a"].skipped);
+        assert!(!group.player_turns["b"].acted);
+    }
+
+    #[test]
     fn trpg_group_rejects_turn_action_for_non_member() {
         let mut group = TrpgGroup {
             players: vec!["a".to_owned()],
@@ -2236,6 +2332,19 @@ mod tests {
         assert!(!group.mark_player_acted("missing"));
         assert_eq!(group.world_turn, 0);
         assert!(group.player_turns.is_empty());
+    }
+
+    #[test]
+    fn trpg_group_sets_player_turn_count() {
+        let mut group = TrpgGroup {
+            players: vec!["a".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(group.set_player_turns_passed("a", 7));
+        assert_eq!(group.player_turns["a"].turns_passed, 7);
+        assert!(!group.set_player_turns_passed("missing", 3));
+        assert_eq!(group.world_turn, 0);
     }
 
     #[test]

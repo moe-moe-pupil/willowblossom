@@ -352,7 +352,7 @@ mod only_in_debug {
             return;
         };
         text.sections[0].value = format!(
-            "FPS {:.0}",
+            "帧率 {:.0}",
             fps.smoothed().unwrap_or(0.0)
         );
     }
@@ -389,11 +389,11 @@ mod only_in_debug {
         let speed = time.relative_speed();
 
         text.sections[0].value = if time.is_paused() {
-            "Paused".into()
+            "已暂停".into()
         } else if speed == 1. {
             "".into()
         } else {
-            format!("Speed {:.1}", speed)
+            format!("速度 {:.1}", speed)
         };
     }
 

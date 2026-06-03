@@ -9,6 +9,10 @@ description: Repo-local implementation guidance for Willowblossom, a Rust/Bevy 0
 
 Use this skill to keep TRPG knowledge boundaries explicit in Willowblossom. The GM writes and controls the story; AI/MCP features may summarize allowed chat history, but must not create plot, describe new scenes, decide outcomes, or roleplay as narrator.
 
+## Communication
+
+Reply to the user in English by default. The Chinese-first rule below applies to Willowblossom user-facing app UI text, not to Codex chat responses.
+
 ## Repo Map
 
 - `src/napcat/mod.rs`: active QQ/NapCat websocket integration and persisted message manager.
@@ -69,6 +73,8 @@ When implementing LLM/MCP-style access, use it for summarization only and pass o
 Summaries must be labeled by scope in the app state, for example public summary, party summary, player-private summary, or GM summary. A summary inherits the strictest visibility of the source messages unless the GM explicitly publishes it to a wider scope.
 
 ## GUI Expectations
+
+Display Chinese text first in all user-facing UI. Existing or new labels, buttons, window titles, tooltips, empty states, and help text should be written in Chinese by default; keep English only when it is a protocol/API name, compact game stat abbreviation, player-authored content, or a secondary clarification after the Chinese text.
 
 Prefer GUI controls over chat commands for:
 

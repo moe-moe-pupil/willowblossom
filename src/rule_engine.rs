@@ -353,6 +353,10 @@ impl RuleEngineState {
         self.engine.replace_buffs_for_target(target_id, buffs);
     }
 
+    pub fn character(&self, target_id: &str) -> Option<&Character> {
+        self.engine.characters.get(target_id)
+    }
+
     pub fn active_buff_names(&mut self, target_id: &str) -> Vec<String> {
         self.engine.active_buff_names(target_id)
     }
@@ -616,9 +620,17 @@ impl RuleEngine {
             .ecs_world
             .query::<(Entity, &BuffOwner, &mut ActiveBuff)>();
         for (entity, owner, mut buff) in query.iter_mut(&mut self.ecs_world) {
+            if buff.turns_remaining == 0 {
+                continue;
+            }
+            if buff.turns_remaining < 0 {
+                changed_targets.insert(owner.target);
+                expired.push(entity);
+                continue;
+            }
             buff.turns_remaining -= 1;
             changed_targets.insert(owner.target);
-            if buff.turns_remaining <= 0 {
+            if buff.turns_remaining == 0 {
                 expired.push(entity);
             }
         }
@@ -673,7 +685,7 @@ impl RuleEngine {
             .ecs_world
             .query::<(&BuffOwner, &ActiveBuff, &BuffEffects)>()
             .iter(&self.ecs_world)
-            .filter(|(owner, buff, _)| owner.target == entity && buff.turns_remaining > 0)
+            .filter(|(owner, buff, _)| owner.target == entity && buff.turns_remaining >= 0)
             .map(|(_, buff, effects)| (buff.priority, effects.0.clone()))
             .collect::<Vec<_>>();
         effects.sort_by_key(|(priority, _)| *priority);
@@ -1355,7 +1367,7 @@ fn rule_engine_panel(mut contexts: EguiContexts, mut state: ResMut<RuleEngineSta
     let mut panel_open = state.panel_open;
     let mut close_requested = false;
 
-    egui::Window::new("Rule Engine")
+    egui::Window::new("规则引擎")
         .default_pos(egui::pos2(12.0, 430.0))
         .default_width(360.0)
         .resizable(true)
@@ -1374,10 +1386,10 @@ fn rule_engine_panel(mut contexts: EguiContexts, mut state: ResMut<RuleEngineSta
                         parse_owner_rule(&mut state, "alice");
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("Parse").clicked() {
+                        if ui.button("解析").clicked() {
                             parse_owner_rule(&mut state, "alice");
                         }
-                        if ui.button("Enemy Attack").clicked() {
+                        if ui.button("敌人攻击").clicked() {
                             let attack_amount = state.attack_amount;
                             state.engine.attack(
                                 "enemy",
@@ -1386,20 +1398,20 @@ fn rule_engine_panel(mut contexts: EguiContexts, mut state: ResMut<RuleEngineSta
                                 DamageType::Physical,
                             );
                         }
-                        if ui.button("Reset").clicked() {
+                        if ui.button("重置").clicked() {
                             *state = RuleEngineState::default();
                         }
-                        if ui.button("Clear Log").clicked() {
+                        if ui.button("清空日志").clicked() {
                             state.engine.log.clear();
                         }
-                        if ui.button("Close").clicked() {
+                        if ui.button("关闭").clicked() {
                             close_requested = true;
                         }
                     });
-                    ui.add(egui::Slider::new(&mut state.attack_amount, 0.0..=20.0).text("Damage"));
+                    ui.add(egui::Slider::new(&mut state.attack_amount, 0.0..=20.0).text("伤害"));
                     ui.separator();
                     ui.label(&state.parse_preview);
-                    ui.collapsing("Available Words", |ui| {
+                    ui.collapsing("可用词", |ui| {
                         rule_words(ui);
                     });
                     ui.separator();
@@ -1409,7 +1421,7 @@ fn rule_engine_panel(mut contexts: EguiContexts, mut state: ResMut<RuleEngineSta
                         character_hp(ui, &state.engine, "enemy");
                     });
                     ui.separator();
-                    ui.label("Log");
+                    ui.label("日志");
                     egui::ScrollArea::vertical()
                         .max_height(180.0)
                         .stick_to_bottom(true)
@@ -1441,7 +1453,7 @@ fn parse_owner_rule(state: &mut RuleEngineState, owner_id: &str) {
 fn character_hp(ui: &mut egui::Ui, engine: &RuleEngine, id: &str) {
     if let Some(character) = engine.characters.get(id) {
         ui.label(format!(
-            "{} HP: {}/{}",
+            "{} HP：{}/{}",
             character.name,
             format_number(character.hp),
             format_number(character.max_hp)
@@ -1455,49 +1467,49 @@ fn rule_words(ui: &mut egui::Ui) {
         .spacing([12.0, 4.0])
         .striped(true)
         .show(ui, |ui| {
-            ui.label("Trigger starters");
+            ui.label("触发起始词");
             ui.label("每当, 主动使用, 主动技能, 使用技能, 施放技能");
             ui.end_row();
 
-            ui.label("Trigger subject");
+            ui.label("触发主体");
             ui.label("自己, 目标, 来源, 攻击者");
             ui.end_row();
 
-            ui.label("Trigger events");
+            ui.label("触发事件");
             ui.label("受到伤害, 造成伤害, 释放技能");
             ui.end_row();
 
-            ui.label("Action markers");
+            ui.label("动作标记");
             ui.label("时");
             ui.end_row();
 
-            ui.label("Heal actions");
+            ui.label("治疗动作");
             ui.label("回复, 点生命值");
             ui.end_row();
 
-            ui.label("Damage actions");
+            ui.label("伤害动作");
             ui.label("造成, 点伤害");
             ui.end_row();
 
-            ui.label("Action target");
+            ui.label("动作目标");
             ui.label("自己, 目标, 来源, 攻击者, 周围N米");
             ui.end_row();
 
-            ui.label("Values");
+            ui.label("数值");
             ui.label("数字, 本次伤害");
             ui.end_row();
 
-            ui.label("Damage types");
+            ui.label("伤害类型");
             ui.label("物理, 魔法, 远程, 诅咒, 疾病, 流血, 中毒");
             ui.end_row();
 
-            ui.label("Separators");
+            ui.label("分隔符");
             ui.label("， , ； ;");
             ui.end_row();
         });
 
     ui.add_space(6.0);
-    ui.label("Examples:");
+    ui.label("示例：");
     ui.monospace("每当自己受到伤害时，回复2点生命值");
     ui.monospace("每当自己受到伤害时，对攻击者造成本次伤害点物理伤害");
     ui.monospace("每当自己造成伤害时，回复自己1点生命值");
@@ -1919,6 +1931,42 @@ mod tests {
     }
 
     #[test]
+    fn zero_turn_buff_is_permanent() {
+        let mut engine = RuleEngine::default();
+        engine.add_character(Character::new("alice", "自己", 10.0));
+        engine.add_character(Character::new("enemy", "敌人", 10.0));
+
+        assert!(engine.give_buff("alice", BuffSpec {
+            name: "Permanent Guard".to_owned(),
+            kind: BuffKind::Magic,
+            priority: 0,
+            turns_remaining: 0,
+            source_id: "gm".to_owned(),
+            beneficial: true,
+            effects: vec![BuffEffect {
+                field: BuffField::DamageTakenModifier,
+                value: BuffValue::Set(0.5),
+            }],
+        }));
+
+        engine.advance_turn();
+        assert_eq!(engine.active_buff_names("alice"), vec![
+            "Permanent Guard".to_owned()
+        ]);
+
+        engine.attack(
+            "enemy",
+            "alice",
+            4.0,
+            DamageType::Physical,
+        );
+        assert_eq!(
+            engine.characters.get("alice").unwrap().hp,
+            8.0
+        );
+    }
+
+    #[test]
     fn replacing_buffs_for_target_does_not_duplicate_persisted_buffs() {
         let mut engine = RuleEngine::default();
         engine.add_character(Character::new("alice", "自己", 10.0));
@@ -1950,6 +1998,36 @@ mod tests {
         assert_eq!(
             engine.characters.get("alice").unwrap().hp,
             8.0
+        );
+    }
+
+    #[test]
+    fn replacing_max_hp_percent_buff_recomputes_from_base() {
+        let mut engine = RuleEngine::default();
+        engine.add_character(Character::new("alice", "自己", 10.0));
+        let buffs = vec![BuffSpec {
+            name: "GM查看你".to_owned(),
+            kind: BuffKind::None,
+            priority: 0,
+            turns_remaining: 2,
+            source_id: "gm".to_owned(),
+            beneficial: true,
+            effects: vec![BuffEffect {
+                field: BuffField::MaxHp,
+                value: BuffValue::AddPercent(100.0),
+            }],
+        }];
+
+        engine.replace_buffs_for_target("alice", buffs.clone());
+        assert_eq!(
+            engine.characters.get("alice").unwrap().max_hp,
+            20.0
+        );
+
+        engine.replace_buffs_for_target("alice", buffs);
+        assert_eq!(
+            engine.characters.get("alice").unwrap().max_hp,
+            20.0
         );
     }
 }

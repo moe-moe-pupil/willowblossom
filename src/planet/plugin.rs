@@ -71,6 +71,14 @@ pub struct PlanetTerrainRoot;
 #[derive(Component)]
 pub struct PlanetPreviewMesh;
 
+#[derive(Component)]
+pub struct PlanetAtmosphereShell;
+
+#[derive(Resource, Default, Debug, Clone, Copy)]
+pub struct PlanetTerrainCameraOverride {
+    pub position: Option<Vec3>,
+}
+
 #[derive(Component, Clone, Copy)]
 pub struct PlanetChunk {
     pub center: Vec3,
@@ -117,6 +125,7 @@ impl PlanetTerrainRuntime {
 impl Plugin for PlanetTerrainPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PlanetTerrainSettings>()
+            .init_resource::<PlanetTerrainCameraOverride>()
             .init_resource::<PlanetTerrainRuntime>()
             .add_systems(Startup, setup_planet_terrain)
             .add_systems(
@@ -139,16 +148,27 @@ fn setup_planet_terrain(
     mut runtime: ResMut<PlanetTerrainRuntime>,
 ) {
     runtime.material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.42, 0.66, 0.58),
-        emissive: Color::srgb(0.015, 0.04, 0.035).into(),
-        perceptual_roughness: 0.86,
+        base_color: Color::srgb(0.28, 0.52, 0.42),
+        perceptual_roughness: 0.92,
         metallic: 0.0,
+        cull_mode: None,
+        ..default()
+    });
+    let atmosphere_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.18, 0.55, 1.0, 0.11),
+        emissive: Color::srgb(0.015, 0.055, 0.12).into(),
+        alpha_mode: AlphaMode::Add,
+        unlit: true,
         cull_mode: None,
         ..default()
     });
 
     let root = commands
-        .spawn((PlanetTerrainRoot, Transform::default()))
+        .spawn((
+            PlanetTerrainRoot,
+            Transform::default(),
+            Visibility::default(),
+        ))
         .id();
     let sdf = PlanetSdf::new(
         settings.center,
@@ -176,22 +196,29 @@ fn setup_planet_terrain(
             Transform::default(),
             PlanetPreviewMesh,
         ));
+        parent.spawn((
+            Mesh3d(meshes.add(Sphere::new(settings.radius * 1.018).mesh().uv(96, 48))),
+            MeshMaterial3d(atmosphere_material),
+            Transform::from_translation(settings.center),
+            PlanetAtmosphereShell,
+        ));
     });
 }
 
 fn refresh_planet_lod(
     mut commands: Commands,
     settings: Res<PlanetTerrainSettings>,
+    camera_override: Res<PlanetTerrainCameraOverride>,
     mut runtime: ResMut<PlanetTerrainRuntime>,
     cameras: Query<&GlobalTransform, (With<Camera3d>, With<GameCamera>)>,
 ) {
-    let Some(camera_position) = cameras
-        .iter()
-        .next()
-        .map(|transform| transform.translation())
-    else {
-        return;
-    };
+    let camera_position = camera_override.position.or_else(|| {
+        cameras
+            .iter()
+            .next()
+            .map(|transform| transform.translation())
+    });
+    let Some(camera_position) = camera_position else { return };
 
     let surface_anchor = planet_surface_anchor(camera_position, &settings);
 

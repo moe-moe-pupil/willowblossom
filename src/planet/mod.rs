@@ -6,6 +6,7 @@ pub mod sdf;
 
 pub use plugin::{
     PlanetChunk,
+    PlanetTerrainCameraOverride,
     PlanetTerrainPlugin,
     PlanetTerrainRoot,
     PlanetTerrainRuntime,

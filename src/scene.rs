@@ -20,6 +20,18 @@ use std::{
     },
 };
 
+use avian3d::prelude::{
+    AngularVelocity,
+    Collider,
+    Gravity,
+    GravityScale,
+    LinearDamping,
+    LinearVelocity,
+    PhysicsPlugins,
+    PhysicsSchedule,
+    PhysicsStepSystems,
+    RigidBody,
+};
 use bevy::{
     asset::RenderAssetUsages,
     camera::{
@@ -27,15 +39,9 @@ use bevy::{
         RenderTarget,
     },
     input::mouse::MouseMotion,
-    light::AtmosphereEnvironmentMapLight,
     mesh::{
         Indices,
         PrimitiveTopology,
-    },
-    pbr::{
-        Atmosphere,
-        AtmosphereSettings,
-        ScatteringMedium,
     },
     prelude::*,
     render::{
@@ -81,18 +87,13 @@ use crate::{
         NapcatMessageManager,
         NapcatOutboundMessage,
     },
-    planet::{
-        PlanetTerrainPlugin,
-        PlanetTerrainRuntime,
-        PlanetTerrainSettings,
-    },
 };
 
 pub struct ScenePreviewPlugin;
 
 const SCENE_GIZMO_RENDER_LAYER: usize = 1;
 const SPACE_HIFI_MAP_ID: &str = "space-hifi-wide-ship10";
-const SPACE_HIFI_MAP_NAME: &str = "Space HiFi Wide Ship 10x";
+const SPACE_HIFI_MAP_NAME: &str = "太空HiFi宽体飞船10x";
 const VOXEL_TEXTURE_LAYERS: u32 = 12;
 const MAT_VOID: u8 = 0;
 const MAT_STAR: u8 = 1;
@@ -111,15 +112,67 @@ const VOXEL_MAP_APPLY_BUDGET_PER_FRAME: usize = 600;
 const BATTLE_SPACESHIP_SCALE: i32 = 10;
 const SPACE_HIFI_MAP_SCALE: i32 = 100;
 const EARTH_PLANET_SCALE: i32 = 100;
+const LEGACY_DEFAULT_CAMERA_SPEED: f32 = 12.0;
+const DEFAULT_CAMERA_SPEED: f32 = 64.0;
+const MAX_CAMERA_SPEED: f32 = 1800.0;
+const SCENE_CAPTURE_PREPARE_FRAMES: u8 = 12;
 const SPACE_HIFI_STATION_A_CENTER: IVec3 = IVec3::new(-54, 13, 24);
 const SPACE_HIFI_STATION_B_CENTER: IVec3 = IVec3::new(58, 14, -28);
 const SPACE_HIFI_SUN_CENTER: IVec3 = IVec3::new(-88, 38, -76);
 const SPACE_HIFI_SUN_RADIUS: i32 = 8;
 const EARTH_PLANET_NEAR_POINT: IVec3 = IVec3::new(72, 28, 70);
-const EARTH_PLANET_RADIUS: i32 = 12 * EARTH_PLANET_SCALE;
+const EARTH_PLANET_RADIUS: i32 = 96 * EARTH_PLANET_SCALE;
+const VOXEL_PLANET_MAX_ELEVATION: f32 = 220.0;
+const VOXEL_PLANET_PREVIEW_STEP: i32 = 512;
+const VOXEL_PLANET_PREVIEW_HIDE_ALTITUDE: f32 = 1400.0;
+const PLANET_GRAVITY_ACCELERATION: f32 = 28.0;
+const PLANET_PHYSICS_PROBE_RADIUS: f32 = 1.2;
+const HELD_PHYSICS_VOXEL_DISTANCE: f32 = 6.0;
+const PHYSICS_VOXEL_DROP_SPEED: f32 = 4.0;
+const ORPHANED_VOXEL_COLLIDER_FRAME_GRACE: u8 = 3;
+
+fn planet_outward_at(position: Vec3) -> Vec3 {
+    (position - earth_planet_center().as_vec3())
+        .try_normalize()
+        .unwrap_or(Vec3::Y)
+}
+
+fn planet_gravity_direction_at(position: Vec3) -> Vec3 {
+    (earth_planet_center().as_vec3() - position)
+        .try_normalize()
+        .unwrap_or(Vec3::ZERO)
+}
+
+fn planet_gravity_delta_velocity(position: Vec3, delta_seconds: f32) -> Vec3 {
+    if delta_seconds <= 0.0 {
+        return Vec3::ZERO;
+    }
+    planet_gravity_direction_at(position) * PLANET_GRAVITY_ACCELERATION * delta_seconds
+}
+
+fn scene_camera_fog() -> DistanceFog {
+    DistanceFog {
+        color: Color::srgb(0.006, 0.01, 0.016),
+        falloff: FogFalloff::ExponentialSquared { density: 0.00018 },
+        directional_light_color: Color::srgb(0.12, 0.18, 0.28),
+        directional_light_exponent: 18.0,
+    }
+}
 
 #[derive(Resource, Clone, Default)]
 pub struct TrpgVoxelWorld;
+
+#[derive(Bundle, Clone)]
+pub struct VoxelChunkPhysicsBundle {
+    rigid_body: RigidBody,
+    collider: Collider,
+    terrain_collider: VoxelChunkTerrainCollider,
+}
+
+#[derive(Component, Clone)]
+pub struct VoxelChunkTerrainCollider {
+    frames_without_mesh: u8,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VoxelEditMode {
@@ -134,6 +187,7 @@ struct VoxelEditorState {
     material: u8,
     brush_radius: i32,
     camera_speed: f32,
+    camera_speed_dirty: bool,
     mouse_sensitivity: f32,
     new_map_name: String,
     rename_map_name: String,
@@ -158,9 +212,10 @@ impl Default for VoxelEditorState {
             mode: VoxelEditMode::Add,
             material: 2,
             brush_radius: 0,
-            camera_speed: 12.0,
+            camera_speed: DEFAULT_CAMERA_SPEED,
+            camera_speed_dirty: false,
             mouse_sensitivity: 0.003,
-            new_map_name: "New map".to_owned(),
+            new_map_name: "新地图".to_owned(),
             rename_map_name: String::new(),
             selected_map_id: None,
             selected_status_snapshot_id: None,
@@ -180,6 +235,11 @@ struct VoxelMapRuntimeState {
     apply_cursor: usize,
 }
 
+#[derive(Resource, Default)]
+struct PhysicsVoxelGrabState {
+    held_entity: Option<Entity>,
+}
+
 #[derive(Resource)]
 struct SceneWaypointState {
     selected_index: usize,
@@ -192,7 +252,7 @@ impl Default for SceneWaypointState {
         Self {
             selected_index: 0,
             custom_waypoints: Vec::new(),
-            new_waypoint_name: "Waypoint".to_owned(),
+            new_waypoint_name: "路径点".to_owned(),
         }
     }
 }
@@ -205,8 +265,30 @@ struct SceneWaypoint {
     builtin: bool,
 }
 
+#[derive(Clone, Copy)]
+struct VoxelEditTarget {
+    position: IVec3,
+    normal: IVec3,
+    material: Option<u8>,
+}
+
 #[derive(Component)]
 struct SpaceHiFiVoxelPreview;
+
+#[derive(Component)]
+struct VoxelPlanetPreview;
+
+#[derive(Component)]
+struct PlanetGravityBody;
+
+#[derive(Component)]
+struct PlanetPhysicsProbe;
+
+#[derive(Component)]
+struct PhysicsVoxel;
+
+#[derive(Component)]
+struct HeldPhysicsVoxel;
 
 #[derive(Component)]
 struct FreeCamera;
@@ -219,6 +301,16 @@ pub struct SceneCaptureRequests {
 #[derive(Resource, Default)]
 pub struct SceneCharacterPositions {
     pub positions: HashMap<String, Vec3>,
+}
+
+#[derive(Resource, Default)]
+pub struct ScenePlayerCameraPositions {
+    pub positions: HashMap<u64, Vec3>,
+}
+
+#[derive(Resource, Default)]
+pub struct ScenePlayerViewRequest {
+    pub user_id: Option<u64>,
 }
 
 pub struct SceneCaptureRequest {
@@ -237,6 +329,8 @@ struct PendingSceneCapture {
     camera_entity: Entity,
     target: Handle<Image>,
     output_path: std::path::PathBuf,
+    prepare_frames_remaining: u8,
+    started_preparing: bool,
 }
 
 #[derive(Resource, Default)]
@@ -284,8 +378,10 @@ impl Default for SceneCaptureEditorState {
     }
 }
 
-#[derive(Resource, Serialize, Deserialize, Default)]
+#[derive(Resource, Serialize, Deserialize)]
 struct VoxelSceneStore {
+    #[serde(default = "default_camera_speed")]
+    editor_camera_speed: f32,
     #[serde(default)]
     active_map_id: Option<String>,
     #[serde(default)]
@@ -298,6 +394,20 @@ struct VoxelSceneStore {
     capture_cameras: Vec<PersistedCaptureCamera>,
     #[serde(default)]
     character_standees: Vec<PersistedCharacterStandee>,
+}
+
+impl Default for VoxelSceneStore {
+    fn default() -> Self {
+        Self {
+            editor_camera_speed: DEFAULT_CAMERA_SPEED,
+            active_map_id: None,
+            maps: Vec::new(),
+            map_status_snapshots: Vec::new(),
+            edits: Vec::new(),
+            capture_cameras: Vec::new(),
+            character_standees: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -347,20 +457,20 @@ struct PersistedCharacterStandee {
 }
 
 impl VoxelWorldConfig for TrpgVoxelWorld {
-    type ChunkUserBundle = ();
+    type ChunkUserBundle = VoxelChunkPhysicsBundle;
     type MaterialIndex = u8;
 
-    fn spawning_distance(&self) -> u32 { 3 }
+    fn spawning_distance(&self) -> u32 { 6 }
 
-    fn min_despawn_distance(&self) -> u32 { 2 }
+    fn min_despawn_distance(&self) -> u32 { 3 }
 
     fn chunk_despawn_strategy(&self) -> ChunkDespawnStrategy { ChunkDespawnStrategy::FarAway }
 
     fn chunk_spawn_strategy(&self) -> ChunkSpawnStrategy { ChunkSpawnStrategy::Close }
 
-    fn max_spawn_per_frame(&self) -> usize { 6 }
+    fn max_spawn_per_frame(&self) -> usize { 12 }
 
-    fn spawning_rays(&self) -> usize { 8 }
+    fn spawning_rays(&self) -> usize { 16 }
 
     fn texture_index_mapper(&self) -> TextureIndexMapperFn<Self::MaterialIndex> {
         Arc::new(|material| match material {
@@ -383,6 +493,43 @@ impl VoxelWorldConfig for TrpgVoxelWorld {
         Box::new(|_, _, _| Box::new(starter_scene_voxel))
     }
 
+    fn chunk_meshing_delegate(
+        &self,
+    ) -> ChunkMeshingDelegate<Self::MaterialIndex, Self::ChunkUserBundle> {
+        Some(Box::new(
+            |position, lod, data_shape, mesh_shape, previous_data| {
+                let mut default_mesher =
+                    default_chunk_meshing_delegate::<u8, VoxelChunkPhysicsBundle>(
+                        position,
+                        lod,
+                        data_shape,
+                        mesh_shape,
+                        previous_data,
+                    );
+                Box::new(
+                    move |voxels, data_shape_in, mesh_shape_in, texture_index_mapper| {
+                        let (mesh, _) = default_mesher(
+                            voxels,
+                            data_shape_in,
+                            mesh_shape_in,
+                            texture_index_mapper,
+                        );
+                        let physics_bundle = Collider::trimesh_from_mesh(&mesh).map(|collider| {
+                            VoxelChunkPhysicsBundle {
+                                rigid_body: RigidBody::Static,
+                                collider,
+                                terrain_collider: VoxelChunkTerrainCollider {
+                                    frames_without_mesh: 0,
+                                },
+                            }
+                        });
+                        (mesh, physics_bundle)
+                    },
+                )
+            },
+        ))
+    }
+
     fn voxel_texture(&self) -> Option<(String, u32)> {
         Some((
             "textures/voxel_space_hifi.png".to_owned(),
@@ -393,20 +540,23 @@ impl VoxelWorldConfig for TrpgVoxelWorld {
 
 impl Plugin for ScenePreviewPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(earth_planet_sdf_settings())
+        app.add_plugins(PhysicsPlugins::default())
+            .insert_resource(Gravity::ZERO)
             .add_plugins(VoxelWorldPlugin::with_config(
                 TrpgVoxelWorld,
             ))
-            .add_plugins(PlanetTerrainPlugin)
             .init_resource::<VoxelEditorState>()
             .init_resource::<SceneCaptureRequests>()
             .init_resource::<SceneCharacterPositions>()
+            .init_resource::<ScenePlayerCameraPositions>()
+            .init_resource::<ScenePlayerViewRequest>()
             .init_resource::<SceneCaptureState>()
             .init_resource::<PlayerSceneCameras>()
             .init_resource::<SceneCaptureEditorState>()
             .init_resource::<ScenePointerState>()
             .init_resource::<CharacterStandeeAssets>()
             .init_resource::<VoxelMapRuntimeState>()
+            .init_resource::<PhysicsVoxelGrabState>()
             .init_resource::<SceneWaypointState>()
             .add_systems(Startup, setup_scene_preview)
             .add_systems(
@@ -423,17 +573,29 @@ impl Plugin for ScenePreviewPlugin {
                 auto_save_map_status_for_battle_turn,
             )
             .add_systems(
+                PhysicsSchedule,
+                apply_planet_radial_gravity.before(PhysicsStepSystems::First),
+            )
+            .add_systems(
                 PostUpdate,
                 (
+                    apply_scene_player_view_request,
                     free_camera_system,
+                    physics_voxel_grab_drop_system,
                     edit_voxel_world_system,
+                    sync_voxel_planet_preview_visibility,
+                    cleanup_orphaned_voxel_chunk_colliders,
                 )
                     .chain()
                     .after(EguiPostUpdateSet::ProcessOutput),
             )
             .add_systems(
                 PostUpdate,
-                sync_scene_character_positions.after(TransformSystems::Propagate),
+                (
+                    sync_scene_character_positions,
+                    sync_scene_player_camera_positions,
+                )
+                    .after(TransformSystems::Propagate),
             )
             .add_systems(
                 EguiPrimaryContextPass,
@@ -456,8 +618,8 @@ fn setup_scene_preview(
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
     mut gizmo_config: ResMut<GizmoConfigStore>,
+    mut editor: ResMut<VoxelEditorState>,
     mut player_cameras: ResMut<PlayerSceneCameras>,
 ) {
     for (_, config, _) in gizmo_config.iter_mut() {
@@ -474,12 +636,11 @@ fn setup_scene_preview(
         .expect("failed to init voxel scene store");
     let mut voxel_scene_store = voxel_scene_store;
     ensure_voxel_maps(&mut voxel_scene_store);
-    let mut removed_deprecated_voxels =
-        remove_deprecated_planet_marker_voxels(&mut voxel_scene_store);
-    removed_deprecated_voxels |= remove_deprecated_orbit_beacon_voxels(&mut voxel_scene_store);
-    if removed_deprecated_voxels {
+    let normalized_editor_settings = normalize_persisted_editor_settings(&mut voxel_scene_store);
+    editor.camera_speed = voxel_scene_store.editor_camera_speed;
+    if normalized_editor_settings {
         if let Err(err) = voxel_scene_store.persist() {
-            eprintln!("failed to persist deprecated voxel cleanup: {err}");
+            eprintln!("failed to persist voxel scene normalization: {err}");
         }
     }
 
@@ -489,35 +650,27 @@ fn setup_scene_preview(
             &mut images,
             &mut player_cameras,
             persisted_camera.user_id,
-            capture_camera_transform_near_dense_map(persisted_camera_transform(
-                persisted_camera,
-            )),
+            persisted_camera_transform(persisted_camera),
         );
     }
 
     commands.insert_resource(voxel_scene_store);
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.72, 0.82, 1.0),
-        brightness: 1_100.0,
+        color: Color::srgb(0.32, 0.42, 0.55),
+        brightness: 18.0,
         ..default()
     });
 
+    let sun_position = scaled_space_hifi_point(SPACE_HIFI_SUN_CENTER).as_vec3();
+    let planet_center = earth_planet_center().as_vec3();
     commands.spawn((
         DirectionalLight {
-            illuminance: 38_000.0,
+            color: Color::srgb(1.0, 0.88, 0.68),
+            illuminance: 68_000.0,
             shadows_enabled: false,
             ..default()
         },
-        Transform::from_xyz(18.0, 28.0, 24.0).looking_at(Vec3::new(0.0, 4.0, 0.0), Vec3::Y),
-    ));
-    commands.spawn((
-        DirectionalLight {
-            color: Color::srgb(0.42, 0.7, 1.0),
-            illuminance: 8_000.0,
-            shadows_enabled: false,
-            ..default()
-        },
-        Transform::from_xyz(-24.0, 10.0, -18.0).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
+        Transform::from_translation(sun_position).looking_at(planet_center, Vec3::Y),
     ));
     spawn_space_hifi_lights(&mut commands);
     spawn_space_hifi_voxel_preview(
@@ -525,26 +678,26 @@ fn setup_scene_preview(
         &mut meshes,
         &mut materials,
     );
+    spawn_voxel_planet_preview(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+    );
+    spawn_planet_physics_probe(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+    );
 
+    let starting_waypoint = planet_surface_waypoint();
     commands.spawn((
         Camera3d::default(),
         Camera {
             clear_color: ClearColorConfig::Custom(Color::srgb(0.06, 0.07, 0.08)),
             ..default()
         },
-        DistanceFog {
-            color: Color::srgb(0.08, 0.16, 0.22),
-            falloff: FogFalloff::ExponentialSquared { density: 0.0016 },
-            directional_light_color: Color::srgb(0.45, 0.78, 1.0),
-            directional_light_exponent: 7.0,
-        },
-        Atmosphere::earthlike(scattering_mediums.add(ScatteringMedium::default())),
-        AtmosphereSettings::default(),
-        AtmosphereEnvironmentMapLight {
-            intensity: 650.0,
-            ..default()
-        },
-        Transform::from_xyz(24.0, 18.0, 32.0).looking_at(Vec3::new(0.0, 8.0, 0.0), Vec3::Y),
+        scene_camera_fog(),
+        waypoint_transform(&starting_waypoint),
         VoxelWorldCamera::<TrpgVoxelWorld>::default(),
         RenderLayers::from_layers(&[0, SCENE_GIZMO_RENDER_LAYER]),
         PrimaryEguiContext,
@@ -620,8 +773,8 @@ fn spawn_space_hifi_lights(commands: &mut Commands) {
         commands,
         scaled_space_hifi_point(SPACE_HIFI_SUN_CENTER).as_vec3(),
         Color::srgb(1.0, 0.74, 0.28),
-        420_000.0,
-        220.0,
+        3_800_000.0,
+        9_000.0,
     );
 }
 
@@ -694,6 +847,73 @@ fn spawn_space_hifi_voxel_preview(
     }
 }
 
+fn spawn_voxel_planet_preview(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let voxels = voxel_planet_preview_blocks();
+    for material in [MAT_PLANET_OCEAN, MAT_PLANET_LAND] {
+        let mesh = build_voxel_planet_preview_mesh(&voxels, material);
+        if mesh.count_vertices() == 0 {
+            continue;
+        }
+        commands.spawn((
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: preview_material_color(material),
+                perceptual_roughness: 0.9,
+                metallic: 0.0,
+                ..default()
+            })),
+            Transform::default(),
+            Visibility::Visible,
+            VoxelPlanetPreview,
+        ));
+    }
+}
+
+fn spawn_planet_physics_probe(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(PLANET_PHYSICS_PROBE_RADIUS).mesh().uv(24, 12))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.86, 0.24),
+            emissive: Color::srgb(0.04, 0.025, 0.0).into(),
+            perceptual_roughness: 0.72,
+            metallic: 0.0,
+            ..default()
+        })),
+        planet_physics_probe_transform(),
+        RigidBody::Dynamic,
+        Collider::sphere(PLANET_PHYSICS_PROBE_RADIUS),
+        LinearVelocity::ZERO,
+        AngularVelocity::ZERO,
+        GravityScale(0.0),
+        LinearDamping(0.35),
+        PlanetGravityBody,
+        PlanetPhysicsProbe,
+    ));
+}
+
+fn planet_physics_probe_transform() -> Transform {
+    let center = earth_planet_center().as_vec3();
+    let outward = (earth_planet_near_point().as_vec3() - center)
+        .try_normalize()
+        .unwrap_or(Vec3::Y);
+    Transform::from_translation(
+        center
+            + outward
+                * (EARTH_PLANET_RADIUS as f32
+                    + VOXEL_PLANET_MAX_ELEVATION
+                    + PLANET_PHYSICS_PROBE_RADIUS
+                    + 24.0),
+    )
+}
+
 fn build_voxel_preview_mesh(voxels: &HashMap<IVec3, u8>, material: u8) -> Mesh {
     let mut positions = Vec::<[f32; 3]>::new();
     let mut normals = Vec::<[f32; 3]>::new();
@@ -730,6 +950,37 @@ fn build_voxel_preview_mesh(voxels: &HashMap<IVec3, u8>, material: u8) -> Mesh {
                 &mut indices,
             );
         }
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+fn build_voxel_planet_preview_mesh(voxels: &HashMap<IVec3, u8>, material: u8) -> Mesh {
+    let mut positions = Vec::<[f32; 3]>::new();
+    let mut normals = Vec::<[f32; 3]>::new();
+    let mut uvs = Vec::<[f32; 2]>::new();
+    let mut indices = Vec::<u32>::new();
+
+    for (&origin, &voxel_material) in voxels {
+        if voxel_material != material {
+            continue;
+        }
+        append_visible_cuboid_faces(
+            origin,
+            IVec3::splat(VOXEL_PLANET_PREVIEW_STEP),
+            voxels,
+            &mut positions,
+            &mut normals,
+            &mut uvs,
+            &mut indices,
+        );
     }
 
     Mesh::new(
@@ -791,20 +1042,20 @@ fn append_visible_cuboid_faces(
     ];
 
     let base = origin.as_vec3();
-    let size = size.as_vec3();
+    let size_vec = size.as_vec3();
     for (normal, corners) in FACES {
         let neighbor_origin = origin
             + IVec3::new(
-                normal.x * BATTLE_SPACESHIP_SCALE,
-                normal.y * BATTLE_SPACESHIP_SCALE,
-                normal.z * BATTLE_SPACESHIP_SCALE,
+                normal.x * size.x,
+                normal.y * size.y,
+                normal.z * size.z,
             );
         if cuboids.contains_key(&neighbor_origin) {
             continue;
         }
         let start = positions.len() as u32;
         for corner in corners {
-            let corner = Vec3::from(corner) * size;
+            let corner = Vec3::from(corner) * size_vec;
             positions.push((base + corner).to_array());
             normals.push(normal.as_vec3().to_array());
         }
@@ -913,22 +1164,22 @@ fn voxel_editor_panel(
         return;
     };
 
-    egui::Window::new("Voxel Tools")
+    egui::Window::new("体素工具")
         .default_pos(egui::pos2(12.0, 36.0))
         .default_width(220.0)
         .resizable(false)
         .show(ctx, |ui| {
-            ui.checkbox(&mut editor.enabled, "Edit");
+            ui.checkbox(&mut editor.enabled, "编辑");
             ui.horizontal(|ui| {
                 ui.selectable_value(
                     &mut editor.mode,
                     VoxelEditMode::Add,
-                    "Add",
+                    "添加",
                 );
                 ui.selectable_value(
                     &mut editor.mode,
                     VoxelEditMode::Erase,
-                    "Erase",
+                    "擦除",
                 );
             });
             ui.add(
@@ -936,17 +1187,36 @@ fn voxel_editor_panel(
                     &mut editor.material,
                     MAT_VOID..=MAT_PLANET_LAND,
                 )
-                .text("Material"),
+                .text("材质"),
             );
-            ui.add(egui::Slider::new(&mut editor.brush_radius, 0..=3).text("Brush"));
+            ui.add(egui::Slider::new(&mut editor.brush_radius, 0..=3).text("笔刷"));
             ui.separator();
-            ui.add(egui::Slider::new(&mut editor.camera_speed, 2.0..=40.0).text("Camera"));
+            let camera_speed_response = ui.add(
+                egui::Slider::new(
+                    &mut editor.camera_speed,
+                    2.0..=MAX_CAMERA_SPEED,
+                )
+                .text("相机"),
+            );
             if let Some(store) = store.as_deref_mut() {
                 ensure_voxel_maps(store);
+                if camera_speed_response.changed() {
+                    editor.camera_speed = normalized_camera_speed(editor.camera_speed);
+                    if store.editor_camera_speed != editor.camera_speed {
+                        store.editor_camera_speed = editor.camera_speed;
+                        editor.camera_speed_dirty = true;
+                    }
+                }
+                let should_persist_camera_speed = camera_speed_response.drag_stopped()
+                    || (camera_speed_response.changed() && !camera_speed_response.dragged());
+                if editor.camera_speed_dirty && should_persist_camera_speed {
+                    persist_voxel_store(store, "camera speed");
+                    editor.camera_speed_dirty = false;
+                }
                 voxel_map_manager_ui(ui, &mut editor, store, &mut map_runtime);
                 ui.separator();
                 ui.label(format!(
-                    "Saved edits: {}",
+                    "已保存编辑：{}",
                     active_voxel_map(store).map_or(0, |map| map.edits.len())
                 ));
             }
@@ -969,12 +1239,12 @@ fn voxel_map_manager_ui(
             latest_status_snapshot_for_active_map(store).map(|snapshot| snapshot.id.clone());
     }
 
-    ui.label("Voxel Maps");
+    ui.label("体素地图");
     let selected_text = active_voxel_map(store)
         .map(|map| map.name.as_str())
-        .unwrap_or("No map");
+        .unwrap_or("无地图");
     let mut selected_map_id = active_map_id.unwrap_or_default();
-    egui::ComboBox::from_label("Active")
+    egui::ComboBox::from_label("当前")
         .selected_text(selected_text)
         .show_ui(ui, |ui| {
             for map in &store.maps {
@@ -1002,7 +1272,7 @@ fn voxel_map_manager_ui(
 
     ui.horizontal(|ui| {
         ui.text_edit_singleline(&mut editor.new_map_name);
-        if ui.button("Create").clicked() {
+        if ui.button("创建").clicked() {
             let name = clean_voxel_map_name(&editor.new_map_name);
             let id = new_voxel_map_id(&store.maps);
             let name = unique_voxel_map_name(&store.maps, &name, None);
@@ -1023,7 +1293,7 @@ fn voxel_map_manager_ui(
 
     ui.horizontal(|ui| {
         ui.text_edit_singleline(&mut editor.rename_map_name);
-        if ui.button("Rename").clicked() {
+        if ui.button("重命名").clicked() {
             let active_id = store.active_map_id.clone();
             let name = clean_voxel_map_name(&editor.rename_map_name);
             let unique_name = unique_voxel_map_name(&store.maps, &name, active_id.as_deref());
@@ -1036,12 +1306,12 @@ fn voxel_map_manager_ui(
     });
 
     ui.horizontal(|ui| {
-        if ui.button("Duplicate").clicked() {
+        if ui.button("复制").clicked() {
             if let Some(map) = active_voxel_map(store).cloned() {
                 let id = new_voxel_map_id(&store.maps);
                 let name = unique_voxel_map_name(
                     &store.maps,
-                    &format!("{} copy", map.name.trim()),
+                    &format!("{} 副本", map.name.trim()),
                     None,
                 );
                 store.maps.push(PersistedVoxelMap {
@@ -1060,7 +1330,7 @@ fn voxel_map_manager_ui(
         }
         let can_delete = store.maps.len() > 1;
         if ui
-            .add_enabled(can_delete, egui::Button::new("Delete"))
+            .add_enabled(can_delete, egui::Button::new("删除"))
             .clicked()
         {
             if let Some(active_id) = store.active_map_id.clone() {
@@ -1079,7 +1349,7 @@ fn voxel_map_manager_ui(
                 persist_voxel_store(store, "map deletion");
             }
         }
-        if ui.button("Clear").clicked() {
+        if ui.button("清空").clicked() {
             if let Some(map) = active_voxel_map_mut(store) {
                 map.edits.clear();
                 runtime.reload_requested = true;
@@ -1089,10 +1359,10 @@ fn voxel_map_manager_ui(
     });
 
     ui.separator();
-    ui.label("Map Status");
+    ui.label("地图状态");
     ui.horizontal(|ui| {
-        if ui.button("Save current status").clicked() {
-            let snapshot_id = save_active_map_status(store, "Manual", false);
+        if ui.button("保存当前状态").clicked() {
+            let snapshot_id = save_active_map_status(store, "手动", false);
             editor.selected_status_snapshot_id = snapshot_id;
             persist_voxel_store(store, "map status snapshot");
         }
@@ -1103,7 +1373,7 @@ fn voxel_map_manager_ui(
         if ui
             .add_enabled(
                 can_revert,
-                egui::Button::new("Revert to status"),
+                egui::Button::new("恢复到状态"),
             )
             .clicked()
         {
@@ -1119,7 +1389,7 @@ fn voxel_map_manager_ui(
 
     let snapshots = status_snapshots_for_active_map(store);
     if snapshots.is_empty() {
-        ui.small("No saved status yet.");
+        ui.small("还没有保存状态。");
     } else {
         if editor
             .selected_status_snapshot_id
@@ -1138,8 +1408,8 @@ fn voxel_map_manager_ui(
             .iter()
             .find(|snapshot| snapshot.id == selected_snapshot_id)
             .map(status_snapshot_label)
-            .unwrap_or_else(|| "Select status".to_owned());
-        egui::ComboBox::from_label("Saved")
+            .unwrap_or_else(|| "选择状态".to_owned());
+        egui::ComboBox::from_label("已保存")
             .selected_text(selected_text)
             .show_ui(ui, |ui| {
                 for snapshot in &snapshots {
@@ -1153,8 +1423,8 @@ fn voxel_map_manager_ui(
         editor.selected_status_snapshot_id = Some(selected_snapshot_id.clone());
 
         ui.horizontal(|ui| {
-            ui.small(format!("{} saved", snapshots.len()));
-            if ui.button("Delete status").clicked() {
+            ui.small(format!("已保存{}个", snapshots.len()));
+            if ui.button("删除状态").clicked() {
                 store
                     .map_status_snapshots
                     .retain(|snapshot| snapshot.id != selected_snapshot_id);
@@ -1181,14 +1451,14 @@ fn voxel_minimap_panel(
         return;
     };
 
-    egui::Window::new("Voxel Minimap")
+    egui::Window::new("体素小地图")
         .default_pos(egui::pos2(12.0, 520.0))
         .default_width(220.0)
         .resizable(false)
         .show(ctx, |ui| {
             ui.small(map.name.as_str());
             let Some(bounds) = minimap_bounds(&map.edits) else {
-                ui.small("No voxels in active map.");
+                ui.small("当前地图没有体素。");
                 return;
             };
 
@@ -1258,7 +1528,6 @@ fn voxel_minimap_panel(
 fn scene_waypoint_panel(
     mut contexts: EguiContexts,
     mut waypoint_state: ResMut<SceneWaypointState>,
-    planet_runtime: Option<Res<PlanetTerrainRuntime>>,
     mut free_camera: Query<&mut Transform, With<FreeCamera>>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -1270,13 +1539,13 @@ fn scene_waypoint_panel(
     waypoints.extend(waypoint_state.custom_waypoints.iter().cloned());
     waypoint_state.selected_index = waypoint_state.selected_index.min(waypoints.len() - 1);
 
-    egui::Window::new("Waypoints")
+    egui::Window::new("路径点")
         .default_pos(egui::pos2(238.0, 60.0))
         .default_width(260.0)
         .resizable(false)
         .show(ctx, |ui| {
             let selected = &waypoints[waypoint_state.selected_index];
-            egui::ComboBox::from_label("Target")
+            egui::ComboBox::from_label("目标")
                 .selected_text(selected.name.as_str())
                 .show_ui(ui, |ui| {
                     for (index, waypoint) in waypoints.iter().enumerate() {
@@ -1290,35 +1559,20 @@ fn scene_waypoint_panel(
 
             let selected = &waypoints[waypoint_state.selected_index];
             ui.small(format!(
-                "Eye X {:.0} Y {:.0} Z {:.0}",
+                "视点 X {:.0} Y {:.0} Z {:.0}",
                 selected.eye.x, selected.eye.y, selected.eye.z
             ));
             ui.small(format!(
-                "Look X {:.0} Y {:.0} Z {:.0}",
+                "朝向 X {:.0} Y {:.0} Z {:.0}",
                 selected.focus.x, selected.focus.y, selected.focus.z
             ));
-            if let Some(runtime) = planet_runtime.as_deref() {
-                ui.small(format!(
-                    "SDF chunks: visible {} queued {} desired {}",
-                    runtime.visible_chunks(),
-                    runtime.queued_chunks(),
-                    runtime.last_desired_chunks()
-                ));
-                ui.small(format!(
-                    "SDF meshes: built {} empty {}",
-                    runtime.completed_meshes(),
-                    runtime.empty_meshes()
-                ));
-                if let Some(anchor) = runtime.last_anchor() {
-                    ui.small(format!(
-                        "SDF anchor X {:.0} Y {:.0} Z {:.0}",
-                        anchor.x, anchor.y, anchor.z
-                    ));
-                }
-            }
+            ui.small(format!(
+                "体素星球：半径{} 预览{}格/块",
+                EARTH_PLANET_RADIUS, VOXEL_PLANET_PREVIEW_STEP
+            ));
 
             ui.horizontal(|ui| {
-                if ui.button("Teleport").clicked() {
+                if ui.button("传送").clicked() {
                     if let Ok(mut camera) = free_camera.single_mut() {
                         *camera = waypoint_transform(selected);
                     }
@@ -1329,7 +1583,7 @@ fn scene_waypoint_panel(
                 if ui
                     .add_enabled(
                         can_delete,
-                        egui::Button::new("Delete custom"),
+                        egui::Button::new("删除自定义"),
                     )
                     .clicked()
                 {
@@ -1345,13 +1599,13 @@ fn scene_waypoint_panel(
 
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label("Name");
+                ui.label("名称");
                 ui.text_edit_singleline(&mut waypoint_state.new_waypoint_name);
             });
-            if ui.button("Save current view").clicked() {
+            if ui.button("保存当前视角").clicked() {
                 if let Ok(camera) = free_camera.single_mut() {
                     let name = waypoint_state.new_waypoint_name.trim();
-                    let name = if name.is_empty() { "Waypoint" } else { name }.to_owned();
+                    let name = if name.is_empty() { "路径点" } else { name }.to_owned();
                     waypoint_state.custom_waypoints.push(SceneWaypoint {
                         name,
                         eye: camera.translation,
@@ -1372,31 +1626,31 @@ fn waypoint_transform(waypoint: &SceneWaypoint) -> Transform {
 fn default_scene_waypoints() -> Vec<SceneWaypoint> {
     let mut waypoints = vec![
         look_at_waypoint(
-            "Battle ship",
+            "战舰",
             Vec3::new(24.0, 18.0, 32.0),
             Vec3::new(0.0, 8.0, 0.0),
         ),
         look_at_waypoint(
-            "Station A",
+            "空间站A",
             scaled_space_hifi_point(SPACE_HIFI_STATION_A_CENTER).as_vec3()
                 + Vec3::new(220.0, 120.0, 220.0),
             scaled_space_hifi_point(SPACE_HIFI_STATION_A_CENTER).as_vec3(),
         ),
         look_at_waypoint(
-            "Station B",
+            "空间站B",
             scaled_space_hifi_point(SPACE_HIFI_STATION_B_CENTER).as_vec3()
                 + Vec3::new(-220.0, 120.0, 220.0),
             scaled_space_hifi_point(SPACE_HIFI_STATION_B_CENTER).as_vec3(),
         ),
         look_at_waypoint(
-            "Sun",
+            "太阳",
             scaled_space_hifi_point(SPACE_HIFI_SUN_CENTER).as_vec3()
                 + Vec3::new(260.0, 160.0, 260.0),
             scaled_space_hifi_point(SPACE_HIFI_SUN_CENTER).as_vec3(),
         ),
         planet_surface_waypoint(),
         look_at_waypoint(
-            "Planet center",
+            "行星中心",
             earth_planet_center().as_vec3()
                 + Vec3::new(
                     0.0,
@@ -1406,7 +1660,7 @@ fn default_scene_waypoints() -> Vec<SceneWaypoint> {
             earth_planet_center().as_vec3(),
         ),
         look_at_waypoint(
-            "Moon",
+            "月球",
             earth_moon_center().as_vec3() + Vec3::new(80.0, 52.0, 80.0),
             earth_moon_center().as_vec3(),
         ),
@@ -1420,7 +1674,7 @@ fn default_scene_waypoints() -> Vec<SceneWaypoint> {
     .enumerate()
     {
         waypoints.push(look_at_waypoint(
-            &format!("Asteroids {}", index + 1),
+            &format!("小行星{}", index + 1),
             center.as_vec3() + Vec3::new(180.0, 96.0, 180.0),
             center.as_vec3(),
         ));
@@ -1444,8 +1698,8 @@ fn planet_surface_waypoint() -> SceneWaypoint {
         .try_normalize()
         .unwrap_or(Vec3::Z);
     look_at_waypoint(
-        "Planet surface",
-        focus + outward * 96.0 + Vec3::Y * 32.0,
+        "行星表面",
+        focus + outward * 128.0,
         focus,
     )
 }
@@ -1589,12 +1843,34 @@ fn minimap_material_color(material: u8) -> egui::Color32 {
     }
 }
 
+fn default_camera_speed() -> f32 { DEFAULT_CAMERA_SPEED }
+
+fn normalized_camera_speed(speed: f32) -> f32 {
+    if speed.is_finite() {
+        speed.clamp(2.0, MAX_CAMERA_SPEED)
+    } else {
+        DEFAULT_CAMERA_SPEED
+    }
+}
+
+fn normalize_persisted_editor_settings(store: &mut VoxelSceneStore) -> bool {
+    let camera_speed =
+        if (store.editor_camera_speed - LEGACY_DEFAULT_CAMERA_SPEED).abs() <= f32::EPSILON {
+            DEFAULT_CAMERA_SPEED
+        } else {
+            normalized_camera_speed(store.editor_camera_speed)
+        };
+    let changed = store.editor_camera_speed != camera_speed;
+    store.editor_camera_speed = camera_speed;
+    changed
+}
+
 fn ensure_voxel_maps(store: &mut Persistent<VoxelSceneStore>) {
     if store.maps.is_empty() {
         let legacy_edits = std::mem::take(&mut store.edits);
         store.maps.push(PersistedVoxelMap {
             id: "default".to_owned(),
-            name: "Default map".to_owned(),
+            name: "默认地图".to_owned(),
             edits: legacy_edits,
         });
     } else if !store.edits.is_empty() {
@@ -1712,6 +1988,9 @@ fn space_hifi_procedural_voxel(position: IVec3) -> WorldVoxel<u8> {
     if let Some(detail_material) = procedural_space_details(position) {
         material = Some(detail_material);
     }
+    if let Some(planet_material) = procedural_earth_voxel_planet(position) {
+        material = Some(planet_material);
+    }
     let sun_center = scaled_space_hifi_point(SPACE_HIFI_SUN_CENTER);
     if procedural_ellipsoid_shell(
         position,
@@ -1758,20 +2037,134 @@ fn earth_planet_center() -> IVec3 {
 
 fn earth_moon_center() -> IVec3 { earth_planet_near_point() + IVec3::new(380, 86, -260) }
 
-fn earth_planet_sdf_settings() -> PlanetTerrainSettings {
-    PlanetTerrainSettings {
-        center: earth_planet_center().as_vec3(),
-        radius: EARTH_PLANET_RADIUS as f32,
-        noise_scale: 80.0,
-        frequency: 0.006,
-        seed: 7_331,
-        root_size: 20,
-        min_chunk_size: 4,
-        lod_levels: 5,
-        lod_shell_size: 2,
-        lod_update_distance: 32.0,
+fn procedural_earth_voxel_planet(position: IVec3) -> Option<u8> {
+    let center = earth_planet_center();
+    let offset = position - center;
+    let max_radius = EARTH_PLANET_RADIUS + VOXEL_PLANET_MAX_ELEVATION.ceil() as i32;
+    if offset.abs().cmpgt(IVec3::splat(max_radius)).any() {
+        return None;
+    }
+
+    let distance_squared = offset.as_vec3().length_squared();
+    let min_uniform_radius = EARTH_PLANET_RADIUS as f32 - VOXEL_PLANET_MAX_ELEVATION;
+    if distance_squared <= min_uniform_radius * min_uniform_radius {
+        return Some(MAT_PLANET_LAND);
+    }
+
+    if distance_squared > (max_radius * max_radius) as f32 {
+        return None;
+    }
+
+    let distance = distance_squared.sqrt();
+    let direction = offset.as_vec3().try_normalize().unwrap_or(Vec3::Y);
+    let surface_radius = EARTH_PLANET_RADIUS as f32 + voxel_planet_elevation(direction);
+    if distance > surface_radius {
+        return None;
+    }
+
+    Some(voxel_planet_material(
+        direction,
+        surface_radius - distance,
+    ))
+}
+
+fn voxel_planet_elevation(direction: Vec3) -> f32 {
+    let continent = smooth_voxel_planet_noise(direction * 3.6, 7_331);
+    let hills = smooth_voxel_planet_noise(
+        direction * 13.0 + Vec3::splat(17.0),
+        19_327,
+    );
+    let detail = smooth_voxel_planet_noise(
+        direction * 41.0 + Vec3::new(3.0, 11.0, 23.0),
+        91_337,
+    );
+
+    (continent * 44.0 + hills * 16.0 + detail * 8.0).clamp(
+        -VOXEL_PLANET_MAX_ELEVATION,
+        VOXEL_PLANET_MAX_ELEVATION,
+    )
+}
+
+fn voxel_planet_material(direction: Vec3, depth_below_surface: f32) -> u8 {
+    if depth_below_surface > 12.0 {
+        return MAT_PLANET_LAND;
+    }
+
+    let continent = smooth_voxel_planet_noise(direction * 3.6, 7_331);
+    let moisture = smooth_voxel_planet_noise(
+        direction * 9.0 + Vec3::splat(5.0),
+        38_411,
+    );
+    if continent + moisture * 0.35 < -0.22 {
+        MAT_PLANET_OCEAN
+    } else {
+        MAT_PLANET_LAND
     }
 }
+
+fn voxel_planet_preview_blocks() -> HashMap<IVec3, u8> {
+    let mut voxels = HashMap::new();
+    let center = earth_planet_center();
+    let step = VOXEL_PLANET_PREVIEW_STEP;
+    let half_step = step / 2;
+    let extent = EARTH_PLANET_RADIUS + VOXEL_PLANET_MAX_ELEVATION.ceil() as i32 + step;
+
+    for x in (-extent..=extent).step_by(step as usize) {
+        for y in (-extent..=extent).step_by(step as usize) {
+            for z in (-extent..=extent).step_by(step as usize) {
+                let origin = center + IVec3::new(x, y, z) - IVec3::splat(half_step);
+                let sample = origin + IVec3::splat(half_step);
+                if let Some(material) = procedural_earth_voxel_planet(sample) {
+                    voxels.insert(origin, material);
+                }
+            }
+        }
+    }
+
+    voxels
+}
+
+fn smooth_voxel_planet_noise(position: Vec3, seed: u32) -> f32 {
+    let cell = position.floor().as_ivec3();
+    let local = position - cell.as_vec3();
+    let fade =
+        local * local * local * (local * (local * 6.0 - Vec3::splat(15.0)) + Vec3::splat(10.0));
+
+    let mut values = [[[0.0; 2]; 2]; 2];
+    for x in 0..=1 {
+        for y in 0..=1 {
+            for z in 0..=1 {
+                values[x][y][z] = voxel_planet_hash_noise(
+                    cell + IVec3::new(x as i32, y as i32, z as i32),
+                    seed,
+                );
+            }
+        }
+    }
+
+    let x00 = lerp(values[0][0][0], values[1][0][0], fade.x);
+    let x10 = lerp(values[0][1][0], values[1][1][0], fade.x);
+    let x01 = lerp(values[0][0][1], values[1][0][1], fade.x);
+    let x11 = lerp(values[0][1][1], values[1][1][1], fade.x);
+    let y0 = lerp(x00, x10, fade.y);
+    let y1 = lerp(x01, x11, fade.y);
+    lerp(y0, y1, fade.z)
+}
+
+fn voxel_planet_hash_noise(cell: IVec3, seed: u32) -> f32 {
+    let mut h = seed
+        ^ (cell.x as u32).wrapping_mul(0x8da6_b343)
+        ^ (cell.y as u32).wrapping_mul(0xd816_3841)
+        ^ (cell.z as u32).wrapping_mul(0xcb1a_b31f);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7feb_352d);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846c_a68b);
+    h ^= h >> 16;
+    (h as f32 / u32::MAX as f32) * 2.0 - 1.0
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 { a + (b - a) * t }
 
 fn procedural_star(position: IVec3) -> bool {
     for i in 0i32..80 {
@@ -2348,87 +2741,6 @@ fn push_sun(edits: &mut Vec<PersistedVoxelEdit>, center: IVec3, radius: i32) {
     }
 }
 
-fn remove_deprecated_planet_marker_voxels(store: &mut Persistent<VoxelSceneStore>) -> bool {
-    let near_point = earth_planet_near_point();
-    let Some(map) = store
-        .maps
-        .iter_mut()
-        .find(|map| map.id == SPACE_HIFI_MAP_ID)
-    else {
-        return false;
-    };
-
-    let before = map.edits.len();
-    map.edits.retain(|edit| {
-        let PersistedVoxel::Solid(material) = edit.voxel else {
-            return true;
-        };
-        if !matches!(
-            material,
-            MAT_PLANET_OCEAN | MAT_PLANET_LAND
-        ) {
-            return true;
-        }
-        let position = IVec3::new(
-            edit.position[0],
-            edit.position[1],
-            edit.position[2],
-        );
-        (position - near_point).length_squared() > 72 * 72
-    });
-    before != map.edits.len()
-}
-
-fn remove_deprecated_orbit_beacon_voxels(store: &mut Persistent<VoxelSceneStore>) -> bool {
-    let near_point = earth_planet_near_point();
-    let deprecated_centers = [
-        near_point + IVec3::new(90, 18, 0),
-        near_point + IVec3::new(-90, 18, 0),
-        near_point + IVec3::new(0, 18, 90),
-        near_point + IVec3::new(0, 18, -90),
-        near_point + IVec3::new(64, 44, 64),
-        near_point + IVec3::new(-64, 44, -64),
-    ];
-    let Some(map) = store
-        .maps
-        .iter_mut()
-        .find(|map| map.id == SPACE_HIFI_MAP_ID)
-    else {
-        return false;
-    };
-
-    let before = map.edits.len();
-    map.edits.retain(|edit| {
-        let PersistedVoxel::Solid(material) = edit.voxel else {
-            return true;
-        };
-        if !matches!(material, MAT_WINDOW_CYAN | MAT_STAR) {
-            return true;
-        }
-        let position = IVec3::new(
-            edit.position[0],
-            edit.position[1],
-            edit.position[2],
-        );
-        !deprecated_centers.iter().any(|center| {
-            point_in_box(
-                position,
-                *center + IVec3::new(-1, -9, -1),
-                *center + IVec3::new(1, 9, 1),
-            ) || point_in_box(
-                position,
-                *center + IVec3::new(-5, 3, -5),
-                *center + IVec3::new(5, 3, 5),
-            ) || point_in_box(
-                position,
-                *center + IVec3::new(0, 10, 0),
-                *center + IVec3::new(0, 13, 0),
-            )
-        })
-    });
-    before != map.edits.len()
-}
-
 fn push_earth_moon(edits: &mut Vec<PersistedVoxelEdit>, center: IVec3, radius: i32) {
     push_ellipsoid_shell(
         edits,
@@ -2574,7 +2886,7 @@ fn active_voxel_map_mut(store: &mut VoxelSceneStore) -> Option<&mut PersistedVox
 fn clean_voxel_map_name(name: &str) -> String {
     let name = name.trim();
     if name.is_empty() {
-        "Untitled map".to_owned()
+        "未命名地图".to_owned()
     } else {
         name.to_owned()
     }
@@ -2675,7 +2987,7 @@ fn selected_status_snapshot(
 
 fn status_snapshot_label(snapshot: &PersistedVoxelMapStatusSnapshot) -> String {
     format!(
-        "{} - {} edits",
+        "{} - {}次编辑",
         snapshot.name,
         snapshot.edits.len()
     )
@@ -2685,9 +2997,17 @@ fn status_snapshot_name(map_name: &str, reason: &str, created_at: u64) -> String
     format!(
         "{} {} @ {}",
         map_name.trim(),
-        reason,
+        status_snapshot_reason_label(reason),
         created_at
     )
+}
+
+fn status_snapshot_reason_label(reason: &str) -> &str {
+    match reason {
+        "Manual" => "手动",
+        "Auto turn" => "自动轮次",
+        other => other,
+    }
 }
 
 fn new_map_status_snapshot_id(snapshots: &[PersistedVoxelMapStatusSnapshot]) -> String {
@@ -2738,6 +3058,7 @@ fn auto_save_map_status_for_battle_turn(
     mut store: Option<ResMut<Persistent<VoxelSceneStore>>>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
     mut last_turn_signature: Local<Option<u64>>,
+    mut last_auto_map_signature: Local<Option<u64>>,
 ) {
     let Some(manager) = manager else {
         return;
@@ -2749,7 +3070,14 @@ fn auto_save_map_status_for_battle_turn(
 
     let initialized = last_turn_signature.is_some();
     *last_turn_signature = Some(signature);
-    if !initialized || !trpg_manager_has_started_turns(&manager) {
+    if !initialized {
+        if let Some(store) = store.as_deref_mut() {
+            ensure_voxel_maps(store);
+            *last_auto_map_signature = active_voxel_map_edit_signature(store);
+        }
+        return;
+    }
+    if !trpg_manager_has_started_turns(&manager) {
         return;
     }
 
@@ -2757,9 +3085,13 @@ fn auto_save_map_status_for_battle_turn(
         return;
     };
     ensure_voxel_maps(store);
-    if save_active_map_status(store, "Auto turn", true).is_some() {
-        persist_voxel_store(store, "automatic map status snapshot");
+    let map_signature = active_voxel_map_edit_signature(store);
+    if *last_auto_map_signature == map_signature {
+        return;
     }
+    *last_auto_map_signature = map_signature;
+
+    save_active_map_status(store, "Auto turn", true);
 }
 
 fn trpg_manager_has_started_turns(manager: &NapcatMessageManager) -> bool {
@@ -2791,6 +3123,28 @@ fn trpg_group_turn_signature(manager: &NapcatMessageManager) -> u64 {
         }
     }
     hasher.finish()
+}
+
+fn active_voxel_map_edit_signature(store: &VoxelSceneStore) -> Option<u64> {
+    let map = active_voxel_map(store)?;
+    let mut hasher = DefaultHasher::new();
+    map.id.hash(&mut hasher);
+    map.edits.len().hash(&mut hasher);
+    if let Some(edit) = map.edits.last() {
+        hash_persisted_voxel_edit(edit, &mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+fn hash_persisted_voxel_edit(edit: &PersistedVoxelEdit, hasher: &mut DefaultHasher) {
+    edit.position.hash(hasher);
+    match edit.voxel {
+        PersistedVoxel::Air => 0_u8.hash(hasher),
+        PersistedVoxel::Solid(material) => {
+            1_u8.hash(hasher);
+            material.hash(hasher);
+        },
+    }
 }
 
 fn persist_voxel_store(store: &mut Persistent<VoxelSceneStore>, reason: &str) {
@@ -2894,7 +3248,6 @@ fn capture_camera_panel(
     let default_transform = free_camera
         .single_mut()
         .map(|transform| *transform)
-        .map(capture_camera_transform_near_dense_map)
         .unwrap_or_else(|_| default_capture_camera_transform());
     let mut created_group_camera = false;
     if let Some(manager) = manager.as_deref() {
@@ -2934,21 +3287,20 @@ fn capture_camera_panel(
         editor.selected_user_id = camera_ids.first().copied();
     }
 
-    egui::Window::new("Scene Capture Camera")
+    egui::Window::new("场景捕捉相机")
         .default_pos(egui::pos2(12.0, 270.0))
         .default_width(260.0)
         .resizable(false)
         .show(ctx, |ui| {
-            ui.checkbox(&mut editor.show_gizmo, "Show gizmo");
+            ui.checkbox(&mut editor.show_gizmo, "显示控件");
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut editor.new_user_id);
-                if ui.button("Create").clicked() {
+                if ui.button("创建").clicked() {
                     if let Ok(user_id) = editor.new_user_id.trim().parse::<u64>() {
                         if !player_cameras.cameras.contains_key(&user_id) {
                             let transform = free_camera
                                 .single_mut()
                                 .map(|transform| *transform)
-                                .map(capture_camera_transform_near_dense_map)
                                 .unwrap_or(default_transform);
                             spawn_player_capture_camera(
                                 &mut commands,
@@ -2970,13 +3322,13 @@ fn capture_camera_panel(
             });
 
             if camera_ids.is_empty() {
-                ui.label("No player capture camera yet");
+                ui.label("还没有玩家捕捉相机");
                 return;
             }
 
             let mut selected_user_id = editor.selected_user_id.unwrap_or(camera_ids[0]);
             let selected_text = scene_player_display_name(manager.as_deref(), selected_user_id);
-            egui::ComboBox::from_label("Player")
+            egui::ComboBox::from_label("玩家")
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
                     for user_id in &camera_ids {
@@ -2995,22 +3347,22 @@ fn capture_camera_panel(
             let mut transform_changed = false;
 
             ui.horizontal(|ui| {
-                if ui.button("Use current view").clicked() {
+                if ui.button("使用当前视角").clicked() {
                     if let Ok(free_transform) = free_camera.single_mut() {
-                        *transform = capture_camera_transform_near_dense_map(*free_transform);
+                        *transform = *free_transform;
                         transform_changed = true;
                     }
                 }
-                if ui.button("View from player").clicked() {
+                if ui.button("查看玩家视角").clicked() {
                     if let Ok(mut free_transform) = free_camera.single_mut() {
-                        *free_transform = capture_camera_transform_near_dense_map(*transform);
+                        *free_transform = *transform;
                     }
                 }
-                if ui.button("Reset").clicked() {
+                if ui.button("重置").clicked() {
                     *transform = default_capture_camera_transform();
                     transform_changed = true;
                 }
-                if ui.button("Delete").clicked() {
+                if ui.button("删除").clicked() {
                     commands.entity(entity).despawn();
                     player_cameras.cameras.remove(&selected_user_id);
                     editor.selected_user_id = camera_ids
@@ -3028,7 +3380,7 @@ fn capture_camera_panel(
             });
 
             ui.separator();
-            ui.label("Translation");
+            ui.label("位移");
             ui.horizontal(|ui| {
                 transform_changed |= ui
                     .add(
@@ -3057,7 +3409,7 @@ fn capture_camera_panel(
             let mut yaw = yaw.to_degrees();
             let mut pitch = pitch.to_degrees();
             let mut roll = roll.to_degrees();
-            ui.label("Rotation");
+            ui.label("旋转");
             let changed = ui
                 .horizontal(|ui| {
                     let yaw_changed = ui
@@ -3091,6 +3443,39 @@ fn capture_camera_panel(
                 }
             }
         });
+}
+
+fn apply_scene_player_view_request(
+    mut request: ResMut<ScenePlayerViewRequest>,
+    mut free_camera: Query<
+        &mut Transform,
+        (
+            With<FreeCamera>,
+            Without<PlayerCaptureCamera>,
+        ),
+    >,
+    capture_cameras: Query<
+        (&Transform, &PlayerCaptureCamera),
+        (
+            With<PlayerCaptureCamera>,
+            Without<FreeCamera>,
+        ),
+    >,
+) {
+    let Some(user_id) = request.user_id.take() else {
+        return;
+    };
+    let Ok(mut free_transform) = free_camera.single_mut() else {
+        return;
+    };
+    let Some((capture_transform, _)) = capture_cameras
+        .iter()
+        .find(|(_, camera)| camera.user_id == user_id)
+    else {
+        return;
+    };
+
+    *free_transform = *capture_transform;
 }
 
 fn free_camera_system(
@@ -3150,11 +3535,12 @@ fn free_camera_system(
     if keyboard.pressed(KeyCode::KeyA) {
         direction -= *transform.right();
     }
+    let local_up = planet_outward_at(transform.translation);
     if keyboard.pressed(KeyCode::KeyE) || keyboard.pressed(KeyCode::Space) {
-        direction += Vec3::Y;
+        direction += local_up;
     }
     if keyboard.pressed(KeyCode::KeyQ) || keyboard.pressed(KeyCode::ControlLeft) {
-        direction -= Vec3::Y;
+        direction -= local_up;
     }
 
     if direction == Vec3::ZERO {
@@ -3168,6 +3554,337 @@ fn free_camera_system(
     };
     transform.translation +=
         direction.normalize() * editor.camera_speed * boost * time.delta_secs();
+}
+
+fn sync_voxel_planet_preview_visibility(
+    active_voxel_cameras: Query<&Transform, With<VoxelWorldCamera<TrpgVoxelWorld>>>,
+    mut previews: Query<&mut Visibility, With<VoxelPlanetPreview>>,
+) {
+    let Some(camera_transform) = active_voxel_cameras.iter().next() else {
+        return;
+    };
+    let altitude = (camera_transform
+        .translation
+        .distance(earth_planet_center().as_vec3())
+        - EARTH_PLANET_RADIUS as f32)
+        .abs();
+    let visibility = if altitude < VOXEL_PLANET_PREVIEW_HIDE_ALTITUDE {
+        Visibility::Hidden
+    } else {
+        Visibility::Visible
+    };
+
+    for mut preview_visibility in &mut previews {
+        *preview_visibility = visibility;
+    }
+}
+
+fn apply_planet_radial_gravity(
+    time: Res<Time>,
+    mut bodies: Query<(&Transform, &mut LinearVelocity), With<PlanetGravityBody>>,
+) {
+    for (transform, mut velocity) in &mut bodies {
+        velocity.0 += planet_gravity_delta_velocity(transform.translation, time.delta_secs());
+    }
+}
+
+fn voxel_edit_target(
+    voxel_world: &VoxelWorld<'_, TrpgVoxelWorld>,
+    ray: Ray3d,
+    raycast_hit: Option<VoxelRaycastResult<u8>>,
+) -> Option<VoxelEditTarget> {
+    if let Some(hit) = raycast_hit {
+        let position = hit.voxel_pos();
+        let normal = hit.voxel_normal().unwrap_or_else(|| {
+            if procedural_earth_voxel_planet(position).is_some() {
+                planet_axis_normal(position)
+            } else {
+                ray_fallback_voxel_normal(*ray.direction)
+            }
+        });
+        let material = match hit.voxel {
+            WorldVoxel::Solid(material) => Some(material),
+            WorldVoxel::Air | WorldVoxel::Unset => None,
+        };
+        return Some(VoxelEditTarget {
+            position,
+            normal,
+            material,
+        });
+    }
+
+    let target = procedural_planet_edit_target_from_ray(ray)?;
+    match voxel_world.get_voxel(target.position) {
+        WorldVoxel::Air => None,
+        WorldVoxel::Solid(material) => Some(VoxelEditTarget {
+            material: Some(material),
+            ..target
+        }),
+        WorldVoxel::Unset => Some(target),
+    }
+}
+
+fn ray_fallback_voxel_normal(direction: Vec3) -> IVec3 {
+    let abs = direction.abs();
+    if abs.x >= abs.y && abs.x >= abs.z {
+        IVec3::new(
+            if direction.x > 0.0 { -1 } else { 1 },
+            0,
+            0,
+        )
+    } else if abs.y >= abs.z {
+        IVec3::new(
+            0,
+            if direction.y > 0.0 { -1 } else { 1 },
+            0,
+        )
+    } else {
+        IVec3::new(
+            0,
+            0,
+            if direction.z > 0.0 { -1 } else { 1 },
+        )
+    }
+}
+
+fn physics_voxel_grab_drop_system(
+    mut commands: Commands,
+    egui_wants_input: Res<EguiWantsInput>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    camera_info: Query<
+        (&Camera, &GlobalTransform, &Transform),
+        (
+            With<VoxelWorldCamera<TrpgVoxelWorld>>,
+            With<FreeCamera>,
+            Without<HeldPhysicsVoxel>,
+        ),
+    >,
+    mut held_voxels: Query<
+        (
+            Entity,
+            &mut Transform,
+            &mut LinearVelocity,
+            &mut AngularVelocity,
+        ),
+        (
+            With<HeldPhysicsVoxel>,
+            Without<FreeCamera>,
+        ),
+    >,
+    mut grab_state: ResMut<PhysicsVoxelGrabState>,
+    mut voxel_world: VoxelWorld<TrpgVoxelWorld>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut store: Option<ResMut<Persistent<VoxelSceneStore>>>,
+) {
+    let Ok((camera, camera_global_transform, camera_transform)) = camera_info.single() else {
+        return;
+    };
+    let held_transform = held_physics_voxel_transform(camera_transform);
+
+    if let Some(entity) = grab_state.held_entity {
+        if let Ok((_, mut transform, mut linear_velocity, mut angular_velocity)) =
+            held_voxels.get_mut(entity)
+        {
+            *transform = held_transform;
+            linear_velocity.0 = Vec3::ZERO;
+            angular_velocity.0 = Vec3::ZERO;
+        } else {
+            grab_state.held_entity = None;
+        }
+    }
+
+    if !keyboard.just_pressed(KeyCode::KeyF) || egui_wants_input.wants_any_keyboard_input() {
+        return;
+    }
+
+    if let Some(entity) = grab_state.held_entity {
+        if let Ok((_, mut transform, mut linear_velocity, mut angular_velocity)) =
+            held_voxels.get_mut(entity)
+        {
+            *transform = held_transform;
+            linear_velocity.0 = *camera_transform.forward() * PHYSICS_VOXEL_DROP_SPEED;
+            angular_velocity.0 = Vec3::ZERO;
+            commands
+                .entity(entity)
+                .remove::<HeldPhysicsVoxel>()
+                .insert((RigidBody::Dynamic, PlanetGravityBody));
+        }
+        grab_state.held_entity = None;
+        return;
+    }
+
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Some(ray) = center_screen_ray(window, camera, camera_global_transform) else {
+        return;
+    };
+    let raycast_hit = voxel_world.raycast(ray.clone(), &|(_, voxel)| {
+        voxel.is_solid()
+    });
+    let Some(target) = voxel_edit_target(&voxel_world, ray, raycast_hit) else {
+        return;
+    };
+    let Some(material) = target.material else {
+        return;
+    };
+
+    voxel_world.set_voxel(target.position, WorldVoxel::Air);
+    persist_single_voxel_edit(
+        &mut store,
+        target.position,
+        PersistedVoxel::Air,
+        "physics voxel grab",
+    );
+
+    let entity = commands
+        .spawn((
+            Mesh3d(meshes.add(Cuboid::default())),
+            MeshMaterial3d(materials.add(physics_voxel_material(material))),
+            held_transform,
+            RigidBody::Kinematic,
+            Collider::cuboid(1.0, 1.0, 1.0),
+            LinearVelocity::ZERO,
+            AngularVelocity::ZERO,
+            GravityScale(0.0),
+            LinearDamping(0.18),
+            PhysicsVoxel,
+            HeldPhysicsVoxel,
+        ))
+        .id();
+    grab_state.held_entity = Some(entity);
+}
+
+fn held_physics_voxel_transform(camera_transform: &Transform) -> Transform {
+    let mut transform = Transform::from_translation(
+        camera_transform.translation + *camera_transform.forward() * HELD_PHYSICS_VOXEL_DISTANCE,
+    );
+    transform.rotation = camera_transform.rotation;
+    transform
+}
+
+fn center_screen_ray(
+    window: &Window,
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+) -> Option<Ray3d> {
+    let center = Vec2::new(
+        window.width() * 0.5,
+        window.height() * 0.5,
+    );
+    camera.viewport_to_world(camera_transform, center).ok()
+}
+
+fn physics_voxel_material(material: u8) -> StandardMaterial {
+    StandardMaterial {
+        base_color: preview_material_color(material),
+        emissive: preview_material_emissive(material).into(),
+        perceptual_roughness: 0.78,
+        metallic: match material {
+            MAT_HULL_LIGHT | MAT_HULL_DARK | MAT_STATION_METAL | MAT_STATION_TRIM => 0.35,
+            _ => 0.0,
+        },
+        unlit: matches!(
+            material,
+            MAT_STAR | MAT_WINDOW_CYAN | MAT_ENGINE_RED | MAT_SUN
+        ),
+        ..default()
+    }
+}
+
+fn procedural_planet_edit_target_from_ray(ray: Ray3d) -> Option<VoxelEditTarget> {
+    let center = earth_planet_center().as_vec3();
+    let outer_radius =
+        EARTH_PLANET_RADIUS as f32 + VOXEL_PLANET_MAX_ELEVATION + HELD_PHYSICS_VOXEL_DISTANCE;
+    let (entry, exit) = ray_sphere_intersection_distances(&ray, center, outer_radius)?;
+    if exit < 0.0 {
+        return None;
+    }
+
+    let start = entry.max(0.0);
+    let end = exit.min(start + VOXEL_PLANET_MAX_ELEVATION * 2.0 + 1024.0);
+    if end < start {
+        return None;
+    }
+
+    let mut last_position = None;
+    let mut distance = start;
+    while distance <= end {
+        let position = ray.get_point(distance).floor().as_ivec3();
+        if last_position != Some(position) {
+            if let Some(material) = procedural_earth_voxel_planet(position) {
+                return Some(VoxelEditTarget {
+                    position,
+                    normal: planet_axis_normal(position),
+                    material: Some(material),
+                });
+            }
+            last_position = Some(position);
+        }
+        distance += 1.0;
+    }
+
+    None
+}
+
+fn ray_sphere_intersection_distances(ray: &Ray3d, center: Vec3, radius: f32) -> Option<(f32, f32)> {
+    let offset = ray.origin - center;
+    let direction = *ray.direction;
+    let half_b = offset.dot(direction);
+    let c = offset.length_squared() - radius * radius;
+    let discriminant = half_b * half_b - c;
+    if discriminant < 0.0 {
+        return None;
+    }
+
+    let root = discriminant.sqrt();
+    Some((-half_b - root, -half_b + root))
+}
+
+fn planet_axis_normal(position: IVec3) -> IVec3 {
+    let direction = (position.as_vec3() + Vec3::splat(0.5) - earth_planet_center().as_vec3())
+        .try_normalize()
+        .unwrap_or(Vec3::Y);
+    dominant_axis_normal(direction)
+}
+
+fn dominant_axis_normal(direction: Vec3) -> IVec3 {
+    let abs = direction.abs();
+    if abs.x >= abs.y && abs.x >= abs.z {
+        IVec3::new(axis_sign(direction.x), 0, 0)
+    } else if abs.y >= abs.z {
+        IVec3::new(0, axis_sign(direction.y), 0)
+    } else {
+        IVec3::new(0, 0, axis_sign(direction.z))
+    }
+}
+
+fn axis_sign(value: f32) -> i32 {
+    if value >= 0.0 {
+        1
+    } else {
+        -1
+    }
+}
+
+fn cleanup_orphaned_voxel_chunk_colliders(
+    mut commands: Commands,
+    mut chunks: Query<(Entity, &mut VoxelChunkTerrainCollider), Without<Mesh3d>>,
+) {
+    for (entity, mut terrain_collider) in &mut chunks {
+        terrain_collider.frames_without_mesh =
+            terrain_collider.frames_without_mesh.saturating_add(1);
+        if terrain_collider.frames_without_mesh < ORPHANED_VOXEL_COLLIDER_FRAME_GRACE {
+            continue;
+        }
+        commands.entity(entity).remove::<(
+            RigidBody,
+            Collider,
+            VoxelChunkTerrainCollider,
+        )>();
+    }
 }
 
 fn draw_capture_camera_gizmos(
@@ -3214,7 +3931,14 @@ fn edit_voxel_world_system(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    camera_info: Query<(&Camera, &GlobalTransform), With<VoxelWorldCamera<TrpgVoxelWorld>>>,
+    camera_info: Query<
+        (&Camera, &GlobalTransform),
+        (
+            With<VoxelWorldCamera<TrpgVoxelWorld>>,
+            With<FreeCamera>,
+            Without<PlayerCaptureCamera>,
+        ),
+    >,
     editor: Res<VoxelEditorState>,
     mut pointer_state: ResMut<ScenePointerState>,
     mut voxel_world: VoxelWorld<TrpgVoxelWorld>,
@@ -3269,13 +3993,16 @@ fn edit_voxel_world_system(
     let Ok(ray) = camera.viewport_to_world(camera_transform, cursor_position) else {
         return;
     };
-    let Some(hit) = voxel_world.raycast(ray, &|(_, voxel)| voxel.is_solid()) else {
+    let raycast_hit = voxel_world.raycast(ray.clone(), &|(_, voxel)| {
+        voxel.is_solid()
+    });
+    let Some(target) = voxel_edit_target(&voxel_world, ray, raycast_hit) else {
         return;
     };
 
     let mut base_position = match editor.mode {
-        VoxelEditMode::Add => hit.voxel_pos() + hit.voxel_normal().unwrap_or(IVec3::Y),
-        VoxelEditMode::Erase => hit.voxel_pos(),
+        VoxelEditMode::Add => target.position + target.normal,
+        VoxelEditMode::Erase => target.position,
     };
     let shift_held = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
     if shift_held {
@@ -3328,19 +4055,92 @@ fn scene_capture_request_system(
     mut capture_state: ResMut<SceneCaptureState>,
     player_cameras: Res<PlayerSceneCameras>,
     mut capture_camera_query: Query<&mut Camera, With<PlayerCaptureCamera>>,
+    voxel_camera_entities: Query<Entity, With<VoxelWorldCamera<TrpgVoxelWorld>>>,
 ) {
-    let pending_captures = capture_state.pending_captures.drain(..).collect::<Vec<_>>();
-    for pending in pending_captures {
+    let capture_requests = requests.requests.drain(..).collect::<Vec<_>>();
+    for request in capture_requests {
+        let Some(player_camera) = player_cameras.cameras.get(&request.user_id) else {
+            eprintln!(
+                "ignored scene capture request from {} without a configured capture camera",
+                request.user_id
+            );
+            continue;
+        };
+        let player_camera = PlayerSceneCamera {
+            entity: player_camera.entity,
+            target: player_camera.target.clone(),
+        };
+
+        let output_dir = Path::new(".data")
+            .join("willowblossom")
+            .join("scene_captures");
+        if let Err(err) = std::fs::create_dir_all(&output_dir) {
+            eprintln!("failed to create scene capture directory: {err}");
+            continue;
+        }
+        let output_path = output_dir.join(format!(
+            "player_{}.png",
+            request.user_id
+        ));
+        let request_id = capture_state.next_request_id;
+        capture_state.next_request_id += 1;
+        let user_id = request.user_id;
+
+        capture_state.pending_captures.push(PendingSceneCapture {
+            request_id,
+            user_id,
+            camera_entity: player_camera.entity,
+            target: player_camera.target.clone(),
+            output_path,
+            prepare_frames_remaining: SCENE_CAPTURE_PREPARE_FRAMES,
+            started_preparing: false,
+        });
+    }
+
+    let Some(current) = capture_state.pending_captures.first_mut() else {
+        return;
+    };
+
+    if !current.started_preparing {
+        if let Ok(mut camera) = capture_camera_query.get_mut(current.camera_entity) {
+            camera.is_active = true;
+        }
+        set_single_voxel_world_camera(
+            &mut commands,
+            voxel_camera_entities.iter(),
+            current.camera_entity,
+        );
+        current.started_preparing = true;
+        return;
+    }
+
+    if current.prepare_frames_remaining > 0 {
+        current.prepare_frames_remaining -= 1;
+        return;
+    }
+
+    let pending = capture_state.pending_captures.remove(0);
+    {
         commands
             .spawn(Screenshot::image(
                 pending.target.clone(),
             ))
             .observe(
                 move |screenshot: On<ScreenshotCaptured>,
+                      mut commands: Commands,
                       napcat_sender: Option<Res<NapcatIOSender>>,
+                      free_camera: Query<Entity, With<FreeCamera>>,
                       mut cameras: Query<&mut Camera, With<PlayerCaptureCamera>>| {
                     if let Ok(mut camera) = cameras.get_mut(pending.camera_entity) {
                         camera.is_active = false;
+                    }
+                    commands
+                        .entity(pending.camera_entity)
+                        .remove::<VoxelWorldCamera<TrpgVoxelWorld>>();
+                    if let Ok(free_camera) = free_camera.single() {
+                        commands
+                            .entity(free_camera)
+                            .try_insert(VoxelWorldCamera::<TrpgVoxelWorld>::default());
                     }
 
                     let save_result = match screenshot.image.clone().try_into_dynamic() {
@@ -3396,65 +4196,27 @@ fn scene_capture_request_system(
                 },
             );
     }
+}
 
-    let capture_requests = requests.requests.drain(..).collect::<Vec<_>>();
-    if capture_requests.is_empty() {
-        return;
-    }
-
-    for request in capture_requests {
-        let Some(player_camera) = player_cameras.cameras.get(&request.user_id) else {
-            eprintln!(
-                "ignored scene capture request from {} without a configured capture camera",
-                request.user_id
-            );
-            continue;
-        };
-        let player_camera = PlayerSceneCamera {
-            entity: player_camera.entity,
-            target: player_camera.target.clone(),
-        };
-
-        if let Ok(mut camera) = capture_camera_query.get_mut(player_camera.entity) {
-            camera.is_active = true;
+fn set_single_voxel_world_camera(
+    commands: &mut Commands,
+    voxel_camera_entities: impl Iterator<Item = Entity>,
+    target: Entity,
+) {
+    for entity in voxel_camera_entities {
+        if entity != target {
+            commands
+                .entity(entity)
+                .remove::<VoxelWorldCamera<TrpgVoxelWorld>>();
         }
-
-        let output_dir = Path::new(".data")
-            .join("willowblossom")
-            .join("scene_captures");
-        if let Err(err) = std::fs::create_dir_all(&output_dir) {
-            eprintln!("failed to create scene capture directory: {err}");
-            continue;
-        }
-        let output_path = output_dir.join(format!(
-            "player_{}.png",
-            request.user_id
-        ));
-        let request_id = capture_state.next_request_id;
-        capture_state.next_request_id += 1;
-        let user_id = request.user_id;
-
-        capture_state.pending_captures.push(PendingSceneCapture {
-            request_id,
-            user_id,
-            camera_entity: player_camera.entity,
-            target: player_camera.target.clone(),
-            output_path,
-        });
     }
+    commands
+        .entity(target)
+        .try_insert(VoxelWorldCamera::<TrpgVoxelWorld>::default());
 }
 
 fn default_capture_camera_transform() -> Transform {
     Transform::from_xyz(24.0, 18.0, 32.0).looking_at(Vec3::new(0.0, 8.0, 0.0), Vec3::Y)
-}
-
-fn capture_camera_transform_near_dense_map(transform: Transform) -> Transform {
-    let focus = Vec3::new(0.0, 8.0, 0.0);
-    if transform.translation.distance(focus) > 90.0 || transform.translation.y > 56.0 {
-        default_capture_camera_transform()
-    } else {
-        transform
-    }
 }
 
 fn spawn_player_capture_camera(
@@ -3475,7 +4237,9 @@ fn spawn_player_capture_camera(
                 ..default()
             },
             RenderTarget::Image(target.clone().into()),
+            scene_camera_fog(),
             transform,
+            RenderLayers::layer(0),
             PlayerCaptureCamera { user_id },
         ))
         .id();
@@ -3662,6 +4426,18 @@ fn sync_scene_character_positions(
     }
 }
 
+fn sync_scene_player_camera_positions(
+    mut positions: ResMut<ScenePlayerCameraPositions>,
+    cameras: Query<(&PlayerCaptureCamera, &GlobalTransform), Without<CharacterStandee>>,
+) {
+    positions.positions.clear();
+    for (camera, transform) in &cameras {
+        positions
+            .positions
+            .insert(camera.user_id, transform.translation());
+    }
+}
+
 fn persisted_camera_transform(camera: &PersistedCaptureCamera) -> Transform {
     Transform {
         translation: Vec3::from(camera.translation),
@@ -3705,7 +4481,6 @@ fn standee_camera_transform(
 
     let transform = persisted_capture_camera(store, user_id)
         .map(persisted_camera_transform)
-        .map(capture_camera_transform_near_dense_map)
         .unwrap_or_else(|| default_character_camera_transform(index));
     if !player_cameras.cameras.contains_key(&user_id) {
         spawn_player_capture_camera(
@@ -4019,6 +4794,21 @@ fn upsert_persisted_edit(
     }
 }
 
+fn persist_single_voxel_edit(
+    store: &mut Option<ResMut<Persistent<VoxelSceneStore>>>,
+    position: IVec3,
+    voxel: PersistedVoxel,
+    reason: &str,
+) {
+    if let Some(store) = store.as_deref_mut() {
+        ensure_voxel_maps(store);
+        if let Some(map) = active_voxel_map_mut(store) {
+            upsert_persisted_edit(&mut map.edits, position, voxel);
+        }
+        persist_voxel_store(store, reason);
+    }
+}
+
 fn upsert_persisted_capture_camera(
     store: &mut Persistent<VoxelSceneStore>,
     user_id: u64,
@@ -4053,5 +4843,98 @@ impl From<PersistedVoxel> for WorldVoxel<u8> {
             PersistedVoxel::Air => WorldVoxel::Air,
             PersistedVoxel::Solid(material) => WorldVoxel::Solid(material),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voxel_planet_is_solid_below_surface_and_empty_above_at_landing_direction() {
+        let center = earth_planet_center();
+        let outward = (earth_planet_near_point() - center)
+            .as_vec3()
+            .normalize_or_zero();
+        let solid_position = (center.as_vec3()
+            + outward * (EARTH_PLANET_RADIUS as f32 - VOXEL_PLANET_MAX_ELEVATION - 8.0))
+            .round()
+            .as_ivec3();
+        let empty_position = (center.as_vec3()
+            + outward * (EARTH_PLANET_RADIUS as f32 + VOXEL_PLANET_MAX_ELEVATION + 32.0))
+            .round()
+            .as_ivec3();
+
+        assert!(matches!(
+            procedural_earth_voxel_planet(solid_position),
+            Some(MAT_PLANET_LAND | MAT_PLANET_OCEAN)
+        ));
+        assert_eq!(
+            procedural_earth_voxel_planet(empty_position),
+            None
+        );
+    }
+
+    #[test]
+    fn starter_scene_lookup_includes_voxel_planet() {
+        let center = earth_planet_center();
+        let outward = (earth_planet_near_point() - center)
+            .as_vec3()
+            .normalize_or_zero();
+        let solid_position = (center.as_vec3()
+            + outward * (EARTH_PLANET_RADIUS as f32 - VOXEL_PLANET_MAX_ELEVATION - 8.0))
+            .round()
+            .as_ivec3();
+
+        assert!(starter_scene_voxel(solid_position, None).is_solid());
+    }
+
+    #[test]
+    fn voxel_planet_radius_is_large_enough_for_playable_horizon() {
+        assert!(EARTH_PLANET_RADIUS >= 9_000);
+        assert!(VOXEL_PLANET_PREVIEW_STEP >= 256);
+    }
+
+    #[test]
+    fn procedural_planet_edit_target_hits_surface_without_streamed_chunks() {
+        let waypoint = planet_surface_waypoint();
+        let direction = Dir3::new(waypoint.focus - waypoint.eye).unwrap();
+        let ray = Ray3d::new(waypoint.eye, direction);
+        let target = procedural_planet_edit_target_from_ray(ray)
+            .expect("planet surface should be targetable analytically");
+
+        assert!(procedural_earth_voxel_planet(target.position).is_some());
+        assert!(target.material.is_some());
+        assert_ne!(target.normal, IVec3::ZERO);
+    }
+
+    #[test]
+    fn planet_gravity_points_to_planet_center_instead_of_world_down() {
+        let center = earth_planet_center().as_vec3();
+        let position = center + Vec3::X * 256.0;
+
+        let direction = planet_gravity_direction_at(position);
+        let delta_velocity = planet_gravity_delta_velocity(position, 0.5);
+
+        assert!(direction.abs_diff_eq(Vec3::NEG_X, 0.0001));
+        assert!(delta_velocity.abs_diff_eq(
+            Vec3::NEG_X * PLANET_GRAVITY_ACCELERATION * 0.5,
+            0.0001,
+        ));
+        assert!(!direction.abs_diff_eq(Vec3::NEG_Y, 0.0001));
+    }
+
+    #[test]
+    fn planet_gravity_is_zero_at_exact_center() {
+        let center = earth_planet_center().as_vec3();
+
+        assert_eq!(
+            planet_gravity_direction_at(center),
+            Vec3::ZERO
+        );
+        assert_eq!(
+            planet_gravity_delta_velocity(center, 1.0),
+            Vec3::ZERO
+        );
     }
 }

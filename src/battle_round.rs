@@ -358,7 +358,7 @@ fn battle_round_panel(
                         .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
 
                     if encounter_rows.is_empty() {
-                        ui.label("No battle rounds yet.");
+                        ui.label("还没有战斗轮。");
                     }
 
                     for encounter_entity in encounter_rows {
@@ -374,7 +374,7 @@ fn battle_round_panel(
                     }
 
                     ui.separator();
-                    if ui.button("Close").clicked() {
+                    if ui.button("关闭").clicked() {
                         close_requested = true;
                     }
                 });
@@ -402,10 +402,10 @@ fn create_encounter_ui(
     }
 
     ui.horizontal_wrapped(|ui| {
-        ui.label("TRPG group");
+        ui.label("TRPG组");
         egui::ComboBox::from_id_salt("battle_round_group_select")
             .selected_text(if ui_state.selected_group.is_empty() {
-                "No group"
+                "无分组"
             } else {
                 ui_state.selected_group.as_str()
             })
@@ -418,9 +418,9 @@ fn create_encounter_ui(
                     );
                 }
             });
-        ui.label("Name");
+        ui.label("名称");
         ui.text_edit_singleline(&mut ui_state.new_encounter_name);
-        if ui.button("Create").clicked() {
+        if ui.button("创建").clicked() {
             let group_name = ui_state.selected_group.trim();
             if let Some(group) = manager.trpg_groups.get(group_name) {
                 let name = if ui_state.new_encounter_name.trim().is_empty() {
@@ -470,29 +470,29 @@ fn encounter_ui(
                 .expect("encounter existence checked");
             ui.horizontal_wrapped(|ui| {
                 ui.heading(&encounter_entity.name);
-                ui.small(format!("Round {}", encounter.round));
-                ui.small(if encounter_entity.active { "Active" } else { "Downtime" });
+                ui.small(format!("第{}轮", encounter.round));
+                ui.small(if encounter_entity.active { "进行中" } else { "休整" });
                 if encounter_entity.negative_enabled {
-                    ui.small("消极 on");
+                    ui.small("消极已开");
                 }
-                changed |= ui.checkbox(&mut encounter.active, "Active").changed();
+                changed |= ui.checkbox(&mut encounter.active, "进行中").changed();
                 changed |= ui
                     .checkbox(&mut encounter.negative_enabled, "消极")
                     .changed();
                 changed |= ui
-                    .checkbox(&mut encounter.sort_by_turn, "Sort")
-                    .on_hover_text("Sort action order by AGI.")
+                    .checkbox(&mut encounter.sort_by_turn, "排序")
+                    .on_hover_text("按AGI排序行动顺序。")
                     .changed();
-                if ui.button("Refresh players").clicked() {
+                if ui.button("刷新玩家").clicked() {
                     changed |= refresh_encounter_players(encounter, manager);
                 }
-                if ui.button("Prev round").clicked() {
+                if ui.button("上一轮").clicked() {
                     prev_round_requested = true;
                 }
-                if ui.button("Next round").clicked() {
+                if ui.button("下一轮").clicked() {
                     next_round_requested = true;
                 }
-                if ui.button("Delete").clicked() {
+                if ui.button("删除").clicked() {
                     remove = true;
                 }
             });
@@ -522,11 +522,11 @@ fn encounter_ui(
                 .show(ui.ctx(), |ui| {
                     ui.label("还有角色未完成行动。确定要强制进入下一轮吗？");
                     ui.horizontal(|ui| {
-                        if ui.button("Confirm next round").clicked() {
+                        if ui.button("确认下一轮").clicked() {
                             changed |= store.next_round(encounter_id);
                             ui_state.confirm_next_round.remove(encounter_id);
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("取消").clicked() {
                             ui_state.confirm_next_round.remove(encounter_id);
                         }
                     });
@@ -581,7 +581,7 @@ fn encounter_roster_ui(
         return false;
     };
 
-    ui.label("Action order");
+    ui.label("行动顺序");
     let order = ordered_participant_indices(encounter);
     for (order_index, participant_index) in order.iter().copied().enumerate() {
         let mut remove = false;
@@ -613,11 +613,11 @@ fn encounter_roster_ui(
             changed |= ui
                 .add(egui::DragValue::new(&mut participant.max_mp).speed(1.0))
                 .changed();
-            changed |= ui.checkbox(&mut participant.alive, "Alive").changed();
+            changed |= ui.checkbox(&mut participant.alive, "存活").changed();
             if participant.action_done {
-                ui.small("done");
+                ui.small("已完成");
             }
-            if ui.button("Remove").clicked() {
+            if ui.button("移除").clicked() {
                 remove = true;
             }
         });
@@ -641,7 +641,7 @@ fn encounter_roster_ui(
             *selected = candidates[0].0.clone();
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label("Add player");
+            ui.label("添加玩家");
             egui::ComboBox::from_id_salt(format!(
                 "battle_add_player_{encounter_id}"
             ))
@@ -657,7 +657,7 @@ fn encounter_roster_ui(
                     ui.selectable_value(selected, target_id.clone(), name);
                 }
             });
-            if ui.button("Add").clicked() {
+            if ui.button("添加").clicked() {
                 encounter.participants.push(participant_from_target(
                     selected, manager,
                 ));
@@ -685,8 +685,8 @@ fn encounter_action_ui(
         return false;
     };
     let Some(actor_index) = current_actor_index(encounter) else {
-        ui.label("All actions are done.");
-        if ui.button("Start next round").clicked() {
+        ui.label("所有行动已完成。");
+        if ui.button("开始下一轮").clicked() {
             changed |= store.next_round(encounter_id);
         }
         return changed;
@@ -710,7 +710,7 @@ fn encounter_action_ui(
         .unwrap_or_default();
 
     ui.label(format!(
-        "Current actor: {}",
+        "当前行动者：{}",
         actor.display_name
     ));
     let target = ui_state
@@ -739,7 +739,7 @@ fn encounter_action_ui(
         .or_insert(1.0);
 
     ui.horizontal_wrapped(|ui| {
-        ui.label("Target");
+        ui.label("目标");
         egui::ComboBox::from_id_salt(format!(
             "battle_action_target_{encounter_id}"
         ))
@@ -752,9 +752,9 @@ fn encounter_action_ui(
                 ui.selectable_value(target, target_id.clone(), name);
             }
         });
-        ui.label("Damage");
+        ui.label("伤害");
         ui.add(egui::DragValue::new(amount).speed(1.0).range(0.0..=9999.0));
-        if ui.button("Normal attack").clicked() {
+        if ui.button("普通攻击").clicked() {
             changed |= store.apply_action(
                 encounter_id,
                 &actor.target_id,
@@ -764,10 +764,10 @@ fn encounter_action_ui(
             );
             changed |= store.finish_actor_action(encounter_id, &actor.target_id);
         }
-        if ui.button("Mark done").clicked() {
+        if ui.button("标记完成").clicked() {
             changed |= store.finish_actor_action(encounter_id, &actor.target_id);
         }
-        if ui.button("Skip + 消极").clicked() {
+        if ui.button("跳过+消极").clicked() {
             changed |= store.skip_negative_participant(encounter_id, &actor.target_id);
         }
     });
@@ -781,7 +781,7 @@ fn encounter_action_ui(
             *selected_skill = 0;
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label("Skill");
+            ui.label("技能");
             egui::ComboBox::from_id_salt(format!("battle_skill_{encounter_id}"))
                 .selected_text(skills[*selected_skill].name.as_str())
                 .show_ui(ui, |ui| {
@@ -818,7 +818,7 @@ fn encounter_action_ui(
             );
             let can_pay = actor.mp + f32::EPSILON >= skill.mp_cost.max(0.0);
             let can_use = cooldown_remaining == 0 && can_pay;
-            let response = ui.add_enabled(can_use, egui::Button::new("Use skill"));
+            let response = ui.add_enabled(can_use, egui::Button::new("使用技能"));
             if response.clicked() {
                 changed |= store.record_skill_use(
                     encounter_id,
@@ -831,17 +831,17 @@ fn encounter_action_ui(
             }
             if !can_pay {
                 ui.small(format!(
-                    "Need {} MP",
+                    "需要{} MP",
                     format_number(skill.mp_cost.max(0.0))
                 ));
             } else if cooldown_remaining > 0 {
                 ui.small(format!(
-                    "Cooldown {cooldown_remaining} turns"
+                    "冷却还剩{cooldown_remaining}轮"
                 ));
             }
         });
     } else {
-        ui.small("No skills on this character.");
+        ui.small("这个角色没有技能。");
     }
 
     changed
@@ -854,7 +854,7 @@ fn encounter_log_ui(ui: &mut egui::Ui, store: &BattleRoundStore, encounter_id: &
     if encounter.action_log.is_empty() {
         return;
     }
-    ui.label("Log");
+    ui.label("日志");
     for entry in encounter.action_log.iter().rev().take(6) {
         ui.small(entry);
     }
@@ -900,10 +900,9 @@ impl BattleRoundStore {
         for participant in &mut encounter.participants {
             participant.action_done = false;
         }
-        encounter.action_log.push(format!(
-            "GM moved back to round {}",
-            encounter.round
-        ));
+        encounter
+            .action_log
+            .push(format!("GM回到第{}轮", encounter.round));
         true
     }
 
@@ -922,10 +921,9 @@ impl BattleRoundStore {
                 participant.mp = (participant.mp + participant.mp_regen).min(participant.max_mp);
             }
         }
-        encounter.action_log.push(format!(
-            "Round {} started",
-            encounter.round
-        ));
+        encounter
+            .action_log
+            .push(format!("第{}轮开始", encounter.round));
         if encounter.negative_enabled {
             mark_negative_candidates(encounter);
         }
@@ -1021,10 +1019,10 @@ impl BattleRoundStore {
         target.hp = (target.hp - final_damage).max(0.0);
         target.alive = target.hp > 0.0;
         encounter.action_log.push(format!(
-            "{} used {} on {} for {} damage",
+            "{}对{}使用{}，造成{}点伤害",
             actor_name,
-            action_name,
             target.display_name,
+            action_name,
             format_number(final_damage)
         ));
         true
@@ -1064,14 +1062,14 @@ impl BattleRoundStore {
         let cooldown_remaining = skill_cooldown_remaining(actor, skill.index, skill.cooldown_turns);
         if cooldown_remaining > 0 {
             encounter.action_log.push(format!(
-                "{} cannot use {}; cooldown {} turns",
+                "{}不能使用{}；冷却还剩{}轮",
                 actor_name, skill.name, cooldown_remaining
             ));
             return false;
         }
         if actor.mp + f32::EPSILON < mp_cost {
             encounter.action_log.push(format!(
-                "{} cannot use {}; needs {} MP",
+                "{}不能使用{}；需要{} MP",
                 actor_name,
                 skill.name,
                 format_number(mp_cost)
@@ -1079,9 +1077,10 @@ impl BattleRoundStore {
             return false;
         }
         actor.mp = (actor.mp - mp_cost).max(0.0);
-        actor
-            .skill_last_used_turns
-            .insert(skill.index.to_string(), actor.turn);
+        actor.skill_last_used_turns.insert(
+            skill.index.to_string(),
+            actor.turn.saturating_add(1),
+        );
 
         match static_skill_effect(&skill.note) {
             Some(SkillEffect::Damage { amount, target }) => {
@@ -1094,7 +1093,7 @@ impl BattleRoundStore {
                 );
                 if target_ids.is_empty() {
                     encounter.action_log.push(format!(
-                        "{} used {} but no targets were in range",
+                        "{}使用{}，但范围内没有目标",
                         actor_name, skill.name
                     ));
                 }
@@ -1109,10 +1108,10 @@ impl BattleRoundStore {
                     target.hp = (target.hp - amount).max(0.0);
                     target.alive = target.hp > 0.0;
                     encounter.action_log.push(format!(
-                        "{} used {} on {} for {} damage",
+                        "{}对{}使用{}，造成{}点伤害",
                         actor_name,
-                        skill.name,
                         target.display_name,
+                        skill.name,
                         format_number(amount)
                     ));
                 }
@@ -1127,7 +1126,7 @@ impl BattleRoundStore {
                 );
                 if target_ids.is_empty() {
                     encounter.action_log.push(format!(
-                        "{} used {} but no targets were in range",
+                        "{}使用{}，但范围内没有目标",
                         actor_name, skill.name
                     ));
                 }
@@ -1142,10 +1141,10 @@ impl BattleRoundStore {
                     target.hp = (target.hp + amount).min(target.max_hp);
                     target.alive = target.hp > 0.0;
                     encounter.action_log.push(format!(
-                        "{} used {} on {} for {} healing",
+                        "{}对{}使用{}，回复{}点生命值",
                         actor_name,
-                        skill.name,
                         target.display_name,
+                        skill.name,
                         format_number(amount)
                     ));
                 }
@@ -1154,20 +1153,20 @@ impl BattleRoundStore {
                 let note = skill.note.trim();
                 if note.is_empty() {
                     encounter.action_log.push(format!(
-                        "{} used {} on {}",
-                        actor_name, skill.name, target_name
+                        "{}对{}使用{}",
+                        actor_name, target_name, skill.name
                     ));
                 } else {
                     encounter.action_log.push(format!(
-                        "{} used {} on {} ({})",
-                        actor_name, skill.name, target_name, note
+                        "{}对{}使用{}（{}）",
+                        actor_name, target_name, skill.name, note
                     ));
                 }
             },
         }
         if mp_cost > 0.0 {
             encounter.action_log.push(format!(
-                "{} spent {} MP",
+                "{}消耗{} MP",
                 actor_name,
                 format_number(mp_cost)
             ));
@@ -1443,7 +1442,7 @@ fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
         .enumerate()
         .map(|(index, name)| {
             let display_name = if name.trim().is_empty() {
-                format!("Skill {}", index + 1)
+                format!("技能{}", index + 1)
             } else {
                 name.trim().to_owned()
             };
@@ -1817,5 +1816,38 @@ mod tests {
         assert_eq!(participant.hp, 10.0);
         assert_eq!(participant.mp, 10.0);
         assert!(participant.alive);
+    }
+
+    #[test]
+    fn skill_cooldown_starts_after_skill_action_finishes() {
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0), participant("b", 0)],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "旋风斩".to_owned(),
+            note: String::new(),
+            mp_cost: 0.0,
+            cooldown_turns: 1,
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, None));
+        assert!(store.finish_actor_action("battle", "a"));
+
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert_eq!(actor.turn, 1);
+        assert_eq!(
+            skill_cooldown_remaining(actor, skill.index, skill.cooldown_turns),
+            1
+        );
     }
 }

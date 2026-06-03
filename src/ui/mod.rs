@@ -91,6 +91,8 @@ use crate::{
         DeepseekSummaryBlock,
     },
     napcat::{
+        update_character_from_status,
+        CharacterBuffBaseStats,
         CharacterCreationStep,
         CharacterStatus,
         ChatGroup,
@@ -107,17 +109,28 @@ use crate::{
         PlayerCharacter,
         TextData,
         TrpgGroup,
+        TrpgPlayerTurnState,
     },
     rule_engine::{
         parse_rule,
+        Action,
+        ActorRef,
         BuffEffect,
         BuffField,
         BuffKind,
         BuffSpec,
         BuffValue,
+        Character as RuleCharacter,
         RuleAst,
         RuleEngineState,
         StatusKey,
+        TargetSelector,
+        ValueExpr,
+    },
+    scene::{
+        SceneCharacterPositions,
+        ScenePlayerCameraPositions,
+        ScenePlayerViewRequest,
     },
 };
 pub struct UIPlugin;
@@ -146,6 +159,8 @@ pub(crate) struct CharacterEditState {
     gm_status_drafts: HashMap<String, CharacterStatus>,
     buff_drafts: HashMap<String, BuffDraft>,
     pending_character_reset: Option<String>,
+    quick_cast_skill_index: HashMap<String, usize>,
+    pending_force_cast: Option<(String, usize)>,
 }
 
 #[derive(Clone)]
@@ -162,7 +177,7 @@ pub(crate) struct BuffDraft {
 impl Default for BuffDraft {
     fn default() -> Self {
         Self {
-            name: "New buff".to_owned(),
+            name: "新buff".to_owned(),
             kind: BuffKind::Magic,
             priority: 0,
             turns_remaining: 1,
@@ -184,8 +199,9 @@ pub struct UiSystemLocals<'s> {
     chat_list_edit_name: Local<'s, String>,
     trpg_group_settings: Local<'s, TrpgGroupSettingsState>,
     character_edit_state: Local<'s, CharacterEditState>,
-    quick_character_target: Local<'s, Option<String>>,
+    quick_character_targets: Local<'s, HashSet<String>>,
     chat_image_textures: Local<'s, HashMap<String, TextureHandle>>,
+    chat_turn_count_drafts: Local<'s, HashMap<(String, String), u32>>,
 }
 
 pub struct CircleImageButton {
@@ -216,12 +232,12 @@ fn file_menu_button(
         *new_chat_group_modal_open = true
     }
 
-    ui.menu_button("Edit", |ui| {
+    ui.menu_button("编辑", |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
 
         if ui
             .add(
-                egui::Button::new("New Chat Group")
+                egui::Button::new("新建讨论组")
                     .shortcut_text(ui.ctx().format_shortcut(&new_chat_group_shortcup)),
             )
             .clicked()
@@ -229,7 +245,7 @@ fn file_menu_button(
             *new_chat_group_modal_open = true
         }
 
-        if ui.button("Player / Group Pools").clicked() {
+        if ui.button("玩家/群池").clicked() {
             *trpg_group_settings_open = true;
             ui.close();
         }
@@ -241,14 +257,14 @@ fn tools_menu_button(
     rule_engine_state: &mut RuleEngineState,
     battle_round_state: &mut BattleRoundUiState,
 ) {
-    ui.menu_button("Tools", |ui| {
+    ui.menu_button("工具", |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
 
         if ui.button("战斗轮").clicked() {
             battle_round_state.open_panel();
             ui.close();
         }
-        if ui.button("Rule Engine").clicked() {
+        if ui.button("规则引擎").clicked() {
             rule_engine_state.open_panel();
             ui.close();
         }
@@ -410,8 +426,12 @@ fn chat_window(
     current_group: Option<&str>,
     group_delta: Option<Vec2>,
     unread_count: usize,
-    quick_character_target: &mut Local<Option<String>>,
+    quick_character_targets: &mut Local<HashSet<String>>,
     image_textures: &mut Local<HashMap<String, TextureHandle>>,
+    focused_trpg_group_name: Option<&str>,
+    turn_count_drafts: &mut Local<HashMap<(String, String), u32>>,
+    rule_engine_state: &mut RuleEngineState,
+    mut player_view_request: Option<&mut ScenePlayerViewRequest>,
 ) {
     let mut window_open = true;
     let mut leave_group = false;
@@ -454,13 +474,7 @@ fn chat_window(
                 "group_member_chat_window_v2",
             ))
         })
-        .unwrap_or_else(|| {
-            Id::new((
-                id,
-                target_id,
-                "standalone_chat_window_v2",
-            ))
-        });
+        .unwrap_or_else(|| standalone_chat_window_id(id, target_id));
     let mut window = egui::Window::new(nickname)
         .open(&mut window_open)
         .id(window_id)
@@ -481,12 +495,90 @@ fn chat_window(
         ));
     }
     let show_character_button = !is_group_chat_target(manager, target_id);
+    let trpg_membership_group = focused_trpg_group_name
+        .filter(|group_name| manager.trpg_groups.contains_key(*group_name))
+        .map(str::to_owned);
+    let target_is_group_chat = is_group_chat_target(manager, target_id);
+    let mut trpg_membership_selected = trpg_membership_group
+        .as_deref()
+        .and_then(|group_name| manager.trpg_groups.get(group_name))
+        .map(|group| {
+            if target_is_group_chat {
+                group.group_chats.contains(&target_id.to_owned())
+            } else {
+                group.players.contains(&target_id.to_owned())
+            }
+        })
+        .unwrap_or_default();
+    let mut trpg_membership_changed = false;
+    let trpg_turn_snapshot = trpg_membership_group.as_deref().and_then(|group_name| {
+        manager
+            .trpg_groups
+            .get(group_name)
+            .filter(|group| {
+                !target_is_group_chat
+                    && group.players.iter().any(|player_id| player_id == target_id)
+            })
+            .map(|group| {
+                let turn = group.player_turns.get(target_id);
+                (
+                    group_name.to_owned(),
+                    group.world_turn,
+                    turn.map(|turn| turn.turns_passed).unwrap_or_default(),
+                    turn.map(|turn| turn.acted).unwrap_or_default(),
+                    turn.map(|turn| turn.skipped).unwrap_or_default(),
+                )
+            })
+    });
+    let mut player_turn_count_set: Option<(String, String, u32)> = None;
+    let mut player_acted_toggle: Option<(String, String, bool)> = None;
     let response = window.show(ctx, |ui| {
-        if current_group.is_some() || show_character_button {
+        if current_group.is_some() || show_character_button || trpg_membership_group.is_some() {
             ui.horizontal(|ui| {
+                if let Some(group_name) = trpg_membership_group.as_deref() {
+                    if ui
+                        .checkbox(
+                            &mut trpg_membership_selected,
+                            target_display_name(manager, target_id),
+                        )
+                        .on_hover_text(format!(
+                            "切换在{group_name}中的成员状态"
+                        ))
+                        .changed()
+                    {
+                        trpg_membership_changed = true;
+                    }
+                }
                 if show_character_button {
-                    if ui.button("Character").clicked() {
-                        quick_character_target.replace(target_id.to_owned());
+                    if ui.button("角色").clicked() {
+                        quick_character_targets.insert(target_id.to_owned());
+                    }
+                    let can_view_player =
+                        target_id.parse::<u64>().is_ok() && player_view_request.is_some();
+                    if ui
+                        .add_enabled(
+                            can_view_player,
+                            egui::Button::new("查看玩家视角"),
+                        )
+                        .on_hover_text("切换到这个玩家的场景捕捉相机")
+                        .clicked()
+                    {
+                        if let (Ok(user_id), Some(request)) = (
+                            target_id.parse::<u64>(),
+                            player_view_request.as_deref_mut(),
+                        ) {
+                            request.user_id = Some(user_id);
+                        }
+                    }
+                }
+                if let Some((group_name, _, _, acted, _)) = trpg_turn_snapshot.as_ref() {
+                    let button_text = if *acted { "已行动" } else { "行动" };
+                    if ui.button(button_text).clicked() {
+                        player_acted_toggle = Some((
+                            group_name.clone(),
+                            target_id.to_owned(),
+                            !*acted,
+                        ));
                     }
                 }
                 ui.with_layout(
@@ -500,6 +592,43 @@ fn chat_window(
                     },
                 );
             });
+            if let Some((group_name, world_turn, turns_passed, acted, skipped)) =
+                trpg_turn_snapshot.as_ref()
+            {
+                ui.horizontal_wrapped(|ui| {
+                    let status = if *acted {
+                        "已行动"
+                    } else if *skipped {
+                        "已跳过"
+                    } else {
+                        "等待中"
+                    };
+                    ui.small(format!("世界轮次 {world_turn}"));
+                    ui.small(format!("玩家轮次 {turns_passed}"));
+                    ui.small(status);
+
+                    let draft_key = (group_name.clone(), target_id.to_owned());
+                    let draft = turn_count_drafts
+                        .entry(draft_key.clone())
+                        .or_insert(*turns_passed);
+                    ui.add(
+                        egui::DragValue::new(draft)
+                            .range(0..=9999)
+                            .speed(1)
+                            .prefix("设为 "),
+                    );
+                    if ui.button("设置轮次").clicked() {
+                        player_turn_count_set = Some((
+                            group_name.clone(),
+                            target_id.to_owned(),
+                            *draft,
+                        ));
+                    }
+                    if ui.small_button("当前").clicked() {
+                        *draft = *turns_passed;
+                    }
+                });
+            }
         }
         chat_body_ui(
             ui,
@@ -515,6 +644,59 @@ fn chat_window(
             None,
         );
     });
+
+    if let Some((group_name, target_id, turns_passed)) = player_turn_count_set {
+        if manager
+            .trpg_groups
+            .get_mut(&group_name)
+            .is_some_and(|group| group.set_player_turns_passed(&target_id, turns_passed))
+        {
+            manager.persist().ok();
+        }
+    }
+
+    if let Some((group_name, target_id, acted)) = player_acted_toggle {
+        let changed = if acted {
+            mark_group_player_turn(
+                manager.as_mut(),
+                &group_name,
+                &target_id,
+                true,
+                rule_engine_state,
+            )
+        } else {
+            set_group_player_waiting(
+                manager.as_mut(),
+                &group_name,
+                &target_id,
+            )
+        };
+        if changed {
+            manager.persist().ok();
+        }
+    }
+
+    if trpg_membership_changed {
+        if let Some(group_name) = trpg_membership_group.as_deref() {
+            if let Some(group) = manager.trpg_groups.get_mut(group_name) {
+                if target_is_group_chat {
+                    set_target_membership(
+                        &mut group.group_chats,
+                        target_id,
+                        trpg_membership_selected,
+                    );
+                } else {
+                    set_target_membership(
+                        &mut group.players,
+                        target_id,
+                        trpg_membership_selected,
+                    );
+                    group.sync_turn_players();
+                }
+                manager.persist().ok();
+            }
+        }
+    }
 
     if let Some(group_name) = current_group {
         ctx.set_sublayer(
@@ -593,6 +775,30 @@ fn chat_window(
 
 fn window_received_focus(ctx: &Context, response: &Response) -> bool {
     response.contains_pointer() && ctx.input(|input| input.pointer.any_pressed())
+}
+
+fn standalone_chat_window_id(id: Id, target_id: &str) -> Id {
+    Id::new((
+        id,
+        target_id,
+        "standalone_chat_window_v2",
+    ))
+}
+
+fn focus_standalone_chat_window(ctx: &Context, target_id: &str) {
+    let window_id = standalone_chat_window_id(Id::new(target_id), target_id);
+    let mut collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ctx,
+        window_id.with("collapsing"),
+        true,
+    );
+    collapsing.set_open(true);
+    collapsing.store(ctx);
+    ctx.move_to_top(egui::LayerId::new(
+        egui::Order::Middle,
+        window_id,
+    ));
+    ctx.request_repaint();
 }
 
 fn mark_target_read(
@@ -902,9 +1108,9 @@ fn message_image_ui(
     image_textures: &mut Local<HashMap<String, TextureHandle>>,
 ) {
     let Some(path) = cached_image_path(data.local_path.trim()) else {
-        ui.label("[image]");
+        ui.label("[图片]");
         if !data.url.trim().is_empty() {
-            ui.small("image URL unavailable");
+            ui.small("图片URL不可用");
         }
         return;
     };
@@ -913,8 +1119,8 @@ fn message_image_ui(
         texture.clone()
     } else {
         let Some(color_image) = load_cached_color_image(&path) else {
-            ui.label("[image]");
-            ui.small("failed to decode cached image");
+            ui.label("[图片]");
+            ui.small("缓存图片解码失败");
             return;
         };
         let texture = ui.ctx().load_texture(
@@ -1448,14 +1654,14 @@ fn pending_chat_requests_window(
     pending_targets.sort();
 
     let mut changed = false;
-    egui::Window::new("New chat requests")
+    egui::Window::new("新的聊天请求")
         .id(Id::new("pending_chat_requests_window"))
         .default_pos(Pos2::new(16.0, 48.0))
         .default_size(Vec2::new(300.0, 120.0))
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
-            ui.label("NapCat received messages from chats that do not have windows yet.");
+            ui.label("NapCat收到了还没有打开窗口的聊天消息。");
             ui.separator();
 
             for target_id in pending_targets {
@@ -1465,7 +1671,7 @@ fn pending_chat_requests_window(
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            if ui.button("Create chat").clicked() {
+                            if ui.button("创建聊天").clicked() {
                                 manager.open_chat_targets.insert(target_id.clone());
                                 manager.pending_chat_targets.remove(&target_id);
                                 changed = true;
@@ -1478,6 +1684,77 @@ fn pending_chat_requests_window(
 
     if changed {
         manager.persist().ok();
+    }
+}
+
+fn waiting_turn_manager_window(
+    ctx: &Context,
+    manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+) {
+    let Some(group_name) = manager.current_trpg_group.clone() else {
+        return;
+    };
+    let Some(group) = manager.trpg_groups.get(&group_name) else {
+        return;
+    };
+
+    let waiting_players = group
+        .players
+        .iter()
+        .filter(|target_id| {
+            group
+                .player_turns
+                .get(*target_id)
+                .map(|turn| !turn.acted && !turn.skipped)
+                .unwrap_or(true)
+        })
+        .map(|target_id| {
+            (
+                target_id.clone(),
+                target_display_name(manager, target_id),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut target_to_focus = None;
+    egui::Window::new("轮次管理")
+        .id(Id::new("waiting_turn_manager_window"))
+        .default_pos(Pos2::new(240.0, 48.0))
+        .default_size(Vec2::new(240.0, 220.0))
+        .min_size(Vec2::new(180.0, 120.0))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(group_name.as_str());
+                ui.small(format!(
+                    "{}人等待中",
+                    waiting_players.len()
+                ));
+            });
+            ui.separator();
+
+            if waiting_players.is_empty() {
+                ui.label("所有玩家都已行动。");
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .id_salt("waiting_turn_manager_players")
+                .show(ui, |ui| {
+                    for (target_id, display_name) in &waiting_players {
+                        if ui.button(display_name).on_hover_text(target_id).clicked() {
+                            target_to_focus = Some(target_id.clone());
+                        }
+                    }
+                });
+        });
+
+    if let Some(target_id) = target_to_focus {
+        let opened = manager.open_chat_targets.insert(target_id.clone());
+        manager.pending_chat_targets.remove(&target_id);
+        focus_standalone_chat_window(ctx, &target_id);
+        if opened {
+            manager.persist().ok();
+        }
     }
 }
 
@@ -1524,18 +1801,19 @@ fn trpg_group_member_count(group: &TrpgGroup) -> usize {
 
 fn chat_list_panel(
     ui: &mut Ui,
+    ctx: &Context,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
     edit_target: &mut Option<String>,
     edit_name: &mut String,
     trpg_group_settings: &mut TrpgGroupSettingsState,
 ) {
-    ui.heading("TRPG Groups");
+    ui.heading("TRPG组");
     ui.add_space(4.0);
 
     let mut trpg_group_names = manager.trpg_groups.keys().cloned().collect::<Vec<_>>();
     trpg_group_names.sort();
     if trpg_group_names.is_empty() {
-        ui.label("No TRPG groups.");
+        ui.label("还没有TRPG组。");
     } else {
         for group_name in trpg_group_names {
             let Some(group) = manager.trpg_groups.get(&group_name).cloned() else {
@@ -1557,12 +1835,12 @@ fn chat_list_panel(
                     }
                 });
                 ui.small(format!(
-                    "{} players, {} group chats, turn {}",
+                    "{}名玩家，{}个群聊，第{}轮",
                     group.players.len(),
                     group.group_chats.len(),
                     group.world_turn
                 ));
-                if ui.button("Open workspace").clicked() {
+                if ui.button("打开工作区").clicked() {
                     trpg_group_settings.open = true;
                     trpg_group_settings.focused_group_name = Some(group_name.clone());
                 }
@@ -1572,11 +1850,11 @@ fn chat_list_panel(
     }
 
     ui.separator();
-    ui.heading("Chats");
+    ui.heading("聊天");
     ui.add_space(4.0);
 
     if manager.messages.is_empty() {
-        ui.label("No saved chats yet.");
+        ui.label("还没有保存的聊天。");
         return;
     }
 
@@ -1618,6 +1896,7 @@ fn chat_list_panel(
                         {
                             manager.open_chat_targets.insert(target_id.clone());
                             manager.pending_chat_targets.remove(&target_id);
+                            focus_standalone_chat_window(ctx, &target_id);
                             changed = true;
                         }
 
@@ -1635,7 +1914,7 @@ fn chat_list_panel(
                     if is_editing {
                         ui.text_edit_singleline(edit_name);
                         ui.horizontal(|ui| {
-                            if ui.button("Save").clicked() {
+                            if ui.button("保存").clicked() {
                                 manager
                                     .chat_targets
                                     .entry(target_id.clone())
@@ -1645,11 +1924,11 @@ fn chat_list_panel(
                                 edit_name.clear();
                                 changed = true;
                             }
-                            if ui.button("Cancel").clicked() {
+                            if ui.button("取消").clicked() {
                                 *edit_target = None;
                                 edit_name.clear();
                             }
-                            if ui.button("Clear").clicked() {
+                            if ui.button("清除").clicked() {
                                 if let Some(metadata) = manager.chat_targets.get_mut(&target_id) {
                                     metadata.display_name.clear();
                                 }
@@ -1660,7 +1939,7 @@ fn chat_list_panel(
                         });
                     } else {
                         ui.horizontal(|ui| {
-                            if ui.button("Edit").clicked() {
+                            if ui.button("编辑").clicked() {
                                 *edit_target = Some(target_id.clone());
                                 *edit_name = manager
                                     .chat_targets
@@ -1669,13 +1948,14 @@ fn chat_list_panel(
                                     .filter(|name| !name.trim().is_empty())
                                     .unwrap_or_else(|| target_display_name(manager, &target_id));
                             }
-                            let close_label = if is_open { "Close" } else { "Open" };
+                            let close_label = if is_open { "关闭" } else { "打开" };
                             if ui.button(close_label).clicked() {
                                 if is_open {
                                     manager.open_chat_targets.remove(&target_id);
                                 } else {
                                     manager.open_chat_targets.insert(target_id.clone());
                                     manager.pending_chat_targets.remove(&target_id);
+                                    focus_standalone_chat_window(ctx, &target_id);
                                 }
                                 changed = true;
                             }
@@ -1730,7 +2010,7 @@ fn character_status_summary_ui(ui: &mut Ui, character: &PlayerCharacter) {
         ));
         ui.small(format!("Lv {}", character.level));
         ui.small(format!(
-            "Speed {}",
+            "速度 {}",
             format_character_number(character.speed)
         ));
     });
@@ -1792,69 +2072,533 @@ fn character_status_summary_ui(ui: &mut Ui, character: &PlayerCharacter) {
         });
 }
 
-fn quick_character_window(
+#[derive(Clone)]
+struct QuickCastSkill {
+    index: usize,
+    name: String,
+    note: String,
+    mp_cost: f32,
+    cooldown_turns: u32,
+}
+
+#[derive(Clone, Copy)]
+enum QuickCastEffect {
+    Damage { amount: f32, target: TargetSelector },
+    Heal { amount: f32, target: TargetSelector },
+}
+
+struct QuickCastAction {
+    caster_id: String,
+    skill: QuickCastSkill,
+    targets: Vec<String>,
+    effect: Option<QuickCastEffect>,
+    cast_turn: u32,
+    force: bool,
+}
+
+fn quick_character_windows(
     ctx: &Context,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
-    quick_character_target: &mut Local<Option<String>>,
+    quick_character_targets: &mut Local<HashSet<String>>,
     character_edit_state: &mut CharacterEditState,
     rule_engine_state: &mut RuleEngineState,
+    scene_positions: Option<&SceneCharacterPositions>,
+    player_camera_positions: Option<&ScenePlayerCameraPositions>,
 ) {
-    let Some(target_id) = quick_character_target.as_ref().cloned() else {
-        return;
-    };
-    if is_group_chat_target(manager, &target_id) {
-        quick_character_target.take();
-        return;
-    }
+    let mut target_ids = quick_character_targets.iter().cloned().collect::<Vec<_>>();
+    target_ids.sort();
 
-    let display_name = target_display_name(manager, &target_id);
-    let mut open = true;
-    let mut changed = false;
-    let window_max_width = ctx
-        .content_rect()
-        .width()
-        .min(CHARACTER_WINDOW_MAX_WIDTH)
-        .max(CHARACTER_WINDOW_MIN_WIDTH);
-    egui::Window::new(format!("Character: {display_name}"))
-        .id(Id::new((
-            "quick_character_window",
-            target_id.as_str(),
-        )))
-        .open(&mut open)
-        .default_width(CHARACTER_WINDOW_DEFAULT_WIDTH)
-        .min_width(CHARACTER_WINDOW_MIN_WIDTH)
-        .max_width(window_max_width)
-        .resizable(true)
-        .show(ctx, |ui| {
-            ui.set_max_width(window_max_width);
-            ui.horizontal(|ui| {
-                ui.small("Player");
-                ui.monospace(&target_id);
-            });
-            let character = manager
-                .player_characters
-                .entry(target_id.clone())
-                .or_default();
-            character_status_summary_ui(ui, character);
-            ui.separator();
-            ui.collapsing("Edit character", |ui| {
-                changed |= character_editor_ui(
+    let mut closed_targets = Vec::new();
+    for target_id in target_ids {
+        if is_group_chat_target(manager, &target_id) {
+            closed_targets.push(target_id);
+            continue;
+        }
+
+        let display_name = target_display_name(manager, &target_id);
+        let character_targets = quick_cast_character_targets(manager);
+        let cast_turn = quick_cast_cooldown_turn(manager, &target_id);
+        let mut open = true;
+        let mut changed = false;
+        let mut cast_action = None;
+        let window_max_width = ctx
+            .content_rect()
+            .width()
+            .min(CHARACTER_WINDOW_MAX_WIDTH)
+            .max(CHARACTER_WINDOW_MIN_WIDTH);
+        egui::Window::new(format!("角色：{display_name}"))
+            .id(Id::new((
+                "quick_character_window",
+                target_id.as_str(),
+            )))
+            .open(&mut open)
+            .default_width(CHARACTER_WINDOW_DEFAULT_WIDTH)
+            .min_width(CHARACTER_WINDOW_MIN_WIDTH)
+            .max_width(window_max_width)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.set_max_width(window_max_width);
+                ui.horizontal(|ui| {
+                    ui.small("玩家");
+                    ui.monospace(&target_id);
+                });
+                let character = manager
+                    .player_characters
+                    .entry(target_id.clone())
+                    .or_default();
+                character_status_summary_ui(ui, character);
+                ui.separator();
+                cast_action = quick_cast_ui(
                     ui,
                     &target_id,
                     character,
-                    &display_name,
                     character_edit_state,
-                    rule_engine_state,
+                    &character_targets,
+                    cast_turn,
+                    scene_positions,
+                    player_camera_positions,
                 );
+                ui.separator();
+                ui.collapsing("编辑角色", |ui| {
+                    changed |= character_editor_ui(
+                        ui,
+                        &target_id,
+                        character,
+                        &display_name,
+                        character_edit_state,
+                        rule_engine_state,
+                    );
+                });
             });
-        });
 
-    if !open {
-        quick_character_target.take();
+        if !open {
+            closed_targets.push(target_id);
+        }
+        if let Some(action) = cast_action {
+            changed |= apply_quick_cast_action(manager, action);
+        }
+        if changed {
+            manager.persist().ok();
+        }
     }
-    if changed {
-        manager.persist().ok();
+
+    for target_id in closed_targets {
+        quick_character_targets.remove(&target_id);
     }
+}
+
+fn quick_cast_ui(
+    ui: &mut Ui,
+    caster_id: &str,
+    character: &mut PlayerCharacter,
+    edit_state: &mut CharacterEditState,
+    character_targets: &[(String, String)],
+    cast_turn: u32,
+    scene_positions: Option<&SceneCharacterPositions>,
+    player_camera_positions: Option<&ScenePlayerCameraPositions>,
+) -> Option<QuickCastAction> {
+    let skills = quick_cast_skills(character);
+    if skills.is_empty() {
+        ui.small("没有可释放技能。");
+        return None;
+    }
+
+    let selected = edit_state
+        .quick_cast_skill_index
+        .entry(caster_id.to_owned())
+        .or_insert(0);
+    if *selected >= skills.len() {
+        *selected = 0;
+    }
+    let skill = skills[*selected].clone();
+    let effect = quick_cast_effect(&skill.note);
+    let cooldown_remaining = quick_skill_cooldown_remaining(
+        character,
+        skill.index,
+        skill.cooldown_turns,
+        cast_turn,
+    );
+    let targets = effect
+        .as_ref()
+        .map(|effect| {
+            quick_cast_targets(
+                caster_id,
+                effect,
+                character_targets,
+                scene_positions,
+                player_camera_positions,
+            )
+        })
+        .unwrap_or_default();
+    let can_pay = character.mp + f32::EPSILON >= skill.mp_cost;
+    let can_cast = can_pay && cooldown_remaining == 0 && effect.is_some();
+    let force_pending = edit_state
+        .pending_force_cast
+        .as_ref()
+        .is_some_and(|(target_id, index)| target_id == caster_id && *index == *selected);
+
+    let mut action = None;
+    egui::CollapsingHeader::new("释放技能")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("技能");
+                egui::ComboBox::from_id_salt(format!("quick_cast_skill_{caster_id}"))
+                    .selected_text(skill.name.as_str())
+                    .show_ui(ui, |ui| {
+                        for (index, skill) in skills.iter().enumerate() {
+                            let remaining = quick_skill_cooldown_remaining(
+                                character,
+                                skill.index,
+                                skill.cooldown_turns,
+                                cast_turn,
+                            );
+                            let mut details = Vec::new();
+                            if skill.mp_cost > 0.0 {
+                                details.push(format!(
+                                    "MP {}",
+                                    format_character_number(skill.mp_cost)
+                                ));
+                            }
+                            if remaining > 0 {
+                                details.push(format!("CD {remaining}"));
+                            } else if skill.cooldown_turns > 0 {
+                                details.push(format!("CD {}", skill.cooldown_turns));
+                            }
+                            let label = if details.is_empty() {
+                                skill.name.clone()
+                            } else {
+                                format!(
+                                    "{} ({})",
+                                    skill.name,
+                                    details.join(", ")
+                                )
+                            };
+                            ui.selectable_value(selected, index, label);
+                        }
+                    });
+                if let Some(radius) = effect.as_ref().and_then(quick_cast_radius) {
+                    ui.small(format!(
+                        "以玩家镜头为中心 {}米",
+                        format_character_number(radius)
+                    ));
+                }
+            });
+
+            if let Some(effect) = effect.as_ref() {
+                let target_label = match effect {
+                    QuickCastEffect::Damage { .. } => "范围内目标",
+                    QuickCastEffect::Heal { .. } => "可影响角色",
+                };
+                if targets.is_empty() {
+                    ui.small("范围内没有可影响角色。");
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small(target_label);
+                        for target_id in &targets {
+                            let name = character_targets
+                                .iter()
+                                .find(|(candidate_id, _)| candidate_id == target_id)
+                                .map(|(_, name)| name.as_str())
+                                .unwrap_or(target_id.as_str());
+                            ui.small(name);
+                        }
+                    });
+                }
+            } else {
+                ui.small("技能描述需要是可解析的固定伤害或治疗规则。");
+            }
+
+            let response = ui.add_enabled(can_cast, egui::Button::new("释放"));
+            if response.clicked() {
+                action = Some(QuickCastAction {
+                    caster_id: caster_id.to_owned(),
+                    skill: skill.clone(),
+                    targets: targets.clone(),
+                    effect: effect.clone(),
+                    cast_turn,
+                    force: false,
+                });
+                edit_state.pending_force_cast = None;
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                let force_response = ui
+                    .add(egui::Button::new("强制释放"))
+                    .on_hover_text("GM强制释放：忽略MP、目标和规则解析条件。");
+                if force_response.clicked() {
+                    if force_pending {
+                        action = Some(QuickCastAction {
+                            caster_id: caster_id.to_owned(),
+                            skill: skill.clone(),
+                            targets: targets.clone(),
+                            effect: effect.clone(),
+                            cast_turn,
+                            force: true,
+                        });
+                        edit_state.pending_force_cast = None;
+                    } else {
+                        edit_state.pending_force_cast = Some((caster_id.to_owned(), *selected));
+                    }
+                }
+                if force_pending {
+                    ui.small("再次点击强制释放确认。");
+                    if ui.small_button("取消").clicked() {
+                        edit_state.pending_force_cast = None;
+                    }
+                }
+            });
+
+            if cooldown_remaining > 0 {
+                ui.small(format!(
+                    "冷却还剩{cooldown_remaining}轮"
+                ));
+            }
+            if !can_cast && can_pay && cooldown_remaining == 0 {
+                ui.small("普通释放需要可解析的固定伤害或治疗规则；强制释放可忽略。");
+            }
+            if !can_pay {
+                ui.small(format!(
+                    "需要{} MP",
+                    format_character_number(skill.mp_cost)
+                ));
+            }
+        });
+    action
+}
+
+fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
+    normalize_character_skill_fields(character);
+    character
+        .skill_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let name = if name.trim().is_empty() {
+                format!("技能{}", index + 1)
+            } else {
+                name.trim().to_owned()
+            };
+            QuickCastSkill {
+                index,
+                name,
+                note: character
+                    .skill_notes
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_default(),
+                mp_cost: character
+                    .skill_mp_costs
+                    .get(index)
+                    .copied()
+                    .unwrap_or_default()
+                    .max(0.0),
+                cooldown_turns: character
+                    .skill_cooldown_turns
+                    .get(index)
+                    .copied()
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+fn quick_cast_cooldown_turn(manager: &NapcatMessageManager, caster_id: &str) -> u32 {
+    manager
+        .trpg_groups
+        .values()
+        .filter(|group| group.players.iter().any(|player_id| player_id == caster_id))
+        .map(|group| {
+            group
+                .player_turns
+                .get(caster_id)
+                .map(|turn| turn.turns_passed)
+                .unwrap_or(group.world_turn)
+        })
+        .max()
+        .unwrap_or_default()
+}
+
+fn quick_skill_cooldown_remaining(
+    character: &PlayerCharacter,
+    skill_index: usize,
+    cooldown_turns: u32,
+    cast_turn: u32,
+) -> u32 {
+    if cooldown_turns == 0 {
+        return 0;
+    }
+    character
+        .skill_last_cast_turns
+        .get(&skill_index.to_string())
+        .map(|last_cast_turn| {
+            cooldown_turns.saturating_sub(cast_turn.saturating_sub(*last_cast_turn))
+        })
+        .unwrap_or(0)
+}
+
+fn quick_cast_effect(note: &str) -> Option<QuickCastEffect> {
+    let ast = parse_rule(note).ok()?;
+    ast.actions.into_iter().find_map(|action| match action {
+        Action::Damage {
+            target,
+            amount: ValueExpr::Number(amount),
+            ..
+        } => Some(QuickCastEffect::Damage {
+            amount: amount.max(0.0),
+            target,
+        }),
+        Action::Heal {
+            target,
+            amount: ValueExpr::Number(amount),
+        } => Some(QuickCastEffect::Heal {
+            amount: amount.max(0.0),
+            target,
+        }),
+        _ => None,
+    })
+}
+
+fn quick_cast_radius(effect: &QuickCastEffect) -> Option<f32> {
+    let target = match effect {
+        QuickCastEffect::Damage { target, .. } | QuickCastEffect::Heal { target, .. } => target,
+    };
+    target.area.and_then(|area| area.radius_meters)
+}
+
+fn quick_cast_targets(
+    caster_id: &str,
+    effect: &QuickCastEffect,
+    character_targets: &[(String, String)],
+    scene_positions: Option<&SceneCharacterPositions>,
+    player_camera_positions: Option<&ScenePlayerCameraPositions>,
+) -> Vec<String> {
+    let target = match effect {
+        QuickCastEffect::Damage { target, .. } | QuickCastEffect::Heal { target, .. } => target,
+    };
+    if let Some(area) = target.area {
+        let Some(radius) = area.radius_meters else {
+            return character_targets
+                .iter()
+                .filter(|(target_id, _)| target_id != caster_id)
+                .map(|(target_id, _)| target_id.clone())
+                .collect();
+        };
+        let Some(user_id) = caster_id.parse::<u64>().ok() else {
+            return Vec::new();
+        };
+        let Some(camera_position) =
+            player_camera_positions.and_then(|positions| positions.positions.get(&user_id))
+        else {
+            return Vec::new();
+        };
+        let Some(scene_positions) = scene_positions else {
+            return Vec::new();
+        };
+        return character_targets
+            .iter()
+            .filter(|(target_id, _)| target_id != caster_id)
+            .filter(|(target_id, _)| {
+                scene_positions
+                    .positions
+                    .get(target_id)
+                    .map(|position| camera_position.distance(*position) <= radius)
+                    .unwrap_or(false)
+            })
+            .map(|(target_id, _)| target_id.clone())
+            .collect();
+    }
+
+    match target.actor {
+        ActorRef::SelfActor => vec![caster_id.to_owned()],
+        ActorRef::Source | ActorRef::Target => character_targets
+            .iter()
+            .find(|(target_id, _)| target_id != caster_id)
+            .map(|(target_id, _)| vec![target_id.clone()])
+            .unwrap_or_default(),
+    }
+}
+
+fn quick_cast_character_targets(manager: &NapcatMessageManager) -> Vec<(String, String)> {
+    let mut targets = manager
+        .player_characters
+        .iter()
+        .filter(|(_, character)| character.inited && character.hp > 0.0)
+        .map(|(target_id, character)| {
+            let display_name = if !character.nickname.trim().is_empty() {
+                character.nickname.trim().to_owned()
+            } else if !character.name.trim().is_empty() {
+                character.name.trim().to_owned()
+            } else {
+                target_display_name(manager, target_id)
+            };
+            (target_id.clone(), display_name)
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    targets
+}
+
+fn apply_quick_cast_action(
+    manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+    action: QuickCastAction,
+) -> bool {
+    apply_quick_cast_action_to_manager(manager.as_mut(), action)
+}
+
+fn apply_quick_cast_action_to_manager(
+    manager: &mut NapcatMessageManager,
+    action: QuickCastAction,
+) -> bool {
+    let Some(caster) = manager.player_characters.get_mut(&action.caster_id) else {
+        return false;
+    };
+    if !action.force && caster.mp + f32::EPSILON < action.skill.mp_cost {
+        return false;
+    }
+    let cooldown_remaining = quick_skill_cooldown_remaining(
+        caster,
+        action.skill.index,
+        action.skill.cooldown_turns,
+        action.cast_turn,
+    );
+    if !action.force && cooldown_remaining > 0 {
+        return false;
+    }
+    if !action.force {
+        caster.mp = (caster.mp - action.skill.mp_cost).max(0.0);
+    }
+    caster.skill_last_cast_turns.insert(
+        action.skill.index.to_string(),
+        action.cast_turn,
+    );
+
+    let mut changed = true;
+    let Some(effect) = action.effect else {
+        return changed;
+    };
+    for target_id in action.targets {
+        let Some(target) = manager.player_characters.get_mut(&target_id) else {
+            continue;
+        };
+        match effect {
+            QuickCastEffect::Damage { amount, .. } => {
+                let next_hp = (target.hp - amount).max(0.0);
+                if (target.hp - next_hp).abs() > f32::EPSILON {
+                    target.hp = next_hp;
+                    changed = true;
+                }
+            },
+            QuickCastEffect::Heal { amount, .. } => {
+                let next_hp = (target.hp + amount).min(target.max_hp);
+                if (target.hp - next_hp).abs() > f32::EPSILON {
+                    target.hp = next_hp;
+                    changed = true;
+                }
+            },
+        }
+    }
+    changed
 }
 
 fn status_summary_value_ui(ui: &mut Ui, label: &str, base: i32, extra: i32) {
@@ -1885,9 +2629,10 @@ fn character_editor_ui(
     rule_engine_state: &mut RuleEngineState,
 ) -> bool {
     let mut changed = false;
+    let mut derived_stats_changed = false;
     ui.horizontal(|ui| {
-        changed |= ui.checkbox(&mut character.inited, "Initialized").changed();
-        egui::ComboBox::from_label("Workflow")
+        changed |= ui.checkbox(&mut character.inited, "已完成").changed();
+        egui::ComboBox::from_label("流程")
             .selected_text(character_creation_step_label(
                 character.creation_step,
             ))
@@ -1902,11 +2647,11 @@ fn character_editor_ui(
                         .changed();
                 }
             });
-        if ui.button("Use chat name").clicked() {
+        if ui.button("使用聊天名").clicked() {
             character.nickname = chat_display_name.to_owned();
             changed = true;
         }
-        if ui.button("Reset").clicked() {
+        if ui.button("重置").clicked() {
             edit_state.pending_character_reset = Some(target_id.to_owned());
         }
     });
@@ -1923,21 +2668,21 @@ fn character_editor_ui(
         )))
         .show(ui.ctx(), |ui| {
             ui.set_width(300.0);
-            ui.heading("Reset character?");
+            ui.heading("重置角色？");
             ui.label(format!(
-                "This will clear all character data for {character_label}."
+                "这会清空{character_label}的所有角色数据。"
             ));
-            ui.label("This action cannot be undone.");
+            ui.label("此操作无法撤销。");
 
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("取消").clicked() {
                         ui.close();
                     }
                 },
                 |ui| {
-                    if ui.button("Reset").clicked() {
+                    if ui.button("重置").clicked() {
                         *character = PlayerCharacter::default();
                         edit_state.unlocked_status_targets.remove(target_id);
                         edit_state.gm_status_drafts.remove(target_id);
@@ -1954,39 +2699,39 @@ fn character_editor_ui(
     }
 
     ui.columns(2, |columns| {
-        columns[0].label("Character name");
+        columns[0].label("角色名");
         changed |= columns[0]
             .text_edit_singleline(&mut character.name)
             .changed();
-        columns[1].label("Nickname");
+        columns[1].label("昵称");
         changed |= columns[1]
             .text_edit_singleline(&mut character.nickname)
             .changed();
     });
-    ui.label("Image URL");
+    ui.label("图片URL");
     changed |= ui.text_edit_singleline(&mut character.image).changed();
 
     ui.separator();
     let status_unlocked = edit_state.unlocked_status_targets.contains(target_id);
     ui.horizontal_wrapped(|ui| {
         ui.label(format!(
-            "Creation pts left {}",
+            "创建点数剩余 {}",
             character.status_points
         ));
         ui.label(format!(
-            "Exchange pts {}",
+            "兑换点数 {}",
             character.exchange_points
         ));
         ui.label(format!(
-            "HP Status: {}",
+            "HP状态：{}",
             character_hp_status(character.hp, character.max_hp)
         ));
         if status_unlocked {
-            if ui.button("Lock").clicked() {
+            if ui.button("锁定").clicked() {
                 edit_state.unlocked_status_targets.remove(target_id);
                 edit_state.gm_status_drafts.remove(target_id);
             }
-        } else if ui.button("Unlock").clicked() {
+        } else if ui.button("解锁").clicked() {
             edit_state
                 .unlocked_status_targets
                 .insert(target_id.to_owned());
@@ -1995,18 +2740,20 @@ fn character_editor_ui(
                 character.extra_status.clone(),
             );
         }
-        changed |= ui
+        let level_response = ui
             .add(
                 egui::DragValue::new(&mut character.level)
                     .range(1..=999)
-                    .prefix("Lv "),
+                    .prefix("等级 "),
             )
             .changed();
+        changed |= level_response;
+        derived_stats_changed |= level_response;
         changed |= ui
             .add(
                 egui::DragValue::new(&mut character.exp)
                     .range(0..=999_999)
-                    .prefix("Exp "),
+                    .prefix("经验 "),
             )
             .changed();
     });
@@ -2032,7 +2779,7 @@ fn character_editor_ui(
                 egui::DragValue::new(&mut character.hp_regen)
                     .range(-9999.0..=9999.0)
                     .speed(0.1)
-                    .prefix("Reg "),
+                    .prefix("回复 "),
             )
             .changed();
     });
@@ -2058,7 +2805,7 @@ fn character_editor_ui(
                 egui::DragValue::new(&mut character.mp_regen)
                     .range(-9999.0..=9999.0)
                     .speed(0.1)
-                    .prefix("Reg "),
+                    .prefix("回复 "),
             )
             .changed();
     });
@@ -2068,7 +2815,7 @@ fn character_editor_ui(
                 egui::DragValue::new(&mut character.speed)
                     .range(0.0..=9999.0)
                     .speed(0.1)
-                    .prefix("Speed "),
+                    .prefix("速度 "),
             )
             .changed();
         changed |= ui
@@ -2076,7 +2823,7 @@ fn character_editor_ui(
                 egui::DragValue::new(&mut character.damage_dealt_modifier)
                     .range(0.0..=99.0)
                     .speed(0.01)
-                    .prefix("DMG "),
+                    .prefix("伤害 "),
             )
             .changed();
         changed |= ui
@@ -2084,7 +2831,7 @@ fn character_editor_ui(
                 egui::DragValue::new(&mut character.damage_taken_modifier)
                     .range(0.0..=99.0)
                     .speed(0.01)
-                    .prefix("Taken "),
+                    .prefix("承伤 "),
             )
             .changed();
     });
@@ -2094,7 +2841,7 @@ fn character_editor_ui(
                 egui::DragValue::new(&mut character.healing_dealt_modifier)
                     .range(0.0..=99.0)
                     .speed(0.01)
-                    .prefix("Heal "),
+                    .prefix("治疗 "),
             )
             .changed();
         changed |= ui
@@ -2102,19 +2849,21 @@ fn character_editor_ui(
                 egui::DragValue::new(&mut character.healing_taken_modifier)
                     .range(0.0..=99.0)
                     .speed(0.01)
-                    .prefix("Heal taken "),
+                    .prefix("受疗 "),
             )
             .changed();
     });
 
     ui.separator();
-    changed |= character_status_source_ui(
+    let status_changed = character_status_source_ui(
         ui,
         target_id,
         character,
         edit_state,
         status_unlocked,
     );
+    changed |= status_changed;
+    derived_stats_changed |= status_changed;
     ui.separator();
     changed |= character_buff_editor_ui(
         ui,
@@ -2130,6 +2879,19 @@ fn character_editor_ui(
         character,
         rule_engine_state,
     );
+
+    if derived_stats_changed {
+        update_character_from_status(character);
+        if !character.active_buffs.is_empty() {
+            character.buff_base_stats = Some(CharacterBuffBaseStats::from_character(
+                character,
+            ));
+            sync_character_buffs(target_id, character, rule_engine_state);
+        } else {
+            sync_character_skill_rules(target_id, character, rule_engine_state);
+        }
+        changed = true;
+    }
 
     if character.max_hp < 0.0 {
         character.max_hp = 0.0;
@@ -2160,14 +2922,10 @@ fn character_skill_editor_ui(
 
     ui.horizontal(|ui| {
         ui.label(format!(
-            "Skill descriptions: {}",
+            "技能描述：{}",
             character.skill_notes.len()
         ));
-        if ui
-            .button("+")
-            .on_hover_text("Add skill description")
-            .clicked()
-        {
+        if ui.button("+").on_hover_text("添加技能描述").clicked() {
             character.skill_names.push(String::new());
             character.skill_notes.push(String::new());
             character.skill_mp_costs.push(0.0);
@@ -2182,7 +2940,7 @@ fn character_skill_editor_ui(
             let width = (ui.available_width() - 28.0).clamp(160.0, CHARACTER_FIELD_MAX_WIDTH);
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Spell name");
+                    ui.label("技能名");
                     changed |= ui
                         .add(
                             egui::TextEdit::singleline(&mut character.skill_names[index])
@@ -2204,7 +2962,7 @@ fn character_skill_editor_ui(
                             egui::DragValue::new(&mut character.skill_cooldown_turns[index])
                                 .range(0..=999)
                                 .speed(1)
-                                .prefix("Cooldown "),
+                                .prefix("冷却 "),
                         )
                         .changed();
                 });
@@ -2227,11 +2985,7 @@ fn character_skill_editor_ui(
                     );
                 }
             });
-            if ui
-                .button("-")
-                .on_hover_text("Remove skill description")
-                .clicked()
-            {
+            if ui.button("-").on_hover_text("移除技能描述").clicked() {
                 remove_index = Some(index);
             }
         });
@@ -2245,6 +2999,10 @@ fn character_skill_editor_ui(
         character.skill_notes.remove(index);
         character.skill_mp_costs.remove(index);
         character.skill_cooldown_turns.remove(index);
+        shift_skill_last_cast_turns_after_remove(
+            &mut character.skill_last_cast_turns,
+            index,
+        );
         changed = true;
     }
 
@@ -2283,7 +3041,46 @@ fn normalize_character_skill_fields(character: &mut PlayerCharacter) -> bool {
             changed = true;
         }
     }
+    if retain_valid_skill_last_cast_turns(
+        &mut character.skill_last_cast_turns,
+        skill_count,
+    ) {
+        changed = true;
+    }
     changed
+}
+
+fn retain_valid_skill_last_cast_turns(
+    last_cast_turns: &mut HashMap<String, u32>,
+    skill_count: usize,
+) -> bool {
+    let before_len = last_cast_turns.len();
+    last_cast_turns.retain(|key, _| {
+        key.parse::<usize>()
+            .ok()
+            .is_some_and(|index| index < skill_count)
+    });
+    before_len != last_cast_turns.len()
+}
+
+fn shift_skill_last_cast_turns_after_remove(
+    last_cast_turns: &mut HashMap<String, u32>,
+    removed_index: usize,
+) {
+    let shifted = last_cast_turns
+        .iter()
+        .filter_map(|(key, turn)| {
+            let index = key.parse::<usize>().ok()?;
+            if index == removed_index {
+                None
+            } else if index > removed_index {
+                Some(((index - 1).to_string(), *turn))
+            } else {
+                Some((key.clone(), *turn))
+            }
+        })
+        .collect();
+    *last_cast_turns = shifted;
 }
 
 fn parse_skill_note(note: &str) -> Result<Option<RuleAst>, String> {
@@ -2298,6 +3095,21 @@ fn sync_character_skill_rules(
     character: &PlayerCharacter,
     rule_engine_state: &mut RuleEngineState,
 ) {
+    let stats = CharacterBuffBaseStats::from_character(character);
+    sync_character_skill_rules_with_stats(
+        target_id,
+        character,
+        &stats,
+        rule_engine_state,
+    );
+}
+
+fn sync_character_skill_rules_with_stats(
+    target_id: &str,
+    character: &PlayerCharacter,
+    stats: &CharacterBuffBaseStats,
+    rule_engine_state: &mut RuleEngineState,
+) {
     let rules = character
         .skill_notes
         .iter()
@@ -2308,19 +3120,19 @@ fn sync_character_skill_rules(
     rule_engine_state.sync_character(
         target_id,
         display_name,
-        character.hp,
-        character.max_hp,
-        character.damage_dealt_modifier,
-        character.damage_taken_modifier,
-        character.healing_dealt_modifier,
-        character.healing_taken_modifier,
+        stats.hp,
+        stats.max_hp,
+        stats.damage_dealt_modifier,
+        stats.damage_taken_modifier,
+        stats.healing_dealt_modifier,
+        stats.healing_taken_modifier,
         rules,
     );
 }
 
 fn character_creation_step_options() -> [(CharacterCreationStep, &'static str); 14] {
     [
-        (CharacterCreationStep::Normal, "Normal"),
+        (CharacterCreationStep::Normal, "普通"),
         (CharacterCreationStep::Str, "STR"),
         (CharacterCreationStep::Agi, "AGI"),
         (CharacterCreationStep::Dex, "DEX"),
@@ -2331,18 +3143,15 @@ fn character_creation_step_options() -> [(CharacterCreationStep, &'static str); 
         (CharacterCreationStep::Cha, "CHA"),
         (
             CharacterCreationStep::ConfirmStatus,
-            "Confirm status",
+            "确认属性",
         ),
-        (CharacterCreationStep::Skill, "Skill"),
+        (CharacterCreationStep::Skill, "技能"),
         (
             CharacterCreationStep::ConfirmSkill,
-            "Confirm skill",
+            "确认技能",
         ),
-        (CharacterCreationStep::Image, "Image"),
-        (
-            CharacterCreationStep::Nickname,
-            "Nickname",
-        ),
+        (CharacterCreationStep::Image, "图片"),
+        (CharacterCreationStep::Nickname, "昵称"),
     ]
 }
 
@@ -2350,7 +3159,7 @@ fn character_creation_step_label(step: CharacterCreationStep) -> &'static str {
     character_creation_step_options()
         .iter()
         .find_map(|(candidate, label)| (*candidate == step).then_some(*label))
-        .unwrap_or("Unknown")
+        .unwrap_or("未知")
 }
 
 fn character_status_source_ui(
@@ -2362,14 +3171,14 @@ fn character_status_source_ui(
 ) -> bool {
     let mut changed = false;
     ui.horizontal_wrapped(|ui| {
-        ui.label("Status sources");
+        ui.label("属性来源");
         if unlocked {
-            ui.small("GM modifier draft is unlocked");
+            ui.small("GM修正草稿已解锁");
         } else {
-            ui.small("Locked");
+            ui.small("已锁定");
         }
     });
-    ui.small("Creation values come from the player's build flow. GM modifier values are separate and are added on top.");
+    ui.small("创建值来自玩家建卡流程。GM修正值单独记录，并叠加到总值上。");
 
     if unlocked && !edit_state.gm_status_drafts.contains_key(target_id) {
         edit_state.gm_status_drafts.insert(
@@ -2388,62 +3197,62 @@ fn character_status_source_ui(
                 .num_columns(5)
                 .spacing([10.0, 4.0])
                 .show(ui, |ui| {
-                    ui.strong("Stat");
-                    ui.strong("Creation");
-                    ui.strong("Current GM");
-                    ui.strong("Draft GM");
-                    ui.strong("Total");
+                    ui.strong("属性");
+                    ui.strong("创建");
+                    ui.strong("当前GM");
+                    ui.strong("草稿GM");
+                    ui.strong("总值");
                     ui.end_row();
-                    changed |= status_source_value_ui(
+                    status_source_value_ui(
                         ui,
                         "STR",
                         character.status.str_,
                         character.extra_status.str_,
                         &mut draft.str_,
                     );
-                    changed |= status_source_value_ui(
+                    status_source_value_ui(
                         ui,
                         "AGI",
                         character.status.agi,
                         character.extra_status.agi,
                         &mut draft.agi,
                     );
-                    changed |= status_source_value_ui(
+                    status_source_value_ui(
                         ui,
                         "DEX",
                         character.status.dex,
                         character.extra_status.dex,
                         &mut draft.dex,
                     );
-                    changed |= status_source_value_ui(
+                    status_source_value_ui(
                         ui,
                         "VIT",
                         character.status.vit,
                         character.extra_status.vit,
                         &mut draft.vit,
                     );
-                    changed |= status_source_value_ui(
+                    status_source_value_ui(
                         ui,
                         "INT",
                         character.status.int_,
                         character.extra_status.int_,
                         &mut draft.int_,
                     );
-                    changed |= status_source_value_ui(
+                    status_source_value_ui(
                         ui,
                         "WIS",
                         character.status.wis,
                         character.extra_status.wis,
                         &mut draft.wis,
                     );
-                    changed |= status_source_value_ui(
+                    status_source_value_ui(
                         ui,
                         "K",
                         character.status.k,
                         character.extra_status.k,
                         &mut draft.k,
                     );
-                    changed |= status_source_value_ui(
+                    status_source_value_ui(
                         ui,
                         "CHA",
                         character.status.cha,
@@ -2454,13 +3263,13 @@ fn character_status_source_ui(
             draft.clone()
         };
         ui.horizontal(|ui| {
-            if ui.button("Apply GM modifiers").clicked() {
+            if ui.button("应用GM修正").clicked() {
                 character.extra_status = draft_for_apply.clone();
                 edit_state.unlocked_status_targets.remove(target_id);
                 edit_state.gm_status_drafts.remove(target_id);
                 changed = true;
             }
-            if ui.button("Cancel").clicked() {
+            if ui.button("取消").clicked() {
                 edit_state.unlocked_status_targets.remove(target_id);
                 edit_state.gm_status_drafts.remove(target_id);
             }
@@ -2471,10 +3280,10 @@ fn character_status_source_ui(
             .spacing([12.0, 4.0])
             .striped(true)
             .show(ui, |ui| {
-                ui.strong("Stat");
-                ui.strong("Creation");
+                ui.strong("属性");
+                ui.strong("创建");
                 ui.strong("GM");
-                ui.strong("Total");
+                ui.strong("总值");
                 ui.end_row();
                 readonly_status_source_row(
                     ui,
@@ -2597,7 +3406,7 @@ fn character_buff_editor_ui(
     sync_character_buffs(target_id, character, rule_engine_state);
     ui.horizontal_wrapped(|ui| {
         ui.label(format!(
-            "Active buffs: {}",
+            "生效buff：{}",
             character.active_buffs.len()
         ));
         let active_names = rule_engine_state.active_buff_names(target_id);
@@ -2612,22 +3421,24 @@ fn character_buff_editor_ui(
             ui.horizontal_wrapped(|ui| {
                 changed |= ui.text_edit_singleline(&mut buff.name).changed();
                 changed |= buff_kind_combo(ui, &mut buff.kind);
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut buff.turns_remaining)
-                            .range(1..=999)
-                            .prefix("Turns "),
-                    )
-                    .changed();
+                let turns_response = ui.add(
+                    egui::DragValue::new(&mut buff.turns_remaining)
+                        .range(0..=999)
+                        .prefix("轮数 "),
+                );
+                changed |= turns_response.on_hover_text("输入0为永久buff").changed();
+                if buff.turns_remaining == 0 {
+                    ui.small("永久");
+                }
                 changed |= ui
                     .add(
                         egui::DragValue::new(&mut buff.priority)
                             .range(-999..=999)
-                            .prefix("Priority "),
+                            .prefix("优先级 "),
                     )
                     .changed();
-                changed |= ui.checkbox(&mut buff.beneficial, "Beneficial").changed();
-                if ui.button("Remove").clicked() {
+                changed |= ui.checkbox(&mut buff.beneficial, "增益").changed();
+                if ui.button("移除").clicked() {
                     remove_index = Some(index);
                 }
             });
@@ -2646,34 +3457,36 @@ fn character_buff_editor_ui(
         .buff_drafts
         .entry(target_id.to_owned())
         .or_default();
-    ui.collapsing("Give buff", |ui| {
+    ui.collapsing("给予buff", |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label("Name");
+            ui.label("名称");
             ui.text_edit_singleline(&mut draft.name);
             buff_kind_combo(ui, &mut draft.kind);
             ui.add(
                 egui::DragValue::new(&mut draft.turns_remaining)
-                    .range(1..=999)
-                    .prefix("Turns "),
-            );
+                    .range(0..=999)
+                    .prefix("轮数 "),
+            )
+            .on_hover_text("输入0为永久buff");
+            ui.small("输入0为永久buff");
             ui.add(
                 egui::DragValue::new(&mut draft.priority)
                     .range(-999..=999)
-                    .prefix("Priority "),
+                    .prefix("优先级 "),
             );
-            ui.checkbox(&mut draft.beneficial, "Beneficial");
+            ui.checkbox(&mut draft.beneficial, "增益");
         });
         ui.horizontal_wrapped(|ui| {
             buff_field_combo(ui, &mut draft.field);
             buff_value_ui(ui, &mut draft.value);
         });
-        if ui.button("Apply buff").clicked() {
+        if ui.button("应用buff").clicked() {
             let name = draft.name.trim();
             character.active_buffs.push(BuffSpec {
-                name: if name.is_empty() { "Unnamed buff".to_owned() } else { name.to_owned() },
+                name: if name.is_empty() { "未命名buff".to_owned() } else { name.to_owned() },
                 kind: draft.kind,
                 priority: draft.priority,
-                turns_remaining: draft.turns_remaining.max(1),
+                turns_remaining: draft.turns_remaining.max(0),
                 source_id: "gm".to_owned(),
                 beneficial: draft.beneficial,
                 effects: vec![BuffEffect {
@@ -2693,7 +3506,7 @@ fn character_buff_editor_ui(
 
 fn buff_kind_combo(ui: &mut Ui, kind: &mut BuffKind) -> bool {
     let mut changed = false;
-    egui::ComboBox::from_label("Type")
+    egui::ComboBox::from_label("类型")
         .selected_text(buff_kind_label(*kind))
         .show_ui(ui, |ui| {
             for candidate in buff_kind_options() {
@@ -2711,14 +3524,168 @@ fn buff_kind_combo(ui: &mut Ui, kind: &mut BuffKind) -> bool {
 
 fn sync_character_buffs(
     target_id: &str,
-    character: &PlayerCharacter,
+    character: &mut PlayerCharacter,
     rule_engine_state: &mut RuleEngineState,
 ) {
-    sync_character_skill_rules(target_id, character, rule_engine_state);
+    if character.active_buffs.is_empty() {
+        if let Some(base_stats) = character.buff_base_stats.take() {
+            restore_character_base_stats(character, base_stats);
+        }
+        sync_character_skill_rules(target_id, character, rule_engine_state);
+        rule_engine_state.replace_character_buffs(target_id, Vec::new());
+        return;
+    }
+
+    if character.buff_base_stats.is_none() {
+        character.buff_base_stats = Some(CharacterBuffBaseStats::from_character(
+            character,
+        ));
+    }
+    let base_stats = character
+        .buff_base_stats
+        .expect("buff base stats are initialized for active buffs");
+    sync_character_skill_rules_with_stats(
+        target_id,
+        character,
+        &base_stats,
+        rule_engine_state,
+    );
     rule_engine_state.replace_character_buffs(
         target_id,
         character.active_buffs.clone(),
     );
+    if let Some(effective) = rule_engine_state.character(target_id).cloned() {
+        apply_effective_character_stats(character, &effective);
+    }
+}
+
+fn advance_group_world_turn(
+    manager: &mut NapcatMessageManager,
+    group_name: &str,
+    rule_engine_state: &mut RuleEngineState,
+) -> bool {
+    let Some(group) = manager.trpg_groups.get_mut(group_name) else {
+        return false;
+    };
+    let players = group.players.clone();
+    let changed = group.advance_world_turn();
+    if changed {
+        advance_buffs_for_players(
+            &mut manager.player_characters,
+            &players,
+            rule_engine_state,
+        );
+    }
+    changed
+}
+
+fn mark_group_player_turn(
+    manager: &mut NapcatMessageManager,
+    group_name: &str,
+    target_id: &str,
+    acted: bool,
+    rule_engine_state: &mut RuleEngineState,
+) -> bool {
+    let Some(group) = manager.trpg_groups.get_mut(group_name) else {
+        return false;
+    };
+    let previous_world_turn = group.world_turn;
+    let players = group.players.clone();
+    let changed = if acted {
+        group.mark_player_acted(target_id)
+    } else {
+        group.mark_player_skipped(target_id)
+    };
+    if changed && group.world_turn > previous_world_turn {
+        advance_buffs_for_players(
+            &mut manager.player_characters,
+            &players,
+            rule_engine_state,
+        );
+    }
+    changed
+}
+
+fn set_group_player_waiting(
+    manager: &mut NapcatMessageManager,
+    group_name: &str,
+    target_id: &str,
+) -> bool {
+    let Some(group) = manager.trpg_groups.get_mut(group_name) else {
+        return false;
+    };
+    if !group.players.iter().any(|player_id| player_id == target_id) {
+        return false;
+    }
+    group.sync_turn_players();
+    let Some(turn) = group.player_turns.get_mut(target_id) else {
+        return false;
+    };
+    if !turn.acted && !turn.skipped {
+        return false;
+    }
+
+    turn.acted = false;
+    turn.skipped = false;
+    true
+}
+
+fn advance_buffs_for_players(
+    player_characters: &mut HashMap<String, PlayerCharacter>,
+    players: &[String],
+    rule_engine_state: &mut RuleEngineState,
+) -> bool {
+    let mut changed = false;
+    for target_id in players {
+        let Some(character) = player_characters.get_mut(target_id) else {
+            continue;
+        };
+        if advance_character_buffs(character) {
+            sync_character_buffs(target_id, character, rule_engine_state);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn advance_character_buffs(character: &mut PlayerCharacter) -> bool {
+    if character.active_buffs.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    character.active_buffs.retain_mut(|buff| {
+        if buff.turns_remaining == 0 {
+            return true;
+        }
+        if buff.turns_remaining < 0 {
+            changed = true;
+            return false;
+        }
+
+        buff.turns_remaining -= 1;
+        changed = true;
+        buff.turns_remaining > 0
+    });
+    changed
+}
+
+fn restore_character_base_stats(character: &mut PlayerCharacter, stats: CharacterBuffBaseStats) {
+    character.hp = stats.hp;
+    character.max_hp = stats.max_hp;
+    character.damage_dealt_modifier = stats.damage_dealt_modifier;
+    character.damage_taken_modifier = stats.damage_taken_modifier;
+    character.healing_dealt_modifier = stats.healing_dealt_modifier;
+    character.healing_taken_modifier = stats.healing_taken_modifier;
+}
+
+fn apply_effective_character_stats(character: &mut PlayerCharacter, effective: &RuleCharacter) {
+    character.hp = effective.hp;
+    character.max_hp = effective.max_hp;
+    character.damage_dealt_modifier = effective.damage_dealt_modifier;
+    character.damage_taken_modifier = effective.damage_taken_modifier;
+    character.healing_dealt_modifier = effective.healing_dealt_modifier;
+    character.healing_taken_modifier = effective.healing_taken_modifier;
 }
 
 fn buff_kind_options() -> [BuffKind; 6] {
@@ -2746,7 +3713,7 @@ fn buff_kind_label(kind: BuffKind) -> &'static str {
 }
 
 fn buff_field_combo(ui: &mut Ui, field: &mut BuffField) {
-    egui::ComboBox::from_label("Field")
+    egui::ComboBox::from_label("字段")
         .selected_text(buff_field_label(*field))
         .show_ui(ui, |ui| {
             for candidate in buff_field_options() {
@@ -2766,13 +3733,13 @@ fn buff_value_ui(ui: &mut Ui, value: &mut BuffValue) {
         BuffValue::Set(_) => 2,
         BuffValue::SetPercentOfBase(_) => 3,
     };
-    egui::ComboBox::from_label("Value")
+    egui::ComboBox::from_label("数值")
         .selected_text(buff_value_mode_label(mode))
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut mode, 0, "Add");
-            ui.selectable_value(&mut mode, 1, "Add %");
-            ui.selectable_value(&mut mode, 2, "Set");
-            ui.selectable_value(&mut mode, 3, "Set % base");
+            ui.selectable_value(&mut mode, 0, "增加");
+            ui.selectable_value(&mut mode, 1, "增加%");
+            ui.selectable_value(&mut mode, 2, "设为");
+            ui.selectable_value(&mut mode, 3, "设为基础%");
         });
 
     let mut amount = match *value {
@@ -2821,10 +3788,10 @@ fn buff_field_label(field: BuffField) -> &'static str {
     match field {
         BuffField::Hp => "HP",
         BuffField::Mp => "MP",
-        BuffField::MaxHp => "Max HP",
-        BuffField::MaxMp => "Max MP",
-        BuffField::HpRegen => "HP regen",
-        BuffField::MpRegen => "MP regen",
+        BuffField::MaxHp => "最大HP",
+        BuffField::MaxMp => "最大MP",
+        BuffField::HpRegen => "HP回复",
+        BuffField::MpRegen => "MP回复",
         BuffField::Status(StatusKey::Str) => "STR",
         BuffField::Status(StatusKey::Agi) => "AGI",
         BuffField::Status(StatusKey::Dex) => "DEX",
@@ -2833,19 +3800,19 @@ fn buff_field_label(field: BuffField) -> &'static str {
         BuffField::Status(StatusKey::Wis) => "WIS",
         BuffField::Status(StatusKey::K) => "K",
         BuffField::Status(StatusKey::Cha) => "CHA",
-        BuffField::DamageDealtModifier => "Damage dealt",
-        BuffField::DamageTakenModifier => "Damage taken",
-        BuffField::HealingDealtModifier => "Healing dealt",
-        BuffField::HealingTakenModifier => "Healing taken",
+        BuffField::DamageDealtModifier => "造成伤害",
+        BuffField::DamageTakenModifier => "受到伤害",
+        BuffField::HealingDealtModifier => "造成治疗",
+        BuffField::HealingTakenModifier => "受到治疗",
     }
 }
 
 fn buff_value_mode_label(mode: i32) -> &'static str {
     match mode {
-        0 => "Add",
-        1 => "Add %",
-        2 => "Set",
-        _ => "Set % base",
+        0 => "增加",
+        1 => "增加%",
+        2 => "设为",
+        _ => "设为基础%",
     }
 }
 
@@ -2856,7 +3823,7 @@ fn format_buff_effect(effect: &BuffEffect) -> String {
         BuffValue::Set(amount) => format!("={}", format_character_number(amount)),
         BuffValue::SetPercentOfBase(amount) => {
             format!(
-                "{}% base",
+                "{}%基础",
                 format_character_number(amount)
             )
         },
@@ -2888,16 +3855,16 @@ fn trpg_group_settings_window(
     let mut turn_reset: Option<String> = None;
     let mut turn_advance: Option<String> = None;
 
-    egui::Window::new("Player / Group Pools")
+    egui::Window::new("玩家/群池")
         .id(Id::new("trpg_group_settings_window"))
         .open(&mut state.open)
         .default_size(Vec2::new(620.0, 520.0))
         .min_width(420.0)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("TRPG group");
+                ui.label("TRPG组");
                 ui.text_edit_singleline(&mut state.new_group_name);
-                if ui.button("Create").clicked() {
+                if ui.button("创建").clicked() {
                     let name = state.new_group_name.trim();
                     if !name.is_empty() {
                         manager.trpg_groups.entry(name.to_owned()).or_default();
@@ -2912,9 +3879,9 @@ fn trpg_group_settings_window(
 
             ui.separator();
             ui.columns(2, |columns| {
-                columns[0].heading("Player Pool");
+                columns[0].heading("玩家池");
                 if player_targets.is_empty() {
-                    columns[0].label("No private player chats yet.");
+                    columns[0].label("还没有玩家私聊。");
                 } else {
                     egui::ScrollArea::vertical()
                         .id_salt("player_pool_settings")
@@ -2929,9 +3896,9 @@ fn trpg_group_settings_window(
                         });
                 }
 
-                columns[1].heading("Group Chat Pool");
+                columns[1].heading("群聊池");
                 if group_chat_targets.is_empty() {
-                    columns[1].label("No QQ group chats yet.");
+                    columns[1].label("还没有QQ群聊。");
                 } else {
                     egui::ScrollArea::vertical()
                         .id_salt("group_chat_pool_settings")
@@ -2948,9 +3915,9 @@ fn trpg_group_settings_window(
             });
 
             ui.separator();
-            ui.heading("Player Characters");
+            ui.heading("玩家角色");
             if player_targets.is_empty() {
-                ui.label("No private player chats yet.");
+                ui.label("还没有玩家私聊。");
             } else {
                 egui::ScrollArea::vertical()
                     .id_salt("player_character_settings")
@@ -2971,20 +3938,20 @@ fn trpg_group_settings_window(
                                             state.pending_character_delete.as_deref()
                                                 == Some(target_id.as_str());
                                         if pending_delete {
-                                            ui.label("Confirm delete?");
-                                            if ui.button("Delete character").clicked() {
+                                            ui.label("确认删除？");
+                                            if ui.button("删除角色").clicked() {
                                                 character_to_delete = Some(target_id.clone());
                                             }
-                                            if ui.button("Cancel").clicked() {
+                                            if ui.button("取消").clicked() {
                                                 state.pending_character_delete = None;
                                             }
-                                        } else if ui.button("Delete character").clicked() {
+                                        } else if ui.button("删除角色").clicked() {
                                             state.pending_character_delete =
                                                 Some(target_id.clone());
                                         }
                                     });
                                     ui.separator();
-                                    ui.collapsing("Edit character", |ui| {
+                                    ui.collapsing("编辑角色", |ui| {
                                         changed |= character_editor_ui(
                                             ui,
                                             target_id,
@@ -3001,28 +3968,24 @@ fn trpg_group_settings_window(
             }
 
             ui.separator();
-            ui.heading("TRPG Group Membership");
+            ui.heading("TRPG组成员");
 
             let mut group_names = manager.trpg_groups.keys().cloned().collect::<Vec<_>>();
             group_names.sort();
             if group_names.is_empty() {
-                ui.label("Create a TRPG group, then assign players and group chats to it.");
+                ui.label("先创建TRPG组，再分配玩家和群聊。");
                 return;
             }
 
             let mut current_group = manager.current_trpg_group.clone().unwrap_or_default();
-            egui::ComboBox::from_label("Current TRPG group")
+            egui::ComboBox::from_label("当前TRPG组")
                 .selected_text(if current_group.is_empty() {
-                    "None"
+                    "无"
                 } else {
                     current_group.as_str()
                 })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut current_group,
-                        String::new(),
-                        "None",
-                    );
+                    ui.selectable_value(&mut current_group, String::new(), "无");
                     for group_name in &group_names {
                         ui.selectable_value(
                             &mut current_group,
@@ -3050,14 +4013,14 @@ fn trpg_group_settings_window(
                             ui.horizontal(|ui| {
                                 ui.heading(&group_name);
                                 ui.small(format!(
-                                    "{} targets, world turn {}",
+                                    "{}个目标，世界轮次{}",
                                     trpg_group_member_count(&snapshot),
                                     snapshot.world_turn
                                 ));
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.button("Delete").clicked() {
+                                        if ui.button("删除").clicked() {
                                             group_to_delete = Some(group_name.clone());
                                         }
                                     },
@@ -3065,18 +4028,18 @@ fn trpg_group_settings_window(
                             });
 
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button("Advance turn").clicked() {
+                                if ui.button("推进轮次").clicked() {
                                     turn_advance = Some(group_name.clone());
                                 }
-                                if ui.button("Reset actions").clicked() {
+                                if ui.button("重置行动").clicked() {
                                     turn_reset = Some(group_name.clone());
                                 }
                             });
 
                             if snapshot.players.is_empty() {
-                                ui.small("No players in this TRPG turn group.");
+                                ui.small("这个TRPG轮次组里没有玩家。");
                             } else {
-                                ui.label("Turn status");
+                                ui.label("轮次状态");
                                 for target_id in &snapshot.players {
                                     let turn = snapshot.player_turns.get(target_id);
                                     let turns_passed =
@@ -3084,24 +4047,24 @@ fn trpg_group_settings_window(
                                     let acted = turn.map(|turn| turn.acted).unwrap_or_default();
                                     let skipped = turn.map(|turn| turn.skipped).unwrap_or_default();
                                     let status = if acted {
-                                        "acted"
+                                        "已行动"
                                     } else if skipped {
-                                        "skipped"
+                                        "已跳过"
                                     } else {
-                                        "waiting"
+                                        "等待中"
                                     };
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label(target_display_name(manager, target_id));
-                                        ui.small(format!("{} turns", turns_passed));
+                                        ui.small(format!("{}轮", turns_passed));
                                         ui.small(status);
-                                        if ui.button("Action").clicked() {
+                                        if ui.button("行动").clicked() {
                                             turn_action = Some((
                                                 group_name.clone(),
                                                 target_id.clone(),
                                                 true,
                                             ));
                                         }
-                                        if ui.button("Skip").clicked() {
+                                        if ui.button("跳过").clicked() {
                                             turn_action = Some((
                                                 group_name.clone(),
                                                 target_id.clone(),
@@ -3114,7 +4077,7 @@ fn trpg_group_settings_window(
                             }
 
                             ui.columns(2, |columns| {
-                                columns[0].label("Players");
+                                columns[0].label("玩家");
                                 for target_id in &player_targets {
                                     let mut selected = snapshot.players.contains(target_id);
                                     if columns[0]
@@ -3139,7 +4102,7 @@ fn trpg_group_settings_window(
                                     }
                                 }
 
-                                columns[1].label("Group Chats");
+                                columns[1].label("群聊");
                                 for target_id in &group_chat_targets {
                                     let mut selected = snapshot.group_chats.contains(target_id);
                                     if columns[1]
@@ -3176,13 +4139,13 @@ fn trpg_group_settings_window(
         });
 
     if let Some((group_name, target_id, acted)) = turn_action {
-        if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
-            changed |= if acted {
-                group.mark_player_acted(&target_id)
-            } else {
-                group.mark_player_skipped(&target_id)
-            };
-        }
+        changed |= mark_group_player_turn(
+            manager.as_mut(),
+            &group_name,
+            &target_id,
+            acted,
+            rule_engine_state,
+        );
     }
     if let Some(group_name) = turn_reset {
         if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
@@ -3190,9 +4153,11 @@ fn trpg_group_settings_window(
         }
     }
     if let Some(group_name) = turn_advance {
-        if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
-            changed |= group.advance_world_turn();
-        }
+        changed |= advance_group_world_turn(
+            manager.as_mut(),
+            &group_name,
+            rule_engine_state,
+        );
     }
 
     if let Some(group_name) = group_to_delete {
@@ -3227,6 +4192,9 @@ pub fn ui_system(
     mut locals: UiSystemLocals,
     mut rule_engine_state: ResMut<RuleEngineState>,
     mut battle_round_state: ResMut<BattleRoundUiState>,
+    scene_positions: Option<Res<SceneCharacterPositions>>,
+    player_camera_positions: Option<Res<ScenePlayerCameraPositions>>,
+    mut player_view_request: Option<ResMut<ScenePlayerViewRequest>>,
 ) {
     let has_run_once: &mut Local<bool> = &mut locals.has_run_once;
     let new_chat_group_modal_string_open: &mut Local<(String, bool)> =
@@ -3239,9 +4207,11 @@ pub fn ui_system(
     let chat_list_edit_name: &mut Local<String> = &mut locals.chat_list_edit_name;
     let trpg_group_settings: &mut Local<TrpgGroupSettingsState> = &mut locals.trpg_group_settings;
     let character_edit_state: &mut Local<CharacterEditState> = &mut locals.character_edit_state;
-    let quick_character_target: &mut Local<Option<String>> = &mut locals.quick_character_target;
+    let quick_character_targets: &mut Local<HashSet<String>> = &mut locals.quick_character_targets;
     let image_textures: &mut Local<HashMap<String, TextureHandle>> =
         &mut locals.chat_image_textures;
+    let turn_count_drafts: &mut Local<HashMap<(String, String), u32>> =
+        &mut locals.chat_turn_count_drafts;
 
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -3290,15 +4260,15 @@ pub fn ui_system(
         let modal = Modal::new(Id::new("New Chat Group")).show(ctx, |ui| {
             ui.set_width(250.0);
 
-            ui.heading("New Chat Group");
-            ui.label("Name:");
+            ui.heading("新建讨论组");
+            ui.label("名称：");
             ui.text_edit_singleline(&mut new_chat_group_modal_string_open.0);
 
             egui::Sides::new().show(
                 ui,
                 |_ui| {},
                 |ui| {
-                    if ui.button("Save").clicked() {
+                    if ui.button("保存").clicked() {
                         manager.groups.insert(
                             new_chat_group_modal_string_open.0.to_owned(),
                             ChatGroup { members: vec![] },
@@ -3306,7 +4276,7 @@ pub fn ui_system(
                         manager.persist().ok();
                         reset_data(new_chat_group_modal_string_open);
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("取消").clicked() {
                         reset_data(new_chat_group_modal_string_open);
                     }
                 },
@@ -3325,12 +4295,14 @@ pub fn ui_system(
         character_edit_state,
         &mut rule_engine_state,
     );
-    quick_character_window(
+    quick_character_windows(
         ctx,
         &mut manager,
-        quick_character_target,
+        quick_character_targets,
         character_edit_state,
         &mut rule_engine_state,
+        scene_positions.as_deref(),
+        player_camera_positions.as_deref(),
     );
 
     egui::TopBottomPanel::top("top_panel")
@@ -3354,10 +4326,10 @@ pub fn ui_system(
         .resizable(true)
         .show(ctx, |ui| {
             if napcat_sender.is_none() {
-                ui.label("NapCat websocket not connected");
+                ui.label("NapCat websocket未连接");
             }
             if deepseek_sender.is_none() {
-                ui.label("Deepseek worker not ready");
+                ui.label("DeepSeek后台未就绪");
             }
             let summary_markers_changed =
                 sync_summarized_message_counts(&mut manager, &deepseek_manager);
@@ -3377,6 +4349,7 @@ pub fn ui_system(
         .show(ctx, |ui| {
             chat_list_panel(
                 ui,
+                ctx,
                 &mut manager,
                 chat_list_edit_target,
                 chat_list_edit_name,
@@ -3388,6 +4361,7 @@ pub fn ui_system(
         .frame(egui::Frame::NONE)
         .show(ctx, |ui| {
             pending_chat_requests_window(ctx, &mut manager);
+            waiting_turn_manager_window(ctx, &mut manager);
 
             let mut closed_group_names = Vec::new();
             for (k, v) in &manager.groups.clone() {
@@ -3515,6 +4489,7 @@ pub fn ui_system(
                     }
                 }
 
+                let active_trpg_group = manager.current_trpg_group.clone();
                 chat_window(
                     &window_title,
                     id,
@@ -3535,8 +4510,12 @@ pub fn ui_system(
                         .as_deref()
                         .and_then(|group_name| group_deltas.get(group_name).copied()),
                     unread_count,
-                    quick_character_target,
+                    quick_character_targets,
                     image_textures,
+                    active_trpg_group.as_deref(),
+                    turn_count_drafts,
+                    &mut rule_engine_state,
+                    player_view_request.as_deref_mut(),
                 );
             }
         });
@@ -3631,4 +4610,178 @@ fn append_local_sent_message(
 
     manager.messages.entry(target_id).or_default().push(message);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_manager() -> NapcatMessageManager {
+        NapcatMessageManager {
+            messages: HashMap::default(),
+            chat_targets: HashMap::default(),
+            player_characters: HashMap::default(),
+            trpg_groups: HashMap::default(),
+            current_trpg_group: None,
+            groups: HashMap::default(),
+            read_message_counts: HashMap::default(),
+            summarized_message_counts: HashMap::default(),
+            open_chat_targets: HashSet::default(),
+            pending_chat_targets: HashSet::default(),
+        }
+    }
+
+    fn buff(name: &str, turns_remaining: i32) -> BuffSpec {
+        BuffSpec {
+            name: name.to_owned(),
+            kind: BuffKind::Magic,
+            priority: 0,
+            turns_remaining,
+            source_id: "gm".to_owned(),
+            beneficial: true,
+            effects: vec![BuffEffect {
+                field: BuffField::DamageTakenModifier,
+                value: BuffValue::Set(0.5),
+            }],
+        }
+    }
+
+    #[test]
+    fn advancing_character_buffs_decrements_and_expires_turn_limited_buffs() {
+        let mut character = PlayerCharacter {
+            active_buffs: vec![buff("expires", 1), buff("continues", 3)],
+            ..Default::default()
+        };
+
+        assert!(advance_character_buffs(&mut character));
+
+        assert_eq!(character.active_buffs.len(), 1);
+        assert_eq!(
+            character.active_buffs[0].name,
+            "continues"
+        );
+        assert_eq!(
+            character.active_buffs[0].turns_remaining,
+            2
+        );
+    }
+
+    #[test]
+    fn advancing_character_buffs_preserves_zero_turn_permanent_buffs() {
+        let mut character = PlayerCharacter {
+            active_buffs: vec![buff("permanent", 0), buff("expires", 1)],
+            ..Default::default()
+        };
+
+        assert!(advance_character_buffs(&mut character));
+
+        assert_eq!(character.active_buffs.len(), 1);
+        assert_eq!(
+            character.active_buffs[0].name,
+            "permanent"
+        );
+        assert_eq!(
+            character.active_buffs[0].turns_remaining,
+            0
+        );
+    }
+
+    #[test]
+    fn quick_cast_records_and_blocks_skill_cooldown_until_turn_passes() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                skill_names: vec!["旋风斩".to_owned()],
+                skill_cooldown_turns: vec![2],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["caster".to_owned(), "target".to_owned()],
+            player_turns: HashMap::from([(
+                "caster".to_owned(),
+                TrpgPlayerTurnState::default(),
+            )]),
+            ..Default::default()
+        });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "旋风斩".to_owned(),
+            note: String::new(),
+            mp_cost: 0.0,
+            cooldown_turns: 2,
+        };
+        let effect = QuickCastEffect::Damage {
+            amount: 1.0,
+            target: TargetSelector {
+                actor: ActorRef::Target,
+                area: None,
+            },
+        };
+
+        assert_eq!(
+            quick_cast_cooldown_turn(&manager, "caster"),
+            0
+        );
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill: skill.clone(),
+                targets: vec!["target".to_owned()],
+                effect: Some(effect),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        let caster = &manager.player_characters["caster"];
+        assert_eq!(
+            quick_skill_cooldown_remaining(caster, 0, 2, 0),
+            2
+        );
+
+        assert!(!apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill: skill.clone(),
+                targets: vec!["target".to_owned()],
+                effect: Some(effect),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+
+        manager
+            .trpg_groups
+            .get_mut("party")
+            .unwrap()
+            .set_player_turns_passed("caster", 2);
+        assert_eq!(
+            quick_cast_cooldown_turn(&manager, "caster"),
+            2
+        );
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(effect),
+                cast_turn: 2,
+                force: false,
+            },
+        ));
+    }
 }
