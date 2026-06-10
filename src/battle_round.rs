@@ -31,6 +31,7 @@ use crate::{
         NapcatMessageManager,
         PlayerCharacter,
         TrpgGroup,
+        UnitPoolEntry,
     },
     rule_engine::{
         parse_rule,
@@ -62,6 +63,7 @@ pub struct BattleRoundUiState {
     new_encounter_name: String,
     selected_group: String,
     selected_add_player: HashMap<String, String>,
+    selected_add_unit: HashMap<String, String>,
     selected_action_target: HashMap<String, String>,
     selected_skill_index: HashMap<String, usize>,
     action_amount: HashMap<String, f32>,
@@ -120,6 +122,8 @@ impl Default for BattleEncounter {
 pub struct BattleParticipantSnapshot {
     pub target_id: String,
     pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_template_id: Option<String>,
     #[serde(default)]
     pub turn: u32,
     #[serde(default)]
@@ -299,6 +303,7 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
         for participant in &encounter.participants {
             participant.target_id.hash(&mut hasher);
             participant.display_name.hash(&mut hasher);
+            participant.unit_template_id.hash(&mut hasher);
             participant.turn.hash(&mut hasher);
             participant.agi.hash(&mut hasher);
             participant.action_done.hash(&mut hasher);
@@ -666,6 +671,48 @@ fn encounter_roster_ui(
         });
     }
 
+    let unit_candidates = available_unit_templates(manager);
+    if !unit_candidates.is_empty() {
+        let selected = ui_state
+            .selected_add_unit
+            .entry(encounter_id.to_owned())
+            .or_insert_with(|| unit_candidates[0].0.clone());
+        if !unit_candidates
+            .iter()
+            .any(|(unit_id, _)| unit_id == selected)
+        {
+            *selected = unit_candidates[0].0.clone();
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("添加单位");
+            egui::ComboBox::from_id_salt(format!(
+                "battle_add_unit_{encounter_id}"
+            ))
+            .selected_text(
+                unit_candidates
+                    .iter()
+                    .find(|(unit_id, _)| unit_id == selected)
+                    .map(|(_, name)| name.as_str())
+                    .unwrap_or(selected.as_str()),
+            )
+            .show_ui(ui, |ui| {
+                for (unit_id, name) in &unit_candidates {
+                    ui.selectable_value(selected, unit_id.clone(), name);
+                }
+            });
+            if ui.button("添加单位").clicked() {
+                let unit_id = selected.as_str();
+                if let Some(unit) = manager.unit_pool.get(unit_id) {
+                    let target_id = next_unit_participant_id(encounter, unit_id);
+                    encounter.participants.push(participant_from_unit_template(
+                        &target_id, unit_id, unit,
+                    ));
+                    changed = true;
+                }
+            }
+        });
+    }
+
     if changed {
         normalize_encounter_after_edit(encounter);
     }
@@ -703,9 +750,7 @@ fn encounter_action_ui(
             )
         })
         .collect::<Vec<_>>();
-    let skills = manager
-        .player_characters
-        .get(&actor.target_id)
+    let skills = character_for_participant(&actor, manager)
         .map(character_skills)
         .unwrap_or_default();
 
@@ -955,7 +1000,7 @@ impl BattleRoundStore {
             if participant.display_name.trim().is_empty()
                 || participant.display_name == participant.target_id
             {
-                let display_name = participant_display_name(&participant.target_id, manager);
+                let display_name = participant_snapshot_display_name(participant, manager);
                 if display_name != participant.display_name {
                     participant.display_name = display_name;
                     changed = true;
@@ -1242,9 +1287,16 @@ fn refresh_encounter_players(
     };
 
     let before_signature = encounter_participants_signature(&encounter.participants);
-    encounter
+    encounter.participants.retain(|participant| {
+        participant.unit_template_id.is_some() || group.players.contains(&participant.target_id)
+    });
+    for participant in encounter
         .participants
-        .retain(|participant| group.players.contains(&participant.target_id));
+        .iter_mut()
+        .filter(|participant| participant.unit_template_id.is_some())
+    {
+        sync_participant_from_manager(participant, manager);
+    }
     for target_id in &group.players {
         if let Some(participant) = encounter
             .participants
@@ -1266,6 +1318,7 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
     for participant in participants {
         participant.target_id.hash(&mut hasher);
         participant.display_name.hash(&mut hasher);
+        participant.unit_template_id.hash(&mut hasher);
         participant.agi.hash(&mut hasher);
         participant.action_done.hash(&mut hasher);
         participant.alive.hash(&mut hasher);
@@ -1287,6 +1340,33 @@ fn participant_from_character(
     BattleParticipantSnapshot {
         target_id: target_id.to_owned(),
         display_name: character_display_name(target_id, character, manager),
+        unit_template_id: None,
+        turn: 0,
+        agi: character.status.agi + character.extra_status.agi,
+        action_done: false,
+        alive: character.hp > 0.0,
+        negative_layers: 0,
+        pending_negative: false,
+        hp: character.hp,
+        max_hp: character.max_hp,
+        mp: character.mp,
+        max_mp: character.max_mp,
+        hp_regen: character.hp_regen,
+        mp_regen: character.mp_regen,
+        skill_last_used_turns: HashMap::new(),
+    }
+}
+
+fn participant_from_unit_template(
+    target_id: &str,
+    unit_id: &str,
+    unit: &UnitPoolEntry,
+) -> BattleParticipantSnapshot {
+    let character = &unit.character;
+    BattleParticipantSnapshot {
+        target_id: target_id.to_owned(),
+        display_name: unit_participant_display_name(target_id, unit_id, unit),
+        unit_template_id: Some(unit_id.to_owned()),
         turn: 0,
         agi: character.status.agi + character.extra_status.agi,
         action_done: false,
@@ -1314,6 +1394,7 @@ fn participant_from_target(
     BattleParticipantSnapshot {
         target_id: target_id.to_owned(),
         display_name: fallback_target_display_name(target_id, manager),
+        unit_template_id: None,
         turn: 0,
         agi: 0,
         action_done: false,
@@ -1334,6 +1415,23 @@ fn sync_participant_from_manager(
     participant: &mut BattleParticipantSnapshot,
     manager: &NapcatMessageManager,
 ) {
+    if let Some(unit_id) = participant.unit_template_id.as_deref() {
+        if let Some(unit) = manager.unit_pool.get(unit_id) {
+            let character = &unit.character;
+            participant.display_name =
+                unit_participant_display_name(&participant.target_id, unit_id, unit);
+            participant.max_hp = character.max_hp;
+            participant.max_mp = character.max_mp;
+            participant.hp_regen = character.hp_regen;
+            participant.mp_regen = character.mp_regen;
+            participant.agi = character.status.agi + character.extra_status.agi;
+            participant.hp = participant.hp.min(participant.max_hp);
+            participant.mp = participant.mp.min(participant.max_mp);
+            participant.alive = participant.hp > 0.0;
+        }
+        return;
+    }
+
     if let Some(character) = manager.player_characters.get(&participant.target_id) {
         participant.display_name = character_display_name(
             &participant.target_id,
@@ -1433,6 +1531,55 @@ fn available_group_players(
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     candidates
+}
+
+fn available_unit_templates(manager: &NapcatMessageManager) -> Vec<(String, String)> {
+    let mut candidates = manager
+        .unit_pool
+        .iter()
+        .map(|(unit_id, unit)| {
+            (
+                unit_id.clone(),
+                unit_template_name(unit_id, unit),
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    candidates
+}
+
+fn next_unit_participant_id(encounter: &BattleEncounter, unit_id: &str) -> String {
+    let base = format!("unit:{unit_id}");
+    if !encounter
+        .participants
+        .iter()
+        .any(|participant| participant.target_id == base)
+    {
+        return base;
+    }
+
+    for index in 2.. {
+        let candidate = format!("{base}#{index}");
+        if !encounter
+            .participants
+            .iter()
+            .any(|participant| participant.target_id == candidate)
+        {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded unit participant id search should always return")
+}
+
+fn character_for_participant<'a>(
+    participant: &BattleParticipantSnapshot,
+    manager: &'a NapcatMessageManager,
+) -> Option<&'a PlayerCharacter> {
+    if let Some(unit_id) = participant.unit_template_id.as_deref() {
+        return manager.unit_pool.get(unit_id).map(|unit| &unit.character);
+    }
+
+    manager.player_characters.get(&participant.target_id)
 }
 
 fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
@@ -1580,6 +1727,34 @@ fn character_display_name(
     fallback_target_display_name(target_id, manager)
 }
 
+fn unit_template_name(unit_id: &str, unit: &UnitPoolEntry) -> String {
+    if !unit.label.trim().is_empty() {
+        return unit.label.trim().to_owned();
+    }
+    if !unit.character.nickname.trim().is_empty() {
+        return unit.character.nickname.trim().to_owned();
+    }
+    if !unit.character.name.trim().is_empty() {
+        return unit.character.name.trim().to_owned();
+    }
+    unit_id.to_owned()
+}
+
+fn unit_participant_display_name(target_id: &str, unit_id: &str, unit: &UnitPoolEntry) -> String {
+    let base = unit_template_name(unit_id, unit);
+    if let Some((_, suffix)) = target_id.rsplit_once('#') {
+        if suffix
+            .parse::<usize>()
+            .ok()
+            .filter(|index| *index > 1)
+            .is_some()
+        {
+            return format!("{base} {suffix}");
+        }
+    }
+    base
+}
+
 fn fallback_target_display_name(target_id: &str, manager: &NapcatMessageManager) -> String {
     manager
         .chat_targets
@@ -1597,6 +1772,19 @@ fn participant_display_name(target_id: &str, manager: &NapcatMessageManager) -> 
         .get(target_id)
         .map(|character| character_display_name(target_id, character, manager))
         .unwrap_or_else(|| fallback_target_display_name(target_id, manager))
+}
+
+fn participant_snapshot_display_name(
+    participant: &BattleParticipantSnapshot,
+    manager: &NapcatMessageManager,
+) -> String {
+    if let Some(unit_id) = participant.unit_template_id.as_deref() {
+        if let Some(unit) = manager.unit_pool.get(unit_id) {
+            return unit_participant_display_name(&participant.target_id, unit_id, unit);
+        }
+    }
+
+    participant_display_name(&participant.target_id, manager)
 }
 
 fn message_sender_nickname<'a>(
@@ -1714,6 +1902,7 @@ mod area_tests {
         BattleParticipantSnapshot {
             target_id: target_id.to_owned(),
             display_name: target_id.to_owned(),
+            unit_template_id: None,
             turn: 0,
             agi: 0,
             action_done: false,
@@ -1735,10 +1924,30 @@ mod area_tests {
 mod tests {
     use super::*;
 
+    fn empty_manager() -> NapcatMessageManager {
+        NapcatMessageManager {
+            messages: HashMap::default(),
+            chat_targets: HashMap::default(),
+            player_characters: HashMap::default(),
+            trpg_groups: HashMap::default(),
+            current_trpg_group: None,
+            groups: HashMap::default(),
+            read_message_counts: HashMap::default(),
+            summarized_message_counts: HashMap::default(),
+            open_chat_targets: HashSet::default(),
+            pending_chat_targets: HashSet::default(),
+            rejected_chat_targets: HashSet::default(),
+            random_pools: HashMap::default(),
+            skill_pool: Vec::new(),
+            unit_pool: HashMap::default(),
+        }
+    }
+
     fn participant(id: &str, turn: u32) -> BattleParticipantSnapshot {
         BattleParticipantSnapshot {
             target_id: id.to_owned(),
             display_name: id.to_owned(),
+            unit_template_id: None,
             turn,
             agi: 0,
             action_done: false,
@@ -1753,6 +1962,117 @@ mod tests {
             mp_regen: 1.0,
             skill_last_used_turns: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn unit_template_participant_uses_template_stats_and_skills() {
+        let mut manager = empty_manager();
+        let unit = UnitPoolEntry {
+            label: "史莱姆".to_owned(),
+            note: String::new(),
+            character: PlayerCharacter {
+                hp: 8.0,
+                max_hp: 12.0,
+                mp: 3.0,
+                max_mp: 5.0,
+                status: crate::napcat::CharacterStatus {
+                    agi: 7,
+                    ..Default::default()
+                },
+                skill_names: vec!["黏液喷吐".to_owned()],
+                skill_notes: vec!["造成3点伤害".to_owned()],
+                skill_mp_costs: vec![1.0],
+                skill_cooldown_turns: vec![2],
+                ..Default::default()
+            },
+        };
+        manager.unit_pool.insert("slime".to_owned(), unit.clone());
+
+        let participant = participant_from_unit_template("unit:slime#2", "slime", &unit);
+
+        assert_eq!(
+            participant.unit_template_id.as_deref(),
+            Some("slime")
+        );
+        assert_eq!(participant.display_name, "史莱姆 2");
+        assert_eq!(participant.agi, 7);
+        assert_eq!(participant.hp, 8.0);
+        assert_eq!(participant.max_hp, 12.0);
+
+        let skills = character_for_participant(&participant, &manager)
+            .map(character_skills)
+            .unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "黏液喷吐");
+        assert_eq!(skills[0].mp_cost, 1.0);
+        assert_eq!(skills[0].cooldown_turns, 2);
+    }
+
+    #[test]
+    fn refresh_encounter_players_keeps_and_syncs_unit_templates() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec!["pc".to_owned()],
+            ..Default::default()
+        });
+        manager
+            .player_characters
+            .insert("pc".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager.unit_pool.insert("slime".to_owned(), UnitPoolEntry {
+            label: "史莱姆".to_owned(),
+            note: String::new(),
+            character: PlayerCharacter {
+                hp: 4.0,
+                max_hp: 6.0,
+                mp: 1.0,
+                max_mp: 2.0,
+                status: crate::napcat::CharacterStatus {
+                    agi: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        });
+        let unit = manager.unit_pool["slime"].clone();
+        let mut encounter = BattleEncounter {
+            name: "battle".to_owned(),
+            trpg_group: Some("table".to_owned()),
+            participants: vec![
+                participant_from_unit_template("unit:slime", "slime", &unit),
+                participant("old", 0),
+            ],
+            ..Default::default()
+        };
+        manager.unit_pool.get_mut("slime").unwrap().character.max_hp = 9.0;
+
+        assert!(refresh_encounter_players(
+            &mut encounter,
+            &manager
+        ));
+
+        assert!(encounter
+            .participants
+            .iter()
+            .any(|participant| participant.target_id == "pc"));
+        assert!(!encounter
+            .participants
+            .iter()
+            .any(|participant| participant.target_id == "old"));
+        let unit_participant = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "unit:slime")
+            .unwrap();
+        assert_eq!(
+            unit_participant.unit_template_id.as_deref(),
+            Some("slime")
+        );
+        assert_eq!(unit_participant.max_hp, 9.0);
+        assert_eq!(unit_participant.agi, 2);
     }
 
     #[test]

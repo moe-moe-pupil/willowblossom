@@ -149,6 +149,7 @@ fn setup_planet_terrain(
 ) {
     runtime.material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.28, 0.52, 0.42),
+        emissive: Color::srgb(0.012, 0.035, 0.025).into(),
         perceptual_roughness: 0.92,
         metallic: 0.0,
         cull_mode: None,

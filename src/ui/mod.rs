@@ -1,6 +1,7 @@
 mod ime;
 use std::{
     collections::{
+        BTreeSet,
         HashMap,
         HashSet,
     },
@@ -54,6 +55,7 @@ use bevy_persistent::{
     StorageFormat,
 };
 use ime::*;
+use rand::RngExt;
 use serde::{
     Deserialize,
     Serialize,
@@ -80,6 +82,18 @@ const CHARACTER_WINDOW_DEFAULT_WIDTH: f32 = 360.0;
 const CHARACTER_WINDOW_MIN_WIDTH: f32 = 320.0;
 const CHARACTER_WINDOW_MAX_WIDTH: f32 = 720.0;
 const CHARACTER_FIELD_MAX_WIDTH: f32 = 560.0;
+const NAPCAT_EXPORT_DEFAULT_PATH: &str = ".data/willowblossom/exports/messages_export.json";
+const NAPCAT_PC_EXPORT_DEFAULT_PATH: &str =
+    ".data/willowblossom/exports/player_characters_export.json";
+const NAPCAT_CHAT_LIST_EXPORT_DEFAULT_PATH: &str =
+    ".data/willowblossom/exports/chat_list_export.json";
+const NAPCAT_UNIT_POOL_EXPORT_DEFAULT_PATH: &str =
+    ".data/willowblossom/exports/unit_pool_export.json";
+const NAPCAT_MOONBERRY_LEGACY_IMPORT_DEFAULT_PATH: &str =
+    ".data/willowblossom/imports/moonberry_legacy.json";
+const DEEPSEEK_SUMMARY_EXPORT_DEFAULT_PATH: &str =
+    ".data/willowblossom/exports/deepseek_summaries_export.json";
+const VOXEL_SCENE_EXPORT_DEFAULT_PATH: &str = ".data/willowblossom/exports/voxel_scene_export.json";
 
 use crate::{
     battle_round::BattleRoundUiState,
@@ -89,14 +103,24 @@ use crate::{
         DeepseekPlugin,
         DeepseekRequest,
         DeepseekSummaryBlock,
+        DEEPSEEK_SUMMARY_EXPORT_VERSION,
     },
     napcat::{
+        normalized_random_pool_counts,
         update_character_from_status,
+        update_character_from_status_with_config,
+        CampaignMessage,
         CharacterBuffBaseStats,
         CharacterCreationStep,
+        CharacterInventory,
+        CharacterSkillMetadata,
+        CharacterSkillSourceKind,
         CharacterStatus,
         ChatGroup,
+        EquipmentSlot,
         ImageData,
+        InventoryItem,
+        InventoryQuality,
         NapcatIOSender,
         NapcatMessage,
         NapcatMessageChain,
@@ -107,9 +131,16 @@ use crate::{
         NapcatSendManager,
         NapcatSender,
         PlayerCharacter,
+        RandomPool,
+        RandomPoolEntry,
+        RandomPoolTextResult,
+        SkillPoolEntry,
         TextData,
+        TrpgBasicConfig,
         TrpgGroup,
-        TrpgPlayerTurnState,
+        UnitPoolEntry,
+        Visibility,
+        NAPCAT_MANAGER_EXPORT_VERSION,
     },
     rule_engine::{
         parse_rule,
@@ -131,6 +162,9 @@ use crate::{
         SceneCharacterPositions,
         ScenePlayerCameraPositions,
         ScenePlayerViewRequest,
+        VoxelMapRuntimeState,
+        VoxelSceneStore,
+        VOXEL_SCENE_EXPORT_VERSION,
     },
 };
 pub struct UIPlugin;
@@ -149,8 +183,25 @@ pub(crate) struct ChatScrollState {
 pub(crate) struct TrpgGroupSettingsState {
     open: bool,
     new_group_name: String,
+    new_random_pool_name: String,
+    random_pool_award_target: String,
+    new_unit_id: String,
+    unit_pool_source_target: String,
     focused_group_name: Option<String>,
     pending_character_delete: Option<String>,
+    random_pool_entry_drafts: HashMap<String, RandomPoolEntry>,
+    unit_pool_draft: UnitPoolEntry,
+    skill_pool_draft: SkillPoolEntry,
+    party_name_drafts: HashMap<String, String>,
+    export_path: String,
+    pc_export_path: String,
+    chat_list_export_path: String,
+    unit_pool_export_path: String,
+    moonberry_legacy_import_path: String,
+    deepseek_summary_export_path: String,
+    voxel_scene_export_path: String,
+    import_path: String,
+    import_export_status: String,
 }
 
 #[derive(Default)]
@@ -161,6 +212,7 @@ pub(crate) struct CharacterEditState {
     pending_character_reset: Option<String>,
     quick_cast_skill_index: HashMap<String, usize>,
     pending_force_cast: Option<(String, usize)>,
+    skill_pool_selected_index: HashMap<String, usize>,
 }
 
 #[derive(Clone)]
@@ -202,6 +254,7 @@ pub struct UiSystemLocals<'s> {
     quick_character_targets: Local<'s, HashSet<String>>,
     chat_image_textures: Local<'s, HashMap<String, TextureHandle>>,
     chat_turn_count_drafts: Local<'s, HashMap<(String, String), u32>>,
+    group_broadcast_scopes: Local<'s, HashMap<String, String>>,
 }
 
 pub struct CircleImageButton {
@@ -245,7 +298,7 @@ fn file_menu_button(
             *new_chat_group_modal_open = true
         }
 
-        if ui.button("玩家/群池").clicked() {
+        if ui.button("TRPG设置").clicked() {
             *trpg_group_settings_open = true;
             ui.close();
         }
@@ -269,6 +322,103 @@ fn tools_menu_button(
             ui.close();
         }
     });
+}
+
+fn pool_menu_button(
+    ui: &mut Ui,
+    manager: &mut NapcatMessageManager,
+    state: &mut TrpgGroupSettingsState,
+) -> bool {
+    let mut changed = false;
+    let player_targets = sorted_pool_targets(manager, false);
+    let group_chat_targets = sorted_pool_targets(manager, true);
+
+    ui.menu_button("池", |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+
+        ui.menu_button(
+            format!("玩家池 ({})", player_targets.len()),
+            |ui| {
+                if player_targets.is_empty() {
+                    ui.label("还没有玩家私聊。");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("top_player_pool_menu")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for target_id in &player_targets {
+                                ui.horizontal(|ui| {
+                                    ui.label(target_display_name(manager, target_id));
+                                    ui.small(target_id);
+                                });
+                            }
+                        });
+                }
+            },
+        );
+
+        ui.menu_button(
+            format!("群聊池 ({})", group_chat_targets.len()),
+            |ui| {
+                if group_chat_targets.is_empty() {
+                    ui.label("还没有QQ群聊。");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("top_group_chat_pool_menu")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for target_id in &group_chat_targets {
+                                ui.horizontal(|ui| {
+                                    ui.label(target_display_name(manager, target_id));
+                                    ui.small(target_id);
+                                });
+                            }
+                        });
+                }
+            },
+        );
+
+        ui.menu_button(
+            format!(
+                "随机池 ({})",
+                manager.random_pools.len()
+            ),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("top_random_pool_menu")
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        changed |= random_pool_settings_ui(ui, manager, state, &player_targets);
+                    });
+            },
+        );
+
+        ui.menu_button(
+            format!("单位池 ({})", manager.unit_pool.len()),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("top_unit_pool_menu")
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        changed |= unit_pool_settings_ui(ui, manager, state, &player_targets);
+                    });
+            },
+        );
+
+        ui.menu_button(
+            format!("技能池 ({})", manager.skill_pool.len()),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("top_skill_pool_menu")
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        changed |= skill_pool_settings_ui(ui, manager, state);
+                    });
+            },
+        );
+    });
+
+    changed
 }
 
 impl Widget for CircleImageButton {
@@ -560,7 +710,7 @@ fn chat_window(
                             can_view_player,
                             egui::Button::new("查看玩家视角"),
                         )
-                        .on_hover_text("切换到这个玩家的场景捕捉相机")
+                        .on_hover_text("切换到这个玩家的场景捕捉相机，并按其可见性过滤场景")
                         .clicked()
                     {
                         if let (Ok(user_id), Some(request)) = (
@@ -950,9 +1100,10 @@ fn group_broadcast_input_ui(
     ctx: &Context,
     group_name: &str,
     members: &[String],
-    messages: &HashMap<String, Vec<NapcatMessage>>,
+    manager: &NapcatMessageManager,
     napcat_sender: Option<&NapcatIOSender>,
     chat_input_msgs: &mut Local<HashMap<String, String>>,
+    broadcast_scopes: &mut Local<HashMap<String, String>>,
     ime: &mut ResMut<ImeManager>,
 ) {
     let input_id = format!("group:{group_name}:broadcast");
@@ -962,28 +1113,18 @@ fn group_broadcast_input_ui(
 
     ui.separator();
     let text = chat_input_msgs.get_mut(&input_id).unwrap();
-    let targets = members
-        .iter()
-        .filter_map(|member_id| {
-            if !matches!(
-                messages
-                    .get(member_id)
-                    .and_then(|messages| messages.first())
-                    .map(|message| &message.data.message_type),
-                Some(NapcatMessageType::Private)
-            ) {
-                return None;
-            }
-
-            match member_id.parse::<u64>() {
-                Ok(user_id) => Some(NapcatSendTarget::Private(user_id)),
-                Err(_) => {
-                    eprintln!("invalid NapCat group member id: {member_id}");
-                    None
-                },
-            }
-        })
-        .collect::<Vec<_>>();
+    let current_group = manager.current_group();
+    let scope = broadcast_scopes
+        .entry(group_name.to_owned())
+        .or_insert_with(|| BROADCAST_SCOPE_ALL.to_owned());
+    group_broadcast_scope_ui(
+        ui,
+        group_name,
+        members,
+        current_group,
+        scope,
+    );
+    let targets = group_broadcast_targets(current_group, members, manager, scope);
 
     let enabled = napcat_sender.is_some() && !targets.is_empty();
     if let Some(napcat_sender) = napcat_sender.filter(|_| enabled) {
@@ -1005,6 +1146,125 @@ fn group_broadcast_input_ui(
                 .desired_rows(GROUP_BROADCAST_INPUT_ROWS),
         );
     }
+}
+
+const BROADCAST_SCOPE_ALL: &str = "all";
+const BROADCAST_SCOPE_PARTY_PREFIX: &str = "party:";
+
+fn group_broadcast_scope_ui(
+    ui: &mut Ui,
+    group_name: &str,
+    members: &[String],
+    current_group: Option<&TrpgGroup>,
+    scope: &mut String,
+) {
+    let mut party_names = current_group
+        .map(|group| {
+            group
+                .parties
+                .keys()
+                .filter(|party_id| {
+                    members.iter().any(|member_id| {
+                        group.party_id_for_player(member_id) == Some(party_id.as_str())
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    party_names.sort();
+    if scope != BROADCAST_SCOPE_ALL
+        && !party_names
+            .iter()
+            .any(|party_id| scope == &broadcast_party_scope(party_id))
+    {
+        *scope = BROADCAST_SCOPE_ALL.to_owned();
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("发送范围");
+        egui::ComboBox::from_id_salt((group_name, "broadcast_scope"))
+            .selected_text(broadcast_scope_label(scope))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    scope,
+                    BROADCAST_SCOPE_ALL.to_owned(),
+                    "全部成员",
+                );
+                for party_name in party_names {
+                    ui.selectable_value(
+                        scope,
+                        broadcast_party_scope(&party_name),
+                        format!("小队：{party_name}"),
+                    );
+                }
+            });
+    });
+}
+
+fn group_broadcast_targets(
+    current_group: Option<&TrpgGroup>,
+    members: &[String],
+    manager: &NapcatMessageManager,
+    scope: &str,
+) -> Vec<NapcatSendTarget> {
+    let requested_party = scope.strip_prefix(BROADCAST_SCOPE_PARTY_PREFIX);
+    let mut seen = HashSet::new();
+    let mut targets = members
+        .iter()
+        .filter(|member_id| match requested_party {
+            Some(party_id) => {
+                current_group.and_then(|group| group.party_id_for_player(member_id))
+                    == Some(party_id)
+            },
+            None => true,
+        })
+        .filter_map(|member_id| private_broadcast_target(manager, member_id))
+        .filter(|target| match target {
+            NapcatSendTarget::Private(user_id) => seen.insert(*user_id),
+            NapcatSendTarget::Group(_) => false,
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|target| match target {
+        NapcatSendTarget::Private(user_id) => *user_id,
+        NapcatSendTarget::Group(group_id) => *group_id,
+    });
+    targets
+}
+
+fn private_broadcast_target(
+    manager: &NapcatMessageManager,
+    member_id: &str,
+) -> Option<NapcatSendTarget> {
+    if !matches!(
+        manager
+            .messages
+            .get(member_id)
+            .and_then(|messages| messages.first())
+            .map(|message| &message.data.message_type),
+        Some(NapcatMessageType::Private)
+    ) {
+        return None;
+    }
+
+    match member_id.parse::<u64>() {
+        Ok(user_id) => Some(NapcatSendTarget::Private(user_id)),
+        Err(_) => {
+            eprintln!("invalid NapCat group member id: {member_id}");
+            None
+        },
+    }
+}
+
+fn broadcast_party_scope(party_id: &str) -> String {
+    format!("{BROADCAST_SCOPE_PARTY_PREFIX}{party_id}")
+}
+
+fn broadcast_scope_label(scope: &str) -> String {
+    scope
+        .strip_prefix(BROADCAST_SCOPE_PARTY_PREFIX)
+        .map(|party_id| format!("小队：{party_id}"))
+        .unwrap_or_else(|| "全部成员".to_owned())
 }
 
 fn group_drop_area_ui(ui: &mut Ui, group_name: &str, members: &[String]) {
@@ -1417,27 +1677,37 @@ struct PlayerTextLine {
     summary_eligible: bool,
 }
 
-fn player_text_lines(messages: &[NapcatMessage]) -> Vec<PlayerTextLine> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SummaryScope {
+    Private,
+    GroupPublic,
+    GroupParty(String),
+}
+
+impl SummaryScope {
+    fn summary_key(&self, target_id: &str) -> String {
+        match self {
+            SummaryScope::Private => target_id.to_owned(),
+            SummaryScope::GroupPublic => format!("group:{target_id}:public"),
+            SummaryScope::GroupParty(party_id) => format!("group:{target_id}:party:{party_id}"),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            SummaryScope::Private => "私聊".to_owned(),
+            SummaryScope::GroupPublic => "公开".to_owned(),
+            SummaryScope::GroupParty(party_id) => format!("小队：{party_id}"),
+        }
+    }
+}
+
+fn player_text_lines(messages: &[CampaignMessage]) -> Vec<PlayerTextLine> {
     let mut player_message_count = 0;
     let mut lines = Vec::new();
 
-    for message in messages
-        .iter()
-        .filter(|message| message.data.user_id != message.data.self_id)
-    {
-        let text = message
-            .data
-            .message
-            .iter()
-            .filter_map(|chain| match &chain.variant {
-                NapcatMessageChainType::Text { data } => Some(data.text.trim()),
-                NapcatMessageChainType::Source(_) => None,
-                NapcatMessageChainType::Image { .. } => None,
-                NapcatMessageChainType::Unsupported => None,
-            })
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+    for message in messages {
+        let text = message.text.trim();
 
         if text.is_empty() {
             continue;
@@ -1450,24 +1720,55 @@ fn player_text_lines(messages: &[NapcatMessage]) -> Vec<PlayerTextLine> {
                 text.trim(),
                 "#观察" | "#gc" | ".观察" | ".gc"
             ),
-            text: format!(
-                "{}: {}",
-                message.data.sender.nickname, text
-            ),
+            text: format!("{}: {}", message.sender_name, text),
         });
     }
 
     lines
 }
 
-fn queue_summary_if_needed(
+fn queue_summaries_if_needed(
+    manager: &NapcatMessageManager,
     target_id: &str,
     messages: &[NapcatMessage],
+    summarized_message_counts: &HashMap<String, usize>,
+    deepseek_sender: Option<&DeepseekIOSender>,
+    deepseek_manager: &mut DeepseekManager,
+) -> bool {
+    let mut changed = false;
+    for scope in summary_scopes_for_target(manager, target_id, messages) {
+        let summary_key = scope.summary_key(target_id);
+        let summarized_message_count = summarized_message_counts
+            .get(&summary_key)
+            .copied()
+            .unwrap_or_default();
+        changed |= queue_summary_if_needed_for_scope(
+            manager,
+            target_id,
+            messages,
+            &scope,
+            &summary_key,
+            summarized_message_count,
+            deepseek_sender,
+            deepseek_manager,
+        );
+    }
+    changed
+}
+
+fn queue_summary_if_needed_for_scope(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    messages: &[NapcatMessage],
+    scope: &SummaryScope,
+    summary_key: &str,
     summarized_message_count: usize,
     deepseek_sender: Option<&DeepseekIOSender>,
     deepseek_manager: &mut DeepseekManager,
 ) -> bool {
-    let lines = player_text_lines(messages);
+    let campaign_messages =
+        campaign_messages_for_summary_scope(manager, target_id, messages, scope);
+    let lines = player_text_lines(&campaign_messages);
     let message_count = lines
         .last()
         .map(|line| line.player_message_count)
@@ -1479,7 +1780,7 @@ fn queue_summary_if_needed(
         return false;
     }
 
-    if let Some(summary) = deepseek_manager.summaries.get(target_id) {
+    if let Some(summary) = deepseek_manager.summaries.get(summary_key) {
         if summary
             .blocks
             .iter()
@@ -1506,7 +1807,7 @@ fn queue_summary_if_needed(
     }
 
     let request = DeepseekRequest::Summary {
-        target_id: target_id.to_owned(),
+        target_id: summary_key.to_owned(),
         message_count,
         text,
     };
@@ -1525,7 +1826,7 @@ fn queue_summary_if_needed(
         Ok(()) => {
             deepseek_manager
                 .summaries
-                .entry(target_id.to_owned())
+                .entry(summary_key.to_owned())
                 .or_default()
                 .upsert_block(DeepseekSummaryBlock {
                     latest: String::new(),
@@ -1538,7 +1839,7 @@ fn queue_summary_if_needed(
         Err(error) => {
             deepseek_manager
                 .summaries
-                .entry(target_id.to_owned())
+                .entry(summary_key.to_owned())
                 .or_default()
                 .upsert_block(DeepseekSummaryBlock {
                     latest: String::new(),
@@ -1548,6 +1849,71 @@ fn queue_summary_if_needed(
                 });
             true
         },
+    }
+}
+
+fn summary_scopes_for_target(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    messages: &[NapcatMessage],
+) -> Vec<SummaryScope> {
+    if !matches!(
+        messages.first().map(|message| &message.data.message_type),
+        Some(NapcatMessageType::Group)
+    ) {
+        return vec![SummaryScope::Private];
+    }
+
+    let mut party_ids = BTreeSet::new();
+    if let Some(group) = manager.current_group().filter(|group| {
+        group
+            .group_chats
+            .iter()
+            .any(|group_id| group_id == target_id)
+    }) {
+        party_ids.extend(group.parties.keys().cloned());
+    }
+
+    for message in messages {
+        if message.data.user_id == message.data.self_id {
+            continue;
+        }
+        if let Visibility::Party(party_id) = manager
+            .campaign_message_for_target(target_id, message)
+            .visibility
+        {
+            party_ids.insert(party_id);
+        }
+    }
+
+    let mut scopes = vec![SummaryScope::GroupPublic];
+    scopes.extend(party_ids.into_iter().map(SummaryScope::GroupParty));
+    scopes
+}
+
+fn campaign_messages_for_summary_scope(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    messages: &[NapcatMessage],
+    scope: &SummaryScope,
+) -> Vec<CampaignMessage> {
+    match scope {
+        SummaryScope::Private => manager.visible_campaign_messages_for_summary(target_id, messages),
+        SummaryScope::GroupPublic => messages
+            .iter()
+            .filter(|message| message.data.user_id != message.data.self_id)
+            .map(|message| manager.campaign_message_for_target(target_id, message))
+            .filter(|message| matches!(message.visibility, Visibility::Public))
+            .collect(),
+        SummaryScope::GroupParty(party_id) => messages
+            .iter()
+            .filter(|message| message.data.user_id != message.data.self_id)
+            .map(|message| manager.campaign_message_for_target(target_id, message))
+            .filter(|message| {
+                matches!(message.visibility, Visibility::Public)
+                    || matches!(&message.visibility, Visibility::Party(message_party) if message_party == party_id)
+            })
+            .collect(),
     }
 }
 
@@ -1583,6 +1949,54 @@ fn sync_summarized_message_counts(
     changed
 }
 
+fn summary_display_parts<'a>(
+    manager: &NapcatMessageManager,
+    summary_key: &'a str,
+) -> (String, String) {
+    let (target_id, scope) = parse_group_summary_key(summary_key)
+        .map(|(target_id, scope)| (target_id, scope.label()))
+        .unwrap_or_else(|| {
+            let scope = if manager.messages.get(summary_key).is_some_and(|messages| {
+                matches!(
+                    messages.first().map(|message| &message.data.message_type),
+                    Some(NapcatMessageType::Group)
+                )
+            }) {
+                "全部（旧）".to_owned()
+            } else {
+                "私聊".to_owned()
+            };
+            (summary_key, scope)
+        });
+    let display_name = manager
+        .messages
+        .get(target_id)
+        .map(|messages| {
+            get_nickname_lens(target_id.to_string(), messages)
+                .0
+                .to_owned()
+        })
+        .filter(|nickname| !nickname.is_empty())
+        .unwrap_or_else(|| target_id.to_string());
+
+    (display_name, scope)
+}
+
+fn parse_group_summary_key(summary_key: &str) -> Option<(&str, SummaryScope)> {
+    let rest = summary_key.strip_prefix("group:")?;
+    let mut parts = rest.splitn(3, ':');
+    let target_id = parts.next()?;
+    let scope_kind = parts.next()?;
+    match scope_kind {
+        "public" => Some((target_id, SummaryScope::GroupPublic)),
+        "party" => Some((
+            target_id,
+            SummaryScope::GroupParty(parts.next()?.to_owned()),
+        )),
+        _ => None,
+    }
+}
+
 fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: &DeepseekManager) {
     ui.heading("DeepSeek 总结");
     ui.separator();
@@ -1601,21 +2015,13 @@ fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: 
         summaries.sort_by_key(|(target_id, _)| target_id.as_str());
 
         for (target_id, summary) in summaries {
-            let nickname = manager
-                .messages
-                .get(target_id)
-                .map(|messages| {
-                    get_nickname_lens(target_id.to_string(), messages)
-                        .0
-                        .to_owned()
-                })
-                .filter(|nickname| !nickname.is_empty())
-                .unwrap_or_else(|| target_id.to_string());
+            let (nickname, scope) = summary_display_parts(manager, target_id);
 
             ui.group(|ui| {
                 ui.label(format!(
-                    "{} / {} 个总结",
+                    "{} / {} / {} 个总结",
                     nickname,
+                    scope,
                     summary.blocks.len()
                 ));
                 for block in &summary.blocks {
@@ -1641,6 +2047,8 @@ fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: 
 fn pending_chat_requests_window(
     ctx: &Context,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+    napcat_sender: Option<&NapcatIOSender>,
+    ime: &mut ResMut<ImeManager>,
 ) {
     if manager.pending_chat_targets.is_empty() {
         return;
@@ -1672,9 +2080,27 @@ fn pending_chat_requests_window(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             if ui.button("创建聊天").clicked() {
-                                manager.open_chat_targets.insert(target_id.clone());
-                                manager.pending_chat_targets.remove(&target_id);
-                                changed = true;
+                                if manager.approve_chat_target(&target_id) {
+                                    changed = true;
+                                    if let (Some(sender), Some(text), Some(target)) = (
+                                        napcat_sender,
+                                        approval_onboarding_text(manager, &target_id),
+                                        private_broadcast_target(manager, &target_id),
+                                    ) {
+                                        if let Err(err) =
+                                            ime.queue_text_send(&target_id, text, sender, vec![
+                                                target,
+                                            ])
+                                        {
+                                            eprintln!(
+                                                "failed to queue NapCat onboarding message: {err}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if ui.button("拒绝").clicked() {
+                                changed |= manager.reject_chat_target(&target_id);
                             }
                         },
                     );
@@ -1684,6 +2110,31 @@ fn pending_chat_requests_window(
 
     if changed {
         manager.persist().ok();
+    }
+}
+
+fn approval_onboarding_text(manager: &NapcatMessageManager, target_id: &str) -> Option<String> {
+    if !matches!(
+        manager
+            .messages
+            .get(target_id)
+            .and_then(|messages| messages.first())
+            .map(|message| &message.data.message_type),
+        Some(NapcatMessageType::Private)
+    ) {
+        return None;
+    }
+
+    let group = manager.current_group()?;
+    if !group.players.iter().any(|player_id| player_id == target_id) {
+        return None;
+    }
+
+    let guide = group.guide.trim();
+    if guide.is_empty() {
+        None
+    } else {
+        Some(format!("团内引导：\n{guide}"))
     }
 }
 
@@ -2142,6 +2593,8 @@ fn quick_character_windows(
                     ui.small("玩家");
                     ui.monospace(&target_id);
                 });
+                let skill_pool_snapshot = manager.skill_pool.clone();
+                let stat_config = manager.character_stat_config_for_target(&target_id);
                 let character = manager
                     .player_characters
                     .entry(target_id.clone())
@@ -2167,6 +2620,8 @@ fn quick_character_windows(
                         &display_name,
                         character_edit_state,
                         rule_engine_state,
+                        &skill_pool_snapshot,
+                        stat_config,
                     );
                 });
             });
@@ -2373,13 +2828,16 @@ fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
         .skill_names
         .iter()
         .enumerate()
-        .map(|(index, name)| {
+        .filter_map(|(index, name)| {
+            if !character.skill_metadata[index].is_approved() {
+                return None;
+            }
             let name = if name.trim().is_empty() {
                 format!("技能{}", index + 1)
             } else {
                 name.trim().to_owned()
             };
-            QuickCastSkill {
+            Some(QuickCastSkill {
                 index,
                 name,
                 note: character
@@ -2398,7 +2856,7 @@ fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
                     .get(index)
                     .copied()
                     .unwrap_or_default(),
-            }
+            })
         })
         .collect()
 }
@@ -2627,6 +3085,8 @@ fn character_editor_ui(
     chat_display_name: &str,
     edit_state: &mut CharacterEditState,
     rule_engine_state: &mut RuleEngineState,
+    skill_pool: &[SkillPoolEntry],
+    stat_config: TrpgBasicConfig,
 ) -> bool {
     let mut changed = false;
     let mut derived_stats_changed = false;
@@ -2873,15 +3333,19 @@ fn character_editor_ui(
         rule_engine_state,
     );
     ui.separator();
+    changed |= character_inventory_editor_ui(ui, character);
+    ui.separator();
     changed |= character_skill_editor_ui(
         ui,
         target_id,
         character,
+        edit_state,
         rule_engine_state,
+        skill_pool,
     );
 
     if derived_stats_changed {
-        update_character_from_status(character);
+        update_character_from_status_with_config(character, &stat_config);
         if !character.active_buffs.is_empty() {
             character.buff_base_stats = Some(CharacterBuffBaseStats::from_character(
                 character,
@@ -2909,16 +3373,124 @@ fn character_editor_ui(
     changed
 }
 
+fn character_skill_pool_picker_ui(
+    ui: &mut Ui,
+    target_id: &str,
+    character: &mut PlayerCharacter,
+    edit_state: &mut CharacterEditState,
+    skill_pool: &[SkillPoolEntry],
+) -> bool {
+    if skill_pool.is_empty() {
+        return false;
+    }
+
+    let selected = edit_state
+        .skill_pool_selected_index
+        .entry(target_id.to_owned())
+        .or_insert(0);
+    if *selected >= skill_pool.len() {
+        *selected = 0;
+    }
+
+    let mut changed = false;
+    ui.collapsing("技能池", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt(format!("skill_pool_picker_{target_id}"))
+                .selected_text(skill_pool_entry_label(
+                    &skill_pool[*selected],
+                ))
+                .show_ui(ui, |ui| {
+                    for (index, entry) in skill_pool.iter().enumerate() {
+                        ui.selectable_value(
+                            selected,
+                            index,
+                            skill_pool_entry_label(entry),
+                        );
+                    }
+                });
+            if ui.button("复制到角色").clicked() {
+                add_skill_pool_entry_to_character(character, &skill_pool[*selected]);
+                changed = true;
+            }
+        });
+        let entry = &skill_pool[*selected];
+        ui.horizontal_wrapped(|ui| {
+            ui.small(format!(
+                "MP {}",
+                format_character_number(entry.mp_cost)
+            ));
+            ui.small(format!(
+                "冷却 {}轮",
+                entry.cooldown_turns
+            ));
+            if let Some(source) = entry.source_character_name.as_deref() {
+                ui.small(format!("来源 {source}"));
+            } else {
+                ui.small("来源 手动");
+            }
+            if let Some(category) = entry
+                .category
+                .as_deref()
+                .filter(|category| !category.trim().is_empty())
+            {
+                ui.small(format!("类型 {category}"));
+            }
+            if !entry.tags.is_empty() {
+                ui.small(format!("标签 {}", entry.tags.join(" ")));
+            }
+        });
+        if let Some(legacy_label) = skill_pool_entry_legacy_label(entry) {
+            ui.small(legacy_label);
+        }
+        if !entry.note.trim().is_empty() {
+            ui.monospace(entry.note.trim());
+        }
+    });
+    changed
+}
+
+fn add_skill_pool_entry_to_character(character: &mut PlayerCharacter, entry: &SkillPoolEntry) {
+    normalize_character_skill_fields(character);
+    character.skill_names.push(entry.name.clone());
+    character.skill_notes.push(entry.note.clone());
+    character.skill_mp_costs.push(entry.mp_cost.max(0.0));
+    character.skill_cooldown_turns.push(entry.cooldown_turns);
+    character
+        .skill_metadata
+        .push(CharacterSkillMetadata::skill_pool(
+            entry,
+        ));
+}
+
+fn skill_pool_entry_label(entry: &SkillPoolEntry) -> String {
+    match entry.source_character_name.as_deref() {
+        Some(source) if !source.trim().is_empty() => {
+            format!(
+                "{} - {}",
+                skill_pool_entry_name(entry),
+                source
+            )
+        },
+        _ => skill_pool_entry_name(entry),
+    }
+}
+
 fn character_skill_editor_ui(
     ui: &mut Ui,
     target_id: &str,
     character: &mut PlayerCharacter,
+    edit_state: &mut CharacterEditState,
     rule_engine_state: &mut RuleEngineState,
+    skill_pool: &[SkillPoolEntry],
 ) -> bool {
     let mut changed = false;
     let mut remove_index = None;
 
     changed |= normalize_character_skill_fields(character);
+
+    changed |= character_skill_pool_picker_ui(
+        ui, target_id, character, edit_state, skill_pool,
+    );
 
     ui.horizontal(|ui| {
         ui.label(format!(
@@ -2930,6 +3502,9 @@ fn character_skill_editor_ui(
             character.skill_notes.push(String::new());
             character.skill_mp_costs.push(0.0);
             character.skill_cooldown_turns.push(0);
+            character
+                .skill_metadata
+                .push(CharacterSkillMetadata::default());
             changed = true;
         }
     });
@@ -2966,6 +3541,18 @@ fn character_skill_editor_ui(
                         )
                         .changed();
                 });
+                ui.horizontal_wrapped(|ui| {
+                    let metadata = &mut character.skill_metadata[index];
+                    changed |= ui.checkbox(&mut metadata.pc_approved, "PC确认").changed();
+                    changed |= ui.checkbox(&mut metadata.st_approved, "GM确认").changed();
+                    if let Some(source) = character_skill_metadata_source_label(metadata) {
+                        ui.small(source);
+                    }
+                });
+                let metadata = &mut character.skill_metadata[index];
+                ui.collapsing("技能结构", |ui| {
+                    changed |= character_skill_shape_metadata_ui(ui, metadata);
+                });
                 let response = ui.add(
                     egui::TextEdit::multiline(&mut character.skill_notes[index])
                         .desired_rows(2)
@@ -2999,6 +3586,7 @@ fn character_skill_editor_ui(
         character.skill_notes.remove(index);
         character.skill_mp_costs.remove(index);
         character.skill_cooldown_turns.remove(index);
+        character.skill_metadata.remove(index);
         shift_skill_last_cast_turns_after_remove(
             &mut character.skill_last_cast_turns,
             index,
@@ -3011,6 +3599,139 @@ fn character_skill_editor_ui(
     changed
 }
 
+fn character_skill_shape_metadata_ui(ui: &mut Ui, metadata: &mut CharacterSkillMetadata) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        changed |= optional_string_field(
+            ui,
+            "类型",
+            &mut metadata.skill_type,
+            86.0,
+        );
+        changed |= optional_string_field(
+            ui,
+            "目标",
+            &mut metadata.target_class,
+            86.0,
+        );
+        changed |= optional_u32_drag(
+            ui,
+            "数量",
+            &mut metadata.target_count,
+            0..=999,
+        );
+        changed |= optional_i32_drag(
+            ui,
+            "范围",
+            &mut metadata.range,
+            0..=9999,
+        );
+        changed |= optional_i32_drag(
+            ui,
+            "兑换点",
+            &mut metadata.exchange_point,
+            0..=9999,
+        );
+        changed |= optional_u32_drag(
+            ui,
+            "剩余冷却",
+            &mut metadata.cooldown_left,
+            0..=999,
+        );
+        changed |= optional_string_field(
+            ui,
+            "释放者",
+            &mut metadata.legacy_caster,
+            86.0,
+        );
+    });
+    if !metadata.args.is_empty() {
+        ui.small(format!(
+            "旧变量：{}",
+            metadata
+                .args
+                .iter()
+                .map(skill_arg_label)
+                .collect::<Vec<_>>()
+                .join("，")
+        ));
+    }
+    if metadata.legacy_has_buff_machine {
+        ui.small("含旧buff机，尚未转换为规则。");
+    }
+    changed
+}
+
+fn optional_string_field(ui: &mut Ui, label: &str, value: &mut Option<String>, width: f32) -> bool {
+    ui.label(label);
+    let mut text = value.clone().unwrap_or_default();
+    let changed = ui
+        .add(egui::TextEdit::singleline(&mut text).desired_width(width))
+        .changed();
+    if changed {
+        let text = text.trim();
+        *value = (!text.is_empty()).then(|| text.to_owned());
+    }
+    changed
+}
+
+fn optional_u32_drag(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut Option<u32>,
+    range: std::ops::RangeInclusive<u32>,
+) -> bool {
+    let mut changed = false;
+    let mut enabled = value.is_some();
+    changed |= ui.checkbox(&mut enabled, label).changed();
+    if enabled {
+        let value_ref = value.get_or_insert(0);
+        changed |= ui
+            .add(egui::DragValue::new(value_ref).range(range).speed(1))
+            .changed();
+    } else if value.take().is_some() {
+        changed = true;
+    }
+    changed
+}
+
+fn optional_i32_drag(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut Option<i32>,
+    range: std::ops::RangeInclusive<i32>,
+) -> bool {
+    let mut changed = false;
+    let mut enabled = value.is_some();
+    changed |= ui.checkbox(&mut enabled, label).changed();
+    if enabled {
+        let value_ref = value.get_or_insert(0);
+        changed |= ui
+            .add(egui::DragValue::new(value_ref).range(range).speed(1))
+            .changed();
+    } else if value.take().is_some() {
+        changed = true;
+    }
+    changed
+}
+
+fn skill_arg_label(arg: &crate::napcat::SkillPoolArg) -> String {
+    let name = if arg.name.trim().is_empty() { "未命名变量" } else { arg.name.trim() };
+    if arg.kind.trim().is_empty() && arg.value.trim().is_empty() {
+        name.to_owned()
+    } else if arg.value.trim().is_empty() {
+        format!("{name}:{}", arg.kind.trim())
+    } else if arg.kind.trim().is_empty() {
+        format!("{name}={}", arg.value.trim())
+    } else {
+        format!(
+            "{name}:{}={}",
+            arg.kind.trim(),
+            arg.value.trim()
+        )
+    }
+}
+
 fn normalize_character_skill_fields(character: &mut PlayerCharacter) -> bool {
     let mut changed = false;
     let skill_count = character
@@ -3018,7 +3739,8 @@ fn normalize_character_skill_fields(character: &mut PlayerCharacter) -> bool {
         .len()
         .max(character.skill_notes.len())
         .max(character.skill_mp_costs.len())
-        .max(character.skill_cooldown_turns.len());
+        .max(character.skill_cooldown_turns.len())
+        .max(character.skill_metadata.len());
     if character.skill_names.len() != skill_count {
         character.skill_names.resize(skill_count, String::new());
         changed = true;
@@ -3035,6 +3757,13 @@ fn normalize_character_skill_fields(character: &mut PlayerCharacter) -> bool {
         character.skill_cooldown_turns.resize(skill_count, 0);
         changed = true;
     }
+    if character.skill_metadata.len() != skill_count {
+        character.skill_metadata.resize(
+            skill_count,
+            CharacterSkillMetadata::default(),
+        );
+        changed = true;
+    }
     for cost in &mut character.skill_mp_costs {
         if *cost < 0.0 {
             *cost = 0.0;
@@ -3048,6 +3777,28 @@ fn normalize_character_skill_fields(character: &mut PlayerCharacter) -> bool {
         changed = true;
     }
     changed
+}
+
+fn character_skill_metadata_source_label(metadata: &CharacterSkillMetadata) -> Option<String> {
+    match metadata.source {
+        CharacterSkillSourceKind::Manual => None,
+        CharacterSkillSourceKind::Talent => {
+            let label = metadata
+                .source_pool_label
+                .as_deref()
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or("天赋");
+            Some(format!("来源：{label}"))
+        },
+        CharacterSkillSourceKind::SkillPool => {
+            let label = metadata
+                .source_pool_label
+                .as_deref()
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or("技能池");
+            Some(format!("来源：{label}"))
+        },
+    }
 }
 
 fn retain_valid_skill_last_cast_turns(
@@ -3113,7 +3864,16 @@ fn sync_character_skill_rules_with_stats(
     let rules = character
         .skill_notes
         .iter()
-        .filter_map(|note| parse_skill_note(note).ok().flatten())
+        .enumerate()
+        .filter(|(index, _)| {
+            character
+                .skill_metadata
+                .get(*index)
+                .cloned()
+                .unwrap_or_default()
+                .is_approved()
+        })
+        .filter_map(|(_, note)| parse_skill_note(note).ok().flatten())
         .collect::<Vec<_>>();
     let display_name =
         if character.name.trim().is_empty() { target_id } else { character.name.trim() };
@@ -3504,6 +4264,140 @@ fn character_buff_editor_ui(
     changed
 }
 
+fn character_inventory_editor_ui(ui: &mut Ui, character: &mut PlayerCharacter) -> bool {
+    let mut changed = false;
+    changed |= normalize_inventory(&mut character.inventory);
+
+    egui::CollapsingHeader::new("背包 / 装备")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut character.inventory.gold)
+                            .range(0..=9_999_999)
+                            .prefix("金币 "),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut character.inventory.bag_slots)
+                            .range(1..=160)
+                            .prefix("格子 "),
+                    )
+                    .changed();
+                ui.small(format!(
+                    "已用 {}/{}",
+                    character.inventory.items.len(),
+                    character.inventory.bag_slots
+                ));
+            });
+
+            ui.collapsing("已装备", |ui| {
+                for slot in equipment_slot_options() {
+                    if slot == EquipmentSlot::None {
+                        continue;
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(equipment_slot_label(slot));
+                        if let Some(item) = character.inventory.equipment.get(&slot) {
+                            ui.colored_label(
+                                item_quality_color(item.quality),
+                                item_display_name(item),
+                            );
+                            ui.small(format!("物品等级 {}", item.item_level));
+                            if ui.button("卸下").clicked() {
+                                if let Some(item) = character.inventory.equipment.remove(&slot) {
+                                    add_item_to_inventory(&mut character.inventory, item);
+                                    changed = true;
+                                }
+                            }
+                        } else {
+                            ui.small("空");
+                        }
+                    });
+                }
+            });
+
+            let mut remove_index = None;
+            let mut equip_index = None;
+            ui.horizontal(|ui| {
+                ui.label("背包");
+                if ui.button("+").on_hover_text("添加空物品").clicked() {
+                    add_item_to_inventory(
+                        &mut character.inventory,
+                        InventoryItem::default(),
+                    );
+                    changed = true;
+                }
+            });
+            egui::Grid::new(ui.next_auto_id())
+                .num_columns(7)
+                .spacing([8.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("物品");
+                    ui.strong("品质");
+                    ui.strong("数量");
+                    ui.strong("装备位");
+                    ui.strong("等级");
+                    ui.strong("绑定");
+                    ui.strong("操作");
+                    ui.end_row();
+
+                    for (index, item) in character.inventory.items.iter_mut().enumerate() {
+                        changed |= ui
+                            .add(egui::TextEdit::singleline(&mut item.name).desired_width(120.0))
+                            .changed();
+                        changed |= item_quality_combo(ui, &mut item.quality);
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut item.stack)
+                                    .range(1..=9999)
+                                    .speed(1),
+                            )
+                            .changed();
+                        changed |= equipment_slot_combo(ui, &mut item.equipment_slot);
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut item.item_level)
+                                    .range(0..=9999)
+                                    .speed(1),
+                            )
+                            .changed();
+                        changed |= ui.checkbox(&mut item.soulbound, "").changed();
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    item.equipment_slot != EquipmentSlot::None,
+                                    egui::Button::new("装备"),
+                                )
+                                .clicked()
+                            {
+                                equip_index = Some(index);
+                            }
+                            if ui.button("-").on_hover_text("移除物品").clicked() {
+                                remove_index = Some(index);
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+
+            if let Some(index) = equip_index {
+                equip_inventory_item(&mut character.inventory, index);
+                changed = true;
+            }
+            if let Some(index) = remove_index {
+                character.inventory.items.remove(index);
+                changed = true;
+            }
+        });
+
+    changed |= normalize_inventory(&mut character.inventory);
+    changed
+}
+
 fn buff_kind_combo(ui: &mut Ui, kind: &mut BuffKind) -> bool {
     let mut changed = false;
     egui::ComboBox::from_label("类型")
@@ -3520,6 +4414,211 @@ fn buff_kind_combo(ui: &mut Ui, kind: &mut BuffKind) -> bool {
             }
         });
     changed
+}
+
+fn normalize_inventory(inventory: &mut CharacterInventory) -> bool {
+    let mut changed = false;
+    if inventory.bag_slots == 0 {
+        inventory.bag_slots = 1;
+        changed = true;
+    }
+    for item in &mut inventory.items {
+        changed |= normalize_item(item);
+    }
+    for item in inventory.equipment.values_mut() {
+        changed |= normalize_item(item);
+    }
+    let before_equipment = inventory.equipment.len();
+    inventory
+        .equipment
+        .retain(|slot, item| *slot != EquipmentSlot::None && item.equipment_slot == *slot);
+    changed |= inventory.equipment.len() != before_equipment;
+    changed
+}
+
+fn normalize_item(item: &mut InventoryItem) -> bool {
+    let mut changed = false;
+    if item.max_stack == 0 {
+        item.max_stack = 1;
+        changed = true;
+    }
+    if item.stack == 0 {
+        item.stack = 1;
+        changed = true;
+    }
+    if item.stack > item.max_stack {
+        item.stack = item.max_stack;
+        changed = true;
+    }
+    changed
+}
+
+fn add_item_to_inventory(inventory: &mut CharacterInventory, mut item: InventoryItem) {
+    normalize_item(&mut item);
+    if !item.name.trim().is_empty() && item.max_stack > 1 {
+        let mut remaining = item.stack;
+        for existing in &mut inventory.items {
+            if same_stackable_item(existing, &item) && existing.stack < existing.max_stack {
+                let free = existing.max_stack - existing.stack;
+                let moved = free.min(remaining);
+                existing.stack += moved;
+                remaining -= moved;
+                if remaining == 0 {
+                    return;
+                }
+            }
+        }
+        item.stack = remaining;
+    }
+    inventory.items.push(item);
+}
+
+fn same_stackable_item(left: &InventoryItem, right: &InventoryItem) -> bool {
+    left.name == right.name
+        && left.description == right.description
+        && left.icon == right.icon
+        && left.quality == right.quality
+        && left.equipment_slot == right.equipment_slot
+        && left.max_stack == right.max_stack
+        && left.item_level == right.item_level
+        && left.soulbound == right.soulbound
+        && left.max_stack > 1
+}
+
+fn equip_inventory_item(inventory: &mut CharacterInventory, index: usize) {
+    if index >= inventory.items.len() {
+        return;
+    }
+    let item = inventory.items.remove(index);
+    let slot = item.equipment_slot;
+    if slot == EquipmentSlot::None {
+        inventory.items.insert(index, item);
+        return;
+    }
+    if let Some(previous) = inventory.equipment.insert(slot, item) {
+        add_item_to_inventory(inventory, previous);
+    }
+}
+
+fn item_display_name(item: &InventoryItem) -> String {
+    if item.name.trim().is_empty() {
+        "未命名物品".to_owned()
+    } else if item.stack > 1 {
+        format!("{} x{}", item.name.trim(), item.stack)
+    } else {
+        item.name.trim().to_owned()
+    }
+}
+
+fn item_quality_combo(ui: &mut Ui, quality: &mut InventoryQuality) -> bool {
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(ui.next_auto_id())
+        .selected_text(inventory_quality_label(*quality))
+        .show_ui(ui, |ui| {
+            for candidate in inventory_quality_options() {
+                changed |= ui
+                    .selectable_value(
+                        quality,
+                        candidate,
+                        inventory_quality_label(candidate),
+                    )
+                    .changed();
+            }
+        });
+    changed
+}
+
+fn equipment_slot_combo(ui: &mut Ui, slot: &mut EquipmentSlot) -> bool {
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(ui.next_auto_id())
+        .selected_text(equipment_slot_label(*slot))
+        .show_ui(ui, |ui| {
+            for candidate in equipment_slot_options() {
+                changed |= ui
+                    .selectable_value(
+                        slot,
+                        candidate,
+                        equipment_slot_label(candidate),
+                    )
+                    .changed();
+            }
+        });
+    changed
+}
+
+fn inventory_quality_options() -> [InventoryQuality; 6] {
+    [
+        InventoryQuality::Poor,
+        InventoryQuality::Common,
+        InventoryQuality::Uncommon,
+        InventoryQuality::Rare,
+        InventoryQuality::Epic,
+        InventoryQuality::Legendary,
+    ]
+}
+
+fn inventory_quality_label(quality: InventoryQuality) -> &'static str {
+    match quality {
+        InventoryQuality::Poor => "粗糙",
+        InventoryQuality::Common => "普通",
+        InventoryQuality::Uncommon => "优秀",
+        InventoryQuality::Rare => "精良",
+        InventoryQuality::Epic => "史诗",
+        InventoryQuality::Legendary => "传说",
+    }
+}
+
+fn item_quality_color(quality: InventoryQuality) -> egui::Color32 {
+    match quality {
+        InventoryQuality::Poor => egui::Color32::from_gray(150),
+        InventoryQuality::Common => egui::Color32::WHITE,
+        InventoryQuality::Uncommon => egui::Color32::from_rgb(30, 255, 0),
+        InventoryQuality::Rare => egui::Color32::from_rgb(0, 112, 221),
+        InventoryQuality::Epic => egui::Color32::from_rgb(163, 53, 238),
+        InventoryQuality::Legendary => egui::Color32::from_rgb(255, 128, 0),
+    }
+}
+
+fn equipment_slot_options() -> [EquipmentSlot; 16] {
+    [
+        EquipmentSlot::None,
+        EquipmentSlot::Head,
+        EquipmentSlot::Neck,
+        EquipmentSlot::Shoulder,
+        EquipmentSlot::Back,
+        EquipmentSlot::Chest,
+        EquipmentSlot::Wrist,
+        EquipmentSlot::Hands,
+        EquipmentSlot::Waist,
+        EquipmentSlot::Legs,
+        EquipmentSlot::Feet,
+        EquipmentSlot::Finger,
+        EquipmentSlot::Trinket,
+        EquipmentSlot::MainHand,
+        EquipmentSlot::OffHand,
+        EquipmentSlot::Ranged,
+    ]
+}
+
+fn equipment_slot_label(slot: EquipmentSlot) -> &'static str {
+    match slot {
+        EquipmentSlot::Head => "头部",
+        EquipmentSlot::Neck => "颈部",
+        EquipmentSlot::Shoulder => "肩部",
+        EquipmentSlot::Back => "背部",
+        EquipmentSlot::Chest => "胸部",
+        EquipmentSlot::Wrist => "手腕",
+        EquipmentSlot::Hands => "手",
+        EquipmentSlot::Waist => "腰部",
+        EquipmentSlot::Legs => "腿部",
+        EquipmentSlot::Feet => "脚",
+        EquipmentSlot::Finger => "戒指",
+        EquipmentSlot::Trinket => "饰品",
+        EquipmentSlot::MainHand => "主手",
+        EquipmentSlot::OffHand => "副手",
+        EquipmentSlot::Ranged => "远程",
+        EquipmentSlot::None => "非装备",
+    }
 }
 
 fn sync_character_buffs(
@@ -3835,9 +4934,1458 @@ fn format_buff_effect(effect: &BuffEffect) -> String {
     )
 }
 
+fn random_pool_settings_ui(
+    ui: &mut Ui,
+    manager: &mut NapcatMessageManager,
+    state: &mut TrpgGroupSettingsState,
+    player_targets: &[String],
+) -> bool {
+    let mut changed = false;
+
+    ui.heading("随机池");
+    ui.horizontal_wrapped(|ui| {
+        ui.label("池名");
+        ui.text_edit_singleline(&mut state.new_random_pool_name);
+        if ui.button("创建随机池").clicked() {
+            let name = state.new_random_pool_name.trim();
+            if !name.is_empty() {
+                manager
+                    .random_pools
+                    .entry(name.to_owned())
+                    .or_insert_with(RandomPool::default);
+                state.new_random_pool_name.clear();
+                changed = true;
+            }
+        }
+
+        if !player_targets.is_empty() {
+            if state.random_pool_award_target.is_empty()
+                || !player_targets
+                    .iter()
+                    .any(|target_id| target_id == &state.random_pool_award_target)
+            {
+                state.random_pool_award_target = player_targets[0].clone();
+            }
+            egui::ComboBox::from_label("发给角色")
+                .selected_text(target_display_name(
+                    manager,
+                    &state.random_pool_award_target,
+                ))
+                .show_ui(ui, |ui| {
+                    for target_id in player_targets {
+                        ui.selectable_value(
+                            &mut state.random_pool_award_target,
+                            target_id.clone(),
+                            target_display_name(manager, target_id),
+                        );
+                    }
+                });
+        }
+    });
+
+    let mut pool_names = manager.random_pools.keys().cloned().collect::<Vec<_>>();
+    pool_names.sort();
+    if pool_names.is_empty() {
+        ui.label("还没有随机池。");
+        return changed;
+    }
+
+    let mut pool_to_delete = None;
+    for pool_name in pool_names {
+        let Some(pool) = manager.random_pools.get_mut(&pool_name) else {
+            continue;
+        };
+        let total_weight = random_pool_total_weight(pool);
+        ui.collapsing(
+            format!("{pool_name} ({})", pool.entries.len()),
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("随机抽取").clicked() {
+                        if let Some(entry) = pick_random_pool_entry(pool) {
+                            let mut item = entry.item.clone();
+                            normalize_item(&mut item);
+                            pool.last_pick = Some(item.clone());
+                            pool.last_text_result = random_pool_entry_text_result(&entry);
+                            if let Some(character) = manager
+                                .player_characters
+                                .get_mut(&state.random_pool_award_target)
+                            {
+                                add_item_to_inventory(&mut character.inventory, item);
+                            }
+                            changed = true;
+                        }
+                    }
+                    if let Some(item) = pool.last_pick.as_ref() {
+                        ui.label("上次抽取");
+                        ui.colored_label(
+                            item_quality_color(item.quality),
+                            item_display_name(item),
+                        );
+                    }
+                    if let Some(result) = pool.last_text_result.as_ref() {
+                        ui.label("上次文本");
+                        ui.label(random_pool_text_result_label(result));
+                    }
+                    if ui.button("删除池").clicked() {
+                        pool_to_delete = Some(pool_name.clone());
+                    }
+                });
+
+                let mut remove_index = None;
+                egui::Grid::new(ui.next_auto_id())
+                    .num_columns(11)
+                    .spacing([8.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("启用");
+                        ui.strong("物品");
+                        ui.strong("文本结果");
+                        ui.strong("最小");
+                        ui.strong("最大");
+                        ui.strong("品质");
+                        ui.strong("权重");
+                        ui.strong("概率");
+                        ui.strong("数量");
+                        ui.strong("装备位");
+                        ui.strong("操作");
+                        ui.end_row();
+
+                        for (index, entry) in pool.entries.iter_mut().enumerate() {
+                            changed |= ui.checkbox(&mut entry.enabled, "").changed();
+                            changed |= ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut entry.item.name)
+                                        .desired_width(120.0),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut entry.result_text)
+                                        .desired_width(140.0),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut entry.min_count)
+                                        .range(0..=9999)
+                                        .speed(1),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut entry.max_count)
+                                        .range(0..=9999)
+                                        .speed(1),
+                                )
+                                .changed();
+                            changed |= normalize_random_pool_entry(entry);
+                            changed |= item_quality_combo(ui, &mut entry.item.quality);
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut entry.weight)
+                                        .range(0.0..=999_999.0)
+                                        .speed(0.1),
+                                )
+                                .changed();
+                            let probability = if entry.enabled && total_weight > 0.0 {
+                                entry.weight.max(0.0) / total_weight * 100.0
+                            } else {
+                                0.0
+                            };
+                            ui.label(format!("{probability:.1}%"));
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut entry.item.stack)
+                                        .range(1..=9999)
+                                        .speed(1),
+                                )
+                                .changed();
+                            changed |= equipment_slot_combo(ui, &mut entry.item.equipment_slot);
+                            if ui.button("-").on_hover_text("移除池项目").clicked() {
+                                remove_index = Some(index);
+                            }
+                            ui.end_row();
+                        }
+                    });
+
+                if let Some(index) = remove_index {
+                    pool.entries.remove(index);
+                    changed = true;
+                }
+
+                let draft = state
+                    .random_pool_entry_drafts
+                    .entry(pool_name.clone())
+                    .or_default();
+                ui.collapsing("添加池项目", |ui| {
+                    random_pool_entry_draft_ui(ui, draft);
+                    if ui.button("添加到随机池").clicked() {
+                        normalize_random_pool_entry(draft);
+                        pool.entries.push(draft.clone());
+                        changed = true;
+                    }
+                });
+            },
+        );
+    }
+
+    if let Some(pool_name) = pool_to_delete {
+        manager.random_pools.remove(&pool_name);
+        state.random_pool_entry_drafts.remove(&pool_name);
+        changed = true;
+    }
+
+    changed
+}
+
+fn random_pool_entry_draft_ui(ui: &mut Ui, draft: &mut RandomPoolEntry) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui.checkbox(&mut draft.enabled, "启用").changed();
+        ui.label("名称");
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut draft.item.name).desired_width(120.0))
+            .changed();
+        changed |= item_quality_combo(ui, &mut draft.item.quality);
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut draft.weight)
+                    .range(0.0..=999_999.0)
+                    .speed(0.1)
+                    .prefix("权重 "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut draft.item.stack)
+                    .range(1..=9999)
+                    .speed(1)
+                    .prefix("物品数量 "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut draft.min_count)
+                    .range(0..=9999)
+                    .speed(1)
+                    .prefix("最少出现 "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut draft.max_count)
+                    .range(0..=9999)
+                    .speed(1)
+                    .prefix("最多出现 "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut draft.item.max_stack)
+                    .range(1..=9999)
+                    .speed(1)
+                    .prefix("最大堆叠 "),
+            )
+            .changed();
+        changed |= equipment_slot_combo(ui, &mut draft.item.equipment_slot);
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut draft.item.item_level)
+                    .range(0..=9999)
+                    .speed(1)
+                    .prefix("等级 "),
+            )
+            .changed();
+        changed |= ui.checkbox(&mut draft.item.soulbound, "绑定").changed();
+    });
+    ui.label("文本结果");
+    changed |= ui
+        .add(
+            egui::TextEdit::multiline(&mut draft.result_text)
+                .desired_rows(2)
+                .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
+        )
+        .changed();
+    ui.label("说明");
+    changed |= ui
+        .add(
+            egui::TextEdit::multiline(&mut draft.item.description)
+                .desired_rows(2)
+                .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
+        )
+        .changed();
+    changed |= normalize_random_pool_entry(draft);
+    changed
+}
+
+fn normalize_random_pool_entry(entry: &mut RandomPoolEntry) -> bool {
+    let mut changed = normalize_item(&mut entry.item);
+    let weight = entry.weight.max(0.0);
+    if (entry.weight - weight).abs() > f32::EPSILON {
+        entry.weight = weight;
+        changed = true;
+    }
+    let (min_count, max_count) = normalized_random_pool_counts(entry.min_count, entry.max_count);
+    if entry.min_count != min_count {
+        entry.min_count = min_count;
+        changed = true;
+    }
+    if entry.max_count != max_count {
+        entry.max_count = max_count;
+        changed = true;
+    }
+    changed
+}
+
+fn random_pool_total_weight(pool: &RandomPool) -> f32 {
+    pool.entries
+        .iter()
+        .filter(|entry| entry.enabled)
+        .map(|entry| entry.weight.max(0.0))
+        .sum()
+}
+
+fn pick_random_pool_entry(pool: &RandomPool) -> Option<RandomPoolEntry> {
+    let total = random_pool_total_weight(pool);
+    if total <= 0.0 {
+        return None;
+    }
+
+    let mut roll = rand::rng().random_range(0.0..total);
+    for entry in pool.entries.iter().filter(|entry| entry.enabled) {
+        let weight = entry.weight.max(0.0);
+        if roll < weight {
+            return Some(entry.clone());
+        }
+        roll -= weight;
+    }
+    None
+}
+
+#[cfg(test)]
+fn pick_random_pool_item(pool: &RandomPool) -> Option<InventoryItem> {
+    pick_random_pool_entry(pool).map(|entry| {
+        let mut item = entry.item;
+        normalize_item(&mut item);
+        item
+    })
+}
+
+fn random_pool_entry_text_result(entry: &RandomPoolEntry) -> Option<RandomPoolTextResult> {
+    let text = entry.result_text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (min_count, max_count) = normalized_random_pool_counts(entry.min_count, entry.max_count);
+    let count = if min_count == max_count {
+        min_count
+    } else {
+        rand::rng().random_range(min_count..=max_count)
+    };
+    Some(RandomPoolTextResult {
+        entry_name: entry.item.name.clone(),
+        text: text.to_owned(),
+        count,
+    })
+}
+
+fn random_pool_text_result_label(result: &RandomPoolTextResult) -> String {
+    if result.count == 1 {
+        result.text.clone()
+    } else {
+        format!("{} x{}", result.text, result.count)
+    }
+}
+
+fn unit_pool_settings_ui(
+    ui: &mut Ui,
+    manager: &mut NapcatMessageManager,
+    state: &mut TrpgGroupSettingsState,
+    player_targets: &[String],
+) -> bool {
+    let mut changed = false;
+
+    ui.heading("单位池");
+    ui.horizontal_wrapped(|ui| {
+        ui.label("单位ID");
+        ui.add(egui::TextEdit::singleline(&mut state.new_unit_id).desired_width(140.0));
+        if ui.button("新建单位").clicked() {
+            let unit_id = state.new_unit_id.trim().to_owned();
+            if !unit_id.is_empty() {
+                let mut unit = state.unit_pool_draft.clone();
+                prepare_unit_pool_entry(&unit_id, &mut unit);
+                manager.unit_pool.insert(unit_id, unit);
+                state.new_unit_id.clear();
+                state.unit_pool_draft = UnitPoolEntry::default();
+                changed = true;
+            }
+        }
+    });
+
+    ui.collapsing("新单位模板", |ui| {
+        changed |= unit_pool_entry_editor_ui(ui, "draft", &mut state.unit_pool_draft);
+    });
+
+    if !player_targets.is_empty() {
+        if state.unit_pool_source_target.is_empty()
+            || !player_targets
+                .iter()
+                .any(|target_id| target_id == &state.unit_pool_source_target)
+        {
+            state.unit_pool_source_target = player_targets[0].clone();
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_label("来源角色")
+                .selected_text(target_display_name(
+                    manager,
+                    &state.unit_pool_source_target,
+                ))
+                .show_ui(ui, |ui| {
+                    for target_id in player_targets {
+                        ui.selectable_value(
+                            &mut state.unit_pool_source_target,
+                            target_id.clone(),
+                            target_display_name(manager, target_id),
+                        );
+                    }
+                });
+
+            if ui.button("从角色复制").clicked() {
+                let source_id = state.unit_pool_source_target.clone();
+                let unit_id = if state.new_unit_id.trim().is_empty() {
+                    format!("unit-{source_id}")
+                } else {
+                    state.new_unit_id.trim().to_owned()
+                };
+                if let Some(character) = manager.player_characters.get(&source_id).cloned() {
+                    let mut unit = UnitPoolEntry {
+                        label: target_display_name(manager, &source_id),
+                        note: "从玩家角色复制".to_owned(),
+                        character,
+                    };
+                    prepare_unit_pool_entry(&unit_id, &mut unit);
+                    manager.unit_pool.insert(unit_id, unit);
+                    state.new_unit_id.clear();
+                    changed = true;
+                }
+            }
+        });
+    } else {
+        ui.small("还没有可复制的玩家角色。");
+    }
+
+    let mut unit_ids = manager.unit_pool.keys().cloned().collect::<Vec<_>>();
+    unit_ids.sort();
+    if unit_ids.is_empty() {
+        ui.label("还没有单位模板。");
+        return changed;
+    }
+
+    let mut unit_to_delete = None;
+    for unit_id in unit_ids {
+        let title = manager
+            .unit_pool
+            .get(&unit_id)
+            .map(|unit| unit_pool_entry_title(&unit_id, unit))
+            .unwrap_or_else(|| unit_id.clone());
+        ui.collapsing(title, |ui| {
+            if let Some(unit) = manager.unit_pool.get_mut(&unit_id) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.small(format!("ID {unit_id}"));
+                    if ui.button("删除单位").clicked() {
+                        unit_to_delete = Some(unit_id.clone());
+                    }
+                });
+                changed |= unit_pool_entry_editor_ui(ui, &unit_id, unit);
+            }
+        });
+    }
+
+    if let Some(unit_id) = unit_to_delete {
+        manager.unit_pool.remove(&unit_id);
+        changed = true;
+    }
+
+    changed
+}
+
+fn prepare_unit_pool_entry(unit_id: &str, unit: &mut UnitPoolEntry) {
+    let label = unit.label.trim();
+    if label.is_empty() {
+        unit.label = unit_id.to_owned();
+    }
+
+    let label = unit.label.trim();
+    if unit.character.nickname.trim().is_empty() {
+        unit.character.nickname = label.to_owned();
+    }
+    if unit.character.name.trim().is_empty() {
+        unit.character.name = label.to_owned();
+    }
+    unit.character.inited = true;
+    update_character_from_status(&mut unit.character);
+}
+
+fn unit_pool_entry_title(unit_id: &str, unit: &UnitPoolEntry) -> String {
+    let label = unit.label.trim();
+    if label.is_empty() {
+        unit_id.to_owned()
+    } else {
+        format!("{label} ({unit_id})")
+    }
+}
+
+fn unit_pool_entry_editor_ui(ui: &mut Ui, unit_id: &str, unit: &mut UnitPoolEntry) -> bool {
+    let mut changed = false;
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("显示名");
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut unit.label).desired_width(160.0))
+            .changed();
+    });
+    ui.label("备注");
+    changed |= ui
+        .add(
+            egui::TextEdit::multiline(&mut unit.note)
+                .desired_rows(2)
+                .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
+        )
+        .changed();
+
+    changed |= unit_character_template_editor_ui(ui, unit_id, &mut unit.character);
+    changed
+}
+
+fn unit_character_template_editor_ui(
+    ui: &mut Ui,
+    unit_id: &str,
+    character: &mut PlayerCharacter,
+) -> bool {
+    let mut changed = false;
+    let mut derived_stats_changed = false;
+
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui.checkbox(&mut character.inited, "已完成").changed();
+        ui.label("角色名");
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut character.name).desired_width(120.0))
+            .changed();
+        ui.label("昵称");
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut character.nickname).desired_width(120.0))
+            .changed();
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        let level_response = ui
+            .add(
+                egui::DragValue::new(&mut character.level)
+                    .range(1..=999)
+                    .prefix("等级 "),
+            )
+            .changed();
+        changed |= level_response;
+        derived_stats_changed |= level_response;
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.exp)
+                    .range(0..=999_999)
+                    .prefix("经验 "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.speed)
+                    .range(0.0..=9999.0)
+                    .speed(0.1)
+                    .prefix("速度 "),
+            )
+            .changed();
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.hp)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("HP "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.max_hp)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("/ "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.mp)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("MP "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.max_mp)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("/ "),
+            )
+            .changed();
+    });
+
+    let status_changed = unit_character_status_editor_ui(ui, &mut character.status);
+    changed |= status_changed;
+    derived_stats_changed |= status_changed;
+
+    if derived_stats_changed {
+        update_character_from_status(character);
+        changed = true;
+    }
+    if character.hp > character.max_hp {
+        character.hp = character.max_hp;
+        changed = true;
+    }
+    if character.mp > character.max_mp {
+        character.mp = character.max_mp;
+        changed = true;
+    }
+
+    character_status_summary_ui(ui, character);
+    ui.horizontal_wrapped(|ui| {
+        ui.small(format!(
+            "技能 {}",
+            character.skill_names.len()
+        ));
+        ui.small(format!(
+            "背包 {}",
+            character.inventory.items.len()
+        ));
+        ui.small(format!("模板 {unit_id}"));
+    });
+
+    changed
+}
+
+fn unit_character_status_editor_ui(ui: &mut Ui, status: &mut CharacterStatus) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut status.str_)
+                    .range(0..=999)
+                    .prefix("STR "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut status.agi)
+                    .range(0..=999)
+                    .prefix("AGI "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut status.dex)
+                    .range(0..=999)
+                    .prefix("DEX "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut status.vit)
+                    .range(0..=999)
+                    .prefix("VIT "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut status.int_)
+                    .range(0..=999)
+                    .prefix("INT "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut status.wis)
+                    .range(0..=999)
+                    .prefix("WIS "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut status.k)
+                    .range(0..=999)
+                    .prefix("K "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut status.cha)
+                    .range(0..=999)
+                    .prefix("CHA "),
+            )
+            .changed();
+    });
+    changed
+}
+
+fn skill_pool_settings_ui(
+    ui: &mut Ui,
+    manager: &mut NapcatMessageManager,
+    state: &mut TrpgGroupSettingsState,
+) -> bool {
+    let mut changed = false;
+    changed |= manager.sync_skill_pool_from_completed_characters();
+
+    let auto_count = manager
+        .skill_pool
+        .iter()
+        .filter(|entry| entry.source_key().is_some())
+        .count();
+    let manual_count = manager.skill_pool.len().saturating_sub(auto_count);
+    ui.heading("技能池");
+    ui.horizontal_wrapped(|ui| {
+        ui.small(format!("已兑换技能 {auto_count}"));
+        ui.small(format!("手动技能 {manual_count}"));
+        if ui.button("刷新已兑换技能").clicked() {
+            changed |= manager.sync_skill_pool_from_completed_characters();
+        }
+    });
+
+    if manager.skill_pool.is_empty() {
+        ui.label("还没有技能。完成角色兑换后，技能会自动进入这里。");
+    } else {
+        let mut remove_manual_index = None;
+        egui::ScrollArea::vertical()
+            .id_salt("skill_pool_settings")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                egui::Grid::new(ui.next_auto_id())
+                    .num_columns(7)
+                    .spacing([8.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("技能");
+                        ui.strong("类型");
+                        ui.strong("标签");
+                        ui.strong("来源");
+                        ui.strong("MP");
+                        ui.strong("冷却");
+                        ui.strong("操作");
+                        ui.end_row();
+
+                        for (index, entry) in manager.skill_pool.iter().enumerate() {
+                            ui.label(skill_pool_entry_name(entry));
+                            ui.small(skill_pool_entry_category_label(entry));
+                            ui.small(skill_pool_entry_tags_label(entry));
+                            ui.small(entry.source_character_name.as_deref().unwrap_or("手动"));
+                            ui.label(format_character_number(entry.mp_cost));
+                            ui.label(entry.cooldown_turns.to_string());
+                            if entry.source_key().is_none() {
+                                if ui.button("-").on_hover_text("移除手动技能").clicked() {
+                                    remove_manual_index = Some(index);
+                                }
+                            } else {
+                                ui.small("自动");
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some(index) = remove_manual_index {
+            manager.skill_pool.remove(index);
+            changed = true;
+        }
+    }
+
+    ui.collapsing("添加手动技能", |ui| {
+        let draft = &mut state.skill_pool_draft;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("技能名");
+            ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(140.0));
+            ui.add(
+                egui::DragValue::new(&mut draft.mp_cost)
+                    .range(0.0..=9999.0)
+                    .speed(1.0)
+                    .prefix("MP "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut draft.cooldown_turns)
+                    .range(0..=999)
+                    .speed(1)
+                    .prefix("冷却 "),
+            );
+            ui.label("类型");
+            ui.add(
+                egui::TextEdit::singleline(draft.category.get_or_insert_with(String::new))
+                    .desired_width(100.0),
+            );
+            ui.label("标签");
+            let mut tags = draft.tags.join(" ");
+            if ui
+                .add(egui::TextEdit::singleline(&mut tags).desired_width(140.0))
+                .changed()
+            {
+                draft.tags = tags.split_whitespace().map(str::to_owned).collect();
+            }
+        });
+        ui.label("规则描述");
+        ui.add(
+            egui::TextEdit::multiline(&mut draft.note)
+                .desired_rows(2)
+                .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
+        );
+        if ui.button("加入技能池").clicked() {
+            if let Some(mut entry) = normalized_manual_skill_pool_entry(draft) {
+                entry.source_character_id = None;
+                entry.source_character_name = None;
+                entry.source_skill_index = None;
+                manager.skill_pool.push(entry);
+                state.skill_pool_draft = SkillPoolEntry::default();
+                changed = true;
+            }
+        }
+    });
+
+    changed
+}
+
+fn normalized_manual_skill_pool_entry(draft: &SkillPoolEntry) -> Option<SkillPoolEntry> {
+    let note = draft.note.trim();
+    if note.is_empty() {
+        return None;
+    }
+    let name = if draft.name.trim().is_empty() {
+        "未命名技能".to_owned()
+    } else {
+        draft.name.trim().to_owned()
+    };
+    Some(SkillPoolEntry {
+        name,
+        note: note.to_owned(),
+        mp_cost: draft.mp_cost.max(0.0),
+        cooldown_turns: draft.cooldown_turns,
+        source_character_id: None,
+        source_character_name: None,
+        source_skill_index: None,
+        tags: draft.tags.clone(),
+        category: draft.category.clone(),
+        args: draft.args.clone(),
+        ..Default::default()
+    })
+}
+
+fn skill_pool_entry_name(entry: &SkillPoolEntry) -> String {
+    if entry.name.trim().is_empty() {
+        "未命名技能".to_owned()
+    } else {
+        entry.name.trim().to_owned()
+    }
+}
+
+fn skill_pool_entry_category_label(entry: &SkillPoolEntry) -> String {
+    entry
+        .category
+        .as_deref()
+        .filter(|category| !category.trim().is_empty())
+        .unwrap_or("-")
+        .to_owned()
+}
+
+fn skill_pool_entry_tags_label(entry: &SkillPoolEntry) -> String {
+    if entry.tags.is_empty() {
+        "-".to_owned()
+    } else {
+        entry.tags.join(" ")
+    }
+}
+
+fn skill_pool_entry_legacy_label(entry: &SkillPoolEntry) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(id) = entry
+        .legacy_pool_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        parts.push(format!("旧ID {id}"));
+    }
+    if !entry.args.is_empty() {
+        let args = entry
+            .args
+            .iter()
+            .map(|arg| {
+                let name =
+                    if arg.name.trim().is_empty() { "未命名变量" } else { arg.name.trim() };
+                if arg.kind.trim().is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{name}:{}", arg.kind.trim())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("变量 {args}"));
+    }
+    if entry.legacy_buff_count > 0 {
+        parts.push(format!(
+            "旧BUFF {}",
+            entry.legacy_buff_count
+        ));
+    }
+    if entry.legacy_event_buff_count > 0 {
+        parts.push(format!(
+            "旧事件BUFF {}",
+            entry.legacy_event_buff_count
+        ));
+    }
+    if entry.legacy_has_graph {
+        parts.push("含旧蓝图".to_owned());
+    }
+    (!parts.is_empty()).then(|| parts.join("；"))
+}
+
+fn ensure_import_export_paths(state: &mut TrpgGroupSettingsState) {
+    if state.export_path.trim().is_empty() {
+        state.export_path = NAPCAT_EXPORT_DEFAULT_PATH.to_owned();
+    }
+    if state.pc_export_path.trim().is_empty() {
+        state.pc_export_path = NAPCAT_PC_EXPORT_DEFAULT_PATH.to_owned();
+    }
+    if state.chat_list_export_path.trim().is_empty() {
+        state.chat_list_export_path = NAPCAT_CHAT_LIST_EXPORT_DEFAULT_PATH.to_owned();
+    }
+    if state.unit_pool_export_path.trim().is_empty() {
+        state.unit_pool_export_path = NAPCAT_UNIT_POOL_EXPORT_DEFAULT_PATH.to_owned();
+    }
+    if state.moonberry_legacy_import_path.trim().is_empty() {
+        state.moonberry_legacy_import_path = NAPCAT_MOONBERRY_LEGACY_IMPORT_DEFAULT_PATH.to_owned();
+    }
+    if state.deepseek_summary_export_path.trim().is_empty() {
+        state.deepseek_summary_export_path = DEEPSEEK_SUMMARY_EXPORT_DEFAULT_PATH.to_owned();
+    }
+    if state.voxel_scene_export_path.trim().is_empty() {
+        state.voxel_scene_export_path = VOXEL_SCENE_EXPORT_DEFAULT_PATH.to_owned();
+    }
+    if state.import_path.trim().is_empty() {
+        state.import_path = state.export_path.clone();
+    }
+}
+
+fn napcat_import_export_ui(
+    ui: &mut Ui,
+    manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+    deepseek_manager: &mut ResMut<Persistent<DeepseekManager>>,
+    mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
+    mut scene_runtime: Option<&mut VoxelMapRuntimeState>,
+    state: &mut TrpgGroupSettingsState,
+) {
+    ensure_import_export_paths(state);
+
+    ui.collapsing("导入/导出", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "NapCat格式版本 {} / DeepSeek总结版本 {} / 场景版本 {}",
+                NAPCAT_MANAGER_EXPORT_VERSION,
+                DEEPSEEK_SUMMARY_EXPORT_VERSION,
+                VOXEL_SCENE_EXPORT_VERSION
+            ));
+            if !state.import_export_status.trim().is_empty() {
+                ui.small(state.import_export_status.as_str());
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("导出路径");
+            ui.text_edit_singleline(&mut state.export_path);
+            if ui.button("导出").clicked() {
+                match write_napcat_manager_export(manager, &state.export_path) {
+                    Ok(()) => {
+                        state.import_export_status = format!("已导出到 {}", state.export_path);
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("导出失败：{err}");
+                    },
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("PC文件");
+            ui.text_edit_singleline(&mut state.pc_export_path);
+            if ui.button("导出PC").clicked() {
+                match write_text_export(
+                    &state.pc_export_path,
+                    manager.to_player_characters_export_json(),
+                ) {
+                    Ok(()) => {
+                        state.import_export_status = format!("已导出PC到 {}", state.pc_export_path);
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("PC导出失败：{err}");
+                    },
+                }
+            }
+            if ui.button("导入PC").clicked() {
+                match read_text_import(&state.pc_export_path)
+                    .and_then(|text| manager.merge_player_characters_export_json(&text))
+                {
+                    Ok(count) => match manager.persist() {
+                        Ok(()) => {
+                            state.import_export_status = format!("已导入{}个PC", count);
+                        },
+                        Err(err) => {
+                            state.import_export_status = format!("PC导入保存失败：{err}");
+                        },
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("PC导入失败：{err}");
+                    },
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("聊天列表文件");
+            ui.text_edit_singleline(&mut state.chat_list_export_path);
+            if ui.button("导出聊天列表").clicked() {
+                match write_text_export(
+                    &state.chat_list_export_path,
+                    manager.to_chat_list_export_json(),
+                ) {
+                    Ok(()) => {
+                        state.import_export_status = format!(
+                            "已导出聊天列表到 {}",
+                            state.chat_list_export_path
+                        );
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("聊天列表导出失败：{err}");
+                    },
+                }
+            }
+            if ui.button("导入聊天列表").clicked() {
+                match read_text_import(&state.chat_list_export_path)
+                    .and_then(|text| manager.merge_chat_list_export_json(&text))
+                {
+                    Ok(count) => match manager.persist() {
+                        Ok(()) => {
+                            state.import_export_status = format!("已导入{}个聊天目标", count);
+                        },
+                        Err(err) => {
+                            state.import_export_status = format!("聊天列表导入保存失败：{err}");
+                        },
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("聊天列表导入失败：{err}");
+                    },
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("单位池文件");
+            ui.text_edit_singleline(&mut state.unit_pool_export_path);
+            if ui.button("导出单位池").clicked() {
+                match write_text_export(
+                    &state.unit_pool_export_path,
+                    manager.to_unit_pool_export_json(),
+                ) {
+                    Ok(()) => {
+                        state.import_export_status = format!(
+                            "已导出单位池到 {}",
+                            state.unit_pool_export_path
+                        );
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("单位池导出失败：{err}");
+                    },
+                }
+            }
+            if ui.button("导入单位池").clicked() {
+                match read_text_import(&state.unit_pool_export_path)
+                    .and_then(|text| manager.merge_unit_pool_export_json(&text))
+                {
+                    Ok(count) => match manager.persist() {
+                        Ok(()) => {
+                            state.import_export_status = format!("已导入{}个单位模板", count);
+                        },
+                        Err(err) => {
+                            state.import_export_status = format!("单位池导入保存失败：{err}");
+                        },
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("单位池导入失败：{err}");
+                    },
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("月莓旧JSON");
+            ui.text_edit_singleline(&mut state.moonberry_legacy_import_path);
+            if ui.button("导入月莓旧JSON").clicked() {
+                match read_text_import(&state.moonberry_legacy_import_path)
+                    .and_then(|text| manager.merge_moonberry_legacy_json(&text))
+                {
+                    Ok(summary) => match manager.persist() {
+                        Ok(()) => {
+                            state.import_export_status = format!(
+                                "已导入月莓旧JSON：{}个团，{}个PC，{}个聊天目标，{}条消息，{}个技能池，{}个单位模板，{}个随机池",
+                                summary.groups,
+                                summary.players,
+                                summary.chat_targets,
+                                summary.messages,
+                                summary.skill_pools,
+                                summary.unit_templates,
+                                summary.random_pools
+                            );
+                        },
+                        Err(err) => {
+                            state.import_export_status = format!("月莓旧JSON导入保存失败：{err}");
+                        },
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("月莓旧JSON导入失败：{err}");
+                    },
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("DeepSeek总结文件");
+            ui.text_edit_singleline(&mut state.deepseek_summary_export_path);
+            if ui.button("导出总结").clicked() {
+                match write_text_export(
+                    &state.deepseek_summary_export_path,
+                    deepseek_manager.to_summary_export_json(),
+                ) {
+                    Ok(()) => {
+                        state.import_export_status = format!(
+                            "已导出DeepSeek总结到 {}",
+                            state.deepseek_summary_export_path
+                        );
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("DeepSeek总结导出失败：{err}");
+                    },
+                }
+            }
+            if ui.button("导入总结").clicked() {
+                match read_text_import(&state.deepseek_summary_export_path)
+                    .and_then(|text| deepseek_manager.merge_summary_export_json(&text))
+                {
+                    Ok(count) => match deepseek_manager.persist() {
+                        Ok(()) => {
+                            state.import_export_status = format!("已导入{}个DeepSeek总结", count);
+                        },
+                        Err(err) => {
+                            state.import_export_status = format!("DeepSeek总结导入保存失败：{err}");
+                        },
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("DeepSeek总结导入失败：{err}");
+                    },
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("体素场景文件");
+            ui.text_edit_singleline(&mut state.voxel_scene_export_path);
+            if ui.button("导出场景").clicked() {
+                let result = scene_store
+                    .as_deref()
+                    .ok_or_else(|| "场景存储未就绪".to_owned())
+                    .and_then(|store| {
+                        write_text_export(
+                            &state.voxel_scene_export_path,
+                            store.to_export_json(),
+                        )
+                    });
+                match result {
+                    Ok(()) => {
+                        state.import_export_status = format!(
+                            "已导出体素场景到 {}",
+                            state.voxel_scene_export_path
+                        );
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("体素场景导出失败：{err}");
+                    },
+                }
+            }
+            if ui.button("导入场景").clicked() {
+                let result = scene_store
+                    .as_deref_mut()
+                    .ok_or_else(|| "场景存储未就绪".to_owned())
+                    .and_then(|store| {
+                        let text = read_text_import(&state.voxel_scene_export_path)?;
+                        let count = store.merge_export_json(&text)?;
+                        store.persist().map_err(|err| err.to_string())?;
+                        if let Some(runtime) = scene_runtime.as_deref_mut() {
+                            runtime.request_reload();
+                        }
+                        Ok(count)
+                    });
+                match result {
+                    Ok(count) => {
+                        state.import_export_status = format!("已导入{}张体素地图", count);
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("体素场景导入失败：{err}");
+                    },
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("导入路径");
+            ui.text_edit_singleline(&mut state.import_path);
+            if ui.button("导入").clicked() {
+                match read_napcat_manager_export(&state.import_path) {
+                    Ok(imported) => match manager.set(imported) {
+                        Ok(()) => {
+                            state.import_export_status = format!("已从 {} 导入", state.import_path);
+                        },
+                        Err(err) => {
+                            state.import_export_status = format!("导入保存失败：{err}");
+                        },
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("导入失败：{err}");
+                    },
+                }
+            }
+        });
+    });
+}
+
+fn write_napcat_manager_export(manager: &NapcatMessageManager, path: &str) -> Result<(), String> {
+    write_text_export(path, manager.to_export_json())
+}
+
+fn write_text_export(path: &str, text: Result<String, String>) -> Result<(), String> {
+    let path = Path::new(path.trim());
+    if path.as_os_str().is_empty() {
+        return Err("路径不能为空".to_owned());
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::write(path, text?).map_err(|err| err.to_string())
+}
+
+fn read_napcat_manager_export(path: &str) -> Result<NapcatMessageManager, String> {
+    let text = read_text_import(path)?;
+    NapcatMessageManager::from_export_json(&text)
+}
+
+fn read_text_import(path: &str) -> Result<String, String> {
+    let path = Path::new(path.trim());
+    if path.as_os_str().is_empty() {
+        return Err("路径不能为空".to_owned());
+    }
+    fs::read_to_string(path).map_err(|err| err.to_string())
+}
+
+fn trpg_basic_config_ui(ui: &mut Ui, config: &mut TrpgBasicConfig) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        changed |= f32_config_drag(
+            ui,
+            "基础HP",
+            &mut config.base_max_hp,
+            0.0..=9999.0,
+            0.5,
+        );
+        changed |= f32_config_drag(
+            ui,
+            "等级HP",
+            &mut config.lv_max_hp,
+            0.0..=9999.0,
+            0.5,
+        );
+        changed |= f32_config_drag(
+            ui,
+            "力量HP",
+            &mut config.str_max_hp,
+            0.0..=9999.0,
+            0.5,
+        );
+        changed |= f32_config_drag(
+            ui,
+            "体质HP",
+            &mut config.vit_max_hp,
+            0.0..=9999.0,
+            0.5,
+        );
+        changed |= f32_config_drag(
+            ui,
+            "体质回复",
+            &mut config.vit_hp_reg,
+            -999.0..=999.0,
+            0.1,
+        );
+    });
+    ui.horizontal_wrapped(|ui| {
+        changed |= f32_config_drag(
+            ui,
+            "智力MP",
+            &mut config.int_max_mp,
+            0.0..=9999.0,
+            0.5,
+        );
+        changed |= f32_config_drag(
+            ui,
+            "智慧MP",
+            &mut config.wis_max_mp,
+            0.0..=9999.0,
+            0.5,
+        );
+        changed |= f32_config_drag(
+            ui,
+            "智慧回蓝",
+            &mut config.wis_mp_reg,
+            -999.0..=999.0,
+            0.1,
+        );
+        changed |= f32_config_drag(
+            ui,
+            "基础速度",
+            &mut config.basic_speed,
+            0.0..=999.0,
+            0.1,
+        );
+        changed |= f32_config_drag(
+            ui,
+            "力量速度",
+            &mut config.str_speed,
+            -999.0..=999.0,
+            0.1,
+        );
+        changed |= f32_config_drag(
+            ui,
+            "敏捷速度",
+            &mut config.agi_speed,
+            -999.0..=999.0,
+            0.1,
+        );
+        changed |= f32_config_drag(
+            ui,
+            "灵巧速度",
+            &mut config.dex_speed,
+            -999.0..=999.0,
+            0.1,
+        );
+    });
+    ui.collapsing("伤害与治疗系数", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            changed |= f32_config_drag(
+                ui,
+                "力量伤害",
+                &mut config.str_damage_bonus,
+                -99.0..=99.0,
+                0.001,
+            );
+            changed |= f32_config_drag(
+                ui,
+                "智力伤害",
+                &mut config.int_damage_bonus,
+                -99.0..=99.0,
+                0.001,
+            );
+            changed |= f32_config_drag(
+                ui,
+                "敏捷伤害",
+                &mut config.agi_damage_bonus,
+                -99.0..=99.0,
+                0.001,
+            );
+            changed |= f32_config_drag(
+                ui,
+                "灵巧伤害",
+                &mut config.dex_damage_bonus,
+                -99.0..=99.0,
+                0.001,
+            );
+            changed |= f32_config_drag(
+                ui,
+                "灵巧远程",
+                &mut config.dex_range_damage_bonus,
+                -99.0..=99.0,
+                0.001,
+            );
+            changed |= f32_config_drag(
+                ui,
+                "智力治疗",
+                &mut config.int_heal_bonus,
+                -99.0..=99.0,
+                0.001,
+            );
+            changed |= f32_config_drag(
+                ui,
+                "智慧治疗",
+                &mut config.wis_heal_bonus,
+                -99.0..=99.0,
+                0.001,
+            );
+        });
+    });
+    ui.horizontal_wrapped(|ui| {
+        changed |= f32_config_drag(
+            ui,
+            "升级经验",
+            &mut config.exp_gain_per_level,
+            0.0..=9999.0,
+            0.1,
+        );
+        changed |= f32_config_drag(
+            ui,
+            "PVP经验",
+            &mut config.exp_gain_per_level_pvp,
+            0.0..=9999.0,
+            0.01,
+        );
+        if ui.button("恢复默认公式").clicked() {
+            *config = TrpgBasicConfig::default();
+            changed = true;
+        }
+    });
+    changed
+}
+
+fn f32_config_drag(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    speed: f64,
+) -> bool {
+    ui.add(
+        egui::DragValue::new(value)
+            .range(range)
+            .speed(speed)
+            .prefix(format!("{label} ")),
+    )
+    .changed()
+}
+
 fn trpg_group_settings_window(
     ctx: &Context,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+    deepseek_manager: &mut ResMut<Persistent<DeepseekManager>>,
+    scene_store: Option<&mut Persistent<VoxelSceneStore>>,
+    scene_runtime: Option<&mut VoxelMapRuntimeState>,
     state: &mut TrpgGroupSettingsState,
     character_edit_state: &mut CharacterEditState,
     rule_engine_state: &mut RuleEngineState,
@@ -3854,10 +6402,11 @@ fn trpg_group_settings_window(
     let mut turn_action: Option<(String, String, bool)> = None;
     let mut turn_reset: Option<String> = None;
     let mut turn_advance: Option<String> = None;
+    let mut settings_open = state.open;
 
-    egui::Window::new("玩家/群池")
+    egui::Window::new("TRPG设置")
         .id(Id::new("trpg_group_settings_window"))
-        .open(&mut state.open)
+        .open(&mut settings_open)
         .default_size(Vec2::new(620.0, 520.0))
         .min_width(420.0)
         .show(ctx, |ui| {
@@ -3877,44 +6426,16 @@ fn trpg_group_settings_window(
                 }
             });
 
+            napcat_import_export_ui(
+                ui,
+                manager,
+                deepseek_manager,
+                scene_store,
+                scene_runtime,
+                state,
+            );
             ui.separator();
-            ui.columns(2, |columns| {
-                columns[0].heading("玩家池");
-                if player_targets.is_empty() {
-                    columns[0].label("还没有玩家私聊。");
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt("player_pool_settings")
-                        .max_height(140.0)
-                        .show(&mut columns[0], |ui| {
-                            for target_id in &player_targets {
-                                ui.horizontal(|ui| {
-                                    ui.label(target_display_name(manager, target_id));
-                                    ui.small(target_id);
-                                });
-                            }
-                        });
-                }
 
-                columns[1].heading("群聊池");
-                if group_chat_targets.is_empty() {
-                    columns[1].label("还没有QQ群聊。");
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt("group_chat_pool_settings")
-                        .max_height(140.0)
-                        .show(&mut columns[1], |ui| {
-                            for target_id in &group_chat_targets {
-                                ui.horizontal(|ui| {
-                                    ui.label(target_display_name(manager, target_id));
-                                    ui.small(target_id);
-                                });
-                            }
-                        });
-                }
-            });
-
-            ui.separator();
             ui.heading("玩家角色");
             if player_targets.is_empty() {
                 ui.label("还没有玩家私聊。");
@@ -3925,6 +6446,8 @@ fn trpg_group_settings_window(
                     .show(ui, |ui| {
                         for target_id in &player_targets {
                             let display_name = target_display_name(manager, target_id);
+                            let skill_pool_snapshot = manager.skill_pool.clone();
+                            let stat_config = manager.character_stat_config_for_target(target_id);
                             let character = manager
                                 .player_characters
                                 .entry(target_id.clone())
@@ -3959,6 +6482,8 @@ fn trpg_group_settings_window(
                                             &display_name,
                                             character_edit_state,
                                             rule_engine_state,
+                                            &skill_pool_snapshot,
+                                            stat_config,
                                         );
                                     });
                                 },
@@ -4036,6 +6561,73 @@ fn trpg_group_settings_window(
                                 }
                             });
 
+                            ui.collapsing("团设与建卡规则", |ui| {
+                                if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
+                                    ui.horizontal(|ui| {
+                                        ui.label("活动ID");
+                                        changed |= ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut group.campaign_id)
+                                                    .desired_width(180.0),
+                                            )
+                                            .changed();
+                                        ui.label("初始属性点");
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut group.initial_status_points,
+                                                )
+                                                .range(0..=999),
+                                            )
+                                            .changed();
+                                        ui.label("初始技能点");
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut group.initial_exchange_points,
+                                                )
+                                                .range(0..=999),
+                                            )
+                                            .changed();
+                                        changed |= ui
+                                            .checkbox(
+                                                &mut group.allow_join_requests,
+                                                "允许入团请求",
+                                            )
+                                            .changed();
+                                    });
+
+                                    ui.label("公开说明");
+                                    changed |= ui
+                                        .add(
+                                            egui::TextEdit::multiline(&mut group.description)
+                                                .desired_width(ui.available_width())
+                                                .desired_rows(2),
+                                        )
+                                        .changed();
+                                    ui.label("GM说明");
+                                    changed |= ui
+                                        .add(
+                                            egui::TextEdit::multiline(&mut group.st_description)
+                                                .desired_width(ui.available_width())
+                                                .desired_rows(2),
+                                        )
+                                        .changed();
+                                    ui.label("玩家引导");
+                                    changed |= ui
+                                        .add(
+                                            egui::TextEdit::multiline(&mut group.guide)
+                                                .desired_width(ui.available_width())
+                                                .desired_rows(3),
+                                        )
+                                        .changed();
+                                    ui.collapsing("属性公式", |ui| {
+                                        changed |=
+                                            trpg_basic_config_ui(ui, &mut group.basic_config);
+                                    });
+                                }
+                            });
+
                             if snapshot.players.is_empty() {
                                 ui.small("这个TRPG轮次组里没有玩家。");
                             } else {
@@ -4076,6 +6668,105 @@ fn trpg_group_settings_window(
                                 ui.separator();
                             }
 
+                            ui.collapsing("小队与可见性", |ui| {
+                                let draft = state
+                                    .party_name_drafts
+                                    .entry(group_name.clone())
+                                    .or_default();
+                                ui.horizontal(|ui| {
+                                    ui.label("新小队");
+                                    ui.text_edit_singleline(draft);
+                                    if ui.button("创建小队").clicked() {
+                                        let party_name = draft.trim().to_owned();
+                                        if !party_name.is_empty() {
+                                            if let Some(group) =
+                                                manager.trpg_groups.get_mut(&group_name)
+                                            {
+                                                changed |= group.ensure_party(&party_name);
+                                            }
+                                            draft.clear();
+                                        }
+                                    }
+                                });
+
+                                let mut party_names =
+                                    snapshot.parties.keys().cloned().collect::<Vec<_>>();
+                                party_names.sort();
+
+                                if snapshot.players.is_empty() {
+                                    ui.small("这个TRPG组里没有可分配的小队玩家。");
+                                } else {
+                                    for target_id in &snapshot.players {
+                                        let display_name = target_display_name(manager, target_id);
+                                        let mut selected_party = snapshot
+                                            .party_id_for_player(target_id)
+                                            .unwrap_or_default()
+                                            .to_owned();
+                                        let before_party = selected_party.clone();
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(display_name);
+                                            egui::ComboBox::from_id_salt((
+                                                "party_assignment",
+                                                &group_name,
+                                                target_id,
+                                            ))
+                                            .selected_text(if selected_party.is_empty() {
+                                                "无小队"
+                                            } else {
+                                                selected_party.as_str()
+                                            })
+                                            .show_ui(
+                                                ui,
+                                                |ui| {
+                                                    ui.selectable_value(
+                                                        &mut selected_party,
+                                                        String::new(),
+                                                        "无小队",
+                                                    );
+                                                    for party_name in &party_names {
+                                                        ui.selectable_value(
+                                                            &mut selected_party,
+                                                            party_name.clone(),
+                                                            party_name,
+                                                        );
+                                                    }
+                                                },
+                                            );
+
+                                            if let Ok(user_id) = target_id.parse::<u64>() {
+                                                let mut is_gm =
+                                                    snapshot.gm_users.contains(&user_id);
+                                                if ui.checkbox(&mut is_gm, "GM").changed() {
+                                                    if let Some(group) =
+                                                        manager.trpg_groups.get_mut(&group_name)
+                                                    {
+                                                        if is_gm {
+                                                            changed |=
+                                                                group.gm_users.insert(user_id);
+                                                        } else {
+                                                            changed |=
+                                                                group.gm_users.remove(&user_id);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+
+                                        if selected_party != before_party {
+                                            if let Some(group) =
+                                                manager.trpg_groups.get_mut(&group_name)
+                                            {
+                                                changed |= group.set_player_party(
+                                                    target_id,
+                                                    (!selected_party.is_empty())
+                                                        .then_some(selected_party.as_str()),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+
                             ui.columns(2, |columns| {
                                 columns[0].label("玩家");
                                 for target_id in &player_targets {
@@ -4097,6 +6788,7 @@ fn trpg_group_settings_window(
                                                 selected,
                                             );
                                             group.sync_turn_players();
+                                            group.sync_parties();
                                             changed = true;
                                         }
                                     }
@@ -4137,6 +6829,7 @@ fn trpg_group_settings_window(
                     }
                 });
         });
+    state.open = settings_open;
 
     if let Some((group_name, target_id, acted)) = turn_action {
         changed |= mark_group_player_turn(
@@ -4194,6 +6887,8 @@ pub fn ui_system(
     mut battle_round_state: ResMut<BattleRoundUiState>,
     scene_positions: Option<Res<SceneCharacterPositions>>,
     player_camera_positions: Option<Res<ScenePlayerCameraPositions>>,
+    mut scene_store: Option<ResMut<Persistent<VoxelSceneStore>>>,
+    mut scene_runtime: Option<ResMut<VoxelMapRuntimeState>>,
     mut player_view_request: Option<ResMut<ScenePlayerViewRequest>>,
 ) {
     let has_run_once: &mut Local<bool> = &mut locals.has_run_once;
@@ -4212,11 +6907,16 @@ pub fn ui_system(
         &mut locals.chat_image_textures;
     let turn_count_drafts: &mut Local<HashMap<(String, String), u32>> =
         &mut locals.chat_turn_count_drafts;
+    let group_broadcast_scopes: &mut Local<HashMap<String, String>> =
+        &mut locals.group_broadcast_scopes;
 
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    if manager.migrate_chat_window_state() || manager.sync_chat_targets() {
+    if manager.migrate_chat_window_state()
+        || manager.sync_chat_targets()
+        || manager.sync_skill_pool_from_completed_characters()
+    {
         manager.persist().ok();
     }
     let napcat_sender = napcat_sender.as_deref();
@@ -4291,6 +6991,9 @@ pub fn ui_system(
     trpg_group_settings_window(
         ctx,
         &mut manager,
+        &mut deepseek_manager,
+        scene_store.as_deref_mut(),
+        scene_runtime.as_deref_mut(),
         trpg_group_settings,
         character_edit_state,
         &mut rule_engine_state,
@@ -4319,6 +7022,10 @@ pub fn ui_system(
                     &mut rule_engine_state,
                     &mut battle_round_state,
                 );
+                let pools_changed = pool_menu_button(ui, &mut manager, trpg_group_settings);
+                if pools_changed {
+                    manager.persist().ok();
+                }
             });
         });
 
@@ -4360,7 +7067,12 @@ pub fn ui_system(
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(ctx, |ui| {
-            pending_chat_requests_window(ctx, &mut manager);
+            pending_chat_requests_window(
+                ctx,
+                &mut manager,
+                napcat_sender,
+                &mut ime,
+            );
             waiting_turn_manager_window(ctx, &mut manager);
 
             let mut closed_group_names = Vec::new();
@@ -4388,9 +7100,10 @@ pub fn ui_system(
                             ctx,
                             &k,
                             &v.members,
-                            &manager.messages,
+                            &manager,
                             napcat_sender,
                             chat_input_msgs,
+                            group_broadcast_scopes,
                             &mut ime,
                         );
                     });
@@ -4471,15 +7184,11 @@ pub fn ui_system(
                 let window_title = target_display_name(&manager, &target_id);
                 let targets = targets_for_messages(&target_id, &messages);
                 let unread_count = target_unread_count(&manager, &target_id);
-                let summarized_message_count = manager
-                    .summarized_message_counts
-                    .get(&target_id)
-                    .copied()
-                    .unwrap_or_default();
-                let summary_request_changed = queue_summary_if_needed(
+                let summary_request_changed = queue_summaries_if_needed(
+                    &manager,
                     &target_id,
                     &messages,
-                    summarized_message_count,
+                    &manager.summarized_message_counts,
                     deepseek_sender,
                     &mut deepseek_manager,
                 );
@@ -4585,6 +7294,17 @@ fn append_local_sent_message(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
+    let campaign_id = manager.current_campaign_id();
+    let (character_id, party_id, visibility) = if let Some(recipient_id) = recipient_id {
+        let access = manager.player_access_for_user(recipient_id);
+        (
+            access.character_id,
+            access.party_id,
+            Visibility::Player(recipient_id),
+        )
+    } else {
+        (None, None, Visibility::Public)
+    };
     let message = NapcatMessage {
         data: NapcatMessageData {
             time,
@@ -4605,6 +7325,10 @@ fn append_local_sent_message(
                 user_id: self_id,
                 nickname: "GM".to_owned(),
             },
+            campaign_id,
+            character_id,
+            party_id,
+            visibility,
         },
     };
 
@@ -4628,7 +7352,85 @@ mod tests {
             summarized_message_counts: HashMap::default(),
             open_chat_targets: HashSet::default(),
             pending_chat_targets: HashSet::default(),
+            rejected_chat_targets: HashSet::default(),
+            random_pools: HashMap::default(),
+            skill_pool: Vec::new(),
+            unit_pool: HashMap::default(),
         }
+    }
+
+    fn test_private_message(user_id: u64) -> NapcatMessage {
+        NapcatMessage {
+            data: NapcatMessageData {
+                time: 1780132600,
+                message_type: NapcatMessageType::Private,
+                message: vec![NapcatMessageChain {
+                    variant: NapcatMessageChainType::Text {
+                        data: TextData {
+                            text: "hello".to_owned(),
+                        },
+                    },
+                }],
+                self_id: 1,
+                user_id,
+                group_id: None,
+                group_name: None,
+                target_id: None,
+                sender: NapcatSender {
+                    user_id,
+                    nickname: format!("user-{user_id}"),
+                },
+                campaign_id: "default".to_owned(),
+                character_id: None,
+                party_id: None,
+                visibility: Visibility::Public,
+            },
+        }
+    }
+
+    fn test_group_message(user_id: u64, text: &str) -> NapcatMessage {
+        NapcatMessage {
+            data: NapcatMessageData {
+                time: 1780132600,
+                message_type: NapcatMessageType::Group,
+                message: vec![NapcatMessageChain {
+                    variant: NapcatMessageChainType::Text {
+                        data: TextData {
+                            text: text.to_owned(),
+                        },
+                    },
+                }],
+                self_id: 1,
+                user_id,
+                group_id: Some(99),
+                group_name: Some("测试群".to_owned()),
+                target_id: None,
+                sender: NapcatSender {
+                    user_id,
+                    nickname: format!("user-{user_id}"),
+                },
+                campaign_id: "default".to_owned(),
+                character_id: None,
+                party_id: None,
+                visibility: Visibility::Public,
+            },
+        }
+    }
+
+    fn split_party_summary_manager() -> NapcatMessageManager {
+        let mut manager = empty_manager();
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned()],
+            group_chats: vec!["99".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("blue"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+        manager
     }
 
     fn buff(name: &str, turns_remaining: i32) -> BuffSpec {
@@ -4644,6 +7446,398 @@ mod tests {
                 value: BuffValue::Set(0.5),
             }],
         }
+    }
+
+    #[test]
+    fn approval_onboarding_text_uses_current_group_guide_for_private_player() {
+        let mut manager = empty_manager();
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message(2),
+        ]);
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            guide: "请先完成角色设定。".to_owned(),
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
+
+        assert!(manager.approve_chat_target("2"));
+
+        assert_eq!(
+            approval_onboarding_text(&manager, "2"),
+            Some("团内引导：\n请先完成角色设定。".to_owned())
+        );
+    }
+
+    #[test]
+    fn approval_onboarding_text_skips_group_targets_and_empty_guides() {
+        let mut manager = empty_manager();
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message(2),
+        ]);
+        manager.messages.insert("99".to_owned(), vec![
+            test_group_message(4, "hello"),
+        ]);
+        manager
+            .trpg_groups
+            .insert("table".to_owned(), TrpgGroup::default());
+        manager.current_trpg_group = Some("table".to_owned());
+
+        assert!(manager.approve_chat_target("2"));
+        assert!(manager.approve_chat_target("99"));
+
+        assert_eq!(
+            approval_onboarding_text(&manager, "2"),
+            None
+        );
+        assert_eq!(
+            approval_onboarding_text(&manager, "99"),
+            None
+        );
+    }
+
+    #[test]
+    fn group_broadcast_targets_default_to_all_private_members_deduped() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3, 4] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message(user_id),
+            ]);
+        }
+        let members = vec![
+            "2".to_owned(),
+            "3".to_owned(),
+            "2".to_owned(),
+            "4".to_owned(),
+            "missing".to_owned(),
+        ];
+
+        let targets = group_broadcast_targets(
+            None,
+            &members,
+            &manager,
+            BROADCAST_SCOPE_ALL,
+        );
+
+        assert_eq!(targets, vec![
+            NapcatSendTarget::Private(2),
+            NapcatSendTarget::Private(3),
+            NapcatSendTarget::Private(4),
+        ]);
+    }
+
+    #[test]
+    fn group_broadcast_targets_filter_to_selected_party() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3, 4] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message(user_id),
+            ]);
+        }
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("red"));
+        group.set_player_party("4", Some("blue"));
+        let members = vec!["2".to_owned(), "3".to_owned(), "4".to_owned()];
+
+        let targets = group_broadcast_targets(
+            Some(&group),
+            &members,
+            &manager,
+            &broadcast_party_scope("red"),
+        );
+
+        assert_eq!(targets, vec![
+            NapcatSendTarget::Private(2),
+            NapcatSendTarget::Private(3),
+        ]);
+    }
+
+    #[test]
+    fn group_broadcast_targets_party_scope_requires_current_group() {
+        let mut manager = empty_manager();
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message(2),
+        ]);
+        let members = vec!["2".to_owned()];
+
+        let targets = group_broadcast_targets(
+            None,
+            &members,
+            &manager,
+            &broadcast_party_scope("red"),
+        );
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn group_summary_scope_filters_public_and_party_messages() {
+        let manager = split_party_summary_manager();
+        let messages = vec![
+            test_group_message(4, "public clue"),
+            test_group_message(2, "red clue"),
+            test_group_message(3, "blue clue"),
+        ];
+
+        let public_lines = player_text_lines(&campaign_messages_for_summary_scope(
+            &manager,
+            "99",
+            &messages,
+            &SummaryScope::GroupPublic,
+        ));
+        let red_lines = player_text_lines(&campaign_messages_for_summary_scope(
+            &manager,
+            "99",
+            &messages,
+            &SummaryScope::GroupParty("red".to_owned()),
+        ));
+
+        let public_text = public_lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let red_text = red_lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(public_text.contains("public clue"));
+        assert!(!public_text.contains("red clue"));
+        assert!(!public_text.contains("blue clue"));
+        assert!(red_text.contains("public clue"));
+        assert!(red_text.contains("red clue"));
+        assert!(!red_text.contains("blue clue"));
+    }
+
+    #[test]
+    fn group_chat_summary_requests_use_scoped_keys_and_filtered_payloads() {
+        let manager = split_party_summary_manager();
+        let mut messages = Vec::new();
+        for index in 0..5 {
+            messages.push(test_group_message(
+                4,
+                &format!("public clue {index}"),
+            ));
+            messages.push(test_group_message(
+                2,
+                &format!("red clue {index}"),
+            ));
+            messages.push(test_group_message(
+                3,
+                &format!("blue clue {index}"),
+            ));
+        }
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let deepseek_sender = DeepseekIOSender(sender);
+        let mut deepseek_manager = DeepseekManager::default();
+
+        assert!(queue_summaries_if_needed(
+            &manager,
+            "99",
+            &messages,
+            &HashMap::default(),
+            Some(&deepseek_sender),
+            &mut deepseek_manager,
+        ));
+
+        assert!(deepseek_manager.summaries.contains_key("group:99:public"));
+        assert!(deepseek_manager
+            .summaries
+            .contains_key("group:99:party:red"));
+        assert!(deepseek_manager
+            .summaries
+            .contains_key("group:99:party:blue"));
+        assert!(!deepseek_manager.summaries.contains_key("99"));
+
+        let mut request_texts = HashMap::new();
+        while let Ok(message) = receiver.try_recv() {
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let DeepseekRequest::Summary {
+                target_id, text, ..
+            } = serde_json::from_str::<DeepseekRequest>(&text)
+                .expect("summary request should deserialize");
+            request_texts.insert(target_id, text);
+        }
+
+        let public_text = &request_texts["group:99:public"];
+        let red_text = &request_texts["group:99:party:red"];
+        let blue_text = &request_texts["group:99:party:blue"];
+        assert!(public_text.contains("public clue 0"));
+        assert!(!public_text.contains("red clue 0"));
+        assert!(!public_text.contains("blue clue 0"));
+        assert!(red_text.contains("public clue 0"));
+        assert!(red_text.contains("red clue 0"));
+        assert!(!red_text.contains("blue clue 0"));
+        assert!(blue_text.contains("public clue 0"));
+        assert!(!blue_text.contains("red clue 0"));
+        assert!(blue_text.contains("blue clue 0"));
+    }
+
+    #[test]
+    fn inventory_stacks_matching_stackable_items() {
+        let mut inventory = CharacterInventory::default();
+        add_item_to_inventory(&mut inventory, InventoryItem {
+            name: "治疗药水".to_owned(),
+            stack: 3,
+            max_stack: 5,
+            ..Default::default()
+        });
+        add_item_to_inventory(&mut inventory, InventoryItem {
+            name: "治疗药水".to_owned(),
+            stack: 4,
+            max_stack: 5,
+            ..Default::default()
+        });
+
+        assert_eq!(inventory.items.len(), 2);
+        assert_eq!(inventory.items[0].stack, 5);
+        assert_eq!(inventory.items[1].stack, 2);
+    }
+
+    #[test]
+    fn equipping_item_moves_previous_item_to_bag() {
+        let mut inventory = CharacterInventory::default();
+        inventory.items.push(InventoryItem {
+            name: "旧剑".to_owned(),
+            equipment_slot: EquipmentSlot::MainHand,
+            ..Default::default()
+        });
+        inventory.items.push(InventoryItem {
+            name: "新剑".to_owned(),
+            equipment_slot: EquipmentSlot::MainHand,
+            ..Default::default()
+        });
+
+        equip_inventory_item(&mut inventory, 0);
+        equip_inventory_item(&mut inventory, 0);
+
+        assert_eq!(
+            inventory.equipment[&EquipmentSlot::MainHand].name,
+            "新剑"
+        );
+        assert_eq!(inventory.items.len(), 1);
+        assert_eq!(inventory.items[0].name, "旧剑");
+    }
+
+    #[test]
+    fn random_pool_ignores_disabled_and_zero_weight_entries() {
+        let pool = RandomPool {
+            entries: vec![
+                RandomPoolEntry {
+                    item: InventoryItem {
+                        name: "不会出现".to_owned(),
+                        ..Default::default()
+                    },
+                    weight: 999.0,
+                    enabled: false,
+                    ..Default::default()
+                },
+                RandomPoolEntry {
+                    item: InventoryItem {
+                        name: "也不会出现".to_owned(),
+                        ..Default::default()
+                    },
+                    weight: 0.0,
+                    enabled: true,
+                    ..Default::default()
+                },
+                RandomPoolEntry {
+                    item: InventoryItem {
+                        name: "固定结果".to_owned(),
+                        ..Default::default()
+                    },
+                    weight: 1.0,
+                    enabled: true,
+                    ..Default::default()
+                },
+            ],
+            last_pick: None,
+            last_text_result: None,
+        };
+
+        assert_eq!(random_pool_total_weight(&pool), 1.0);
+        assert_eq!(
+            pick_random_pool_item(&pool).unwrap().name,
+            "固定结果"
+        );
+    }
+
+    #[test]
+    fn random_pool_text_result_uses_fixed_count_and_label() {
+        let entry = RandomPoolEntry {
+            item: InventoryItem {
+                name: "事件".to_owned(),
+                ..Default::default()
+            },
+            result_text: "获得线索".to_owned(),
+            min_count: 2,
+            max_count: 2,
+            ..Default::default()
+        };
+
+        let result = random_pool_entry_text_result(&entry).unwrap();
+
+        assert_eq!(result.entry_name, "事件");
+        assert_eq!(result.text, "获得线索");
+        assert_eq!(result.count, 2);
+        assert_eq!(
+            random_pool_text_result_label(&result),
+            "获得线索 x2"
+        );
+    }
+
+    #[test]
+    fn skill_pool_entry_copies_to_character_skills() {
+        let mut character = PlayerCharacter::default();
+        let entry = SkillPoolEntry {
+            name: "烈焰箭".to_owned(),
+            note: "主动使用对目标造成3点魔法伤害".to_owned(),
+            mp_cost: 2.0,
+            cooldown_turns: 1,
+            source_character_id: Some("player-1".to_owned()),
+            source_character_name: Some("法师".to_owned()),
+            source_skill_index: Some(0),
+            legacy_pool_id: Some("legacy-fire".to_owned()),
+            category: Some("普通".to_owned()),
+            ..Default::default()
+        };
+
+        add_skill_pool_entry_to_character(&mut character, &entry);
+
+        assert_eq!(character.skill_names, vec![
+            "烈焰箭".to_owned()
+        ]);
+        assert_eq!(character.skill_notes, vec![
+            "主动使用对目标造成3点魔法伤害".to_owned()
+        ]);
+        assert_eq!(character.skill_mp_costs, vec![2.0]);
+        assert_eq!(character.skill_cooldown_turns, vec![1]);
+        assert_eq!(character.skill_metadata.len(), 1);
+        assert_eq!(
+            character.skill_metadata[0].source,
+            CharacterSkillSourceKind::SkillPool
+        );
+        assert_eq!(
+            character.skill_metadata[0].source_character_id.as_deref(),
+            Some("player-1")
+        );
+        assert_eq!(
+            character.skill_metadata[0].source_pool_id.as_deref(),
+            Some("legacy-fire")
+        );
+        assert_eq!(
+            character.skill_metadata[0].source_pool_label.as_deref(),
+            Some("烈焰箭")
+        );
     }
 
     #[test]
@@ -4687,6 +7881,27 @@ mod tests {
     }
 
     #[test]
+    fn quick_cast_skills_exclude_unapproved_entries() {
+        let mut character = PlayerCharacter {
+            skill_names: vec!["已批准".to_owned(), "待批准".to_owned()],
+            skill_notes: vec![
+                "主动使用对目标造成1点物理伤害".to_owned(),
+                "主动使用对目标造成9点物理伤害".to_owned(),
+            ],
+            skill_metadata: vec![CharacterSkillMetadata::default(), CharacterSkillMetadata {
+                st_approved: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let skills = quick_cast_skills(&mut character);
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "已批准");
+    }
+
+    #[test]
     fn quick_cast_records_and_blocks_skill_cooldown_until_turn_passes() {
         let mut manager = empty_manager();
         manager
@@ -4711,7 +7926,7 @@ mod tests {
             players: vec!["caster".to_owned(), "target".to_owned()],
             player_turns: HashMap::from([(
                 "caster".to_owned(),
-                TrpgPlayerTurnState::default(),
+                crate::napcat::TrpgPlayerTurnState::default(),
             )]),
             ..Default::default()
         });

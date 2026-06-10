@@ -59,8 +59,6 @@ pub struct DeepseekManager {
     #[serde(default)]
     pub last_post_text: String,
     #[serde(default)]
-    pub last_fim_response: String,
-    #[serde(default)]
     pub summaries: HashMap<String, DeepseekSummary>,
 }
 
@@ -80,6 +78,21 @@ pub struct DeepseekSummaryBlock {
     pub pending: bool,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+pub const DEEPSEEK_SUMMARY_EXPORT_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeepseekSummaryExportEntry {
+    pub summary_key: String,
+    pub summary: DeepseekSummary,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeepseekSummaryExport {
+    version: u32,
+    export_type: String,
+    summaries: Vec<DeepseekSummaryExportEntry>,
 }
 
 impl DeepseekSummary {
@@ -157,71 +170,63 @@ fn deepseek_authorization_header() -> Result<String, String> {
 }
 
 impl DeepseekManager {
-    fn post_completion(
-        prompt: &str,
-        suffix: Option<&str>,
-        max_tokens: u32,
-    ) -> Result<String, String> {
-        let payload = json!({
-            "model": "deepseek-chat",
-            "prompt": filter_control_characters(prompt),
-            "echo": false,
-            "frequency_penalty": 0,
-            "logprobs": 0,
-            "max_tokens": max_tokens,
-            "presence_penalty": 0,
-            "stop": null,
-            "stream": false,
-            "stream_options": null,
-            "suffix": suffix.map(filter_control_characters),
-            "temperature": 1.3,
-            "top_p": 1
+    pub fn to_summary_export_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(&DeepseekSummaryExport {
+            version: DEEPSEEK_SUMMARY_EXPORT_VERSION,
+            export_type: "deepseek_summaries".to_owned(),
+            summaries: self.summary_export_entries(),
         })
-        .to_string();
+        .map_err(|err| err.to_string())
+    }
 
-        let mut data = payload.as_bytes();
-
-        let mut easy = Easy::new();
-        easy.url("https://api.deepseek.com/beta/completions")
-            .map_err(|err| err.to_string())?;
-
-        let mut list = List::new();
-        list.append("Content-Type: application/json")
-            .map_err(|err| err.to_string())?;
-        list.append("Accept: application/json")
-            .map_err(|err| err.to_string())?;
-        list.append(&deepseek_authorization_header()?)
-            .map_err(|err| err.to_string())?;
-        easy.http_headers(list).map_err(|err| err.to_string())?;
-        easy.post(true).map_err(|err| err.to_string())?;
-        easy.post_field_size(data.len() as u64)
-            .map_err(|err| err.to_string())?;
-
-        let mut dst = Vec::new();
-
-        {
-            let mut transfer = easy.transfer();
-            transfer
-                .read_function(|buf| Ok(data.read(buf).unwrap_or(0)))
-                .map_err(|err| err.to_string())?;
-            transfer
-                .write_function(|data| {
-                    dst.extend_from_slice(data);
-                    Ok(data.len())
-                })
-                .map_err(|err| err.to_string())?;
-            transfer.perform().map_err(|err| err.to_string())?;
+    pub fn merge_summary_export_json(&mut self, text: &str) -> Result<usize, String> {
+        let export: DeepseekSummaryExport =
+            serde_json::from_str(text).map_err(|err| err.to_string())?;
+        if export.version != DEEPSEEK_SUMMARY_EXPORT_VERSION {
+            return Err(format!(
+                "unsupported DeepSeek summary export version {}; expected {}",
+                export.version, DEEPSEEK_SUMMARY_EXPORT_VERSION
+            ));
+        }
+        if export.export_type != "deepseek_summaries" {
+            return Err(format!(
+                "unsupported DeepSeek summary export type {}",
+                export.export_type
+            ));
         }
 
-        let json_response = String::from_utf8(dst).map_err(|err| err.to_string())?;
-        let response: ApiResponse =
-            serde_json::from_str(&json_response).map_err(|err| err.to_string())?;
+        let mut imported_count = 0;
+        for entry in export.summaries {
+            let summary_key = entry.summary_key.trim();
+            if summary_key.is_empty() {
+                return Err("DeepSeek summary export contains an empty summary key".to_owned());
+            }
 
-        response
-            .choices
-            .first()
-            .map(|choice| choice.text.to_string())
-            .ok_or_else(|| "DeepSeek response did not include choices".to_owned())
+            let summary = self.summaries.entry(summary_key.to_owned()).or_default();
+            for block in entry.summary.blocks {
+                summary.upsert_block(block);
+            }
+            imported_count += 1;
+        }
+
+        Ok(imported_count)
+    }
+
+    pub fn summary_export_entries(&self) -> Vec<DeepseekSummaryExportEntry> {
+        let mut entries = self
+            .summaries
+            .iter()
+            .map(|(summary_key, summary)| {
+                let mut summary = summary.clone();
+                summary.blocks.sort_by_key(|block| block.message_count);
+                DeepseekSummaryExportEntry {
+                    summary_key: summary_key.clone(),
+                    summary,
+                }
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.summary_key.cmp(&right.summary_key));
+        entries
     }
 
     fn post_chat_completion(
@@ -300,14 +305,6 @@ impl DeepseekManager {
             .ok_or_else(|| "DeepSeek response did not include message content".to_owned())
     }
 
-    pub fn post_fim(text: &str, suffix: &str) -> String {
-        let prompt = format!(
-            "纯科幻太空世界，仅描述场景，不要续写任何人物故事，不要描述你的回答，比如，”下面是一段对你内容的续写：“，这种句式不被允许。必须记住仅描述场景。狂妄号是一艘退役的太空战列舰，装载有大量火炮，不过在星际战争结束后就被封存了，如今狂妄号仅保留了极其坚固的外壳和能量护盾。狂妄号船身较长，内部通道众多。有热熔炸弹的自动生成工厂，太空服自动售货机，以及全舰的监控和可以上锁的自动太空门。飞船上没有任何npc，飞船收到了女皇号的求救信号，解除了全舱的休眠。{}",
-            text
-        );
-        Self::post_completion(&prompt, Some(suffix), 20).unwrap_or_default()
-    }
-
     fn post_summary(text: &str) -> Result<String, String> {
         let user_text = format!("请整理最近这些玩家发言：\n{}", text);
         Self::post_chat_completion(SUMMARY_SYSTEM_PROMPT, &user_text, 120)
@@ -337,9 +334,6 @@ enum DeepseekResponse {
         message_count: usize,
         text: String,
     },
-    Fim {
-        text: String,
-    },
 }
 
 impl Plugin for DeepseekPlugin {
@@ -351,16 +345,6 @@ impl Plugin for DeepseekPlugin {
             )
             .add_systems(Update, message_system);
     }
-}
-
-#[derive(Deserialize)]
-struct ApiResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    text: String,
 }
 
 #[derive(Deserialize)]
@@ -453,15 +437,10 @@ async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> Comm
                                             .expect("Could not send message");
                                     },
                                 }
-                            } else if let Some((prefix, suffix)) = text.split_once('|') {
-                                let response = DeepseekResponse::Fim {
-                                    text: DeepseekManager::post_fim(prefix, suffix),
-                                };
-                                let response = serde_json::to_string(&response)
-                                    .expect("failed to serialize DeepSeek response");
-                                client_to_game_sender
-                                    .send(response.into())
-                                    .expect("Could not send message");
+                            } else {
+                                eprintln!(
+                                    "ignored non-summary DeepSeek request; DeepSeek is summary-only"
+                                );
                             }
                         }
                     }
@@ -480,50 +459,7 @@ fn message_system(
     let mut changed = false;
     while let Ok(msg) = receiver.0.try_recv() {
         let text = msg.to_string();
-        match serde_json::from_str::<DeepseekResponse>(&text) {
-            Ok(DeepseekResponse::Summary {
-                target_id,
-                message_count,
-                text,
-            }) => {
-                deepseek_manager
-                    .summaries
-                    .entry(target_id)
-                    .or_default()
-                    .upsert_block(DeepseekSummaryBlock {
-                        latest: text,
-                        message_count,
-                        pending: false,
-                        error: None,
-                    });
-                changed = true;
-            },
-            Ok(DeepseekResponse::Error {
-                target_id,
-                message_count,
-                text,
-            }) => {
-                deepseek_manager
-                    .summaries
-                    .entry(target_id)
-                    .or_default()
-                    .upsert_block(DeepseekSummaryBlock {
-                        latest: String::new(),
-                        message_count,
-                        pending: false,
-                        error: Some(text),
-                    });
-                changed = true;
-            },
-            Ok(DeepseekResponse::Fim { text }) => {
-                deepseek_manager.last_fim_response = text;
-                changed = true;
-            },
-            Err(_) => {
-                deepseek_manager.last_fim_response = text;
-                changed = true;
-            },
-        }
+        changed |= apply_deepseek_response(&mut deepseek_manager, &text);
     }
 
     if changed {
@@ -533,64 +469,226 @@ fn message_system(
     }
 }
 
+fn apply_deepseek_response(deepseek_manager: &mut DeepseekManager, text: &str) -> bool {
+    match serde_json::from_str::<DeepseekResponse>(text) {
+        Ok(DeepseekResponse::Summary {
+            target_id,
+            message_count,
+            text,
+        }) => {
+            deepseek_manager
+                .summaries
+                .entry(target_id)
+                .or_default()
+                .upsert_block(DeepseekSummaryBlock {
+                    latest: text,
+                    message_count,
+                    pending: false,
+                    error: None,
+                });
+            true
+        },
+        Ok(DeepseekResponse::Error {
+            target_id,
+            message_count,
+            text,
+        }) => {
+            deepseek_manager
+                .summaries
+                .entry(target_id)
+                .or_default()
+                .upsert_block(DeepseekSummaryBlock {
+                    latest: String::new(),
+                    message_count,
+                    pending: false,
+                    error: Some(text),
+                });
+            true
+        },
+        Err(_) => {
+            eprintln!("ignored invalid DeepSeek response: {text}");
+            false
+        },
+    }
+}
+
+#[test]
+fn invalid_deepseek_response_does_not_mutate_manager() {
+    let mut manager = DeepseekManager::default();
+
+    assert!(!apply_deepseek_response(
+        &mut manager,
+        "legacy|fim"
+    ));
+
+    assert!(manager.summaries.is_empty());
+}
+
+#[test]
+fn summary_export_json_contains_scoped_summaries_without_raw_prompt_text() {
+    let mut manager = DeepseekManager {
+        last_post_text: "raw player source text should stay out".to_owned(),
+        ..Default::default()
+    };
+    manager.summaries.insert(
+        "group:99:party:red".to_owned(),
+        DeepseekSummary {
+            blocks: vec![
+                DeepseekSummaryBlock {
+                    latest: "later red summary".to_owned(),
+                    message_count: 10,
+                    pending: false,
+                    error: None,
+                },
+                DeepseekSummaryBlock {
+                    latest: "earlier red summary".to_owned(),
+                    message_count: 5,
+                    pending: true,
+                    error: None,
+                },
+            ],
+        },
+    );
+    manager.summaries.insert("2".to_owned(), DeepseekSummary {
+        blocks: vec![DeepseekSummaryBlock {
+            latest: String::new(),
+            message_count: 7,
+            pending: false,
+            error: Some("network error".to_owned()),
+        }],
+    });
+
+    let json = manager.to_summary_export_json().unwrap();
+    let export: DeepseekSummaryExport = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(
+        export.version,
+        DEEPSEEK_SUMMARY_EXPORT_VERSION
+    );
+    assert_eq!(export.export_type, "deepseek_summaries");
+    assert_eq!(
+        export
+            .summaries
+            .iter()
+            .map(|entry| entry.summary_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["2", "group:99:party:red"]
+    );
+    assert_eq!(
+        export.summaries[1]
+            .summary
+            .blocks
+            .iter()
+            .map(|block| block.message_count)
+            .collect::<Vec<_>>(),
+        vec![5, 10]
+    );
+    assert_eq!(
+        export.summaries[0].summary.blocks[0].error.as_deref(),
+        Some("network error")
+    );
+    assert!(!json.contains("raw player source text"));
+    assert!(!json.contains("last_post_text"));
+}
+
+#[test]
+fn summary_export_json_merges_scoped_blocks_without_raw_prompt_state() {
+    let mut source = DeepseekManager::default();
+    source.summaries.insert(
+        "group:99:party:red".to_owned(),
+        DeepseekSummary {
+            blocks: vec![
+                DeepseekSummaryBlock {
+                    latest: "replacement".to_owned(),
+                    message_count: 5,
+                    pending: false,
+                    error: None,
+                },
+                DeepseekSummaryBlock {
+                    latest: "newer".to_owned(),
+                    message_count: 10,
+                    pending: false,
+                    error: None,
+                },
+            ],
+        },
+    );
+    source.summaries.insert("2".to_owned(), DeepseekSummary {
+        blocks: vec![DeepseekSummaryBlock {
+            latest: String::new(),
+            message_count: 7,
+            pending: false,
+            error: Some("network error".to_owned()),
+        }],
+    });
+
+    let json = source.to_summary_export_json().unwrap();
+    let mut manager = DeepseekManager {
+        last_post_text: "local raw source text".to_owned(),
+        ..Default::default()
+    };
+    manager.summaries.insert(
+        "group:99:party:red".to_owned(),
+        DeepseekSummary {
+            blocks: vec![DeepseekSummaryBlock {
+                latest: "old".to_owned(),
+                message_count: 5,
+                pending: true,
+                error: None,
+            }],
+        },
+    );
+
+    let imported = manager.merge_summary_export_json(&json).unwrap();
+
+    assert_eq!(imported, 2);
+    assert_eq!(
+        manager.last_post_text,
+        "local raw source text"
+    );
+    let red_blocks = &manager.summaries["group:99:party:red"].blocks;
+    assert_eq!(
+        red_blocks
+            .iter()
+            .map(|block| (
+                block.message_count,
+                block.latest.as_str(),
+                block.pending
+            ))
+            .collect::<Vec<_>>(),
+        vec![(5, "replacement", false), (10, "newer", false)]
+    );
+    assert_eq!(
+        manager.summaries["2"].blocks[0].error.as_deref(),
+        Some("network error")
+    );
+}
+
+#[test]
+fn summary_import_rejects_wrong_export_shape() {
+    let json = serde_json::json!({
+        "version": DEEPSEEK_SUMMARY_EXPORT_VERSION,
+        "export_type": "chat_list",
+        "summaries": [],
+    })
+    .to_string();
+    let mut manager = DeepseekManager::default();
+
+    let error = manager
+        .merge_summary_export_json(&json)
+        .err()
+        .expect("wrong export type should fail");
+
+    assert!(error.contains("unsupported DeepSeek summary export type"));
+    assert!(manager.summaries.is_empty());
+}
+
 #[test]
 #[ignore = "calls the live DeepSeek API"]
-pub fn arrogance_ship() {
-    let mut data = r#"{
-  "model": "deepseek-chat",
-  "prompt": "纯科幻太空世界，仅描述场景，不要续写任何人物故事，必须记住仅描述场景。狂妄号是一艘退役的太空战列舰，装载有大量火炮，不过在星际战争结束后就被封存了，如今狂妄号仅保留了极其坚固的外壳和能量护盾。狂妄号船身较长，内部通道众多。有热熔炸弹的自动生成工厂，太空服自动售货机，以及全舰的监控和可以上锁的自动太空门。飞船上没有任何npc，飞船收到了女皇号的求救信号，解除了全舱的休眠。你刚从休眠舱中醒来，你动了动还有些麻木的手脚，从休眠舱里起身，看见四周的休眠舱有几个早已打开，通向外侧的舱门也敞开着，你走了出去，通道上",
-  "echo": false,
-  "frequency_penalty": 0,
-  "logprobs": 0,
-  "max_tokens": 100,
-  "presence_penalty": 0,
-  "stop": null,
-  "stream": false,
-  "stream_options": null,
-  "suffix": null,
-  "temperature": 1.3,
-  "top_p": 1
-}"#
-    .as_bytes();
+pub fn summary_live_api_smoke() {
+    let summary =
+        DeepseekManager::post_summary("玩家甲：我打开左侧的门。\n玩家乙：我记录门上有星形标记。")
+            .expect("summary request should succeed");
 
-    let mut easy = Easy::new();
-    easy.url("https://api.deepseek.com/beta/completions")
-        .unwrap();
-
-    let mut list = List::new();
-    list.append("Content-Type: application/json").unwrap();
-    list.append("Accept: application/json").unwrap();
-    list.append(&deepseek_authorization_header().unwrap())
-        .unwrap();
-    easy.http_headers(list).unwrap();
-    easy.post(true).unwrap();
-    easy.post_field_size(data.len() as u64).unwrap();
-
-    // Perform the request and capture the response
-
-    let mut dst = Vec::new();
-
-    {
-        let mut transfer = easy.transfer();
-        transfer
-            .read_function(|buf| Ok(data.read(buf).unwrap_or(0)))
-            .unwrap();
-        transfer
-            .write_function(|data| {
-                dst.extend_from_slice(data);
-                Ok(data.len())
-            })
-            .unwrap();
-        transfer.perform().unwrap();
-    }
-
-    let json_response = String::from_utf8(dst).unwrap();
-    // Parse the JSON response
-    let response: ApiResponse = serde_json::from_str(&json_response).unwrap();
-
-    // Extract the text from the first choice
-    let extracted_text = &response.choices[0].text;
-
-    // Print the extracted text
-    println!("Extracted Text: {}", extracted_text);
+    assert!(!summary.trim().is_empty());
 }
