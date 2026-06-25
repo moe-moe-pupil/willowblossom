@@ -28,15 +28,42 @@ use serde::{
 
 use crate::{
     napcat::{
+        character_damage_dealt_talent_buffs,
+        character_damage_taken_attribute_multiplier,
+        character_dying_healing_taken_modifier,
+        character_large_hit_damage_taken_modifier,
+        character_minimum_damage_floor,
+        character_minimum_range_meters,
+        character_moonberry_talent_damage_attribute_bonus,
+        character_mutual_aid_healing_rate,
+        character_physical_damage_lifesteal,
+        character_range_magic_converter_damage_bonus,
+        character_wounded_healing_dealt_modifier,
+        dying_healing_taken_multiplier,
+        large_hit_damage_taken_multiplier,
+        low_hp_damage_multiplier,
+        moonberry_effective_skill_range_radius,
+        skill_rule_args,
+        status_damage_attribute_multiplier,
+        status_healing_attribute_multiplier,
+        wounded_healing_dealt_multiplier,
+        CharacterStatus,
         NapcatMessageManager,
         PlayerCharacter,
+        SkillRuleArgs,
+        TrpgBasicConfig,
+        TrpgDamageBonusKind,
+        TrpgDamageTakenKind,
         TrpgGroup,
         UnitPoolEntry,
     },
     rule_engine::{
-        parse_rule,
+        apply_skill_type_damage_default,
+        legacy_moonberry_buff_machine_skill_cast_rule,
+        parse_rule_with_named_args,
         Action,
         ActorRef,
+        DamageType,
         TargetSelector,
         ValueExpr,
     },
@@ -127,7 +154,16 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub turn: u32,
     #[serde(default)]
+    #[serde(rename = "str")]
+    pub str_: i32,
+    #[serde(default)]
     pub agi: i32,
+    #[serde(default)]
+    pub dex: i32,
+    #[serde(default, rename = "int")]
+    pub int_: i32,
+    #[serde(default)]
+    pub wis: i32,
     #[serde(default)]
     pub action_done: bool,
     #[serde(default = "default_true")]
@@ -148,6 +184,20 @@ pub struct BattleParticipantSnapshot {
     pub hp_regen: f32,
     #[serde(default)]
     pub mp_regen: f32,
+    #[serde(default = "default_combat_modifier")]
+    pub damage_dealt_modifier: f32,
+    #[serde(default = "default_combat_modifier")]
+    pub damage_taken_modifier: f32,
+    #[serde(default = "default_combat_modifier")]
+    pub healing_dealt_modifier: f32,
+    #[serde(default = "default_combat_modifier")]
+    pub healing_taken_modifier: f32,
+    #[serde(default)]
+    pub wound_healing_taken_turns: i32,
+    #[serde(default)]
+    pub damage_taken_this_turn: f32,
+    #[serde(default)]
+    pub healing_taken_this_turn: f32,
     #[serde(default)]
     pub skill_last_used_turns: HashMap<String, u32>,
 }
@@ -157,8 +207,15 @@ struct CharacterSkill {
     index: usize,
     name: String,
     note: String,
+    skill_type: Option<String>,
+    legacy_buff_machine_json: Option<String>,
     mp_cost: f32,
     cooldown_turns: u32,
+    cooldown_left: Option<u32>,
+    target_count: Option<u32>,
+    target_class: Option<String>,
+    range: Option<i32>,
+    arg_values: SkillRuleArgs,
 }
 
 #[derive(Component, Debug, Clone)]
@@ -205,6 +262,40 @@ struct BattleRoundRuntime;
 fn default_next_encounter_index() -> u64 { 1 }
 
 fn default_true() -> bool { true }
+
+fn default_combat_modifier() -> f32 { 1.0 }
+
+fn record_participant_damage_taken(
+    participant: &mut BattleParticipantSnapshot,
+    amount: f32,
+) -> bool {
+    let amount = amount.max(0.0);
+    if amount <= f32::EPSILON {
+        return false;
+    }
+    participant.damage_taken_this_turn += amount;
+    true
+}
+
+fn record_participant_healing_taken(
+    participant: &mut BattleParticipantSnapshot,
+    amount: f32,
+) -> bool {
+    let amount = amount.max(0.0);
+    if amount <= f32::EPSILON {
+        return false;
+    }
+    participant.healing_taken_this_turn += amount;
+    true
+}
+
+fn reset_participant_turn_totals(participant: &mut BattleParticipantSnapshot) -> bool {
+    let changed = participant.damage_taken_this_turn.abs() > f32::EPSILON
+        || participant.healing_taken_this_turn.abs() > f32::EPSILON;
+    participant.damage_taken_this_turn = 0.0;
+    participant.healing_taken_this_turn = 0.0;
+    changed
+}
 
 fn setup_battle_round_store(mut commands: Commands) {
     let config_dir = Path::new(".data").join("willowblossom");
@@ -305,7 +396,11 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant.display_name.hash(&mut hasher);
             participant.unit_template_id.hash(&mut hasher);
             participant.turn.hash(&mut hasher);
+            participant.str_.hash(&mut hasher);
             participant.agi.hash(&mut hasher);
+            participant.dex.hash(&mut hasher);
+            participant.int_.hash(&mut hasher);
+            participant.wis.hash(&mut hasher);
             participant.action_done.hash(&mut hasher);
             participant.alive.hash(&mut hasher);
             participant.negative_layers.hash(&mut hasher);
@@ -316,6 +411,31 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant.max_mp.to_bits().hash(&mut hasher);
             participant.hp_regen.to_bits().hash(&mut hasher);
             participant.mp_regen.to_bits().hash(&mut hasher);
+            participant
+                .damage_dealt_modifier
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .damage_taken_modifier
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .healing_dealt_modifier
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .healing_taken_modifier
+                .to_bits()
+                .hash(&mut hasher);
+            participant.wound_healing_taken_turns.hash(&mut hasher);
+            participant
+                .damage_taken_this_turn
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .healing_taken_this_turn
+                .to_bits()
+                .hash(&mut hasher);
         }
     }
     hasher.finish()
@@ -619,6 +739,11 @@ fn encounter_roster_ui(
                 .add(egui::DragValue::new(&mut participant.max_mp).speed(1.0))
                 .changed();
             changed |= ui.checkbox(&mut participant.alive, "存活").changed();
+            ui.small(format!(
+                "本轮承伤 {} / 受疗 {}",
+                format_number(participant.damage_taken_this_turn),
+                format_number(participant.healing_taken_this_turn)
+            ));
             if participant.action_done {
                 ui.small("已完成");
             }
@@ -835,6 +960,7 @@ fn encounter_action_ui(
                             &actor,
                             skill.index,
                             skill.cooldown_turns,
+                            skill.cooldown_left,
                         );
                         let mut label = skill.name.clone();
                         let mut details = Vec::new();
@@ -860,6 +986,7 @@ fn encounter_action_ui(
                 &actor,
                 skill.index,
                 skill.cooldown_turns,
+                skill.cooldown_left,
             );
             let can_pay = actor.mp + f32::EPSILON >= skill.mp_cost.max(0.0);
             let can_use = cooldown_remaining == 0 && can_pay;
@@ -870,6 +997,7 @@ fn encounter_action_ui(
                     &actor.target_id,
                     target,
                     skill,
+                    manager,
                     scene_positions,
                 );
                 changed |= store.finish_actor_action(encounter_id, &actor.target_id);
@@ -926,8 +1054,8 @@ impl BattleRoundStore {
                 name,
                 trpg_group: Some(group_name),
                 active: true,
-                sort_by_turn: true,
-                negative_enabled: false,
+                sort_by_turn: group.battle_sort_by_turn,
+                negative_enabled: group.battle_negative_enabled,
                 round: 0,
                 participants,
                 action_log: Vec::new(),
@@ -958,6 +1086,7 @@ impl BattleRoundStore {
         encounter.round += 1;
         for participant in &mut encounter.participants {
             participant.action_done = false;
+            reset_participant_turn_totals(participant);
             if participant.alive {
                 if !encounter.active {
                     participant.hp =
@@ -1061,6 +1190,7 @@ impl BattleRoundStore {
             return false;
         };
         let final_damage = damage.max(0.0);
+        record_participant_damage_taken(target, final_damage);
         target.hp = (target.hp - final_damage).max(0.0);
         target.alive = target.hp > 0.0;
         encounter.action_log.push(format!(
@@ -1079,17 +1209,32 @@ impl BattleRoundStore {
         actor_id: &str,
         target_id: &str,
         skill: &CharacterSkill,
+        manager: &NapcatMessageManager,
         scene_positions: Option<&SceneCharacterPositions>,
     ) -> bool {
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
-        let actor_name = encounter
+        let basic_config = encounter_basic_config(encounter, manager, actor_id);
+        let Some(actor_snapshot) = encounter
             .participants
             .iter()
             .find(|participant| participant.target_id == actor_id)
-            .map(|participant| participant.display_name.clone())
-            .unwrap_or_else(|| actor_id.to_owned());
+            .cloned()
+        else {
+            return false;
+        };
+        let actor_character = character_for_participant(&actor_snapshot, manager);
+        let actor_damage_dealt_buffs = actor_character
+            .map(|character| character_damage_dealt_talent_buffs(character, actor_id))
+            .unwrap_or_default();
+        let actor_physical_damage_lifesteal = actor_character
+            .map(character_physical_damage_lifesteal)
+            .unwrap_or(0.0);
+        let actor_minimum_damage_floor = actor_character
+            .map(character_minimum_damage_floor)
+            .unwrap_or(0.0);
+        let actor_name = actor_snapshot.display_name.clone();
         let target_name = encounter
             .participants
             .iter()
@@ -1104,7 +1249,12 @@ impl BattleRoundStore {
             return false;
         };
         let mp_cost = skill.mp_cost.max(0.0);
-        let cooldown_remaining = skill_cooldown_remaining(actor, skill.index, skill.cooldown_turns);
+        let cooldown_remaining = skill_cooldown_remaining(
+            actor,
+            skill.index,
+            skill.cooldown_turns,
+            skill.cooldown_left,
+        );
         if cooldown_remaining > 0 {
             encounter.action_log.push(format!(
                 "{}不能使用{}；冷却还剩{}轮",
@@ -1127,14 +1277,43 @@ impl BattleRoundStore {
             actor.turn.saturating_add(1),
         );
 
-        match static_skill_effect(&skill.note) {
-            Some(SkillEffect::Damage { amount, target }) => {
+        match static_skill_effect(
+            &skill.note,
+            &skill.arg_values,
+            skill.skill_type.as_deref(),
+            skill.legacy_buff_machine_json.as_deref(),
+        ) {
+            Some(SkillEffect::Damage {
+                amount,
+                target,
+                damage_type,
+            }) => {
+                let actor_damage_multiplier = participant_damage_multiplier(
+                    &actor_snapshot,
+                    actor_character,
+                    &basic_config,
+                    damage_type,
+                );
+                let fallback_radius = battle_skill_damage_range_radius(
+                    skill.range,
+                    actor_character,
+                    damage_type,
+                );
                 let target_ids = resolve_skill_targets(
                     target,
                     actor_id,
                     target_id,
                     encounter,
                     scene_positions,
+                    fallback_radius,
+                    skill.target_class.as_deref(),
+                );
+                let target_ids = limit_skill_targets(
+                    target_ids,
+                    skill_target_limit(
+                        skill.target_count,
+                        skill.target_class.as_deref(),
+                    ),
                 );
                 if target_ids.is_empty() {
                     encounter.action_log.push(format!(
@@ -1142,6 +1321,7 @@ impl BattleRoundStore {
                         actor_name, skill.name
                     ));
                 }
+                let mut pending_actor_lifesteal = 0.0;
                 for resolved_target_id in target_ids {
                     let Some(target) = encounter
                         .participants
@@ -1150,24 +1330,97 @@ impl BattleRoundStore {
                     else {
                         continue;
                     };
-                    target.hp = (target.hp - amount).max(0.0);
+                    let target_character = character_for_participant(target, manager);
+                    let target_damage_multiplier = target.damage_taken_modifier
+                        * target_character
+                            .map(|character| {
+                                character_damage_taken_attribute_multiplier(
+                                    character,
+                                    trpg_damage_taken_kind(damage_type),
+                                )
+                            })
+                            .unwrap_or(1.0);
+                    let incoming_amount =
+                        (amount * actor_damage_multiplier * target_damage_multiplier).max(0.0);
+                    let target_large_hit_modifier = target_character
+                        .map(character_large_hit_damage_taken_modifier)
+                        .unwrap_or(1.0);
+                    let typed_final_amount = (incoming_amount
+                        * large_hit_damage_taken_multiplier(
+                            target.max_hp,
+                            incoming_amount,
+                            target_large_hit_modifier,
+                        ))
+                    .max(0.0);
+                    let final_amount =
+                        if amount > f32::EPSILON && actor_minimum_damage_floor > f32::EPSILON {
+                            typed_final_amount.max(actor_minimum_damage_floor)
+                        } else {
+                            typed_final_amount
+                        };
+                    record_participant_damage_taken(target, final_amount);
+                    target.hp = (target.hp - final_amount).max(0.0);
                     target.alive = target.hp > 0.0;
+                    if final_amount > f32::EPSILON
+                        && actor_damage_dealt_buffs
+                            .iter()
+                            .any(|buff| buff.name == "溃伤")
+                    {
+                        target.wound_healing_taken_turns = 1;
+                    }
+                    if final_amount > f32::EPSILON && damage_type == DamageType::Physical {
+                        pending_actor_lifesteal +=
+                            typed_final_amount * actor_physical_damage_lifesteal;
+                    }
                     encounter.action_log.push(format!(
                         "{}对{}使用{}，造成{}点伤害",
                         actor_name,
                         target.display_name,
                         skill.name,
-                        format_number(amount)
+                        format_number(final_amount)
                     ));
+                }
+                if pending_actor_lifesteal > f32::EPSILON {
+                    if let Some(actor) = encounter
+                        .participants
+                        .iter_mut()
+                        .find(|participant| participant.target_id == actor_id)
+                    {
+                        record_participant_healing_taken(actor, pending_actor_lifesteal);
+                        actor.hp = (actor.hp + pending_actor_lifesteal).min(actor.max_hp);
+                        actor.alive = actor.hp > 0.0;
+                        encounter.action_log.push(format!(
+                            "{}触发禅宗古训，回复{}点生命值",
+                            actor_name,
+                            format_number(pending_actor_lifesteal)
+                        ));
+                    }
                 }
             },
             Some(SkillEffect::Heal { amount, target }) => {
+                let actor_healing_multiplier = participant_healing_multiplier(
+                    &actor_snapshot,
+                    actor_character,
+                    &basic_config,
+                );
+                let actor_mutual_aid_healing_rate = actor_character
+                    .map(character_mutual_aid_healing_rate)
+                    .unwrap_or(0.0);
                 let target_ids = resolve_skill_targets(
                     target,
                     actor_id,
                     target_id,
                     encounter,
                     scene_positions,
+                    skill_range_radius(skill.range),
+                    skill.target_class.as_deref(),
+                );
+                let target_ids = limit_skill_targets(
+                    target_ids,
+                    skill_target_limit(
+                        skill.target_count,
+                        skill.target_class.as_deref(),
+                    ),
                 );
                 if target_ids.is_empty() {
                     encounter.action_log.push(format!(
@@ -1175,6 +1428,7 @@ impl BattleRoundStore {
                         actor_name, skill.name
                     ));
                 }
+                let mut pending_actor_mutual_aid_healing = 0.0;
                 for resolved_target_id in target_ids {
                     let Some(target) = encounter
                         .participants
@@ -1183,15 +1437,52 @@ impl BattleRoundStore {
                     else {
                         continue;
                     };
-                    target.hp = (target.hp + amount).min(target.max_hp);
+                    let target_character = character_for_participant(target, manager);
+                    let target_dying_healing_modifier = target_character
+                        .map(character_dying_healing_taken_modifier)
+                        .unwrap_or(1.0);
+                    let target_mutual_aid_healing_rate = target_character
+                        .map(character_mutual_aid_healing_rate)
+                        .unwrap_or(0.0);
+                    let target_healing_multiplier = target.healing_taken_modifier
+                        * participant_wound_healing_multiplier(target)
+                        * dying_healing_taken_multiplier(
+                            target.hp,
+                            target.max_hp,
+                            target_dying_healing_modifier,
+                        );
+                    let final_amount =
+                        (amount * actor_healing_multiplier * target_healing_multiplier).max(0.0);
+                    record_participant_healing_taken(target, final_amount);
+                    target.hp = (target.hp + final_amount).min(target.max_hp);
                     target.alive = target.hp > 0.0;
+                    if resolved_target_id != actor_id && final_amount > f32::EPSILON {
+                        pending_actor_mutual_aid_healing += final_amount
+                            * (actor_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
+                    }
                     encounter.action_log.push(format!(
                         "{}对{}使用{}，回复{}点生命值",
                         actor_name,
                         target.display_name,
                         skill.name,
-                        format_number(amount)
+                        format_number(final_amount)
                     ));
+                }
+                if pending_actor_mutual_aid_healing > f32::EPSILON {
+                    if let Some(actor) = encounter
+                        .participants
+                        .iter_mut()
+                        .find(|participant| participant.target_id == actor_id)
+                    {
+                        record_participant_healing_taken(actor, pending_actor_mutual_aid_healing);
+                        actor.hp = (actor.hp + pending_actor_mutual_aid_healing).min(actor.max_hp);
+                        actor.alive = actor.hp > 0.0;
+                        encounter.action_log.push(format!(
+                            "{}触发互帮互助，回复{}点生命值",
+                            actor_name,
+                            format_number(pending_actor_mutual_aid_healing)
+                        ));
+                    }
                 }
             },
             None => {
@@ -1240,6 +1531,10 @@ impl BattleRoundStore {
                 participant.hp = (participant.hp + participant.hp_regen).min(participant.max_hp);
             }
             participant.mp = (participant.mp + participant.mp_regen).min(participant.max_mp);
+        }
+        reset_participant_turn_totals(participant);
+        if participant.wound_healing_taken_turns > 0 {
+            participant.wound_healing_taken_turns -= 1;
         }
         participant.turn += 1;
         participant.pending_negative = false;
@@ -1319,7 +1614,11 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant.target_id.hash(&mut hasher);
         participant.display_name.hash(&mut hasher);
         participant.unit_template_id.hash(&mut hasher);
+        participant.str_.hash(&mut hasher);
         participant.agi.hash(&mut hasher);
+        participant.dex.hash(&mut hasher);
+        participant.int_.hash(&mut hasher);
+        participant.wis.hash(&mut hasher);
         participant.action_done.hash(&mut hasher);
         participant.alive.hash(&mut hasher);
         participant.hp.to_bits().hash(&mut hasher);
@@ -1328,6 +1627,30 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant.max_mp.to_bits().hash(&mut hasher);
         participant.hp_regen.to_bits().hash(&mut hasher);
         participant.mp_regen.to_bits().hash(&mut hasher);
+        participant
+            .damage_dealt_modifier
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .damage_taken_modifier
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .healing_dealt_modifier
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .healing_taken_modifier
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .damage_taken_this_turn
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .healing_taken_this_turn
+            .to_bits()
+            .hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -1337,12 +1660,17 @@ fn participant_from_character(
     character: &PlayerCharacter,
     manager: &NapcatMessageManager,
 ) -> BattleParticipantSnapshot {
+    let status = character.status.combined(&character.extra_status);
     BattleParticipantSnapshot {
         target_id: target_id.to_owned(),
         display_name: character_display_name(target_id, character, manager),
         unit_template_id: None,
         turn: 0,
-        agi: character.status.agi + character.extra_status.agi,
+        str_: status.str_,
+        agi: status.agi,
+        dex: status.dex,
+        int_: status.int_,
+        wis: status.wis,
         action_done: false,
         alive: character.hp > 0.0,
         negative_layers: 0,
@@ -1353,6 +1681,13 @@ fn participant_from_character(
         max_mp: character.max_mp,
         hp_regen: character.hp_regen,
         mp_regen: character.mp_regen,
+        damage_dealt_modifier: character.damage_dealt_modifier,
+        damage_taken_modifier: character.damage_taken_modifier,
+        healing_dealt_modifier: character.healing_dealt_modifier,
+        healing_taken_modifier: character.healing_taken_modifier,
+        wound_healing_taken_turns: 0,
+        damage_taken_this_turn: character.damage_taken_this_turn,
+        healing_taken_this_turn: character.healing_taken_this_turn,
         skill_last_used_turns: HashMap::new(),
     }
 }
@@ -1363,12 +1698,17 @@ fn participant_from_unit_template(
     unit: &UnitPoolEntry,
 ) -> BattleParticipantSnapshot {
     let character = &unit.character;
+    let status = character.status.combined(&character.extra_status);
     BattleParticipantSnapshot {
         target_id: target_id.to_owned(),
         display_name: unit_participant_display_name(target_id, unit_id, unit),
         unit_template_id: Some(unit_id.to_owned()),
         turn: 0,
-        agi: character.status.agi + character.extra_status.agi,
+        str_: status.str_,
+        agi: status.agi,
+        dex: status.dex,
+        int_: status.int_,
+        wis: status.wis,
         action_done: false,
         alive: character.hp > 0.0,
         negative_layers: 0,
@@ -1379,6 +1719,13 @@ fn participant_from_unit_template(
         max_mp: character.max_mp,
         hp_regen: character.hp_regen,
         mp_regen: character.mp_regen,
+        damage_dealt_modifier: character.damage_dealt_modifier,
+        damage_taken_modifier: character.damage_taken_modifier,
+        healing_dealt_modifier: character.healing_dealt_modifier,
+        healing_taken_modifier: character.healing_taken_modifier,
+        wound_healing_taken_turns: 0,
+        damage_taken_this_turn: character.damage_taken_this_turn,
+        healing_taken_this_turn: character.healing_taken_this_turn,
         skill_last_used_turns: HashMap::new(),
     }
 }
@@ -1396,7 +1743,11 @@ fn participant_from_target(
         display_name: fallback_target_display_name(target_id, manager),
         unit_template_id: None,
         turn: 0,
+        str_: 0,
         agi: 0,
+        dex: 0,
+        int_: 0,
+        wis: 0,
         action_done: false,
         alive: true,
         negative_layers: 0,
@@ -1407,6 +1758,13 @@ fn participant_from_target(
         max_mp: 0.0,
         hp_regen: 0.0,
         mp_regen: 0.0,
+        damage_dealt_modifier: 1.0,
+        damage_taken_modifier: 1.0,
+        healing_dealt_modifier: 1.0,
+        healing_taken_modifier: 1.0,
+        wound_healing_taken_turns: 0,
+        damage_taken_this_turn: 0.0,
+        healing_taken_this_turn: 0.0,
         skill_last_used_turns: HashMap::new(),
     }
 }
@@ -1418,13 +1776,22 @@ fn sync_participant_from_manager(
     if let Some(unit_id) = participant.unit_template_id.as_deref() {
         if let Some(unit) = manager.unit_pool.get(unit_id) {
             let character = &unit.character;
+            let status = character.status.combined(&character.extra_status);
             participant.display_name =
                 unit_participant_display_name(&participant.target_id, unit_id, unit);
             participant.max_hp = character.max_hp;
             participant.max_mp = character.max_mp;
             participant.hp_regen = character.hp_regen;
             participant.mp_regen = character.mp_regen;
-            participant.agi = character.status.agi + character.extra_status.agi;
+            participant.str_ = status.str_;
+            participant.agi = status.agi;
+            participant.dex = status.dex;
+            participant.int_ = status.int_;
+            participant.wis = status.wis;
+            participant.damage_dealt_modifier = character.damage_dealt_modifier;
+            participant.damage_taken_modifier = character.damage_taken_modifier;
+            participant.healing_dealt_modifier = character.healing_dealt_modifier;
+            participant.healing_taken_modifier = character.healing_taken_modifier;
             participant.hp = participant.hp.min(participant.max_hp);
             participant.mp = participant.mp.min(participant.max_mp);
             participant.alive = participant.hp > 0.0;
@@ -1433,6 +1800,7 @@ fn sync_participant_from_manager(
     }
 
     if let Some(character) = manager.player_characters.get(&participant.target_id) {
+        let status = character.status.combined(&character.extra_status);
         participant.display_name = character_display_name(
             &participant.target_id,
             character,
@@ -1442,7 +1810,15 @@ fn sync_participant_from_manager(
         participant.max_mp = character.max_mp;
         participant.hp_regen = character.hp_regen;
         participant.mp_regen = character.mp_regen;
-        participant.agi = character.status.agi + character.extra_status.agi;
+        participant.str_ = status.str_;
+        participant.agi = status.agi;
+        participant.dex = status.dex;
+        participant.int_ = status.int_;
+        participant.wis = status.wis;
+        participant.damage_dealt_modifier = character.damage_dealt_modifier;
+        participant.damage_taken_modifier = character.damage_taken_modifier;
+        participant.healing_dealt_modifier = character.healing_dealt_modifier;
+        participant.healing_taken_modifier = character.healing_taken_modifier;
         participant.hp = participant.hp.min(participant.max_hp);
         participant.mp = participant.mp.min(participant.max_mp);
         participant.alive = participant.hp > 0.0;
@@ -1496,6 +1872,8 @@ fn normalize_encounter_after_edit(encounter: &mut BattleEncounter) {
         participant.hp = participant.hp.clamp(0.0, participant.max_hp);
         participant.max_mp = participant.max_mp.max(0.0);
         participant.mp = participant.mp.clamp(0.0, participant.max_mp);
+        participant.damage_taken_this_turn = participant.damage_taken_this_turn.max(0.0);
+        participant.healing_taken_this_turn = participant.healing_taken_this_turn.max(0.0);
         if participant.hp <= 0.0 {
             participant.alive = false;
         }
@@ -1601,6 +1979,14 @@ fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
                     .get(index)
                     .cloned()
                     .unwrap_or_default(),
+                skill_type: character
+                    .skill_metadata
+                    .get(index)
+                    .and_then(|metadata| metadata.skill_type.clone()),
+                legacy_buff_machine_json: character
+                    .skill_metadata
+                    .get(index)
+                    .and_then(|metadata| metadata.legacy_buff_machine_json.clone()),
                 mp_cost: character
                     .skill_mp_costs
                     .get(index)
@@ -1612,6 +1998,27 @@ fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
                     .get(index)
                     .copied()
                     .unwrap_or_default(),
+                cooldown_left: character
+                    .skill_metadata
+                    .get(index)
+                    .and_then(|metadata| metadata.cooldown_left),
+                target_count: character
+                    .skill_metadata
+                    .get(index)
+                    .and_then(|metadata| metadata.target_count),
+                target_class: character
+                    .skill_metadata
+                    .get(index)
+                    .and_then(|metadata| metadata.target_class.clone()),
+                range: character
+                    .skill_metadata
+                    .get(index)
+                    .and_then(|metadata| metadata.range),
+                arg_values: character
+                    .skill_metadata
+                    .get(index)
+                    .map(|metadata| skill_rule_args(&metadata.args))
+                    .unwrap_or_default(),
             }
         })
         .collect()
@@ -1621,17 +2028,15 @@ fn skill_cooldown_remaining(
     participant: &BattleParticipantSnapshot,
     skill_index: usize,
     cooldown_turns: u32,
+    cooldown_left: Option<u32>,
 ) -> u32 {
-    if cooldown_turns == 0 {
-        return 0;
-    }
-    participant
+    let Some(last_used_turn) = participant
         .skill_last_used_turns
         .get(&skill_index.to_string())
-        .map(|last_used_turn| {
-            cooldown_turns.saturating_sub(participant.turn.saturating_sub(*last_used_turn))
-        })
-        .unwrap_or(0)
+    else {
+        return cooldown_left.unwrap_or_default();
+    };
+    cooldown_turns.saturating_sub(participant.turn.saturating_sub(*last_used_turn))
 }
 
 fn display_name_for_target(options: &[(String, String)], target_id: &str) -> String {
@@ -1642,21 +2047,149 @@ fn display_name_for_target(options: &[(String, String)], target_id: &str) -> Str
         .unwrap_or_else(|| target_id.to_owned())
 }
 
-enum SkillEffect {
-    Damage { amount: f32, target: TargetSelector },
-    Heal { amount: f32, target: TargetSelector },
+fn encounter_basic_config(
+    encounter: &BattleEncounter,
+    manager: &NapcatMessageManager,
+    actor_id: &str,
+) -> TrpgBasicConfig {
+    encounter
+        .trpg_group
+        .as_deref()
+        .and_then(|group_name| manager.trpg_groups.get(group_name))
+        .map(|group| group.basic_config)
+        .unwrap_or_else(|| manager.character_stat_config_for_target(actor_id))
 }
 
-fn static_skill_effect(note: &str) -> Option<SkillEffect> {
-    let ast = parse_rule(note).ok()?;
+fn participant_status(participant: &BattleParticipantSnapshot) -> CharacterStatus {
+    CharacterStatus {
+        str_: participant.str_,
+        agi: participant.agi,
+        dex: participant.dex,
+        int_: participant.int_,
+        wis: participant.wis,
+        ..Default::default()
+    }
+}
+
+fn participant_damage_multiplier(
+    participant: &BattleParticipantSnapshot,
+    character: Option<&PlayerCharacter>,
+    config: &TrpgBasicConfig,
+    damage_type: DamageType,
+) -> f32 {
+    let status = participant_status(participant);
+    let bonus_kind = trpg_damage_bonus_kind(damage_type);
+    let talent_bonus = character
+        .map(|character| {
+            let typed_bonus =
+                character_moonberry_talent_damage_attribute_bonus(character, &status, bonus_kind);
+            if bonus_kind == TrpgDamageBonusKind::Range {
+                typed_bonus
+                    + character_range_magic_converter_damage_bonus(character, &status, config)
+            } else {
+                typed_bonus
+            }
+        })
+        .unwrap_or_default();
+    participant.damage_dealt_modifier
+        * low_hp_damage_multiplier(participant.hp, participant.max_hp)
+        * (status_damage_attribute_multiplier(&status, config, bonus_kind) + talent_bonus)
+}
+
+fn participant_healing_multiplier(
+    participant: &BattleParticipantSnapshot,
+    character: Option<&PlayerCharacter>,
+    config: &TrpgBasicConfig,
+) -> f32 {
+    let wounded_modifier = character
+        .map(character_wounded_healing_dealt_modifier)
+        .unwrap_or(1.0);
+    participant.healing_dealt_modifier
+        * status_healing_attribute_multiplier(&participant_status(participant), config)
+        * wounded_healing_dealt_multiplier(
+            participant.hp,
+            participant.max_hp,
+            wounded_modifier,
+        )
+}
+
+fn participant_wound_healing_multiplier(participant: &BattleParticipantSnapshot) -> f32 {
+    if participant.wound_healing_taken_turns > 0 {
+        0.75
+    } else {
+        1.0
+    }
+}
+
+fn trpg_damage_bonus_kind(damage_type: DamageType) -> TrpgDamageBonusKind {
+    match damage_type {
+        DamageType::Magical => TrpgDamageBonusKind::Magical,
+        DamageType::Physical => TrpgDamageBonusKind::Physical,
+        DamageType::Range => TrpgDamageBonusKind::Range,
+        DamageType::Cursed
+        | DamageType::Diseased
+        | DamageType::Bleed
+        | DamageType::Poisoning
+        | DamageType::None => TrpgDamageBonusKind::Other,
+    }
+}
+
+fn trpg_damage_taken_kind(damage_type: DamageType) -> TrpgDamageTakenKind {
+    match damage_type {
+        DamageType::Magical => TrpgDamageTakenKind::Magical,
+        DamageType::Diseased => TrpgDamageTakenKind::Diseased,
+        DamageType::Poisoning => TrpgDamageTakenKind::Poisoning,
+        DamageType::Physical
+        | DamageType::Range
+        | DamageType::Cursed
+        | DamageType::Bleed
+        | DamageType::None => TrpgDamageTakenKind::Other,
+    }
+}
+
+enum SkillEffect {
+    Damage {
+        amount: f32,
+        target: TargetSelector,
+        damage_type: DamageType,
+    },
+    Heal {
+        amount: f32,
+        target: TargetSelector,
+    },
+}
+
+fn static_skill_effect(
+    note: &str,
+    arg_values: &SkillRuleArgs,
+    skill_type: Option<&str>,
+    legacy_buff_machine_json: Option<&str>,
+) -> Option<SkillEffect> {
+    let ast = parse_rule_with_named_args(
+        note,
+        &arg_values.numeric_values,
+        &arg_values.text_values,
+    )
+    .ok()
+    .map(|ast| apply_skill_type_damage_default(ast, skill_type))
+    .or_else(|| {
+        legacy_buff_machine_json.and_then(|json| {
+            legacy_moonberry_buff_machine_skill_cast_rule(
+                json,
+                &arg_values.numeric_values,
+                skill_type,
+            )
+        })
+    })?;
     ast.actions.into_iter().find_map(|action| match action {
         Action::Damage {
             target,
             amount: ValueExpr::Number(amount),
-            ..
+            damage_type,
         } => Some(SkillEffect::Damage {
             amount: amount.max(0.0),
             target,
+            damage_type,
         }),
         Action::Heal {
             target,
@@ -1676,9 +2209,17 @@ fn resolve_skill_targets(
     selected_target_id: &str,
     encounter: &BattleEncounter,
     scene_positions: Option<&SceneCharacterPositions>,
+    fallback_radius: Option<f32>,
+    target_class: Option<&str>,
 ) -> Vec<String> {
-    if let Some(area) = target.area {
-        let Some(radius) = area.radius_meters else {
+    let force_area =
+        skill_target_class_is_area(target_class) && !matches!(target.actor, ActorRef::SelfActor);
+    if target.area.is_some() || force_area {
+        let radius = target
+            .area
+            .and_then(|area| area.radius_meters)
+            .or(fallback_radius);
+        let Some(radius) = radius else {
             return encounter
                 .participants
                 .iter()
@@ -1707,9 +2248,19 @@ fn resolve_skill_targets(
             .collect();
     }
 
-    match target.actor {
+    let targets = match target.actor {
         ActorRef::SelfActor => vec![actor_id.to_owned()],
         ActorRef::Source | ActorRef::Target => vec![selected_target_id.to_owned()],
+    };
+    if matches!(target.actor, ActorRef::SelfActor) {
+        targets
+    } else {
+        filter_battle_targets_by_range(
+            actor_id,
+            targets,
+            scene_positions,
+            fallback_radius,
+        )
     }
 }
 
@@ -1845,6 +2396,74 @@ fn mark_negative_candidates(encounter: &mut BattleEncounter) {
     }
 }
 
+fn limit_skill_targets(mut targets: Vec<String>, target_count: Option<u32>) -> Vec<String> {
+    if let Some(target_count) = target_count {
+        targets.truncate(target_count as usize);
+    }
+    targets
+}
+
+fn skill_target_limit(target_count: Option<u32>, target_class: Option<&str>) -> Option<u32> {
+    match target_class.map(str::trim) {
+        Some("无目标") => Some(0),
+        Some("单目标") => Some(target_count.unwrap_or(1).min(1)),
+        _ => target_count,
+    }
+}
+
+fn skill_target_class_is_area(target_class: Option<&str>) -> bool {
+    matches!(
+        target_class.map(str::trim),
+        Some("范围")
+    )
+}
+
+fn skill_range_radius(range: Option<i32>) -> Option<f32> {
+    range.filter(|range| *range > 0).map(|range| range as f32)
+}
+
+fn battle_skill_damage_range_radius(
+    skill_range: Option<i32>,
+    actor_character: Option<&PlayerCharacter>,
+    damage_type: DamageType,
+) -> Option<f32> {
+    let minimum_range = if damage_type == DamageType::Range {
+        actor_character
+            .map(character_minimum_range_meters)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    moonberry_effective_skill_range_radius(skill_range, minimum_range)
+}
+
+fn filter_battle_targets_by_range(
+    actor_id: &str,
+    targets: Vec<String>,
+    scene_positions: Option<&SceneCharacterPositions>,
+    radius: Option<f32>,
+) -> Vec<String> {
+    let Some(radius) = radius else {
+        return targets;
+    };
+    let Some(positions) = scene_positions else {
+        return Vec::new();
+    };
+    let Some(actor_position) = positions.positions.get(actor_id) else {
+        return Vec::new();
+    };
+    targets
+        .into_iter()
+        .filter(|target_id| {
+            positions
+                .positions
+                .get(target_id)
+                .map(|position| actor_position.distance(*position) <= radius)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 fn format_number(value: f32) -> String {
     if value.fract().abs() < f32::EPSILON {
         format!("{}", value as i32)
@@ -1893,6 +2512,48 @@ mod area_tests {
             "far",
             &encounter,
             Some(&positions),
+            None,
+            None,
+        );
+
+        assert_eq!(targets, vec!["near".to_owned()]);
+    }
+
+    #[test]
+    fn range_target_class_expands_single_target_rule() {
+        let encounter = BattleEncounter {
+            participants: vec![
+                battle_participant("actor"),
+                battle_participant("near"),
+                battle_participant("far"),
+            ],
+            ..default()
+        };
+        let positions = SceneCharacterPositions {
+            positions: HashMap::from([
+                ("actor".to_owned(), Vec3::ZERO),
+                (
+                    "near".to_owned(),
+                    Vec3::new(2.9, 0.0, 0.0),
+                ),
+                (
+                    "far".to_owned(),
+                    Vec3::new(3.1, 0.0, 0.0),
+                ),
+            ]),
+        };
+
+        let targets = resolve_skill_targets(
+            TargetSelector {
+                actor: ActorRef::Target,
+                area: None,
+            },
+            "actor",
+            "far",
+            &encounter,
+            Some(&positions),
+            Some(3.0),
+            Some("范围"),
         );
 
         assert_eq!(targets, vec!["near".to_owned()]);
@@ -1904,7 +2565,11 @@ mod area_tests {
             display_name: target_id.to_owned(),
             unit_template_id: None,
             turn: 0,
+            str_: 0,
             agi: 0,
+            dex: 0,
+            int_: 0,
+            wis: 0,
             action_done: false,
             alive: true,
             negative_layers: 0,
@@ -1915,6 +2580,13 @@ mod area_tests {
             max_mp: 0.0,
             hp_regen: 0.0,
             mp_regen: 0.0,
+            damage_dealt_modifier: 1.0,
+            damage_taken_modifier: 1.0,
+            healing_dealt_modifier: 1.0,
+            healing_taken_modifier: 1.0,
+            wound_healing_taken_turns: 0,
+            damage_taken_this_turn: 0.0,
+            healing_taken_this_turn: 0.0,
             skill_last_used_turns: HashMap::new(),
         }
     }
@@ -1949,7 +2621,11 @@ mod tests {
             display_name: id.to_owned(),
             unit_template_id: None,
             turn,
+            str_: 0,
             agi: 0,
+            dex: 0,
+            int_: 0,
+            wis: 0,
             action_done: false,
             alive: true,
             negative_layers: 0,
@@ -1960,6 +2636,13 @@ mod tests {
             max_mp: 10.0,
             hp_regen: 1.0,
             mp_regen: 1.0,
+            damage_dealt_modifier: 1.0,
+            damage_taken_modifier: 1.0,
+            healing_dealt_modifier: 1.0,
+            healing_taken_modifier: 1.0,
+            wound_healing_taken_turns: 0,
+            damage_taken_this_turn: 0.0,
+            healing_taken_this_turn: 0.0,
             skill_last_used_turns: HashMap::new(),
         }
     }
@@ -1970,6 +2653,7 @@ mod tests {
         let unit = UnitPoolEntry {
             label: "史莱姆".to_owned(),
             note: String::new(),
+            legacy_member_id: None,
             character: PlayerCharacter {
                 hp: 8.0,
                 max_hp: 12.0,
@@ -2025,6 +2709,7 @@ mod tests {
         manager.unit_pool.insert("slime".to_owned(), UnitPoolEntry {
             label: "史莱姆".to_owned(),
             note: String::new(),
+            legacy_member_id: None,
             character: PlayerCharacter {
                 hp: 4.0,
                 max_hp: 6.0,
@@ -2076,6 +2761,30 @@ mod tests {
     }
 
     #[test]
+    fn group_battle_defaults_apply_to_new_encounters() {
+        let manager = empty_manager();
+        let group = TrpgGroup {
+            players: vec!["a".to_owned()],
+            battle_sort_by_turn: false,
+            battle_negative_enabled: true,
+            ..Default::default()
+        };
+        let mut store = BattleRoundStore::default();
+
+        let encounter_id = store.create_encounter_from_group(
+            "战斗".to_owned(),
+            "party".to_owned(),
+            &group,
+            &manager,
+        );
+
+        let encounter = &store.encounters[&encounter_id];
+        assert!(!encounter.sort_by_turn);
+        assert!(encounter.negative_enabled);
+        assert_eq!(encounter.participants.len(), 1);
+    }
+
+    #[test]
     fn half_party_advance_marks_lagging_participants_negative() {
         let mut encounter = BattleEncounter {
             name: "test".to_owned(),
@@ -2119,6 +2828,57 @@ mod tests {
     }
 
     #[test]
+    fn battle_damage_and_heal_track_turn_totals_until_next_round() {
+        let manager = empty_manager();
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0), target],
+                ..Default::default()
+            });
+
+        assert!(store.apply_action("battle", "a", "b", "普通攻击", 3.0));
+        let heal = CharacterSkill {
+            index: 0,
+            name: "治疗".to_owned(),
+            note: "主动使用对目标回复2点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        assert!(store.record_skill_use("battle", "a", "b", &heal, &manager, None));
+
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 9.0);
+        assert_eq!(target.damage_taken_this_turn, 3.0);
+        assert_eq!(target.healing_taken_this_turn, 2.0);
+
+        assert!(store.next_round("battle"));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.damage_taken_this_turn, 0.0);
+        assert_eq!(target.healing_taken_this_turn, 0.0);
+    }
+
+    #[test]
     fn rest_advance_restores_vitals() {
         let mut store = BattleRoundStore::default();
         store
@@ -2139,8 +2899,1220 @@ mod tests {
     }
 
     #[test]
+    fn parsed_battle_skill_uses_group_attribute_and_combat_modifiers() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            basic_config: TrpgBasicConfig {
+                str_damage_bonus: 0.25,
+                agi_damage_bonus: 0.5,
+                dex_damage_bonus: 0.1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut actor = participant("a", 0);
+        actor.str_ = 4;
+        actor.agi = 51;
+        actor.dex = 3;
+        actor.damage_dealt_modifier = 2.0;
+        let mut target = participant("b", 0);
+        target.hp = 20.0;
+        target.max_hp = 20.0;
+        target.damage_taken_modifier = 0.5;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                trpg_group: Some("party".to_owned()),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "旋风斩".to_owned(),
+            note: "主动使用对目标造成2点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 14.4).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_magic_skill_uses_archmage_talent_bonus() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            basic_config: TrpgBasicConfig {
+                int_damage_bonus: 0.1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            status: CharacterStatus {
+                int_: 10,
+                ..Default::default()
+            },
+            skill_names: vec!["大魔法师".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), character.clone());
+        let actor = participant_from_character("a", &character, &manager);
+        let mut target = participant("b", 0);
+        target.hp = 50.0;
+        target.max_hp = 50.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                trpg_group: Some("party".to_owned()),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "奥术冲击".to_owned(),
+            note: "主动使用对目标造成10点魔法伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 29.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_skill_applies_typed_damage_taken_talents() {
+        let mut manager = empty_manager();
+        let target_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            skill_names: vec!["人类基因工程".to_owned(), "抗魔体质".to_owned()],
+            skill_metadata: vec![
+                crate::napcat::CharacterSkillMetadata::talent("normal_talent", "天赋"),
+                crate::napcat::CharacterSkillMetadata::talent("support_talent", "辅助天赋"),
+            ],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let mut actor = participant("a", 0);
+        actor.hp = 10.0;
+        actor.max_hp = 10.0;
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let disease = CharacterSkill {
+            index: 0,
+            name: "病灶".to_owned(),
+            note: "主动使用对目标造成10点疾病伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let magic = CharacterSkill {
+            index: 1,
+            name: "魔弹".to_owned(),
+            note: "主动使用对目标造成10点魔法伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &disease, &manager, None,));
+        assert!(store.record_skill_use("battle", "a", "b", &magic, &manager, None,));
+
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 2.5).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 17.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_skill_applies_wound_healing_taken_debuff() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            skill_names: vec!["溃伤".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let mut target = participant("b", 0);
+        target.hp = 20.0;
+        target.max_hp = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let damage = CharacterSkill {
+            index: 0,
+            name: "切割".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let heal = CharacterSkill {
+            index: 1,
+            name: "治疗".to_owned(),
+            note: "主动使用对目标治疗4点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &damage, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.wound_healing_taken_turns, 1);
+
+        assert!(store.record_skill_use("battle", "a", "b", &heal, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 13.0).abs() < 0.0001);
+
+        assert!(store.advance_participant("battle", "b", false));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.wound_healing_taken_turns, 0);
+
+        assert!(store.record_skill_use("battle", "a", "b", &heal, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 17.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_physical_damage_applies_lifesteal_talent() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 9.0,
+            max_hp: 10.0,
+            skill_names: vec!["禅宗古训".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let mut target = participant("b", 0);
+        target.hp = 20.0;
+        target.max_hp = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "切割".to_owned(),
+            note: "主动使用对目标造成4点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!((actor.hp - 9.6).abs() < 0.0001);
+        assert!((actor.healing_taken_this_turn - 0.6).abs() < 0.0001);
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 16.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_skill_applies_large_hit_damage_reduction_talent() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            skill_names: vec!["过度免疫".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "重击".to_owned(),
+            note: "主动使用对目标造成5点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 16.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_skill_applies_minimum_damage_floor_talent() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            level: 4,
+            skill_names: vec!["菜鸡猛啄".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            damage_taken_modifier: 0.1,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "轻击".to_owned(),
+            note: "主动使用对目标造成2点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 16.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_skill_applies_dying_target_healing_talent() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 4.0,
+            max_hp: 20.0,
+            skill_names: vec!["生死时速".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "急救".to_owned(),
+            note: "主动使用对目标治疗4点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 10.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 6.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_skill_applies_wounded_healing_dealt_talent() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 16.0,
+            max_hp: 20.0,
+            skill_names: vec!["火源之力".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 0.0,
+            max_hp: 30.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "火疗".to_owned(),
+            note: "主动使用对目标治疗10点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 12.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 12.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_skill_applies_mutual_aid_healing_feedback_talent() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 20.0,
+            skill_names: vec!["互帮互助".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 0.0,
+            max_hp: 20.0,
+            skill_names: vec!["互帮互助".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "互助治疗".to_owned(),
+            note: "主动使用对目标治疗4点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!((actor.hp - 14.0).abs() < 0.0001);
+        assert!((actor.healing_taken_this_turn - 4.0).abs() < 0.0001);
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 4.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_skill_applies_low_hp_damage_penalty() {
+        let manager = empty_manager();
+        let mut actor = participant("a", 0);
+        actor.hp = 5.0;
+        actor.max_hp = 10.0;
+        let mut target = participant("b", 0);
+        target.hp = 20.0;
+        target.max_hp = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "旋风斩".to_owned(),
+            note: "主动使用对目标造成4点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 17.0);
+    }
+
+    #[test]
+    fn battle_skill_uses_numeric_skill_args_in_amounts() {
+        let manager = empty_manager();
+        let character = PlayerCharacter {
+            skill_names: vec!["变量伤害".to_owned()],
+            skill_notes: vec!["主动使用对目标造成伤害值点物理伤害".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata {
+                args: vec![crate::napcat::SkillPoolArg {
+                    name: "伤害值".to_owned(),
+                    kind: "数字".to_owned(),
+                    value: "3".to_owned(),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let skill = character_skills(&character).remove(0);
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 10.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0), target],
+                ..Default::default()
+            });
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 7.0);
+    }
+
+    #[test]
+    fn battle_skill_uses_text_skill_args_in_rule_text() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            basic_config: TrpgBasicConfig {
+                dex_range_damage_bonus: 0.5,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let character = PlayerCharacter {
+            skill_names: vec!["变量类型".to_owned()],
+            skill_notes: vec!["主动使用对目标造成2点伤害类型伤害".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata {
+                args: vec![crate::napcat::SkillPoolArg {
+                    name: "伤害类型".to_owned(),
+                    kind: "字符串".to_owned(),
+                    value: "远程".to_owned(),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let skill = character_skills(&character).remove(0);
+        let mut actor = participant("a", 0);
+        actor.dex = 4;
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 10.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                trpg_group: Some("party".to_owned()),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 4.0);
+    }
+
+    #[test]
+    fn battle_skill_uses_legacy_buff_machine_heal_when_note_unparsed() {
+        let manager = empty_manager();
+        let character = PlayerCharacter {
+            skill_names: vec!["旧蓝图治疗".to_owned()],
+            skill_notes: vec!["旧月莓图形技能".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata {
+                args: vec![crate::napcat::SkillPoolArg {
+                    name: "治疗量".to_owned(),
+                    kind: "数字".to_owned(),
+                    value: "3".to_owned(),
+                }],
+                legacy_has_buff_machine: true,
+                legacy_buff_machine_json: Some(
+                    r#"{"技能释放":[{"name":"治疗术","effect":["治疗"],"type":0,"from":"技能目标","value":["治疗量"]}]}"#
+                        .to_owned(),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let skill = character_skills(&character).remove(0);
+        let mut target = participant("b", 0);
+        target.hp = 4.0;
+        target.max_hp = 10.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0), target],
+                ..Default::default()
+            });
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 7.0);
+        assert_eq!(target.healing_taken_this_turn, 3.0);
+    }
+
+    #[test]
+    fn battle_skill_uses_skill_type_as_default_damage_type() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            basic_config: TrpgBasicConfig {
+                dex_range_damage_bonus: 0.5,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let character = PlayerCharacter {
+            skill_names: vec!["远程伤害".to_owned()],
+            skill_notes: vec!["主动使用对目标造成2点伤害".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata {
+                skill_type: Some("远程".to_owned()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let skill = character_skills(&character).remove(0);
+        let mut actor = participant("a", 0);
+        actor.dex = 4;
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 10.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                trpg_group: Some("party".to_owned()),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 4.0);
+    }
+
+    #[test]
+    fn battle_range_damage_uses_converter_magic_bonus_talent() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            basic_config: TrpgBasicConfig {
+                dex_range_damage_bonus: 0.5,
+                int_damage_bonus: 0.2,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let character = PlayerCharacter {
+            status: CharacterStatus {
+                dex: 4,
+                int_: 5,
+                ..Default::default()
+            },
+            skill_names: vec!["远程伤害".to_owned(), "数魔转换器".to_owned()],
+            skill_notes: vec!["主动使用对目标造成2点伤害".to_owned(), String::new()],
+            skill_metadata: vec![
+                crate::napcat::CharacterSkillMetadata {
+                    skill_type: Some("远程".to_owned()),
+                    ..Default::default()
+                },
+                crate::napcat::CharacterSkillMetadata::talent("normal_talent", "天赋"),
+            ],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), character.clone());
+        let skill = character_skills(&character).remove(0);
+        let actor = participant_from_character("a", &character, &manager);
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 10.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                trpg_group: Some("party".to_owned()),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 2.0);
+    }
+
+    #[test]
+    fn battle_skill_respects_imported_cooldown_left() {
+        let mut store = BattleRoundStore::default();
+        let manager = empty_manager();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0), participant("b", 0)],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "护盾".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: Some(2),
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(!store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        assert!(store.encounters["battle"].action_log[0].contains("冷却还剩2轮"));
+    }
+
+    #[test]
+    fn battle_skill_limits_targets_by_metadata_target_count() {
+        let mut store = BattleRoundStore::default();
+        let manager = empty_manager();
+        let mut first = participant("b", 0);
+        first.hp = 10.0;
+        first.max_hp = 10.0;
+        let mut second = participant("c", 0);
+        second.hp = 10.0;
+        second.max_hp = 10.0;
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0), first, second],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "范围测试".to_owned(),
+            note: "主动使用对范围内目标造成1点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: Some(1),
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let encounter = &store.encounters["battle"];
+        let first = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        let second = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert_eq!(first.hp, 9.0);
+        assert_eq!(second.hp, 10.0);
+    }
+
+    #[test]
+    fn battle_skill_no_target_class_blocks_targets() {
+        let mut store = BattleRoundStore::default();
+        let manager = empty_manager();
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 10.0;
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0), target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "无目标测试".to_owned(),
+            note: "主动使用对目标造成1点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: Some(1),
+            target_class: Some("无目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 10.0);
+    }
+
+    #[test]
+    fn battle_skill_uses_metadata_range_when_area_omits_radius() {
+        let mut store = BattleRoundStore::default();
+        let manager = empty_manager();
+        let mut first = participant("b", 0);
+        first.hp = 10.0;
+        first.max_hp = 10.0;
+        let mut second = participant("c", 0);
+        second.hp = 10.0;
+        second.max_hp = 10.0;
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0), first, second],
+                ..Default::default()
+            });
+        let positions = SceneCharacterPositions {
+            positions: HashMap::from([
+                ("a".to_owned(), Vec3::ZERO),
+                ("b".to_owned(), Vec3::new(2.9, 0.0, 0.0)),
+                ("c".to_owned(), Vec3::new(3.1, 0.0, 0.0)),
+            ]),
+        };
+        let skill = CharacterSkill {
+            index: 0,
+            name: "范围测试".to_owned(),
+            note: "主动使用对范围内目标造成1点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: Some(3),
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &skill,
+            &manager,
+            Some(&positions),
+        ));
+        let encounter = &store.encounters["battle"];
+        let first = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        let second = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert_eq!(first.hp, 9.0);
+        assert_eq!(second.hp, 10.0);
+    }
+
+    #[test]
+    fn battle_skill_single_target_respects_metadata_range() {
+        let mut store = BattleRoundStore::default();
+        let manager = empty_manager();
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 10.0;
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0), target],
+                ..Default::default()
+            });
+        let positions = SceneCharacterPositions {
+            positions: HashMap::from([
+                ("a".to_owned(), Vec3::ZERO),
+                ("b".to_owned(), Vec3::new(3.1, 0.0, 0.0)),
+            ]),
+        };
+        let skill = CharacterSkill {
+            index: 0,
+            name: "射程测试".to_owned(),
+            note: "主动使用对目标造成1点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: Some(3),
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &skill,
+            &manager,
+            Some(&positions),
+        ));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 10.0);
+    }
+
+    #[test]
+    fn battle_range_damage_uses_tex30_minimum_range_talent() {
+        let mut manager = empty_manager();
+        let character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            mp: 10.0,
+            max_mp: 10.0,
+            level: 2,
+            skill_names: vec!["远程伤害".to_owned(), "瞄准镜Tex-30".to_owned()],
+            skill_notes: vec!["主动使用对目标造成1点伤害".to_owned(), String::new()],
+            skill_metadata: vec![
+                crate::napcat::CharacterSkillMetadata {
+                    skill_type: Some("远程".to_owned()),
+                    range: Some(3),
+                    ..Default::default()
+                },
+                crate::napcat::CharacterSkillMetadata::talent("normal_talent", "天赋"),
+            ],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), character.clone());
+        let skill = character_skills(&character).remove(0);
+        let actor = participant_from_character("a", &character, &manager);
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 10.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let positions = SceneCharacterPositions {
+            positions: HashMap::from([
+                ("a".to_owned(), Vec3::ZERO),
+                (
+                    "b".to_owned(),
+                    Vec3::new(20.0, 0.0, 0.0),
+                ),
+            ]),
+        };
+
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &skill,
+            &manager,
+            Some(&positions),
+        ));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 9.0);
+    }
+
+    #[test]
     fn skill_cooldown_starts_after_skill_action_finishes() {
         let mut store = BattleRoundStore::default();
+        let manager = empty_manager();
         store
             .encounters
             .insert("battle".to_owned(), BattleEncounter {
@@ -2152,11 +4124,18 @@ mod tests {
             index: 0,
             name: "旋风斩".to_owned(),
             note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
             mp_cost: 0.0,
             cooldown_turns: 1,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
         };
 
-        assert!(store.record_skill_use("battle", "a", "b", &skill, None));
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
         assert!(store.finish_actor_action("battle", "a"));
 
         let actor = store.encounters["battle"]
@@ -2166,7 +4145,12 @@ mod tests {
             .unwrap();
         assert_eq!(actor.turn, 1);
         assert_eq!(
-            skill_cooldown_remaining(actor, skill.index, skill.cooldown_turns),
+            skill_cooldown_remaining(
+                actor,
+                skill.index,
+                skill.cooldown_turns,
+                skill.cooldown_left
+            ),
             1
         );
     }

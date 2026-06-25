@@ -21,18 +21,26 @@ use std::{
 };
 
 use avian3d::prelude::{
+    AngularInertia,
     AngularVelocity,
+    CenterOfMass,
     Collider,
+    Forces,
     Gravity,
     GravityScale,
     LinearDamping,
     LinearVelocity,
+    Mass,
     PhysicsPlugins,
     PhysicsSchedule,
     PhysicsStepSystems,
+    Position,
+    ReadRigidBodyForces,
     RigidBody,
+    Rotation,
     SpatialQuery,
     SpatialQueryFilter,
+    WriteRigidBodyForces,
 };
 use bevy::{
     asset::RenderAssetUsages,
@@ -110,6 +118,14 @@ const MAT_SOLAR_PANEL: u8 = 9;
 const MAT_PLANET_OCEAN: u8 = 10;
 const MAT_PLANET_LAND: u8 = 11;
 const MAX_AUTO_MAP_STATUS_SNAPSHOTS_PER_MAP: usize = 40;
+const UNIT_TEMPLATE_STANDEE_PREFIX: &str = "unit:";
+const UNIT_TEMPLATE_TOKEN_PREFIX: &str = "unit-token:";
+const UNIT_SCENE_TOKEN_Y: f32 = 0.35;
+const UNIT_SCENE_TOKEN_SPACING: f32 = 1.6;
+const LEGACY_AREA_MARKER_SCALE: f32 = 0.1;
+const LEGACY_AREA_MARKER_Y: f32 = 0.08;
+const LEGACY_AREA_MARKER_VOXEL_Y: i32 = 1;
+const LEGACY_AREA_MARKER_FILL_VOXEL_LIMIT: usize = 10_000;
 const VOXEL_MAP_APPLY_BUDGET_PER_FRAME: usize = 600;
 const BATTLE_SPACESHIP_SCALE: i32 = 10;
 const SPACE_HIFI_MAP_SCALE: i32 = 100;
@@ -141,6 +157,31 @@ const PHYSICS_VOXEL_DROP_SPEED: f32 = 4.0;
 const PHYSICS_VOXEL_GRAB_DEBOUNCE_SECONDS: f32 = 0.18;
 const PHYSICS_VOXEL_GRAB_MAX_DISTANCE: f32 = 80.0;
 const BATTLE_SPACESHIP_GRAB_MAX_DISTANCE: f32 = 1_500.0;
+const BATTLE_SPACESHIP_BLOCK_MASS: f32 = 18.0;
+const BATTLE_SPACESHIP_THRUST_PER_SAIL_POWER: f32 = 0.012;
+const BATTLE_SPACESHIP_MAX_THROTTLE: f32 = 2.0;
+const BATTLE_SPACESHIP_LINEAR_DAMPENER: f32 = 0.35;
+const BATTLE_SPACESHIP_MAX_DAMPENER_ACCELERATION: f32 = 18.0;
+const BATTLE_SPACESHIP_ANGULAR_DAMPENER: f32 = 0.7;
+const BATTLE_SPACESHIP_AIRFLOW_PER_SAIL_ROOT: f32 = 8.0;
+const BATTLE_SPACESHIP_AIRFLOW_FRICTION_SCALE: f32 = 0.08;
+const BATTLE_SPACESHIP_AIRFLOW_LIFETIME: f32 = 26.0;
+const BATTLE_SPACESHIP_AIRFLOW_RESPONSE: f32 = 0.125;
+const BATTLE_SPACESHIP_AIRFLOW_MAX_ACCELERATION: f32 = 36.0;
+const BATTLE_SPACESHIP_AIRFLOW_MIN_RADIUS: f32 = 18.0;
+const BATTLE_SPACESHIP_AIRFLOW_MAX_RADIUS: f32 = 90.0;
+const BATTLE_SPACESHIP_DISASSEMBLE_MAX_SPEED: f32 = 8.0;
+const BATTLE_SPACESHIP_DISASSEMBLE_MAX_ANGULAR_SPEED: f32 = 0.7;
+const BATTLE_SPACESHIP_DISASSEMBLE_MAX_ROTATION_DEGREES: f32 = 25.0;
+const BATTLE_SPACESHIP_DISASSEMBLY_ALIGN_MAX_SECONDS: f32 = 8.0;
+const BATTLE_SPACESHIP_DISASSEMBLY_ALIGN_SPEED: f32 = 140.0;
+const BATTLE_SPACESHIP_DISASSEMBLY_ALIGN_ROTATION_SPEED: f32 = 2.8;
+const BATTLE_SPACESHIP_DISASSEMBLY_READY_TICKS: u8 = 6;
+const BATTLE_SPACESHIP_DISASSEMBLY_TRANSLATION_TOLERANCE: f32 = 2.0;
+const BATTLE_SPACESHIP_DISASSEMBLY_ROTATION_TOLERANCE_DEGREES: f32 = 2.0;
+const BATTLE_SPACESHIP_UNSCALED_MIN: IVec3 = IVec3::new(-20, 0, -44);
+const BATTLE_SPACESHIP_UNSCALED_MAX: IVec3 = IVec3::new(20, 19, 44);
+const MAX_STATIC_VOXEL_COLLIDER_BOXES: usize = 8_192;
 const PICKUP_INDICATOR_COLOR: Color = Color::srgb(0.15, 0.45, 1.0);
 
 fn planet_outward_at(position: Vec3) -> Vec3 {
@@ -196,6 +237,7 @@ struct VoxelEditorState {
     enabled: bool,
     mode: VoxelEditMode,
     material: u8,
+    edit_visibility: SceneVisibility,
     brush_radius: i32,
     brush_shape: VoxelBrushShape,
     camera_speed: f32,
@@ -224,6 +266,7 @@ impl Default for VoxelEditorState {
             enabled: true,
             mode: VoxelEditMode::Add,
             material: 2,
+            edit_visibility: SceneVisibility::Public,
             brush_radius: 0,
             brush_shape: VoxelBrushShape::Single,
             camera_speed: DEFAULT_CAMERA_SPEED,
@@ -266,8 +309,8 @@ struct VoxelEditStroke {
 #[derive(Clone)]
 struct VoxelEditChange {
     position: IVec3,
-    before: Option<PersistedVoxel>,
-    after: Option<PersistedVoxel>,
+    before: Option<PersistedVoxelState>,
+    after: Option<PersistedVoxelState>,
 }
 
 #[derive(Resource, Default)]
@@ -284,6 +327,100 @@ struct BattleSpaceshipGrabState {
 
 #[derive(Component)]
 struct BattleSpaceshipPreviewRoot;
+
+#[derive(Component)]
+struct BattleSpaceshipDocked;
+
+#[derive(Component, Clone, Copy)]
+struct BattleSpaceshipDisassemblyAlignment {
+    target_translation: Vec3,
+    target_rotation: Quat,
+    ready_ticks: u8,
+    elapsed_seconds: f32,
+}
+
+#[derive(Resource)]
+struct BattleSpaceshipControlState {
+    enabled: bool,
+    throttle: f32,
+    lift: f32,
+    airflow: f32,
+    dampeners: bool,
+}
+
+impl Default for BattleSpaceshipControlState {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            throttle: 0.35,
+            lift: 1.0,
+            airflow: 1.0,
+            dampeners: true,
+        }
+    }
+}
+
+#[derive(Component, Clone)]
+struct BattleSpaceshipPhysicsAssembly {
+    local_center_of_mass: Vec3,
+    mass: f32,
+    angular_inertia: Vec3,
+    bounds_min: Vec3,
+    bounds_max: Vec3,
+    propellers: Vec<BattleSpaceshipForcePoint>,
+    lift_points: Vec<BattleSpaceshipForcePoint>,
+    total_lift_strength: f32,
+}
+
+#[derive(Clone, Copy)]
+struct BattleSpaceshipForcePoint {
+    local_position: Vec3,
+    local_direction: Vec3,
+    strength: f32,
+    airflow_speed: f32,
+    airflow_radius: f32,
+}
+
+#[derive(Default)]
+struct BattleSpaceshipForceAccumulator {
+    weighted_position: Vec3,
+    strength: f32,
+}
+
+impl BattleSpaceshipForceAccumulator {
+    fn add(&mut self, local_position: Vec3, strength: f32) {
+        let strength = strength.max(0.0);
+        self.weighted_position += local_position * strength;
+        self.strength += strength;
+    }
+
+    fn into_force_point(self, local_direction: Vec3) -> Option<BattleSpaceshipForcePoint> {
+        (self.strength > 0.0).then(|| BattleSpaceshipForcePoint {
+            local_position: self.weighted_position / self.strength,
+            local_direction,
+            strength: self.strength,
+            airflow_speed: 0.0,
+            airflow_radius: 0.0,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BattleSpaceshipDisassemblyStatus {
+    Ready,
+    TooFast,
+    TooTilted,
+}
+
+impl BattleSpaceshipDisassemblyStatus {
+    fn label(self) -> &'static str {
+        match self {
+            BattleSpaceshipDisassemblyStatus::Ready => "可解体",
+            BattleSpaceshipDisassemblyStatus::TooFast => "速度过高",
+            BattleSpaceshipDisassemblyStatus::TooTilted => "姿态未对齐",
+        }
+    }
+}
 
 #[derive(Resource)]
 struct SceneWaypointState {
@@ -318,6 +455,17 @@ struct VoxelEditTarget {
 
 #[derive(Component)]
 struct SpaceHiFiVoxelPreview;
+
+#[derive(Component)]
+struct StaticVoxelCollisionRoot {
+    boxes: usize,
+}
+
+#[derive(Component)]
+struct SpaceHiFiDecorCollision;
+
+#[derive(Component)]
+struct VoxelPlanetDetailCollision;
 
 #[derive(Component)]
 struct VoxelPlanetPreview;
@@ -360,8 +508,23 @@ pub struct ScenePlayerCameraPositions {
 
 #[derive(Resource, Default)]
 pub struct ScenePlayerViewRequest {
-    pub user_id: Option<u64>,
-    pub restore_gm_view: bool,
+    user_id: Option<u64>,
+    restore_gm_view: bool,
+    use_capture_camera: bool,
+}
+
+impl ScenePlayerViewRequest {
+    pub fn view_with_capture_camera(&mut self, user_id: u64) {
+        self.user_id = Some(user_id);
+        self.use_capture_camera = true;
+    }
+
+    pub fn filter_current_view(&mut self, user_id: u64) {
+        self.user_id = Some(user_id);
+        self.use_capture_camera = false;
+    }
+
+    pub fn restore_gm_view(&mut self) { self.restore_gm_view = true; }
 }
 
 pub struct SceneCaptureRequest {
@@ -383,6 +546,7 @@ struct PendingSceneCapture {
     prepare_frames_remaining: u8,
     started_preparing: bool,
     voxel_view_changes: Vec<SceneCaptureVoxelViewChange>,
+    standee_visibility_changes: Vec<SceneStandeeVisibilityChange>,
 }
 
 #[derive(Resource, Default)]
@@ -397,6 +561,12 @@ struct SceneCaptureVoxelViewChange {
     position: IVec3,
     capture_voxel: WorldVoxel<u8>,
     restore_voxel: WorldVoxel<u8>,
+}
+
+#[derive(Clone)]
+struct SceneStandeeVisibilityChange {
+    target_id: String,
+    restore_visibility: Visibility,
 }
 
 #[derive(Resource, Default)]
@@ -425,6 +595,7 @@ struct CharacterStandeeAssets {
 struct CharacterStandee {
     target_id: String,
     image_source: String,
+    visibility: SceneVisibility,
 }
 
 #[derive(Resource)]
@@ -462,6 +633,10 @@ pub struct VoxelSceneStore {
     capture_cameras: Vec<PersistedCaptureCamera>,
     #[serde(default)]
     character_standees: Vec<PersistedCharacterStandee>,
+    #[serde(default)]
+    unit_scene_tokens: Vec<PersistedUnitSceneToken>,
+    #[serde(default)]
+    legacy_area_markers: Vec<PersistedLegacyAreaMarker>,
 }
 
 impl Default for VoxelSceneStore {
@@ -475,6 +650,8 @@ impl Default for VoxelSceneStore {
             edits: Vec::new(),
             capture_cameras: Vec::new(),
             character_standees: Vec::new(),
+            unit_scene_tokens: Vec::new(),
+            legacy_area_markers: Vec::new(),
         }
     }
 }
@@ -571,6 +748,30 @@ impl VoxelSceneStore {
             );
         }
 
+        for token in imported.unit_scene_tokens {
+            if token.token_id.trim().is_empty() {
+                return Err("voxel scene export contains an empty unit scene token id".to_owned());
+            }
+            upsert_by(
+                &mut self.unit_scene_tokens,
+                token,
+                |token| token.token_id.clone(),
+            );
+        }
+
+        for marker in imported.legacy_area_markers {
+            if marker.marker_id.trim().is_empty() {
+                return Err(
+                    "voxel scene export contains an empty legacy area marker id".to_owned(),
+                );
+            }
+            upsert_by(
+                &mut self.legacy_area_markers,
+                marker,
+                |marker| marker.marker_id.clone(),
+            );
+        }
+
         if imported
             .active_map_id
             .as_deref()
@@ -581,6 +782,642 @@ impl VoxelSceneStore {
 
         Ok(imported_map_ids.len())
     }
+}
+
+pub fn unit_template_standee_target_id(unit_id: &str) -> String {
+    format!(
+        "{UNIT_TEMPLATE_STANDEE_PREFIX}{}",
+        unit_id.trim()
+    )
+}
+
+pub fn place_unit_template_standee(
+    store: &mut VoxelSceneStore,
+    unit_id: &str,
+    image_source: &str,
+) -> Result<bool, String> {
+    let unit_id = unit_id.trim();
+    if unit_id.is_empty() {
+        return Err("单位ID为空".to_owned());
+    }
+    let image_source = image_source.trim();
+    if image_source.is_empty() {
+        return Err("单位模板还没有立绘".to_owned());
+    }
+
+    let target_id = unit_template_standee_target_id(unit_id);
+    if let Some(existing) = store
+        .character_standees
+        .iter_mut()
+        .find(|standee| standee.target_id == target_id)
+    {
+        if existing.image_source == image_source {
+            return Ok(false);
+        }
+        existing.image_source = image_source.to_owned();
+        return Ok(true);
+    }
+
+    let transform = default_character_camera_transform(store.character_standees.len());
+    store.character_standees.push(PersistedCharacterStandee {
+        target_id,
+        image_source: image_source.to_owned(),
+        translation: transform.translation.to_array(),
+        rotation: transform.rotation.to_array(),
+        visibility: SceneVisibility::Public,
+    });
+    Ok(true)
+}
+
+pub fn remove_unit_template_standee(store: &mut VoxelSceneStore, unit_id: &str) -> bool {
+    let target_id = unit_template_standee_target_id(unit_id);
+    let len = store.character_standees.len();
+    store
+        .character_standees
+        .retain(|standee| standee.target_id != target_id);
+    len != store.character_standees.len()
+}
+
+pub fn has_unit_template_standee(store: &VoxelSceneStore, unit_id: &str) -> bool {
+    let target_id = unit_template_standee_target_id(unit_id);
+    store
+        .character_standees
+        .iter()
+        .any(|standee| standee.target_id == target_id)
+}
+
+pub fn unit_template_token_id(unit_id: &str) -> String {
+    format!(
+        "{UNIT_TEMPLATE_TOKEN_PREFIX}{}",
+        unit_id.trim()
+    )
+}
+
+pub fn legacy_world_unit_token_id(group_name: &str, world_id: &str, unit_id: &str) -> String {
+    format!(
+        "{UNIT_TEMPLATE_TOKEN_PREFIX}legacy-world:{}:{}:{}",
+        group_name.trim(),
+        world_id.trim(),
+        unit_id.trim()
+    )
+}
+
+fn legacy_world_unit_token_prefix(group_name: &str, world_id: &str) -> String {
+    format!(
+        "{UNIT_TEMPLATE_TOKEN_PREFIX}legacy-world:{}:{}:",
+        group_name.trim(),
+        world_id.trim()
+    )
+}
+
+pub fn legacy_area_unit_token_id(
+    group_name: &str,
+    world_id: &str,
+    area_id: &str,
+    unit_id: &str,
+) -> String {
+    format!(
+        "{UNIT_TEMPLATE_TOKEN_PREFIX}legacy-area:{}:{}:{}:{}",
+        group_name.trim(),
+        world_id.trim(),
+        area_id.trim(),
+        unit_id.trim()
+    )
+}
+
+fn legacy_area_unit_token_prefix(group_name: &str, world_id: &str, area_id: &str) -> String {
+    format!(
+        "{UNIT_TEMPLATE_TOKEN_PREFIX}legacy-area:{}:{}:{}:",
+        group_name.trim(),
+        world_id.trim(),
+        area_id.trim()
+    )
+}
+
+pub fn place_unit_template_token(
+    store: &mut VoxelSceneStore,
+    unit_id: &str,
+    label: &str,
+) -> Result<bool, String> {
+    let token_id = unit_template_token_id(unit_id);
+    let translation = default_unit_scene_token_translation(store.unit_scene_tokens.len());
+    upsert_unit_scene_token(
+        store,
+        &token_id,
+        unit_id,
+        label,
+        translation,
+        SceneVisibility::Public,
+    )
+}
+
+pub fn place_legacy_world_unit_token(
+    store: &mut VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+    world_name: &str,
+    unit_id: &str,
+    label: &str,
+    visible: bool,
+) -> Result<bool, String> {
+    let group_name = group_name.trim();
+    let world_id = world_id.trim();
+    if group_name.is_empty() {
+        return Err("团名为空".to_owned());
+    }
+    if world_id.is_empty() {
+        return Err("旧世界ID为空".to_owned());
+    }
+    let token_id = legacy_world_unit_token_id(group_name, world_id, unit_id);
+    let world_name = world_name.trim();
+    let label = if world_name.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{world_name}/{label}")
+    };
+    let translation = default_unit_scene_token_translation(store.unit_scene_tokens.len());
+    upsert_unit_scene_token(
+        store,
+        &token_id,
+        unit_id,
+        &label,
+        translation,
+        if visible { SceneVisibility::Public } else { SceneVisibility::Gm },
+    )
+}
+
+pub fn place_legacy_area_unit_token(
+    store: &mut VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+    area_id: &str,
+    area_name: &str,
+    unit_id: &str,
+    label: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    visible: bool,
+    index: usize,
+) -> Result<bool, String> {
+    let group_name = group_name.trim();
+    let world_id = world_id.trim();
+    let area_id = area_id.trim();
+    if group_name.is_empty() {
+        return Err("团名为空".to_owned());
+    }
+    if world_id.is_empty() {
+        return Err("旧世界ID为空".to_owned());
+    }
+    if area_id.is_empty() {
+        return Err("旧区域ID为空".to_owned());
+    }
+    let token_id = legacy_area_unit_token_id(group_name, world_id, area_id, unit_id);
+    let area_name = area_name.trim();
+    let label = if area_name.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{area_name}/{label}")
+    };
+    upsert_unit_scene_token(
+        store,
+        &token_id,
+        unit_id,
+        &label,
+        legacy_area_unit_token_translation(x, y, width, height, index),
+        if visible { SceneVisibility::Public } else { SceneVisibility::Gm },
+    )
+}
+
+pub fn prune_legacy_world_unit_tokens(
+    store: &mut VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+    keep_unit_ids: &[String],
+) -> usize {
+    let prefix = legacy_world_unit_token_prefix(group_name, world_id);
+    let keep_token_ids = keep_unit_ids
+        .iter()
+        .map(|unit_id| legacy_world_unit_token_id(group_name, world_id, unit_id))
+        .collect::<HashSet<_>>();
+    let len = store.unit_scene_tokens.len();
+    store.unit_scene_tokens.retain(|token| {
+        !token.token_id.starts_with(&prefix) || keep_token_ids.contains(&token.token_id)
+    });
+    len - store.unit_scene_tokens.len()
+}
+
+pub fn prune_legacy_area_unit_tokens(
+    store: &mut VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+    area_id: &str,
+    keep_unit_ids: &[String],
+) -> usize {
+    let prefix = legacy_area_unit_token_prefix(group_name, world_id, area_id);
+    let keep_token_ids = keep_unit_ids
+        .iter()
+        .map(|unit_id| legacy_area_unit_token_id(group_name, world_id, area_id, unit_id))
+        .collect::<HashSet<_>>();
+    let len = store.unit_scene_tokens.len();
+    store.unit_scene_tokens.retain(|token| {
+        !token.token_id.starts_with(&prefix) || keep_token_ids.contains(&token.token_id)
+    });
+    len - store.unit_scene_tokens.len()
+}
+
+pub fn remove_legacy_world_unit_tokens(
+    store: &mut VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+) -> usize {
+    prune_legacy_world_unit_tokens(store, group_name, world_id, &[])
+}
+
+pub fn remove_legacy_area_unit_tokens(
+    store: &mut VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+    area_id: &str,
+) -> usize {
+    let keep_unit_ids: &[String] = &[];
+    prune_legacy_area_unit_tokens(
+        store,
+        group_name,
+        world_id,
+        area_id,
+        keep_unit_ids,
+    )
+}
+
+fn upsert_unit_scene_token(
+    store: &mut VoxelSceneStore,
+    token_id: &str,
+    unit_id: &str,
+    label: &str,
+    translation: [f32; 3],
+    visibility: SceneVisibility,
+) -> Result<bool, String> {
+    let unit_id = unit_id.trim();
+    if unit_id.is_empty() {
+        return Err("单位ID为空".to_owned());
+    }
+    let token_id = token_id.trim();
+    if token_id.is_empty() {
+        return Err("单位标记ID为空".to_owned());
+    }
+    let label = label.trim();
+    let label = if label.is_empty() { unit_id } else { label };
+
+    if let Some(existing) = store
+        .unit_scene_tokens
+        .iter_mut()
+        .find(|token| token.token_id == token_id)
+    {
+        let mut changed = false;
+        if existing.unit_id != unit_id {
+            existing.unit_id = unit_id.to_owned();
+            changed = true;
+        }
+        if existing.label != label {
+            existing.label = label.to_owned();
+            changed = true;
+        }
+        if !changed {
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+
+    store.unit_scene_tokens.push(PersistedUnitSceneToken {
+        token_id: token_id.to_owned(),
+        unit_id: unit_id.to_owned(),
+        label: label.to_owned(),
+        translation,
+        visibility,
+    });
+    Ok(true)
+}
+
+pub fn remove_unit_template_token(store: &mut VoxelSceneStore, unit_id: &str) -> bool {
+    let token_id = unit_template_token_id(unit_id);
+    let len = store.unit_scene_tokens.len();
+    store
+        .unit_scene_tokens
+        .retain(|token| token.token_id != token_id);
+    len != store.unit_scene_tokens.len()
+}
+
+pub fn has_unit_template_token(store: &VoxelSceneStore, unit_id: &str) -> bool {
+    let token_id = unit_template_token_id(unit_id);
+    store
+        .unit_scene_tokens
+        .iter()
+        .any(|token| token.token_id == token_id)
+}
+
+fn default_unit_scene_token_translation(index: usize) -> [f32; 3] {
+    let column = (index % 6) as f32;
+    let row = (index / 6) as f32;
+    [
+        column * UNIT_SCENE_TOKEN_SPACING,
+        UNIT_SCENE_TOKEN_Y,
+        -3.0 - row * UNIT_SCENE_TOKEN_SPACING,
+    ]
+}
+
+fn legacy_area_unit_token_translation(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    index: usize,
+) -> [f32; 3] {
+    let center_x = (x + width.max(1.0) * 0.5) * LEGACY_AREA_MARKER_SCALE;
+    let center_z = (y + height.max(1.0) * 0.5) * LEGACY_AREA_MARKER_SCALE;
+    let column = (index % 4) as f32 - 1.5;
+    let row = (index / 4) as f32;
+    [
+        center_x + column * UNIT_SCENE_TOKEN_SPACING * 0.5,
+        UNIT_SCENE_TOKEN_Y,
+        center_z + row * UNIT_SCENE_TOKEN_SPACING * 0.5,
+    ]
+}
+
+fn update_unit_scene_token_state(
+    store: &mut VoxelSceneStore,
+    token_id: &str,
+    translation: [f32; 3],
+    visibility: SceneVisibility,
+) -> bool {
+    let Some(token) = store
+        .unit_scene_tokens
+        .iter_mut()
+        .find(|token| token.token_id == token_id)
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    if token.translation != translation {
+        token.translation = translation;
+        changed = true;
+    }
+    if token.visibility != visibility {
+        token.visibility = visibility;
+        changed = true;
+    }
+    changed
+}
+
+pub fn legacy_area_marker_id(group_name: &str, world_id: &str, area_id: &str) -> String {
+    format!(
+        "legacy-area:{}:{}:{}",
+        group_name.trim(),
+        world_id.trim(),
+        area_id.trim()
+    )
+}
+
+pub fn place_legacy_area_marker(
+    store: &mut VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+    world_name: &str,
+    area_id: &str,
+    area_name: &str,
+    combat: bool,
+    members: &[String],
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    visible: bool,
+) -> Result<bool, String> {
+    let group_name = group_name.trim();
+    let world_id = world_id.trim();
+    let area_id = area_id.trim();
+    if group_name.is_empty() {
+        return Err("团名为空".to_owned());
+    }
+    if world_id.is_empty() {
+        return Err("旧世界ID为空".to_owned());
+    }
+    if area_id.is_empty() {
+        return Err("旧区域ID为空".to_owned());
+    }
+
+    let marker_id = legacy_area_marker_id(group_name, world_id, area_id);
+    let mut marker_members = members
+        .iter()
+        .map(|member| member.trim())
+        .filter(|member| !member.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    marker_members.sort();
+    marker_members.dedup();
+
+    let marker = PersistedLegacyAreaMarker {
+        marker_id,
+        group_name: group_name.to_owned(),
+        world_id: world_id.to_owned(),
+        world_name: if world_name.trim().is_empty() {
+            world_id.to_owned()
+        } else {
+            world_name.trim().to_owned()
+        },
+        area_id: area_id.to_owned(),
+        area_name: if area_name.trim().is_empty() {
+            area_id.to_owned()
+        } else {
+            area_name.trim().to_owned()
+        },
+        combat,
+        members: marker_members,
+        x,
+        y,
+        width: width.max(0.0),
+        height: height.max(0.0),
+        visibility: if visible { SceneVisibility::Public } else { SceneVisibility::Gm },
+    };
+
+    if let Some(existing) = store
+        .legacy_area_markers
+        .iter_mut()
+        .find(|existing| existing.marker_id == marker.marker_id)
+    {
+        if existing == &marker {
+            return Ok(false);
+        }
+        *existing = marker;
+        return Ok(true);
+    }
+
+    store.legacy_area_markers.push(marker);
+    Ok(true)
+}
+
+pub fn remove_legacy_area_marker(
+    store: &mut VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+    area_id: &str,
+) -> bool {
+    let marker_id = legacy_area_marker_id(group_name, world_id, area_id);
+    let len = store.legacy_area_markers.len();
+    store
+        .legacy_area_markers
+        .retain(|marker| marker.marker_id != marker_id);
+    len != store.legacy_area_markers.len()
+}
+
+pub fn has_legacy_area_marker(
+    store: &VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+    area_id: &str,
+) -> bool {
+    let marker_id = legacy_area_marker_id(group_name, world_id, area_id);
+    store
+        .legacy_area_markers
+        .iter()
+        .any(|marker| marker.marker_id == marker_id)
+}
+
+pub fn stamp_legacy_area_marker_voxel_outline(
+    store: &mut VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+    area_id: &str,
+) -> Result<usize, String> {
+    stamp_legacy_area_marker_voxels(
+        store, group_name, world_id, area_id, false,
+    )
+}
+
+pub fn stamp_legacy_area_marker_voxel_fill(
+    store: &mut VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+    area_id: &str,
+) -> Result<usize, String> {
+    stamp_legacy_area_marker_voxels(
+        store, group_name, world_id, area_id, true,
+    )
+}
+
+fn stamp_legacy_area_marker_voxels(
+    store: &mut VoxelSceneStore,
+    group_name: &str,
+    world_id: &str,
+    area_id: &str,
+    filled: bool,
+) -> Result<usize, String> {
+    ensure_voxel_maps_inner(store);
+    let marker_id = legacy_area_marker_id(group_name, world_id, area_id);
+    let Some(marker) = store
+        .legacy_area_markers
+        .iter()
+        .find(|marker| marker.marker_id == marker_id)
+        .cloned()
+    else {
+        return Err("场景里没有这个旧区域标记".to_owned());
+    };
+    let positions = if filled {
+        legacy_area_marker_voxel_fill_positions(&marker)?
+    } else {
+        legacy_area_marker_voxel_outline_positions(&marker)
+    };
+    let material = legacy_area_marker_voxel_material(&marker);
+    let visibility = marker.visibility.clone();
+    let Some(map) = active_voxel_map_mut(store) else {
+        return Err("没有可写入的场景地图".to_owned());
+    };
+    for position in &positions {
+        upsert_persisted_edit_with_visibility(
+            &mut map.edits,
+            *position,
+            PersistedVoxel::Solid(material),
+            visibility.clone(),
+        );
+    }
+    Ok(positions.len())
+}
+
+fn legacy_area_marker_voxel_material(marker: &PersistedLegacyAreaMarker) -> u8 {
+    if marker.combat {
+        MAT_ENGINE_RED
+    } else {
+        MAT_WINDOW_CYAN
+    }
+}
+
+fn legacy_area_marker_voxel_outline_positions(marker: &PersistedLegacyAreaMarker) -> Vec<IVec3> {
+    let (min_x, max_x, min_z, max_z) = legacy_area_marker_voxel_bounds(marker);
+    let mut positions = Vec::new();
+    for x in min_x..=max_x {
+        for z in min_z..=max_z {
+            if x == min_x || x == max_x || z == min_z || z == max_z {
+                positions.push(IVec3::new(
+                    x,
+                    LEGACY_AREA_MARKER_VOXEL_Y,
+                    z,
+                ));
+            }
+        }
+    }
+    positions.sort_by_key(|position| ivec3_sort_key(*position));
+    positions.dedup();
+    positions
+}
+
+fn legacy_area_marker_voxel_fill_positions(
+    marker: &PersistedLegacyAreaMarker,
+) -> Result<Vec<IVec3>, String> {
+    let (min_x, max_x, min_z, max_z) = legacy_area_marker_voxel_bounds(marker);
+    let width = (max_x - min_x + 1).max(0) as usize;
+    let depth = (max_z - min_z + 1).max(0) as usize;
+    let Some(count) = width.checked_mul(depth) else {
+        return Err("旧区域太大，无法写入体素填充".to_owned());
+    };
+    if count > LEGACY_AREA_MARKER_FILL_VOXEL_LIMIT {
+        return Err(format!(
+            "旧区域填充需要 {count} 格，超过上限 {} 格",
+            LEGACY_AREA_MARKER_FILL_VOXEL_LIMIT
+        ));
+    }
+
+    let mut positions = Vec::with_capacity(count);
+    for x in min_x..=max_x {
+        for z in min_z..=max_z {
+            positions.push(IVec3::new(
+                x,
+                LEGACY_AREA_MARKER_VOXEL_Y,
+                z,
+            ));
+        }
+    }
+    positions.sort_by_key(|position| ivec3_sort_key(*position));
+    positions.dedup();
+    Ok(positions)
+}
+
+fn legacy_area_marker_voxel_bounds(marker: &PersistedLegacyAreaMarker) -> (i32, i32, i32, i32) {
+    let min_x = (marker.x * LEGACY_AREA_MARKER_SCALE).floor() as i32;
+    let min_z = (marker.y * LEGACY_AREA_MARKER_SCALE).floor() as i32;
+    let width = (marker.width.max(1.0) * LEGACY_AREA_MARKER_SCALE)
+        .ceil()
+        .max(1.0) as i32;
+    let depth = (marker.height.max(1.0) * LEGACY_AREA_MARKER_SCALE)
+        .ceil()
+        .max(1.0) as i32;
+    (
+        min_x,
+        min_x + width,
+        min_z,
+        min_z + depth,
+    )
 }
 
 fn upsert_by<T, K: PartialEq>(items: &mut Vec<T>, item: T, key: impl Fn(&T) -> K) {
@@ -684,12 +1521,49 @@ struct PersistedCaptureCamera {
     rotation: [f32; 4],
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+struct PersistedLegacyAreaMarker {
+    marker_id: String,
+    group_name: String,
+    world_id: String,
+    world_name: String,
+    area_id: String,
+    area_name: String,
+    #[serde(default)]
+    combat: bool,
+    #[serde(default)]
+    members: Vec<String>,
+    #[serde(default)]
+    x: f32,
+    #[serde(default)]
+    y: f32,
+    #[serde(default)]
+    width: f32,
+    #[serde(default)]
+    height: f32,
+    #[serde(default)]
+    visibility: SceneVisibility,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+struct PersistedUnitSceneToken {
+    token_id: String,
+    unit_id: String,
+    label: String,
+    #[serde(default)]
+    translation: [f32; 3],
+    #[serde(default)]
+    visibility: SceneVisibility,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct PersistedCharacterStandee {
     target_id: String,
     image_source: String,
     translation: [f32; 3],
     rotation: [f32; 4],
+    #[serde(default)]
+    visibility: SceneVisibility,
 }
 
 impl VoxelWorldConfig for TrpgVoxelWorld {
@@ -758,13 +1632,17 @@ impl Plugin for ScenePreviewPlugin {
             .init_resource::<VoxelMapRuntimeState>()
             .init_resource::<PhysicsVoxelGrabState>()
             .init_resource::<BattleSpaceshipGrabState>()
+            .init_resource::<BattleSpaceshipControlState>()
             .init_resource::<SceneWaypointState>()
             .add_systems(Startup, setup_scene_preview)
             .add_systems(
                 Update,
                 (
                     draw_capture_camera_gizmos,
+                    draw_legacy_area_marker_gizmos,
+                    draw_unit_scene_token_gizmos,
                     draw_pickup_indicator_gizmo,
+                    draw_battle_spaceship_airflow_gizmos,
                     draw_voxel_edit_preview_gizmo,
                     sync_character_standees,
                 ),
@@ -774,6 +1652,7 @@ impl Plugin for ScenePreviewPlugin {
                 (
                     apply_saved_voxel_edits,
                     maintain_scene_player_voxel_view,
+                    maintain_scene_player_standee_visibility,
                     scene_capture_request_system,
                     flush_voxel_edit_save_requests,
                 )
@@ -785,13 +1664,20 @@ impl Plugin for ScenePreviewPlugin {
             )
             .add_systems(
                 PhysicsSchedule,
-                apply_planet_radial_gravity.before(PhysicsStepSystems::First),
+                (
+                    apply_planet_radial_gravity,
+                    apply_battle_spaceship_aeronautics_forces,
+                    apply_battle_spaceship_propeller_airflow,
+                )
+                    .chain()
+                    .before(PhysicsStepSystems::First),
             )
             .add_systems(
                 PostUpdate,
                 (
                     apply_scene_player_view_request,
                     free_camera_system,
+                    update_battle_spaceship_disassembly_alignment,
                     physics_voxel_grab_drop_system,
                     edit_voxel_world_system,
                     sync_voxel_planet_preview_visibility,
@@ -813,6 +1699,7 @@ impl Plugin for ScenePreviewPlugin {
                     voxel_editor_panel,
                     voxel_minimap_panel,
                     scene_waypoint_panel,
+                    unit_scene_token_panel,
                     capture_camera_panel,
                 ),
             );
@@ -896,6 +1783,7 @@ fn setup_scene_preview(
         &mut meshes,
         &mut materials,
     );
+    spawn_static_voxel_collision_previews(&mut commands);
     spawn_planet_physics_probe(
         &mut commands,
         &mut meshes,
@@ -1033,27 +1921,31 @@ fn spawn_space_hifi_voxel_preview(
         ));
     }
 
-    let has_battle_spaceship = voxels
-        .keys()
-        .any(|&position| battle_spaceship_preview_origin(position).is_some());
-    if has_battle_spaceship {
+    let ship_voxels = procedural_battle_spaceship_voxels();
+    if let Some(assembly) = battle_spaceship_physics_assembly(&ship_voxels) {
+        let collider = battle_spaceship_assembly_collider(&assembly);
+        let mass = Mass(assembly.mass);
+        let center_of_mass = CenterOfMass(assembly.local_center_of_mass);
+        let angular_inertia = AngularInertia::new(assembly.angular_inertia);
         commands
             .spawn((
                 Transform::from_translation(battle_spaceship_translation),
                 Visibility::Visible,
                 BattleSpaceshipPreviewRoot,
                 SpaceHiFiVoxelPreview,
+                assembly,
+                RigidBody::Dynamic,
+                collider,
+                mass,
+                center_of_mass,
+                angular_inertia,
+                LinearVelocity::ZERO,
+                AngularVelocity::ZERO,
+                GravityScale(0.0),
+                LinearDamping(0.16),
             ))
             .with_children(|parent| {
                 for material in MAT_STAR..=MAT_PLANET_LAND {
-                    let ship_voxels = voxels
-                        .iter()
-                        .filter_map(|(&position, &voxel_material)| {
-                            (voxel_material == material
-                                && battle_spaceship_preview_origin(position).is_some())
-                            .then_some((position, voxel_material))
-                        })
-                        .collect::<HashMap<_, _>>();
                     let mesh = build_voxel_preview_mesh(&ship_voxels, material);
                     if mesh.count_vertices() == 0 {
                         continue;
@@ -1173,6 +2065,62 @@ fn spawn_voxel_planet_preview(
             VoxelPlanetDetailPreview,
         ));
     }
+}
+
+fn spawn_static_voxel_collision_previews(commands: &mut Commands) {
+    let decor_positions = space_hifi_decor_voxel_edits()
+        .into_iter()
+        .filter_map(|edit| {
+            let PersistedVoxel::Solid(material) = edit.voxel else {
+                return None;
+            };
+            (material != MAT_STAR).then_some(IVec3::new(
+                edit.position[0],
+                edit.position[1],
+                edit.position[2],
+            ))
+        })
+        .collect::<Vec<_>>();
+    spawn_static_voxel_collision_root(
+        commands,
+        decor_positions,
+        1,
+        SpaceHiFiDecorCollision,
+    );
+
+    let detail_positions = voxel_planet_detail_preview_blocks()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    spawn_static_voxel_collision_root(
+        commands,
+        detail_positions,
+        VOXEL_PLANET_DETAIL_PREVIEW_BLOCK,
+        VoxelPlanetDetailCollision,
+    );
+}
+
+fn spawn_static_voxel_collision_root<T: Component>(
+    commands: &mut Commands,
+    positions: Vec<IVec3>,
+    block_size: i32,
+    marker: T,
+) {
+    let boxes = voxel_collision_boxes_from_positions(
+        positions,
+        block_size,
+        MAX_STATIC_VOXEL_COLLIDER_BOXES,
+    );
+    let Some(collider) = voxel_collision_compound(&boxes) else {
+        return;
+    };
+    commands.spawn((
+        Transform::default(),
+        RigidBody::Static,
+        collider,
+        StaticVoxelCollisionRoot { boxes: boxes.len() },
+        marker,
+    ));
 }
 
 fn spawn_scene_point_light_child(
@@ -1318,6 +2266,109 @@ fn build_voxel_planet_preview_mesh(
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
     .with_inserted_indices(Indices::U32(indices))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VoxelCollisionBox {
+    origin: IVec3,
+    size: IVec3,
+}
+
+fn voxel_collision_boxes_from_positions(
+    positions: impl IntoIterator<Item = IVec3>,
+    block_size: i32,
+    max_boxes: usize,
+) -> Vec<VoxelCollisionBox> {
+    if block_size <= 0 || max_boxes == 0 {
+        return Vec::new();
+    }
+
+    let mut remaining = positions
+        .into_iter()
+        .map(|position| {
+            IVec3::new(
+                position.x.div_euclid(block_size),
+                position.y.div_euclid(block_size),
+                position.z.div_euclid(block_size),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let mut boxes = Vec::new();
+
+    while !remaining.is_empty() && boxes.len() < max_boxes {
+        let start = *remaining
+            .iter()
+            .min_by_key(|position| ivec3_sort_key(**position))
+            .expect("remaining is not empty");
+        let mut max_x = start.x;
+        while remaining.contains(&IVec3::new(max_x + 1, start.y, start.z)) {
+            max_x += 1;
+        }
+
+        let mut max_y = start.y;
+        'expand_y: loop {
+            let next_y = max_y + 1;
+            for x in start.x..=max_x {
+                if !remaining.contains(&IVec3::new(x, next_y, start.z)) {
+                    break 'expand_y;
+                }
+            }
+            max_y = next_y;
+        }
+
+        let mut max_z = start.z;
+        'expand_z: loop {
+            let next_z = max_z + 1;
+            for x in start.x..=max_x {
+                for y in start.y..=max_y {
+                    if !remaining.contains(&IVec3::new(x, y, next_z)) {
+                        break 'expand_z;
+                    }
+                }
+            }
+            max_z = next_z;
+        }
+
+        for x in start.x..=max_x {
+            for y in start.y..=max_y {
+                for z in start.z..=max_z {
+                    remaining.remove(&IVec3::new(x, y, z));
+                }
+            }
+        }
+
+        let cell_size = IVec3::new(
+            max_x - start.x + 1,
+            max_y - start.y + 1,
+            max_z - start.z + 1,
+        );
+        boxes.push(VoxelCollisionBox {
+            origin: start * block_size,
+            size: cell_size * block_size,
+        });
+    }
+
+    boxes
+}
+
+fn voxel_collision_compound(boxes: &[VoxelCollisionBox]) -> Option<Collider> {
+    if boxes.is_empty() {
+        return None;
+    }
+    Some(Collider::compound(
+        boxes
+            .iter()
+            .map(|collision_box| {
+                let size = collision_box.size.as_vec3();
+                let center = collision_box.origin.as_vec3() + size * 0.5;
+                (
+                    Position::new(center),
+                    Rotation::IDENTITY,
+                    Collider::cuboid(size.x, size.y, size.z),
+                )
+            })
+            .collect::<Vec<_>>(),
+    ))
 }
 
 fn append_visible_cuboid_faces(
@@ -1489,10 +2540,27 @@ fn preview_material_emissive(material: u8) -> Color {
 }
 
 fn voxel_editor_panel(
+    mut commands: Commands,
     mut contexts: EguiContexts,
     mut editor: ResMut<VoxelEditorState>,
+    mut ship_control: ResMut<BattleSpaceshipControlState>,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
     mut store: Option<ResMut<Persistent<VoxelSceneStore>>>,
     mut map_runtime: ResMut<VoxelMapRuntimeState>,
+    mut battle_spaceships: Query<
+        (
+            Entity,
+            &BattleSpaceshipPhysicsAssembly,
+            &Transform,
+            &RigidBody,
+            &mut LinearVelocity,
+            &mut AngularVelocity,
+            Option<&BattleSpaceshipDocked>,
+            Option<&BattleSpaceshipDisassemblyAlignment>,
+        ),
+        With<BattleSpaceshipPreviewRoot>,
+    >,
+    collision_roots: Query<&StaticVoxelCollisionRoot>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -1549,6 +2617,13 @@ fn voxel_editor_panel(
             ui.label("材质");
             voxel_material_palette_ui(ui, &mut editor.material);
             ui.separator();
+            scene_visibility_selector_ui(
+                ui,
+                manager.as_deref(),
+                &mut editor.edit_visibility,
+                "新编辑可见性",
+            );
+            ui.separator();
             ui.label("笔刷");
             ui.horizontal(|ui| {
                 ui.selectable_value(
@@ -1603,6 +2678,147 @@ fn voxel_editor_panel(
                 }
                 voxel_map_manager_ui(ui, &mut editor, store, &mut map_runtime);
                 ui.separator();
+                ui.label("飞船物理");
+                if let Ok((
+                    entity,
+                    assembly,
+                    ship_transform,
+                    rigid_body,
+                    mut linear_velocity,
+                    mut angular_velocity,
+                    docked,
+                    alignment,
+                )) = battle_spaceships.single_mut()
+                {
+                    let is_aligning = alignment.is_some() && docked.is_none();
+                    let is_docked = docked.is_some() || (rigid_body.is_kinematic() && !is_aligning);
+                    let disassembly_status = battle_spaceship_disassembly_status(
+                        ship_transform.rotation,
+                        linear_velocity.0,
+                        angular_velocity.0,
+                    );
+                    ui.horizontal(|ui| {
+                        if is_docked {
+                            if ui.button("组装").clicked() {
+                                linear_velocity.0 = Vec3::ZERO;
+                                angular_velocity.0 = Vec3::ZERO;
+                                commands
+                                    .entity(entity)
+                                    .insert(RigidBody::Dynamic)
+                                    .remove::<BattleSpaceshipDocked>()
+                                    .remove::<BattleSpaceshipDisassemblyAlignment>();
+                                ship_control.enabled = true;
+                            }
+                        } else if is_aligning {
+                            if ui.button("取消对齐").clicked() {
+                                linear_velocity.0 = Vec3::ZERO;
+                                angular_velocity.0 = Vec3::ZERO;
+                                commands
+                                    .entity(entity)
+                                    .insert(RigidBody::Dynamic)
+                                    .remove::<BattleSpaceshipDisassemblyAlignment>();
+                                ship_control.enabled = true;
+                            }
+                        } else if ui
+                            .add_enabled(
+                                disassembly_status != BattleSpaceshipDisassemblyStatus::TooFast,
+                                egui::Button::new("解体对齐"),
+                            )
+                            .clicked()
+                        {
+                            let target_rotation = battle_spaceship_disassembly_target_rotation(
+                                ship_transform.rotation,
+                            );
+                            let target_translation =
+                                battle_spaceship_disassembly_target_translation(
+                                    ship_transform.translation,
+                                    ship_transform.rotation,
+                                    target_rotation,
+                                    assembly.local_center_of_mass,
+                                );
+                            linear_velocity.0 = Vec3::ZERO;
+                            angular_velocity.0 = Vec3::ZERO;
+                            commands.entity(entity).insert((
+                                RigidBody::Kinematic,
+                                BattleSpaceshipDisassemblyAlignment {
+                                    target_translation,
+                                    target_rotation,
+                                    ready_ticks: 0,
+                                    elapsed_seconds: 0.0,
+                                },
+                            ));
+                            ship_control.enabled = false;
+                        }
+                    });
+                    ui.small(format!(
+                        "状态 {}  {}",
+                        if is_aligning {
+                            "对齐中"
+                        } else if is_docked {
+                            "已停泊"
+                        } else {
+                            "已组装"
+                        },
+                        disassembly_status.label()
+                    ));
+                    if let Some(alignment) = alignment {
+                        ui.small(format!(
+                            "对齐 {:.1}s  稳定 {}/{}",
+                            alignment.elapsed_seconds,
+                            alignment.ready_ticks,
+                            BATTLE_SPACESHIP_DISASSEMBLY_READY_TICKS
+                        ));
+                    }
+                    ui.checkbox(&mut ship_control.enabled, "动力");
+                    let controls_enabled = ship_control.enabled && !is_docked && !is_aligning;
+                    ui.add_enabled(
+                        controls_enabled,
+                        egui::Slider::new(
+                            &mut ship_control.throttle,
+                            -1.0..=BATTLE_SPACESHIP_MAX_THROTTLE,
+                        )
+                        .text("推力"),
+                    );
+                    ui.add_enabled(
+                        controls_enabled,
+                        egui::Slider::new(&mut ship_control.lift, 0.0..=1.6).text("升力"),
+                    );
+                    ui.add_enabled(
+                        controls_enabled,
+                        egui::Slider::new(&mut ship_control.airflow, 0.0..=2.5).text("气流"),
+                    );
+                    ui.add_enabled_ui(controls_enabled, |ui| {
+                        ui.checkbox(&mut ship_control.dampeners, "阻尼");
+                    });
+                    let max_airflow_range = assembly
+                        .propellers
+                        .iter()
+                        .map(|propeller| {
+                            battle_spaceship_airflow_range(
+                                propeller.airflow_speed
+                                    * ship_control.throttle.abs()
+                                    * ship_control.airflow,
+                            )
+                            .abs()
+                        })
+                        .fold(0.0, f32::max);
+                    ui.small(format!("质量 {:.0}", assembly.mass));
+                    ui.small(format!(
+                        "推进器 {}  浮力点 {}  气流 {:.0}",
+                        assembly.propellers.len(),
+                        assembly.lift_points.len(),
+                        max_airflow_range
+                    ));
+                } else {
+                    ui.small("未生成飞船");
+                }
+                let static_collision_boxes =
+                    collision_roots.iter().map(|root| root.boxes).sum::<usize>();
+                ui.small(format!(
+                    "静态碰撞 {}",
+                    static_collision_boxes
+                ));
+                ui.separator();
                 let saved_edits = active_voxel_map(store).map_or(0, |map| {
                     if map_runtime.edit_index_map_id.as_deref() == Some(map.id.as_str()) {
                         map_runtime.edit_index.len()
@@ -1644,6 +2860,104 @@ fn voxel_material_palette_ui(ui: &mut egui::Ui, material: &mut u8) {
                 ui.end_row();
             }
         });
+}
+
+fn scene_visibility_selector_ui(
+    ui: &mut egui::Ui,
+    manager: Option<&Persistent<NapcatMessageManager>>,
+    visibility: &mut SceneVisibility,
+    label: &str,
+) {
+    scene_visibility_selector_ui_with_id(ui, manager, visibility, label, label);
+}
+
+fn scene_visibility_selector_ui_with_id(
+    ui: &mut egui::Ui,
+    manager: Option<&Persistent<NapcatMessageManager>>,
+    visibility: &mut SceneVisibility,
+    label: &str,
+    id: impl Hash,
+) {
+    ui.label(label);
+    egui::ComboBox::from_id_salt(("scene_visibility_selector", id))
+        .selected_text(scene_visibility_label(
+            manager, visibility,
+        ))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                visibility,
+                SceneVisibility::Public,
+                "公开",
+            );
+            ui.selectable_value(visibility, SceneVisibility::Gm, "仅GM");
+
+            if let Some(group) = manager.and_then(|manager| manager.current_group()) {
+                let mut parties = group
+                    .parties
+                    .iter()
+                    .map(|(party_id, party)| {
+                        let name = party.name.trim();
+                        let label = if name.is_empty() || name == party_id {
+                            format!("小队 {party_id}")
+                        } else {
+                            format!("小队 {name} ({party_id})")
+                        };
+                        (label, party_id.clone())
+                    })
+                    .collect::<Vec<_>>();
+                parties.sort_by(|left, right| left.0.cmp(&right.0));
+                for (label, party_id) in parties {
+                    ui.selectable_value(
+                        visibility,
+                        SceneVisibility::Party(party_id),
+                        label,
+                    );
+                }
+
+                let mut players = group
+                    .players
+                    .iter()
+                    .filter_map(|target_id| {
+                        let user_id = target_id.parse::<u64>().ok()?;
+                        Some((
+                            scene_player_display_name(manager, user_id),
+                            user_id,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                players.sort_by(|left, right| left.0.cmp(&right.0));
+                for (label, user_id) in players {
+                    ui.selectable_value(
+                        visibility,
+                        SceneVisibility::Player(user_id),
+                        format!("玩家 {label}"),
+                    );
+                }
+            }
+        });
+}
+
+fn scene_visibility_label(
+    manager: Option<&Persistent<NapcatMessageManager>>,
+    visibility: &SceneVisibility,
+) -> String {
+    match visibility {
+        SceneVisibility::Public => "公开".to_owned(),
+        SceneVisibility::Gm => "仅GM".to_owned(),
+        SceneVisibility::Party(party_id) => manager
+            .and_then(|manager| manager.current_group())
+            .and_then(|group| group.parties.get(party_id))
+            .map(|party| party.name.trim())
+            .filter(|name| !name.is_empty() && *name != party_id.as_str())
+            .map(|name| format!("小队 {name} ({party_id})"))
+            .unwrap_or_else(|| format!("小队 {party_id}")),
+        SceneVisibility::Player(user_id) => {
+            format!(
+                "玩家 {}",
+                scene_player_display_name(manager, *user_id)
+            )
+        },
+    }
 }
 
 fn voxel_map_manager_ui(
@@ -2049,6 +3363,104 @@ fn scene_waypoint_panel(
         });
 }
 
+fn unit_scene_token_panel(
+    mut contexts: EguiContexts,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    mut store: Option<ResMut<Persistent<VoxelSceneStore>>>,
+) {
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+
+    egui::Window::new("单位场景标记")
+        .default_pos(egui::pos2(512.0, 60.0))
+        .default_width(320.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            let Some(store) = store.as_deref_mut() else {
+                ui.small("场景未就绪");
+                return;
+            };
+            if store.unit_scene_tokens.is_empty() {
+                ui.small("还没有单位场景标记。");
+                return;
+            }
+
+            let token_rows = store
+                .unit_scene_tokens
+                .iter()
+                .enumerate()
+                .map(|(index, token)| {
+                    (
+                        index,
+                        token.token_id.clone(),
+                        token.unit_id.clone(),
+                        token.label.clone(),
+                        token.translation,
+                        token.visibility.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut changed = false;
+            for (index, token_id, unit_id, label, mut translation, mut visibility) in token_rows {
+                let title = if label.trim().is_empty() {
+                    format!("{unit_id} ({token_id})")
+                } else {
+                    format!("{} ({unit_id})", label.trim())
+                };
+                ui.collapsing(title, |ui| {
+                    ui.small(format!("标记ID {token_id}"));
+                    ui.horizontal(|ui| {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut translation[0])
+                                    .speed(0.1)
+                                    .prefix("X "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut translation[1])
+                                    .speed(0.1)
+                                    .prefix("Y "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut translation[2])
+                                    .speed(0.1)
+                                    .prefix("Z "),
+                            )
+                            .changed();
+                    });
+                    if ui.button("重置位置").clicked() {
+                        translation = default_unit_scene_token_translation(index);
+                        changed = true;
+                    }
+                    let before_visibility = visibility.clone();
+                    scene_visibility_selector_ui_with_id(
+                        ui,
+                        manager.as_deref(),
+                        &mut visibility,
+                        "可见范围",
+                        token_id.as_str(),
+                    );
+                    changed |= visibility != before_visibility;
+                });
+                changed |= update_unit_scene_token_state(
+                    store,
+                    &token_id,
+                    translation,
+                    visibility,
+                );
+            }
+
+            if changed {
+                persist_voxel_store(store, "unit scene tokens");
+            }
+        });
+}
+
 fn waypoint_transform(waypoint: &SceneWaypoint) -> Transform {
     Transform::from_translation(waypoint.eye).looking_at(waypoint.focus, Vec3::Y)
 }
@@ -2405,10 +3817,13 @@ fn scaled_space_hifi_point(point: IVec3) -> IVec3 { point * SPACE_HIFI_MAP_SCALE
 
 fn scaled_battle_spaceship_position(position: IVec3) -> IVec3 { position * BATTLE_SPACESHIP_SCALE }
 
+fn battle_spaceship_preview_position(unscaled: IVec3) -> IVec3 {
+    scaled_battle_spaceship_position(unscaled) + IVec3::Y * (BATTLE_SPACESHIP_SCALE - 1)
+}
+
 fn battle_spaceship_preview_origin(position: IVec3) -> Option<IVec3> {
     let unscaled = unscaled_battle_spaceship_position(position);
-    let expected_position =
-        scaled_battle_spaceship_position(unscaled) + IVec3::Y * (BATTLE_SPACESHIP_SCALE - 1);
+    let expected_position = battle_spaceship_preview_position(unscaled);
     (position == expected_position && procedural_battle_spaceship_unscaled(unscaled).is_some())
         .then(|| scaled_battle_spaceship_position(unscaled))
 }
@@ -2419,6 +3834,343 @@ fn unscaled_battle_spaceship_position(position: IVec3) -> IVec3 {
         position.y.div_euclid(BATTLE_SPACESHIP_SCALE),
         position.z.div_euclid(BATTLE_SPACESHIP_SCALE),
     )
+}
+
+fn procedural_battle_spaceship_voxels() -> HashMap<IVec3, u8> {
+    let mut voxels = HashMap::new();
+    for x in BATTLE_SPACESHIP_UNSCALED_MIN.x..=BATTLE_SPACESHIP_UNSCALED_MAX.x {
+        for y in BATTLE_SPACESHIP_UNSCALED_MIN.y..=BATTLE_SPACESHIP_UNSCALED_MAX.y {
+            for z in BATTLE_SPACESHIP_UNSCALED_MIN.z..=BATTLE_SPACESHIP_UNSCALED_MAX.z {
+                let unscaled = IVec3::new(x, y, z);
+                if let Some(material) = procedural_battle_spaceship_unscaled(unscaled) {
+                    voxels.insert(
+                        battle_spaceship_preview_position(unscaled),
+                        material,
+                    );
+                }
+            }
+        }
+    }
+    voxels
+}
+
+fn battle_spaceship_physics_assembly(
+    voxels: &HashMap<IVec3, u8>,
+) -> Option<BattleSpaceshipPhysicsAssembly> {
+    let scale = BATTLE_SPACESHIP_SCALE as f32;
+    let mut blocks = Vec::new();
+    let mut mass = 0.0;
+    let mut weighted_center = Vec3::ZERO;
+    let mut bounds_min = Vec3::splat(f32::INFINITY);
+    let mut bounds_max = Vec3::splat(f32::NEG_INFINITY);
+    let mut propeller_groups = HashMap::<i32, BattleSpaceshipForceAccumulator>::new();
+    let mut lift_groups = HashMap::<(i32, i32), BattleSpaceshipForceAccumulator>::new();
+
+    for (&position, &material) in voxels {
+        let Some(origin) = battle_spaceship_preview_origin(position) else {
+            continue;
+        };
+        let unscaled = unscaled_battle_spaceship_position(position);
+        let local_min = origin.as_vec3();
+        let local_max = (origin + IVec3::splat(BATTLE_SPACESHIP_SCALE)).as_vec3();
+        let local_center = local_min + Vec3::splat(scale * 0.5);
+        let block_mass = BATTLE_SPACESHIP_BLOCK_MASS * battle_spaceship_material_mass(material);
+
+        bounds_min = bounds_min.min(local_min);
+        bounds_max = bounds_max.max(local_max);
+        mass += block_mass;
+        weighted_center += local_center * block_mass;
+        blocks.push((local_center, block_mass));
+
+        if material == MAT_ENGINE_RED {
+            propeller_groups
+                .entry(battle_spaceship_propeller_group(
+                    unscaled,
+                ))
+                .or_default()
+                .add(local_center, 1.0);
+        }
+        if battle_spaceship_is_lift_cell(material, unscaled) {
+            lift_groups
+                .entry(battle_spaceship_lift_group(unscaled))
+                .or_default()
+                .add(
+                    local_center,
+                    battle_spaceship_lift_strength(material, unscaled),
+                );
+        }
+    }
+
+    if mass <= 0.0 || blocks.is_empty() {
+        return None;
+    }
+
+    let local_center_of_mass = weighted_center / mass;
+    let mut angular_inertia = Vec3::ZERO;
+    let cuboid_axis_inertia = scale * scale / 6.0;
+    for (local_center, block_mass) in blocks {
+        let offset = local_center - local_center_of_mass;
+        angular_inertia.x +=
+            block_mass * (cuboid_axis_inertia + offset.y * offset.y + offset.z * offset.z);
+        angular_inertia.y +=
+            block_mass * (cuboid_axis_inertia + offset.x * offset.x + offset.z * offset.z);
+        angular_inertia.z +=
+            block_mass * (cuboid_axis_inertia + offset.x * offset.x + offset.y * offset.y);
+    }
+
+    let propellers = propeller_groups
+        .into_values()
+        .filter_map(|accumulator| {
+            let sail_power = accumulator.strength;
+            let strength = battle_spaceship_propeller_acceleration(sail_power, 1.0);
+            let mut point = accumulator.into_force_point(Vec3::Z)?;
+            point.strength = strength;
+            point.airflow_speed = battle_spaceship_propeller_airflow_speed(sail_power);
+            point.airflow_radius = battle_spaceship_propeller_airflow_radius(sail_power);
+            Some(point)
+        })
+        .collect::<Vec<_>>();
+    let lift_points = lift_groups
+        .into_values()
+        .filter_map(|accumulator| accumulator.into_force_point(Vec3::Y))
+        .collect::<Vec<_>>();
+    let total_lift_strength = lift_points.iter().map(|point| point.strength).sum();
+
+    Some(BattleSpaceshipPhysicsAssembly {
+        local_center_of_mass,
+        mass,
+        angular_inertia,
+        bounds_min,
+        bounds_max,
+        propellers,
+        lift_points,
+        total_lift_strength,
+    })
+}
+
+fn battle_spaceship_assembly_collider(assembly: &BattleSpaceshipPhysicsAssembly) -> Collider {
+    let size = (assembly.bounds_max - assembly.bounds_min).max(Vec3::splat(1.0));
+    let center = assembly.bounds_min + size * 0.5;
+    Collider::compound(vec![(
+        Position::new(center),
+        Rotation::IDENTITY,
+        Collider::cuboid(size.x, size.y, size.z),
+    )])
+}
+
+fn battle_spaceship_material_mass(material: u8) -> f32 {
+    match material {
+        MAT_ENGINE_RED => 2.2,
+        MAT_STATION_TRIM => 1.5,
+        MAT_HULL_DARK => 1.2,
+        MAT_HULL_LIGHT => 0.9,
+        MAT_WINDOW_CYAN => 0.35,
+        _ => 1.0,
+    }
+}
+
+fn battle_spaceship_propeller_group(unscaled: IVec3) -> i32 {
+    if unscaled.x < -3 {
+        -1
+    } else if unscaled.x > 3 {
+        1
+    } else {
+        0
+    }
+}
+
+fn battle_spaceship_propeller_acceleration(sail_power: f32, throttle: f32) -> f32 {
+    sail_power.max(0.0).powf(1.5)
+        * BATTLE_SPACESHIP_THRUST_PER_SAIL_POWER
+        * throttle.clamp(-1.0, BATTLE_SPACESHIP_MAX_THROTTLE)
+}
+
+fn battle_spaceship_propeller_airflow_speed(sail_power: f32) -> f32 {
+    sail_power.max(0.0).sqrt() * BATTLE_SPACESHIP_AIRFLOW_PER_SAIL_ROOT
+}
+
+fn battle_spaceship_propeller_airflow_radius(sail_power: f32) -> f32 {
+    (sail_power.max(0.0).sqrt() * BATTLE_SPACESHIP_SCALE as f32).clamp(
+        BATTLE_SPACESHIP_AIRFLOW_MIN_RADIUS,
+        BATTLE_SPACESHIP_AIRFLOW_MAX_RADIUS,
+    )
+}
+
+fn battle_spaceship_airflow_range(airflow_speed: f32) -> f32 {
+    let tick_speed = airflow_speed / 20.0;
+    if tick_speed.abs() <= f32::EPSILON {
+        return 0.0;
+    }
+    tick_speed.signum()
+        * ((tick_speed.abs()
+            * BATTLE_SPACESHIP_AIRFLOW_FRICTION_SCALE
+            * BATTLE_SPACESHIP_AIRFLOW_LIFETIME
+            + 1.0)
+            .ln()
+            / BATTLE_SPACESHIP_AIRFLOW_FRICTION_SCALE)
+        * BATTLE_SPACESHIP_SCALE as f32
+}
+
+fn battle_spaceship_airflow_delta_velocity(
+    target_position: Vec3,
+    target_velocity: Vec3,
+    propeller_position: Vec3,
+    airflow_direction: Vec3,
+    airflow_speed: f32,
+    airflow_radius: f32,
+    throttle: f32,
+    airflow_scale: f32,
+    delta_seconds: f32,
+) -> Vec3 {
+    if delta_seconds <= 0.0 || airflow_radius <= 0.0 {
+        return Vec3::ZERO;
+    }
+
+    let signed_speed = airflow_speed * throttle * airflow_scale;
+    if signed_speed.abs() <= 0.001 {
+        return Vec3::ZERO;
+    }
+    let mut direction = airflow_direction.try_normalize().unwrap_or(Vec3::ZERO);
+    if direction == Vec3::ZERO {
+        return Vec3::ZERO;
+    }
+    if signed_speed < 0.0 {
+        direction = -direction;
+    }
+
+    let speed = signed_speed.abs();
+    let range = battle_spaceship_airflow_range(speed).abs();
+    if range <= 0.0 {
+        return Vec3::ZERO;
+    }
+
+    let offset = target_position - propeller_position;
+    let axial_distance = direction.dot(offset);
+    if axial_distance <= 0.0 || axial_distance > range {
+        return Vec3::ZERO;
+    }
+
+    let radial_offset = offset - direction * axial_distance;
+    let radial_distance = radial_offset.length();
+    if radial_distance > airflow_radius {
+        return Vec3::ZERO;
+    }
+
+    let distance_blocks = axial_distance / BATTLE_SPACESHIP_SCALE as f32;
+    let radial_t = (radial_distance / airflow_radius).clamp(0.0, 1.0);
+    let falloff =
+        (-distance_blocks * BATTLE_SPACESHIP_AIRFLOW_FRICTION_SCALE - radial_t.powi(4) * 0.8).exp();
+    let desired_velocity = direction * speed * falloff;
+    let max_delta = BATTLE_SPACESHIP_AIRFLOW_MAX_ACCELERATION * delta_seconds;
+
+    (desired_velocity - target_velocity).clamp_length_max(max_delta)
+        * BATTLE_SPACESHIP_AIRFLOW_RESPONSE
+}
+
+fn battle_spaceship_is_lift_cell(material: u8, unscaled: IVec3) -> bool {
+    matches!(
+        material,
+        MAT_HULL_LIGHT | MAT_WINDOW_CYAN
+    ) && unscaled.y >= 8
+}
+
+fn battle_spaceship_lift_group(unscaled: IVec3) -> (i32, i32) {
+    let x_side = if unscaled.x < 0 { -1 } else { 1 };
+    let z_side = if unscaled.z < 0 { -1 } else { 1 };
+    (x_side, z_side)
+}
+
+fn battle_spaceship_lift_strength(material: u8, unscaled: IVec3) -> f32 {
+    let height_bias = ((unscaled.y - 8) as f32 / 12.0).clamp(0.0, 1.0);
+    match material {
+        MAT_WINDOW_CYAN => 1.4 + height_bias,
+        MAT_HULL_LIGHT => 0.35 + height_bias * 0.25,
+        _ => 0.0,
+    }
+}
+
+fn battle_spaceship_disassembly_status(
+    rotation: Quat,
+    linear_velocity: Vec3,
+    angular_velocity: Vec3,
+) -> BattleSpaceshipDisassemblyStatus {
+    if linear_velocity.length() > BATTLE_SPACESHIP_DISASSEMBLE_MAX_SPEED
+        || angular_velocity.length() > BATTLE_SPACESHIP_DISASSEMBLE_MAX_ANGULAR_SPEED
+    {
+        return BattleSpaceshipDisassemblyStatus::TooFast;
+    }
+
+    if rotation.angle_between(Quat::IDENTITY).to_degrees()
+        > BATTLE_SPACESHIP_DISASSEMBLE_MAX_ROTATION_DEGREES
+    {
+        return BattleSpaceshipDisassemblyStatus::TooTilted;
+    }
+
+    BattleSpaceshipDisassemblyStatus::Ready
+}
+
+fn battle_spaceship_disassembly_target_rotation(rotation: Quat) -> Quat {
+    let (yaw, ..) = rotation.to_euler(EulerRot::YXZ);
+    let snapped_yaw = (yaw / std::f32::consts::FRAC_PI_2).round() * std::f32::consts::FRAC_PI_2;
+    Quat::from_rotation_y(snapped_yaw)
+}
+
+fn battle_spaceship_disassembly_target_translation(
+    translation: Vec3,
+    rotation: Quat,
+    target_rotation: Quat,
+    local_center_of_mass: Vec3,
+) -> Vec3 {
+    let current_center_of_mass = translation + rotation * local_center_of_mass;
+    let grid = BATTLE_SPACESHIP_SCALE as f32;
+    let target_center_of_mass = Vec3::new(
+        battle_spaceship_nearest_grid_center(current_center_of_mass.x, grid),
+        battle_spaceship_nearest_grid_center(current_center_of_mass.y, grid),
+        battle_spaceship_nearest_grid_center(current_center_of_mass.z, grid),
+    );
+
+    target_center_of_mass - target_rotation * local_center_of_mass
+}
+
+fn battle_spaceship_nearest_grid_center(value: f32, grid: f32) -> f32 {
+    ((value / grid) - 0.5).round().mul_add(grid, grid * 0.5)
+}
+
+fn battle_spaceship_move_towards(current: Vec3, target: Vec3, max_step: f32) -> Vec3 {
+    let offset = target - current;
+    let distance = offset.length();
+    if distance <= max_step || distance <= f32::EPSILON {
+        target
+    } else {
+        current + offset / distance * max_step
+    }
+}
+
+fn battle_spaceship_rotate_towards(current: Quat, target: Quat, max_angle: f32) -> Quat {
+    let angle = current.angle_between(target);
+    if angle <= max_angle || angle <= f32::EPSILON {
+        target
+    } else {
+        current
+            .slerp(
+                target,
+                (max_angle / angle).clamp(0.0, 1.0),
+            )
+            .normalize()
+    }
+}
+
+fn battle_spaceship_alignment_is_ready(
+    transform: &Transform,
+    alignment: &BattleSpaceshipDisassemblyAlignment,
+) -> bool {
+    transform.translation.distance(alignment.target_translation)
+        <= BATTLE_SPACESHIP_DISASSEMBLY_TRANSLATION_TOLERANCE
+        && transform
+            .rotation
+            .angle_between(alignment.target_rotation)
+            .to_degrees()
+            <= BATTLE_SPACESHIP_DISASSEMBLY_ROTATION_TOLERANCE_DEGREES
 }
 
 fn earth_planet_near_point() -> IVec3 { scaled_space_hifi_point(EARTH_PLANET_NEAR_POINT) }
@@ -3857,7 +5609,7 @@ fn capture_camera_panel(
                         scene_player_display_name(manager.as_deref(), active_user_id)
                     ));
                     if ui.button("恢复GM视角").clicked() {
-                        player_view_request.restore_gm_view = true;
+                        player_view_request.restore_gm_view();
                     }
                 });
             }
@@ -3906,6 +5658,32 @@ fn capture_camera_panel(
                 });
             editor.selected_user_id = Some(selected_user_id);
 
+            ui.separator();
+            ui.label("立绘可见性");
+            let selected_target_id = selected_user_id.to_string();
+            if let Some(store) = store.as_deref_mut() {
+                if let Some(index) = store
+                    .character_standees
+                    .iter()
+                    .position(|standee| standee.target_id == selected_target_id)
+                {
+                    let before = store.character_standees[index].visibility.clone();
+                    scene_visibility_selector_ui(
+                        ui,
+                        manager.as_deref(),
+                        &mut store.character_standees[index].visibility,
+                        "可见范围",
+                    );
+                    if store.character_standees[index].visibility != before {
+                        if let Err(err) = store.persist() {
+                            eprintln!("failed to persist standee visibility: {err}");
+                        }
+                    }
+                } else {
+                    ui.small("这个玩家还没有角色立绘。");
+                }
+            }
+
             let Some((entity, mut transform, _)) = capture_cameras
                 .iter_mut()
                 .find(|(_, _, camera)| camera.user_id == selected_user_id)
@@ -3921,8 +5699,11 @@ fn capture_camera_panel(
                         transform_changed = true;
                     }
                 }
-                if ui.button("查看玩家视角").clicked() {
-                    player_view_request.user_id = Some(selected_user_id);
+                if ui.button("过滤当前视角").clicked() {
+                    player_view_request.filter_current_view(selected_user_id);
+                }
+                if ui.button("查看捕捉视角").clicked() {
+                    player_view_request.view_with_capture_camera(selected_user_id);
                 }
                 if ui.button("重置").clicked() {
                     *transform = default_capture_camera_transform();
@@ -4040,17 +5821,20 @@ fn apply_scene_player_view_request(
     let Some(user_id) = request.user_id.take() else {
         return;
     };
-    let Ok(mut free_transform) = free_camera.single_mut() else {
-        return;
-    };
-    let Some((capture_transform, _)) = capture_cameras
-        .iter()
-        .find(|(_, camera)| camera.user_id == user_id)
-    else {
-        return;
-    };
+    if request.use_capture_camera {
+        let Ok(mut free_transform) = free_camera.single_mut() else {
+            return;
+        };
+        let Some((capture_transform, _)) = capture_cameras
+            .iter()
+            .find(|(_, camera)| camera.user_id == user_id)
+        else {
+            return;
+        };
 
-    *free_transform = *capture_transform;
+        *free_transform = *capture_transform;
+    }
+
     player_view_state.active_user_id = Some(user_id);
     let access = scene_capture_player_access(manager.as_deref(), user_id);
     apply_scene_player_voxel_view(
@@ -4081,6 +5865,26 @@ fn maintain_scene_player_voxel_view(
         &runtime.edit_index,
         &access,
     );
+}
+
+fn maintain_scene_player_standee_visibility(
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    capture_state: Res<SceneCaptureState>,
+    player_view_state: Res<ScenePlayerVoxelViewState>,
+    mut standees: Query<(&CharacterStandee, &mut Visibility)>,
+) {
+    if capture_state
+        .pending_captures
+        .iter()
+        .any(|pending| pending.started_preparing)
+    {
+        return;
+    }
+
+    let access = player_view_state
+        .active_user_id
+        .map(|user_id| scene_capture_player_access(manager.as_deref(), user_id));
+    apply_scene_player_standee_visibility(&mut standees, access.as_ref());
 }
 
 fn free_camera_system(
@@ -4193,6 +5997,208 @@ fn apply_planet_radial_gravity(
     }
 }
 
+fn apply_battle_spaceship_aeronautics_forces(
+    control: Res<BattleSpaceshipControlState>,
+    mut ships: Query<
+        (
+            &BattleSpaceshipPhysicsAssembly,
+            Option<&BattleSpaceshipDocked>,
+            Option<&BattleSpaceshipDisassemblyAlignment>,
+            Forces,
+        ),
+        With<BattleSpaceshipPreviewRoot>,
+    >,
+) {
+    let throttle = control.throttle.clamp(-1.0, BATTLE_SPACESHIP_MAX_THROTTLE);
+    let lift = control.lift.clamp(0.0, 1.6);
+
+    for (assembly, docked, alignment, mut forces) in &mut ships {
+        if docked.is_some() || alignment.is_some() {
+            continue;
+        }
+        let position = forces.position().0;
+        let rotation = forces.rotation().0;
+        let world_center_of_mass = position + rotation * assembly.local_center_of_mass;
+
+        let gravity_direction = planet_gravity_direction_at(world_center_of_mass);
+        if gravity_direction != Vec3::ZERO {
+            forces.apply_linear_acceleration(gravity_direction * PLANET_GRAVITY_ACCELERATION);
+        }
+
+        if !control.enabled {
+            continue;
+        }
+
+        if lift > 0.0 && assembly.total_lift_strength > 0.0 {
+            let lift_direction = planet_outward_at(world_center_of_mass);
+            let lift_acceleration = PLANET_GRAVITY_ACCELERATION * lift;
+            for point in &assembly.lift_points {
+                let world_point = position + rotation * point.local_position;
+                let share = point.strength / assembly.total_lift_strength;
+                forces.apply_linear_acceleration_at_point(
+                    lift_direction * lift_acceleration * share,
+                    world_point,
+                );
+            }
+        }
+
+        if throttle.abs() > 0.001 {
+            for point in &assembly.propellers {
+                let thrust_direction = (rotation * point.local_direction)
+                    .try_normalize()
+                    .unwrap_or(Vec3::ZERO);
+                if thrust_direction == Vec3::ZERO {
+                    continue;
+                }
+                let world_point = position + rotation * point.local_position;
+                forces.apply_linear_acceleration_at_point(
+                    thrust_direction * point.strength * throttle,
+                    world_point,
+                );
+            }
+        }
+
+        if control.dampeners {
+            let velocity = forces.linear_velocity();
+            if velocity.length_squared() > 0.0001 {
+                let acceleration = (-velocity * BATTLE_SPACESHIP_LINEAR_DAMPENER)
+                    .clamp_length_max(BATTLE_SPACESHIP_MAX_DAMPENER_ACCELERATION);
+                forces.apply_linear_acceleration(acceleration);
+            }
+            let angular_velocity = forces.angular_velocity();
+            if angular_velocity.length_squared() > 0.0001 {
+                forces.apply_angular_acceleration(
+                    -angular_velocity * BATTLE_SPACESHIP_ANGULAR_DAMPENER,
+                );
+            }
+        }
+    }
+}
+
+fn apply_battle_spaceship_propeller_airflow(
+    control: Res<BattleSpaceshipControlState>,
+    time: Res<Time>,
+    ships: Query<
+        (
+            &Transform,
+            &BattleSpaceshipPhysicsAssembly,
+            Option<&BattleSpaceshipDocked>,
+            Option<&BattleSpaceshipDisassemblyAlignment>,
+        ),
+        With<BattleSpaceshipPreviewRoot>,
+    >,
+    mut physics_voxels: Query<
+        (&Transform, &mut LinearVelocity),
+        (
+            With<PhysicsVoxel>,
+            Without<BattleSpaceshipPreviewRoot>,
+            Without<HeldPhysicsVoxel>,
+        ),
+    >,
+) {
+    if !control.enabled || control.airflow <= 0.0 {
+        return;
+    }
+    let throttle = control.throttle.clamp(-1.0, BATTLE_SPACESHIP_MAX_THROTTLE);
+    if throttle.abs() <= 0.001 {
+        return;
+    }
+
+    let airflow_scale = control.airflow.clamp(0.0, 2.5);
+    let delta_seconds = time.delta_secs();
+    for (target_transform, mut target_velocity) in &mut physics_voxels {
+        let mut delta_velocity = Vec3::ZERO;
+        for (ship_transform, assembly, docked, alignment) in &ships {
+            if docked.is_some() || alignment.is_some() {
+                continue;
+            }
+            for propeller in &assembly.propellers {
+                let propeller_position =
+                    ship_transform.translation + ship_transform.rotation * propeller.local_position;
+                let airflow_direction = ship_transform.rotation * propeller.local_direction;
+                delta_velocity += battle_spaceship_airflow_delta_velocity(
+                    target_transform.translation,
+                    target_velocity.0,
+                    propeller_position,
+                    airflow_direction,
+                    propeller.airflow_speed,
+                    propeller.airflow_radius,
+                    throttle,
+                    airflow_scale,
+                    delta_seconds,
+                );
+            }
+        }
+        target_velocity.0 += delta_velocity;
+    }
+}
+
+fn update_battle_spaceship_disassembly_alignment(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut ship_control: ResMut<BattleSpaceshipControlState>,
+    mut ships: Query<
+        (
+            Entity,
+            &mut Transform,
+            &mut LinearVelocity,
+            &mut AngularVelocity,
+            &mut BattleSpaceshipDisassemblyAlignment,
+        ),
+        (
+            With<BattleSpaceshipPreviewRoot>,
+            Without<BattleSpaceshipDocked>,
+        ),
+    >,
+) {
+    let delta_seconds = time.delta_secs();
+    let max_translation_step = BATTLE_SPACESHIP_DISASSEMBLY_ALIGN_SPEED * delta_seconds;
+    let max_rotation_step = BATTLE_SPACESHIP_DISASSEMBLY_ALIGN_ROTATION_SPEED * delta_seconds;
+
+    for (entity, mut transform, mut linear_velocity, mut angular_velocity, mut alignment) in
+        &mut ships
+    {
+        alignment.elapsed_seconds += delta_seconds;
+        linear_velocity.0 = Vec3::ZERO;
+        angular_velocity.0 = Vec3::ZERO;
+        transform.translation = battle_spaceship_move_towards(
+            transform.translation,
+            alignment.target_translation,
+            max_translation_step,
+        );
+        transform.rotation = battle_spaceship_rotate_towards(
+            transform.rotation,
+            alignment.target_rotation,
+            max_rotation_step,
+        );
+
+        if battle_spaceship_alignment_is_ready(&transform, &alignment) {
+            alignment.ready_ticks = alignment.ready_ticks.saturating_add(1);
+        } else {
+            alignment.ready_ticks = 0;
+        }
+
+        if alignment.ready_ticks >= BATTLE_SPACESHIP_DISASSEMBLY_READY_TICKS {
+            transform.translation = alignment.target_translation;
+            transform.rotation = alignment.target_rotation;
+            commands
+                .entity(entity)
+                .insert((
+                    RigidBody::Kinematic,
+                    BattleSpaceshipDocked,
+                ))
+                .remove::<BattleSpaceshipDisassemblyAlignment>();
+            ship_control.enabled = false;
+        } else if alignment.elapsed_seconds >= BATTLE_SPACESHIP_DISASSEMBLY_ALIGN_MAX_SECONDS {
+            commands
+                .entity(entity)
+                .insert(RigidBody::Dynamic)
+                .remove::<BattleSpaceshipDisassemblyAlignment>();
+            ship_control.enabled = true;
+        }
+    }
+}
+
 fn voxel_edit_target(
     voxel_world: &VoxelWorld<'_, TrpgVoxelWorld>,
     ray: Ray3d,
@@ -4276,7 +6282,21 @@ fn physics_voxel_grab_drop_system(
     mut grab_state: ResMut<PhysicsVoxelGrabState>,
     mut ship_grab_state: ResMut<BattleSpaceshipGrabState>,
     mut battle_spaceships: Query<
-        &mut Transform,
+        (
+            &mut Transform,
+            Option<&BattleSpaceshipDisassemblyAlignment>,
+        ),
+        (
+            With<BattleSpaceshipPreviewRoot>,
+            Without<PhysicsVoxel>,
+            Without<FreeCamera>,
+        ),
+    >,
+    mut battle_spaceship_velocities: Query<
+        (
+            &mut LinearVelocity,
+            &mut AngularVelocity,
+        ),
         (
             With<BattleSpaceshipPreviewRoot>,
             Without<PhysicsVoxel>,
@@ -4295,8 +6315,18 @@ fn physics_voxel_grab_drop_system(
     let held_ship_position = held_battle_spaceship_position(camera_transform);
 
     if ship_grab_state.held {
-        if let Ok(mut ship_transform) = battle_spaceships.single_mut() {
-            ship_transform.translation = held_ship_position - ship_grab_state.grab_local_offset;
+        if let Ok((mut ship_transform, alignment)) = battle_spaceships.single_mut() {
+            if alignment.is_some() {
+                ship_grab_state.held = false;
+            } else {
+                ship_transform.translation = held_ship_position - ship_grab_state.grab_local_offset;
+            }
+            if let Ok((mut linear_velocity, mut angular_velocity)) =
+                battle_spaceship_velocities.single_mut()
+            {
+                linear_velocity.0 = Vec3::ZERO;
+                angular_velocity.0 = Vec3::ZERO;
+            }
         } else {
             ship_grab_state.held = false;
         }
@@ -4324,14 +6354,22 @@ fn physics_voxel_grab_drop_system(
 
     if ship_grab_state.held {
         ship_grab_state.held = false;
-        if let (Ok(ship_transform), Some(store)) = (
+        if let (Ok((ship_transform, alignment)), Some(store)) = (
             battle_spaceships.single(),
             store.as_deref_mut(),
         ) {
-            store.battle_spaceship_translation = ship_transform.translation.to_array();
-            if let Err(err) = store.persist() {
-                eprintln!("failed to persist battle spaceship transform: {err}");
+            if alignment.is_none() {
+                store.battle_spaceship_translation = ship_transform.translation.to_array();
+                if let Err(err) = store.persist() {
+                    eprintln!("failed to persist battle spaceship transform: {err}");
+                }
             }
+        }
+        if let Ok((mut linear_velocity, mut angular_velocity)) =
+            battle_spaceship_velocities.single_mut()
+        {
+            linear_velocity.0 = Vec3::ZERO;
+            angular_velocity.0 = Vec3::ZERO;
         }
         return;
     }
@@ -4359,14 +6397,22 @@ fn physics_voxel_grab_drop_system(
         return;
     };
 
-    if let Ok(ship_transform) = battle_spaceships.single() {
-        if let Some(hit_distance) =
-            battle_spaceship_ray_intersection(ray, ship_transform.translation)
-        {
-            let hit_position = ray.origin + *ray.direction * hit_distance;
-            ship_grab_state.grab_local_offset = hit_position - ship_transform.translation;
-            ship_grab_state.held = true;
-            return;
+    if let Ok((ship_transform, alignment)) = battle_spaceships.single() {
+        if alignment.is_none() {
+            if let Some(hit_distance) =
+                battle_spaceship_ray_intersection(ray, ship_transform.translation)
+            {
+                let hit_position = ray.origin + *ray.direction * hit_distance;
+                ship_grab_state.grab_local_offset = hit_position - ship_transform.translation;
+                ship_grab_state.held = true;
+                if let Ok((mut linear_velocity, mut angular_velocity)) =
+                    battle_spaceship_velocities.single_mut()
+                {
+                    linear_velocity.0 = Vec3::ZERO;
+                    angular_velocity.0 = Vec3::ZERO;
+                }
+                return;
+            }
         }
     }
 
@@ -4469,8 +6515,8 @@ fn pickup_indicator_target(
 
 fn battle_spaceship_ray_intersection(ray: Ray3d, translation: Vec3) -> Option<f32> {
     let scale = BATTLE_SPACESHIP_SCALE as f32;
-    let min = Vec3::new(-20.0 * scale, 0.0, -44.0 * scale) + translation;
-    let max = Vec3::new(21.0 * scale, 20.0 * scale, 45.0 * scale) + translation;
+    let min = BATTLE_SPACESHIP_UNSCALED_MIN.as_vec3() * scale + translation;
+    let max = (BATTLE_SPACESHIP_UNSCALED_MAX + IVec3::ONE).as_vec3() * scale + translation;
     ray_aabb_intersection(ray.origin, *ray.direction, min, max)
         .filter(|distance| *distance <= BATTLE_SPACESHIP_GRAB_MAX_DISTANCE)
 }
@@ -4620,6 +6666,169 @@ fn draw_capture_camera_gizmos(
     }
 }
 
+fn draw_legacy_area_marker_gizmos(
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    store: Option<Res<Persistent<VoxelSceneStore>>>,
+    capture_state: Res<SceneCaptureState>,
+    player_view_state: Res<ScenePlayerVoxelViewState>,
+    mut gizmos: Gizmos,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let access = scene_overlay_access(
+        manager.as_deref(),
+        &capture_state,
+        &player_view_state,
+    );
+    for marker in &store.legacy_area_markers {
+        if !legacy_area_marker_visible_for_access(marker, access.as_ref()) {
+            continue;
+        }
+        draw_legacy_area_marker_gizmo(&mut gizmos, marker);
+    }
+}
+
+fn draw_unit_scene_token_gizmos(
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    store: Option<Res<Persistent<VoxelSceneStore>>>,
+    capture_state: Res<SceneCaptureState>,
+    player_view_state: Res<ScenePlayerVoxelViewState>,
+    mut gizmos: Gizmos,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let access = scene_overlay_access(
+        manager.as_deref(),
+        &capture_state,
+        &player_view_state,
+    );
+    for token in &store.unit_scene_tokens {
+        if !unit_scene_token_visible_for_access(token, access.as_ref()) {
+            continue;
+        }
+        draw_unit_scene_token_gizmo(&mut gizmos, token);
+    }
+}
+
+fn scene_overlay_access(
+    manager: Option<&Persistent<NapcatMessageManager>>,
+    capture_state: &SceneCaptureState,
+    player_view_state: &ScenePlayerVoxelViewState,
+) -> Option<PlayerAccess> {
+    capture_state
+        .pending_captures
+        .iter()
+        .find(|pending| pending.started_preparing)
+        .map(|pending| pending.user_id)
+        .or(player_view_state.active_user_id)
+        .map(|user_id| scene_capture_player_access(manager, user_id))
+}
+
+fn unit_scene_token_visible_for_access(
+    token: &PersistedUnitSceneToken,
+    access: Option<&PlayerAccess>,
+) -> bool {
+    access
+        .map(|access| token.visibility.can_read_for_access(access))
+        .unwrap_or(true)
+}
+
+fn legacy_area_marker_visible_for_access(
+    marker: &PersistedLegacyAreaMarker,
+    access: Option<&PlayerAccess>,
+) -> bool {
+    access
+        .map(|access| marker.visibility.can_read_for_access(access))
+        .unwrap_or(true)
+}
+
+fn draw_legacy_area_marker_gizmo(gizmos: &mut Gizmos, marker: &PersistedLegacyAreaMarker) {
+    let color = legacy_area_marker_color(marker);
+    let corners = legacy_area_marker_corners(marker);
+    for (start, end) in [
+        (corners[0], corners[1]),
+        (corners[1], corners[2]),
+        (corners[2], corners[3]),
+        (corners[3], corners[0]),
+    ] {
+        gizmos.line(start, end, color);
+    }
+
+    let center = legacy_area_marker_center(marker);
+    let pin_top = center + Vec3::Y * 1.2;
+    gizmos.line(center, pin_top, color);
+    gizmos.sphere(
+        Isometry3d::from_translation(pin_top),
+        0.16,
+        color,
+    );
+
+    if marker.combat {
+        gizmos.line(corners[0], corners[2], color);
+        gizmos.line(corners[1], corners[3], color);
+    }
+}
+
+fn draw_unit_scene_token_gizmo(gizmos: &mut Gizmos, token: &PersistedUnitSceneToken) {
+    let color = unit_scene_token_color(token);
+    let center = Vec3::from(token.translation);
+    gizmos.sphere(
+        Isometry3d::from_translation(center),
+        0.28,
+        color,
+    );
+    gizmos.line(
+        center - Vec3::X * 0.45,
+        center + Vec3::X * 0.45,
+        color,
+    );
+    gizmos.line(
+        center - Vec3::Z * 0.45,
+        center + Vec3::Z * 0.45,
+        color,
+    );
+    gizmos.line(center, center + Vec3::Y * 0.9, color);
+}
+
+fn unit_scene_token_color(token: &PersistedUnitSceneToken) -> Color {
+    match &token.visibility {
+        SceneVisibility::Public => Color::srgb(0.2, 0.92, 1.0),
+        SceneVisibility::Party(_) => Color::srgb(1.0, 0.72, 0.18),
+        SceneVisibility::Player(_) => Color::srgb(0.22, 0.88, 0.34),
+        SceneVisibility::Gm => Color::srgb(0.95, 0.45, 1.0),
+    }
+}
+
+fn legacy_area_marker_color(marker: &PersistedLegacyAreaMarker) -> Color {
+    match (&marker.visibility, marker.combat) {
+        (SceneVisibility::Gm, _) => Color::srgb(0.95, 0.45, 1.0),
+        (_, true) => Color::srgb(1.0, 0.32, 0.18),
+        _ => Color::srgb(0.15, 0.82, 1.0),
+    }
+}
+
+fn legacy_area_marker_center(marker: &PersistedLegacyAreaMarker) -> Vec3 {
+    Vec3::new(
+        (marker.x + marker.width.max(1.0) * 0.5) * LEGACY_AREA_MARKER_SCALE,
+        LEGACY_AREA_MARKER_Y,
+        (marker.y + marker.height.max(1.0) * 0.5) * LEGACY_AREA_MARKER_SCALE,
+    )
+}
+
+fn legacy_area_marker_corners(marker: &PersistedLegacyAreaMarker) -> [Vec3; 4] {
+    let center = legacy_area_marker_center(marker);
+    let half_width = marker.width.max(1.0) * LEGACY_AREA_MARKER_SCALE * 0.5;
+    let half_depth = marker.height.max(1.0) * LEGACY_AREA_MARKER_SCALE * 0.5;
+    [
+        center + Vec3::new(-half_width, 0.0, -half_depth),
+        center + Vec3::new(half_width, 0.0, -half_depth),
+        center + Vec3::new(half_width, 0.0, half_depth),
+        center + Vec3::new(-half_width, 0.0, half_depth),
+    ]
+}
+
 fn draw_pickup_indicator_gizmo(
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_info: Query<
@@ -4674,6 +6883,51 @@ fn draw_pickup_indicator_gizmo(
         target,
         PICKUP_INDICATOR_COLOR,
     );
+}
+
+fn draw_battle_spaceship_airflow_gizmos(
+    control: Res<BattleSpaceshipControlState>,
+    ships: Query<
+        (
+            &Transform,
+            &BattleSpaceshipPhysicsAssembly,
+            Option<&BattleSpaceshipDocked>,
+            Option<&BattleSpaceshipDisassemblyAlignment>,
+        ),
+        With<BattleSpaceshipPreviewRoot>,
+    >,
+    mut gizmos: Gizmos,
+) {
+    if !control.enabled || control.airflow <= 0.0 {
+        return;
+    }
+    let throttle = control.throttle.clamp(-1.0, BATTLE_SPACESHIP_MAX_THROTTLE);
+    if throttle.abs() <= 0.001 {
+        return;
+    }
+    let airflow_scale = control.airflow.clamp(0.0, 2.5);
+    for (ship_transform, assembly, docked, alignment) in &ships {
+        if docked.is_some() || alignment.is_some() {
+            continue;
+        }
+        for propeller in &assembly.propellers {
+            let signed_speed = propeller.airflow_speed * throttle * airflow_scale;
+            let range = battle_spaceship_airflow_range(signed_speed);
+            if range.abs() <= 0.001 {
+                continue;
+            }
+            let origin =
+                ship_transform.translation + ship_transform.rotation * propeller.local_position;
+            let direction = (ship_transform.rotation * propeller.local_direction)
+                .try_normalize()
+                .unwrap_or(Vec3::ZERO);
+            if direction == Vec3::ZERO {
+                continue;
+            }
+            let end = origin + direction * range;
+            gizmos.arrow(origin, end, Color::srgb(0.0, 0.72, 1.0));
+        }
+    }
 }
 
 fn draw_voxel_edit_preview_gizmo(
@@ -4919,6 +7173,7 @@ fn edit_voxel_world_system(
                 &mut voxel_world,
                 positions,
                 PersistedVoxel::Solid(editor.material),
+                editor.edit_visibility.clone(),
             );
         } else {
             editor.box_anchor = Some(base_position);
@@ -4953,6 +7208,7 @@ fn edit_voxel_world_system(
         &mut voxel_world,
         positions,
         persisted_voxel,
+        editor.edit_visibility.clone(),
     );
     pointer_state.last_edit_position = Some(base_position);
 }
@@ -4967,6 +7223,7 @@ fn scene_capture_request_system(
     player_cameras: Res<PlayerSceneCameras>,
     mut voxel_world: VoxelWorld<TrpgVoxelWorld>,
     mut capture_camera_query: Query<&mut Camera, With<PlayerCaptureCamera>>,
+    mut standee_visibility_query: Query<(&CharacterStandee, &mut Visibility)>,
     voxel_camera_entities: Query<Entity, With<VoxelWorldCamera<TrpgVoxelWorld>>>,
 ) {
     let capture_requests = requests.requests.drain(..).collect::<Vec<_>>();
@@ -5007,6 +7264,7 @@ fn scene_capture_request_system(
             prepare_frames_remaining: SCENE_CAPTURE_PREPARE_FRAMES,
             started_preparing: false,
             voxel_view_changes: Vec::new(),
+            standee_visibility_changes: Vec::new(),
         });
     }
 
@@ -5032,9 +7290,17 @@ fn scene_capture_request_system(
             &current.voxel_view_changes,
             SceneCaptureVoxelView::Capture,
         );
+        current.standee_visibility_changes =
+            apply_scene_capture_standee_visibility(&mut standee_visibility_query, &access);
         current.started_preparing = true;
         return;
     }
+
+    let access = scene_capture_player_access(manager.as_deref(), current.user_id);
+    apply_scene_player_standee_visibility(
+        &mut standee_visibility_query,
+        Some(&access),
+    );
 
     if current.prepare_frames_remaining > 0 {
         current.prepare_frames_remaining -= 1;
@@ -5056,7 +7322,8 @@ fn scene_capture_request_system(
                       mut player_view_state: ResMut<ScenePlayerVoxelViewState>,
                       free_camera: Query<Entity, With<FreeCamera>>,
                       mut voxel_world: VoxelWorld<TrpgVoxelWorld>,
-                      mut cameras: Query<&mut Camera, With<PlayerCaptureCamera>>| {
+                      mut cameras: Query<&mut Camera, With<PlayerCaptureCamera>>,
+                      mut standee_visibility_query: Query<(&CharacterStandee, &mut Visibility)>| {
                     if let Ok(mut camera) = cameras.get_mut(pending.camera_entity) {
                         camera.is_active = false;
                     }
@@ -5064,6 +7331,10 @@ fn scene_capture_request_system(
                         &mut voxel_world,
                         &pending.voxel_view_changes,
                         SceneCaptureVoxelView::Restore,
+                    );
+                    restore_scene_standee_visibility(
+                        &mut standee_visibility_query,
+                        &pending.standee_visibility_changes,
                     );
                     if let Some(active_user_id) = player_view_state.active_user_id {
                         let access =
@@ -5073,6 +7344,15 @@ fn scene_capture_request_system(
                             &mut player_view_state,
                             &runtime.edit_index,
                             &access,
+                        );
+                        apply_scene_player_standee_visibility(
+                            &mut standee_visibility_query,
+                            Some(&access),
+                        );
+                    } else {
+                        apply_scene_player_standee_visibility(
+                            &mut standee_visibility_query,
+                            None,
                         );
                     }
                     commands
@@ -5286,6 +7566,60 @@ fn apply_scene_capture_voxel_view(
     }
 }
 
+fn scene_standee_visibility_for_access(
+    visibility: &SceneVisibility,
+    access: Option<&PlayerAccess>,
+) -> Visibility {
+    match access {
+        Some(access) if !visibility.can_read_for_access(access) => Visibility::Hidden,
+        _ => Visibility::Visible,
+    }
+}
+
+fn apply_scene_player_standee_visibility(
+    standees: &mut Query<(&CharacterStandee, &mut Visibility)>,
+    access: Option<&PlayerAccess>,
+) {
+    for (standee, mut bevy_visibility) in standees.iter_mut() {
+        *bevy_visibility = scene_standee_visibility_for_access(&standee.visibility, access);
+    }
+}
+
+fn apply_scene_capture_standee_visibility(
+    standees: &mut Query<(&CharacterStandee, &mut Visibility)>,
+    access: &PlayerAccess,
+) -> Vec<SceneStandeeVisibilityChange> {
+    let mut changes = Vec::new();
+    for (standee, mut bevy_visibility) in standees.iter_mut() {
+        let next_visibility =
+            scene_standee_visibility_for_access(&standee.visibility, Some(access));
+        if *bevy_visibility == next_visibility {
+            continue;
+        }
+        changes.push(SceneStandeeVisibilityChange {
+            target_id: standee.target_id.clone(),
+            restore_visibility: *bevy_visibility,
+        });
+        *bevy_visibility = next_visibility;
+    }
+    changes.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+    changes
+}
+
+fn restore_scene_standee_visibility(
+    standees: &mut Query<(&CharacterStandee, &mut Visibility)>,
+    changes: &[SceneStandeeVisibilityChange],
+) {
+    for change in changes {
+        if let Some((_, mut bevy_visibility)) = standees
+            .iter_mut()
+            .find(|(standee, _)| standee.target_id == change.target_id)
+        {
+            *bevy_visibility = change.restore_visibility;
+        }
+    }
+}
+
 fn default_capture_camera_transform() -> Transform {
     Transform::from_xyz(24.0, 18.0, 32.0).looking_at(Vec3::new(0.0, 8.0, 0.0), Vec3::Y)
 }
@@ -5352,7 +7686,7 @@ fn sync_character_standees(
         standees.entities.insert(standee.target_id.clone(), entity);
     }
 
-    let active_targets = manager
+    let mut active_targets = manager
         .player_characters
         .iter()
         .filter_map(|(target_id, character)| {
@@ -5365,6 +7699,9 @@ fn sync_character_standees(
             })
         })
         .collect::<Vec<_>>();
+    active_targets.extend(active_unit_template_standee_targets(
+        &manager, store,
+    ));
     let active_ids = active_targets
         .iter()
         .map(|(target_id, _)| target_id.as_str())
@@ -5419,7 +7756,9 @@ fn sync_character_standees(
 
         if let Some(entity) = standees.entities.get(&target_id).copied() {
             if let Ok((_, existing_standee)) = existing.get(entity) {
-                if existing_standee.image_source == image_source {
+                if existing_standee.image_source == image_source
+                    && existing_standee.visibility == persisted.visibility
+                {
                     if let Ok(mut standee_transform) = standee_transforms.get_mut(entity) {
                         *standee_transform = transform;
                     }
@@ -5462,9 +7801,11 @@ fn sync_character_standees(
                             ..default()
                         })),
                         transform,
+                        Visibility::Visible,
                         CharacterStandee {
                             target_id: target_id.clone(),
                             image_source,
+                            visibility: persisted.visibility.clone(),
                         },
                     ))
                     .id();
@@ -5482,6 +7823,28 @@ fn sync_character_standees(
             eprintln!("failed to persist character standees: {err}");
         }
     }
+}
+
+fn active_unit_template_standee_targets(
+    manager: &NapcatMessageManager,
+    store: &VoxelSceneStore,
+) -> Vec<(String, String)> {
+    store
+        .character_standees
+        .iter()
+        .filter_map(|standee| {
+            let unit_id = standee
+                .target_id
+                .strip_prefix(UNIT_TEMPLATE_STANDEE_PREFIX)?;
+            let image_source = manager.unit_pool.get(unit_id)?.character.image.trim();
+            (!image_source.is_empty()).then(|| {
+                (
+                    standee.target_id.clone(),
+                    image_source.to_owned(),
+                )
+            })
+        })
+        .collect()
 }
 
 fn sync_scene_character_positions(
@@ -5532,6 +7895,7 @@ fn default_character_standee(target_id: &str, image_source: &str) -> PersistedCh
         image_source: image_source.to_owned(),
         translation: transform.translation.to_array(),
         rotation: transform.rotation.to_array(),
+        visibility: SceneVisibility::Public,
     }
 }
 
@@ -5981,8 +8345,9 @@ fn apply_voxel_edit_positions(
     voxel_world: &mut VoxelWorld<TrpgVoxelWorld>,
     positions: Vec<IVec3>,
     after: PersistedVoxel,
+    visibility: SceneVisibility,
 ) {
-    let stroke = voxel_edit_stroke(runtime, positions, after);
+    let stroke = voxel_edit_stroke(runtime, positions, after, visibility);
     if stroke.changes.is_empty() {
         return;
     }
@@ -5999,17 +8364,21 @@ fn voxel_edit_stroke(
     runtime: &VoxelMapRuntimeState,
     positions: Vec<IVec3>,
     after: PersistedVoxel,
+    visibility: SceneVisibility,
 ) -> VoxelEditStroke {
     let mut by_position: HashMap<IVec3, VoxelEditChange> = HashMap::new();
     for position in positions {
-        let before = runtime.edit_index.get(&position).map(|state| state.voxel);
-        let after = Some(after);
+        let before = runtime.edit_index.get(&position).cloned();
+        let after = Some(PersistedVoxelState {
+            voxel: after,
+            visibility: visibility.clone(),
+        });
         if before == after {
             continue;
         }
         by_position
             .entry(position)
-            .and_modify(|change| change.after = after)
+            .and_modify(|change| change.after = after.clone())
             .or_insert(VoxelEditChange {
                 position,
                 before,
@@ -6029,11 +8398,11 @@ fn apply_voxel_stroke(
     undo: bool,
 ) {
     for change in &stroke.changes {
-        let next = if undo { change.before } else { change.after };
-        set_runtime_voxel_state(runtime, change.position, next);
+        let next = if undo { change.before.clone() } else { change.after.clone() };
+        set_runtime_voxel_state(runtime, change.position, next.clone());
         voxel_world.set_voxel(
             change.position,
-            persisted_state_to_world_voxel(change.position, next),
+            persisted_state_to_world_voxel(change.position, next.as_ref()),
         );
     }
 }
@@ -6041,17 +8410,10 @@ fn apply_voxel_stroke(
 fn set_runtime_voxel_state(
     runtime: &mut VoxelMapRuntimeState,
     position: IVec3,
-    state: Option<PersistedVoxel>,
+    state: Option<PersistedVoxelState>,
 ) {
     match state {
-        Some(voxel) => {
-            let visibility = runtime
-                .edit_index
-                .get(&position)
-                .or_else(|| runtime.applied_index.get(&position))
-                .map(|state| state.visibility.clone())
-                .unwrap_or_default();
-            let state = PersistedVoxelState { voxel, visibility };
+        Some(state) => {
             runtime.edit_index.insert(position, state.clone());
             runtime.applied_index.insert(position, state);
         },
@@ -6064,10 +8426,10 @@ fn set_runtime_voxel_state(
 
 fn persisted_state_to_world_voxel(
     position: IVec3,
-    state: Option<PersistedVoxel>,
+    state: Option<&PersistedVoxelState>,
 ) -> WorldVoxel<u8> {
     state
-        .map(WorldVoxel::from)
+        .map(|state| WorldVoxel::from(state.voxel))
         .unwrap_or_else(|| starter_scene_voxel(position, None))
 }
 
@@ -6252,6 +8614,25 @@ impl From<PersistedVoxel> for WorldVoxel<u8> {
 mod tests {
     use super::*;
 
+    fn empty_manager() -> NapcatMessageManager {
+        NapcatMessageManager {
+            messages: HashMap::default(),
+            chat_targets: HashMap::default(),
+            player_characters: HashMap::default(),
+            trpg_groups: HashMap::default(),
+            current_trpg_group: None,
+            groups: HashMap::default(),
+            read_message_counts: HashMap::default(),
+            summarized_message_counts: HashMap::default(),
+            open_chat_targets: HashSet::default(),
+            pending_chat_targets: HashSet::default(),
+            rejected_chat_targets: HashSet::default(),
+            random_pools: HashMap::default(),
+            skill_pool: Vec::new(),
+            unit_pool: HashMap::default(),
+        }
+    }
+
     #[test]
     fn voxel_planet_is_solid_below_surface_and_empty_above_at_landing_direction() {
         let center = earth_planet_center();
@@ -6332,6 +8713,80 @@ mod tests {
     }
 
     #[test]
+    fn voxel_collision_boxes_merge_rectangular_prisms() {
+        let positions = (0..3)
+            .flat_map(|x| (0..2).flat_map(move |y| (0..2).map(move |z| IVec3::new(x, y, z))))
+            .collect::<Vec<_>>();
+
+        let boxes = voxel_collision_boxes_from_positions(positions, 1, 16);
+
+        assert_eq!(boxes, vec![VoxelCollisionBox {
+            origin: IVec3::ZERO,
+            size: IVec3::new(3, 2, 2),
+        }]);
+    }
+
+    #[test]
+    fn voxel_collision_boxes_keep_l_shapes_conservative() {
+        let boxes = voxel_collision_boxes_from_positions(
+            [
+                IVec3::new(0, 0, 0),
+                IVec3::new(1, 0, 0),
+                IVec3::new(0, 1, 0),
+            ],
+            1,
+            16,
+        );
+
+        assert_eq!(boxes.len(), 2);
+        assert!(boxes.contains(&VoxelCollisionBox {
+            origin: IVec3::ZERO,
+            size: IVec3::new(2, 1, 1),
+        }));
+        assert!(boxes.contains(&VoxelCollisionBox {
+            origin: IVec3::new(0, 1, 0),
+            size: IVec3::ONE,
+        }));
+    }
+
+    #[test]
+    fn static_voxel_collision_inputs_stay_bounded() {
+        let decor_positions = space_hifi_decor_voxel_edits()
+            .into_iter()
+            .filter_map(|edit| {
+                let PersistedVoxel::Solid(material) = edit.voxel else {
+                    return None;
+                };
+                (material != MAT_STAR).then_some(IVec3::new(
+                    edit.position[0],
+                    edit.position[1],
+                    edit.position[2],
+                ))
+            })
+            .collect::<Vec<_>>();
+        let decor_boxes = voxel_collision_boxes_from_positions(
+            decor_positions.clone(),
+            1,
+            MAX_STATIC_VOXEL_COLLIDER_BOXES,
+        );
+        let detail_positions = voxel_planet_detail_preview_blocks()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let detail_boxes = voxel_collision_boxes_from_positions(
+            detail_positions.clone(),
+            VOXEL_PLANET_DETAIL_PREVIEW_BLOCK,
+            MAX_STATIC_VOXEL_COLLIDER_BOXES,
+        );
+
+        assert!(!decor_boxes.is_empty());
+        assert!(decor_boxes.len() < decor_positions.len());
+        assert!(!detail_boxes.is_empty());
+        assert!(detail_boxes.len() <= MAX_STATIC_VOXEL_COLLIDER_BOXES);
+        assert!(detail_boxes.len() <= detail_positions.len());
+    }
+
+    #[test]
     fn voxel_planet_far_preview_hides_before_detail_preview() {
         assert!(VOXEL_PLANET_PREVIEW_HIDE_ALTITUDE > VOXEL_PLANET_DETAIL_PREVIEW_BLOCK as f32);
         assert!(VOXEL_PLANET_DETAIL_PREVIEW_RADIUS < VOXEL_PLANET_PREVIEW_HIDE_ALTITUDE as i32);
@@ -6352,6 +8807,219 @@ mod tests {
             .values()
             .any(|state| state.voxel == PersistedVoxel::Solid(MAT_ENGINE_RED)));
         assert!(index.contains_key(&IVec3::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn procedural_battle_spaceship_generates_physics_assembly() {
+        let voxels = procedural_battle_spaceship_voxels();
+        let assembly = battle_spaceship_physics_assembly(&voxels).unwrap();
+
+        assert!(voxels.len() > 2_000);
+        assert!(voxels.len() < 50_000);
+        assert!(voxels.values().any(|material| *material == MAT_ENGINE_RED));
+        assert!(assembly.mass > 30_000.0);
+        assert!(assembly.local_center_of_mass.is_finite());
+        assert!(assembly.angular_inertia.cmpgt(Vec3::ZERO).all());
+        assert!(assembly.propellers.len() >= 3);
+        assert!(assembly
+            .propellers
+            .iter()
+            .all(|propeller| propeller.airflow_speed > 0.0 && propeller.airflow_radius > 0.0));
+        assert!(assembly.lift_points.len() >= 4);
+        assert!(assembly.total_lift_strength > 0.0);
+        assert!(assembly.bounds_min.x <= -200.0);
+        assert!(assembly.bounds_max.z >= 450.0);
+    }
+
+    #[test]
+    fn battle_spaceship_propeller_acceleration_uses_sail_power_curve() {
+        let one_sail = battle_spaceship_propeller_acceleration(1.0, 1.0);
+        let four_sails = battle_spaceship_propeller_acceleration(4.0, 1.0);
+        let reverse = battle_spaceship_propeller_acceleration(4.0, -1.0);
+
+        assert!(one_sail > 0.0);
+        assert!((four_sails / one_sail - 8.0).abs() < 0.001);
+        assert!((reverse + four_sails).abs() < 0.001);
+    }
+
+    #[test]
+    fn battle_spaceship_airflow_range_grows_logarithmically() {
+        let low = battle_spaceship_airflow_range(20.0);
+        let high = battle_spaceship_airflow_range(80.0);
+        let reverse = battle_spaceship_airflow_range(-80.0);
+
+        assert!(low > 0.0);
+        assert!(high > low);
+        assert!(high < low * 3.0);
+        assert!((reverse + high).abs() < 0.001);
+    }
+
+    #[test]
+    fn battle_spaceship_airflow_pushes_only_inside_propeller_column() {
+        let pushed = battle_spaceship_airflow_delta_velocity(
+            Vec3::new(0.0, 0.0, 60.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::Z,
+            60.0,
+            25.0,
+            1.0,
+            1.0,
+            1.0 / 60.0,
+        );
+        let outside_radius = battle_spaceship_airflow_delta_velocity(
+            Vec3::new(30.0, 0.0, 60.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::Z,
+            60.0,
+            25.0,
+            1.0,
+            1.0,
+            1.0 / 60.0,
+        );
+        let behind = battle_spaceship_airflow_delta_velocity(
+            Vec3::new(0.0, 0.0, -4.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::Z,
+            60.0,
+            25.0,
+            1.0,
+            1.0,
+            1.0 / 60.0,
+        );
+        let reverse = battle_spaceship_airflow_delta_velocity(
+            Vec3::new(0.0, 0.0, -60.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::Z,
+            60.0,
+            25.0,
+            -1.0,
+            1.0,
+            1.0 / 60.0,
+        );
+
+        assert!(pushed.z > 0.0);
+        assert_eq!(outside_radius, Vec3::ZERO);
+        assert_eq!(behind, Vec3::ZERO);
+        assert!(reverse.z < 0.0);
+    }
+
+    #[test]
+    fn battle_spaceship_disassembly_requires_slow_aligned_ship() {
+        assert_eq!(
+            battle_spaceship_disassembly_status(Quat::IDENTITY, Vec3::ZERO, Vec3::ZERO),
+            BattleSpaceshipDisassemblyStatus::Ready
+        );
+        assert_eq!(
+            battle_spaceship_disassembly_status(
+                Quat::IDENTITY,
+                Vec3::X * (BATTLE_SPACESHIP_DISASSEMBLE_MAX_SPEED + 0.1),
+                Vec3::ZERO,
+            ),
+            BattleSpaceshipDisassemblyStatus::TooFast
+        );
+        assert_eq!(
+            battle_spaceship_disassembly_status(
+                Quat::IDENTITY,
+                Vec3::ZERO,
+                Vec3::Y * (BATTLE_SPACESHIP_DISASSEMBLE_MAX_ANGULAR_SPEED + 0.1),
+            ),
+            BattleSpaceshipDisassemblyStatus::TooFast
+        );
+        assert_eq!(
+            battle_spaceship_disassembly_status(
+                Quat::from_rotation_x(
+                    (BATTLE_SPACESHIP_DISASSEMBLE_MAX_ROTATION_DEGREES + 2.0).to_radians(),
+                ),
+                Vec3::ZERO,
+                Vec3::ZERO,
+            ),
+            BattleSpaceshipDisassemblyStatus::TooTilted
+        );
+    }
+
+    #[test]
+    fn battle_spaceship_disassembly_target_snaps_to_grid_and_cardinal_yaw() {
+        let rotation = Quat::from_euler(
+            EulerRot::YXZ,
+            100.0_f32.to_radians(),
+            12.0_f32.to_radians(),
+            -8.0_f32.to_radians(),
+        );
+        let target_rotation = battle_spaceship_disassembly_target_rotation(rotation);
+        let (target_yaw, target_pitch, target_roll) = target_rotation.to_euler(EulerRot::YXZ);
+
+        assert!((target_yaw.to_degrees() - 90.0).abs() < 0.001);
+        assert!(target_pitch.abs() < 0.001);
+        assert!(target_roll.abs() < 0.001);
+
+        let translation = Vec3::new(12.0, 24.0, -9.0);
+        let local_center = Vec3::new(3.25, 4.5, -7.75);
+        let target_translation = battle_spaceship_disassembly_target_translation(
+            translation,
+            rotation,
+            target_rotation,
+            local_center,
+        );
+        let current_center = translation + rotation * local_center;
+        let target_center = target_translation + target_rotation * local_center;
+        let grid = BATTLE_SPACESHIP_SCALE as f32;
+
+        assert!(
+            (target_center.x - battle_spaceship_nearest_grid_center(current_center.x, grid)).abs()
+                < 0.001
+        );
+        assert!(
+            (target_center.y - battle_spaceship_nearest_grid_center(current_center.y, grid)).abs()
+                < 0.001
+        );
+        assert!(
+            (target_center.z - battle_spaceship_nearest_grid_center(current_center.z, grid)).abs()
+                < 0.001
+        );
+    }
+
+    #[test]
+    fn battle_spaceship_alignment_steps_are_bounded_and_settle() {
+        let target_translation = Vec3::new(10.0, 0.0, 0.0);
+        assert_eq!(
+            battle_spaceship_move_towards(Vec3::ZERO, target_translation, 3.0),
+            Vec3::new(3.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            battle_spaceship_move_towards(
+                Vec3::new(9.0, 0.0, 0.0),
+                target_translation,
+                3.0
+            ),
+            target_translation
+        );
+
+        let target_rotation = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let half_step = battle_spaceship_rotate_towards(
+            Quat::IDENTITY,
+            target_rotation,
+            std::f32::consts::FRAC_PI_4,
+        );
+        assert!(
+            (half_step.angle_between(Quat::from_rotation_y(
+                std::f32::consts::FRAC_PI_4
+            )))
+            .to_degrees()
+            .abs()
+                < 0.001
+        );
+        assert_eq!(
+            battle_spaceship_rotate_towards(
+                half_step,
+                target_rotation,
+                std::f32::consts::FRAC_PI_2,
+            ),
+            target_rotation
+        );
     }
 
     #[test]
@@ -6483,6 +9151,29 @@ mod tests {
                 image_source: "portrait.png".to_owned(),
                 translation: [3.0, 2.0, 1.0],
                 rotation: [0.0, 0.0, 0.0, 1.0],
+                visibility: SceneVisibility::Player(2),
+            }],
+            unit_scene_tokens: vec![PersistedUnitSceneToken {
+                token_id: "unit-token:unit-a".to_owned(),
+                unit_id: "unit-a".to_owned(),
+                label: "巡逻兵".to_owned(),
+                translation: [6.0, UNIT_SCENE_TOKEN_Y, -3.0],
+                visibility: SceneVisibility::Party("red".to_owned()),
+            }],
+            legacy_area_markers: vec![PersistedLegacyAreaMarker {
+                marker_id: "legacy-area:旧团:world-a:area-a".to_owned(),
+                group_name: "旧团".to_owned(),
+                world_id: "world-a".to_owned(),
+                world_name: "旧世界".to_owned(),
+                area_id: "area-a".to_owned(),
+                area_name: "密谈区".to_owned(),
+                combat: true,
+                members: vec!["2".to_owned()],
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 4.0,
+                visibility: SceneVisibility::Party("red".to_owned()),
             }],
         };
 
@@ -6518,6 +9209,26 @@ mod tests {
         assert_eq!(
             export.store.character_standees[0].image_source,
             "portrait.png"
+        );
+        assert_eq!(
+            export.store.character_standees[0].visibility,
+            SceneVisibility::Player(2)
+        );
+        assert_eq!(
+            export.store.unit_scene_tokens[0].token_id,
+            "unit-token:unit-a"
+        );
+        assert_eq!(
+            export.store.unit_scene_tokens[0].visibility,
+            SceneVisibility::Party("red".to_owned())
+        );
+        assert_eq!(
+            export.store.legacy_area_markers[0].marker_id,
+            "legacy-area:旧团:world-a:area-a"
+        );
+        assert_eq!(
+            export.store.legacy_area_markers[0].visibility,
+            SceneVisibility::Party("red".to_owned())
         );
     }
 
@@ -6570,6 +9281,29 @@ mod tests {
                 image_source: "imported.png".to_owned(),
                 translation: [3.0, 2.0, 1.0],
                 rotation: [0.0, 0.0, 0.0, 1.0],
+                visibility: SceneVisibility::Party("red".to_owned()),
+            }],
+            unit_scene_tokens: vec![PersistedUnitSceneToken {
+                token_id: "unit-token:unit-a".to_owned(),
+                unit_id: "unit-a".to_owned(),
+                label: "导入巡逻兵".to_owned(),
+                translation: [6.0, UNIT_SCENE_TOKEN_Y, -3.0],
+                visibility: SceneVisibility::Gm,
+            }],
+            legacy_area_markers: vec![PersistedLegacyAreaMarker {
+                marker_id: "legacy-area:旧团:world-a:area-a".to_owned(),
+                group_name: "旧团".to_owned(),
+                world_id: "world-a".to_owned(),
+                world_name: "导入世界".to_owned(),
+                area_id: "area-a".to_owned(),
+                area_name: "导入密谈区".to_owned(),
+                combat: true,
+                members: vec!["2".to_owned(), "3".to_owned()],
+                x: 11.0,
+                y: 12.0,
+                width: 13.0,
+                height: 14.0,
+                visibility: SceneVisibility::Gm,
             }],
         };
         let json = source.to_export_json().unwrap();
@@ -6618,12 +9352,62 @@ mod tests {
                     image_source: "old.png".to_owned(),
                     translation: [0.0, 0.0, 0.0],
                     rotation: [0.0, 0.0, 0.0, 1.0],
+                    visibility: SceneVisibility::Public,
                 },
                 PersistedCharacterStandee {
                     target_id: "9".to_owned(),
                     image_source: "local.png".to_owned(),
                     translation: [1.0, 1.0, 1.0],
                     rotation: [0.0, 0.0, 0.0, 1.0],
+                    visibility: SceneVisibility::Gm,
+                },
+            ],
+            unit_scene_tokens: vec![
+                PersistedUnitSceneToken {
+                    token_id: "unit-token:unit-a".to_owned(),
+                    unit_id: "unit-a".to_owned(),
+                    label: "本地巡逻兵".to_owned(),
+                    translation: [0.0, UNIT_SCENE_TOKEN_Y, -3.0],
+                    visibility: SceneVisibility::Public,
+                },
+                PersistedUnitSceneToken {
+                    token_id: "unit-token:unit-b".to_owned(),
+                    unit_id: "unit-b".to_owned(),
+                    label: "本地守卫".to_owned(),
+                    translation: [1.0, UNIT_SCENE_TOKEN_Y, -3.0],
+                    visibility: SceneVisibility::Public,
+                },
+            ],
+            legacy_area_markers: vec![
+                PersistedLegacyAreaMarker {
+                    marker_id: "legacy-area:旧团:world-a:area-a".to_owned(),
+                    group_name: "旧团".to_owned(),
+                    world_id: "world-a".to_owned(),
+                    world_name: "本地世界".to_owned(),
+                    area_id: "area-a".to_owned(),
+                    area_name: "本地密谈区".to_owned(),
+                    combat: false,
+                    members: vec!["9".to_owned()],
+                    x: 1.0,
+                    y: 1.0,
+                    width: 1.0,
+                    height: 1.0,
+                    visibility: SceneVisibility::Public,
+                },
+                PersistedLegacyAreaMarker {
+                    marker_id: "legacy-area:旧团:world-b:area-b".to_owned(),
+                    group_name: "旧团".to_owned(),
+                    world_id: "world-b".to_owned(),
+                    world_name: "本地世界B".to_owned(),
+                    area_id: "area-b".to_owned(),
+                    area_name: "本地区域B".to_owned(),
+                    combat: false,
+                    members: Vec::new(),
+                    x: 2.0,
+                    y: 2.0,
+                    width: 2.0,
+                    height: 2.0,
+                    visibility: SceneVisibility::Public,
                 },
             ],
             ..Default::default()
@@ -6682,10 +9466,52 @@ mod tests {
                 .image_source,
             "imported.png"
         );
+        assert_eq!(
+            store
+                .character_standees
+                .iter()
+                .find(|standee| standee.target_id == "2")
+                .unwrap()
+                .visibility,
+            SceneVisibility::Party("red".to_owned())
+        );
         assert!(store
             .character_standees
             .iter()
             .any(|standee| standee.target_id == "9"));
+        let imported_token = store
+            .unit_scene_tokens
+            .iter()
+            .find(|token| token.token_id == "unit-token:unit-a")
+            .unwrap();
+        assert_eq!(imported_token.label, "导入巡逻兵");
+        assert_eq!(
+            imported_token.visibility,
+            SceneVisibility::Gm
+        );
+        assert!(store
+            .unit_scene_tokens
+            .iter()
+            .any(|token| token.token_id == "unit-token:unit-b"));
+        let imported_marker = store
+            .legacy_area_markers
+            .iter()
+            .find(|marker| marker.marker_id == "legacy-area:旧团:world-a:area-a")
+            .unwrap();
+        assert_eq!(imported_marker.world_name, "导入世界");
+        assert_eq!(imported_marker.area_name, "导入密谈区");
+        assert_eq!(imported_marker.members, vec![
+            "2".to_owned(),
+            "3".to_owned()
+        ]);
+        assert_eq!(
+            imported_marker.visibility,
+            SceneVisibility::Gm
+        );
+        assert!(store
+            .legacy_area_markers
+            .iter()
+            .any(|marker| marker.marker_id == "legacy-area:旧团:world-b:area-b"));
     }
 
     #[test]
@@ -6705,6 +9531,835 @@ mod tests {
 
         assert!(error.contains("unsupported voxel scene export type"));
         assert!(store.maps.is_empty());
+    }
+
+    #[test]
+    fn unit_template_standee_helpers_place_update_and_remove_scene_standee() {
+        let mut store = VoxelSceneStore::default();
+
+        assert!(place_unit_template_standee(
+            &mut store,
+            "unit-alpha",
+            "unit-alpha.png"
+        )
+        .unwrap());
+        assert!(has_unit_template_standee(
+            &store,
+            "unit-alpha"
+        ));
+        assert_eq!(store.character_standees.len(), 1);
+        assert_eq!(
+            store.character_standees[0].target_id,
+            unit_template_standee_target_id("unit-alpha")
+        );
+        assert_eq!(
+            store.character_standees[0].image_source,
+            "unit-alpha.png"
+        );
+        assert_eq!(
+            store.character_standees[0].visibility,
+            SceneVisibility::Public
+        );
+
+        assert!(!place_unit_template_standee(
+            &mut store,
+            "unit-alpha",
+            "unit-alpha.png"
+        )
+        .unwrap());
+        assert_eq!(store.character_standees.len(), 1);
+        assert!(place_unit_template_standee(
+            &mut store,
+            "unit-alpha",
+            "unit-alpha-v2.png"
+        )
+        .unwrap());
+        assert_eq!(
+            store.character_standees[0].image_source,
+            "unit-alpha-v2.png"
+        );
+
+        assert!(remove_unit_template_standee(
+            &mut store,
+            "unit-alpha"
+        ));
+        assert!(!has_unit_template_standee(
+            &store,
+            "unit-alpha"
+        ));
+        assert!(store.character_standees.is_empty());
+    }
+
+    #[test]
+    fn unit_template_token_helpers_place_update_and_remove_scene_token() {
+        let mut store = VoxelSceneStore::default();
+
+        assert!(place_unit_template_token(&mut store, " unit-alpha ", "巡逻兵").unwrap());
+        assert!(has_unit_template_token(
+            &store,
+            "unit-alpha"
+        ));
+        assert_eq!(store.unit_scene_tokens.len(), 1);
+        assert_eq!(
+            store.unit_scene_tokens[0].token_id,
+            unit_template_token_id("unit-alpha")
+        );
+        assert_eq!(
+            store.unit_scene_tokens[0].unit_id,
+            "unit-alpha"
+        );
+        assert_eq!(
+            store.unit_scene_tokens[0].label,
+            "巡逻兵"
+        );
+        assert_eq!(
+            store.unit_scene_tokens[0].translation,
+            [0.0, UNIT_SCENE_TOKEN_Y, -3.0]
+        );
+        assert_eq!(
+            store.unit_scene_tokens[0].visibility,
+            SceneVisibility::Public
+        );
+
+        assert!(!place_unit_template_token(&mut store, "unit-alpha", "巡逻兵").unwrap());
+        let original_translation = store.unit_scene_tokens[0].translation;
+        store.unit_scene_tokens[0].visibility = SceneVisibility::Gm;
+
+        assert!(place_unit_template_token(&mut store, "unit-alpha", "精英巡逻兵").unwrap());
+        assert_eq!(store.unit_scene_tokens.len(), 1);
+        assert_eq!(
+            store.unit_scene_tokens[0].label,
+            "精英巡逻兵"
+        );
+        assert_eq!(
+            store.unit_scene_tokens[0].translation,
+            original_translation
+        );
+        assert_eq!(
+            store.unit_scene_tokens[0].visibility,
+            SceneVisibility::Gm
+        );
+
+        assert!(remove_unit_template_token(
+            &mut store,
+            "unit-alpha"
+        ));
+        assert!(!has_unit_template_token(
+            &store,
+            "unit-alpha"
+        ));
+        assert!(store.unit_scene_tokens.is_empty());
+    }
+
+    #[test]
+    fn legacy_world_and_area_unit_tokens_use_scoped_ids_and_visibility() {
+        let mut store = VoxelSceneStore::default();
+
+        assert!(place_legacy_world_unit_token(
+            &mut store,
+            "旧团",
+            "world-a",
+            "旧世界",
+            "unit-old",
+            "行尸",
+            false,
+        )
+        .unwrap());
+        assert!(place_legacy_area_unit_token(
+            &mut store,
+            "旧团",
+            "world-a",
+            "area-a",
+            "密谈区",
+            "unit-old",
+            "行尸",
+            10.0,
+            20.0,
+            30.0,
+            40.0,
+            true,
+            1,
+        )
+        .unwrap());
+
+        assert_eq!(store.unit_scene_tokens.len(), 2);
+        let world_token = store
+            .unit_scene_tokens
+            .iter()
+            .find(|token| {
+                token.token_id == legacy_world_unit_token_id("旧团", "world-a", "unit-old")
+            })
+            .unwrap();
+        assert_eq!(world_token.unit_id, "unit-old");
+        assert_eq!(world_token.label, "旧世界/行尸");
+        assert_eq!(
+            world_token.visibility,
+            SceneVisibility::Gm
+        );
+
+        let area_token = store
+            .unit_scene_tokens
+            .iter()
+            .find(|token| {
+                token.token_id == legacy_area_unit_token_id("旧团", "world-a", "area-a", "unit-old")
+            })
+            .unwrap();
+        assert_eq!(area_token.unit_id, "unit-old");
+        assert_eq!(area_token.label, "密谈区/行尸");
+        assert_eq!(
+            area_token.visibility,
+            SceneVisibility::Public
+        );
+        assert_eq!(area_token.translation, [
+            2.5 - UNIT_SCENE_TOKEN_SPACING * 0.25,
+            UNIT_SCENE_TOKEN_Y,
+            4.0,
+        ]);
+
+        let original_translation = store
+            .unit_scene_tokens
+            .iter()
+            .find(|token| {
+                token.token_id == legacy_area_unit_token_id("旧团", "world-a", "area-a", "unit-old")
+            })
+            .unwrap()
+            .translation;
+        assert!(place_legacy_area_unit_token(
+            &mut store,
+            "旧团",
+            "world-a",
+            "area-a",
+            "密谈区",
+            "unit-old",
+            "精英行尸",
+            10.0,
+            20.0,
+            30.0,
+            40.0,
+            false,
+            3,
+        )
+        .unwrap());
+        let updated_area_token = store
+            .unit_scene_tokens
+            .iter()
+            .find(|token| {
+                token.token_id == legacy_area_unit_token_id("旧团", "world-a", "area-a", "unit-old")
+            })
+            .unwrap();
+        assert_eq!(
+            updated_area_token.label,
+            "密谈区/精英行尸"
+        );
+        assert_eq!(
+            updated_area_token.translation,
+            original_translation
+        );
+        assert_eq!(
+            updated_area_token.visibility,
+            SceneVisibility::Public
+        );
+
+        assert!(place_legacy_world_unit_token(
+            &mut store,
+            "旧团",
+            "world-a",
+            "旧世界",
+            "stale-world",
+            "旧世界多余单位",
+            true,
+        )
+        .unwrap());
+        assert!(place_legacy_area_unit_token(
+            &mut store,
+            "旧团",
+            "world-a",
+            "area-a",
+            "密谈区",
+            "stale-area",
+            "密谈区多余单位",
+            10.0,
+            20.0,
+            30.0,
+            40.0,
+            true,
+            2,
+        )
+        .unwrap());
+        assert!(place_legacy_world_unit_token(
+            &mut store,
+            "旧团",
+            "world-b",
+            "另一个世界",
+            "other-world",
+            "其他世界单位",
+            true,
+        )
+        .unwrap());
+        assert!(place_unit_template_token(&mut store, "generic", "通用标记").unwrap());
+
+        assert_eq!(
+            prune_legacy_world_unit_tokens(&mut store, "旧团", "world-a", &[
+                "unit-old".to_owned()
+            ],),
+            1
+        );
+        assert!(!store
+            .unit_scene_tokens
+            .iter()
+            .any(|token| token.token_id
+                == legacy_world_unit_token_id("旧团", "world-a", "stale-world")));
+        assert!(store
+            .unit_scene_tokens
+            .iter()
+            .any(|token| token.token_id
+                == legacy_world_unit_token_id("旧团", "world-b", "other-world")));
+        assert!(store
+            .unit_scene_tokens
+            .iter()
+            .any(|token| token.token_id == unit_template_token_id("generic")));
+
+        assert_eq!(
+            prune_legacy_area_unit_tokens(
+                &mut store,
+                "旧团",
+                "world-a",
+                "area-a",
+                &["unit-old".to_owned()],
+            ),
+            1
+        );
+        assert!(
+            !store.unit_scene_tokens.iter().any(|token| token.token_id
+                == legacy_area_unit_token_id(
+                    "旧团",
+                    "world-a",
+                    "area-a",
+                    "stale-area"
+                ))
+        );
+
+        assert_eq!(
+            remove_legacy_area_unit_tokens(&mut store, "旧团", "world-a", "area-a"),
+            1
+        );
+        assert!(
+            !store.unit_scene_tokens.iter().any(|token| token.token_id
+                == legacy_area_unit_token_id("旧团", "world-a", "area-a", "unit-old"))
+        );
+        assert_eq!(
+            remove_legacy_world_unit_tokens(&mut store, "旧团", "world-a"),
+            1
+        );
+        assert!(!store.unit_scene_tokens.iter().any(
+            |token| token.token_id == legacy_world_unit_token_id("旧团", "world-a", "unit-old")
+        ));
+        assert_eq!(
+            remove_legacy_world_unit_tokens(&mut store, "旧团", "world-a"),
+            0
+        );
+    }
+
+    #[test]
+    fn unit_scene_token_state_update_changes_position_and_visibility() {
+        let mut store = VoxelSceneStore::default();
+        place_unit_template_token(&mut store, "unit-alpha", "巡逻兵").unwrap();
+
+        assert!(update_unit_scene_token_state(
+            &mut store,
+            &unit_template_token_id("unit-alpha"),
+            [1.0, 2.0, 3.0],
+            SceneVisibility::Party("red".to_owned()),
+        ));
+        assert_eq!(
+            store.unit_scene_tokens[0].translation,
+            [1.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            store.unit_scene_tokens[0].visibility,
+            SceneVisibility::Party("red".to_owned())
+        );
+
+        assert!(!update_unit_scene_token_state(
+            &mut store,
+            &unit_template_token_id("unit-alpha"),
+            [1.0, 2.0, 3.0],
+            SceneVisibility::Party("red".to_owned()),
+        ));
+        assert!(!update_unit_scene_token_state(
+            &mut store,
+            "unit-token:missing",
+            [4.0, 5.0, 6.0],
+            SceneVisibility::Gm,
+        ));
+    }
+
+    #[test]
+    fn legacy_area_marker_helpers_place_update_and_remove_scene_marker() {
+        let mut store = VoxelSceneStore::default();
+        let members = vec!["3".to_owned(), "2".to_owned(), "2".to_owned()];
+
+        assert!(place_legacy_area_marker(
+            &mut store,
+            "旧团",
+            "world-a",
+            "旧世界",
+            "area-a",
+            "密谈区",
+            true,
+            &members,
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            false,
+        )
+        .unwrap());
+        assert!(has_legacy_area_marker(
+            &store, "旧团", "world-a", "area-a"
+        ));
+        assert_eq!(store.legacy_area_markers.len(), 1);
+        assert_eq!(
+            store.legacy_area_markers[0].marker_id,
+            legacy_area_marker_id("旧团", "world-a", "area-a")
+        );
+        assert_eq!(
+            store.legacy_area_markers[0].members,
+            vec!["2".to_owned(), "3".to_owned()]
+        );
+        assert_eq!(
+            store.legacy_area_markers[0].visibility,
+            SceneVisibility::Gm
+        );
+
+        assert!(!place_legacy_area_marker(
+            &mut store,
+            "旧团",
+            "world-a",
+            "旧世界",
+            "area-a",
+            "密谈区",
+            true,
+            &members,
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            false,
+        )
+        .unwrap());
+
+        assert!(place_legacy_area_marker(
+            &mut store,
+            "旧团",
+            "world-a",
+            "旧世界",
+            "area-a",
+            "公开区",
+            false,
+            &members,
+            5.0,
+            6.0,
+            7.0,
+            8.0,
+            true,
+        )
+        .unwrap());
+        assert_eq!(store.legacy_area_markers.len(), 1);
+        assert_eq!(
+            store.legacy_area_markers[0].area_name,
+            "公开区"
+        );
+        assert_eq!(
+            store.legacy_area_markers[0].visibility,
+            SceneVisibility::Public
+        );
+
+        assert!(remove_legacy_area_marker(
+            &mut store, "旧团", "world-a", "area-a"
+        ));
+        assert!(!has_legacy_area_marker(
+            &store, "旧团", "world-a", "area-a"
+        ));
+    }
+
+    #[test]
+    fn legacy_area_marker_voxel_outline_writes_visible_border_to_active_map() {
+        let mut store = VoxelSceneStore {
+            active_map_id: Some("legacy-map".to_owned()),
+            maps: vec![PersistedVoxelMap {
+                id: "legacy-map".to_owned(),
+                name: "旧区域地图".to_owned(),
+                edits: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        place_legacy_area_marker(
+            &mut store,
+            "旧团",
+            "world-a",
+            "旧世界",
+            "area-a",
+            "战斗区",
+            true,
+            &[],
+            10.0,
+            20.0,
+            30.0,
+            40.0,
+            false,
+        )
+        .unwrap();
+
+        let count = stamp_legacy_area_marker_voxel_outline(&mut store, "旧团", "world-a", "area-a")
+            .unwrap();
+
+        assert_eq!(count, 14);
+        let map = active_voxel_map(&store).unwrap();
+        assert_eq!(map.id, "legacy-map");
+        assert_eq!(map.edits.len(), 14);
+        assert!(map
+            .edits
+            .iter()
+            .any(|edit| edit.position == [1, LEGACY_AREA_MARKER_VOXEL_Y, 2]));
+        assert!(map
+            .edits
+            .iter()
+            .any(|edit| edit.position == [4, LEGACY_AREA_MARKER_VOXEL_Y, 6]));
+        assert!(!map
+            .edits
+            .iter()
+            .any(|edit| edit.position == [2, LEGACY_AREA_MARKER_VOXEL_Y, 3]));
+        assert!(map
+            .edits
+            .iter()
+            .all(|edit| edit.voxel == PersistedVoxel::Solid(MAT_ENGINE_RED)));
+        assert!(map
+            .edits
+            .iter()
+            .all(|edit| edit.visibility == SceneVisibility::Gm));
+    }
+
+    #[test]
+    fn legacy_area_marker_voxel_fill_writes_visible_area_to_active_map() {
+        let mut store = VoxelSceneStore {
+            active_map_id: Some("legacy-map".to_owned()),
+            maps: vec![PersistedVoxelMap {
+                id: "legacy-map".to_owned(),
+                name: "旧区域地图".to_owned(),
+                edits: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        place_legacy_area_marker(
+            &mut store,
+            "旧团",
+            "world-a",
+            "旧世界",
+            "area-a",
+            "讨论区",
+            false,
+            &[],
+            10.0,
+            20.0,
+            30.0,
+            40.0,
+            true,
+        )
+        .unwrap();
+
+        let count =
+            stamp_legacy_area_marker_voxel_fill(&mut store, "旧团", "world-a", "area-a").unwrap();
+
+        assert_eq!(count, 20);
+        let map = active_voxel_map(&store).unwrap();
+        assert_eq!(map.id, "legacy-map");
+        assert_eq!(map.edits.len(), 20);
+        assert!(map
+            .edits
+            .iter()
+            .any(|edit| edit.position == [1, LEGACY_AREA_MARKER_VOXEL_Y, 2]));
+        assert!(map
+            .edits
+            .iter()
+            .any(|edit| edit.position == [2, LEGACY_AREA_MARKER_VOXEL_Y, 3]));
+        assert!(map
+            .edits
+            .iter()
+            .any(|edit| edit.position == [4, LEGACY_AREA_MARKER_VOXEL_Y, 6]));
+        assert!(map
+            .edits
+            .iter()
+            .all(|edit| edit.voxel == PersistedVoxel::Solid(MAT_WINDOW_CYAN)));
+        assert!(map
+            .edits
+            .iter()
+            .all(|edit| edit.visibility == SceneVisibility::Public));
+    }
+
+    #[test]
+    fn legacy_area_marker_voxel_fill_rejects_oversized_old_area() {
+        let mut store = VoxelSceneStore {
+            active_map_id: Some("legacy-map".to_owned()),
+            maps: vec![PersistedVoxelMap {
+                id: "legacy-map".to_owned(),
+                name: "旧区域地图".to_owned(),
+                edits: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        place_legacy_area_marker(
+            &mut store,
+            "旧团",
+            "world-a",
+            "旧世界",
+            "area-a",
+            "超大区域",
+            true,
+            &[],
+            0.0,
+            0.0,
+            10_000.0,
+            10_000.0,
+            false,
+        )
+        .unwrap();
+
+        let err = stamp_legacy_area_marker_voxel_fill(&mut store, "旧团", "world-a", "area-a")
+            .unwrap_err();
+
+        assert!(err.contains("超过上限"));
+        assert!(active_voxel_map(&store).unwrap().edits.is_empty());
+    }
+
+    #[test]
+    fn legacy_area_marker_visibility_uses_player_access_scope() {
+        let public_marker = PersistedLegacyAreaMarker {
+            marker_id: "legacy-area:旧团:world-a:public".to_owned(),
+            group_name: "旧团".to_owned(),
+            world_id: "world-a".to_owned(),
+            world_name: "旧世界".to_owned(),
+            area_id: "public".to_owned(),
+            area_name: "公开区".to_owned(),
+            visibility: SceneVisibility::Public,
+            ..legacy_area_marker_for_test()
+        };
+        let red_marker = PersistedLegacyAreaMarker {
+            marker_id: "legacy-area:旧团:world-a:red".to_owned(),
+            area_id: "red".to_owned(),
+            area_name: "红队区".to_owned(),
+            visibility: SceneVisibility::Party("red".to_owned()),
+            ..legacy_area_marker_for_test()
+        };
+        let gm_marker = PersistedLegacyAreaMarker {
+            marker_id: "legacy-area:旧团:world-a:gm".to_owned(),
+            area_id: "gm".to_owned(),
+            area_name: "GM区".to_owned(),
+            visibility: SceneVisibility::Gm,
+            ..legacy_area_marker_for_test()
+        };
+        let red_access = PlayerAccess {
+            player_id: 2,
+            party_id: Some("red".to_owned()),
+            character_id: None,
+            is_gm: false,
+        };
+        let blue_access = PlayerAccess {
+            player_id: 3,
+            party_id: Some("blue".to_owned()),
+            character_id: None,
+            is_gm: false,
+        };
+        let gm_access = PlayerAccess {
+            player_id: 9,
+            party_id: None,
+            character_id: None,
+            is_gm: true,
+        };
+
+        assert!(legacy_area_marker_visible_for_access(
+            &public_marker,
+            Some(&blue_access)
+        ));
+        assert!(legacy_area_marker_visible_for_access(
+            &red_marker,
+            Some(&red_access)
+        ));
+        assert!(!legacy_area_marker_visible_for_access(
+            &red_marker,
+            Some(&blue_access)
+        ));
+        assert!(!legacy_area_marker_visible_for_access(
+            &gm_marker,
+            Some(&red_access)
+        ));
+        assert!(legacy_area_marker_visible_for_access(
+            &gm_marker,
+            Some(&gm_access)
+        ));
+        assert!(legacy_area_marker_visible_for_access(
+            &gm_marker, None
+        ));
+    }
+
+    #[test]
+    fn unit_scene_token_visibility_uses_player_access_scope() {
+        let public_token = PersistedUnitSceneToken {
+            token_id: "unit-token:public".to_owned(),
+            unit_id: "public".to_owned(),
+            label: "公开单位".to_owned(),
+            translation: [0.0, UNIT_SCENE_TOKEN_Y, -3.0],
+            visibility: SceneVisibility::Public,
+        };
+        let red_token = PersistedUnitSceneToken {
+            token_id: "unit-token:red".to_owned(),
+            unit_id: "red".to_owned(),
+            label: "红队单位".to_owned(),
+            translation: [0.0, UNIT_SCENE_TOKEN_Y, -3.0],
+            visibility: SceneVisibility::Party("red".to_owned()),
+        };
+        let player_token = PersistedUnitSceneToken {
+            token_id: "unit-token:player".to_owned(),
+            unit_id: "player".to_owned(),
+            label: "私有单位".to_owned(),
+            translation: [0.0, UNIT_SCENE_TOKEN_Y, -3.0],
+            visibility: SceneVisibility::Player(2),
+        };
+        let gm_token = PersistedUnitSceneToken {
+            token_id: "unit-token:gm".to_owned(),
+            unit_id: "gm".to_owned(),
+            label: "GM单位".to_owned(),
+            translation: [0.0, UNIT_SCENE_TOKEN_Y, -3.0],
+            visibility: SceneVisibility::Gm,
+        };
+        let red_access = PlayerAccess {
+            player_id: 2,
+            party_id: Some("red".to_owned()),
+            character_id: None,
+            is_gm: false,
+        };
+        let blue_access = PlayerAccess {
+            player_id: 3,
+            party_id: Some("blue".to_owned()),
+            character_id: None,
+            is_gm: false,
+        };
+        let gm_access = PlayerAccess {
+            player_id: 9,
+            party_id: None,
+            character_id: None,
+            is_gm: true,
+        };
+
+        assert!(unit_scene_token_visible_for_access(
+            &public_token,
+            Some(&blue_access)
+        ));
+        assert!(unit_scene_token_visible_for_access(
+            &red_token,
+            Some(&red_access)
+        ));
+        assert!(!unit_scene_token_visible_for_access(
+            &red_token,
+            Some(&blue_access)
+        ));
+        assert!(unit_scene_token_visible_for_access(
+            &player_token,
+            Some(&red_access)
+        ));
+        assert!(!unit_scene_token_visible_for_access(
+            &player_token,
+            Some(&blue_access)
+        ));
+        assert!(!unit_scene_token_visible_for_access(
+            &gm_token,
+            Some(&red_access)
+        ));
+        assert!(unit_scene_token_visible_for_access(
+            &gm_token,
+            Some(&gm_access)
+        ));
+        assert!(unit_scene_token_visible_for_access(
+            &gm_token, None
+        ));
+    }
+
+    #[test]
+    fn legacy_area_marker_corners_map_old_rect_to_scene_xz_plane() {
+        let marker = PersistedLegacyAreaMarker {
+            x: 10.0,
+            y: 20.0,
+            width: 30.0,
+            height: 40.0,
+            ..legacy_area_marker_for_test()
+        };
+
+        assert_eq!(
+            legacy_area_marker_center(&marker),
+            Vec3::new(2.5, LEGACY_AREA_MARKER_Y, 4.0)
+        );
+        assert_eq!(legacy_area_marker_corners(&marker), [
+            Vec3::new(1.0, LEGACY_AREA_MARKER_Y, 2.0),
+            Vec3::new(4.0, LEGACY_AREA_MARKER_Y, 2.0),
+            Vec3::new(4.0, LEGACY_AREA_MARKER_Y, 6.0),
+            Vec3::new(1.0, LEGACY_AREA_MARKER_Y, 6.0),
+        ]);
+    }
+
+    fn legacy_area_marker_for_test() -> PersistedLegacyAreaMarker {
+        PersistedLegacyAreaMarker {
+            marker_id: "legacy-area:旧团:world-a:area-a".to_owned(),
+            group_name: "旧团".to_owned(),
+            world_id: "world-a".to_owned(),
+            world_name: "旧世界".to_owned(),
+            area_id: "area-a".to_owned(),
+            area_name: "密谈区".to_owned(),
+            combat: false,
+            members: Vec::new(),
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            visibility: SceneVisibility::Public,
+        }
+    }
+
+    #[test]
+    fn active_unit_template_standees_require_explicit_scene_placement() {
+        let mut manager = empty_manager();
+        let mut unit = crate::napcat::UnitPoolEntry::default();
+        unit.character.image = "unit.png".to_owned();
+        manager.unit_pool.insert("unit-a".to_owned(), unit);
+
+        let mut store = VoxelSceneStore::default();
+        assert!(active_unit_template_standee_targets(&manager, &store).is_empty());
+
+        assert!(place_unit_template_standee(&mut store, "unit-a", "unit.png").unwrap());
+        assert_eq!(
+            active_unit_template_standee_targets(&manager, &store),
+            vec![(
+                unit_template_standee_target_id("unit-a"),
+                "unit.png".to_owned()
+            )]
+        );
+
+        manager.unit_pool.get_mut("unit-a").unwrap().character.image = "unit-v2.png".to_owned();
+        assert_eq!(
+            active_unit_template_standee_targets(&manager, &store),
+            vec![(
+                unit_template_standee_target_id("unit-a"),
+                "unit-v2.png".to_owned()
+            )]
+        );
+
+        manager
+            .unit_pool
+            .get_mut("unit-a")
+            .unwrap()
+            .character
+            .image
+            .clear();
+        assert!(active_unit_template_standee_targets(&manager, &store).is_empty());
     }
 
     #[test]
@@ -6772,6 +10427,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_character_standee_deserializes_as_public_visibility() {
+        let standee = serde_json::from_value::<PersistedCharacterStandee>(serde_json::json!({
+            "target_id": "2",
+            "image_source": "portrait.png",
+            "translation": [1.0, 2.0, 3.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0]
+        }))
+        .expect("legacy persisted character standee should deserialize");
+
+        assert_eq!(
+            standee.visibility,
+            SceneVisibility::Public
+        );
+    }
+
+    #[test]
     fn scene_visibility_access_matches_party_player_and_gm_rules() {
         assert!(SceneVisibility::Public.can_read(2, None, false));
         assert!(SceneVisibility::Party("red".to_owned()).can_read(2, Some("red"), false));
@@ -6780,6 +10451,66 @@ mod tests {
         assert!(!SceneVisibility::Player(2).can_read(3, None, false));
         assert!(!SceneVisibility::Gm.can_read(2, Some("red"), false));
         assert!(SceneVisibility::Gm.can_read(9, None, true));
+    }
+
+    #[test]
+    fn scene_standee_visibility_uses_player_access() {
+        let red_access = PlayerAccess {
+            player_id: 2,
+            party_id: Some("red".to_owned()),
+            ..Default::default()
+        };
+        let blue_access = PlayerAccess {
+            player_id: 3,
+            party_id: Some("blue".to_owned()),
+            ..Default::default()
+        };
+        let gm_access = PlayerAccess {
+            player_id: 9,
+            is_gm: true,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            scene_standee_visibility_for_access(
+                &SceneVisibility::Public,
+                Some(&red_access)
+            ),
+            Visibility::Visible
+        ));
+        assert!(matches!(
+            scene_standee_visibility_for_access(
+                &SceneVisibility::Party("red".to_owned()),
+                Some(&red_access)
+            ),
+            Visibility::Visible
+        ));
+        assert!(matches!(
+            scene_standee_visibility_for_access(
+                &SceneVisibility::Party("red".to_owned()),
+                Some(&blue_access)
+            ),
+            Visibility::Hidden
+        ));
+        assert!(matches!(
+            scene_standee_visibility_for_access(
+                &SceneVisibility::Player(2),
+                Some(&blue_access)
+            ),
+            Visibility::Hidden
+        ));
+        assert!(matches!(
+            scene_standee_visibility_for_access(&SceneVisibility::Gm, Some(&red_access)),
+            Visibility::Hidden
+        ));
+        assert!(matches!(
+            scene_standee_visibility_for_access(&SceneVisibility::Gm, Some(&gm_access)),
+            Visibility::Visible
+        ));
+        assert!(matches!(
+            scene_standee_visibility_for_access(&SceneVisibility::Gm, None),
+            Visibility::Visible
+        ));
     }
 
     #[test]
@@ -6926,6 +10657,22 @@ mod tests {
     }
 
     #[test]
+    fn scene_player_view_request_distinguishes_filter_and_capture_modes() {
+        let mut request = ScenePlayerViewRequest::default();
+
+        request.filter_current_view(2);
+        assert_eq!(request.user_id, Some(2));
+        assert!(!request.use_capture_camera);
+
+        request.view_with_capture_camera(3);
+        assert_eq!(request.user_id, Some(3));
+        assert!(request.use_capture_camera);
+
+        request.restore_gm_view();
+        assert!(request.restore_gm_view);
+    }
+
+    #[test]
     fn voxel_edit_index_round_trips_without_duplicate_positions() {
         let edits = vec![
             PersistedVoxelEdit {
@@ -7059,6 +10806,7 @@ mod tests {
             &runtime,
             vec![IVec3::ZERO, IVec3::ZERO, IVec3::X],
             PersistedVoxel::Solid(MAT_WINDOW_CYAN),
+            SceneVisibility::Party("red".to_owned()),
         );
 
         assert_eq!(stroke.changes.len(), 2);
@@ -7069,11 +10817,47 @@ mod tests {
             .unwrap();
         assert_eq!(
             zero_change.before,
-            Some(PersistedVoxel::Solid(MAT_HULL_LIGHT))
+            Some(PersistedVoxelState::public(
+                PersistedVoxel::Solid(MAT_HULL_LIGHT)
+            ))
         );
         assert_eq!(
             zero_change.after,
-            Some(PersistedVoxel::Solid(MAT_WINDOW_CYAN))
+            Some(PersistedVoxelState {
+                voxel: PersistedVoxel::Solid(MAT_WINDOW_CYAN),
+                visibility: SceneVisibility::Party("red".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn voxel_edit_stroke_records_visibility_changes() {
+        let mut runtime = VoxelMapRuntimeState::default();
+        runtime.edit_index.insert(
+            IVec3::ZERO,
+            PersistedVoxelState::public(PersistedVoxel::Solid(MAT_HULL_LIGHT)),
+        );
+
+        let stroke = voxel_edit_stroke(
+            &runtime,
+            vec![IVec3::ZERO],
+            PersistedVoxel::Solid(MAT_HULL_LIGHT),
+            SceneVisibility::Player(2),
+        );
+
+        assert_eq!(stroke.changes.len(), 1);
+        assert_eq!(
+            stroke.changes[0].before,
+            Some(PersistedVoxelState::public(
+                PersistedVoxel::Solid(MAT_HULL_LIGHT)
+            ))
+        );
+        assert_eq!(
+            stroke.changes[0].after,
+            Some(PersistedVoxelState {
+                voxel: PersistedVoxel::Solid(MAT_HULL_LIGHT),
+                visibility: SceneVisibility::Player(2),
+            })
         );
     }
 

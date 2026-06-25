@@ -40,6 +40,7 @@ use serde::{
 };
 use serde_json::{
     json,
+    Map,
     Value,
 };
 use tokio::{
@@ -56,7 +57,18 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    rule_engine::BuffSpec,
+    moonberry_talents::{
+        MoonberryTalent,
+        NORMAL_TALENT_POOL,
+        SUPPORT_TALENT_POOL,
+    },
+    rule_engine::{
+        BuffEffect,
+        BuffField,
+        BuffKind,
+        BuffSpec,
+        BuffValue,
+    },
     scene::{
         SceneCaptureRequest,
         SceneCaptureRequests,
@@ -315,6 +327,21 @@ pub struct CharacterStatus {
     pub cha: i32,
 }
 
+impl CharacterStatus {
+    pub fn combined(&self, extra: &Self) -> Self {
+        Self {
+            str_: self.str_ + extra.str_,
+            agi: self.agi + extra.agi,
+            dex: self.dex + extra.dex,
+            vit: self.vit + extra.vit,
+            int_: self.int_ + extra.int_,
+            wis: self.wis + extra.wis,
+            k: self.k + extra.k,
+            cha: self.cha + extra.cha,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum InventoryQuality {
@@ -452,6 +479,26 @@ pub struct RandomPoolTextResult {
     pub count: u32,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RandomPoolCheckedResult {
+    #[serde(default = "default_random_pool_checked_result_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub target_id: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+impl Default for RandomPoolCheckedResult {
+    fn default() -> Self {
+        Self {
+            enabled: default_random_pool_checked_result_enabled(),
+            target_id: String::new(),
+            text: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct RandomPool {
     #[serde(default)]
@@ -460,6 +507,18 @@ pub struct RandomPool {
     pub last_pick: Option<InventoryItem>,
     #[serde(default)]
     pub last_text_result: Option<RandomPoolTextResult>,
+    #[serde(default)]
+    pub legacy_pool_id: Option<String>,
+    #[serde(default)]
+    pub legacy_group: Option<i32>,
+    #[serde(default)]
+    pub tags: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub checked_results: Vec<RandomPoolCheckedResult>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -468,6 +527,8 @@ pub struct UnitPoolEntry {
     pub label: String,
     #[serde(default)]
     pub note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_member_id: Option<String>,
     #[serde(default)]
     pub character: PlayerCharacter,
 }
@@ -477,6 +538,7 @@ impl Default for UnitPoolEntry {
         Self {
             label: "新单位".to_owned(),
             note: String::new(),
+            legacy_member_id: None,
             character: PlayerCharacter::default(),
         }
     }
@@ -490,6 +552,61 @@ pub struct SkillPoolArg {
     pub kind: String,
     #[serde(default)]
     pub value: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SkillRuleArgs {
+    pub numeric_values: Vec<(String, f32)>,
+    pub text_values: Vec<(String, String)>,
+}
+
+pub fn skill_rule_args(args: &[SkillPoolArg]) -> SkillRuleArgs {
+    SkillRuleArgs {
+        numeric_values: skill_numeric_arg_values(args),
+        text_values: skill_text_arg_values(args),
+    }
+}
+
+pub fn skill_numeric_arg_values(args: &[SkillPoolArg]) -> Vec<(String, f32)> {
+    args.iter()
+        .filter_map(|arg| {
+            let name = arg.name.trim();
+            if name.is_empty() || !skill_arg_kind_is_numeric(&arg.kind) {
+                return None;
+            }
+            let value = arg.value.trim().parse::<f32>().ok()?;
+            Some((name.to_owned(), value))
+        })
+        .collect()
+}
+
+pub fn skill_text_arg_values(args: &[SkillPoolArg]) -> Vec<(String, String)> {
+    args.iter()
+        .filter_map(|arg| {
+            let name = arg.name.trim();
+            let value = arg.value.trim();
+            if name.is_empty() || value.is_empty() || !skill_arg_kind_is_textual(&arg.kind, value) {
+                return None;
+            }
+            Some((name.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn skill_arg_kind_is_numeric(kind: &str) -> bool {
+    let kind = kind.trim();
+    kind.is_empty() || kind.eq_ignore_ascii_case("number") || kind == "数字"
+}
+
+fn skill_arg_kind_is_textual(kind: &str, value: &str) -> bool {
+    let kind = kind.trim();
+    if kind.is_empty() {
+        return value.parse::<f32>().is_err();
+    }
+    kind.eq_ignore_ascii_case("string")
+        || kind.eq_ignore_ascii_case("buff")
+        || kind == "字符串"
+        || kind == "BUFF"
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
@@ -526,6 +643,14 @@ pub struct SkillPoolEntry {
     pub legacy_event_buff_count: usize,
     #[serde(default)]
     pub legacy_has_graph: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buff_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_event_buff_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_graph_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buff_machine_json: Option<String>,
 }
 
 impl SkillPoolEntry {
@@ -535,6 +660,56 @@ impl SkillPoolEntry {
             self.source_skill_index?,
         ))
     }
+
+    pub fn legacy_raw_payload(&self) -> Option<String> { legacy_skill_pool_raw_payload(self) }
+}
+
+fn compact_legacy_json(value: &Value) -> Option<String> {
+    (!value.is_null())
+        .then(|| serde_json::to_string(value).ok())
+        .flatten()
+        .filter(|text| !text.trim().is_empty() && text != "null")
+}
+
+fn moonberry_legacy_json_field(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(compact_legacy_json)
+}
+
+fn legacy_json_value(text: &str) -> Option<Value> { serde_json::from_str(text).ok() }
+
+fn legacy_skill_pool_raw_payload(entry: &SkillPoolEntry) -> Option<String> {
+    let mut payload = Map::new();
+    if let Some(value) = entry
+        .legacy_buff_machine_json
+        .as_deref()
+        .and_then(legacy_json_value)
+    {
+        payload.insert("buffMachine".to_owned(), value);
+    }
+    if let Some(value) = entry
+        .legacy_buff_json
+        .as_deref()
+        .and_then(legacy_json_value)
+    {
+        payload.insert("buff".to_owned(), value);
+    }
+    if let Some(value) = entry
+        .legacy_event_buff_json
+        .as_deref()
+        .and_then(legacy_json_value)
+    {
+        payload.insert("eventBuffs".to_owned(), value);
+    }
+    if let Some(value) = entry
+        .legacy_graph_json
+        .as_deref()
+        .and_then(legacy_json_value)
+    {
+        payload.insert("graph".to_owned(), value);
+    }
+    (!payload.is_empty())
+        .then(|| serde_json::to_string(&Value::Object(payload)).ok())
+        .flatten()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -579,10 +754,16 @@ pub struct CharacterSkillMetadata {
     pub cooldown_left: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_caster: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub talent_trigger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub talent_effect: Option<String>,
     #[serde(default)]
     pub args: Vec<SkillPoolArg>,
     #[serde(default)]
     pub legacy_has_buff_machine: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buff_machine_json: Option<String>,
 }
 
 impl Default for CharacterSkillMetadata {
@@ -602,19 +783,42 @@ impl Default for CharacterSkillMetadata {
             exchange_point: None,
             cooldown_left: None,
             legacy_caster: None,
+            talent_trigger: None,
+            talent_effect: None,
             args: Vec::new(),
             legacy_has_buff_machine: false,
+            legacy_buff_machine_json: None,
         }
     }
 }
 
 impl CharacterSkillMetadata {
+    pub fn player_submitted() -> Self {
+        Self {
+            pc_approved: true,
+            st_approved: false,
+            ..Default::default()
+        }
+    }
+
     pub fn talent(pool_id: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             source: CharacterSkillSourceKind::Talent,
             source_pool_id: Some(pool_id.into()),
             source_pool_label: Some(label.into()),
             ..Default::default()
+        }
+    }
+
+    pub fn moonberry_talent(
+        pool_id: impl Into<String>,
+        label: impl Into<String>,
+        talent: &MoonberryTalent,
+    ) -> Self {
+        Self {
+            talent_trigger: moonberry_talent_trigger(talent).map(str::to_owned),
+            talent_effect: moonberry_talent_effect_summary(talent).map(str::to_owned),
+            ..Self::talent(pool_id, label)
         }
     }
 
@@ -634,6 +838,17 @@ impl CharacterSkillMetadata {
             source_character_id: entry.source_character_id.clone(),
             source_skill_index: entry.source_skill_index,
             args: entry.args.clone(),
+            legacy_has_buff_machine: entry.legacy_buff_machine_json.is_some()
+                || entry.legacy_buff_json.is_some()
+                || entry.legacy_event_buff_json.is_some()
+                || entry.legacy_graph_json.is_some()
+                || entry.legacy_buff_count > 0
+                || entry.legacy_event_buff_count > 0
+                || entry.legacy_has_graph,
+            legacy_buff_machine_json: entry
+                .legacy_buff_machine_json
+                .clone()
+                .or_else(|| legacy_skill_pool_raw_payload(entry)),
             ..Default::default()
         }
     }
@@ -683,6 +898,10 @@ pub struct PlayerCharacter {
     pub damage_taken_modifier: f32,
     #[serde(default = "default_modifier")]
     pub healing_taken_modifier: f32,
+    #[serde(default, alias = "tdpt")]
+    pub damage_taken_this_turn: f32,
+    #[serde(default, alias = "thpt")]
+    pub healing_taken_this_turn: f32,
     #[serde(default)]
     pub status: CharacterStatus,
     #[serde(default)]
@@ -730,6 +949,8 @@ impl Default for PlayerCharacter {
             healing_dealt_modifier: default_modifier(),
             damage_taken_modifier: default_modifier(),
             healing_taken_modifier: default_modifier(),
+            damage_taken_this_turn: 0.0,
+            healing_taken_this_turn: 0.0,
             status: CharacterStatus::default(),
             extra_status: CharacterStatus::default(),
             skill_names: Vec::new(),
@@ -745,12 +966,48 @@ impl Default for PlayerCharacter {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+pub fn record_character_damage_taken(character: &mut PlayerCharacter, amount: f32) -> bool {
+    let amount = amount.max(0.0);
+    if amount <= f32::EPSILON {
+        return false;
+    }
+    character.damage_taken_this_turn += amount;
+    true
+}
+
+pub fn record_character_healing_taken(character: &mut PlayerCharacter, amount: f32) -> bool {
+    let amount = amount.max(0.0);
+    if amount <= f32::EPSILON {
+        return false;
+    }
+    character.healing_taken_this_turn += amount;
+    true
+}
+
+pub fn reset_character_turn_totals(character: &mut PlayerCharacter) -> bool {
+    let changed = character.damage_taken_this_turn.abs() > f32::EPSILON
+        || character.healing_taken_this_turn.abs() > f32::EPSILON;
+    character.damage_taken_this_turn = 0.0;
+    character.healing_taken_this_turn = 0.0;
+    changed
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CharacterBuffBaseStats {
     #[serde(default = "default_character_hp")]
     pub hp: f32,
     #[serde(default = "default_character_hp")]
     pub max_hp: f32,
+    #[serde(default)]
+    pub hp_regen: f32,
+    #[serde(default)]
+    pub mp: f32,
+    #[serde(default)]
+    pub max_mp: f32,
+    #[serde(default)]
+    pub mp_regen: f32,
+    #[serde(default = "default_character_speed")]
+    pub speed: f32,
     #[serde(default = "default_modifier")]
     pub damage_dealt_modifier: f32,
     #[serde(default = "default_modifier")]
@@ -759,6 +1016,8 @@ pub struct CharacterBuffBaseStats {
     pub healing_dealt_modifier: f32,
     #[serde(default = "default_modifier")]
     pub healing_taken_modifier: f32,
+    #[serde(default)]
+    pub extra_status: CharacterStatus,
 }
 
 impl CharacterBuffBaseStats {
@@ -766,10 +1025,16 @@ impl CharacterBuffBaseStats {
         Self {
             hp: character.hp,
             max_hp: character.max_hp,
+            hp_regen: character.hp_regen,
+            mp: character.mp,
+            max_mp: character.max_mp,
+            mp_regen: character.mp_regen,
+            speed: character.speed,
             damage_dealt_modifier: character.damage_dealt_modifier,
             damage_taken_modifier: character.damage_taken_modifier,
             healing_dealt_modifier: character.healing_dealt_modifier,
             healing_taken_modifier: character.healing_taken_modifier,
+            extra_status: character.extra_status.clone(),
         }
     }
 }
@@ -871,6 +1136,8 @@ fn default_random_pool_count() -> u32 { 1 }
 
 fn default_random_pool_enabled() -> bool { true }
 
+fn default_random_pool_checked_result_enabled() -> bool { true }
+
 pub fn normalized_random_pool_counts(min_count: u32, max_count: u32) -> (u32, u32) {
     if max_count < min_count {
         (min_count, min_count)
@@ -888,6 +1155,8 @@ fn default_status_points() -> i32 { 5 }
 fn default_exchange_points() -> i32 { 6 }
 
 fn default_allow_join_requests() -> bool { true }
+
+fn default_battle_sort_by_turn() -> bool { true }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct TrpgBasicConfig {
@@ -933,6 +1202,22 @@ pub struct TrpgBasicConfig {
     pub agi_speed: f32,
     #[serde(default = "default_dex_speed")]
     pub dex_speed: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrpgDamageBonusKind {
+    Magical,
+    Physical,
+    Range,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrpgDamageTakenKind {
+    Magical,
+    Diseased,
+    Poisoning,
+    Other,
 }
 
 impl Default for TrpgBasicConfig {
@@ -999,6 +1284,146 @@ impl PartialEq for TrpgParty {
 
 impl Eq for TrpgParty {}
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct TrpgLegacyTeamChatMessage {
+    #[serde(default)]
+    pub sender_id: String,
+    #[serde(default)]
+    pub sender_name: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub time: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct TrpgLegacyTeam {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub players: Vec<String>,
+    #[serde(default = "default_legacy_visible")]
+    pub visible: bool,
+    #[serde(default)]
+    pub allow_pc_nickname_repeat: bool,
+    #[serde(default)]
+    pub anonymous_speakers: bool,
+    #[serde(default)]
+    pub buff_count: usize,
+    #[serde(default)]
+    pub chat_message_count: usize,
+    #[serde(default)]
+    pub chat_messages: Vec<TrpgLegacyTeamChatMessage>,
+    #[serde(default)]
+    pub window_x: f32,
+    #[serde(default)]
+    pub window_y: f32,
+    #[serde(default)]
+    pub window_width: f32,
+    #[serde(default)]
+    pub window_height: f32,
+}
+
+impl Default for TrpgLegacyTeam {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            players: Vec::new(),
+            visible: default_legacy_visible(),
+            allow_pc_nickname_repeat: false,
+            anonymous_speakers: false,
+            buff_count: 0,
+            chat_message_count: 0,
+            chat_messages: Vec::new(),
+            window_x: 0.0,
+            window_y: 0.0,
+            window_width: 0.0,
+            window_height: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct TrpgLegacyArea {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub x: f32,
+    #[serde(default)]
+    pub y: f32,
+    #[serde(default)]
+    pub width: f32,
+    #[serde(default)]
+    pub height: f32,
+    #[serde(default)]
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub combat: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct TrpgLegacyWorld {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_legacy_visible")]
+    pub visible: bool,
+    #[serde(default)]
+    pub players: Vec<String>,
+    #[serde(default)]
+    pub npcs: Vec<String>,
+    #[serde(default)]
+    pub chat_areas: Vec<TrpgLegacyArea>,
+    #[serde(default)]
+    pub areas: Vec<TrpgLegacyArea>,
+}
+
+impl Default for TrpgLegacyWorld {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            visible: default_legacy_visible(),
+            players: Vec::new(),
+            npcs: Vec::new(),
+            chat_areas: Vec::new(),
+            areas: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TrpgLegacySendPane {
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default = "default_legacy_closable")]
+    pub closable: bool,
+}
+
+impl Default for TrpgLegacySendPane {
+    fn default() -> Self {
+        Self {
+            key: String::new(),
+            title: String::new(),
+            targets: Vec::new(),
+            closable: default_legacy_closable(),
+        }
+    }
+}
+
+fn default_legacy_visible() -> bool { true }
+fn default_legacy_closable() -> bool { true }
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TrpgGroup {
     #[serde(default = "default_campaign_id")]
@@ -1017,12 +1442,28 @@ pub struct TrpgGroup {
     pub initial_exchange_points: i32,
     #[serde(default)]
     pub basic_config: TrpgBasicConfig,
+    #[serde(default, alias = "runTimes")]
+    pub run_times: u32,
+    #[serde(default = "default_battle_sort_by_turn", alias = "orderByTurn")]
+    pub battle_sort_by_turn: bool,
+    #[serde(default, alias = "negativeEnabled")]
+    pub battle_negative_enabled: bool,
+    #[serde(default)]
+    pub legacy_negative_count: usize,
+    #[serde(default)]
+    pub legacy_negative_timers: Vec<TrpgLegacyNegativeTimer>,
     #[serde(default)]
     pub gm_users: HashSet<u64>,
     #[serde(default)]
     pub parties: HashMap<String, TrpgParty>,
     #[serde(default)]
     pub player_parties: HashMap<String, String>,
+    #[serde(default)]
+    pub legacy_teams: Vec<TrpgLegacyTeam>,
+    #[serde(default)]
+    pub legacy_worlds: Vec<TrpgLegacyWorld>,
+    #[serde(default)]
+    pub legacy_send_panes: Vec<TrpgLegacySendPane>,
     #[serde(default)]
     pub players: Vec<String>,
     #[serde(default)]
@@ -1044,9 +1485,17 @@ impl Default for TrpgGroup {
             initial_status_points: default_status_points(),
             initial_exchange_points: default_exchange_points(),
             basic_config: TrpgBasicConfig::default(),
+            run_times: 0,
+            battle_sort_by_turn: default_battle_sort_by_turn(),
+            battle_negative_enabled: false,
+            legacy_negative_count: 0,
+            legacy_negative_timers: Vec::new(),
             gm_users: HashSet::default(),
             parties: HashMap::default(),
             player_parties: HashMap::default(),
+            legacy_teams: Vec::new(),
+            legacy_worlds: Vec::new(),
+            legacy_send_panes: Vec::new(),
             players: Vec::new(),
             group_chats: Vec::new(),
             world_turn: 0,
@@ -1065,6 +1514,35 @@ pub struct TrpgPlayerTurnState {
     pub skipped: bool,
 }
 
+pub const LEGACY_NEGATIVE_TIMEOUT_MS: u64 = 2 * 60 * 1000;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct TrpgLegacyNegativeTimer {
+    #[serde(default)]
+    pub target_id: String,
+    #[serde(default)]
+    pub remaining_ms: u64,
+    #[serde(default)]
+    pub replied: bool,
+    #[serde(default)]
+    pub generation: u32,
+    #[serde(default)]
+    pub half_warned: bool,
+    #[serde(default)]
+    pub negative_layers: u32,
+}
+
+impl TrpgLegacyNegativeTimer {
+    fn for_target(target_id: &str) -> Self {
+        Self {
+            target_id: target_id.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    pub fn active(&self) -> bool { self.remaining_ms > 0 && !self.replied }
+}
+
 impl TrpgGroup {
     pub fn sync_turn_players(&mut self) -> bool {
         let before_len = self.player_turns.len();
@@ -1078,6 +1556,194 @@ impl TrpgGroup {
                     target_id.clone(),
                     TrpgPlayerTurnState::default(),
                 );
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn sync_legacy_negative_timers(&mut self) -> bool {
+        let before = self.legacy_negative_timers.clone();
+        let mut next = Vec::new();
+        let mut seen = HashSet::new();
+
+        for mut timer in std::mem::take(&mut self.legacy_negative_timers) {
+            timer.target_id = timer.target_id.trim().to_owned();
+            if timer.target_id.is_empty() || !seen.insert(timer.target_id.clone()) {
+                continue;
+            }
+            next.push(timer);
+        }
+
+        if self.battle_negative_enabled || !next.is_empty() {
+            for target_id in &self.players {
+                let target_id = target_id.trim();
+                if !target_id.is_empty() && seen.insert(target_id.to_owned()) {
+                    next.push(TrpgLegacyNegativeTimer::for_target(
+                        target_id,
+                    ));
+                }
+            }
+        }
+
+        let changed = before != next;
+        self.legacy_negative_timers = next;
+        changed
+    }
+
+    pub fn legacy_negative_timer(&self, target_id: &str) -> Option<&TrpgLegacyNegativeTimer> {
+        let target_id = target_id.trim();
+        self.legacy_negative_timers
+            .iter()
+            .find(|timer| timer.target_id == target_id)
+    }
+
+    pub fn register_legacy_negative_reply(&mut self, target_id: &str) -> bool {
+        let Some(index) = self.ensure_legacy_negative_timer_index(target_id) else {
+            return false;
+        };
+        let timer = &mut self.legacy_negative_timers[index];
+        let changed = timer.remaining_ms != 0 || !timer.replied || timer.half_warned;
+        if changed {
+            timer.remaining_ms = 0;
+            timer.replied = true;
+            timer.half_warned = false;
+            timer.generation = timer.generation.saturating_add(1);
+        }
+        changed
+    }
+
+    pub fn start_legacy_negative_timer(&mut self, target_id: &str, remaining_ms: u64) -> bool {
+        if remaining_ms == 0 {
+            return self.reset_legacy_negative_timer(target_id);
+        }
+
+        let Some(index) = self.ensure_legacy_negative_timer_index(target_id) else {
+            return false;
+        };
+        let timer = &mut self.legacy_negative_timers[index];
+        timer.remaining_ms = remaining_ms;
+        timer.replied = false;
+        timer.half_warned = false;
+        timer.generation = timer.generation.saturating_add(1);
+        true
+    }
+
+    pub fn mark_legacy_negative_half_warned(&mut self, target_id: &str) -> bool {
+        let Some(index) = self.ensure_legacy_negative_timer_index(target_id) else {
+            return false;
+        };
+        let timer = &mut self.legacy_negative_timers[index];
+        if !timer.active() || timer.half_warned {
+            return false;
+        }
+        timer.half_warned = true;
+        true
+    }
+
+    pub fn record_legacy_negative_timeout(&mut self, target_id: &str) -> bool {
+        let Some(index) = self.ensure_legacy_negative_timer_index(target_id) else {
+            return false;
+        };
+        let timer = &mut self.legacy_negative_timers[index];
+        timer.remaining_ms = 0;
+        timer.replied = false;
+        timer.half_warned = false;
+        timer.negative_layers = timer.negative_layers.saturating_add(1);
+        timer.generation = timer.generation.saturating_add(1);
+        true
+    }
+
+    pub fn reset_legacy_negative_timer(&mut self, target_id: &str) -> bool {
+        let Some(index) = self.ensure_legacy_negative_timer_index(target_id) else {
+            return false;
+        };
+        let timer = &mut self.legacy_negative_timers[index];
+        let changed = timer.remaining_ms != 0 || timer.replied || timer.half_warned;
+        if changed {
+            timer.remaining_ms = 0;
+            timer.replied = false;
+            timer.half_warned = false;
+            timer.generation = timer.generation.saturating_add(1);
+        }
+        changed
+    }
+
+    pub fn refresh_legacy_negative_timers(&mut self) -> bool {
+        if !self.battle_negative_enabled || self.players.is_empty() {
+            return false;
+        }
+
+        self.sync_turn_players();
+        let mut changed = self.sync_legacy_negative_timers();
+        let effective_turns = self
+            .players
+            .iter()
+            .map(|target_id| {
+                let turn = self.player_turns.get(target_id);
+                let finished = turn.is_some_and(|turn| turn.acted || turn.skipped);
+                let turns_passed = turn.map(|turn| turn.turns_passed).unwrap_or_default();
+                (
+                    target_id.clone(),
+                    turns_passed.saturating_add(if finished { 1 } else { 0 }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let player_count = effective_turns.len();
+
+        for (target_id, turn) in &effective_turns {
+            let advanced_count = effective_turns
+                .iter()
+                .filter(|(_, other_turn)| other_turn > turn)
+                .count();
+            if advanced_count == 0 || advanced_count * 2 < player_count {
+                continue;
+            }
+            let Some(index) = self.ensure_legacy_negative_timer_index(target_id) else {
+                continue;
+            };
+            let timer = &mut self.legacy_negative_timers[index];
+            if timer.active() || timer.replied {
+                continue;
+            }
+            timer.remaining_ms = LEGACY_NEGATIVE_TIMEOUT_MS;
+            timer.replied = false;
+            timer.half_warned = false;
+            timer.generation = timer.generation.saturating_add(1);
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn ensure_legacy_negative_timer_index(&mut self, target_id: &str) -> Option<usize> {
+        let target_id = target_id.trim();
+        if target_id.is_empty() {
+            return None;
+        }
+        let is_known = self.players.iter().any(|player_id| player_id == target_id)
+            || self
+                .legacy_negative_timers
+                .iter()
+                .any(|timer| timer.target_id == target_id);
+        if !is_known {
+            return None;
+        }
+
+        self.sync_legacy_negative_timers();
+        self.legacy_negative_timers
+            .iter()
+            .position(|timer| timer.target_id == target_id)
+    }
+
+    fn reset_all_legacy_negative_timers(&mut self) -> bool {
+        let mut changed = false;
+        for timer in &mut self.legacy_negative_timers {
+            if timer.remaining_ms != 0 || timer.replied || timer.half_warned {
+                timer.remaining_ms = 0;
+                timer.replied = false;
+                timer.half_warned = false;
+                timer.generation = timer.generation.saturating_add(1);
                 changed = true;
             }
         }
@@ -1159,6 +1825,60 @@ impl TrpgGroup {
         true
     }
 
+    pub fn remove_party(&mut self, party_id: &str) -> bool {
+        let party_id = party_id.trim();
+        if party_id.is_empty() || !self.parties.contains_key(party_id) {
+            return false;
+        }
+
+        let before_parties = self.parties.clone();
+        let before_player_parties = self.player_parties.clone();
+
+        self.parties.remove(party_id);
+        self.player_parties
+            .retain(|_, assigned| assigned != party_id);
+        self.sync_parties();
+
+        self.parties != before_parties || self.player_parties != before_player_parties
+    }
+
+    pub fn merge_party(&mut self, from_party_id: &str, to_party_id: &str) -> bool {
+        let from_party_id = from_party_id.trim();
+        let to_party_id = to_party_id.trim();
+        if from_party_id.is_empty()
+            || to_party_id.is_empty()
+            || from_party_id == to_party_id
+            || !self.parties.contains_key(from_party_id)
+            || !self.parties.contains_key(to_party_id)
+        {
+            return false;
+        }
+
+        let before_parties = self.parties.clone();
+        let before_player_parties = self.player_parties.clone();
+
+        let source_players = self
+            .parties
+            .get(from_party_id)
+            .map(|party| party.players.clone())
+            .unwrap_or_default();
+        for target_id in source_players {
+            if self.players.iter().any(|player_id| player_id == &target_id) {
+                self.player_parties
+                    .insert(target_id, to_party_id.to_owned());
+            }
+        }
+        for assigned in self.player_parties.values_mut() {
+            if assigned == from_party_id {
+                *assigned = to_party_id.to_owned();
+            }
+        }
+        self.parties.remove(from_party_id);
+        self.sync_parties();
+
+        self.parties != before_parties || self.player_parties != before_player_parties
+    }
+
     pub fn set_player_party(&mut self, target_id: &str, party_id: Option<&str>) -> bool {
         if !self.players.iter().any(|player_id| player_id == target_id) {
             return false;
@@ -1202,6 +1922,422 @@ impl TrpgGroup {
 
     pub fn party_id_for_player(&self, target_id: &str) -> Option<&str> {
         self.player_parties.get(target_id).map(String::as_str)
+    }
+
+    pub fn legacy_team(&self, team_id: &str) -> Option<&TrpgLegacyTeam> {
+        let team_id = team_id.trim();
+        self.legacy_teams
+            .iter()
+            .find(|team| team.id.trim() == team_id)
+    }
+
+    pub fn legacy_team_members(&self, team_id: &str) -> Vec<String> {
+        self.legacy_team(team_id)
+            .map(|team| {
+                let targets = vec![team.id.clone()];
+                self.legacy_target_members(&targets)
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn append_legacy_team_chat_message(
+        &mut self,
+        team_id: &str,
+        message: TrpgLegacyTeamChatMessage,
+    ) -> bool {
+        let Some(team) = self
+            .legacy_teams
+            .iter_mut()
+            .find(|team| team.id.trim() == team_id.trim())
+        else {
+            return false;
+        };
+        if message.text.trim().is_empty() {
+            return false;
+        }
+        let before_total = team.chat_message_count.max(team.chat_messages.len());
+        team.chat_messages.push(message);
+        team.chat_message_count = before_total + 1;
+        true
+    }
+
+    pub fn update_legacy_team_chat_message(
+        &mut self,
+        team_id: &str,
+        message_index: usize,
+        text: &str,
+    ) -> bool {
+        let Some(team) = self
+            .legacy_teams
+            .iter_mut()
+            .find(|team| team.id.trim() == team_id.trim())
+        else {
+            return false;
+        };
+        if text.trim().is_empty() {
+            return false;
+        }
+        let Some(message) = team.chat_messages.get_mut(message_index) else {
+            return false;
+        };
+        if message.text == text {
+            return false;
+        }
+        message.text = text.to_owned();
+        true
+    }
+
+    pub fn remove_legacy_team_chat_message(&mut self, team_id: &str, message_index: usize) -> bool {
+        let Some(team) = self
+            .legacy_teams
+            .iter_mut()
+            .find(|team| team.id.trim() == team_id.trim())
+        else {
+            return false;
+        };
+        if message_index >= team.chat_messages.len() {
+            return false;
+        }
+        let before_total = team.chat_message_count.max(team.chat_messages.len());
+        team.chat_messages.remove(message_index);
+        team.chat_message_count = before_total.saturating_sub(1).max(team.chat_messages.len());
+        true
+    }
+
+    pub fn legacy_chat_area(&self, area_id: &str) -> Option<&TrpgLegacyArea> {
+        let area_id = area_id.trim();
+        self.legacy_worlds.iter().find_map(|world| {
+            world
+                .chat_areas
+                .iter()
+                .chain(world.areas.iter())
+                .find(|area| area.id.trim() == area_id)
+        })
+    }
+
+    pub fn legacy_send_pane(&self, pane_key: &str) -> Option<&TrpgLegacySendPane> {
+        let pane_key = pane_key.trim();
+        self.legacy_send_panes
+            .iter()
+            .find(|pane| pane.key.trim() == pane_key)
+    }
+
+    pub fn legacy_send_pane_members(&self, pane_key: &str) -> Vec<String> {
+        self.legacy_send_pane(pane_key)
+            .map(|pane| {
+                self.legacy_target_members(&self.legacy_effective_send_targets(&pane.targets))
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn legacy_send_pane_effective_targets(&self, pane_key: &str) -> Vec<String> {
+        self.legacy_send_pane(pane_key)
+            .map(|pane| self.legacy_effective_send_targets(&pane.targets))
+            .unwrap_or_default()
+    }
+
+    pub fn legacy_send_pane_disabled_direct_targets(&self, pane_key: &str) -> Vec<String> {
+        self.legacy_send_pane(pane_key)
+            .map(|pane| self.legacy_disabled_direct_send_targets(&pane.targets))
+            .unwrap_or_default()
+    }
+
+    pub fn legacy_send_pane_direct_target_is_covered(
+        &self,
+        pane_key: &str,
+        target_id: &str,
+    ) -> bool {
+        self.legacy_send_pane(pane_key)
+            .map(|pane| {
+                self.legacy_direct_target_covered_by_group_targets(&pane.targets, target_id)
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn add_legacy_send_pane(&mut self, title: &str) -> Option<String> {
+        let title = {
+            let title = title.trim();
+            if title.is_empty() {
+                "多选发送"
+            } else {
+                title
+            }
+        };
+
+        for index in 0..99999 {
+            let key = index.to_string();
+            if self
+                .legacy_send_panes
+                .iter()
+                .any(|pane| pane.key.trim() == key)
+            {
+                continue;
+            }
+            self.legacy_send_panes.push(TrpgLegacySendPane {
+                key: key.clone(),
+                title: title.to_owned(),
+                targets: Vec::new(),
+                closable: true,
+            });
+            return Some(key);
+        }
+
+        None
+    }
+
+    pub fn remove_legacy_send_pane(&mut self, pane_key: &str) -> bool {
+        let pane_key = pane_key.trim();
+        let before = self.legacy_send_panes.len();
+        self.legacy_send_panes
+            .retain(|pane| pane.key.trim() != pane_key || !pane.closable);
+        self.legacy_send_panes.len() != before
+    }
+
+    pub fn clear_legacy_send_pane_targets(&mut self, pane_key: &str) -> bool {
+        let Some(pane_index) = self
+            .legacy_send_panes
+            .iter()
+            .position(|pane| pane.key.trim() == pane_key.trim())
+        else {
+            return false;
+        };
+        if self.legacy_send_panes[pane_index].targets.is_empty() {
+            return false;
+        }
+        self.legacy_send_panes[pane_index].targets.clear();
+        true
+    }
+
+    pub fn set_legacy_send_pane_target(
+        &mut self,
+        pane_key: &str,
+        target_id: &str,
+        selected: bool,
+    ) -> bool {
+        let target_id = target_id.trim();
+        if target_id.is_empty() {
+            return false;
+        }
+        let Some(pane_index) = self
+            .legacy_send_panes
+            .iter()
+            .position(|pane| pane.key.trim() == pane_key.trim())
+        else {
+            return false;
+        };
+
+        let before = self.legacy_send_panes[pane_index].targets.clone();
+        let mut targets = before.clone();
+        if selected {
+            if target_id != "0" && targets.iter().any(|target| target.trim() == "0") {
+                return false;
+            }
+            if !targets.iter().any(|target| target.trim() == target_id) {
+                targets.push(target_id.to_owned());
+            }
+        } else {
+            targets.retain(|target| target.trim() != target_id);
+        }
+
+        let targets = self.legacy_normalized_send_targets(&targets);
+        if before == targets {
+            return false;
+        }
+        self.legacy_send_panes[pane_index].targets = targets;
+        true
+    }
+
+    fn legacy_normalized_send_targets(&self, targets: &[String]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut normalized = Vec::new();
+        for target in self.legacy_effective_send_targets(targets) {
+            if seen.insert(target.clone()) {
+                normalized.push(target);
+            }
+        }
+        normalized
+    }
+
+    fn legacy_effective_send_targets(&self, targets: &[String]) -> Vec<String> {
+        if targets.iter().any(|target| target.trim() == "0") {
+            return vec!["0".to_owned()];
+        }
+
+        let disabled_direct_targets = self
+            .legacy_disabled_direct_send_targets(targets)
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        targets
+            .iter()
+            .map(|target| target.trim())
+            .filter(|target| !target.is_empty())
+            .filter(|target| !disabled_direct_targets.contains(*target))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn legacy_disabled_direct_send_targets(&self, targets: &[String]) -> Vec<String> {
+        let mut disabled = targets
+            .iter()
+            .map(|target| target.trim())
+            .filter(|target| {
+                moonberry_exact_u64(target).is_some_and(|id| id > 10000)
+                    && self.legacy_direct_target_covered_by_group_targets(targets, target)
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        disabled.sort();
+        disabled.dedup();
+        disabled
+    }
+
+    fn legacy_direct_target_covered_by_group_targets(
+        &self,
+        targets: &[String],
+        target_id: &str,
+    ) -> bool {
+        let target_id = target_id.trim();
+        if !moonberry_exact_u64(target_id).is_some_and(|id| id > 10000) {
+            return false;
+        }
+
+        for target in targets {
+            let target = target.trim();
+            if target.is_empty() || target == target_id {
+                continue;
+            }
+            if target == "0" {
+                return self.players.iter().any(|player_id| player_id == target_id);
+            }
+            if let Some(numeric_id) = moonberry_exact_u64(target) {
+                if numeric_id < 10000 {
+                    if self.legacy_team(target).is_some_and(|team| {
+                        team.players.iter().any(|player_id| player_id == target_id)
+                    }) {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            if self
+                .legacy_chat_area(target)
+                .is_some_and(|area| area.members.iter().any(|player_id| player_id == target_id))
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn promote_legacy_team_to_party(&mut self, team_id: &str) -> bool {
+        let Some(team) = self.legacy_team(team_id).cloned() else {
+            return false;
+        };
+        let party_name = legacy_party_name(&team.name, &team.id, "旧频道");
+        self.promote_legacy_members_to_party(&party_name, &team.players)
+    }
+
+    pub fn promote_legacy_chat_area_to_party(&mut self, area_id: &str) -> bool {
+        let Some(area) = self.legacy_chat_area(area_id).cloned() else {
+            return false;
+        };
+        let party_name = legacy_party_name(&area.name, &area.id, "虚拟讨论组");
+        self.promote_legacy_members_to_party(&party_name, &area.members)
+    }
+
+    fn promote_legacy_members_to_party(&mut self, party_name: &str, members: &[String]) -> bool {
+        let party_name = party_name.trim();
+        if party_name.is_empty() {
+            return false;
+        }
+
+        let before_parties = self.parties.clone();
+        let before_player_parties = self.player_parties.clone();
+
+        let mut members = members
+            .iter()
+            .map(|member| member.trim())
+            .filter(|member| self.players.iter().any(|player_id| player_id == *member))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        members.sort();
+        members.dedup();
+        if members.is_empty() {
+            return false;
+        }
+
+        self.parties
+            .entry(party_name.to_owned())
+            .or_insert_with(|| TrpgParty {
+                name: party_name.to_owned(),
+                players: Vec::new(),
+            });
+
+        for member_id in members {
+            for party in self.parties.values_mut() {
+                party.players.retain(|player_id| player_id != &member_id);
+            }
+            self.player_parties
+                .insert(member_id.clone(), party_name.to_owned());
+            if let Some(party) = self.parties.get_mut(party_name) {
+                if !party
+                    .players
+                    .iter()
+                    .any(|player_id| player_id == &member_id)
+                {
+                    party.players.push(member_id);
+                }
+            }
+        }
+        self.sync_parties();
+
+        self.parties != before_parties || self.player_parties != before_player_parties
+    }
+
+    pub fn legacy_target_members(&self, targets: &[String]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut members = Vec::new();
+
+        for target in targets {
+            let target = target.trim();
+            if target.is_empty() {
+                continue;
+            }
+            if target == "0" {
+                for player_id in &self.players {
+                    push_legacy_member(&mut members, &mut seen, player_id);
+                }
+                continue;
+            }
+
+            if let Some(numeric_id) = moonberry_exact_u64(target) {
+                if numeric_id < 10000 {
+                    if let Some(team) = self.legacy_team(target) {
+                        for player_id in &team.players {
+                            push_legacy_member_if_group_player(
+                                self,
+                                &mut members,
+                                &mut seen,
+                                player_id,
+                            );
+                        }
+                    }
+                } else if numeric_id > 10000 {
+                    push_legacy_member_if_group_player(self, &mut members, &mut seen, target);
+                }
+                continue;
+            }
+
+            if let Some(area) = self.legacy_chat_area(target) {
+                for player_id in &area.members {
+                    push_legacy_member_if_group_player(self, &mut members, &mut seen, player_id);
+                }
+            }
+        }
+
+        members
     }
 
     pub fn player_access(&self, player_id: u64) -> PlayerAccess {
@@ -1249,6 +2385,7 @@ impl TrpgGroup {
         }
 
         turn.turns_passed = turns_passed;
+        self.refresh_legacy_negative_timers();
         true
     }
 
@@ -1260,6 +2397,7 @@ impl TrpgGroup {
             turn.acted = false;
             turn.skipped = false;
         }
+        self.reset_all_legacy_negative_timers();
         true
     }
 
@@ -1268,14 +2406,16 @@ impl TrpgGroup {
             return false;
         }
 
+        let negative_reply_changed =
+            if acted { self.register_legacy_negative_reply(target_id) } else { false };
         let sync_changed = self.sync_turn_players();
         let Some(turn) = self.player_turns.get_mut(target_id) else {
-            return sync_changed;
+            return sync_changed || negative_reply_changed;
         };
         let already_set =
             if acted { turn.acted && !turn.skipped } else { !turn.acted && turn.skipped };
         if already_set {
-            return sync_changed;
+            return sync_changed || negative_reply_changed;
         }
 
         if acted {
@@ -1288,6 +2428,8 @@ impl TrpgGroup {
 
         if self.all_players_finished_turn() {
             self.advance_world_turn();
+        } else {
+            self.refresh_legacy_negative_timers();
         }
         true
     }
@@ -1299,6 +2441,38 @@ impl TrpgGroup {
                     .get(target_id)
                     .is_some_and(|turn| turn.acted || turn.skipped)
             })
+    }
+}
+
+fn push_legacy_member(members: &mut Vec<String>, seen: &mut HashSet<String>, target_id: &str) {
+    let target_id = target_id.trim();
+    if !target_id.is_empty() && seen.insert(target_id.to_owned()) {
+        members.push(target_id.to_owned());
+    }
+}
+
+fn push_legacy_member_if_group_player(
+    group: &TrpgGroup,
+    members: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    target_id: &str,
+) {
+    if group.players.iter().any(|player_id| player_id == target_id) {
+        push_legacy_member(members, seen, target_id);
+    }
+}
+
+fn legacy_party_name(name: &str, id: &str, fallback: &str) -> String {
+    let name = name.trim();
+    if !name.is_empty() {
+        name.to_owned()
+    } else {
+        let id = id.trim();
+        if id.is_empty() {
+            fallback.to_owned()
+        } else {
+            format!("{fallback}{id}")
+        }
     }
 }
 
@@ -1416,6 +2590,11 @@ pub struct MoonberryLegacyImportSummary {
     pub skill_pools: usize,
     pub unit_templates: usize,
     pub random_pools: usize,
+    pub legacy_teams: usize,
+    pub legacy_worlds: usize,
+    pub legacy_chat_areas: usize,
+    pub legacy_send_panes: usize,
+    pub legacy_negative_timers: usize,
 }
 
 impl MoonberryLegacyImportSummary {
@@ -1427,6 +2606,11 @@ impl MoonberryLegacyImportSummary {
             || self.skill_pools > 0
             || self.unit_templates > 0
             || self.random_pools > 0
+            || self.legacy_teams > 0
+            || self.legacy_worlds > 0
+            || self.legacy_chat_areas > 0
+            || self.legacy_send_panes > 0
+            || self.legacy_negative_timers > 0
     }
 }
 
@@ -1606,6 +2790,44 @@ impl NapcatMessageManager {
         Ok(imported_count)
     }
 
+    pub fn unit_pool_ids_for_legacy_members(&self, members: &[String]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut resolved = Vec::new();
+
+        for member in members {
+            let member = member.trim();
+            if member.is_empty() {
+                continue;
+            }
+
+            if self.unit_pool.contains_key(member) && seen.insert(member.to_owned()) {
+                resolved.push(member.to_owned());
+            }
+
+            let mut alias_matches = self
+                .unit_pool
+                .iter()
+                .filter(|(unit_id, unit)| {
+                    unit_id.as_str() != member && unit.legacy_member_id.as_deref() == Some(member)
+                })
+                .map(|(unit_id, _)| unit_id.clone())
+                .collect::<Vec<_>>();
+            alias_matches.sort();
+            for unit_id in alias_matches {
+                if seen.insert(unit_id.clone()) {
+                    resolved.push(unit_id);
+                }
+            }
+
+            let fallback_id = format!("moonberry-unit-{member}");
+            if self.unit_pool.contains_key(&fallback_id) && seen.insert(fallback_id.clone()) {
+                resolved.push(fallback_id);
+            }
+        }
+
+        resolved
+    }
+
     pub fn merge_moonberry_legacy_json(
         &mut self,
         text: &str,
@@ -1619,13 +2841,26 @@ impl NapcatMessageManager {
             self.merge_moonberry_skill_pool(skill_pools, &mut summary)?;
         }
 
+        let root_order_by_turn = value
+            .get("config")
+            .and_then(|config| moonberry_bool_field(config, "orderByTurn"));
+        let root_negative_enabled = value
+            .get("config")
+            .and_then(|config| moonberry_bool_field(config, "negative"));
+
         if let Some(groups) = value.get("groups").and_then(Value::as_array) {
             recognized_shape = true;
             let current_group_index = moonberry_usize_field(&value, "currentGroup");
             let mut imported_group_names = Vec::new();
             for (index, group) in groups.iter().enumerate() {
                 let group_name = moonberry_group_name(group, index);
-                self.merge_moonberry_group(&group_name, group, &mut summary);
+                self.merge_moonberry_group(
+                    &group_name,
+                    group,
+                    root_order_by_turn,
+                    root_negative_enabled,
+                    &mut summary,
+                );
                 imported_group_names.push(group_name);
             }
             if let Some(index) = current_group_index {
@@ -1683,11 +2918,21 @@ impl NapcatMessageManager {
         &mut self,
         group_name: &str,
         group: &Value,
+        root_order_by_turn: Option<bool>,
+        root_negative_enabled: Option<bool>,
         summary: &mut MoonberryLegacyImportSummary,
     ) {
         let description = moonberry_string_field(group, "description");
         let st_description = moonberry_string_field(group, "stDesc");
         let guide = moonberry_string_field(group, "guide");
+        let run_times = moonberry_u32_field(group, "runTimes");
+        let battle_sort_by_turn = moonberry_bool_field(group, "orderByTurn").or(root_order_by_turn);
+        let battle_negative_enabled =
+            moonberry_bool_field(group, "negativeEnabled").or(root_negative_enabled);
+        let legacy_negative_timers = group
+            .get("negative")
+            .and_then(Value::as_array)
+            .map(|timers| moonberry_legacy_negative_timers(timers));
         let initial_status_points = group
             .get("basicConfig")
             .and_then(|config| moonberry_i32_field(config, "initStatusPoint"))
@@ -1697,6 +2942,18 @@ impl NapcatMessageManager {
             .and_then(|config| moonberry_i32_field(config, "initExchangePoint"))
             .or_else(|| moonberry_i32_field(group, "initExchangePoint"));
         let basic_config = group.get("basicConfig").map(moonberry_basic_config);
+        let legacy_teams = group
+            .get("currentTeams")
+            .and_then(Value::as_array)
+            .map(|teams| moonberry_legacy_teams(teams));
+        let legacy_worlds = group
+            .get("currentWorlds")
+            .and_then(Value::as_array)
+            .map(|worlds| moonberry_legacy_worlds(worlds));
+        let legacy_send_panes = group
+            .get("currentSendPanes")
+            .and_then(Value::as_array)
+            .map(|panes| moonberry_legacy_send_panes(panes));
 
         {
             let trpg_group = self.trpg_groups.entry(group_name.to_owned()).or_default();
@@ -1719,7 +2976,39 @@ impl NapcatMessageManager {
             if let Some(config) = basic_config {
                 trpg_group.basic_config = config;
             }
+            if let Some(run_times) = run_times {
+                trpg_group.run_times = run_times;
+            }
+            if let Some(sort_by_turn) = battle_sort_by_turn {
+                trpg_group.battle_sort_by_turn = sort_by_turn;
+            }
+            if let Some(negative_enabled) = battle_negative_enabled {
+                trpg_group.battle_negative_enabled = negative_enabled;
+            }
+            if let Some(timers) = legacy_negative_timers {
+                summary.legacy_negative_timers += timers.len();
+                trpg_group.legacy_negative_count = timers.len();
+                trpg_group.legacy_negative_timers = timers;
+            }
+            if let Some(teams) = legacy_teams {
+                summary.legacy_teams += teams.len();
+                trpg_group.legacy_teams = teams;
+            }
+            if let Some(worlds) = legacy_worlds {
+                summary.legacy_worlds += worlds.len();
+                summary.legacy_chat_areas += worlds
+                    .iter()
+                    .map(|world| world.chat_areas.len() + world.areas.len())
+                    .sum::<usize>();
+                trpg_group.legacy_worlds = worlds;
+            }
+            if let Some(send_panes) = legacy_send_panes {
+                summary.legacy_send_panes += send_panes.len();
+                trpg_group.legacy_send_panes = send_panes;
+            }
+            sync_legacy_surface_players(trpg_group);
             trpg_group.sync_turn_players();
+            trpg_group.sync_legacy_negative_timers();
             trpg_group.sync_parties();
         }
         summary.groups += 1;
@@ -1768,6 +3057,7 @@ impl NapcatMessageManager {
                 }
             }
             group.sync_turn_players();
+            group.sync_legacy_negative_timers();
             group.sync_parties();
         }
     }
@@ -1815,6 +3105,7 @@ impl NapcatMessageManager {
                 }
             }
             group.sync_turn_players();
+            group.sync_legacy_negative_timers();
             group.sync_parties();
         }
     }
@@ -1861,6 +3152,7 @@ impl NapcatMessageManager {
             let pc = unit
                 .get("Pc")
                 .ok_or_else(|| format!("月莓单位池 {unit_id} 缺少Pc数据"))?;
+            let legacy_member_id = moonberry_pc_target_id(pc);
             let character = moonberry_pc_to_character(pc);
             let label = moonberry_character_display_name(&unit_id, &character);
             let mut note_parts = Vec::new();
@@ -1877,6 +3169,7 @@ impl NapcatMessageManager {
             self.unit_pool.insert(unit_id, UnitPoolEntry {
                 label,
                 note: note_parts.join("\n"),
+                legacy_member_id,
                 character,
             });
             summary.unit_templates += 1;
@@ -1915,7 +3208,10 @@ impl NapcatMessageManager {
                 .and_then(Value::as_array)
                 .map(Vec::len)
                 .unwrap_or_default();
-            let legacy_has_graph = pool.get("graph").is_some_and(|graph| !graph.is_null());
+            let legacy_buff_json = moonberry_legacy_json_field(pool, "buff");
+            let legacy_event_buff_json = moonberry_legacy_json_field(pool, "eventBuffs");
+            let legacy_graph_json = moonberry_legacy_json_field(pool, "graph");
+            let legacy_has_graph = legacy_graph_json.is_some();
             let entry = SkillPoolEntry {
                 name,
                 note,
@@ -1937,6 +3233,10 @@ impl NapcatMessageManager {
                 legacy_buff_count,
                 legacy_event_buff_count,
                 legacy_has_graph,
+                legacy_buff_json,
+                legacy_event_buff_json,
+                legacy_graph_json,
+                legacy_buff_machine_json: None,
             };
             if let Some(legacy_pool_id) = legacy_pool_id.as_deref() {
                 self.skill_pool
@@ -1954,10 +3254,16 @@ impl NapcatMessageManager {
         summary: &mut MoonberryLegacyImportSummary,
     ) -> Result<(), String> {
         for pool in pools {
+            let legacy_pool_id =
+                moonberry_string_field(pool, "id").filter(|id| !id.trim().is_empty());
             let pool_name = moonberry_string_field(pool, "name")
-                .or_else(|| moonberry_string_field(pool, "id"))
+                .or_else(|| legacy_pool_id.clone())
                 .filter(|name| !name.trim().is_empty())
                 .ok_or_else(|| "月莓随机池包含缺少名称的池".to_owned())?;
+            let tags = moonberry_string_field(pool, "tags").unwrap_or_default();
+            let description = moonberry_string_field(pool, "desc").unwrap_or_default();
+            let created_at = moonberry_string_field(pool, "createdAt").unwrap_or_default();
+            let legacy_group = moonberry_i32_field(pool, "group");
             let items = pool
                 .get("IRandomItem")
                 .or_else(|| pool.get("IRandomItems"))
@@ -1995,6 +3301,12 @@ impl NapcatMessageManager {
                 entries,
                 last_pick: None,
                 last_text_result: None,
+                legacy_pool_id,
+                legacy_group,
+                tags,
+                description,
+                created_at,
+                checked_results: Vec::new(),
             };
             self.random_pools.insert(pool_name, pool);
             summary.random_pools += 1;
@@ -2182,6 +3494,7 @@ impl NapcatMessageManager {
             changed |= group_chat_len != group.group_chats.len();
 
             changed |= group.sync_turn_players();
+            changed |= group.sync_legacy_negative_timers();
             changed |= group.sync_parties();
         }
         if self
@@ -2210,6 +3523,21 @@ impl NapcatMessageManager {
     pub fn current_group_for_player(&self, target_id: &str) -> Option<&TrpgGroup> {
         self.current_group()
             .filter(|group| group.players.iter().any(|player_id| player_id == target_id))
+    }
+
+    pub fn register_legacy_negative_reply(&mut self, target_id: &str) -> bool {
+        let mut changed = false;
+        for group in self.trpg_groups.values_mut() {
+            if group.players.iter().any(|player_id| player_id == target_id)
+                || group
+                    .legacy_negative_timers
+                    .iter()
+                    .any(|timer| timer.target_id == target_id)
+            {
+                changed |= group.register_legacy_negative_reply(target_id);
+            }
+        }
+        changed
     }
 
     pub fn character_creation_config_for_target(&self, target_id: &str) -> (i32, i32) {
@@ -2285,6 +3613,23 @@ impl NapcatMessageManager {
             .filter(|message| message.data.user_id != message.data.self_id)
             .map(|message| self.campaign_message_for_target(target_id, message))
             .filter(|message| access.can_read(&message.visibility))
+            .collect()
+    }
+
+    pub fn visible_messages_for_player(
+        &self,
+        target_id: &str,
+        messages: &[NapcatMessage],
+        player_id: u64,
+    ) -> Vec<NapcatMessage> {
+        let access = self.player_access_for_user(player_id);
+        messages
+            .iter()
+            .filter(|message| {
+                let campaign_message = self.campaign_message_for_target(target_id, message);
+                access.can_read(&campaign_message.visibility)
+            })
+            .cloned()
             .collect()
     }
 
@@ -2429,6 +3774,7 @@ impl NapcatMessageManager {
                         changed = true;
                     }
                     changed |= group.sync_turn_players();
+                    changed |= group.sync_legacy_negative_timers();
                     changed |= group.sync_parties();
                 }
             }
@@ -2531,6 +3877,342 @@ fn moonberry_basic_config(config: &Value) -> TrpgBasicConfig {
         imported.dex_speed = value;
     }
     imported
+}
+
+fn moonberry_legacy_teams(teams: &[Value]) -> Vec<TrpgLegacyTeam> {
+    teams
+        .iter()
+        .enumerate()
+        .filter_map(|(index, team)| {
+            let id =
+                moonberry_target_id_field(team, "Id").unwrap_or_else(|| (index + 1).to_string());
+            let name = moonberry_string_field(team, "name")
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| format!("旧频道{id}"));
+            let players = team
+                .get("pcs")
+                .and_then(Value::as_array)
+                .map(|pcs| moonberry_legacy_pc_member_ids(pcs))
+                .unwrap_or_default();
+            let chat_values = team.get("chat").and_then(Value::as_array);
+            let chat_message_count = chat_values.map(Vec::len).unwrap_or_default();
+            let chat_messages = chat_values
+                .map(|chats| moonberry_legacy_team_chat_messages(chats))
+                .unwrap_or_default();
+            (!id.trim().is_empty()).then_some(TrpgLegacyTeam {
+                id,
+                name,
+                players,
+                visible: moonberry_bool_field(team, "visible").unwrap_or(true),
+                allow_pc_nickname_repeat: moonberry_bool_field(team, "allowPcNicknameRepeat")
+                    .unwrap_or(false),
+                anonymous_speakers: moonberry_bool_field(team, "nemo").unwrap_or(false),
+                buff_count: team
+                    .get("buff")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or_default(),
+                chat_message_count,
+                chat_messages,
+                window_x: team
+                    .get("bounds")
+                    .and_then(|bounds| moonberry_f32_field(bounds, "x"))
+                    .unwrap_or_default(),
+                window_y: team
+                    .get("bounds")
+                    .and_then(|bounds| moonberry_f32_field(bounds, "y"))
+                    .unwrap_or_default(),
+                window_width: team
+                    .get("size")
+                    .and_then(|size| moonberry_f32_field(size, "width"))
+                    .unwrap_or_default(),
+                window_height: team
+                    .get("size")
+                    .and_then(|size| moonberry_f32_field(size, "height"))
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn moonberry_legacy_team_chat_messages(chats: &[Value]) -> Vec<TrpgLegacyTeamChatMessage> {
+    chats
+        .iter()
+        .filter_map(|chat| {
+            let sender = chat.get("sender");
+            let sender_id = sender
+                .and_then(|sender| moonberry_target_id_field(sender, "id"))
+                .unwrap_or_default();
+            let sender_name = sender
+                .and_then(moonberry_legacy_team_chat_sender_name)
+                .or_else(|| (!sender_id.trim().is_empty()).then_some(sender_id.clone()))
+                .unwrap_or_default();
+            let chain_values = chat.get("messageChain").and_then(Value::as_array)?;
+            let text = moonberry_legacy_team_chat_text(chain_values);
+            (!text.trim().is_empty()).then_some(TrpgLegacyTeamChatMessage {
+                sender_id,
+                sender_name,
+                text,
+                time: moonberry_message_time(chain_values),
+            })
+        })
+        .collect()
+}
+
+fn moonberry_legacy_team_chat_sender_name(sender: &Value) -> Option<String> {
+    ["memberName", "nickname", "remark"]
+        .into_iter()
+        .find_map(|key| {
+            moonberry_string_field(sender, key)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn moonberry_legacy_team_chat_text(segments: &[Value]) -> String {
+    segments
+        .iter()
+        .filter_map(moonberry_legacy_team_chat_segment_text)
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn moonberry_legacy_team_chat_segment_text(segment: &Value) -> Option<String> {
+    let segment_type = moonberry_string_field(segment, "type").unwrap_or_default();
+    match segment_type.as_str() {
+        "Source" | "Quote" => None,
+        "Plain" => moonberry_string_field(segment, "text"),
+        "Image" | "FlashImage" => Some(moonberry_legacy_team_chat_image_text(
+            segment,
+        )),
+        _ => [
+            "text", "content", "display", "summary", "name", "title", "value",
+        ]
+        .into_iter()
+        .find_map(|key| {
+            moonberry_string_field(segment, key)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            let segment_type = segment_type.trim();
+            (!segment_type.is_empty()).then(|| format!("[{segment_type}]"))
+        }),
+    }
+}
+
+fn moonberry_legacy_team_chat_image_text(segment: &Value) -> String {
+    ["url", "path", "imageId"]
+        .into_iter()
+        .find_map(|key| {
+            moonberry_string_field(segment, key)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .map(|label| format!("[图片:{label}]"))
+        .unwrap_or_else(|| "[图片]".to_owned())
+}
+
+fn moonberry_legacy_worlds(worlds: &[Value]) -> Vec<TrpgLegacyWorld> {
+    worlds
+        .iter()
+        .enumerate()
+        .filter_map(|(index, modal)| {
+            let world = modal.get("world").unwrap_or(modal);
+            let id = moonberry_string_field(modal, "Id")
+                .or_else(|| moonberry_string_field(world, "Id"))
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| format!("moonberry-world-{}", index + 1));
+            let name = moonberry_string_field(world, "name")
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| format!("旧世界{}", index + 1));
+            let players = world
+                .get("PcNumbers")
+                .and_then(Value::as_array)
+                .map(|values| moonberry_legacy_member_ids(values))
+                .unwrap_or_default();
+            let npcs = world
+                .get("NpcNumbers")
+                .and_then(Value::as_array)
+                .map(|values| moonberry_legacy_member_ids(values))
+                .unwrap_or_default();
+            let chat_areas = world
+                .get("chatAreas")
+                .and_then(Value::as_array)
+                .map(|areas| moonberry_legacy_areas(areas, "虚拟讨论组"))
+                .unwrap_or_default();
+            let areas = world
+                .get("Areas")
+                .and_then(Value::as_array)
+                .map(|areas| moonberry_legacy_areas(areas, "区域"))
+                .unwrap_or_default();
+            (!id.trim().is_empty()).then_some(TrpgLegacyWorld {
+                id,
+                name,
+                visible: moonberry_bool_field(modal, "visible").unwrap_or(true),
+                players,
+                npcs,
+                chat_areas,
+                areas,
+            })
+        })
+        .collect()
+}
+
+fn moonberry_legacy_areas(areas: &[Value], fallback_prefix: &str) -> Vec<TrpgLegacyArea> {
+    areas
+        .iter()
+        .enumerate()
+        .filter_map(|(index, area)| {
+            let id = moonberry_string_field(area, "id")
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| format!("{fallback_prefix}-{}", index + 1));
+            let name = moonberry_string_field(area, "name")
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| format!("{fallback_prefix}{}", index + 1));
+            let members = area
+                .get("member")
+                .and_then(Value::as_array)
+                .map(|values| moonberry_legacy_member_ids(values))
+                .unwrap_or_default();
+            (!id.trim().is_empty()).then_some(TrpgLegacyArea {
+                id,
+                name,
+                x: moonberry_f32_field(area, "x").unwrap_or_default(),
+                y: moonberry_f32_field(area, "y").unwrap_or_default(),
+                width: moonberry_f32_field(area, "width").unwrap_or_default(),
+                height: moonberry_f32_field(area, "height").unwrap_or_default(),
+                members,
+                combat: moonberry_bool_field(area, "combat").unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn moonberry_legacy_send_panes(panes: &[Value]) -> Vec<TrpgLegacySendPane> {
+    panes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pane)| {
+            let targets = pane
+                .get("sendTo")
+                .and_then(|send_to| send_to.get("targets"))
+                .and_then(Value::as_array)
+                .map(|values| moonberry_legacy_member_ids(values))
+                .unwrap_or_default();
+            if targets.is_empty() {
+                return None;
+            }
+            let key = pane
+                .get("key")
+                .and_then(moonberry_scalar_to_string)
+                .filter(|key| !key.trim().is_empty())
+                .unwrap_or_else(|| index.to_string());
+            let title = moonberry_string_field(pane, "title")
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| format!("旧发送窗{}", index + 1));
+            Some(TrpgLegacySendPane {
+                key,
+                title,
+                targets,
+                closable: moonberry_bool_field(pane, "closable").unwrap_or(true),
+            })
+        })
+        .collect()
+}
+
+fn moonberry_legacy_negative_timers(timers: &[Value]) -> Vec<TrpgLegacyNegativeTimer> {
+    let mut imported = Vec::new();
+    let mut seen = HashSet::new();
+    for timer in timers {
+        let Some(target_id) = moonberry_target_id_field(timer, "Id") else {
+            continue;
+        };
+        if !seen.insert(target_id.clone()) {
+            continue;
+        }
+        imported.push(TrpgLegacyNegativeTimer {
+            target_id,
+            remaining_ms: moonberry_u64_field(timer, "remain").unwrap_or_default(),
+            replied: moonberry_bool_field(timer, "reply").unwrap_or_default(),
+            generation: moonberry_u32_field(timer, "idx").unwrap_or_default(),
+            half_warned: false,
+            negative_layers: 0,
+        });
+    }
+    imported
+}
+
+fn moonberry_legacy_pc_member_ids(pcs: &[Value]) -> Vec<String> {
+    let mut ids = pcs
+        .iter()
+        .filter_map(moonberry_pc_target_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn moonberry_legacy_member_ids(values: &[Value]) -> Vec<String> {
+    let mut ids = values
+        .iter()
+        .filter_map(moonberry_scalar_to_string)
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty() && id != "-1")
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn sync_legacy_surface_players(group: &mut TrpgGroup) {
+    let mut imported = Vec::new();
+    for team in &group.legacy_teams {
+        imported.extend(team.players.iter().cloned());
+    }
+    for world in &group.legacy_worlds {
+        imported.extend(world.players.iter().cloned());
+        for area in world.chat_areas.iter().chain(world.areas.iter()) {
+            imported.extend(area.members.iter().cloned());
+        }
+    }
+    for pane in &group.legacy_send_panes {
+        for target in &pane.targets {
+            let target = target.trim();
+            if target.is_empty() || target == "0" {
+                continue;
+            }
+            if let Some(numeric_id) = moonberry_exact_u64(target) {
+                if numeric_id < 10000 {
+                    if let Some(team) = group.legacy_team(target) {
+                        imported.extend(team.players.iter().cloned());
+                    }
+                } else if numeric_id > 10000 {
+                    imported.push(target.to_owned());
+                }
+                continue;
+            }
+            if let Some(area) = group.legacy_chat_area(target) {
+                imported.extend(area.members.iter().cloned());
+            }
+        }
+    }
+    for timer in &group.legacy_negative_timers {
+        imported.push(timer.target_id.clone());
+    }
+    for target_id in imported {
+        if !group
+            .players
+            .iter()
+            .any(|player_id| player_id == &target_id)
+        {
+            group.players.push(target_id);
+        }
+    }
+    group.players.sort();
+    group.players.dedup();
 }
 
 fn moonberry_pc_target_id(pc: &Value) -> Option<String> { moonberry_target_id_field(pc, "Id") }
@@ -2664,6 +4346,12 @@ fn moonberry_u64_field(value: &Value, key: &str) -> Option<u64> {
         })
 }
 
+fn moonberry_exact_u64(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let parsed = value.parse::<u64>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
 fn moonberry_usize_field(value: &Value, key: &str) -> Option<usize> {
     let raw = value.get(key)?;
     raw.as_u64()
@@ -2757,6 +4445,12 @@ fn moonberry_pc_to_character(pc: &Value) -> PlayerCharacter {
     if let Some(value) = moonberry_f32_field(pc, "tHealModify") {
         character.healing_taken_modifier = value;
     }
+    if let Some(value) = moonberry_f32_field(pc, "tdpt") {
+        character.damage_taken_this_turn = value.max(0.0);
+    }
+    if let Some(value) = moonberry_f32_field(pc, "thpt") {
+        character.healing_taken_this_turn = value.max(0.0);
+    }
     if let Some(status) = pc.get("status") {
         character.status = moonberry_status(status);
     }
@@ -2789,6 +4483,7 @@ fn moonberry_pc_to_character(pc: &Value) -> PlayerCharacter {
             let legacy_has_buff_machine = skill
                 .get("buffMachine")
                 .is_some_and(|buff_machine| !buff_machine.is_null());
+            let legacy_buff_machine_json = moonberry_legacy_json_field(skill, "buffMachine");
             character.skill_metadata.push(CharacterSkillMetadata {
                 pc_approved: moonberry_bool_field(skill, "pcInited").unwrap_or(true),
                 st_approved: moonberry_bool_field(skill, "stInited").unwrap_or(true),
@@ -2813,8 +4508,11 @@ fn moonberry_pc_to_character(pc: &Value) -> PlayerCharacter {
                     .get("caster")
                     .and_then(moonberry_scalar_to_string)
                     .filter(|value| !value.trim().is_empty()),
+                talent_trigger: None,
+                talent_effect: None,
                 args: skill_args,
                 legacy_has_buff_machine,
+                legacy_buff_machine_json,
             });
         }
     }
@@ -3020,8 +4718,11 @@ fn completed_character_skill_pool_entries(
                 source_character_id: Some(target_id.to_owned()),
                 source_character_name: Some(source_character_name.clone()),
                 source_skill_index: Some(index),
-                legacy_pool_id: metadata.source_pool_id,
-                category: metadata.source_pool_label,
+                legacy_pool_id: metadata.source_pool_id.clone(),
+                category: metadata.source_pool_label.clone(),
+                args: metadata.args.clone(),
+                legacy_has_graph: metadata.legacy_has_buff_machine,
+                legacy_buff_machine_json: metadata.legacy_buff_machine_json.clone(),
                 ..Default::default()
             })
         })
@@ -3414,6 +5115,7 @@ fn message_system(
                 manager.set_automatic_target_name(&target_id, &group_name);
             }
             if is_incoming_message {
+                manager.register_legacy_negative_reply(&incoming_user_id.to_string());
                 manager.register_incoming_target(&target_id, is_new_target);
             }
 
@@ -3728,9 +5430,9 @@ fn handle_character_creation_message(
             character.skill_cooldown_turns.push(0);
             character
                 .skill_metadata
-                .push(CharacterSkillMetadata::default());
+                .push(CharacterSkillMetadata::player_submitted());
             Some(format!(
-                "技能兑换数据已录入，目前记录{}条。继续发送技能，或输入【.】结束技能录入。",
+                "技能兑换数据已录入，目前记录{}条，等待GM确认后可使用。继续发送技能，或输入【.】结束技能录入。",
                 character.skill_notes.len()
             ))
         },
@@ -3823,35 +5525,14 @@ fn handle_private_player_command(
     }
 }
 
-const NORMAL_TALENT_POOL: &[&str] = &[
-    "坚韧：每次战斗第一次受到伤害时，减少1点受到伤害。",
-    "灵感：每场战斗第一次施放技能后，回复1点MP。",
-    "疾行：自己的速度提高1。",
-    "专注：单目标技能的MP消耗降低1，最低为0。",
-    "破势：主动造成物理伤害时，额外造成1点伤害。",
-    "回声：治疗技能第一次生效时，额外回复1点HP。",
-    "洞察：观察或调查相关判定获得GM提示时，可以额外追问一次细节。",
-    "守护：同小队成员受到伤害后，每轮一次可以为其承担1点伤害。",
-];
-
-const SUPPORT_TALENT_POOL: &[&str] = &[
-    "补给：每次休整后获得一件临时消耗品。",
-    "协调：同小队成员第一次行动后，你可以获得1点临时速度，持续1轮。",
-    "急救：每场战斗第一次治疗生命低于一半的目标时，额外回复2点HP。",
-    "侦查：进入新区域时，可以请求GM公开一个安全路径或危险来源。",
-    "掩护：同小队成员被单目标攻击时，每场战斗一次使其受到伤害减少1。",
-    "后援：自己跳过行动时，指定同小队一名成员回复1点MP。",
-    "整备：战斗开始前选择一名同小队成员，其第一项技能冷却减少1轮。",
-    "记录：总结线索时，可以向GM请求一次遗漏线索提示。",
-];
-
 fn draw_character_talent(
     manager: &mut NapcatMessageManager,
     target_id: &str,
     label: &str,
-    pool: &[&str],
+    pool: &[MoonberryTalent],
     message_time: u64,
 ) -> String {
+    let stat_config = manager.character_stat_config_for_target(target_id);
     let Some(character) = manager.player_characters.get_mut(target_id) else {
         return "你还没有角色卡。输入【.兑换】开始建卡。".to_owned();
     };
@@ -3861,30 +5542,46 @@ fn draw_character_talent(
     if pool.is_empty() {
         return format!("{label}池为空，请联系GM配置。");
     }
+    if character
+        .skill_metadata
+        .iter()
+        .any(|metadata| metadata.source == CharacterSkillSourceKind::Talent)
+    {
+        return "你已经抽过了！".to_owned();
+    }
 
-    let talent = pool[stable_talent_index(
+    let talent = &pool[stable_talent_index(
         target_id,
         label,
         message_time,
         pool.len(),
     )];
-    let talent_name = talent
-        .split_once('：')
-        .map(|(name, _)| name)
-        .unwrap_or(label)
-        .trim()
-        .to_owned();
-    character.skill_names.push(talent_name);
-    character.skill_notes.push(talent.to_owned());
+    let talent_note = talent_note(talent);
+    character.skill_names.push(talent.name.to_owned());
+    character.skill_notes.push(talent_note.clone());
     character.skill_mp_costs.push(0.0);
     character.skill_cooldown_turns.push(0);
-    character
-        .skill_metadata
-        .push(CharacterSkillMetadata::talent(
+    character.skill_metadata.push(
+        CharacterSkillMetadata::moonberry_talent(
             talent_pool_id(label),
             label.to_owned(),
-        ));
-    format!("抽取{label}：{talent}\n已加入已兑换技能。")
+            talent,
+        ),
+    );
+    let applied_effect = apply_moonberry_immediate_talent_effect(character, talent, &stat_config);
+    let mut response = format!("抽取{label}：{talent_note}\n已加入已兑换技能。");
+    if let Some(applied_effect) = applied_effect {
+        response.push('\n');
+        response.push_str(&applied_effect);
+    }
+    response
+}
+
+fn talent_note(talent: &MoonberryTalent) -> String {
+    format!(
+        "{}：{}",
+        talent.name, talent.description
+    )
 }
 
 fn talent_pool_id(label: &str) -> String {
@@ -3892,6 +5589,163 @@ fn talent_pool_id(label: &str) -> String {
         "天赋" => "normal_talent".to_owned(),
         "辅助天赋" => "support_talent".to_owned(),
         other => other.trim().to_owned(),
+    }
+}
+
+fn moonberry_talent_trigger(talent: &MoonberryTalent) -> Option<&'static str> {
+    let description = talent.description.trim();
+    if description.contains("跑团开始") {
+        Some("跑团开始")
+    } else if description.contains("进入突袭轮") {
+        Some("进入突袭轮")
+    } else if description.contains("进入战斗轮") {
+        Some("进入战斗轮")
+    } else if description.contains("脱离战斗轮") {
+        Some("脱离战斗轮")
+    } else if description.contains("持续治疗") && description.contains("结束") {
+        Some("持续治疗结束")
+    } else if description.contains("过量治疗") {
+        Some("过量治疗")
+    } else if description.contains("受到治疗") || description.contains("受到越是高等级的治疗")
+    {
+        Some("受到治疗")
+    } else if description.contains("死亡时") {
+        Some("死亡时")
+    } else if description.contains("受到致命伤害") || description.contains("足以致死") {
+        Some("受到致命伤害")
+    } else if description.contains("造成伤害") {
+        Some("造成伤害")
+    } else if description.contains("承受伤害") || description.contains("受到伤害") {
+        Some("受到伤害")
+    } else if description.contains("到达") {
+        Some("到达位置")
+    } else if description.contains("遇到解决不了的问题") {
+        Some("遇到难题")
+    } else if description.contains("更换道具部件") {
+        Some("更换道具")
+    } else if description.contains("夜间") {
+        Some("夜间")
+    } else if description.contains("试图追赶") {
+        Some("追赶目标")
+    } else if description.contains("每度过一个自然回合") {
+        Some("自然回合经过")
+    } else if description.contains("移动时") {
+        Some("移动时")
+    } else if description.starts_with("无论何时") {
+        Some("常驻")
+    } else {
+        None
+    }
+}
+
+fn moonberry_talent_effect_summary(talent: &MoonberryTalent) -> Option<&'static str> {
+    match talent.name {
+        "那美克星之慧" => Some("立即获得等级*2的知识额外值"),
+        "物理专长" => Some("立即将知识基础值提升到至少2；炮塔效果需GM处理"),
+        "溃伤" => Some("造成伤害时令目标受到治疗效果-25%，持续1回合"),
+        "人类基因工程" => Some("常驻最大生命值+5%；疾病/中毒伤害-15%"),
+        "大魔法师" => Some("常驻每点智力+1最大MP并+0.5%魔法伤害"),
+        "矢量压缩能量池" => Some("常驻每点知识+2最大MP并+1%治疗效果"),
+        "狡黠之思" => Some("常驻每点智慧+2最大MP并+1/回合MP回复"),
+        "抗魔体质" => Some("常驻魔法伤害减免10%"),
+        "数魔转换器" => Some("远程伤害享受正向魔法伤害加成"),
+        "瞄准镜Tex-30" => Some("远程技能射程至少为等级*15米"),
+        "禅宗古训" => Some("常驻物理伤害造成15%吸血"),
+        "过度免疫" => Some("单次伤害大于20%最大HP时伤害-20%"),
+        "生死时速" => Some("治疗濒死目标时治疗效果+50%"),
+        "菜鸡猛啄" => Some("单次伤害至少造成等级点无类型伤害"),
+        "火源之力" => Some("治疗效果随自身伤势提供0%/10%/20%加成"),
+        "互帮互助" => Some("治疗他人/受到治疗时50%治疗量回馈给治疗者"),
+        _ => moonberry_talent_effect_category(talent.description),
+    }
+}
+
+fn moonberry_talent_effect_category(description: &str) -> Option<&'static str> {
+    let description = description.trim();
+    if description.is_empty() {
+        return None;
+    }
+
+    if description.contains("召唤物")
+        || description.contains("小炮塔")
+        || description.contains("小精灵")
+    {
+        Some("召唤/单位或特殊随从效果，需GM处理")
+    } else if description.contains("道具")
+        || description.contains("烧鹅")
+        || description.contains("折扣")
+    {
+        Some("道具/物品经济效果，需GM处理")
+    } else if description.contains("经验") {
+        Some("经验收益修正，需GM处理")
+    } else if (description.contains("伤害") || description.contains("减伤"))
+        && (description.contains("治疗") || description.contains("回复"))
+    {
+        Some("伤害与治疗修正，待规则/战斗钩子执行")
+    } else if description.contains("治疗") || description.contains("回复") {
+        Some("治疗/回复效果，待规则/战斗钩子执行")
+    } else if description.contains("伤害")
+        || description.contains("减伤")
+        || description.contains("减免")
+        || description.contains("闪避")
+    {
+        Some("伤害/减伤效果，待规则/战斗钩子执行")
+    } else if description.contains("魔法值")
+        || description.contains("蓝量")
+        || description.contains("魔法")
+    {
+        Some("魔法/资源效果，需按场景或规则处理")
+    } else if description.contains("移动速度")
+        || description.contains("移速")
+        || description.contains("速度")
+        || description.contains("射程")
+    {
+        Some("移动/射程效果，需场景或战斗距离处理")
+    } else if description.contains("属性")
+        || description.contains("生命上限")
+        || description.contains("知识")
+        || description.contains("智力")
+        || description.contains("智慧")
+        || description.contains("敏捷")
+    {
+        Some("属性/派生数值效果，需GM或后续规则处理")
+    } else if description.contains("提示")
+        || description.contains("地图")
+        || description.contains("位置")
+        || description.contains("最优解")
+    {
+        Some("情报/位置提示效果，需GM处理")
+    } else if description.contains("选择") || description.contains("指定") {
+        Some("跑团选择/指定目标效果，需GM处理")
+    } else {
+        Some("旧月莓天赋效果已保留，需GM按描述处理")
+    }
+}
+
+fn apply_moonberry_immediate_talent_effect(
+    character: &mut PlayerCharacter,
+    talent: &MoonberryTalent,
+    stat_config: &TrpgBasicConfig,
+) -> Option<String> {
+    match talent.name {
+        "那美克星之慧" => {
+            let amount = character.level.max(1).saturating_mul(2);
+            character.extra_status.k = character.extra_status.k.saturating_add(amount);
+            update_character_from_status_with_config(character, stat_config);
+            Some(format!(
+                "已立即应用天赋效果：知识额外值 +{amount}。"
+            ))
+        },
+        "物理专长" => {
+            if character.status.k < 2 {
+                character.status.k = 2;
+                update_character_from_status_with_config(character, stat_config);
+                Some("已立即应用天赋效果：知识基础值提升到2。".to_owned())
+            } else {
+                Some("天赋立即效果已满足：知识基础值已不低于2。".to_owned())
+            }
+        },
+        _ => None,
     }
 }
 
@@ -3990,8 +5844,10 @@ fn format_private_character_status(manager: &NapcatMessageManager, target_id: &s
             character_display_name(character, target_id)
         ),
         format!(
-            "等级：{}  经验：{}",
-            character.level, character.exp
+            "等级：{}  经验：{} / {}",
+            character.level,
+            character.exp,
+            character_next_level_exp(character.level)
         ),
         format!(
             "HP：{}/{}  MP：{}/{}",
@@ -3999,6 +5855,11 @@ fn format_private_character_status(manager: &NapcatMessageManager, target_id: &s
             format_character_number(character.max_hp),
             format_character_number(character.mp),
             format_character_number(character.max_mp)
+        ),
+        format!(
+            "本轮承伤：{}  本轮受疗：{}",
+            format_character_number(character.damage_taken_this_turn),
+            format_character_number(character.healing_taken_this_turn)
         ),
         format!(
             "速度：{}",
@@ -4135,12 +5996,22 @@ fn format_private_character_cooldowns(manager: &NapcatMessageManager, target_id:
         let has_cast_record = character
             .skill_last_cast_turns
             .contains_key(&index.to_string());
-        if cooldown == 0 && !has_cast_record {
+        let cooldown_left = character
+            .skill_metadata
+            .get(index)
+            .and_then(|metadata| metadata.cooldown_left);
+        if cooldown == 0 && !has_cast_record && cooldown_left.unwrap_or_default() == 0 {
             continue;
         }
 
         let name = character_skill_display_name(character, index);
-        let remaining = skill_cooldown_remaining(character, index, cooldown, current_turn);
+        let remaining = skill_cooldown_remaining(
+            character,
+            index,
+            cooldown,
+            cooldown_left,
+            current_turn,
+        );
         if remaining == 0 {
             lines.push(format!("{name}：可用"));
         } else {
@@ -4273,18 +6144,16 @@ fn skill_cooldown_remaining(
     character: &PlayerCharacter,
     skill_index: usize,
     cooldown_turns: u32,
+    cooldown_left: Option<u32>,
     current_turn: u32,
 ) -> u32 {
-    if cooldown_turns == 0 {
-        return 0;
-    }
-    character
+    let Some(last_cast_turn) = character
         .skill_last_cast_turns
         .get(&skill_index.to_string())
-        .map(|last_cast_turn| {
-            cooldown_turns.saturating_sub(current_turn.saturating_sub(*last_cast_turn))
-        })
-        .unwrap_or(0)
+    else {
+        return cooldown_left.unwrap_or_default();
+    };
+    cooldown_turns.saturating_sub(current_turn.saturating_sub(*last_cast_turn))
 }
 
 fn format_character_number(value: f32) -> String {
@@ -4503,27 +6372,343 @@ pub fn update_character_from_status_with_config(
     character: &mut PlayerCharacter,
     config: &TrpgBasicConfig,
 ) {
-    let total_str = character.status.str_ + character.extra_status.str_;
-    let total_agi = character.status.agi + character.extra_status.agi;
-    let total_dex = character.status.dex + character.extra_status.dex;
-    let total_vit = character.status.vit + character.extra_status.vit;
-    let total_int = character.status.int_ + character.extra_status.int_;
-    let total_wis = character.status.wis + character.extra_status.wis;
+    let total = character_total_status(character);
 
     character.max_hp = (config.base_max_hp
         + character.level as f32 * config.lv_max_hp
-        + total_str as f32 * config.str_max_hp
-        + total_vit as f32 * config.vit_max_hp)
+        + total.str_ as f32 * config.str_max_hp
+        + total.vit as f32 * config.vit_max_hp)
         .max(1.0);
     character.hp = character.max_hp;
-    character.hp_regen = total_vit.max(0) as f32 * config.vit_hp_reg;
-    character.max_mp = total_int as f32 * config.int_max_mp + total_wis as f32 * config.wis_max_mp;
+    character.hp_regen = total.vit.max(0) as f32 * config.vit_hp_reg;
+    character.max_mp = total.int_ as f32 * config.int_max_mp + total.wis as f32 * config.wis_max_mp;
     character.mp = character.max_mp.max(0.0);
-    character.mp_regen = total_wis.max(0) as f32 * config.wis_mp_reg;
+    character.mp_regen = total.wis.max(0) as f32 * config.wis_mp_reg;
     character.speed = config.basic_speed
-        + total_str.max(0) as f32 * config.str_speed
-        + total_agi.max(0) as f32 * config.agi_speed
-        + total_dex.max(0) as f32 * config.dex_speed;
+        + total.str_.max(0) as f32 * config.str_speed
+        + total.agi.max(0) as f32 * config.agi_speed
+        + total.dex.max(0) as f32 * config.dex_speed;
+}
+
+pub fn character_next_level_exp(level: i32) -> i32 {
+    let level = level.max(1) as i64;
+    let required = level * (level - 1) * 25 / 2 + 100;
+    required.min(i32::MAX as i64) as i32
+}
+
+pub fn grant_character_experience(character: &mut PlayerCharacter, amount: i32) -> i32 {
+    if amount <= 0 {
+        return 0;
+    }
+    character.level = character.level.max(1);
+    character.exp = character.exp.saturating_add(amount);
+
+    let mut level_ups = 0;
+    while character.level < 999 {
+        let required = character_next_level_exp(character.level);
+        if character.exp < required {
+            break;
+        }
+        character.exp -= required;
+        character.level += 1;
+        level_ups += 1;
+    }
+    level_ups
+}
+
+pub fn character_total_status(character: &PlayerCharacter) -> CharacterStatus {
+    character.status.combined(&character.extra_status)
+}
+
+pub fn character_damage_attribute_multiplier(
+    character: &PlayerCharacter,
+    config: &TrpgBasicConfig,
+    kind: TrpgDamageBonusKind,
+) -> f32 {
+    let total = character_total_status(character);
+    let base = status_damage_attribute_multiplier(&total, config, kind)
+        + character_moonberry_talent_damage_attribute_bonus(character, &total, kind);
+    if kind == TrpgDamageBonusKind::Range {
+        base + character_range_magic_converter_damage_bonus(character, &total, config)
+    } else {
+        base
+    }
+}
+
+pub fn character_moonberry_talent_damage_attribute_bonus(
+    character: &PlayerCharacter,
+    total: &CharacterStatus,
+    kind: TrpgDamageBonusKind,
+) -> f32 {
+    match kind {
+        TrpgDamageBonusKind::Magical
+            if character_has_approved_moonberry_talent(character, "大魔法师") =>
+        {
+            total.int_ as f32 * 0.005
+        },
+        _ => 0.0,
+    }
+}
+
+pub fn character_range_magic_converter_damage_bonus(
+    character: &PlayerCharacter,
+    total: &CharacterStatus,
+    config: &TrpgBasicConfig,
+) -> f32 {
+    if !character_has_approved_moonberry_talent(character, "数魔转换器") {
+        return 0.0;
+    }
+    (status_damage_attribute_multiplier(
+        total,
+        config,
+        TrpgDamageBonusKind::Magical,
+    ) - 1.0
+        + character_moonberry_talent_damage_attribute_bonus(
+            character,
+            total,
+            TrpgDamageBonusKind::Magical,
+        ))
+    .max(0.0)
+}
+
+pub fn character_damage_taken_attribute_multiplier(
+    character: &PlayerCharacter,
+    kind: TrpgDamageTakenKind,
+) -> f32 {
+    let mut multiplier = 1.0;
+    match kind {
+        TrpgDamageTakenKind::Magical => {
+            if character_has_approved_moonberry_talent(character, "抗魔体质") {
+                multiplier *= 0.9;
+            }
+        },
+        TrpgDamageTakenKind::Diseased | TrpgDamageTakenKind::Poisoning => {
+            if character_has_approved_moonberry_talent(character, "人类基因工程") {
+                multiplier *= 0.85;
+            }
+        },
+        TrpgDamageTakenKind::Other => {},
+    }
+    multiplier
+}
+
+pub fn character_damage_dealt_talent_buffs(
+    character: &PlayerCharacter,
+    source_id: &str,
+) -> Vec<BuffSpec> {
+    let mut buffs = Vec::new();
+    if character_has_approved_moonberry_talent(character, "溃伤") {
+        buffs.push(moonberry_wound_buff(source_id));
+    }
+    buffs
+}
+
+pub fn character_physical_damage_lifesteal(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "禅宗古训") {
+        0.15
+    } else {
+        0.0
+    }
+}
+
+pub fn character_minimum_damage_floor(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "菜鸡猛啄") {
+        character.level.max(0) as f32
+    } else {
+        0.0
+    }
+}
+
+pub fn character_minimum_range_meters(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "瞄准镜Tex-30") {
+        character.level.max(0) as f32 * 15.0
+    } else {
+        0.0
+    }
+}
+
+pub fn moonberry_effective_skill_range_radius(
+    skill_range: Option<i32>,
+    minimum_range_meters: f32,
+) -> Option<f32> {
+    let skill_range = skill_range
+        .filter(|range| *range > 0)
+        .map(|range| range as f32);
+    if minimum_range_meters > f32::EPSILON {
+        Some(skill_range.unwrap_or(0.0).max(minimum_range_meters))
+    } else {
+        skill_range
+    }
+}
+
+pub fn character_large_hit_damage_taken_modifier(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "过度免疫") {
+        0.8
+    } else {
+        1.0
+    }
+}
+
+pub fn large_hit_damage_taken_multiplier(
+    max_hp: f32,
+    incoming_damage: f32,
+    large_hit_modifier: f32,
+) -> f32 {
+    if max_hp > 0.0 && incoming_damage > max_hp * 0.2 {
+        large_hit_modifier.max(0.0)
+    } else {
+        1.0
+    }
+}
+
+pub fn character_dying_healing_taken_modifier(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "生死时速") {
+        1.5
+    } else {
+        1.0
+    }
+}
+
+pub fn dying_healing_taken_multiplier(hp: f32, max_hp: f32, dying_healing_modifier: f32) -> f32 {
+    if max_hp > 0.0 && hp <= max_hp * 0.2 {
+        dying_healing_modifier.max(0.0)
+    } else {
+        1.0
+    }
+}
+
+pub fn character_wounded_healing_dealt_modifier(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "火源之力") {
+        1.2
+    } else {
+        1.0
+    }
+}
+
+pub fn wounded_healing_dealt_multiplier(
+    hp: f32,
+    max_hp: f32,
+    wounded_healing_modifier: f32,
+) -> f32 {
+    if max_hp <= 0.0 || wounded_healing_modifier <= 1.0 {
+        return 1.0;
+    }
+    if hp <= max_hp * 0.2 {
+        1.0
+    } else if hp <= max_hp * 0.6 {
+        1.0 + (wounded_healing_modifier - 1.0) * 0.5
+    } else {
+        wounded_healing_modifier
+    }
+}
+
+pub fn character_mutual_aid_healing_rate(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "互帮互助") {
+        0.5
+    } else {
+        0.0
+    }
+}
+
+pub fn upsert_character_active_buff(character: &mut PlayerCharacter, buff: BuffSpec) -> bool {
+    if let Some(existing) = character
+        .active_buffs
+        .iter_mut()
+        .find(|existing| existing.name == buff.name && existing.source_id == buff.source_id)
+    {
+        if *existing == buff {
+            return false;
+        }
+        *existing = buff;
+        true
+    } else {
+        character.active_buffs.push(buff);
+        true
+    }
+}
+
+pub fn character_has_approved_moonberry_talent(
+    character: &PlayerCharacter,
+    talent_name: &str,
+) -> bool {
+    character
+        .skill_metadata
+        .iter()
+        .enumerate()
+        .any(|(index, metadata)| {
+            metadata.is_approved()
+                && metadata.source == CharacterSkillSourceKind::Talent
+                && character
+                    .skill_names
+                    .get(index)
+                    .is_some_and(|name| name.trim() == talent_name)
+        })
+}
+
+fn moonberry_wound_buff(source_id: &str) -> BuffSpec {
+    BuffSpec {
+        name: "溃伤".to_owned(),
+        kind: BuffKind::Bleed,
+        priority: 0,
+        turns_remaining: 1,
+        source_id: format!("{source_id}:talent:溃伤"),
+        beneficial: false,
+        effects: vec![BuffEffect {
+            field: BuffField::HealingTakenModifier,
+            value: BuffValue::AddPercent(-25.0),
+        }],
+        tick_actions: Vec::new(),
+    }
+}
+
+pub fn status_damage_attribute_multiplier(
+    total: &CharacterStatus,
+    config: &TrpgBasicConfig,
+    kind: TrpgDamageBonusKind,
+) -> f32 {
+    match kind {
+        TrpgDamageBonusKind::Magical => 1.0 + total.int_ as f32 * config.int_damage_bonus,
+        TrpgDamageBonusKind::Physical => {
+            1.0 + total.str_ as f32 * config.str_damage_bonus
+                + (total.agi % 50) as f32 * config.agi_damage_bonus
+                + total.dex as f32 * config.dex_damage_bonus
+        },
+        TrpgDamageBonusKind::Range => 1.0 + total.dex as f32 * config.dex_range_damage_bonus,
+        TrpgDamageBonusKind::Other => 1.0,
+    }
+}
+
+pub fn low_hp_damage_multiplier(hp: f32, max_hp: f32) -> f32 {
+    if max_hp <= 0.0 {
+        return 0.0;
+    }
+    let missing_ratio = ((max_hp - hp) / max_hp).clamp(0.0, 1.0);
+    if hp > max_hp * 0.8 {
+        1.0
+    } else if hp > max_hp * 0.6 {
+        1.0 - 0.1 * missing_ratio
+    } else if hp > max_hp * 0.4 {
+        1.0 - 0.5 * missing_ratio
+    } else {
+        1.0 - missing_ratio
+    }
+}
+
+pub fn character_healing_attribute_multiplier(
+    character: &PlayerCharacter,
+    config: &TrpgBasicConfig,
+) -> f32 {
+    status_healing_attribute_multiplier(
+        &character_total_status(character),
+        config,
+    )
+}
+
+pub fn status_healing_attribute_multiplier(
+    total: &CharacterStatus,
+    config: &TrpgBasicConfig,
+) -> f32 {
+    1.0 + total.int_ as f32 * config.int_heal_bonus + total.wis as f32 * config.wis_heal_bonus
 }
 
 fn message_text(message: &NapcatMessage) -> String {
@@ -4765,6 +6950,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn skill_numeric_arg_values_keeps_only_numeric_values() {
+        let args = vec![
+            SkillPoolArg {
+                name: "伤害值".to_owned(),
+                kind: "数字".to_owned(),
+                value: "3.5".to_owned(),
+            },
+            SkillPoolArg {
+                name: "英文数字".to_owned(),
+                kind: "number".to_owned(),
+                value: "2".to_owned(),
+            },
+            SkillPoolArg {
+                name: "默认数字".to_owned(),
+                kind: String::new(),
+                value: "1".to_owned(),
+            },
+            SkillPoolArg {
+                name: "状态".to_owned(),
+                kind: "BUFF".to_owned(),
+                value: "守护".to_owned(),
+            },
+            SkillPoolArg {
+                name: "坏值".to_owned(),
+                kind: "数字".to_owned(),
+                value: "很多".to_owned(),
+            },
+        ];
+
+        assert_eq!(skill_numeric_arg_values(&args), vec![
+            ("伤害值".to_owned(), 3.5),
+            ("英文数字".to_owned(), 2.0),
+            ("默认数字".to_owned(), 1.0),
+        ]);
+    }
+
+    #[test]
+    fn skill_rule_args_keeps_textual_string_and_buff_values() {
+        let args = vec![
+            SkillPoolArg {
+                name: "伤害值".to_owned(),
+                kind: "数字".to_owned(),
+                value: "4".to_owned(),
+            },
+            SkillPoolArg {
+                name: "伤害类型".to_owned(),
+                kind: "字符串".to_owned(),
+                value: "远程".to_owned(),
+            },
+            SkillPoolArg {
+                name: "状态名".to_owned(),
+                kind: "BUFF".to_owned(),
+                value: "守护".to_owned(),
+            },
+            SkillPoolArg {
+                name: "默认文本".to_owned(),
+                kind: String::new(),
+                value: "魔法".to_owned(),
+            },
+            SkillPoolArg {
+                name: "空值".to_owned(),
+                kind: "字符串".to_owned(),
+                value: String::new(),
+            },
+        ];
+
+        assert_eq!(skill_rule_args(&args), SkillRuleArgs {
+            numeric_values: vec![("伤害值".to_owned(), 4.0)],
+            text_values: vec![
+                ("伤害类型".to_owned(), "远程".to_owned()),
+                ("状态名".to_owned(), "守护".to_owned()),
+                ("默认文本".to_owned(), "魔法".to_owned()),
+            ],
+        });
+    }
+
     fn completed_character(nickname: &str) -> PlayerCharacter {
         let mut character = PlayerCharacter {
             inited: true,
@@ -4843,6 +7105,364 @@ mod tests {
     }
 
     #[test]
+    fn trpg_group_merge_party_moves_players_and_access_scope() {
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("blue"));
+        group.set_player_party("4", Some("blue"));
+
+        assert!(group.merge_party("blue", "red"));
+
+        assert!(!group.parties.contains_key("blue"));
+        assert_eq!(
+            group.party_id_for_player("2"),
+            Some("red")
+        );
+        assert_eq!(
+            group.party_id_for_player("3"),
+            Some("red")
+        );
+        assert_eq!(
+            group.party_id_for_player("4"),
+            Some("red")
+        );
+        assert_eq!(group.parties["red"].players, vec![
+            "2".to_owned(),
+            "3".to_owned(),
+            "4".to_owned()
+        ]);
+        assert!(group
+            .player_access(3)
+            .can_read(&Visibility::Party("red".to_owned())));
+        assert!(!group
+            .player_access(3)
+            .can_read(&Visibility::Party("blue".to_owned())));
+    }
+
+    #[test]
+    fn trpg_group_remove_party_unassigns_players() {
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("red"));
+
+        assert!(group.remove_party("red"));
+
+        assert!(!group.parties.contains_key("red"));
+        assert_eq!(group.party_id_for_player("2"), None);
+        assert_eq!(group.party_id_for_player("3"), None);
+        assert!(!group
+            .player_access(2)
+            .can_read(&Visibility::Party("red".to_owned())));
+    }
+
+    #[test]
+    fn legacy_team_can_be_promoted_to_live_party_scope() {
+        let mut group = TrpgGroup {
+            players: vec!["10002".to_owned(), "10003".to_owned(), "10004".to_owned()],
+            legacy_teams: vec![TrpgLegacyTeam {
+                id: "1".to_owned(),
+                name: "红队频道".to_owned(),
+                players: vec!["10002".to_owned(), "10003".to_owned(), "99999".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        group.ensure_party("蓝队");
+        group.set_player_party("10004", Some("蓝队"));
+
+        assert!(group.promote_legacy_team_to_party("1"));
+
+        assert_eq!(
+            group.party_id_for_player("10002"),
+            Some("红队频道")
+        );
+        assert_eq!(
+            group.party_id_for_player("10003"),
+            Some("红队频道")
+        );
+        assert_eq!(
+            group.party_id_for_player("10004"),
+            Some("蓝队")
+        );
+        assert_eq!(group.parties["红队频道"].players, vec![
+            "10002".to_owned(),
+            "10003".to_owned()
+        ]);
+        assert!(
+            group.player_access(10002).can_read(&Visibility::Party(
+                "红队频道".to_owned()
+            ))
+        );
+        assert!(
+            !group.player_access(10004).can_read(&Visibility::Party(
+                "红队频道".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn legacy_team_chat_messages_can_append_gm_local_replies() {
+        let mut group = TrpgGroup {
+            players: vec!["10002".to_owned(), "10003".to_owned()],
+            legacy_teams: vec![TrpgLegacyTeam {
+                id: "1".to_owned(),
+                name: "红队频道".to_owned(),
+                players: vec!["10003".to_owned(), "10002".to_owned(), "missing".to_owned()],
+                chat_message_count: 3,
+                chat_messages: vec![TrpgLegacyTeamChatMessage {
+                    sender_id: "10002".to_owned(),
+                    sender_name: "红队".to_owned(),
+                    text: "旧消息".to_owned(),
+                    time: 1,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(group.legacy_team_members("1"), vec![
+            "10003".to_owned(),
+            "10002".to_owned()
+        ]);
+        assert!(
+            group.append_legacy_team_chat_message("1", TrpgLegacyTeamChatMessage {
+                sender_id: "gm".to_owned(),
+                sender_name: "GM".to_owned(),
+                text: "新的本地回复".to_owned(),
+                time: 2,
+            },)
+        );
+        assert_eq!(
+            group.legacy_teams[0].chat_messages.len(),
+            2
+        );
+        assert_eq!(
+            group.legacy_teams[0].chat_messages[1].text,
+            "新的本地回复"
+        );
+        assert_eq!(
+            group.legacy_teams[0].chat_message_count,
+            4
+        );
+        assert!(
+            !group.append_legacy_team_chat_message("1", TrpgLegacyTeamChatMessage {
+                text: "   ".to_owned(),
+                ..Default::default()
+            },)
+        );
+        assert!(
+            !group.append_legacy_team_chat_message("missing", TrpgLegacyTeamChatMessage {
+                text: "不会写入".to_owned(),
+                ..Default::default()
+            },)
+        );
+    }
+
+    #[test]
+    fn legacy_team_chat_messages_can_be_edited_and_removed_locally() {
+        let mut group = TrpgGroup {
+            legacy_teams: vec![TrpgLegacyTeam {
+                id: "1".to_owned(),
+                name: "红队频道".to_owned(),
+                chat_message_count: 3,
+                chat_messages: vec![
+                    TrpgLegacyTeamChatMessage {
+                        sender_id: "10002".to_owned(),
+                        sender_name: "红队".to_owned(),
+                        text: "旧消息".to_owned(),
+                        time: 1,
+                    },
+                    TrpgLegacyTeamChatMessage {
+                        sender_id: "gm".to_owned(),
+                        sender_name: "GM".to_owned(),
+                        text: "GM备注".to_owned(),
+                        time: 2,
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(group.update_legacy_team_chat_message("1", 0, "修订旧消息"));
+        assert_eq!(
+            group.legacy_teams[0].chat_messages[0].text,
+            "修订旧消息"
+        );
+        assert_eq!(
+            group.legacy_teams[0].chat_message_count,
+            3
+        );
+        assert!(!group.update_legacy_team_chat_message("1", 0, "修订旧消息"));
+        assert!(!group.update_legacy_team_chat_message("1", 0, "   "));
+        assert!(!group.update_legacy_team_chat_message("1", 9, "无效"));
+        assert!(!group.update_legacy_team_chat_message("missing", 0, "无效"));
+
+        assert!(group.remove_legacy_team_chat_message("1", 1));
+        assert_eq!(
+            group.legacy_teams[0].chat_messages.len(),
+            1
+        );
+        assert_eq!(
+            group.legacy_teams[0].chat_message_count,
+            2
+        );
+        assert_eq!(
+            group.legacy_teams[0].chat_messages[0].text,
+            "修订旧消息"
+        );
+        assert!(!group.remove_legacy_team_chat_message("1", 9));
+        assert!(!group.remove_legacy_team_chat_message("missing", 0));
+    }
+
+    #[test]
+    fn legacy_chat_area_can_be_promoted_to_live_party_scope() {
+        let mut group = TrpgGroup {
+            players: vec!["10002".to_owned(), "10003".to_owned(), "10004".to_owned()],
+            legacy_worlds: vec![TrpgLegacyWorld {
+                id: "world-a".to_owned(),
+                name: "旧世界".to_owned(),
+                chat_areas: vec![TrpgLegacyArea {
+                    id: "area-a".to_owned(),
+                    name: "密谈区".to_owned(),
+                    members: vec!["10003".to_owned(), "10004".to_owned(), "20001".to_owned()],
+                    combat: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(group.promote_legacy_chat_area_to_party("area-a"));
+
+        assert_eq!(group.party_id_for_player("10002"), None);
+        assert_eq!(
+            group.party_id_for_player("10003"),
+            Some("密谈区")
+        );
+        assert_eq!(
+            group.party_id_for_player("10004"),
+            Some("密谈区")
+        );
+        assert_eq!(group.parties["密谈区"].players, vec![
+            "10003".to_owned(),
+            "10004".to_owned()
+        ]);
+        assert!(!group.promote_legacy_chat_area_to_party("missing"));
+    }
+
+    #[test]
+    fn legacy_send_pane_target_editing_post_processes_old_multi_select() {
+        let mut group = TrpgGroup {
+            players: vec!["10002".to_owned(), "10003".to_owned(), "10004".to_owned()],
+            legacy_teams: vec![TrpgLegacyTeam {
+                id: "1".to_owned(),
+                name: "红队频道".to_owned(),
+                players: vec!["10002".to_owned(), "10003".to_owned()],
+                ..Default::default()
+            }],
+            legacy_worlds: vec![TrpgLegacyWorld {
+                id: "world-a".to_owned(),
+                name: "旧世界".to_owned(),
+                chat_areas: vec![TrpgLegacyArea {
+                    id: "area-a".to_owned(),
+                    name: "密谈区".to_owned(),
+                    members: vec!["10003".to_owned(), "10004".to_owned()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            legacy_send_panes: vec![TrpgLegacySendPane {
+                key: "7".to_owned(),
+                title: "多选发送".to_owned(),
+                targets: vec!["10003".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(group.set_legacy_send_pane_target("7", "10002", true));
+        assert_eq!(
+            group.legacy_send_panes[0].targets,
+            vec!["10003".to_owned(), "10002".to_owned(),]
+        );
+
+        assert!(group.set_legacy_send_pane_target("7", "1", true));
+        assert_eq!(
+            group.legacy_send_panes[0].targets,
+            vec!["1".to_owned()]
+        );
+        assert!(group.legacy_send_pane_direct_target_is_covered("7", "10003"));
+        assert!(!group.set_legacy_send_pane_target("7", "10003", true));
+
+        assert!(group.set_legacy_send_pane_target("7", "area-a", true));
+        assert_eq!(
+            group.legacy_send_panes[0].targets,
+            vec!["1".to_owned(), "area-a".to_owned(),]
+        );
+        assert!(group.legacy_send_pane_direct_target_is_covered("7", "10004"));
+
+        assert!(group.set_legacy_send_pane_target("7", "0", true));
+        assert_eq!(
+            group.legacy_send_panes[0].targets,
+            vec!["0".to_owned()]
+        );
+        assert!(group.legacy_send_pane_direct_target_is_covered("7", "10002"));
+        assert!(!group.set_legacy_send_pane_target("7", "area-a", true));
+
+        assert!(group.set_legacy_send_pane_target("7", "0", false));
+        assert!(group.legacy_send_panes[0].targets.is_empty());
+    }
+
+    #[test]
+    fn legacy_send_pane_can_be_added_removed_and_cleared() {
+        let mut group = TrpgGroup {
+            legacy_send_panes: vec![
+                TrpgLegacySendPane {
+                    key: "0".to_owned(),
+                    title: "固定窗".to_owned(),
+                    targets: vec!["10002".to_owned()],
+                    closable: false,
+                },
+                TrpgLegacySendPane {
+                    key: "1".to_owned(),
+                    title: "可关窗".to_owned(),
+                    targets: vec!["10003".to_owned()],
+                    closable: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            group.add_legacy_send_pane(""),
+            Some("2".to_owned())
+        );
+        assert_eq!(
+            group.legacy_send_panes[2].title,
+            "多选发送"
+        );
+        assert!(group.set_legacy_send_pane_target("2", "0", true));
+        assert!(group.clear_legacy_send_pane_targets("2"));
+        assert!(group.legacy_send_panes[2].targets.is_empty());
+
+        assert!(!group.remove_legacy_send_pane("0"));
+        assert!(group.remove_legacy_send_pane("1"));
+        assert!(group.legacy_send_pane("1").is_none());
+        assert!(group.legacy_send_pane("0").is_some());
+    }
+
+    #[test]
     fn trpg_group_defaults_preserve_moonberry_creation_points() {
         let group = TrpgGroup::default();
 
@@ -4858,6 +7478,13 @@ mod tests {
             group.basic_config,
             TrpgBasicConfig::default()
         );
+        assert_eq!(group.run_times, 0);
+        assert!(group.battle_sort_by_turn);
+        assert!(!group.battle_negative_enabled);
+        assert_eq!(group.legacy_negative_count, 0);
+        assert!(group.legacy_teams.is_empty());
+        assert!(group.legacy_worlds.is_empty());
+        assert!(group.legacy_send_panes.is_empty());
         assert!(group.allow_join_requests);
 
         let legacy_group = serde_json::from_value::<TrpgGroup>(serde_json::json!({
@@ -4877,6 +7504,13 @@ mod tests {
             legacy_group.basic_config,
             TrpgBasicConfig::default()
         );
+        assert_eq!(legacy_group.run_times, 0);
+        assert!(legacy_group.battle_sort_by_turn);
+        assert!(!legacy_group.battle_negative_enabled);
+        assert_eq!(legacy_group.legacy_negative_count, 0);
+        assert!(legacy_group.legacy_teams.is_empty());
+        assert!(legacy_group.legacy_worlds.is_empty());
+        assert!(legacy_group.legacy_send_panes.is_empty());
         assert!(legacy_group.allow_join_requests);
     }
 
@@ -4932,6 +7566,85 @@ mod tests {
             message.data.party_id.as_deref(),
             Some("red")
         );
+    }
+
+    #[test]
+    fn visible_messages_for_player_filters_split_party_group_chat() {
+        let mut manager = empty_manager();
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
+            group_chats: vec!["99".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("blue"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        let messages = vec![
+            test_message_with_text(NapcatMessageType::Group, "red clue"),
+            {
+                let mut message = test_message_with_text(NapcatMessageType::Group, "blue clue");
+                message.data.user_id = 3;
+                message.data.sender.user_id = 3;
+                message
+            },
+            {
+                let mut message = test_message_with_text(NapcatMessageType::Group, "public clue");
+                message.data.user_id = 4;
+                message.data.sender.user_id = 4;
+                message
+            },
+        ];
+
+        let red_text = manager
+            .visible_messages_for_player("99", &messages, 2)
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>();
+        let blue_text = manager
+            .visible_messages_for_player("99", &messages, 3)
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(red_text, vec![
+            "red clue".to_owned(),
+            "public clue".to_owned()
+        ]);
+        assert_eq!(blue_text, vec![
+            "blue clue".to_owned(),
+            "public clue".to_owned()
+        ]);
+    }
+
+    #[test]
+    fn visible_messages_for_player_keeps_private_local_replies_for_recipient() {
+        let mut manager = empty_manager();
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message_from(2, "player asks"),
+        ]);
+        append_local_private_text_response(&mut manager, "2", 2, "private answer");
+        let messages = manager.messages["2"].clone();
+
+        let player_two_text = manager
+            .visible_messages_for_player("2", &messages, 2)
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>();
+        let player_three_text = manager
+            .visible_messages_for_player("2", &messages, 3)
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(player_two_text, vec![
+            "player asks".to_owned(),
+            "private answer".to_owned()
+        ]);
+        assert!(player_three_text.is_empty());
     }
 
     #[test]
@@ -5280,6 +7993,7 @@ mod tests {
             .insert("zombie".to_owned(), UnitPoolEntry {
                 label: "行尸".to_owned(),
                 note: "缓慢近战单位".to_owned(),
+                legacy_member_id: None,
                 character: completed_character("行尸"),
             });
         manager
@@ -5287,6 +8001,7 @@ mod tests {
             .insert("archer".to_owned(), UnitPoolEntry {
                 label: "弓手".to_owned(),
                 note: "远程单位".to_owned(),
+                legacy_member_id: None,
                 character: completed_character("弓手"),
             });
         manager.messages.insert("2".to_owned(), vec![test_message(
@@ -5319,16 +8034,71 @@ mod tests {
     }
 
     #[test]
+    fn unit_pool_legacy_member_ids_resolve_world_npc_template_ids() {
+        let mut manager = empty_manager();
+        manager
+            .unit_pool
+            .insert("direct".to_owned(), UnitPoolEntry {
+                label: "直接单位".to_owned(),
+                note: String::new(),
+                legacy_member_id: None,
+                character: completed_character("直接单位"),
+            });
+        manager
+            .unit_pool
+            .insert("alias-b".to_owned(), UnitPoolEntry {
+                label: "别名B".to_owned(),
+                note: String::new(),
+                legacy_member_id: Some("20001".to_owned()),
+                character: completed_character("别名B"),
+            });
+        manager
+            .unit_pool
+            .insert("alias-a".to_owned(), UnitPoolEntry {
+                label: "别名A".to_owned(),
+                note: String::new(),
+                legacy_member_id: Some("20001".to_owned()),
+                character: completed_character("别名A"),
+            });
+        manager.unit_pool.insert(
+            "moonberry-unit-30001".to_owned(),
+            UnitPoolEntry {
+                label: "旧兼容单位".to_owned(),
+                note: String::new(),
+                legacy_member_id: None,
+                character: completed_character("旧兼容单位"),
+            },
+        );
+
+        let resolved = manager.unit_pool_ids_for_legacy_members(&[
+            "direct".to_owned(),
+            "20001".to_owned(),
+            "30001".to_owned(),
+            "missing".to_owned(),
+            "20001".to_owned(),
+        ]);
+
+        assert_eq!(resolved, vec![
+            "direct".to_owned(),
+            "alias-a".to_owned(),
+            "alias-b".to_owned(),
+            "moonberry-unit-30001".to_owned(),
+        ]);
+    }
+
+    #[test]
     fn unit_pool_export_json_merges_by_unit_id_without_chat_data() {
         let mut source = empty_manager();
         source.unit_pool.insert("archer".to_owned(), UnitPoolEntry {
             label: "新弓手".to_owned(),
             note: "导入版本".to_owned(),
+            legacy_member_id: None,
             character: completed_character("新弓手"),
         });
         source.unit_pool.insert("zombie".to_owned(), UnitPoolEntry {
             label: "行尸".to_owned(),
             note: "缓慢近战单位".to_owned(),
+            legacy_member_id: None,
             character: completed_character("行尸"),
         });
         let json = source.to_unit_pool_export_json().unwrap();
@@ -5342,6 +8112,7 @@ mod tests {
             .insert("archer".to_owned(), UnitPoolEntry {
                 label: "旧弓手".to_owned(),
                 note: "本地旧版本".to_owned(),
+                legacy_member_id: None,
                 character: completed_character("旧弓手"),
             });
 
@@ -5383,15 +8154,63 @@ mod tests {
     }
 
     #[test]
+    fn moonberry_legacy_team_chat_messages_preserve_local_timeline_excerpts() {
+        let chats = vec![serde_json::json!({
+            "type": "FriendMessage",
+            "sender": {
+                "id": 10001,
+                "nickname": "星见QQ",
+                "memberName": "星见"
+            },
+            "messageChain": [{
+                "type": "Source",
+                "id": 9,
+                "time": 789
+            }, {
+                "type": "Plain",
+                "text": "频道内行动"
+            }, {
+                "type": "Image",
+                "url": "https://example.test/scene.png",
+                "imageId": "scene-img"
+            }, {
+                "type": "At",
+                "target": 10002
+            }]
+        })];
+
+        assert_eq!(
+            moonberry_legacy_team_chat_messages(&chats),
+            vec![TrpgLegacyTeamChatMessage {
+                sender_id: "10001".to_owned(),
+                sender_name: "星见".to_owned(),
+                text: "频道内行动 [图片:https://example.test/scene.png] [At]".to_owned(),
+                time: 789,
+            }]
+        );
+    }
+
+    #[test]
     fn moonberry_legacy_root_import_merges_groups_pcs_units_and_messages() {
         let legacy = r#"{
             "discriminator": "Root",
             "currentGroup": 0,
+            "config": {
+                "orderByTurn": false,
+                "negative": true
+            },
             "groups": [{
                 "name": "旧团",
                 "description": "公开说明",
                 "stDesc": "GM说明",
                 "guide": "旧入团指南",
+                "runTimes": 3,
+                "negative": [{
+                    "Id": 10001,
+                    "remain": 1200,
+                    "reply": false,
+                    "idx": 0
+                }],
                 "basicConfig": {
                     "initStatusPoint": 7,
                     "initExchangePoint": 8,
@@ -5437,6 +8256,8 @@ mod tests {
                     "healModify": 1.1,
                     "tDMGModify": 0.9,
                     "tHealModify": 1.3,
+                    "tdpt": 4,
+                    "thpt": 2,
                     "status": {
                         "str": 1,
                         "agi": 2,
@@ -5492,6 +8313,83 @@ mod tests {
                     "nickName": "星见QQ",
                     "lastWords": "hi",
                     "notReadCount": 2
+                }],
+                "currentTeams": [{
+                    "name": "红队频道",
+                    "Id": 1,
+                    "visible": true,
+                    "bounds": {
+                        "x": 12,
+                        "y": 34
+                    },
+                    "size": {
+                        "width": 320,
+                        "height": 240
+                    },
+                    "allowPcNicknameRepeat": true,
+                    "nemo": true,
+                    "buff": [{}],
+                    "chat": [{
+                        "type": "FriendMessage",
+                        "sender": {
+                            "id": 10001,
+                            "nickname": "星见QQ",
+                            "memberName": "星见"
+                        },
+                        "messageChain": [{
+                            "type": "Source",
+                            "id": 8,
+                            "time": 456
+                        }, {
+                            "type": "Plain",
+                            "text": "旧频道消息"
+                        }, {
+                            "type": "Image",
+                            "url": "https://example.test/a.png",
+                            "imageId": "img-a"
+                        }]
+                    }],
+                    "pcs": [{
+                        "Id": 10001,
+                        "nickname": "星见"
+                    }]
+                }],
+                "currentWorlds": [{
+                    "Id": "world-a",
+                    "visible": true,
+                    "world": {
+                        "name": "旧世界",
+                        "PcNumbers": [10001],
+                        "NpcNumbers": [20001],
+                        "chatAreas": [{
+                            "id": "area-a",
+                            "name": "密谈区",
+                            "x": 1,
+                            "y": 2,
+                            "width": 3,
+                            "height": 4,
+                            "member": [10001],
+                            "combat": true
+                        }],
+                        "Areas": [{
+                            "id": "area-b",
+                            "name": "公开区",
+                            "x": 5,
+                            "y": 6,
+                            "width": 7,
+                            "height": 8,
+                            "member": [10001],
+                            "combat": false
+                        }]
+                    }
+                }],
+                "currentSendPanes": [{
+                    "title": "红队发送窗",
+                    "key": 7,
+                    "closable": false,
+                    "sendTo": {
+                        "targets": [1, "area-a", 10001]
+                    }
                 }],
                 "chatMsg": [{
                     "type": "FriendMessage",
@@ -5555,6 +8453,7 @@ mod tests {
                 "name": "遭遇随机",
                 "group": 0,
                 "tags": "探索",
+                "createdAt": "2024-01-02 03:04:05",
                 "desc": "旧随机池",
                 "IRandomItem": [{
                     "key": "陷阱",
@@ -5576,6 +8475,11 @@ mod tests {
         assert_eq!(summary.skill_pools, 1);
         assert_eq!(summary.unit_templates, 1);
         assert_eq!(summary.random_pools, 1);
+        assert_eq!(summary.legacy_teams, 1);
+        assert_eq!(summary.legacy_worlds, 1);
+        assert_eq!(summary.legacy_chat_areas, 2);
+        assert_eq!(summary.legacy_send_panes, 1);
+        assert_eq!(summary.legacy_negative_timers, 1);
         assert_eq!(
             manager.current_trpg_group.as_deref(),
             Some("旧团")
@@ -5594,6 +8498,88 @@ mod tests {
         assert_eq!(group.basic_config.wis_max_mp, 3.0);
         assert_eq!(group.basic_config.basic_speed, 2.0);
         assert_eq!(group.basic_config.agi_speed, 1.5);
+        assert_eq!(group.run_times, 3);
+        assert!(!group.battle_sort_by_turn);
+        assert!(group.battle_negative_enabled);
+        assert_eq!(group.legacy_negative_count, 1);
+        assert_eq!(group.legacy_negative_timers.len(), 1);
+        assert_eq!(
+            group.legacy_negative_timers[0],
+            TrpgLegacyNegativeTimer {
+                target_id: "10001".to_owned(),
+                remaining_ms: 1200,
+                replied: false,
+                generation: 0,
+                half_warned: false,
+                negative_layers: 0,
+            }
+        );
+        assert_eq!(group.legacy_teams.len(), 1);
+        assert_eq!(group.legacy_teams[0].id, "1");
+        assert_eq!(group.legacy_teams[0].name, "红队频道");
+        assert!(group.legacy_teams[0].allow_pc_nickname_repeat);
+        assert!(group.legacy_teams[0].anonymous_speakers);
+        assert_eq!(group.legacy_teams[0].buff_count, 1);
+        assert_eq!(group.legacy_teams[0].window_x, 12.0);
+        assert_eq!(group.legacy_teams[0].window_y, 34.0);
+        assert_eq!(
+            group.legacy_teams[0].window_width,
+            320.0
+        );
+        assert_eq!(
+            group.legacy_teams[0].window_height,
+            240.0
+        );
+        assert_eq!(
+            group.legacy_teams[0].chat_message_count,
+            1
+        );
+        assert_eq!(
+            group.legacy_teams[0].chat_messages,
+            vec![TrpgLegacyTeamChatMessage {
+                sender_id: "10001".to_owned(),
+                sender_name: "星见".to_owned(),
+                text: "旧频道消息 [图片:https://example.test/a.png]".to_owned(),
+                time: 456,
+            }]
+        );
+        assert_eq!(group.legacy_teams[0].players, vec![
+            "10001".to_owned()
+        ]);
+        assert_eq!(group.legacy_worlds.len(), 1);
+        assert_eq!(group.legacy_worlds[0].id, "world-a");
+        assert_eq!(group.legacy_worlds[0].name, "旧世界");
+        assert_eq!(group.legacy_worlds[0].players, vec![
+            "10001".to_owned()
+        ]);
+        assert_eq!(group.legacy_worlds[0].npcs, vec![
+            "20001".to_owned()
+        ]);
+        assert_eq!(
+            group.legacy_worlds[0].chat_areas.len(),
+            1
+        );
+        assert_eq!(
+            group.legacy_worlds[0].chat_areas[0].id,
+            "area-a"
+        );
+        assert!(group.legacy_worlds[0].chat_areas[0].combat);
+        assert_eq!(group.legacy_worlds[0].areas.len(), 1);
+        assert_eq!(
+            group.legacy_worlds[0].areas[0].id,
+            "area-b"
+        );
+        assert_eq!(group.legacy_send_panes.len(), 1);
+        assert_eq!(group.legacy_send_panes[0].key, "7");
+        assert_eq!(
+            group.legacy_send_panes[0].title,
+            "红队发送窗"
+        );
+        assert!(!group.legacy_send_panes[0].closable);
+        assert_eq!(
+            group.legacy_send_pane_members("7"),
+            vec!["10001".to_owned()]
+        );
         assert!(group.players.contains(&"10001".to_owned()));
         assert_eq!(
             manager.chat_targets["10001"].display_name,
@@ -5609,6 +8595,8 @@ mod tests {
         );
         assert_eq!(character.status.agi, 2);
         assert_eq!(character.extra_status.str_, 1);
+        assert_eq!(character.damage_taken_this_turn, 4.0);
+        assert_eq!(character.healing_taken_this_turn, 2.0);
         assert_eq!(character.skill_names, vec!["护盾"]);
         assert_eq!(character.skill_mp_costs, vec![2.0]);
         assert_eq!(character.skill_cooldown_turns, vec![1]);
@@ -5659,6 +8647,12 @@ mod tests {
             "护盾值"
         );
         assert!(character.skill_metadata[0].legacy_has_buff_machine);
+        assert_eq!(
+            character.skill_metadata[0]
+                .legacy_buff_machine_json
+                .as_deref(),
+            Some("{\"技能释放\":[]}")
+        );
         assert_eq!(manager.messages["10001"].len(), 1);
         assert_eq!(
             manager.messages["10001"][0].data.time,
@@ -5674,10 +8668,25 @@ mod tests {
         );
         assert!(manager.unit_pool["unit-old"].note.contains("旧单位"));
         assert_eq!(
+            manager.unit_pool["unit-old"].legacy_member_id.as_deref(),
+            Some("20001")
+        );
+        assert_eq!(
             manager.unit_pool["unit-old"].character.max_hp,
             5.0
         );
         let random_pool = &manager.random_pools["遭遇随机"];
+        assert_eq!(
+            random_pool.legacy_pool_id.as_deref(),
+            Some("random-old")
+        );
+        assert_eq!(random_pool.legacy_group, Some(0));
+        assert_eq!(random_pool.tags, "探索");
+        assert_eq!(random_pool.description, "旧随机池");
+        assert_eq!(
+            random_pool.created_at,
+            "2024-01-02 03:04:05"
+        );
         assert_eq!(random_pool.entries.len(), 1);
         assert_eq!(random_pool.entries[0].item.name, "陷阱");
         assert_eq!(
@@ -5708,6 +8717,18 @@ mod tests {
         assert_eq!(skill_pool.legacy_buff_count, 1);
         assert_eq!(skill_pool.legacy_event_buff_count, 1);
         assert!(skill_pool.legacy_has_graph);
+        assert_eq!(
+            skill_pool.legacy_buff_json.as_deref(),
+            Some("[{}]")
+        );
+        assert_eq!(
+            skill_pool.legacy_event_buff_json.as_deref(),
+            Some("[{}]")
+        );
+        assert_eq!(
+            skill_pool.legacy_graph_json.as_deref(),
+            Some("{\"nodes\":[]}")
+        );
     }
 
     #[test]
@@ -5875,6 +8896,15 @@ mod tests {
             completed_character("晨星"),
         );
 
+        assert_eq!(NORMAL_TALENT_POOL.len(), 45);
+        assert_eq!(SUPPORT_TALENT_POOL.len(), 29);
+        assert!(NORMAL_TALENT_POOL
+            .iter()
+            .any(|talent| talent.name == "役于我手"));
+        assert!(SUPPORT_TALENT_POOL
+            .iter()
+            .any(|talent| talent.name == "世界之血"));
+
         let normal_response = handle_character_creation_message(
             &mut manager,
             &test_message_with_text(NapcatMessageType::Private, ".抽取天赋"),
@@ -5893,14 +8923,19 @@ mod tests {
         let character = manager.player_characters.get("2").unwrap();
 
         assert!(normal_response.contains("抽取天赋"));
-        assert!(support_response.contains("抽取辅助天赋"));
-        assert_eq!(character.skill_names.len(), 2);
-        assert_eq!(character.skill_notes.len(), 2);
-        assert_eq!(character.skill_mp_costs, vec![0.0, 0.0]);
-        assert_eq!(character.skill_cooldown_turns, vec![
-            0, 0
-        ]);
-        assert_eq!(character.skill_metadata.len(), 2);
+        assert!(normal_response.contains("已加入已兑换技能。"));
+        assert!(support_response.contains("你已经抽过了"));
+        assert_eq!(character.skill_names.len(), 1);
+        assert!(NORMAL_TALENT_POOL
+            .iter()
+            .any(|talent| talent.name == character.skill_names[0]));
+        assert!(NORMAL_TALENT_POOL
+            .iter()
+            .any(|talent| character.skill_notes[0] == talent_note(talent)));
+        assert_eq!(character.skill_notes.len(), 1);
+        assert_eq!(character.skill_mp_costs, vec![0.0]);
+        assert_eq!(character.skill_cooldown_turns, vec![0]);
+        assert_eq!(character.skill_metadata.len(), 1);
         assert_eq!(
             character.skill_metadata[0].source,
             CharacterSkillSourceKind::Talent
@@ -5909,8 +8944,142 @@ mod tests {
             character.skill_metadata[0].source_pool_id.as_deref(),
             Some("normal_talent")
         );
+    }
+
+    #[test]
+    fn immediate_moonberry_talent_effects_update_character_stats() {
+        let namek_talent = NORMAL_TALENT_POOL
+            .iter()
+            .find(|talent| talent.name == "那美克星之慧")
+            .unwrap();
+        let physics_talent = NORMAL_TALENT_POOL
+            .iter()
+            .find(|talent| talent.name == "物理专长")
+            .unwrap();
+        let mut character = PlayerCharacter {
+            inited: true,
+            level: 3,
+            status: CharacterStatus {
+                k: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let namek_effect = apply_moonberry_immediate_talent_effect(
+            &mut character,
+            namek_talent,
+            &TrpgBasicConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(character.extra_status.k, 6);
+        assert!(namek_effect.contains("知识额外值 +6"));
+
+        let physics_effect = apply_moonberry_immediate_talent_effect(
+            &mut character,
+            physics_talent,
+            &TrpgBasicConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(character.status.k, 2);
+        assert!(physics_effect.contains("知识基础值提升到2"));
         assert_eq!(
-            character.skill_metadata[1].source_pool_id.as_deref(),
+            moonberry_talent_trigger(namek_talent),
+            Some("常驻")
+        );
+        assert_eq!(
+            moonberry_talent_effect_summary(namek_talent),
+            Some("立即获得等级*2的知识额外值")
+        );
+    }
+
+    #[test]
+    fn moonberry_talent_metadata_covers_all_preserved_talents() {
+        for talent in NORMAL_TALENT_POOL.iter().chain(SUPPORT_TALENT_POOL.iter()) {
+            assert!(
+                moonberry_talent_trigger(talent).is_some(),
+                "missing trigger metadata for {}",
+                talent.name
+            );
+            assert!(
+                moonberry_talent_effect_summary(talent).is_some(),
+                "missing effect metadata for {}",
+                talent.name
+            );
+        }
+    }
+
+    #[test]
+    fn private_talent_draw_applies_immediate_knowledge_effect_metadata() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "2".to_owned(),
+            completed_character("晨星"),
+        );
+        let talent_index = NORMAL_TALENT_POOL
+            .iter()
+            .position(|talent| talent.name == "那美克星之慧")
+            .unwrap();
+        let message_time = (0..20_000)
+            .find(|time| {
+                stable_talent_index(
+                    "2",
+                    "天赋",
+                    *time,
+                    NORMAL_TALENT_POOL.len(),
+                ) == talent_index
+            })
+            .unwrap();
+        let mut message = test_message_with_text(NapcatMessageType::Private, ".抽取天赋");
+        message.data.time = message_time;
+
+        let response = handle_character_creation_message(&mut manager, &message, "2").unwrap();
+        let character = manager.player_characters.get("2").unwrap();
+
+        assert!(response.contains("知识额外值 +2"));
+        assert_eq!(character.extra_status.k, 2);
+        assert_eq!(character.skill_names, vec![
+            "那美克星之慧".to_owned()
+        ]);
+        assert_eq!(
+            character.skill_metadata[0].talent_trigger.as_deref(),
+            Some("常驻")
+        );
+        assert_eq!(
+            character.skill_metadata[0].talent_effect.as_deref(),
+            Some("立即获得等级*2的知识额外值")
+        );
+    }
+
+    #[test]
+    fn private_support_talent_draw_uses_old_support_pool() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "2".to_owned(),
+            completed_character("晨星"),
+        );
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(
+                NapcatMessageType::Private,
+                ".抽取辅助天赋",
+            ),
+            "2",
+        )
+        .unwrap();
+        let character = manager.player_characters.get("2").unwrap();
+
+        assert!(response.contains("抽取辅助天赋"));
+        assert_eq!(character.skill_names.len(), 1);
+        assert!(SUPPORT_TALENT_POOL
+            .iter()
+            .any(|talent| talent.name == character.skill_names[0]));
+        assert!(SUPPORT_TALENT_POOL
+            .iter()
+            .any(|talent| character.skill_notes[0] == talent_note(talent)));
+        assert_eq!(
+            character.skill_metadata[0].source_pool_id.as_deref(),
             Some("support_talent")
         );
     }
@@ -5936,6 +9105,32 @@ mod tests {
             })]),
             ..Default::default()
         });
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".冷却"),
+            "2",
+        )
+        .unwrap();
+
+        assert!(response.contains("护盾：还剩2轮"));
+    }
+
+    #[test]
+    fn private_cooldown_command_reports_imported_cooldown_left() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("2".to_owned(), PlayerCharacter {
+                inited: true,
+                nickname: "晨星".to_owned(),
+                skill_names: vec!["护盾".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata {
+                    cooldown_left: Some(2),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
 
         let response = handle_character_creation_message(
             &mut manager,
@@ -6032,6 +9227,16 @@ mod tests {
                 skill_notes: vec!["主动使用对目标造成4点物理伤害".to_owned()],
                 skill_mp_costs: vec![2.0],
                 skill_cooldown_turns: vec![3],
+                skill_metadata: vec![CharacterSkillMetadata {
+                    args: vec![SkillPoolArg {
+                        name: "伤害".to_owned(),
+                        kind: "数字".to_owned(),
+                        value: "4".to_owned(),
+                    }],
+                    legacy_has_buff_machine: true,
+                    legacy_buff_machine_json: Some(r#"{"技能释放":[{"id":"n1"}]}"#.to_owned()),
+                    ..Default::default()
+                }],
                 ..Default::default()
             });
         manager
@@ -6053,6 +9258,13 @@ mod tests {
         );
         assert_eq!(entry.mp_cost, 2.0);
         assert_eq!(entry.cooldown_turns, 3);
+        assert_eq!(entry.args.len(), 1);
+        assert_eq!(entry.args[0].name, "伤害");
+        assert!(entry.legacy_has_graph);
+        assert_eq!(
+            entry.legacy_buff_machine_json.as_deref(),
+            Some(r#"{"技能释放":[{"id":"n1"}]}"#)
+        );
         assert_eq!(
             entry.source_character_id.as_deref(),
             Some("player-1")
@@ -6570,6 +9782,57 @@ mod tests {
     }
 
     #[test]
+    fn private_exchange_skill_submission_waits_for_gm_approval() {
+        let mut manager = empty_manager();
+        let target_id = "2";
+
+        handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            target_id,
+        );
+        for value in ["2", "1", "1", "1"] {
+            handle_character_creation_message(
+                &mut manager,
+                &test_message_with_text(NapcatMessageType::Private, value),
+                target_id,
+            );
+        }
+        handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "."),
+            target_id,
+        );
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(
+                NapcatMessageType::Private,
+                "主动使用对目标造成2点物理伤害",
+            ),
+            target_id,
+        )
+        .unwrap();
+        assert!(response.contains("等待GM确认"));
+        let character = manager.player_characters.get(target_id).unwrap();
+        assert_eq!(character.skill_notes.len(), 1);
+        assert!(character.skill_metadata[0].pc_approved);
+        assert!(!character.skill_metadata[0].st_approved);
+        assert!(format_private_character_skills(&manager, target_id).contains("GM待确认"));
+
+        for value in [".", ".", "柳生"] {
+            handle_character_creation_message(
+                &mut manager,
+                &test_message_with_text(NapcatMessageType::Private, value),
+                target_id,
+            );
+        }
+        assert!(manager.player_characters[target_id].inited);
+        assert!(!manager.sync_skill_pool_from_completed_characters());
+        assert!(manager.skill_pool.is_empty());
+    }
+
+    #[test]
     fn private_exchange_command_uses_current_group_creation_config() {
         let mut manager = empty_manager();
         let target_id = "2";
@@ -6677,6 +9940,466 @@ mod tests {
         assert_eq!(character.mp, 63.0);
         assert_eq!(character.mp_regen, 3.5);
         assert_eq!(character.speed, 10.0);
+    }
+
+    #[test]
+    fn moonberry_experience_thresholds_and_grants_level_with_carryover() {
+        assert_eq!(character_next_level_exp(1), 100);
+        assert_eq!(character_next_level_exp(2), 125);
+        assert_eq!(character_next_level_exp(3), 175);
+        assert_eq!(character_next_level_exp(0), 100);
+
+        let mut character = PlayerCharacter {
+            level: 1,
+            exp: 90,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            grant_character_experience(&mut character, 40),
+            1
+        );
+        assert_eq!(character.level, 2);
+        assert_eq!(character.exp, 30);
+
+        assert_eq!(
+            grant_character_experience(&mut character, 500),
+            2
+        );
+        assert_eq!(character.level, 4);
+        assert_eq!(character.exp, 230);
+
+        assert_eq!(
+            grant_character_experience(&mut character, 0),
+            0
+        );
+        assert_eq!(character.level, 4);
+        assert_eq!(character.exp, 230);
+    }
+
+    #[test]
+    fn basic_config_applies_moonberry_damage_and_heal_attribute_multipliers() {
+        let character = PlayerCharacter {
+            status: CharacterStatus {
+                str_: 10,
+                agi: 51,
+                dex: 5,
+                int_: 4,
+                wis: 6,
+                ..Default::default()
+            },
+            extra_status: CharacterStatus {
+                str_: 2,
+                agi: 3,
+                dex: 1,
+                int_: 1,
+                wis: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = TrpgBasicConfig {
+            str_damage_bonus: 0.1,
+            agi_damage_bonus: 0.2,
+            dex_damage_bonus: 0.3,
+            int_damage_bonus: 0.4,
+            dex_range_damage_bonus: 0.5,
+            int_heal_bonus: 0.6,
+            wis_heal_bonus: 0.7,
+            ..Default::default()
+        };
+
+        assert!(
+            (character_damage_attribute_multiplier(
+                &character,
+                &config,
+                TrpgDamageBonusKind::Magical,
+            ) - 3.0)
+                .abs()
+                < f32::EPSILON
+        );
+        let mut mage = character.clone();
+        mage.skill_names.push("大魔法师".to_owned());
+        mage.skill_metadata.push(CharacterSkillMetadata::talent(
+            "normal_talent",
+            "天赋",
+        ));
+        assert!(
+            (character_damage_attribute_multiplier(
+                &mage,
+                &config,
+                TrpgDamageBonusKind::Magical,
+            ) - 3.025)
+                .abs()
+                < 0.0001
+        );
+        assert!(
+            (character_damage_attribute_multiplier(
+                &mage,
+                &config,
+                TrpgDamageBonusKind::Physical,
+            ) - 4.8)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (character_damage_attribute_multiplier(
+                &mage,
+                &config,
+                TrpgDamageBonusKind::Range,
+            ) - 4.0)
+                .abs()
+                < f32::EPSILON
+        );
+        mage.skill_metadata[0].st_approved = false;
+        assert!(
+            (character_damage_attribute_multiplier(
+                &mage,
+                &config,
+                TrpgDamageBonusKind::Magical,
+            ) - 3.0)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (character_damage_taken_attribute_multiplier(
+                &character,
+                TrpgDamageTakenKind::Diseased
+            ) - 1.0)
+                .abs()
+                < f32::EPSILON
+        );
+        let mut human = character.clone();
+        human.skill_names.push("人类基因工程".to_owned());
+        human.skill_metadata.push(CharacterSkillMetadata::talent(
+            "normal_talent",
+            "天赋",
+        ));
+        assert!(
+            (character_damage_taken_attribute_multiplier(&human, TrpgDamageTakenKind::Diseased)
+                - 0.85)
+                .abs()
+                < 0.0001
+        );
+        assert!(
+            (character_damage_taken_attribute_multiplier(&human, TrpgDamageTakenKind::Poisoning)
+                - 0.85)
+                .abs()
+                < 0.0001
+        );
+        assert!(
+            (character_damage_taken_attribute_multiplier(&human, TrpgDamageTakenKind::Magical)
+                - 1.0)
+                .abs()
+                < f32::EPSILON
+        );
+        let mut anti_magic = character.clone();
+        anti_magic.skill_names.push("抗魔体质".to_owned());
+        anti_magic
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            ));
+        assert!(
+            (character_damage_taken_attribute_multiplier(
+                &anti_magic,
+                TrpgDamageTakenKind::Magical,
+            ) - 0.9)
+                .abs()
+                < 0.0001
+        );
+        anti_magic.skill_metadata[0].st_approved = false;
+        assert!(
+            (character_damage_taken_attribute_multiplier(
+                &anti_magic,
+                TrpgDamageTakenKind::Magical,
+            ) - 1.0)
+                .abs()
+                < f32::EPSILON
+        );
+        let mut wounder = character.clone();
+        wounder.skill_names.push("溃伤".to_owned());
+        wounder.skill_metadata.push(CharacterSkillMetadata::talent(
+            "normal_talent",
+            "天赋",
+        ));
+        let wound_buffs = character_damage_dealt_talent_buffs(&wounder, "caster");
+        assert_eq!(wound_buffs.len(), 1);
+        assert_eq!(wound_buffs[0].name, "溃伤");
+        assert_eq!(wound_buffs[0].turns_remaining, 1);
+        assert_eq!(wound_buffs[0].effects, vec![
+            BuffEffect {
+                field: BuffField::HealingTakenModifier,
+                value: BuffValue::AddPercent(-25.0),
+            }
+        ]);
+        wounder.skill_metadata[0].st_approved = false;
+        assert!(character_damage_dealt_talent_buffs(&wounder, "caster").is_empty());
+        let mut lifestealer = character.clone();
+        lifestealer.skill_names.push("禅宗古训".to_owned());
+        lifestealer
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            ));
+        assert!((character_physical_damage_lifesteal(&lifestealer) - 0.15).abs() < f32::EPSILON);
+        lifestealer.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_physical_damage_lifesteal(&lifestealer),
+            0.0
+        );
+        let mut chicken = character.clone();
+        chicken.level = 3;
+        chicken.skill_names.push("菜鸡猛啄".to_owned());
+        chicken.skill_metadata.push(CharacterSkillMetadata::talent(
+            "normal_talent",
+            "天赋",
+        ));
+        assert_eq!(
+            character_minimum_damage_floor(&chicken),
+            3.0
+        );
+        chicken.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_minimum_damage_floor(&chicken),
+            0.0
+        );
+        let mut scoped = character.clone();
+        scoped.level = 2;
+        scoped.skill_names.push("瞄准镜Tex-30".to_owned());
+        scoped.skill_metadata.push(CharacterSkillMetadata::talent(
+            "normal_talent",
+            "天赋",
+        ));
+        assert_eq!(
+            character_minimum_range_meters(&scoped),
+            30.0
+        );
+        assert_eq!(
+            moonberry_effective_skill_range_radius(
+                Some(3),
+                character_minimum_range_meters(&scoped)
+            ),
+            Some(30.0)
+        );
+        assert_eq!(
+            moonberry_effective_skill_range_radius(
+                Some(45),
+                character_minimum_range_meters(&scoped),
+            ),
+            Some(45.0)
+        );
+        assert_eq!(
+            moonberry_effective_skill_range_radius(
+                None,
+                character_minimum_range_meters(&scoped)
+            ),
+            Some(30.0)
+        );
+        scoped.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_minimum_range_meters(&scoped),
+            0.0
+        );
+        assert_eq!(
+            moonberry_effective_skill_range_radius(
+                None,
+                character_minimum_range_meters(&scoped)
+            ),
+            None
+        );
+        let mut large_hit_target = character.clone();
+        large_hit_target.skill_names.push("过度免疫".to_owned());
+        large_hit_target
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            ));
+        assert!(
+            (character_large_hit_damage_taken_modifier(&large_hit_target) - 0.8).abs()
+                < f32::EPSILON
+        );
+        assert_eq!(
+            large_hit_damage_taken_multiplier(20.0, 4.0, 0.8),
+            1.0
+        );
+        assert_eq!(
+            large_hit_damage_taken_multiplier(20.0, 4.01, 0.8),
+            0.8
+        );
+        large_hit_target.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_large_hit_damage_taken_modifier(&large_hit_target),
+            1.0
+        );
+        let mut dying_target = character.clone();
+        dying_target.hp = 4.0;
+        dying_target.max_hp = 20.0;
+        dying_target.skill_names.push("生死时速".to_owned());
+        dying_target
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            ));
+        assert!((character_dying_healing_taken_modifier(&dying_target) - 1.5).abs() < f32::EPSILON);
+        assert_eq!(
+            dying_healing_taken_multiplier(
+                dying_target.hp,
+                dying_target.max_hp,
+                character_dying_healing_taken_modifier(&dying_target),
+            ),
+            1.5
+        );
+        dying_target.hp = 5.0;
+        assert_eq!(
+            dying_healing_taken_multiplier(
+                dying_target.hp,
+                dying_target.max_hp,
+                character_dying_healing_taken_modifier(&dying_target),
+            ),
+            1.0
+        );
+        dying_target.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_dying_healing_taken_modifier(&dying_target),
+            1.0
+        );
+        let mut wounded_healer = character.clone();
+        wounded_healer.hp = 20.0;
+        wounded_healer.max_hp = 20.0;
+        wounded_healer.skill_names.push("火源之力".to_owned());
+        wounded_healer
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            ));
+        assert!((character_wounded_healing_dealt_modifier(&wounded_healer) - 1.2).abs() < 0.0001);
+        assert_eq!(
+            wounded_healing_dealt_multiplier(
+                wounded_healer.hp,
+                wounded_healer.max_hp,
+                character_wounded_healing_dealt_modifier(&wounded_healer),
+            ),
+            1.2
+        );
+        wounded_healer.hp = 8.0;
+        assert!(
+            (wounded_healing_dealt_multiplier(
+                wounded_healer.hp,
+                wounded_healer.max_hp,
+                character_wounded_healing_dealt_modifier(&wounded_healer),
+            ) - 1.1)
+                .abs()
+                < 0.0001
+        );
+        wounded_healer.hp = 4.0;
+        assert_eq!(
+            wounded_healing_dealt_multiplier(
+                wounded_healer.hp,
+                wounded_healer.max_hp,
+                character_wounded_healing_dealt_modifier(&wounded_healer),
+            ),
+            1.0
+        );
+        wounded_healer.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_wounded_healing_dealt_modifier(&wounded_healer),
+            1.0
+        );
+        let mut mutual_aid = character.clone();
+        mutual_aid.skill_names.push("互帮互助".to_owned());
+        mutual_aid
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            ));
+        assert_eq!(
+            character_mutual_aid_healing_rate(&mutual_aid),
+            0.5
+        );
+        mutual_aid.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_mutual_aid_healing_rate(&mutual_aid),
+            0.0
+        );
+        assert!(
+            (character_damage_attribute_multiplier(
+                &character,
+                &config,
+                TrpgDamageBonusKind::Physical,
+            ) - 4.8)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (character_damage_attribute_multiplier(
+                &character,
+                &config,
+                TrpgDamageBonusKind::Range,
+            ) - 4.0)
+                .abs()
+                < f32::EPSILON
+        );
+        let mut converter = character.clone();
+        converter.skill_names.push("数魔转换器".to_owned());
+        converter
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            ));
+        assert!(
+            (character_damage_attribute_multiplier(
+                &converter,
+                &config,
+                TrpgDamageBonusKind::Range,
+            ) - 6.0)
+                .abs()
+                < 0.0001
+        );
+        converter.skill_names.push("大魔法师".to_owned());
+        converter
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            ));
+        assert!(
+            (character_damage_attribute_multiplier(
+                &converter,
+                &config,
+                TrpgDamageBonusKind::Range,
+            ) - 6.025)
+                .abs()
+                < 0.0001
+        );
+        converter.skill_metadata[0].st_approved = false;
+        assert!(
+            (character_damage_attribute_multiplier(
+                &converter,
+                &config,
+                TrpgDamageBonusKind::Range,
+            ) - 4.0)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!((character_healing_attribute_multiplier(&character, &config) - 9.6).abs() < 0.0001);
+    }
+
+    #[test]
+    fn low_hp_damage_multiplier_matches_moonberry_thresholds() {
+        assert!((low_hp_damage_multiplier(9.0, 10.0) - 1.0).abs() < f32::EPSILON);
+        assert!((low_hp_damage_multiplier(7.0, 10.0) - 0.97).abs() < 0.0001);
+        assert!((low_hp_damage_multiplier(5.0, 10.0) - 0.75).abs() < f32::EPSILON);
+        assert!((low_hp_damage_multiplier(2.0, 10.0) - 0.2).abs() < 0.0001);
+        assert!((low_hp_damage_multiplier(0.5, 10.0) - 0.05).abs() < 0.0001);
+        assert_eq!(low_hp_damage_multiplier(1.0, 0.0), 0.0);
     }
 
     #[test]
@@ -6947,5 +10670,53 @@ mod tests {
         assert_eq!(group.world_turn, 1);
         assert_eq!(group.player_turns["a"].turns_passed, 1);
         assert_eq!(group.player_turns["b"].turns_passed, 1);
+    }
+
+    #[test]
+    fn trpg_group_negative_timer_starts_when_half_players_are_ahead() {
+        let mut group = TrpgGroup {
+            battle_negative_enabled: true,
+            players: vec!["a".to_owned(), "b".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(group.mark_player_acted("a"));
+
+        let timer = group.legacy_negative_timer("b").unwrap();
+        assert_eq!(
+            timer.remaining_ms,
+            LEGACY_NEGATIVE_TIMEOUT_MS
+        );
+        assert!(timer.active());
+        assert!(!timer.replied);
+
+        assert!(group.register_legacy_negative_reply("b"));
+        let timer = group.legacy_negative_timer("b").unwrap();
+        assert_eq!(timer.remaining_ms, 0);
+        assert!(!timer.active());
+        assert!(timer.replied);
+    }
+
+    #[test]
+    fn trpg_group_negative_timeout_records_layer_and_uses_turn_skip() {
+        let mut group = TrpgGroup {
+            battle_negative_enabled: true,
+            players: vec!["a".to_owned(), "b".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(group.mark_player_acted("a"));
+        assert!(group.record_legacy_negative_timeout("b"));
+        assert_eq!(
+            group.legacy_negative_timer("b").unwrap().negative_layers,
+            1
+        );
+
+        assert!(group.mark_player_skipped("b"));
+
+        assert_eq!(group.world_turn, 1);
+        let timer = group.legacy_negative_timer("b").unwrap();
+        assert_eq!(timer.negative_layers, 1);
+        assert_eq!(timer.remaining_ms, 0);
     }
 }

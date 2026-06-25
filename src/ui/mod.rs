@@ -82,6 +82,7 @@ const CHARACTER_WINDOW_DEFAULT_WIDTH: f32 = 360.0;
 const CHARACTER_WINDOW_MIN_WIDTH: f32 = 320.0;
 const CHARACTER_WINDOW_MAX_WIDTH: f32 = 720.0;
 const CHARACTER_FIELD_MAX_WIDTH: f32 = 560.0;
+const RANDOM_POOL_BATCH_MAX: u32 = 100;
 const NAPCAT_EXPORT_DEFAULT_PATH: &str = ".data/willowblossom/exports/messages_export.json";
 const NAPCAT_PC_EXPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/exports/player_characters_export.json";
@@ -94,6 +95,17 @@ const NAPCAT_MOONBERRY_LEGACY_IMPORT_DEFAULT_PATH: &str =
 const DEEPSEEK_SUMMARY_EXPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/exports/deepseek_summaries_export.json";
 const VOXEL_SCENE_EXPORT_DEFAULT_PATH: &str = ".data/willowblossom/exports/voxel_scene_export.json";
+const MOONBERRY_SKILL_TYPES: &[&str] = &[
+    "法术",
+    "道具",
+    "异能",
+    "动作",
+    "血统",
+    "职业",
+    "召唤物",
+    "远程",
+];
+const MOONBERRY_TARGET_CLASSES: &[&str] = &["无目标", "单目标", "多目标", "范围"];
 
 use crate::{
     battle_round::BattleRoundUiState,
@@ -106,9 +118,32 @@ use crate::{
         DEEPSEEK_SUMMARY_EXPORT_VERSION,
     },
     napcat::{
+        character_damage_attribute_multiplier,
+        character_damage_dealt_talent_buffs,
+        character_damage_taken_attribute_multiplier,
+        character_dying_healing_taken_modifier,
+        character_healing_attribute_multiplier,
+        character_large_hit_damage_taken_modifier,
+        character_minimum_damage_floor,
+        character_minimum_range_meters,
+        character_mutual_aid_healing_rate,
+        character_next_level_exp,
+        character_physical_damage_lifesteal,
+        character_wounded_healing_dealt_modifier,
+        dying_healing_taken_multiplier,
+        grant_character_experience,
+        large_hit_damage_taken_multiplier,
+        low_hp_damage_multiplier,
+        moonberry_effective_skill_range_radius,
         normalized_random_pool_counts,
+        record_character_damage_taken,
+        record_character_healing_taken,
+        reset_character_turn_totals,
+        skill_rule_args,
         update_character_from_status,
         update_character_from_status_with_config,
+        upsert_character_active_buff,
+        wounded_healing_dealt_multiplier,
         CampaignMessage,
         CharacterBuffBaseStats,
         CharacterCreationStep,
@@ -132,33 +167,67 @@ use crate::{
         NapcatSender,
         PlayerCharacter,
         RandomPool,
+        RandomPoolCheckedResult,
         RandomPoolEntry,
         RandomPoolTextResult,
         SkillPoolEntry,
+        SkillRuleArgs,
         TextData,
         TrpgBasicConfig,
+        TrpgDamageBonusKind,
+        TrpgDamageTakenKind,
         TrpgGroup,
+        TrpgLegacyNegativeTimer,
+        TrpgLegacySendPane,
+        TrpgLegacyTeamChatMessage,
         UnitPoolEntry,
         Visibility,
+        LEGACY_NEGATIVE_TIMEOUT_MS,
         NAPCAT_MANAGER_EXPORT_VERSION,
     },
     rule_engine::{
-        parse_rule,
+        apply_skill_type_damage_default,
+        legacy_moonberry_buff_machine_passive_buffs,
+        legacy_moonberry_buff_machine_skill_cast_rule_with_context,
+        parse_rule_with_named_args,
         Action,
         ActorRef,
         BuffEffect,
         BuffField,
         BuffKind,
         BuffSpec,
+        BuffTickAction,
         BuffValue,
         Character as RuleCharacter,
+        DamageType,
+        LegacyMoonberryPoolArg,
+        LegacyMoonberryPoolEntry,
         RuleAst,
         RuleEngineState,
+        StatusBlock,
         StatusKey,
         TargetSelector,
         ValueExpr,
     },
     scene::{
+        has_legacy_area_marker,
+        has_unit_template_standee,
+        has_unit_template_token,
+        legacy_area_marker_id,
+        place_legacy_area_marker,
+        place_legacy_area_unit_token,
+        place_legacy_world_unit_token,
+        place_unit_template_standee,
+        place_unit_template_token,
+        prune_legacy_area_unit_tokens,
+        prune_legacy_world_unit_tokens,
+        remove_legacy_area_marker,
+        remove_legacy_area_unit_tokens,
+        remove_legacy_world_unit_tokens,
+        remove_unit_template_standee,
+        remove_unit_template_token,
+        stamp_legacy_area_marker_voxel_fill,
+        stamp_legacy_area_marker_voxel_outline,
         SceneCharacterPositions,
         ScenePlayerCameraPositions,
         ScenePlayerViewRequest,
@@ -185,14 +254,29 @@ pub(crate) struct TrpgGroupSettingsState {
     new_group_name: String,
     new_random_pool_name: String,
     random_pool_award_target: String,
+    random_pool_broadcast_scope: String,
+    random_pool_batch_count: u32,
+    random_pool_send_status: String,
+    random_pool_group_filter: String,
+    random_pool_tag_filter: String,
     new_unit_id: String,
     unit_pool_source_target: String,
     focused_group_name: Option<String>,
     pending_character_delete: Option<String>,
+    pending_party_delete: Option<(String, String)>,
+    legacy_send_pane_status: HashMap<String, String>,
+    legacy_team_chat_status: HashMap<String, String>,
+    legacy_team_chat_edit_drafts: HashMap<String, String>,
+    legacy_negative_status: HashMap<String, String>,
+    legacy_area_marker_status: HashMap<String, String>,
+    unit_pool_scene_status: HashMap<String, String>,
+    open_legacy_send_pane_windows: HashSet<(String, String)>,
+    open_legacy_team_chat_windows: HashSet<(String, String)>,
     random_pool_entry_drafts: HashMap<String, RandomPoolEntry>,
     unit_pool_draft: UnitPoolEntry,
     skill_pool_draft: SkillPoolEntry,
     party_name_drafts: HashMap<String, String>,
+    party_merge_targets: HashMap<(String, String), String>,
     export_path: String,
     pc_export_path: String,
     chat_list_export_path: String,
@@ -213,6 +297,7 @@ pub(crate) struct CharacterEditState {
     quick_cast_skill_index: HashMap<String, usize>,
     pending_force_cast: Option<(String, usize)>,
     skill_pool_selected_index: HashMap<String, usize>,
+    exp_award_drafts: HashMap<String, i32>,
 }
 
 #[derive(Clone)]
@@ -255,6 +340,8 @@ pub struct UiSystemLocals<'s> {
     chat_image_textures: Local<'s, HashMap<String, TextureHandle>>,
     chat_turn_count_drafts: Local<'s, HashMap<(String, String), u32>>,
     group_broadcast_scopes: Local<'s, HashMap<String, String>>,
+    chat_player_visible_previews: Local<'s, HashMap<String, String>>,
+    chat_list_player_visible_filter: Local<'s, Option<String>>,
 }
 
 pub struct CircleImageButton {
@@ -328,6 +415,7 @@ fn pool_menu_button(
     ui: &mut Ui,
     manager: &mut NapcatMessageManager,
     state: &mut TrpgGroupSettingsState,
+    mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
 ) -> bool {
     let mut changed = false;
     let player_targets = sorted_pool_targets(manager, false);
@@ -388,7 +476,14 @@ fn pool_menu_button(
                     .id_salt("top_random_pool_menu")
                     .max_height(420.0)
                     .show(ui, |ui| {
-                        changed |= random_pool_settings_ui(ui, manager, state, &player_targets);
+                        changed |= random_pool_settings_ui(
+                            ui,
+                            manager,
+                            state,
+                            &player_targets,
+                            None,
+                            None,
+                        );
                     });
             },
         );
@@ -400,7 +495,13 @@ fn pool_menu_button(
                     .id_salt("top_unit_pool_menu")
                     .max_height(420.0)
                     .show(ui, |ui| {
-                        changed |= unit_pool_settings_ui(ui, manager, state, &player_targets);
+                        changed |= unit_pool_settings_ui(
+                            ui,
+                            manager,
+                            state,
+                            &player_targets,
+                            scene_store.as_deref_mut(),
+                        );
                     });
             },
         );
@@ -580,6 +681,7 @@ fn chat_window(
     image_textures: &mut Local<HashMap<String, TextureHandle>>,
     focused_trpg_group_name: Option<&str>,
     turn_count_drafts: &mut Local<HashMap<(String, String), u32>>,
+    chat_player_visible_previews: &mut Local<HashMap<String, String>>,
     rule_engine_state: &mut RuleEngineState,
     mut player_view_request: Option<&mut ScenePlayerViewRequest>,
 ) {
@@ -682,6 +784,7 @@ fn chat_window(
     });
     let mut player_turn_count_set: Option<(String, String, u32)> = None;
     let mut player_acted_toggle: Option<(String, String, bool)> = None;
+    let player_visible_options = player_visible_preview_options(manager, target_id, messages);
     let response = window.show(ctx, |ui| {
         if current_group.is_some() || show_character_button || trpg_membership_group.is_some() {
             ui.horizontal(|ui| {
@@ -717,7 +820,53 @@ fn chat_window(
                             target_id.parse::<u64>(),
                             player_view_request.as_deref_mut(),
                         ) {
-                            request.user_id = Some(user_id);
+                            request.view_with_capture_camera(user_id);
+                        }
+                    }
+                }
+                if !player_visible_options.is_empty() {
+                    let mut preview_enabled = chat_player_visible_previews.contains_key(target_id);
+                    if ui
+                        .checkbox(&mut preview_enabled, "按玩家可见")
+                        .on_hover_text("按所选玩家的可读范围过滤这个聊天窗口")
+                        .changed()
+                    {
+                        if preview_enabled {
+                            chat_player_visible_previews.insert(
+                                target_id.to_owned(),
+                                player_visible_options[0].clone(),
+                            );
+                        } else {
+                            chat_player_visible_previews.remove(target_id);
+                        }
+                    }
+                    if preview_enabled {
+                        let selected = chat_player_visible_previews
+                            .entry(target_id.to_owned())
+                            .or_insert_with(|| player_visible_options[0].clone());
+                        if !player_visible_options
+                            .iter()
+                            .any(|player_id| player_id == selected)
+                        {
+                            *selected = player_visible_options[0].clone();
+                        }
+                        if player_visible_options.len() == 1 {
+                            ui.small(target_display_name(manager, selected));
+                        } else {
+                            egui::ComboBox::from_id_salt((
+                                "chat_player_visible_preview",
+                                target_id,
+                            ))
+                            .selected_text(target_display_name(manager, selected))
+                            .show_ui(ui, |ui| {
+                                for player_id in &player_visible_options {
+                                    ui.selectable_value(
+                                        selected,
+                                        player_id.clone(),
+                                        target_display_name(manager, player_id),
+                                    );
+                                }
+                            });
                         }
                     }
                 }
@@ -780,10 +929,22 @@ fn chat_window(
                 });
             }
         }
+        let preview_messages = chat_player_visible_previews
+            .get(target_id)
+            .and_then(|player_id| player_id.parse::<u64>().ok())
+            .map(|player_id| manager.visible_messages_for_player(target_id, messages, player_id));
+        if let Some(preview_messages) = preview_messages.as_ref() {
+            ui.small(format!(
+                "玩家可见消息 {}/{}",
+                preview_messages.len(),
+                messages.len()
+            ));
+        }
+        let body_messages = preview_messages.as_ref().unwrap_or(messages);
         chat_body_ui(
             ui,
             ctx,
-            messages,
+            body_messages,
             napcat_sender,
             target_id,
             chat_input_msgs,
@@ -842,6 +1003,7 @@ fn chat_window(
                         trpg_membership_selected,
                     );
                     group.sync_turn_players();
+                    group.sync_legacy_negative_timers();
                 }
                 manager.persist().ok();
             }
@@ -920,6 +1082,41 @@ fn chat_window(
                 }
             }
         }
+    }
+}
+
+fn player_visible_preview_options(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    messages: &[NapcatMessage],
+) -> Vec<String> {
+    match messages.first().map(|message| &message.data.message_type) {
+        Some(NapcatMessageType::Private) => target_id
+            .parse::<u64>()
+            .ok()
+            .map(|_| vec![target_id.to_owned()])
+            .unwrap_or_default(),
+        Some(NapcatMessageType::Group) => manager
+            .current_group()
+            .filter(|group| {
+                group
+                    .group_chats
+                    .iter()
+                    .any(|group_id| group_id == target_id)
+            })
+            .map(|group| {
+                let mut players = group
+                    .players
+                    .iter()
+                    .filter(|player_id| player_id.parse::<u64>().is_ok())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                players.sort();
+                players.dedup();
+                players
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
     }
 }
 
@@ -1150,6 +1347,7 @@ fn group_broadcast_input_ui(
 
 const BROADCAST_SCOPE_ALL: &str = "all";
 const BROADCAST_SCOPE_PARTY_PREFIX: &str = "party:";
+const BROADCAST_SCOPE_LEGACY_PANE_PREFIX: &str = "legacy-pane:";
 
 fn group_broadcast_scope_ui(
     ui: &mut Ui,
@@ -1173,10 +1371,25 @@ fn group_broadcast_scope_ui(
         })
         .unwrap_or_default();
     party_names.sort();
+    let mut legacy_panes = current_group
+        .map(|group| {
+            group
+                .legacy_send_panes
+                .iter()
+                .filter(|pane| !group.legacy_send_pane_members(&pane.key).is_empty())
+                .map(|pane| (pane.key.clone(), pane.title.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    legacy_panes.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+
     if scope != BROADCAST_SCOPE_ALL
         && !party_names
             .iter()
             .any(|party_id| scope == &broadcast_party_scope(party_id))
+        && !legacy_panes
+            .iter()
+            .any(|(pane_key, _)| scope == &broadcast_legacy_pane_scope(pane_key))
     {
         *scope = BROADCAST_SCOPE_ALL.to_owned();
     }
@@ -1184,7 +1397,10 @@ fn group_broadcast_scope_ui(
     ui.horizontal_wrapped(|ui| {
         ui.label("发送范围");
         egui::ComboBox::from_id_salt((group_name, "broadcast_scope"))
-            .selected_text(broadcast_scope_label(scope))
+            .selected_text(broadcast_scope_label(
+                current_group,
+                scope,
+            ))
             .show_ui(ui, |ui| {
                 ui.selectable_value(
                     scope,
@@ -1198,6 +1414,13 @@ fn group_broadcast_scope_ui(
                         format!("小队：{party_name}"),
                     );
                 }
+                for (pane_key, pane_title) in legacy_panes {
+                    ui.selectable_value(
+                        scope,
+                        broadcast_legacy_pane_scope(&pane_key),
+                        format!("旧发送窗：{pane_title}"),
+                    );
+                }
             });
     });
 }
@@ -1208,17 +1431,33 @@ fn group_broadcast_targets(
     manager: &NapcatMessageManager,
     scope: &str,
 ) -> Vec<NapcatSendTarget> {
+    if let (Some(group), Some(pane_key)) = (
+        current_group,
+        scope.strip_prefix(BROADCAST_SCOPE_LEGACY_PANE_PREFIX),
+    ) {
+        let pane_members = group.legacy_send_pane_members(pane_key);
+        return private_targets_for_member_ids(manager, pane_members.iter());
+    }
+
     let requested_party = scope.strip_prefix(BROADCAST_SCOPE_PARTY_PREFIX);
-    let mut seen = HashSet::new();
-    let mut targets = members
-        .iter()
-        .filter(|member_id| match requested_party {
+    private_targets_for_member_ids(
+        manager,
+        members.iter().filter(|member_id| match requested_party {
             Some(party_id) => {
                 current_group.and_then(|group| group.party_id_for_player(member_id))
                     == Some(party_id)
             },
             None => true,
-        })
+        }),
+    )
+}
+
+fn private_targets_for_member_ids<'a>(
+    manager: &NapcatMessageManager,
+    member_ids: impl Iterator<Item = &'a String>,
+) -> Vec<NapcatSendTarget> {
+    let mut seen = HashSet::new();
+    let mut targets = member_ids
         .filter_map(|member_id| private_broadcast_target(manager, member_id))
         .filter(|target| match target {
             NapcatSendTarget::Private(user_id) => seen.insert(*user_id),
@@ -1260,11 +1499,618 @@ fn broadcast_party_scope(party_id: &str) -> String {
     format!("{BROADCAST_SCOPE_PARTY_PREFIX}{party_id}")
 }
 
-fn broadcast_scope_label(scope: &str) -> String {
-    scope
-        .strip_prefix(BROADCAST_SCOPE_PARTY_PREFIX)
-        .map(|party_id| format!("小队：{party_id}"))
-        .unwrap_or_else(|| "全部成员".to_owned())
+fn broadcast_legacy_pane_scope(pane_key: &str) -> String {
+    format!("{BROADCAST_SCOPE_LEGACY_PANE_PREFIX}{pane_key}")
+}
+
+fn broadcast_scope_label(current_group: Option<&TrpgGroup>, scope: &str) -> String {
+    if let Some(party_id) = scope.strip_prefix(BROADCAST_SCOPE_PARTY_PREFIX) {
+        return format!("小队：{party_id}");
+    }
+    if let Some(pane_key) = scope.strip_prefix(BROADCAST_SCOPE_LEGACY_PANE_PREFIX) {
+        if let Some(pane) = current_group.and_then(|group| group.legacy_send_pane(pane_key)) {
+            return format!("旧发送窗：{}", pane.title);
+        }
+        return format!("旧发送窗：{pane_key}");
+    }
+    "全部成员".to_owned()
+}
+
+fn legacy_send_pane_input_id(group_name: &str, pane_key: &str) -> String {
+    format!("legacy-send-pane:{group_name}:{pane_key}")
+}
+
+fn legacy_team_chat_input_id(group_name: &str, team_id: &str) -> String {
+    format!("legacy-team-chat:{group_name}:{team_id}")
+}
+
+fn legacy_team_chat_edit_prefix(group_name: &str, team_id: &str) -> String {
+    format!("legacy-team-chat-edit:{group_name}:{team_id}:")
+}
+
+fn legacy_team_chat_edit_id(group_name: &str, team_id: &str, message_index: usize) -> String {
+    format!(
+        "{}{message_index}",
+        legacy_team_chat_edit_prefix(group_name, team_id)
+    )
+}
+
+fn legacy_send_pane_targets(
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+    pane_key: &str,
+) -> Vec<NapcatSendTarget> {
+    group_broadcast_targets(
+        Some(group),
+        &group.players,
+        manager,
+        &broadcast_legacy_pane_scope(pane_key),
+    )
+}
+
+fn queue_legacy_send_pane_text(
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+    group_name: &str,
+    pane_key: &str,
+    text: &str,
+    sender: &NapcatIOSender,
+    ime: &mut ImeManager,
+) -> Result<usize, String> {
+    if text.trim().is_empty() {
+        return Err("发送内容为空".to_owned());
+    }
+
+    let targets = legacy_send_pane_targets(manager, group, pane_key);
+    let target_count = targets.len();
+    ime.queue_text_send(
+        &legacy_send_pane_input_id(group_name, pane_key),
+        text,
+        sender,
+        targets,
+    )?;
+    Ok(target_count)
+}
+
+fn legacy_team_chat_targets(
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+    team_id: &str,
+) -> Vec<NapcatSendTarget> {
+    group
+        .legacy_team_members(team_id)
+        .into_iter()
+        .filter_map(|target_id| {
+            let user_id = target_id.parse::<u64>().ok()?;
+            manager
+                .messages
+                .contains_key(&target_id)
+                .then_some(NapcatSendTarget::Private(user_id))
+        })
+        .collect()
+}
+
+fn legacy_team_chat_message(text: &str, time: u64) -> TrpgLegacyTeamChatMessage {
+    TrpgLegacyTeamChatMessage {
+        sender_id: "gm".to_owned(),
+        sender_name: "GM".to_owned(),
+        text: text.trim().to_owned(),
+        time,
+    }
+}
+
+fn queue_legacy_team_chat_text(
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+    group_name: &str,
+    team_id: &str,
+    text: &str,
+    sender: &NapcatIOSender,
+    ime: &mut ImeManager,
+) -> Result<usize, String> {
+    if text.trim().is_empty() {
+        return Err("发送内容为空".to_owned());
+    }
+
+    let targets = legacy_team_chat_targets(manager, group, team_id);
+    let target_count = targets.len();
+    ime.queue_text_send(
+        &legacy_team_chat_input_id(group_name, team_id),
+        text,
+        sender,
+        targets,
+    )?;
+    Ok(target_count)
+}
+
+fn legacy_team_chat_title(team: &crate::napcat::TrpgLegacyTeam) -> String {
+    let name = team.name.trim();
+    if !name.is_empty() {
+        return name.to_owned();
+    }
+    let id = team.id.trim();
+    if !id.is_empty() {
+        return format!("旧频道 {id}");
+    }
+    "旧频道".to_owned()
+}
+
+fn legacy_team_chat_default_size(team: &crate::napcat::TrpgLegacyTeam) -> Vec2 {
+    if team.window_width > 0.0 && team.window_height > 0.0 {
+        return Vec2::new(
+            team.window_width.max(320.0),
+            team.window_height.max(260.0),
+        );
+    }
+    Vec2::new(420.0, 360.0)
+}
+
+fn legacy_team_chat_default_pos(team: &crate::napcat::TrpgLegacyTeam) -> Option<Pos2> {
+    (team.window_x != 0.0 || team.window_y != 0.0).then(|| Pos2::new(team.window_x, team.window_y))
+}
+
+fn legacy_team_chat_composer_ui(
+    ui: &mut Ui,
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+    group_name: &str,
+    team: &crate::napcat::TrpgLegacyTeam,
+    state: &mut TrpgGroupSettingsState,
+    chat_input_msgs: &mut HashMap<String, String>,
+    napcat_sender: Option<&NapcatIOSender>,
+    ime: &mut ImeManager,
+    desired_rows: usize,
+    scroll_height: f32,
+) -> Option<LegacyGroupSurfaceAction> {
+    let mut action = None;
+    if !team.chat_messages.is_empty() {
+        egui::ScrollArea::vertical()
+            .id_salt((group_name, "legacy_team_chat", &team.id))
+            .max_height(scroll_height)
+            .show(ui, |ui| {
+                for (message_index, message) in team.chat_messages.iter().enumerate() {
+                    let sender = legacy_team_chat_sender_label(
+                        manager,
+                        &message.sender_id,
+                        &message.sender_name,
+                    );
+                    let draft_key = legacy_team_chat_edit_id(group_name, &team.id, message_index);
+                    let draft = state
+                        .legacy_team_chat_edit_drafts
+                        .entry(draft_key)
+                        .or_insert_with(|| message.text.clone());
+                    ui.small(if message.time > 0 {
+                        format!("{sender} · {}", message.time)
+                    } else {
+                        sender
+                    });
+                    ui.add(
+                        egui::TextEdit::multiline(draft)
+                            .desired_rows(2)
+                            .desired_width(ui.available_width()),
+                    );
+                    let save_enabled =
+                        !draft.trim().is_empty() && draft.as_str() != message.text.as_str();
+                    let save_text = draft.clone();
+                    ui.horizontal_wrapped(|ui| {
+                        let save_response = ui.add_enabled(save_enabled, egui::Button::new("保存"));
+                        if save_response.clicked() {
+                            action = Some(
+                                LegacyGroupSurfaceAction::UpdateTeamChat {
+                                    team_id: team.id.clone(),
+                                    message_index,
+                                    text: save_text.clone(),
+                                },
+                            );
+                        }
+                        save_response.on_hover_text("保存这条本地旧频道消息");
+                        if ui.button("删除").clicked() {
+                            action = Some(
+                                LegacyGroupSurfaceAction::RemoveTeamChat {
+                                    team_id: team.id.clone(),
+                                    message_index,
+                                },
+                            );
+                        }
+                    });
+                    ui.separator();
+                }
+            });
+    }
+    let unparsed_count = team
+        .chat_message_count
+        .saturating_sub(team.chat_messages.len());
+    if unparsed_count > 0 {
+        ui.small(format!(
+            "另有 {}条旧消息没有可预览文本",
+            unparsed_count
+        ));
+    }
+    let input_id = legacy_team_chat_input_id(group_name, &team.id);
+    chat_input_msgs
+        .entry(input_id.clone())
+        .or_insert_with(String::new);
+    let targets = legacy_team_chat_targets(manager, group, &team.id);
+    ui.small(format!(
+        "可发送 {}人：{}",
+        targets.len(),
+        legacy_member_preview(
+            manager,
+            &group.legacy_team_members(&team.id)
+        )
+    ));
+    let text = chat_input_msgs.get_mut(&input_id).unwrap();
+    ui.add(
+        egui::TextEdit::multiline(text)
+            .desired_rows(desired_rows)
+            .desired_width(ui.available_width()),
+    );
+    let text_to_send = text.trim().to_owned();
+    let send_enabled = napcat_sender.is_some() && !targets.is_empty() && !text_to_send.is_empty();
+    let response = ui.add_enabled(
+        send_enabled,
+        egui::Button::new("发送到旧频道"),
+    );
+    let clicked = response.clicked();
+    let hover_text = if napcat_sender.is_none() {
+        "NapCat websocket未连接"
+    } else if targets.is_empty() {
+        "这个旧频道没有可发送的玩家私聊"
+    } else if text_to_send.is_empty() {
+        "输入内容后发送"
+    } else {
+        "发送到这个旧频道的玩家私聊，并追加到本地旧频道聊天"
+    };
+    response.on_hover_text(hover_text);
+    if clicked {
+        if let Some(sender) = napcat_sender {
+            match queue_legacy_team_chat_text(
+                manager,
+                group,
+                group_name,
+                &team.id,
+                &text_to_send,
+                sender,
+                ime,
+            ) {
+                Ok(target_count) => {
+                    let time = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_secs())
+                        .unwrap_or_default();
+                    action = Some(
+                        LegacyGroupSurfaceAction::AppendTeamChat {
+                            team_id: team.id.clone(),
+                            message: legacy_team_chat_message(&text_to_send, time),
+                        },
+                    );
+                    state.legacy_team_chat_status.insert(
+                        input_id.clone(),
+                        format!("已入队：{}个目标", target_count),
+                    );
+                },
+                Err(err) => {
+                    state.legacy_team_chat_status.insert(
+                        input_id.clone(),
+                        format!("发送失败：{err}"),
+                    );
+                },
+            }
+        }
+    }
+    if let Some(status) = state.legacy_team_chat_status.get(&input_id) {
+        ui.small(status);
+    }
+    action
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct LegacyTeamChatWindowEntry {
+    group_name: String,
+    team_id: String,
+    title: String,
+    visible: bool,
+    default_pos: Option<Pos2>,
+    default_size: Vec2,
+}
+
+fn legacy_team_chat_window_entries(
+    manager: &NapcatMessageManager,
+    open_windows: &HashSet<(String, String)>,
+) -> Vec<LegacyTeamChatWindowEntry> {
+    let mut entries = Vec::new();
+    for (group_name, group) in &manager.trpg_groups {
+        for team in &group.legacy_teams {
+            let key = (group_name.clone(), team.id.clone());
+            if !open_windows.contains(&key) {
+                continue;
+            }
+            entries.push(LegacyTeamChatWindowEntry {
+                group_name: group_name.clone(),
+                team_id: team.id.clone(),
+                title: legacy_team_chat_title(team),
+                visible: team.visible,
+                default_pos: legacy_team_chat_default_pos(team),
+                default_size: legacy_team_chat_default_size(team),
+            });
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.group_name
+            .cmp(&right.group_name)
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.team_id.cmp(&right.team_id))
+    });
+    entries
+}
+
+fn legacy_team_chat_windows(
+    ctx: &Context,
+    manager: &NapcatMessageManager,
+    napcat_sender: Option<&NapcatIOSender>,
+    chat_input_msgs: &mut HashMap<String, String>,
+    state: &mut TrpgGroupSettingsState,
+    ime: &mut ImeManager,
+) -> Option<(String, LegacyGroupSurfaceAction)> {
+    let mut action = None;
+    let entries = legacy_team_chat_window_entries(
+        manager,
+        &state.open_legacy_team_chat_windows,
+    );
+    for entry in entries {
+        let Some(group) = manager.trpg_groups.get(&entry.group_name) else {
+            continue;
+        };
+        let Some(team) = group.legacy_team(&entry.team_id) else {
+            continue;
+        };
+
+        let mut window_open = true;
+        let mut window = egui::Window::new(format!(
+            "旧频道聊天：{} / {}",
+            entry.group_name, entry.title
+        ))
+        .id(Id::new((
+            "legacy_team_chat_window",
+            entry.group_name.as_str(),
+            entry.team_id.as_str(),
+        )))
+        .default_size(entry.default_size)
+        .min_width(300.0)
+        .open(&mut window_open);
+        if let Some(default_pos) = entry.default_pos {
+            window = window.default_pos(default_pos);
+        }
+        window.show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&entry.title);
+                ui.small(format!(
+                    "本地聊天 {}条",
+                    team.chat_message_count
+                ));
+                ui.small(format!(
+                    "成员：{}",
+                    legacy_member_preview(manager, &team.players)
+                ));
+                if !entry.visible {
+                    ui.small("旧频道隐藏");
+                }
+            });
+            if let Some(next_action) = legacy_team_chat_composer_ui(
+                ui,
+                manager,
+                group,
+                &entry.group_name,
+                team,
+                state,
+                chat_input_msgs,
+                napcat_sender,
+                ime,
+                3,
+                220.0,
+            ) {
+                action = Some((entry.group_name.clone(), next_action));
+            }
+        });
+        if !window_open {
+            state
+                .open_legacy_team_chat_windows
+                .remove(&(entry.group_name, entry.team_id));
+        }
+    }
+    action
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacySendPaneWindowEntry {
+    group_name: String,
+    pane_key: String,
+    title: String,
+    closable: bool,
+}
+
+fn legacy_send_pane_window_entries(
+    manager: &NapcatMessageManager,
+    open_windows: &HashSet<(String, String)>,
+) -> Vec<LegacySendPaneWindowEntry> {
+    let mut entries = Vec::new();
+    for (group_name, group) in &manager.trpg_groups {
+        for pane in &group.legacy_send_panes {
+            let key = (group_name.clone(), pane.key.clone());
+            if pane.closable && !open_windows.contains(&key) {
+                continue;
+            }
+            entries.push(LegacySendPaneWindowEntry {
+                group_name: group_name.clone(),
+                pane_key: pane.key.clone(),
+                title: pane.title.clone(),
+                closable: pane.closable,
+            });
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.group_name
+            .cmp(&right.group_name)
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.pane_key.cmp(&right.pane_key))
+    });
+    entries
+}
+
+fn legacy_send_pane_composer_ui(
+    ui: &mut Ui,
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+    group_name: &str,
+    pane: &TrpgLegacySendPane,
+    napcat_sender: Option<&NapcatIOSender>,
+    chat_input_msgs: &mut HashMap<String, String>,
+    status: &mut HashMap<String, String>,
+    ime: &mut ImeManager,
+    desired_rows: usize,
+) {
+    let resolved = group.legacy_send_pane_members(&pane.key);
+    let targets = legacy_send_pane_targets(manager, group, &pane.key);
+    let effective_targets = group.legacy_send_pane_effective_targets(&pane.key);
+    let disabled_direct_targets = group.legacy_send_pane_disabled_direct_targets(&pane.key);
+    let input_id = legacy_send_pane_input_id(group_name, &pane.key);
+    chat_input_msgs
+        .entry(input_id.clone())
+        .or_insert_with(String::new);
+
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(&pane.title);
+        ui.small(format!("目标 {}项", pane.targets.len()));
+        if effective_targets.len() != pane.targets.len() {
+            ui.small(format!(
+                "有效 {}项",
+                effective_targets.len()
+            ));
+        }
+        ui.small(format!("可发送 {}人", targets.len()));
+        ui.small(format!(
+            "成员：{}",
+            legacy_member_preview(manager, &resolved)
+        ));
+        if !disabled_direct_targets.is_empty() {
+            ui.small(format!(
+                "重复PC已禁用：{}",
+                legacy_member_preview(manager, &disabled_direct_targets)
+            ));
+        }
+        if !pane.closable {
+            ui.small("旧窗固定");
+        }
+    });
+
+    let text = chat_input_msgs.get_mut(&input_id).unwrap();
+    ui.add(
+        egui::TextEdit::multiline(text)
+            .desired_rows(desired_rows)
+            .desired_width(ui.available_width()),
+    );
+    let text_to_send = text.trim().to_owned();
+    let send_enabled = napcat_sender.is_some() && !targets.is_empty() && !text_to_send.is_empty();
+    ui.horizontal_wrapped(|ui| {
+        let response = ui.add_enabled(send_enabled, egui::Button::new("发送"));
+        let clicked = response.clicked();
+        let hover_text = if napcat_sender.is_none() {
+            "NapCat websocket未连接"
+        } else if targets.is_empty() {
+            "这个旧发送窗没有可发送的玩家私聊"
+        } else if text_to_send.is_empty() {
+            "输入内容后发送"
+        } else {
+            "发送到这个旧发送窗的解析目标"
+        };
+        response.on_hover_text(hover_text);
+        if clicked {
+            if let Some(sender) = napcat_sender {
+                match queue_legacy_send_pane_text(
+                    manager,
+                    group,
+                    group_name,
+                    &pane.key,
+                    &text_to_send,
+                    sender,
+                    ime,
+                ) {
+                    Ok(target_count) => {
+                        status.insert(
+                            input_id.clone(),
+                            format!("已入队：{}个目标", target_count),
+                        );
+                    },
+                    Err(err) => {
+                        status.insert(
+                            input_id.clone(),
+                            format!("发送失败：{err}"),
+                        );
+                    },
+                }
+            }
+        }
+        if let Some(status_text) = status.get(&input_id) {
+            ui.small(status_text);
+        }
+    });
+}
+
+fn legacy_send_pane_windows(
+    ctx: &Context,
+    manager: &NapcatMessageManager,
+    napcat_sender: Option<&NapcatIOSender>,
+    chat_input_msgs: &mut HashMap<String, String>,
+    state: &mut TrpgGroupSettingsState,
+    ime: &mut ImeManager,
+) {
+    let entries = legacy_send_pane_window_entries(
+        manager,
+        &state.open_legacy_send_pane_windows,
+    );
+    for entry in entries {
+        let Some(group) = manager.trpg_groups.get(&entry.group_name) else {
+            continue;
+        };
+        let Some(pane) = group.legacy_send_pane(&entry.pane_key) else {
+            continue;
+        };
+
+        let mut window_open = true;
+        let mut window = egui::Window::new(format!(
+            "旧发送窗：{} / {}",
+            entry.group_name, entry.title
+        ))
+        .id(Id::new((
+            "legacy_send_pane_window",
+            entry.group_name.as_str(),
+            entry.pane_key.as_str(),
+        )))
+        .default_size(Vec2::new(360.0, 180.0))
+        .min_width(280.0);
+        if entry.closable {
+            window = window.open(&mut window_open);
+        }
+        window.show(ctx, |ui| {
+            legacy_send_pane_composer_ui(
+                ui,
+                manager,
+                group,
+                &entry.group_name,
+                pane,
+                napcat_sender,
+                chat_input_msgs,
+                &mut state.legacy_send_pane_status,
+                ime,
+                4,
+            );
+        });
+        if entry.closable && !window_open {
+            state
+                .open_legacy_send_pane_windows
+                .remove(&(entry.group_name, entry.pane_key));
+        }
+    }
 }
 
 fn group_drop_area_ui(ui: &mut Ui, group_name: &str, members: &[String]) {
@@ -2250,12 +3096,146 @@ fn trpg_group_member_count(group: &TrpgGroup) -> usize {
     group.players.len() + group.group_chats.len()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatListTargetView {
+    target_id: String,
+    message_count: usize,
+    total_message_count: usize,
+    unread_count: usize,
+    last_time: u64,
+}
+
+fn chat_list_player_filter_options(manager: &NapcatMessageManager) -> Vec<String> {
+    let mut players = manager
+        .current_group()
+        .map(|group| group.players.clone())
+        .unwrap_or_default();
+
+    if players.is_empty() {
+        players = manager
+            .messages
+            .iter()
+            .filter_map(|(target_id, messages)| {
+                matches!(
+                    messages.first().map(|message| &message.data.message_type),
+                    Some(NapcatMessageType::Private)
+                )
+                .then(|| target_id.parse::<u64>().ok().map(|_| target_id.clone()))
+                .flatten()
+            })
+            .collect();
+    }
+
+    players.retain(|player_id| player_id.parse::<u64>().is_ok());
+    players.sort_by(|left, right| {
+        target_display_name(manager, left)
+            .cmp(&target_display_name(manager, right))
+            .then_with(|| left.cmp(right))
+    });
+    players.dedup();
+    players
+}
+
+fn chat_list_target_views(
+    manager: &NapcatMessageManager,
+    player_filter: Option<u64>,
+) -> Vec<ChatListTargetView> {
+    let mut targets = manager
+        .messages
+        .iter()
+        .filter_map(|(target_id, messages)| {
+            chat_list_target_view(
+                manager,
+                target_id,
+                messages,
+                player_filter,
+            )
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        right
+            .last_time
+            .cmp(&left.last_time)
+            .then_with(|| left.target_id.cmp(&right.target_id))
+    });
+    targets
+}
+
+fn chat_list_target_view(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    messages: &[NapcatMessage],
+    player_filter: Option<u64>,
+) -> Option<ChatListTargetView> {
+    let (message_count, last_time, unread_count) = match player_filter {
+        Some(player_id) => {
+            let visible_messages =
+                manager.visible_messages_for_player(target_id, messages, player_id);
+            let message_count = visible_messages.len();
+            if message_count == 0 {
+                return None;
+            }
+            let last_time = visible_messages
+                .last()
+                .map(|message| message.data.time)
+                .unwrap_or_default();
+            let unread_count =
+                target_unread_count_for_player(manager, target_id, messages, player_id);
+            (message_count, last_time, unread_count)
+        },
+        None => {
+            let last_time = messages
+                .last()
+                .map(|message| message.data.time)
+                .unwrap_or_default();
+            (
+                messages.len(),
+                last_time,
+                target_unread_count(manager, target_id),
+            )
+        },
+    };
+
+    Some(ChatListTargetView {
+        target_id: target_id.to_owned(),
+        message_count,
+        total_message_count: messages.len(),
+        unread_count,
+        last_time,
+    })
+}
+
+fn target_unread_count_for_player(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    messages: &[NapcatMessage],
+    player_id: u64,
+) -> usize {
+    let read_count = manager
+        .read_message_counts
+        .get(target_id)
+        .copied()
+        .unwrap_or_default();
+    let access = manager.player_access_for_user(player_id);
+
+    messages
+        .iter()
+        .skip(read_count)
+        .filter(|message| message.data.user_id != message.data.self_id)
+        .filter(|message| {
+            let campaign_message = manager.campaign_message_for_target(target_id, message);
+            access.can_read(&campaign_message.visibility)
+        })
+        .count()
+}
+
 fn chat_list_panel(
     ui: &mut Ui,
     ctx: &Context,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
     edit_target: &mut Option<String>,
     edit_name: &mut String,
+    player_visible_filter: &mut Option<String>,
     trpg_group_settings: &mut TrpgGroupSettingsState,
 ) {
     ui.heading("TRPG组");
@@ -2309,31 +3289,68 @@ fn chat_list_panel(
         return;
     }
 
-    let mut targets = manager.messages.keys().cloned().collect::<Vec<_>>();
-    targets.sort_by(|a, b| {
-        let a_time = manager
-            .messages
-            .get(a)
-            .and_then(|messages| messages.last())
-            .map(|message| message.data.time)
-            .unwrap_or_default();
-        let b_time = manager
-            .messages
-            .get(b)
-            .and_then(|messages| messages.last())
-            .map(|message| message.data.time)
-            .unwrap_or_default();
-        b_time.cmp(&a_time).then_with(|| a.cmp(b))
-    });
+    let player_filter_options = chat_list_player_filter_options(manager);
+    if player_filter_options.is_empty() {
+        *player_visible_filter = None;
+    } else {
+        let mut filter_enabled = player_visible_filter.is_some();
+        if ui
+            .checkbox(
+                &mut filter_enabled,
+                "按玩家可见筛选列表",
+            )
+            .on_hover_text("只显示所选玩家可读取的聊天目标和消息计数")
+            .changed()
+        {
+            if filter_enabled {
+                *player_visible_filter = Some(player_filter_options[0].clone());
+            } else {
+                *player_visible_filter = None;
+            }
+        }
+
+        if filter_enabled {
+            let selected =
+                player_visible_filter.get_or_insert_with(|| player_filter_options[0].clone());
+            if !player_filter_options
+                .iter()
+                .any(|player_id| player_id == selected)
+            {
+                *selected = player_filter_options[0].clone();
+            }
+
+            egui::ComboBox::from_id_salt("chat_list_player_visible_filter")
+                .selected_text(target_display_name(manager, selected))
+                .show_ui(ui, |ui| {
+                    for player_id in &player_filter_options {
+                        ui.selectable_value(
+                            selected,
+                            player_id.clone(),
+                            target_display_name(manager, player_id),
+                        );
+                    }
+                });
+        }
+    }
+
+    let player_filter_id = player_visible_filter
+        .as_deref()
+        .and_then(|player_id| player_id.parse::<u64>().ok());
+    let targets = chat_list_target_views(manager, player_filter_id);
+    if targets.is_empty() {
+        ui.label("所选玩家当前没有可见聊天。");
+        return;
+    }
 
     let mut changed = false;
     egui::ScrollArea::vertical()
         .id_salt("chat_list_panel_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for target_id in targets {
+            for target in targets {
+                let target_id = target.target_id;
                 let display_name = target_display_name(manager, &target_id);
-                let unread_count = target_unread_count(manager, &target_id);
+                let unread_count = target.unread_count;
                 let is_open = manager.open_chat_targets.contains(&target_id);
                 let is_editing = edit_target.as_deref() == Some(target_id.as_str());
 
@@ -2360,6 +3377,12 @@ fn chat_list_panel(
                             manager.messages.get(&target_id),
                         ));
                         ui.small(&target_id);
+                        if player_filter_id.is_some() {
+                            ui.small(format!(
+                                "可见 {}/{}",
+                                target.message_count, target.total_message_count
+                            ));
+                        }
                     });
 
                     if is_editing {
@@ -2528,14 +3551,32 @@ struct QuickCastSkill {
     index: usize,
     name: String,
     note: String,
+    skill_type: Option<String>,
+    legacy_buff_machine_json: Option<String>,
     mp_cost: f32,
     cooldown_turns: u32,
+    cooldown_left: Option<u32>,
+    target_count: Option<u32>,
+    target_class: Option<String>,
+    range: Option<i32>,
+    arg_values: SkillRuleArgs,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum QuickCastEffect {
-    Damage { amount: f32, target: TargetSelector },
-    Heal { amount: f32, target: TargetSelector },
+    Damage {
+        amount: f32,
+        target: TargetSelector,
+        damage_type: DamageType,
+    },
+    Heal {
+        amount: f32,
+        target: TargetSelector,
+    },
+    GrantBuff {
+        target: TargetSelector,
+        buff: crate::rule_engine::RuleBuffTemplate,
+    },
 }
 
 struct QuickCastAction {
@@ -2599,6 +3640,16 @@ fn quick_character_windows(
                     .player_characters
                     .entry(target_id.clone())
                     .or_default();
+                if character_effect_sync_needed(&target_id, character) {
+                    sync_character_buffs(
+                        &target_id,
+                        character,
+                        &stat_config,
+                        rule_engine_state,
+                        &skill_pool_snapshot,
+                    );
+                    changed = true;
+                }
                 character_status_summary_ui(ui, character);
                 ui.separator();
                 cast_action = quick_cast_ui(
@@ -2607,6 +3658,7 @@ fn quick_character_windows(
                     character,
                     character_edit_state,
                     &character_targets,
+                    &skill_pool_snapshot,
                     cast_turn,
                     scene_positions,
                     player_camera_positions,
@@ -2648,6 +3700,7 @@ fn quick_cast_ui(
     character: &mut PlayerCharacter,
     edit_state: &mut CharacterEditState,
     character_targets: &[(String, String)],
+    skill_pool: &[SkillPoolEntry],
     cast_turn: u32,
     scene_positions: Option<&SceneCharacterPositions>,
     player_camera_positions: Option<&ScenePlayerCameraPositions>,
@@ -2666,22 +3719,38 @@ fn quick_cast_ui(
         *selected = 0;
     }
     let skill = skills[*selected].clone();
-    let effect = quick_cast_effect(&skill.note);
+    let effect = quick_cast_effect(
+        &skill.note,
+        &skill.arg_values,
+        skill.skill_type.as_deref(),
+        skill.legacy_buff_machine_json.as_deref(),
+        skill_pool,
+    );
     let cooldown_remaining = quick_skill_cooldown_remaining(
         character,
         skill.index,
         skill.cooldown_turns,
+        skill.cooldown_left,
         cast_turn,
     );
     let targets = effect
         .as_ref()
         .map(|effect| {
-            quick_cast_targets(
-                caster_id,
-                effect,
-                character_targets,
-                scene_positions,
-                player_camera_positions,
+            let fallback_radius = quick_cast_skill_range_radius(character, effect, skill.range);
+            limit_skill_targets(
+                quick_cast_targets(
+                    caster_id,
+                    effect,
+                    character_targets,
+                    scene_positions,
+                    player_camera_positions,
+                    fallback_radius,
+                    skill.target_class.as_deref(),
+                ),
+                skill_target_limit(
+                    skill.target_count,
+                    skill.target_class.as_deref(),
+                ),
             )
         })
         .unwrap_or_default();
@@ -2706,6 +3775,7 @@ fn quick_cast_ui(
                                 character,
                                 skill.index,
                                 skill.cooldown_turns,
+                                skill.cooldown_left,
                                 cast_turn,
                             );
                             let mut details = Vec::new();
@@ -2720,6 +3790,23 @@ fn quick_cast_ui(
                             } else if skill.cooldown_turns > 0 {
                                 details.push(format!("CD {}", skill.cooldown_turns));
                             }
+                            if let Some(target_count) = skill.target_count {
+                                details.push(format!("目标 {target_count}"));
+                            }
+                            if let Some(target_class) = skill
+                                .target_class
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|target_class| !target_class.is_empty())
+                            {
+                                details.push(target_class.to_owned());
+                            }
+                            if let Some(radius) = skill_range_radius(skill.range) {
+                                details.push(format!(
+                                    "范围 {}",
+                                    format_character_number(radius)
+                                ));
+                            }
                             let label = if details.is_empty() {
                                 skill.name.clone()
                             } else {
@@ -2732,7 +3819,12 @@ fn quick_cast_ui(
                             ui.selectable_value(selected, index, label);
                         }
                     });
-                if let Some(radius) = effect.as_ref().and_then(quick_cast_radius) {
+                if let Some(radius) = effect.as_ref().and_then(|effect| {
+                    quick_cast_radius(
+                        effect,
+                        quick_cast_skill_range_radius(character, effect, skill.range),
+                    )
+                }) {
                     ui.small(format!(
                         "以玩家镜头为中心 {}米",
                         format_character_number(radius)
@@ -2744,6 +3836,7 @@ fn quick_cast_ui(
                 let target_label = match effect {
                     QuickCastEffect::Damage { .. } => "范围内目标",
                     QuickCastEffect::Heal { .. } => "可影响角色",
+                    QuickCastEffect::GrantBuff { .. } => "可获得状态",
                 };
                 if targets.is_empty() {
                     ui.small("范围内没有可影响角色。");
@@ -2829,7 +3922,8 @@ fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
         .iter()
         .enumerate()
         .filter_map(|(index, name)| {
-            if !character.skill_metadata[index].is_approved() {
+            let metadata = character.skill_metadata[index].clone();
+            if !metadata.is_approved() {
                 return None;
             }
             let name = if name.trim().is_empty() {
@@ -2845,6 +3939,8 @@ fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
                     .get(index)
                     .cloned()
                     .unwrap_or_default(),
+                skill_type: metadata.skill_type,
+                legacy_buff_machine_json: metadata.legacy_buff_machine_json,
                 mp_cost: character
                     .skill_mp_costs
                     .get(index)
@@ -2856,6 +3952,11 @@ fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
                     .get(index)
                     .copied()
                     .unwrap_or_default(),
+                cooldown_left: metadata.cooldown_left,
+                target_count: metadata.target_count,
+                target_class: metadata.target_class,
+                range: metadata.range,
+                arg_values: skill_rule_args(&metadata.args),
             })
         })
         .collect()
@@ -2881,30 +3982,53 @@ fn quick_skill_cooldown_remaining(
     character: &PlayerCharacter,
     skill_index: usize,
     cooldown_turns: u32,
+    cooldown_left: Option<u32>,
     cast_turn: u32,
 ) -> u32 {
-    if cooldown_turns == 0 {
-        return 0;
-    }
-    character
+    let Some(last_cast_turn) = character
         .skill_last_cast_turns
         .get(&skill_index.to_string())
-        .map(|last_cast_turn| {
-            cooldown_turns.saturating_sub(cast_turn.saturating_sub(*last_cast_turn))
-        })
-        .unwrap_or(0)
+    else {
+        return cooldown_left.unwrap_or_default();
+    };
+    cooldown_turns.saturating_sub(cast_turn.saturating_sub(*last_cast_turn))
 }
 
-fn quick_cast_effect(note: &str) -> Option<QuickCastEffect> {
-    let ast = parse_rule(note).ok()?;
+fn quick_cast_effect(
+    note: &str,
+    arg_values: &SkillRuleArgs,
+    skill_type: Option<&str>,
+    legacy_buff_machine_json: Option<&str>,
+    skill_pool: &[SkillPoolEntry],
+) -> Option<QuickCastEffect> {
+    let legacy_pool_entries = legacy_moonberry_pool_entries(skill_pool);
+    let ast = parse_rule_with_named_args(
+        note,
+        &arg_values.numeric_values,
+        &arg_values.text_values,
+    )
+    .ok()
+    .map(|ast| apply_skill_type_damage_default(ast, skill_type))
+    .or_else(|| {
+        legacy_buff_machine_json.and_then(|json| {
+            legacy_moonberry_buff_machine_skill_cast_rule_with_context(
+                json,
+                &arg_values.numeric_values,
+                &arg_values.text_values,
+                skill_type,
+                &legacy_pool_entries,
+            )
+        })
+    })?;
     ast.actions.into_iter().find_map(|action| match action {
         Action::Damage {
             target,
             amount: ValueExpr::Number(amount),
-            ..
+            damage_type,
         } => Some(QuickCastEffect::Damage {
             amount: amount.max(0.0),
             target,
+            damage_type,
         }),
         Action::Heal {
             target,
@@ -2913,15 +4037,65 @@ fn quick_cast_effect(note: &str) -> Option<QuickCastEffect> {
             amount: amount.max(0.0),
             target,
         }),
+        Action::GrantBuff { target, buff } => Some(QuickCastEffect::GrantBuff { target, buff }),
         _ => None,
     })
 }
 
-fn quick_cast_radius(effect: &QuickCastEffect) -> Option<f32> {
-    let target = match effect {
-        QuickCastEffect::Damage { target, .. } | QuickCastEffect::Heal { target, .. } => target,
+fn quick_cast_skill_range_radius(
+    character: &PlayerCharacter,
+    effect: &QuickCastEffect,
+    range: Option<i32>,
+) -> Option<f32> {
+    let minimum_range = match effect {
+        QuickCastEffect::Damage {
+            damage_type: DamageType::Range,
+            ..
+        } => character_minimum_range_meters(character),
+        _ => 0.0,
     };
-    target.area.and_then(|area| area.radius_meters)
+    moonberry_effective_skill_range_radius(range, minimum_range)
+}
+
+fn quick_cast_radius(effect: &QuickCastEffect, fallback_radius: Option<f32>) -> Option<f32> {
+    let target = match effect {
+        QuickCastEffect::Damage { target, .. }
+        | QuickCastEffect::Heal { target, .. }
+        | QuickCastEffect::GrantBuff { target, .. } => target,
+    };
+    target
+        .area
+        .and_then(|area| area.radius_meters.or(fallback_radius))
+}
+
+fn skill_range_radius(range: Option<i32>) -> Option<f32> {
+    range.filter(|range| *range > 0).map(|range| range as f32)
+}
+
+fn trpg_damage_bonus_kind(damage_type: DamageType) -> TrpgDamageBonusKind {
+    match damage_type {
+        DamageType::Magical => TrpgDamageBonusKind::Magical,
+        DamageType::Physical => TrpgDamageBonusKind::Physical,
+        DamageType::Range => TrpgDamageBonusKind::Range,
+        DamageType::Cursed
+        | DamageType::Diseased
+        | DamageType::Bleed
+        | DamageType::Poisoning
+        | DamageType::None => TrpgDamageBonusKind::Other,
+    }
+}
+
+fn trpg_damage_taken_kind(damage_type: DamageType) -> TrpgDamageTakenKind {
+    match damage_type {
+        DamageType::Magical => TrpgDamageTakenKind::Magical,
+        DamageType::Diseased => TrpgDamageTakenKind::Diseased,
+        DamageType::Poisoning => TrpgDamageTakenKind::Poisoning,
+        DamageType::Physical
+        | DamageType::Range
+        | DamageType::Cursed
+        | DamageType::Bleed
+        | DamageType::None => TrpgDamageTakenKind::Other,
+    }
 }
 
 fn quick_cast_targets(
@@ -2930,12 +4104,22 @@ fn quick_cast_targets(
     character_targets: &[(String, String)],
     scene_positions: Option<&SceneCharacterPositions>,
     player_camera_positions: Option<&ScenePlayerCameraPositions>,
+    fallback_radius: Option<f32>,
+    target_class: Option<&str>,
 ) -> Vec<String> {
     let target = match effect {
-        QuickCastEffect::Damage { target, .. } | QuickCastEffect::Heal { target, .. } => target,
+        QuickCastEffect::Damage { target, .. }
+        | QuickCastEffect::Heal { target, .. }
+        | QuickCastEffect::GrantBuff { target, .. } => target,
     };
-    if let Some(area) = target.area {
-        let Some(radius) = area.radius_meters else {
+    let force_area =
+        skill_target_class_is_area(target_class) && !matches!(target.actor, ActorRef::SelfActor);
+    if target.area.is_some() || force_area {
+        let radius = target
+            .area
+            .and_then(|area| area.radius_meters)
+            .or(fallback_radius);
+        let Some(radius) = radius else {
             return character_targets
                 .iter()
                 .filter(|(target_id, _)| target_id != caster_id)
@@ -2969,12 +4153,76 @@ fn quick_cast_targets(
 
     match target.actor {
         ActorRef::SelfActor => vec![caster_id.to_owned()],
-        ActorRef::Source | ActorRef::Target => character_targets
-            .iter()
-            .find(|(target_id, _)| target_id != caster_id)
-            .map(|(target_id, _)| vec![target_id.clone()])
-            .unwrap_or_default(),
+        ActorRef::Source | ActorRef::Target => {
+            let targets = character_targets
+                .iter()
+                .find(|(target_id, _)| target_id != caster_id)
+                .map(|(target_id, _)| vec![target_id.clone()])
+                .unwrap_or_default();
+            filter_quick_cast_targets_by_range(
+                caster_id,
+                targets,
+                scene_positions,
+                player_camera_positions,
+                fallback_radius,
+            )
+        },
     }
+}
+
+fn filter_quick_cast_targets_by_range(
+    caster_id: &str,
+    targets: Vec<String>,
+    scene_positions: Option<&SceneCharacterPositions>,
+    player_camera_positions: Option<&ScenePlayerCameraPositions>,
+    radius: Option<f32>,
+) -> Vec<String> {
+    let Some(radius) = radius else {
+        return targets;
+    };
+    let Some(user_id) = caster_id.parse::<u64>().ok() else {
+        return Vec::new();
+    };
+    let Some(camera_position) =
+        player_camera_positions.and_then(|positions| positions.positions.get(&user_id))
+    else {
+        return Vec::new();
+    };
+    let Some(scene_positions) = scene_positions else {
+        return Vec::new();
+    };
+    targets
+        .into_iter()
+        .filter(|target_id| {
+            scene_positions
+                .positions
+                .get(target_id)
+                .map(|position| camera_position.distance(*position) <= radius)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn limit_skill_targets(mut targets: Vec<String>, target_count: Option<u32>) -> Vec<String> {
+    if let Some(target_count) = target_count {
+        targets.truncate(target_count as usize);
+    }
+    targets
+}
+
+fn skill_target_limit(target_count: Option<u32>, target_class: Option<&str>) -> Option<u32> {
+    match target_class.map(str::trim) {
+        Some("无目标") => Some(0),
+        Some("单目标") => Some(target_count.unwrap_or(1).min(1)),
+        _ => target_count,
+    }
+}
+
+fn skill_target_class_is_area(target_class: Option<&str>) -> bool {
+    matches!(
+        target_class.map(str::trim),
+        Some("范围")
+    )
 }
 
 fn quick_cast_character_targets(manager: &NapcatMessageManager) -> Vec<(String, String)> {
@@ -3008,52 +4256,191 @@ fn apply_quick_cast_action_to_manager(
     manager: &mut NapcatMessageManager,
     action: QuickCastAction,
 ) -> bool {
-    let Some(caster) = manager.player_characters.get_mut(&action.caster_id) else {
-        return false;
+    let stat_config = manager.character_stat_config_for_target(&action.caster_id);
+    let effect = action.effect;
+    let (
+        source_damage_multiplier,
+        source_healing_multiplier,
+        source_physical_damage_lifesteal,
+        source_minimum_damage_floor,
+        source_mutual_aid_healing_rate,
+        damage_dealt_buffs,
+    ) = {
+        let Some(caster) = manager.player_characters.get_mut(&action.caster_id) else {
+            return false;
+        };
+        if !action.force && caster.mp + f32::EPSILON < action.skill.mp_cost {
+            return false;
+        }
+        let cooldown_remaining = quick_skill_cooldown_remaining(
+            caster,
+            action.skill.index,
+            action.skill.cooldown_turns,
+            action.skill.cooldown_left,
+            action.cast_turn,
+        );
+        if !action.force && cooldown_remaining > 0 {
+            return false;
+        }
+        let source_damage_multiplier = match effect {
+            Some(QuickCastEffect::Damage { damage_type, .. }) => {
+                caster.damage_dealt_modifier
+                    * low_hp_damage_multiplier(caster.hp, caster.max_hp)
+                    * character_damage_attribute_multiplier(
+                        caster,
+                        &stat_config,
+                        trpg_damage_bonus_kind(damage_type),
+                    )
+            },
+            _ => caster.damage_dealt_modifier,
+        };
+        let source_healing_multiplier = caster.healing_dealt_modifier
+            * character_healing_attribute_multiplier(caster, &stat_config)
+            * wounded_healing_dealt_multiplier(
+                caster.hp,
+                caster.max_hp,
+                character_wounded_healing_dealt_modifier(caster),
+            );
+        let source_physical_damage_lifesteal = match effect {
+            Some(QuickCastEffect::Damage {
+                damage_type: DamageType::Physical,
+                ..
+            }) => character_physical_damage_lifesteal(caster),
+            _ => 0.0,
+        };
+        let source_minimum_damage_floor = match effect {
+            Some(QuickCastEffect::Damage { .. }) => character_minimum_damage_floor(caster),
+            _ => 0.0,
+        };
+        let source_mutual_aid_healing_rate = match effect {
+            Some(QuickCastEffect::Heal { .. }) => character_mutual_aid_healing_rate(caster),
+            _ => 0.0,
+        };
+        let damage_dealt_buffs = character_damage_dealt_talent_buffs(caster, &action.caster_id);
+        if !action.force {
+            caster.mp = (caster.mp - action.skill.mp_cost).max(0.0);
+        }
+        caster.skill_last_cast_turns.insert(
+            action.skill.index.to_string(),
+            action.cast_turn,
+        );
+        (
+            source_damage_multiplier,
+            source_healing_multiplier,
+            source_physical_damage_lifesteal,
+            source_minimum_damage_floor,
+            source_mutual_aid_healing_rate,
+            damage_dealt_buffs,
+        )
     };
-    if !action.force && caster.mp + f32::EPSILON < action.skill.mp_cost {
-        return false;
-    }
-    let cooldown_remaining = quick_skill_cooldown_remaining(
-        caster,
-        action.skill.index,
-        action.skill.cooldown_turns,
-        action.cast_turn,
-    );
-    if !action.force && cooldown_remaining > 0 {
-        return false;
-    }
-    if !action.force {
-        caster.mp = (caster.mp - action.skill.mp_cost).max(0.0);
-    }
-    caster.skill_last_cast_turns.insert(
-        action.skill.index.to_string(),
-        action.cast_turn,
-    );
 
     let mut changed = true;
-    let Some(effect) = action.effect else {
+    let Some(effect) = effect else {
         return changed;
     };
-    for target_id in action.targets {
+    let mut pending_source_lifesteal = 0.0;
+    let mut pending_source_mutual_aid_healing = 0.0;
+    for target_id in limit_skill_targets(
+        action.targets,
+        skill_target_limit(
+            action.skill.target_count,
+            action.skill.target_class.as_deref(),
+        ),
+    ) {
         let Some(target) = manager.player_characters.get_mut(&target_id) else {
             continue;
         };
         match effect {
-            QuickCastEffect::Damage { amount, .. } => {
-                let next_hp = (target.hp - amount).max(0.0);
+            QuickCastEffect::Damage {
+                amount,
+                damage_type,
+                ..
+            } => {
+                let target_damage_multiplier = target.damage_taken_modifier
+                    * character_damage_taken_attribute_multiplier(
+                        target,
+                        trpg_damage_taken_kind(damage_type),
+                    );
+                let incoming_amount =
+                    (amount * source_damage_multiplier * target_damage_multiplier).max(0.0);
+                let typed_final_amount = (incoming_amount
+                    * large_hit_damage_taken_multiplier(
+                        target.max_hp,
+                        incoming_amount,
+                        character_large_hit_damage_taken_modifier(target),
+                    ))
+                .max(0.0);
+                let final_amount =
+                    if amount > f32::EPSILON && source_minimum_damage_floor > f32::EPSILON {
+                        typed_final_amount.max(source_minimum_damage_floor)
+                    } else {
+                        typed_final_amount
+                    };
+                changed |= record_character_damage_taken(target, final_amount);
+                let next_hp = (target.hp - final_amount).max(0.0);
                 if (target.hp - next_hp).abs() > f32::EPSILON {
                     target.hp = next_hp;
+                    if let Some(base_stats) = target.buff_base_stats.as_mut() {
+                        base_stats.hp = (base_stats.hp - final_amount).max(0.0);
+                    }
                     changed = true;
+                }
+                if final_amount > f32::EPSILON {
+                    for buff in damage_dealt_buffs.iter().cloned() {
+                        if upsert_character_active_buff(target, buff) {
+                            target.buff_base_stats = None;
+                            changed = true;
+                        }
+                    }
+                    pending_source_lifesteal +=
+                        typed_final_amount * source_physical_damage_lifesteal;
                 }
             },
             QuickCastEffect::Heal { amount, .. } => {
-                let next_hp = (target.hp + amount).min(target.max_hp);
+                let target_healing_multiplier = target.healing_taken_modifier
+                    * dying_healing_taken_multiplier(
+                        target.hp,
+                        target.max_hp,
+                        character_dying_healing_taken_modifier(target),
+                    );
+                let final_amount =
+                    (amount * source_healing_multiplier * target_healing_multiplier).max(0.0);
+                let target_mutual_aid_healing_rate = character_mutual_aid_healing_rate(target);
+                changed |= record_character_healing_taken(target, final_amount);
+                let next_hp = (target.hp + final_amount).min(target.max_hp);
                 if (target.hp - next_hp).abs() > f32::EPSILON {
                     target.hp = next_hp;
+                    if let Some(base_stats) = target.buff_base_stats.as_mut() {
+                        base_stats.hp = (base_stats.hp + final_amount).min(base_stats.max_hp);
+                    }
                     changed = true;
                 }
+                if target_id != action.caster_id && final_amount > f32::EPSILON {
+                    pending_source_mutual_aid_healing += final_amount
+                        * (source_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
+                }
             },
+            QuickCastEffect::GrantBuff { ref buff, .. } => {
+                target
+                    .active_buffs
+                    .push(buff.to_buff_spec(&action.caster_id));
+                target.buff_base_stats = None;
+                changed = true;
+            },
+        }
+    }
+    let pending_source_healing = pending_source_lifesteal + pending_source_mutual_aid_healing;
+    if pending_source_healing > f32::EPSILON {
+        if let Some(caster) = manager.player_characters.get_mut(&action.caster_id) {
+            changed |= record_character_healing_taken(caster, pending_source_healing);
+            let next_hp = (caster.hp + pending_source_healing).min(caster.max_hp);
+            if (caster.hp - next_hp).abs() > f32::EPSILON {
+                caster.hp = next_hp;
+                if let Some(base_stats) = caster.buff_base_stats.as_mut() {
+                    base_stats.hp = (base_stats.hp + pending_source_healing).min(base_stats.max_hp);
+                }
+                changed = true;
+            }
         }
     }
     changed
@@ -3216,6 +4603,27 @@ fn character_editor_ui(
                     .prefix("经验 "),
             )
             .changed();
+        ui.label(format!(
+            "/ {}",
+            character_next_level_exp(character.level)
+        ));
+        let award_draft = edit_state
+            .exp_award_drafts
+            .entry(target_id.to_owned())
+            .or_insert(0);
+        ui.add(
+            egui::DragValue::new(award_draft)
+                .range(0..=999_999)
+                .prefix("授予 "),
+        );
+        if ui.button("应用经验").clicked() && *award_draft > 0 {
+            let level_ups = grant_character_experience(character, *award_draft);
+            *award_draft = 0;
+            changed = true;
+            if level_ups > 0 {
+                derived_stats_changed = true;
+            }
+        }
     });
     ui.horizontal(|ui| {
         changed |= ui
@@ -3313,6 +4721,27 @@ fn character_editor_ui(
             )
             .changed();
     });
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.damage_taken_this_turn)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("本轮承伤 "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.healing_taken_this_turn)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("本轮受疗 "),
+            )
+            .changed();
+        if ui.button("清空本轮").clicked() {
+            changed |= reset_character_turn_totals(character);
+        }
+    });
 
     ui.separator();
     let status_changed = character_status_source_ui(
@@ -3330,7 +4759,9 @@ fn character_editor_ui(
         target_id,
         character,
         edit_state,
+        &stat_config,
         rule_engine_state,
+        skill_pool,
     );
     ui.separator();
     changed |= character_inventory_editor_ui(ui, character);
@@ -3342,18 +4773,21 @@ fn character_editor_ui(
         edit_state,
         rule_engine_state,
         skill_pool,
+        stat_config,
     );
 
     if derived_stats_changed {
-        update_character_from_status_with_config(character, &stat_config);
-        if !character.active_buffs.is_empty() {
-            character.buff_base_stats = Some(CharacterBuffBaseStats::from_character(
-                character,
-            ));
-            sync_character_buffs(target_id, character, rule_engine_state);
-        } else {
-            sync_character_skill_rules(target_id, character, rule_engine_state);
+        if let Some(base_stats) = character.buff_base_stats.take() {
+            restore_character_base_stats(character, base_stats);
         }
+        update_character_from_status_with_config(character, &stat_config);
+        sync_character_buffs(
+            target_id,
+            character,
+            &stat_config,
+            rule_engine_state,
+            skill_pool,
+        );
         changed = true;
     }
 
@@ -3482,6 +4916,7 @@ fn character_skill_editor_ui(
     edit_state: &mut CharacterEditState,
     rule_engine_state: &mut RuleEngineState,
     skill_pool: &[SkillPoolEntry],
+    stat_config: TrpgBasicConfig,
 ) -> bool {
     let mut changed = false;
     let mut remove_index = None;
@@ -3510,7 +4945,15 @@ fn character_skill_editor_ui(
     });
 
     for index in 0..character.skill_names.len() {
-        let validation = parse_skill_note(&character.skill_notes[index]);
+        let metadata = character.skill_metadata.get(index);
+        let arg_values = metadata
+            .map(|metadata| skill_rule_args(&metadata.args))
+            .unwrap_or_default();
+        let validation = parse_skill_note(
+            &character.skill_notes[index],
+            &arg_values,
+            metadata.and_then(|metadata| metadata.skill_type.as_deref()),
+        );
         ui.horizontal(|ui| {
             let width = (ui.available_width() - 28.0).clamp(160.0, CHARACTER_FIELD_MAX_WIDTH);
             ui.vertical(|ui| {
@@ -3545,6 +4988,9 @@ fn character_skill_editor_ui(
                     let metadata = &mut character.skill_metadata[index];
                     changed |= ui.checkbox(&mut metadata.pc_approved, "PC确认").changed();
                     changed |= ui.checkbox(&mut metadata.st_approved, "GM确认").changed();
+                    if metadata.pc_approved && !metadata.st_approved {
+                        ui.small("待GM确认");
+                    }
                     if let Some(source) = character_skill_metadata_source_label(metadata) {
                         ui.small(source);
                     }
@@ -3594,7 +5040,13 @@ fn character_skill_editor_ui(
         changed = true;
     }
 
-    sync_character_skill_rules(target_id, character, rule_engine_state);
+    sync_character_buffs(
+        target_id,
+        character,
+        &stat_config,
+        rule_engine_state,
+        skill_pool,
+    );
 
     changed
 }
@@ -3602,16 +5054,18 @@ fn character_skill_editor_ui(
 fn character_skill_shape_metadata_ui(ui: &mut Ui, metadata: &mut CharacterSkillMetadata) -> bool {
     let mut changed = false;
     ui.horizontal_wrapped(|ui| {
-        changed |= optional_string_field(
+        changed |= optional_known_string_field(
             ui,
             "类型",
             &mut metadata.skill_type,
+            MOONBERRY_SKILL_TYPES,
             86.0,
         );
-        changed |= optional_string_field(
+        changed |= optional_known_string_field(
             ui,
             "目标",
             &mut metadata.target_class,
+            MOONBERRY_TARGET_CLASSES,
             86.0,
         );
         changed |= optional_u32_drag(
@@ -3656,8 +5110,29 @@ fn character_skill_shape_metadata_ui(ui: &mut Ui, metadata: &mut CharacterSkillM
                 .join("，")
         ));
     }
-    if metadata.legacy_has_buff_machine {
-        ui.small("含旧buff机，尚未转换为规则。");
+    if let Some(trigger) = metadata
+        .talent_trigger
+        .as_deref()
+        .filter(|trigger| !trigger.trim().is_empty())
+    {
+        ui.small(format!("天赋触发：{}", trigger.trim()));
+    }
+    if let Some(effect) = metadata
+        .talent_effect
+        .as_deref()
+        .filter(|effect| !effect.trim().is_empty())
+    {
+        ui.small(format!("天赋效果：{}", effect.trim()));
+    }
+    if metadata.legacy_has_buff_machine || metadata.legacy_buff_machine_json.is_some() {
+        let detail = metadata
+            .legacy_buff_machine_json
+            .as_deref()
+            .map(|json| format!("，原始数据 {}字节", json.len()))
+            .unwrap_or_default();
+        ui.small(format!(
+            "含旧buff机{detail}，常见主动/被动效果可执行。"
+        ));
     }
     changed
 }
@@ -3673,6 +5148,60 @@ fn optional_string_field(ui: &mut Ui, label: &str, value: &mut Option<String>, w
         *value = (!text.is_empty()).then(|| text.to_owned());
     }
     changed
+}
+
+fn optional_known_string_field(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut Option<String>,
+    known_values: &[&str],
+    width: f32,
+) -> bool {
+    let mut changed = false;
+    ui.label(label);
+
+    let selected_text = value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未设置");
+    let mut selected_value = value.clone().unwrap_or_default();
+    egui::ComboBox::from_id_salt(ui.next_auto_id())
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            changed |= ui
+                .selectable_value(
+                    &mut selected_value,
+                    String::new(),
+                    "未设置",
+                )
+                .changed();
+            for candidate in known_values {
+                changed |= ui
+                    .selectable_value(
+                        &mut selected_value,
+                        (*candidate).to_owned(),
+                        *candidate,
+                    )
+                    .changed();
+            }
+        });
+
+    if changed {
+        let trimmed = selected_value.trim();
+        *value = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
+
+    let mut text = value.clone().unwrap_or_default();
+    let text_changed = ui
+        .add(egui::TextEdit::singleline(&mut text).desired_width(width))
+        .changed();
+    if text_changed {
+        let text = text.trim();
+        *value = (!text.is_empty()).then(|| text.to_owned());
+    }
+
+    changed || text_changed
 }
 
 fn optional_u32_drag(
@@ -3732,15 +5261,32 @@ fn skill_arg_label(arg: &crate::napcat::SkillPoolArg) -> String {
     }
 }
 
-fn normalize_character_skill_fields(character: &mut PlayerCharacter) -> bool {
-    let mut changed = false;
-    let skill_count = character
+fn character_skill_slot_count(character: &PlayerCharacter) -> usize {
+    character
         .skill_names
         .len()
         .max(character.skill_notes.len())
         .max(character.skill_mp_costs.len())
         .max(character.skill_cooldown_turns.len())
-        .max(character.skill_metadata.len());
+        .max(character.skill_metadata.len())
+}
+
+fn pending_gm_skill_count(character: &PlayerCharacter) -> usize {
+    (0..character_skill_slot_count(character))
+        .filter(|index| {
+            let metadata = character
+                .skill_metadata
+                .get(*index)
+                .cloned()
+                .unwrap_or_default();
+            metadata.pc_approved && !metadata.st_approved
+        })
+        .count()
+}
+
+fn normalize_character_skill_fields(character: &mut PlayerCharacter) -> bool {
+    let mut changed = false;
+    let skill_count = character_skill_slot_count(character);
     if character.skill_names.len() != skill_count {
         character.skill_names.resize(skill_count, String::new());
         changed = true;
@@ -3834,24 +5380,38 @@ fn shift_skill_last_cast_turns_after_remove(
     *last_cast_turns = shifted;
 }
 
-fn parse_skill_note(note: &str) -> Result<Option<RuleAst>, String> {
+fn parse_skill_note(
+    note: &str,
+    arg_values: &SkillRuleArgs,
+    skill_type: Option<&str>,
+) -> Result<Option<RuleAst>, String> {
     if note.trim().is_empty() {
         return Ok(None);
     }
-    parse_rule(note).map(Some)
+    parse_rule_with_named_args(
+        note,
+        &arg_values.numeric_values,
+        &arg_values.text_values,
+    )
+    .map(|ast| apply_skill_type_damage_default(ast, skill_type))
+    .map(Some)
 }
 
 fn sync_character_skill_rules(
     target_id: &str,
     character: &PlayerCharacter,
+    stat_config: &TrpgBasicConfig,
     rule_engine_state: &mut RuleEngineState,
+    skill_pool: &[SkillPoolEntry],
 ) {
     let stats = CharacterBuffBaseStats::from_character(character);
     sync_character_skill_rules_with_stats(
         target_id,
         character,
         &stats,
+        stat_config,
         rule_engine_state,
+        skill_pool,
     );
 }
 
@@ -3859,8 +5419,11 @@ fn sync_character_skill_rules_with_stats(
     target_id: &str,
     character: &PlayerCharacter,
     stats: &CharacterBuffBaseStats,
+    stat_config: &TrpgBasicConfig,
     rule_engine_state: &mut RuleEngineState,
+    skill_pool: &[SkillPoolEntry],
 ) {
+    let legacy_pool_entries = legacy_moonberry_pool_entries(skill_pool);
     let rules = character
         .skill_notes
         .iter()
@@ -3873,21 +5436,142 @@ fn sync_character_skill_rules_with_stats(
                 .unwrap_or_default()
                 .is_approved()
         })
-        .filter_map(|(_, note)| parse_skill_note(note).ok().flatten())
+        .filter_map(|(index, note)| {
+            let metadata = character.skill_metadata.get(index);
+            let arg_values = metadata
+                .map(|metadata| skill_rule_args(&metadata.args))
+                .unwrap_or_default();
+            let mut rules = Vec::new();
+            if let Some(rule) = parse_skill_note(
+                note,
+                &arg_values,
+                metadata.and_then(|metadata| metadata.skill_type.as_deref()),
+            )
+            .ok()
+            .flatten()
+            {
+                rules.push(rule);
+            }
+            if let Some(rule) = metadata
+                .and_then(|metadata| metadata.legacy_buff_machine_json.as_deref())
+                .and_then(|json| {
+                    legacy_moonberry_buff_machine_skill_cast_rule_with_context(
+                        json,
+                        &arg_values.numeric_values,
+                        &arg_values.text_values,
+                        metadata.and_then(|metadata| metadata.skill_type.as_deref()),
+                        &legacy_pool_entries,
+                    )
+                })
+            {
+                rules.push(rule);
+            }
+            (!rules.is_empty()).then_some(rules)
+        })
+        .flatten()
         .collect::<Vec<_>>();
     let display_name =
         if character.name.trim().is_empty() { target_id } else { character.name.trim() };
+    let mut base_character = character.clone();
+    base_character.hp = stats.hp;
+    base_character.max_hp = stats.max_hp;
+    base_character.hp_regen = stats.hp_regen;
+    base_character.mp = stats.mp;
+    base_character.max_mp = stats.max_mp;
+    base_character.mp_regen = stats.mp_regen;
+    base_character.speed = stats.speed;
+    base_character.damage_dealt_modifier = stats.damage_dealt_modifier;
+    base_character.damage_taken_modifier = stats.damage_taken_modifier;
+    base_character.healing_dealt_modifier = stats.healing_dealt_modifier;
+    base_character.healing_taken_modifier = stats.healing_taken_modifier;
+    base_character.extra_status = stats.extra_status.clone();
     rule_engine_state.sync_character(
         target_id,
         display_name,
         stats.hp,
         stats.max_hp,
+        stats.mp,
+        stats.max_mp,
+        stats.hp_regen,
+        stats.mp_regen,
+        character_status_block(&character.status.combined(&stats.extra_status)),
         stats.damage_dealt_modifier,
+        character_damage_attribute_multiplier(
+            &base_character,
+            stat_config,
+            TrpgDamageBonusKind::Physical,
+        ),
+        character_damage_attribute_multiplier(
+            &base_character,
+            stat_config,
+            TrpgDamageBonusKind::Magical,
+        ),
+        character_damage_attribute_multiplier(
+            &base_character,
+            stat_config,
+            TrpgDamageBonusKind::Range,
+        ),
+        character_physical_damage_lifesteal(&base_character),
+        character_minimum_damage_floor(&base_character),
         stats.damage_taken_modifier,
-        stats.healing_dealt_modifier,
+        character_large_hit_damage_taken_modifier(&base_character),
+        character_damage_taken_attribute_multiplier(
+            &base_character,
+            TrpgDamageTakenKind::Magical,
+        ),
+        character_damage_taken_attribute_multiplier(
+            &base_character,
+            TrpgDamageTakenKind::Diseased,
+        ),
+        character_damage_taken_attribute_multiplier(
+            &base_character,
+            TrpgDamageTakenKind::Poisoning,
+        ),
+        stats.healing_dealt_modifier
+            * character_healing_attribute_multiplier(&base_character, stat_config),
+        character_wounded_healing_dealt_modifier(&base_character),
+        character_mutual_aid_healing_rate(&base_character),
         stats.healing_taken_modifier,
+        character_dying_healing_taken_modifier(&base_character),
+        character_damage_dealt_talent_buffs(&base_character, target_id),
         rules,
     );
+}
+
+fn legacy_moonberry_pool_entries(skill_pool: &[SkillPoolEntry]) -> Vec<LegacyMoonberryPoolEntry> {
+    skill_pool
+        .iter()
+        .filter_map(|entry| {
+            let legacy_json = entry.legacy_raw_payload()?;
+            Some(LegacyMoonberryPoolEntry {
+                id: entry.legacy_pool_id.clone(),
+                name: skill_pool_entry_name(entry),
+                legacy_json,
+                args: entry
+                    .args
+                    .iter()
+                    .map(|arg| LegacyMoonberryPoolArg {
+                        name: arg.name.clone(),
+                        kind: arg.kind.clone(),
+                        value: arg.value.clone(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+fn character_status_block(status: &CharacterStatus) -> StatusBlock {
+    StatusBlock {
+        str_: status.str_,
+        agi: status.agi,
+        dex: status.dex,
+        vit: status.vit,
+        int_: status.int_,
+        wis: status.wis,
+        k: status.k,
+        cha: status.cha,
+    }
 }
 
 fn character_creation_step_options() -> [(CharacterCreationStep, &'static str); 14] {
@@ -4158,12 +5842,20 @@ fn character_buff_editor_ui(
     target_id: &str,
     character: &mut PlayerCharacter,
     edit_state: &mut CharacterEditState,
+    stat_config: &TrpgBasicConfig,
     rule_engine_state: &mut RuleEngineState,
+    skill_pool: &[SkillPoolEntry],
 ) -> bool {
     let mut changed = false;
     let mut remove_index = None;
 
-    sync_character_buffs(target_id, character, rule_engine_state);
+    sync_character_buffs(
+        target_id,
+        character,
+        stat_config,
+        rule_engine_state,
+        skill_pool,
+    );
     ui.horizontal_wrapped(|ui| {
         ui.label(format!(
             "生效buff：{}",
@@ -4253,13 +5945,20 @@ fn character_buff_editor_ui(
                     field: draft.field,
                     value: draft.value,
                 }],
+                tick_actions: Vec::new(),
             });
             changed = true;
         }
     });
 
     if changed {
-        sync_character_buffs(target_id, character, rule_engine_state);
+        sync_character_buffs(
+            target_id,
+            character,
+            stat_config,
+            rule_engine_state,
+            skill_pool,
+        );
     }
     changed
 }
@@ -4624,13 +6323,22 @@ fn equipment_slot_label(slot: EquipmentSlot) -> &'static str {
 fn sync_character_buffs(
     target_id: &str,
     character: &mut PlayerCharacter,
+    stat_config: &TrpgBasicConfig,
     rule_engine_state: &mut RuleEngineState,
+    skill_pool: &[SkillPoolEntry],
 ) {
-    if character.active_buffs.is_empty() {
+    let effective_buffs = character_effective_buffs(target_id, character);
+    if effective_buffs.is_empty() {
         if let Some(base_stats) = character.buff_base_stats.take() {
             restore_character_base_stats(character, base_stats);
         }
-        sync_character_skill_rules(target_id, character, rule_engine_state);
+        sync_character_skill_rules(
+            target_id,
+            character,
+            stat_config,
+            rule_engine_state,
+            skill_pool,
+        );
         rule_engine_state.replace_character_buffs(target_id, Vec::new());
         return;
     }
@@ -4642,19 +6350,126 @@ fn sync_character_buffs(
     }
     let base_stats = character
         .buff_base_stats
+        .clone()
         .expect("buff base stats are initialized for active buffs");
     sync_character_skill_rules_with_stats(
         target_id,
         character,
         &base_stats,
+        stat_config,
         rule_engine_state,
+        skill_pool,
     );
-    rule_engine_state.replace_character_buffs(
-        target_id,
-        character.active_buffs.clone(),
-    );
+    rule_engine_state.replace_character_buffs(target_id, effective_buffs);
     if let Some(effective) = rule_engine_state.character(target_id).cloned() {
-        apply_effective_character_stats(character, &effective);
+        apply_effective_character_stats(
+            character,
+            &effective,
+            &base_stats,
+            stat_config,
+        );
+    }
+}
+
+fn character_effective_buffs(target_id: &str, character: &PlayerCharacter) -> Vec<BuffSpec> {
+    let mut buffs = character.active_buffs.clone();
+    buffs.extend(character_legacy_passive_buffs(
+        target_id, character,
+    ));
+    buffs.extend(character_moonberry_talent_passive_buffs(target_id, character));
+    buffs
+}
+
+fn character_effect_sync_needed(target_id: &str, character: &PlayerCharacter) -> bool {
+    let has_effects = !character.active_buffs.is_empty()
+        || !character_legacy_passive_buffs(target_id, character).is_empty()
+        || !character_moonberry_talent_passive_buffs(target_id, character).is_empty();
+    has_effects != character.buff_base_stats.is_some()
+}
+
+fn character_legacy_passive_buffs(target_id: &str, character: &PlayerCharacter) -> Vec<BuffSpec> {
+    character
+        .skill_metadata
+        .iter()
+        .enumerate()
+        .filter(|(_, metadata)| metadata.is_approved())
+        .flat_map(|(index, metadata)| {
+            let Some(legacy_json) = metadata.legacy_buff_machine_json.as_deref() else {
+                return Vec::new();
+            };
+            let source_id = format!("{target_id}:legacy-passive:{index}");
+            legacy_moonberry_buff_machine_passive_buffs(
+                legacy_json,
+                &skill_rule_args(&metadata.args).numeric_values,
+                &source_id,
+            )
+        })
+        .collect()
+}
+
+fn character_moonberry_talent_passive_buffs(
+    target_id: &str,
+    character: &PlayerCharacter,
+) -> Vec<BuffSpec> {
+    let total_status = character.status.combined(&character.extra_status);
+    character
+        .skill_metadata
+        .iter()
+        .enumerate()
+        .filter(|(_, metadata)| {
+            metadata.is_approved() && metadata.source == CharacterSkillSourceKind::Talent
+        })
+        .filter_map(|(index, _)| {
+            let talent_name = character.skill_names.get(index)?.trim();
+            let effects = moonberry_talent_passive_effects(talent_name, &total_status);
+            (!effects.is_empty()).then(|| BuffSpec {
+                name: talent_name.to_owned(),
+                kind: BuffKind::Magic,
+                priority: 0,
+                turns_remaining: 0,
+                source_id: format!("{target_id}:talent-passive:{index}"),
+                beneficial: true,
+                effects,
+                tick_actions: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+fn moonberry_talent_passive_effects(
+    talent_name: &str,
+    total_status: &CharacterStatus,
+) -> Vec<BuffEffect> {
+    match talent_name {
+        "人类基因工程" => vec![BuffEffect {
+            field: BuffField::MaxHp,
+            value: BuffValue::AddPercent(5.0),
+        }],
+        "大魔法师" => vec![BuffEffect {
+            field: BuffField::MaxMp,
+            value: BuffValue::Add(total_status.int_ as f32),
+        }],
+        "矢量压缩能量池" => vec![
+            BuffEffect {
+                field: BuffField::MaxMp,
+                value: BuffValue::Add(total_status.k as f32 * 2.0),
+            },
+            BuffEffect {
+                field: BuffField::HealingDealtModifier,
+                value: BuffValue::AddPercent(total_status.k as f32),
+            },
+        ],
+        "狡黠之思" => vec![
+            BuffEffect {
+                field: BuffField::MaxMp,
+                value: BuffValue::Add(total_status.wis as f32 * 2.0),
+            },
+            BuffEffect {
+                field: BuffField::MpRegen,
+                value: BuffValue::Add(total_status.wis as f32),
+            },
+        ],
+        _ => Vec::new(),
     }
 }
 
@@ -4667,13 +6482,10 @@ fn advance_group_world_turn(
         return false;
     };
     let players = group.players.clone();
-    let changed = group.advance_world_turn();
+    let mut changed = group.advance_world_turn();
     if changed {
-        advance_buffs_for_players(
-            &mut manager.player_characters,
-            &players,
-            rule_engine_state,
-        );
+        changed |= reset_turn_totals_for_players(manager, &players);
+        changed |= advance_buffs_for_players(manager, &players, rule_engine_state);
     }
     changed
 }
@@ -4696,11 +6508,8 @@ fn mark_group_player_turn(
         group.mark_player_skipped(target_id)
     };
     if changed && group.world_turn > previous_world_turn {
-        advance_buffs_for_players(
-            &mut manager.player_characters,
-            &players,
-            rule_engine_state,
-        );
+        let _ = reset_turn_totals_for_players(manager, &players);
+        advance_buffs_for_players(manager, &players, rule_engine_state);
     }
     changed
 }
@@ -4730,29 +6539,67 @@ fn set_group_player_waiting(
 }
 
 fn advance_buffs_for_players(
-    player_characters: &mut HashMap<String, PlayerCharacter>,
+    manager: &mut NapcatMessageManager,
     players: &[String],
     rule_engine_state: &mut RuleEngineState,
 ) -> bool {
     let mut changed = false;
+    let skill_pool_snapshot = manager.skill_pool.clone();
+    let mut tick_actions = Vec::new();
     for target_id in players {
-        let Some(character) = player_characters.get_mut(target_id) else {
+        let stat_config = manager.character_stat_config_for_target(target_id);
+        let Some(character) = manager.player_characters.get_mut(target_id) else {
             continue;
         };
-        if advance_character_buffs(character) {
-            sync_character_buffs(target_id, character, rule_engine_state);
+        let (advanced, ticks) = advance_character_buffs_with_ticks(target_id, character);
+        tick_actions.extend(ticks);
+        if advanced {
+            sync_character_buffs(
+                target_id,
+                character,
+                &stat_config,
+                rule_engine_state,
+                &skill_pool_snapshot,
+            );
             changed = true;
+        }
+    }
+    changed |= apply_character_buff_ticks(manager, &tick_actions);
+    changed
+}
+
+fn reset_turn_totals_for_players(manager: &mut NapcatMessageManager, players: &[String]) -> bool {
+    let mut changed = false;
+    for target_id in players {
+        if let Some(character) = manager.player_characters.get_mut(target_id) {
+            changed |= reset_character_turn_totals(character);
         }
     }
     changed
 }
 
+#[cfg(test)]
 fn advance_character_buffs(character: &mut PlayerCharacter) -> bool {
+    advance_character_buffs_with_ticks("", character).0
+}
+
+#[derive(Debug, Clone)]
+struct CharacterBuffTick {
+    source_id: String,
+    target_id: String,
+    action: BuffTickAction,
+}
+
+fn advance_character_buffs_with_ticks(
+    target_id: &str,
+    character: &mut PlayerCharacter,
+) -> (bool, Vec<CharacterBuffTick>) {
     if character.active_buffs.is_empty() {
-        return false;
+        return (false, Vec::new());
     }
 
     let mut changed = false;
+    let mut ticks = Vec::new();
     character.active_buffs.retain_mut(|buff| {
         if buff.turns_remaining == 0 {
             return true;
@@ -4764,27 +6611,233 @@ fn advance_character_buffs(character: &mut PlayerCharacter) -> bool {
 
         buff.turns_remaining -= 1;
         changed = true;
-        buff.turns_remaining > 0
+        if buff.turns_remaining > 0 {
+            for action in &buff.tick_actions {
+                ticks.push(CharacterBuffTick {
+                    source_id: buff.source_id.clone(),
+                    target_id: target_id.to_owned(),
+                    action: action.clone(),
+                });
+            }
+            true
+        } else {
+            false
+        }
     });
+    (changed, ticks)
+}
+
+fn apply_character_buff_ticks(
+    manager: &mut NapcatMessageManager,
+    ticks: &[CharacterBuffTick],
+) -> bool {
+    let mut changed = false;
+    for tick in ticks {
+        match &tick.action {
+            BuffTickAction::Damage {
+                amount,
+                damage_type,
+            } => {
+                let stat_config = manager.character_stat_config_for_target(&tick.source_id);
+                let source_multiplier = manager
+                    .player_characters
+                    .get(&tick.source_id)
+                    .map(|source| {
+                        source.damage_dealt_modifier
+                            * low_hp_damage_multiplier(source.hp, source.max_hp)
+                            * character_damage_attribute_multiplier(
+                                source,
+                                &stat_config,
+                                trpg_damage_bonus_kind(*damage_type),
+                            )
+                    })
+                    .unwrap_or(1.0);
+                let Some(target) = manager.player_characters.get_mut(&tick.target_id) else {
+                    continue;
+                };
+                let target_multiplier = target.damage_taken_modifier
+                    * character_damage_taken_attribute_multiplier(
+                        target,
+                        trpg_damage_taken_kind(*damage_type),
+                    );
+                let final_amount = (*amount * source_multiplier * target_multiplier).max(0.0);
+                changed |= record_character_damage_taken(target, final_amount);
+                let next_hp = (target.hp - final_amount).max(0.0);
+                if (target.hp - next_hp).abs() > f32::EPSILON {
+                    target.hp = next_hp;
+                    if let Some(base_stats) = target.buff_base_stats.as_mut() {
+                        base_stats.hp = (base_stats.hp - final_amount).max(0.0);
+                    }
+                    changed = true;
+                }
+            },
+            BuffTickAction::Heal { amount } => {
+                let stat_config = manager.character_stat_config_for_target(&tick.source_id);
+                let (source_multiplier, source_mutual_aid_healing_rate) = manager
+                    .player_characters
+                    .get(&tick.source_id)
+                    .map(|source| {
+                        (
+                            source.healing_dealt_modifier
+                                * character_healing_attribute_multiplier(source, &stat_config)
+                                * wounded_healing_dealt_multiplier(
+                                    source.hp,
+                                    source.max_hp,
+                                    character_wounded_healing_dealt_modifier(source),
+                                ),
+                            character_mutual_aid_healing_rate(source),
+                        )
+                    })
+                    .unwrap_or((1.0, 0.0));
+                let mut mutual_aid_heal = 0.0;
+                {
+                    let Some(target) = manager.player_characters.get_mut(&tick.target_id) else {
+                        continue;
+                    };
+                    let final_amount =
+                        (*amount * source_multiplier * target.healing_taken_modifier).max(0.0);
+                    let target_mutual_aid_healing_rate = character_mutual_aid_healing_rate(target);
+                    changed |= record_character_healing_taken(target, final_amount);
+                    let next_hp = (target.hp + final_amount).min(target.max_hp);
+                    if (target.hp - next_hp).abs() > f32::EPSILON {
+                        target.hp = next_hp;
+                        if let Some(base_stats) = target.buff_base_stats.as_mut() {
+                            base_stats.hp = (base_stats.hp + final_amount).min(base_stats.max_hp);
+                        }
+                        changed = true;
+                    }
+                    if tick.source_id != tick.target_id && final_amount > f32::EPSILON {
+                        mutual_aid_heal = final_amount
+                            * (source_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
+                    }
+                };
+                if mutual_aid_heal > f32::EPSILON {
+                    if let Some(source) = manager.player_characters.get_mut(&tick.source_id) {
+                        changed |= record_character_healing_taken(source, mutual_aid_heal);
+                        let next_hp = (source.hp + mutual_aid_heal).min(source.max_hp);
+                        if (source.hp - next_hp).abs() > f32::EPSILON {
+                            source.hp = next_hp;
+                            if let Some(base_stats) = source.buff_base_stats.as_mut() {
+                                base_stats.hp =
+                                    (base_stats.hp + mutual_aid_heal).min(base_stats.max_hp);
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+            },
+        }
+    }
     changed
 }
 
 fn restore_character_base_stats(character: &mut PlayerCharacter, stats: CharacterBuffBaseStats) {
     character.hp = stats.hp;
     character.max_hp = stats.max_hp;
+    character.hp_regen = stats.hp_regen;
+    character.mp = stats.mp;
+    character.max_mp = stats.max_mp;
+    character.mp_regen = stats.mp_regen;
+    character.speed = stats.speed;
     character.damage_dealt_modifier = stats.damage_dealt_modifier;
     character.damage_taken_modifier = stats.damage_taken_modifier;
     character.healing_dealt_modifier = stats.healing_dealt_modifier;
     character.healing_taken_modifier = stats.healing_taken_modifier;
+    character.extra_status = stats.extra_status;
 }
 
-fn apply_effective_character_stats(character: &mut PlayerCharacter, effective: &RuleCharacter) {
+fn apply_effective_character_stats(
+    character: &mut PlayerCharacter,
+    effective: &RuleCharacter,
+    base_stats: &CharacterBuffBaseStats,
+    stat_config: &TrpgBasicConfig,
+) {
+    let base_total = character.status.combined(&base_stats.extra_status);
+    let effective_total = character_status_from_block(&effective.status);
+    let base_derived = derived_stats_for_total_status(
+        character.level,
+        &base_total,
+        stat_config,
+    );
+    let effective_derived = derived_stats_for_total_status(
+        character.level,
+        &effective_total,
+        stat_config,
+    );
+
     character.hp = effective.hp;
-    character.max_hp = effective.max_hp;
+    character.max_hp = (effective.max_hp + effective_derived.max_hp - base_derived.max_hp).max(0.0);
+    character.hp_regen = effective.hp_regen + effective_derived.hp_regen - base_derived.hp_regen;
+    character.mp = effective.mp;
+    character.max_mp = (effective.max_mp + effective_derived.max_mp - base_derived.max_mp).max(0.0);
+    character.mp_regen = effective.mp_regen + effective_derived.mp_regen - base_derived.mp_regen;
+    character.speed = base_stats.speed + effective_derived.speed - base_derived.speed;
+    character.extra_status = effective_extra_status(character, &effective.status);
     character.damage_dealt_modifier = effective.damage_dealt_modifier;
     character.damage_taken_modifier = effective.damage_taken_modifier;
     character.healing_dealt_modifier = effective.healing_dealt_modifier;
     character.healing_taken_modifier = effective.healing_taken_modifier;
+    character.hp = character.hp.clamp(0.0, character.max_hp);
+    character.mp = character.mp.clamp(0.0, character.max_mp);
+}
+
+#[derive(Clone, Copy)]
+struct DerivedCharacterStats {
+    max_hp: f32,
+    hp_regen: f32,
+    max_mp: f32,
+    mp_regen: f32,
+    speed: f32,
+}
+
+fn derived_stats_for_total_status(
+    level: i32,
+    total: &CharacterStatus,
+    config: &TrpgBasicConfig,
+) -> DerivedCharacterStats {
+    DerivedCharacterStats {
+        max_hp: (config.base_max_hp
+            + level as f32 * config.lv_max_hp
+            + total.str_ as f32 * config.str_max_hp
+            + total.vit as f32 * config.vit_max_hp)
+            .max(1.0),
+        hp_regen: total.vit.max(0) as f32 * config.vit_hp_reg,
+        max_mp: total.int_ as f32 * config.int_max_mp + total.wis as f32 * config.wis_max_mp,
+        mp_regen: total.wis.max(0) as f32 * config.wis_mp_reg,
+        speed: config.basic_speed
+            + total.str_.max(0) as f32 * config.str_speed
+            + total.agi.max(0) as f32 * config.agi_speed
+            + total.dex.max(0) as f32 * config.dex_speed,
+    }
+}
+
+fn character_status_from_block(status: &StatusBlock) -> CharacterStatus {
+    CharacterStatus {
+        str_: status.str_,
+        agi: status.agi,
+        dex: status.dex,
+        vit: status.vit,
+        int_: status.int_,
+        wis: status.wis,
+        k: status.k,
+        cha: status.cha,
+    }
+}
+
+fn effective_extra_status(
+    character: &PlayerCharacter,
+    effective_status: &StatusBlock,
+) -> CharacterStatus {
+    CharacterStatus {
+        str_: effective_status.str_ - character.status.str_,
+        agi: effective_status.agi - character.status.agi,
+        dex: effective_status.dex - character.status.dex,
+        vit: effective_status.vit - character.status.vit,
+        int_: effective_status.int_ - character.status.int_,
+        wis: effective_status.wis - character.status.wis,
+        k: effective_status.k - character.status.k,
+        cha: effective_status.cha - character.status.cha,
+    }
 }
 
 fn buff_kind_options() -> [BuffKind; 6] {
@@ -4934,11 +6987,151 @@ fn format_buff_effect(effect: &BuffEffect) -> String {
     )
 }
 
+const RANDOM_POOL_FILTER_ALL: &str = "__all__";
+const RANDOM_POOL_FILTER_UNGROUPED: &str = "__ungrouped__";
+const RANDOM_POOL_FILTER_UNTAGGED: &str = "__untagged__";
+
+fn random_pool_tag_tokens(tags: &str) -> Vec<String> {
+    let mut tokens = tags
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn random_pool_group_filter_value(group: Option<i32>) -> String {
+    group
+        .map(|group| group.to_string())
+        .unwrap_or_else(|| RANDOM_POOL_FILTER_UNGROUPED.to_owned())
+}
+
+fn random_pool_group_label(group: Option<i32>) -> String {
+    match group {
+        Some(group) if group > 10000 => format!("QQ {}", group),
+        Some(group) => format!("旧团索引 {}", group),
+        None => "未分组".to_owned(),
+    }
+}
+
+fn random_pool_filter_options(manager: &NapcatMessageManager) -> (Vec<Option<i32>>, Vec<String>) {
+    let mut groups = manager
+        .random_pools
+        .values()
+        .map(|pool| pool.legacy_group)
+        .collect::<Vec<_>>();
+    groups.sort();
+    groups.dedup();
+
+    let mut tags = manager
+        .random_pools
+        .values()
+        .flat_map(|pool| random_pool_tag_tokens(&pool.tags))
+        .collect::<Vec<_>>();
+    tags.sort();
+    tags.dedup();
+
+    (groups, tags)
+}
+
+fn random_pool_matches_filters(pool: &RandomPool, group_filter: &str, tag_filter: &str) -> bool {
+    let group_matches = group_filter.is_empty()
+        || group_filter == RANDOM_POOL_FILTER_ALL
+        || group_filter == random_pool_group_filter_value(pool.legacy_group);
+    let tag_matches = tag_filter.is_empty()
+        || tag_filter == RANDOM_POOL_FILTER_ALL
+        || (tag_filter == RANDOM_POOL_FILTER_UNTAGGED
+            && random_pool_tag_tokens(&pool.tags).is_empty())
+        || random_pool_tag_tokens(&pool.tags)
+            .iter()
+            .any(|tag| tag == tag_filter);
+
+    group_matches && tag_matches
+}
+
+fn random_pool_metadata_summary(pool: &RandomPool) -> String {
+    let mut parts = vec![random_pool_group_label(pool.legacy_group)];
+    let tags = random_pool_tag_tokens(&pool.tags);
+    if !tags.is_empty() {
+        parts.push(format!("标签 {}", tags.join(" ")));
+    }
+    if !pool.created_at.trim().is_empty() {
+        parts.push(format!(
+            "创建 {}",
+            pool.created_at.trim()
+        ));
+    }
+    parts.join(" · ")
+}
+
+fn random_pool_metadata_editor_ui(ui: &mut Ui, pool: &mut RandomPool) -> bool {
+    let mut changed = false;
+    ui.collapsing("月莓旧随机池元数据", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("旧ID");
+            let clear_legacy_pool_id = {
+                let legacy_pool_id = pool.legacy_pool_id.get_or_insert_with(String::new);
+                changed |= ui
+                    .add(egui::TextEdit::singleline(legacy_pool_id).desired_width(120.0))
+                    .changed();
+                legacy_pool_id.trim().is_empty()
+            };
+            if clear_legacy_pool_id && pool.legacy_pool_id.is_some() {
+                pool.legacy_pool_id = None;
+                changed = true;
+            }
+
+            let mut has_group = pool.legacy_group.is_some();
+            if ui.checkbox(&mut has_group, "旧分组").changed() {
+                pool.legacy_group = has_group.then_some(0);
+                changed = true;
+            }
+            if let Some(group) = pool.legacy_group.as_mut() {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(group)
+                            .range(0..=999_999)
+                            .speed(1)
+                            .prefix("编号 "),
+                    )
+                    .changed();
+            }
+
+            ui.label("创建");
+            changed |= ui
+                .add(egui::TextEdit::singleline(&mut pool.created_at).desired_width(140.0))
+                .changed();
+        });
+        ui.label("标签（空格分隔）");
+        changed |= ui
+            .add(
+                egui::TextEdit::singleline(&mut pool.tags)
+                    .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
+            )
+            .changed();
+        ui.label("描述");
+        changed |= ui
+            .add(
+                egui::TextEdit::multiline(&mut pool.description)
+                    .desired_rows(2)
+                    .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
+            )
+            .changed();
+    });
+
+    changed
+}
+
 fn random_pool_settings_ui(
     ui: &mut Ui,
     manager: &mut NapcatMessageManager,
     state: &mut TrpgGroupSettingsState,
     player_targets: &[String],
+    napcat_sender: Option<&NapcatIOSender>,
+    mut ime: Option<&mut ImeManager>,
 ) -> bool {
     let mut changed = false;
 
@@ -4983,15 +7176,167 @@ fn random_pool_settings_ui(
         }
     });
 
-    let mut pool_names = manager.random_pools.keys().cloned().collect::<Vec<_>>();
+    let (group_filter_options, tag_filter_options) = random_pool_filter_options(manager);
+    if state.random_pool_group_filter.is_empty() {
+        state.random_pool_group_filter = RANDOM_POOL_FILTER_ALL.to_owned();
+    }
+    if state.random_pool_tag_filter.is_empty() {
+        state.random_pool_tag_filter = RANDOM_POOL_FILTER_ALL.to_owned();
+    }
+    ui.horizontal_wrapped(|ui| {
+        egui::ComboBox::from_label("旧分组筛选")
+            .selected_text(
+                if state.random_pool_group_filter == RANDOM_POOL_FILTER_ALL {
+                    "全部".to_owned()
+                } else if state.random_pool_group_filter == RANDOM_POOL_FILTER_UNGROUPED {
+                    "未分组".to_owned()
+                } else {
+                    state.random_pool_group_filter.clone()
+                },
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut state.random_pool_group_filter,
+                    RANDOM_POOL_FILTER_ALL.to_owned(),
+                    "全部",
+                );
+                for group in &group_filter_options {
+                    ui.selectable_value(
+                        &mut state.random_pool_group_filter,
+                        random_pool_group_filter_value(*group),
+                        random_pool_group_label(*group),
+                    );
+                }
+            });
+        egui::ComboBox::from_label("标签筛选")
+            .selected_text(
+                if state.random_pool_tag_filter == RANDOM_POOL_FILTER_ALL {
+                    "全部".to_owned()
+                } else if state.random_pool_tag_filter == RANDOM_POOL_FILTER_UNTAGGED {
+                    "无标签".to_owned()
+                } else {
+                    state.random_pool_tag_filter.clone()
+                },
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut state.random_pool_tag_filter,
+                    RANDOM_POOL_FILTER_ALL.to_owned(),
+                    "全部",
+                );
+                ui.selectable_value(
+                    &mut state.random_pool_tag_filter,
+                    RANDOM_POOL_FILTER_UNTAGGED.to_owned(),
+                    "无标签",
+                );
+                for tag in &tag_filter_options {
+                    ui.selectable_value(
+                        &mut state.random_pool_tag_filter,
+                        tag.clone(),
+                        tag,
+                    );
+                }
+            });
+    });
+
+    let current_group_name = manager.current_trpg_group.clone();
+    let current_group_snapshot = manager.current_group().cloned();
+    let mut send_targets = Vec::new();
+    let mut send_scope = String::new();
+    let mut send_scope_label = String::new();
+    let mut has_send_scope = false;
+    if ime.is_some() {
+        if state.random_pool_batch_count == 0 {
+            state.random_pool_batch_count = 1;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("批量文本");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut state.random_pool_batch_count)
+                        .range(1..=RANDOM_POOL_BATCH_MAX)
+                        .speed(1)
+                        .prefix("抽取 "),
+                )
+                .changed();
+            state.random_pool_batch_count = state
+                .random_pool_batch_count
+                .clamp(1, RANDOM_POOL_BATCH_MAX);
+            if napcat_sender.is_none() {
+                ui.small("NapCat websocket未连接");
+            }
+        });
+
+        if let (Some(group_name), Some(current_group)) = (
+            current_group_name.as_deref(),
+            current_group_snapshot.as_ref(),
+        ) {
+            if state.random_pool_broadcast_scope.is_empty() {
+                state.random_pool_broadcast_scope = BROADCAST_SCOPE_ALL.to_owned();
+            }
+            group_broadcast_scope_ui(
+                ui,
+                group_name,
+                &current_group.players,
+                Some(current_group),
+                &mut state.random_pool_broadcast_scope,
+            );
+            send_scope = state.random_pool_broadcast_scope.clone();
+            send_scope_label = broadcast_scope_label(Some(current_group), &send_scope);
+            send_targets = group_broadcast_targets(
+                Some(current_group),
+                &current_group.players,
+                manager,
+                &send_scope,
+            );
+            has_send_scope = true;
+        } else {
+            ui.small("选择当前TRPG组后可批量发送文本结果。");
+        }
+
+        if !state.random_pool_send_status.is_empty() {
+            ui.small(&state.random_pool_send_status);
+        }
+    }
+
+    let mut pool_names = manager
+        .random_pools
+        .iter()
+        .filter(|(_, pool)| {
+            random_pool_matches_filters(
+                pool,
+                &state.random_pool_group_filter,
+                &state.random_pool_tag_filter,
+            )
+        })
+        .map(|(pool_name, _)| pool_name.clone())
+        .collect::<Vec<_>>();
     pool_names.sort();
-    if pool_names.is_empty() {
+    if manager.random_pools.is_empty() {
         ui.label("还没有随机池。");
+        return changed;
+    } else if pool_names.is_empty() {
+        ui.label("当前筛选下没有随机池。");
         return changed;
     }
 
     let mut pool_to_delete = None;
     for pool_name in pool_names {
+        let checked_target_labels = manager
+            .random_pools
+            .get(&pool_name)
+            .map(|pool| {
+                pool.checked_results
+                    .iter()
+                    .map(|result| {
+                        (
+                            result.target_id.clone(),
+                            target_display_name(manager, &result.target_id),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let Some(pool) = manager.random_pools.get_mut(&pool_name) else {
             continue;
         };
@@ -4999,6 +7344,9 @@ fn random_pool_settings_ui(
         ui.collapsing(
             format!("{pool_name} ({})", pool.entries.len()),
             |ui| {
+                ui.small(random_pool_metadata_summary(pool));
+                changed |= random_pool_metadata_editor_ui(ui, pool);
+
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("随机抽取").clicked() {
                         if let Some(entry) = pick_random_pool_entry(pool) {
@@ -5012,6 +7360,141 @@ fn random_pool_settings_ui(
                             {
                                 add_item_to_inventory(&mut character.inventory, item);
                             }
+                            changed = true;
+                        }
+                    }
+                    if ime.is_some() {
+                        let send_enabled = napcat_sender.is_some()
+                            && has_send_scope
+                            && !send_targets.is_empty()
+                            && total_weight > 0.0;
+                        let response = ui.add_enabled(
+                            send_enabled,
+                            egui::Button::new("批量抽取并发送"),
+                        );
+                        let clicked = response.clicked();
+                        let hover_text = if !has_send_scope {
+                            "先选择当前TRPG组"
+                        } else if send_targets.is_empty() {
+                            "当前范围没有可发送的玩家私聊"
+                        } else if total_weight <= 0.0 {
+                            "随机池没有可抽取的启用项目"
+                        } else if napcat_sender.is_none() {
+                            "NapCat websocket未连接"
+                        } else {
+                            "抽取文本结果并发送到当前范围"
+                        };
+                        response.on_hover_text(hover_text);
+                        if clicked {
+                            let results =
+                                random_pool_batch_text_results(pool, state.random_pool_batch_count);
+                            if let Some(message) =
+                                random_pool_text_results_message(&pool_name, &results)
+                            {
+                                if let (Some(sender), Some(ime)) =
+                                    (napcat_sender, ime.as_deref_mut())
+                                {
+                                    let input_id =
+                                        random_pool_send_input_id(&pool_name, &send_scope);
+                                    match ime.queue_text_send(
+                                        &input_id,
+                                        &message,
+                                        sender,
+                                        send_targets.clone(),
+                                    ) {
+                                        Ok(()) => {
+                                            pool.last_text_result = results.last().cloned();
+                                            state.random_pool_send_status = format!(
+                                                "已入队：{}，{}个目标，{}条结果",
+                                                send_scope_label,
+                                                send_targets.len(),
+                                                results.len()
+                                            );
+                                            changed = true;
+                                        },
+                                        Err(err) => {
+                                            state.random_pool_send_status =
+                                                format!("发送失败：{err}");
+                                        },
+                                    }
+                                }
+                            } else {
+                                state.random_pool_send_status =
+                                    "随机池没有可发送的文本结果。".to_owned();
+                            }
+                        }
+
+                        let stage_enabled =
+                            has_send_scope && !send_targets.is_empty() && total_weight > 0.0;
+                        let response = ui.add_enabled(
+                            stage_enabled,
+                            egui::Button::new("生成待发送结果"),
+                        );
+                        let clicked = response.clicked();
+                        response.on_hover_text(if !has_send_scope {
+                            "先选择当前TRPG组"
+                        } else if send_targets.is_empty() {
+                            "当前范围没有可发送的玩家私聊"
+                        } else if total_weight <= 0.0 {
+                            "随机池没有可抽取的启用项目"
+                        } else {
+                            "生成可逐条确认的玩家私聊随机结果"
+                        });
+                        if clicked {
+                            pool.checked_results = random_pool_checked_results(pool, &send_targets);
+                            if pool.checked_results.is_empty() {
+                                state.random_pool_send_status =
+                                    "没有生成可发送的随机结果。".to_owned();
+                            } else {
+                                state.random_pool_send_status = format!(
+                                    "已生成：{}，{}条待确认结果",
+                                    send_scope_label,
+                                    pool.checked_results.len()
+                                );
+                            }
+                            changed = true;
+                        }
+
+                        let (enabled_checked, total_checked) =
+                            random_pool_checked_result_summary(pool);
+                        let response = ui.add_enabled(
+                            napcat_sender.is_some() && enabled_checked > 0,
+                            egui::Button::new("发送勾选结果"),
+                        );
+                        let clicked = response.clicked();
+                        response.on_hover_text(if total_checked == 0 {
+                            "先生成待发送结果"
+                        } else if enabled_checked == 0 {
+                            "没有已勾选且有内容的结果"
+                        } else if napcat_sender.is_none() {
+                            "NapCat websocket未连接"
+                        } else {
+                            "逐条发送勾选的玩家私聊结果"
+                        });
+                        if clicked {
+                            if let (Some(sender), Some(ime)) = (napcat_sender, ime.as_deref_mut()) {
+                                match queue_random_pool_checked_results(
+                                    &pool_name, pool, sender, ime,
+                                ) {
+                                    Ok(sent_count) => {
+                                        for result in pool.checked_results.iter_mut() {
+                                            if result.enabled && !result.text.trim().is_empty() {
+                                                result.enabled = false;
+                                            }
+                                        }
+                                        state.random_pool_send_status =
+                                            format!("已入队：{}条勾选结果", sent_count);
+                                        changed = true;
+                                    },
+                                    Err(err) => {
+                                        state.random_pool_send_status = format!("发送失败：{err}");
+                                    },
+                                }
+                            }
+                        }
+
+                        if ui.button("清空待发送").clicked() {
+                            pool.checked_results.clear();
                             changed = true;
                         }
                     }
@@ -5030,6 +7513,55 @@ fn random_pool_settings_ui(
                         pool_to_delete = Some(pool_name.clone());
                     }
                 });
+
+                if !pool.checked_results.is_empty() {
+                    ui.separator();
+                    let (enabled_checked, total_checked) = random_pool_checked_result_summary(pool);
+                    ui.label(format!(
+                        "待发送结果：{} / {} 条已勾选",
+                        enabled_checked, total_checked
+                    ));
+                    let mut remove_checked_index = None;
+                    egui::Grid::new((
+                        ui.next_auto_id(),
+                        "random_pool_checked_results",
+                    ))
+                    .num_columns(4)
+                    .spacing([8.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("发送");
+                        ui.strong("目标");
+                        ui.strong("内容");
+                        ui.strong("操作");
+                        ui.end_row();
+
+                        for (index, result) in pool.checked_results.iter_mut().enumerate() {
+                            changed |= ui.checkbox(&mut result.enabled, "").changed();
+                            ui.label(
+                                checked_target_labels
+                                    .get(&result.target_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| result.target_id.clone()),
+                            )
+                            .on_hover_text(&result.target_id);
+                            changed |= ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut result.text)
+                                        .desired_width(240.0),
+                                )
+                                .changed();
+                            if ui.button("-").on_hover_text("移除待发送结果").clicked() {
+                                remove_checked_index = Some(index);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    if let Some(index) = remove_checked_index {
+                        pool.checked_results.remove(index);
+                        changed = true;
+                    }
+                }
 
                 let mut remove_index = None;
                 egui::Grid::new(ui.next_auto_id())
@@ -5297,11 +7829,147 @@ fn random_pool_text_result_label(result: &RandomPoolTextResult) -> String {
     }
 }
 
+fn random_pool_batch_text_results(pool: &RandomPool, draw_count: u32) -> Vec<RandomPoolTextResult> {
+    let draw_count = draw_count.clamp(1, RANDOM_POOL_BATCH_MAX);
+    (0..draw_count)
+        .filter_map(|_| pick_random_pool_entry(pool))
+        .filter_map(|entry| random_pool_entry_text_result(&entry))
+        .collect()
+}
+
+fn random_pool_checked_results(
+    pool: &RandomPool,
+    targets: &[NapcatSendTarget],
+) -> Vec<RandomPoolCheckedResult> {
+    let mut available_targets = targets
+        .iter()
+        .filter_map(|target| match target {
+            NapcatSendTarget::Private(user_id) => Some(user_id.to_string()),
+            NapcatSendTarget::Group(_) => None,
+        })
+        .collect::<Vec<_>>();
+    available_targets.sort();
+    available_targets.dedup();
+
+    if available_targets.is_empty() {
+        return Vec::new();
+    }
+
+    let mut results = Vec::new();
+    for entry in pool.entries.iter().filter(|entry| entry.enabled) {
+        let text = entry.result_text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let (min_count, _) = normalized_random_pool_counts(entry.min_count, entry.max_count);
+        let count = min_count as usize;
+        if count == 0 || count > available_targets.len() {
+            continue;
+        }
+
+        for _ in 0..count {
+            let target_index = if available_targets.len() == 1 {
+                0
+            } else {
+                rand::rng().random_range(0..available_targets.len())
+            };
+            results.push(RandomPoolCheckedResult {
+                enabled: true,
+                target_id: available_targets.remove(target_index),
+                text: text.to_owned(),
+            });
+        }
+    }
+
+    results
+}
+
+fn random_pool_checked_result_summary(pool: &RandomPool) -> (usize, usize) {
+    let total = pool.checked_results.len();
+    let enabled = pool
+        .checked_results
+        .iter()
+        .filter(|result| result.enabled && !result.text.trim().is_empty())
+        .count();
+    (enabled, total)
+}
+
+fn random_pool_text_results_message(
+    pool_name: &str,
+    results: &[RandomPoolTextResult],
+) -> Option<String> {
+    if results.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::with_capacity(results.len() + 1);
+    lines.push(format!("{pool_name}随机结果"));
+    for (index, result) in results.iter().enumerate() {
+        lines.push(format!(
+            "{}. {}",
+            index + 1,
+            random_pool_text_result_label(result)
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+fn random_pool_send_input_id(pool_name: &str, scope: &str) -> String {
+    format!("random-pool:{pool_name}:{scope}")
+}
+
+fn random_pool_checked_send_input_id(pool_name: &str, index: usize) -> String {
+    format!("random-pool-checked:{pool_name}:{index}")
+}
+
+fn queue_random_pool_checked_results(
+    pool_name: &str,
+    pool: &RandomPool,
+    sender: &NapcatIOSender,
+    ime: &mut ImeManager,
+) -> Result<usize, String> {
+    let pending = pool
+        .checked_results
+        .iter()
+        .enumerate()
+        .filter(|(_, result)| result.enabled && !result.text.trim().is_empty())
+        .map(|(index, result)| {
+            let user_id = result.target_id.trim().parse::<u64>().map_err(|_| {
+                format!(
+                    "随机结果目标不是有效QQ号：{}",
+                    result.target_id
+                )
+            })?;
+            Ok((
+                index,
+                user_id,
+                result.text.trim().to_owned(),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    if pending.is_empty() {
+        return Err("没有勾选的随机结果".to_owned());
+    }
+
+    for (index, user_id, text) in &pending {
+        ime.queue_text_send(
+            &random_pool_checked_send_input_id(pool_name, *index),
+            text,
+            sender,
+            vec![NapcatSendTarget::Private(*user_id)],
+        )?;
+    }
+
+    Ok(pending.len())
+}
+
 fn unit_pool_settings_ui(
     ui: &mut Ui,
     manager: &mut NapcatMessageManager,
     state: &mut TrpgGroupSettingsState,
     player_targets: &[String],
+    mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
 ) -> bool {
     let mut changed = false;
 
@@ -5362,6 +8030,7 @@ fn unit_pool_settings_ui(
                     let mut unit = UnitPoolEntry {
                         label: target_display_name(manager, &source_id),
                         note: "从玩家角色复制".to_owned(),
+                        legacy_member_id: None,
                         character,
                     };
                     prepare_unit_pool_entry(&unit_id, &mut unit);
@@ -5396,6 +8065,93 @@ fn unit_pool_settings_ui(
                     if ui.button("删除单位").clicked() {
                         unit_to_delete = Some(unit_id.clone());
                     }
+                    if let Some(store) = scene_store.as_deref_mut() {
+                        let image_source = unit.character.image.trim().to_owned();
+                        let has_standee = has_unit_template_standee(store, &unit_id);
+                        let place_label =
+                            if has_standee { "更新场景立绘" } else { "放入场景立绘" };
+                        if ui
+                            .add_enabled(
+                                !image_source.is_empty(),
+                                egui::Button::new(place_label),
+                            )
+                            .on_disabled_hover_text("单位模板还没有立绘")
+                            .clicked()
+                        {
+                            let status = match place_unit_template_standee(
+                                &mut *store,
+                                &unit_id,
+                                &image_source,
+                            ) {
+                                Ok(scene_changed) => match store.persist() {
+                                    Ok(()) => {
+                                        if scene_changed {
+                                            "已写入场景立绘".to_owned()
+                                        } else {
+                                            "场景立绘已是最新".to_owned()
+                                        }
+                                    },
+                                    Err(err) => format!("场景立绘保存失败：{err}"),
+                                },
+                                Err(err) => format!("场景立绘失败：{err}"),
+                            };
+                            state.unit_pool_scene_status.insert(unit_id.clone(), status);
+                        }
+                        if has_standee && ui.button("移出场景").clicked() {
+                            let removed = remove_unit_template_standee(&mut *store, &unit_id);
+                            let status = if removed {
+                                match store.persist() {
+                                    Ok(()) => "已移出场景立绘".to_owned(),
+                                    Err(err) => format!("移出场景保存失败：{err}"),
+                                }
+                            } else {
+                                "场景里没有这个单位立绘".to_owned()
+                            };
+                            state.unit_pool_scene_status.insert(unit_id.clone(), status);
+                        }
+                        let has_token = has_unit_template_token(store, &unit_id);
+                        let token_label =
+                            if has_token { "更新场景标记" } else { "放入场景标记" };
+                        if ui.button(token_label).clicked() {
+                            let label = if unit.label.trim().is_empty() {
+                                unit_id.as_str()
+                            } else {
+                                unit.label.trim()
+                            };
+                            let status =
+                                match place_unit_template_token(&mut *store, &unit_id, label) {
+                                    Ok(scene_changed) => match store.persist() {
+                                        Ok(()) => {
+                                            if scene_changed {
+                                                "已写入场景标记".to_owned()
+                                            } else {
+                                                "场景标记已是最新".to_owned()
+                                            }
+                                        },
+                                        Err(err) => format!("场景标记保存失败：{err}"),
+                                    },
+                                    Err(err) => format!("场景标记失败：{err}"),
+                                };
+                            state.unit_pool_scene_status.insert(unit_id.clone(), status);
+                        }
+                        if has_token && ui.button("移出标记").clicked() {
+                            let removed = remove_unit_template_token(&mut *store, &unit_id);
+                            let status = if removed {
+                                match store.persist() {
+                                    Ok(()) => "已移出场景标记".to_owned(),
+                                    Err(err) => format!("移出标记保存失败：{err}"),
+                                }
+                            } else {
+                                "场景里没有这个单位标记".to_owned()
+                            };
+                            state.unit_pool_scene_status.insert(unit_id.clone(), status);
+                        }
+                    } else {
+                        ui.small("场景未就绪");
+                    }
+                    if let Some(status) = state.unit_pool_scene_status.get(&unit_id) {
+                        ui.small(status);
+                    }
                 });
                 changed |= unit_pool_entry_editor_ui(ui, &unit_id, unit);
             }
@@ -5404,6 +8160,19 @@ fn unit_pool_settings_ui(
 
     if let Some(unit_id) = unit_to_delete {
         manager.unit_pool.remove(&unit_id);
+        if let Some(store) = scene_store.as_deref_mut() {
+            let removed_standee = remove_unit_template_standee(&mut *store, &unit_id);
+            let removed_token = remove_unit_template_token(&mut *store, &unit_id);
+            let removed_scene_objects = removed_standee || removed_token;
+            if removed_scene_objects {
+                if let Err(err) = store.persist() {
+                    state.unit_pool_scene_status.insert(
+                        unit_id.clone(),
+                        format!("单位已删除；场景对象保存失败：{err}"),
+                    );
+                }
+            }
+        }
         changed = true;
     }
 
@@ -5444,6 +8213,19 @@ fn unit_pool_entry_editor_ui(ui: &mut Ui, unit_id: &str, unit: &mut UnitPoolEntr
         changed |= ui
             .add(egui::TextEdit::singleline(&mut unit.label).desired_width(160.0))
             .changed();
+        ui.label("旧成员ID");
+        let mut legacy_member_id = unit.legacy_member_id.clone().unwrap_or_default();
+        if ui
+            .add(egui::TextEdit::singleline(&mut legacy_member_id).desired_width(120.0))
+            .changed()
+        {
+            if legacy_member_id.trim().is_empty() {
+                unit.legacy_member_id = None;
+            } else {
+                unit.legacy_member_id = Some(legacy_member_id.trim().to_owned());
+            }
+            changed = true;
+        }
     });
     ui.label("备注");
     changed |= ui
@@ -5495,6 +8277,10 @@ fn unit_character_template_editor_ui(
                     .prefix("经验 "),
             )
             .changed();
+        ui.label(format!(
+            "/ {}",
+            character_next_level_exp(character.level)
+        ));
         changed |= ui
             .add(
                 egui::DragValue::new(&mut character.speed)
@@ -5778,6 +8564,13 @@ fn normalized_manual_skill_pool_entry(draft: &SkillPoolEntry) -> Option<SkillPoo
         tags: draft.tags.clone(),
         category: draft.category.clone(),
         args: draft.args.clone(),
+        legacy_buff_count: draft.legacy_buff_count,
+        legacy_event_buff_count: draft.legacy_event_buff_count,
+        legacy_has_graph: draft.legacy_has_graph,
+        legacy_buff_json: draft.legacy_buff_json.clone(),
+        legacy_event_buff_json: draft.legacy_event_buff_json.clone(),
+        legacy_graph_json: draft.legacy_graph_json.clone(),
+        legacy_buff_machine_json: draft.legacy_buff_machine_json.clone(),
         ..Default::default()
     })
 }
@@ -5805,6 +8598,13 @@ fn skill_pool_entry_tags_label(entry: &SkillPoolEntry) -> String {
     } else {
         entry.tags.join(" ")
     }
+}
+
+fn legacy_json_size_label(label: &str, value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .filter(|json| !json.trim().is_empty())
+        .map(|json| format!("{label}原文 {}字节", json.len()))
 }
 
 fn skill_pool_entry_legacy_label(entry: &SkillPoolEntry) -> Option<String> {
@@ -5847,6 +8647,24 @@ fn skill_pool_entry_legacy_label(entry: &SkillPoolEntry) -> Option<String> {
     }
     if entry.legacy_has_graph {
         parts.push("含旧蓝图".to_owned());
+    }
+    if let Some(label) = legacy_json_size_label("旧BUFF", &entry.legacy_buff_json) {
+        parts.push(label);
+    }
+    if let Some(label) = legacy_json_size_label(
+        "旧事件BUFF",
+        &entry.legacy_event_buff_json,
+    ) {
+        parts.push(label);
+    }
+    if let Some(label) = legacy_json_size_label("旧蓝图", &entry.legacy_graph_json) {
+        parts.push(label);
+    }
+    if let Some(label) = legacy_json_size_label(
+        "旧buff机",
+        &entry.legacy_buff_machine_json,
+    ) {
+        parts.push(label);
     }
     (!parts.is_empty()).then(|| parts.join("；"))
 }
@@ -6037,14 +8855,18 @@ fn napcat_import_export_ui(
                     Ok(summary) => match manager.persist() {
                         Ok(()) => {
                             state.import_export_status = format!(
-                                "已导入月莓旧JSON：{}个团，{}个PC，{}个聊天目标，{}条消息，{}个技能池，{}个单位模板，{}个随机池",
+                                "已导入月莓旧JSON：{}个团，{}个PC，{}个聊天目标，{}条消息，{}个技能池，{}个单位模板，{}个随机池，{}个旧频道，{}个旧世界，{}个虚拟讨论组，{}个旧发送窗",
                                 summary.groups,
                                 summary.players,
                                 summary.chat_targets,
                                 summary.messages,
                                 summary.skill_pools,
                                 summary.unit_templates,
-                                summary.random_pools
+                                summary.random_pools,
+                                summary.legacy_teams,
+                                summary.legacy_worlds,
+                                summary.legacy_chat_areas,
+                                summary.legacy_send_panes
                             );
                         },
                         Err(err) => {
@@ -6380,12 +9202,1060 @@ fn f32_config_drag(
     .changed()
 }
 
+fn legacy_member_preview(manager: &NapcatMessageManager, members: &[String]) -> String {
+    if members.is_empty() {
+        return "无成员".to_owned();
+    }
+    let mut labels = members
+        .iter()
+        .take(6)
+        .map(|member_id| target_display_name(manager, member_id))
+        .collect::<Vec<_>>();
+    if members.len() > labels.len() {
+        labels.push(format!(
+            "另{}人",
+            members.len() - labels.len()
+        ));
+    }
+    labels.join("、")
+}
+
+fn unit_template_scene_label(manager: &NapcatMessageManager, unit_id: &str) -> String {
+    manager
+        .unit_pool
+        .get(unit_id)
+        .map(|unit| unit.label.trim())
+        .filter(|label| !label.is_empty())
+        .unwrap_or(unit_id)
+        .to_owned()
+}
+
+fn place_legacy_world_unit_tokens_ui(
+    store: &mut Persistent<VoxelSceneStore>,
+    manager: &NapcatMessageManager,
+    group_name: &str,
+    world_id: &str,
+    world_name: &str,
+    unit_ids: &[String],
+    visible: bool,
+) -> String {
+    if unit_ids.is_empty() {
+        return "没有匹配的单位模板".to_owned();
+    }
+
+    let mut changed = false;
+    for unit_id in unit_ids {
+        let label = unit_template_scene_label(manager, unit_id);
+        match place_legacy_world_unit_token(
+            &mut *store,
+            group_name,
+            world_id,
+            world_name,
+            unit_id,
+            &label,
+            visible,
+        ) {
+            Ok(scene_changed) => changed |= scene_changed,
+            Err(err) => return format!("世界NPC标记失败：{err}"),
+        }
+    }
+    let removed = prune_legacy_world_unit_tokens(
+        &mut *store,
+        group_name,
+        world_id,
+        unit_ids,
+    );
+    changed |= removed > 0;
+
+    if changed {
+        match store.persist() {
+            Ok(()) => {
+                if removed > 0 {
+                    format!(
+                        "已同步世界NPC标记 {} 个，移除旧标记 {removed} 个",
+                        unit_ids.len()
+                    )
+                } else {
+                    format!(
+                        "已写入世界NPC标记 {} 个",
+                        unit_ids.len()
+                    )
+                }
+            },
+            Err(err) => format!("世界NPC标记保存失败：{err}"),
+        }
+    } else {
+        format!(
+            "世界NPC标记已是最新（{}个）",
+            unit_ids.len()
+        )
+    }
+}
+
+fn remove_legacy_world_unit_tokens_ui(
+    store: &mut Persistent<VoxelSceneStore>,
+    group_name: &str,
+    world_id: &str,
+) -> String {
+    let removed = remove_legacy_world_unit_tokens(&mut *store, group_name, world_id);
+    if removed == 0 {
+        return "场景里没有这个旧世界NPC标记".to_owned();
+    }
+    match store.persist() {
+        Ok(()) => format!("已移出世界NPC标记 {removed} 个"),
+        Err(err) => format!("移出世界NPC标记保存失败：{err}"),
+    }
+}
+
+fn place_legacy_area_unit_tokens_ui(
+    store: &mut Persistent<VoxelSceneStore>,
+    manager: &NapcatMessageManager,
+    group_name: &str,
+    world_id: &str,
+    area_id: &str,
+    area_name: &str,
+    unit_ids: &[String],
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    visible: bool,
+) -> String {
+    if unit_ids.is_empty() {
+        return "没有匹配的单位模板".to_owned();
+    }
+
+    let mut changed = false;
+    for (index, unit_id) in unit_ids.iter().enumerate() {
+        let label = unit_template_scene_label(manager, unit_id);
+        match place_legacy_area_unit_token(
+            &mut *store,
+            group_name,
+            world_id,
+            area_id,
+            area_name,
+            unit_id,
+            &label,
+            x,
+            y,
+            width,
+            height,
+            visible,
+            index,
+        ) {
+            Ok(scene_changed) => changed |= scene_changed,
+            Err(err) => return format!("区域单位标记失败：{err}"),
+        }
+    }
+    let removed = prune_legacy_area_unit_tokens(
+        &mut *store,
+        group_name,
+        world_id,
+        area_id,
+        unit_ids,
+    );
+    changed |= removed > 0;
+
+    if changed {
+        match store.persist() {
+            Ok(()) => {
+                if removed > 0 {
+                    format!(
+                        "已同步区域单位标记 {} 个，移除旧标记 {removed} 个",
+                        unit_ids.len()
+                    )
+                } else {
+                    format!(
+                        "已写入区域单位标记 {} 个",
+                        unit_ids.len()
+                    )
+                }
+            },
+            Err(err) => format!("区域单位标记保存失败：{err}"),
+        }
+    } else {
+        format!(
+            "区域单位标记已是最新（{}个）",
+            unit_ids.len()
+        )
+    }
+}
+
+fn remove_legacy_area_unit_tokens_ui(
+    store: &mut Persistent<VoxelSceneStore>,
+    group_name: &str,
+    world_id: &str,
+    area_id: &str,
+) -> String {
+    let removed = remove_legacy_area_unit_tokens(
+        &mut *store,
+        group_name,
+        world_id,
+        area_id,
+    );
+    if removed == 0 {
+        return "场景里没有这个旧区域单位标记".to_owned();
+    }
+    match store.persist() {
+        Ok(()) => format!("已移出区域单位标记 {removed} 个"),
+        Err(err) => format!("移出区域单位标记保存失败：{err}"),
+    }
+}
+
+fn legacy_team_chat_sender_label(
+    manager: &NapcatMessageManager,
+    sender_id: &str,
+    sender_name: &str,
+) -> String {
+    let sender_id = sender_id.trim();
+    let sender_name = sender_name.trim();
+    if !sender_id.is_empty() {
+        let display_name = target_display_name(manager, sender_id);
+        if !display_name.trim().is_empty() && display_name.trim() != sender_id {
+            return display_name;
+        }
+    }
+    if !sender_name.is_empty() {
+        return sender_name.to_owned();
+    }
+    if !sender_id.is_empty() {
+        return sender_id.to_owned();
+    }
+    "未知发送者".to_owned()
+}
+
+#[derive(Clone)]
+enum LegacyPartyPromotion {
+    Team(String),
+    ChatArea(String),
+}
+
+#[derive(Clone)]
+enum LegacyGroupSurfaceAction {
+    Promote(LegacyPartyPromotion),
+    AppendTeamChat {
+        team_id: String,
+        message: TrpgLegacyTeamChatMessage,
+    },
+    UpdateTeamChat {
+        team_id: String,
+        message_index: usize,
+        text: String,
+    },
+    RemoveTeamChat {
+        team_id: String,
+        message_index: usize,
+    },
+    AddSendPane,
+    RemoveSendPane {
+        pane_key: String,
+    },
+    ClearSendPaneTargets {
+        pane_key: String,
+    },
+    SetSendPaneTarget {
+        pane_key: String,
+        target_id: String,
+        selected: bool,
+    },
+}
+
+fn apply_legacy_group_surface_action(
+    manager: &mut NapcatMessageManager,
+    state: &mut TrpgGroupSettingsState,
+    group_name: &str,
+    action: LegacyGroupSurfaceAction,
+) -> bool {
+    let Some(group) = manager.trpg_groups.get_mut(group_name) else {
+        return false;
+    };
+    match action {
+        LegacyGroupSurfaceAction::Promote(promotion) => match promotion {
+            LegacyPartyPromotion::Team(team_id) => group.promote_legacy_team_to_party(&team_id),
+            LegacyPartyPromotion::ChatArea(area_id) => {
+                group.promote_legacy_chat_area_to_party(&area_id)
+            },
+        },
+        LegacyGroupSurfaceAction::AppendTeamChat { team_id, message } => {
+            group.append_legacy_team_chat_message(&team_id, message)
+        },
+        LegacyGroupSurfaceAction::UpdateTeamChat {
+            team_id,
+            message_index,
+            text,
+        } => {
+            let changed = group.update_legacy_team_chat_message(&team_id, message_index, &text);
+            if changed {
+                state
+                    .legacy_team_chat_edit_drafts
+                    .remove(&legacy_team_chat_edit_id(
+                        group_name,
+                        &team_id,
+                        message_index,
+                    ));
+            }
+            state.legacy_team_chat_status.insert(
+                legacy_team_chat_input_id(group_name, &team_id),
+                if changed {
+                    "已更新本地旧频道消息".to_owned()
+                } else {
+                    "没有可更新的本地旧频道消息".to_owned()
+                },
+            );
+            changed
+        },
+        LegacyGroupSurfaceAction::RemoveTeamChat {
+            team_id,
+            message_index,
+        } => {
+            let changed = group.remove_legacy_team_chat_message(&team_id, message_index);
+            if changed {
+                let draft_prefix = legacy_team_chat_edit_prefix(group_name, &team_id);
+                state
+                    .legacy_team_chat_edit_drafts
+                    .retain(|key, _| !key.starts_with(&draft_prefix));
+            }
+            state.legacy_team_chat_status.insert(
+                legacy_team_chat_input_id(group_name, &team_id),
+                if changed {
+                    "已删除本地旧频道消息".to_owned()
+                } else {
+                    "没有可删除的本地旧频道消息".to_owned()
+                },
+            );
+            changed
+        },
+        LegacyGroupSurfaceAction::AddSendPane => group.add_legacy_send_pane("多选发送").is_some(),
+        LegacyGroupSurfaceAction::RemoveSendPane { pane_key } => {
+            group.remove_legacy_send_pane(&pane_key)
+        },
+        LegacyGroupSurfaceAction::ClearSendPaneTargets { pane_key } => {
+            group.clear_legacy_send_pane_targets(&pane_key)
+        },
+        LegacyGroupSurfaceAction::SetSendPaneTarget {
+            pane_key,
+            target_id,
+            selected,
+        } => group.set_legacy_send_pane_target(&pane_key, &target_id, selected),
+    }
+}
+
+fn legacy_pane_has_target(pane: &TrpgLegacySendPane, target_id: &str) -> bool {
+    pane.targets
+        .iter()
+        .any(|target| target.trim() == target_id.trim())
+}
+
+fn legacy_send_pane_target_checkbox(
+    ui: &mut Ui,
+    pane: &TrpgLegacySendPane,
+    target_id: &str,
+    label: String,
+    enabled: bool,
+    hover_text: &str,
+) -> Option<LegacyGroupSurfaceAction> {
+    let mut selected = legacy_pane_has_target(pane, target_id);
+    let response = ui.add_enabled(
+        enabled,
+        egui::Checkbox::new(&mut selected, label),
+    );
+    let changed = response.changed();
+    response.on_hover_text(hover_text);
+    changed.then(
+        || LegacyGroupSurfaceAction::SetSendPaneTarget {
+            pane_key: pane.key.clone(),
+            target_id: target_id.to_owned(),
+            selected,
+        },
+    )
+}
+
+fn legacy_send_pane_target_editor_ui(
+    ui: &mut Ui,
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+    pane: &TrpgLegacySendPane,
+) -> Option<LegacyGroupSurfaceAction> {
+    let mut action = None;
+    let all_selected = legacy_pane_has_target(pane, "0");
+
+    ui.collapsing("编辑发送对象", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if let Some(next_action) = legacy_send_pane_target_checkbox(
+                ui,
+                pane,
+                "0",
+                "全员".to_owned(),
+                true,
+                "旧月莓频道0：发送给当前TRPG组的所有玩家私聊",
+            ) {
+                action = Some(next_action);
+            }
+            if ui.button("清空目标").clicked() {
+                action = Some(
+                    LegacyGroupSurfaceAction::ClearSendPaneTargets {
+                        pane_key: pane.key.clone(),
+                    },
+                );
+            }
+        });
+        if all_selected {
+            ui.small("已选择全员，旧规则会折叠并禁用其他发送对象。");
+        }
+
+        let mut player_ids = group
+            .players
+            .iter()
+            .filter(|target_id| !target_id.trim().is_empty())
+            .collect::<Vec<_>>();
+        player_ids.sort_by(|left, right| {
+            target_display_name(manager, left)
+                .cmp(&target_display_name(manager, right))
+                .then_with(|| left.cmp(right))
+        });
+        if !player_ids.is_empty() {
+            ui.label("目标");
+            ui.horizontal_wrapped(|ui| {
+                for target_id in player_ids {
+                    let covered =
+                        group.legacy_send_pane_direct_target_is_covered(&pane.key, target_id);
+                    let enabled = !all_selected && !covered;
+                    let mut label = target_display_name(manager, target_id);
+                    if covered {
+                        label.push_str("（已覆盖）");
+                    }
+                    let hover_text = if all_selected {
+                        "已选择全员，旧规则禁用单独玩家目标"
+                    } else if covered {
+                        "这个PC已被选中的旧频道或虚拟讨论组覆盖"
+                    } else {
+                        "切换这个玩家私聊目标"
+                    };
+                    if let Some(next_action) = legacy_send_pane_target_checkbox(
+                        ui, pane, target_id, label, enabled, hover_text,
+                    ) {
+                        action = Some(next_action);
+                    }
+                }
+            });
+        }
+
+        let mut teams = group
+            .legacy_teams
+            .iter()
+            .filter(|team| !team.id.trim().is_empty())
+            .collect::<Vec<_>>();
+        teams.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if !teams.is_empty() {
+            ui.label("频道");
+            ui.horizontal_wrapped(|ui| {
+                for team in teams {
+                    let label = if team.name.trim().is_empty() {
+                        format!("频道 {}", team.id)
+                    } else {
+                        format!("{} ({})", team.name, team.id)
+                    };
+                    if let Some(next_action) = legacy_send_pane_target_checkbox(
+                        ui,
+                        pane,
+                        &team.id,
+                        label,
+                        !all_selected,
+                        if all_selected {
+                            "已选择全员，旧规则禁用其他频道"
+                        } else {
+                            "切换这个旧频道目标"
+                        },
+                    ) {
+                        action = Some(next_action);
+                    }
+                }
+            });
+        }
+
+        let mut areas = Vec::new();
+        for world in &group.legacy_worlds {
+            for area in world.chat_areas.iter().chain(world.areas.iter()) {
+                if !area.id.trim().is_empty() {
+                    areas.push((world.name.as_str(), area));
+                }
+            }
+        }
+        areas.sort_by(|left, right| {
+            left.0
+                .cmp(right.0)
+                .then_with(|| left.1.name.cmp(&right.1.name))
+                .then_with(|| left.1.id.cmp(&right.1.id))
+        });
+        if !areas.is_empty() {
+            ui.label("虚拟讨论组");
+            ui.horizontal_wrapped(|ui| {
+                for (world_name, area) in areas {
+                    let area_kind = if area.combat { "战斗区" } else { "讨论组" };
+                    let label = if area.name.trim().is_empty() {
+                        format!("{area_kind} {} ({world_name})", area.id)
+                    } else {
+                        format!(
+                            "{}：{} ({world_name})",
+                            area_kind, area.name
+                        )
+                    };
+                    if let Some(next_action) = legacy_send_pane_target_checkbox(
+                        ui,
+                        pane,
+                        &area.id,
+                        label,
+                        !all_selected,
+                        if all_selected {
+                            "已选择全员，旧规则禁用虚拟讨论组"
+                        } else {
+                            "切换这个虚拟讨论组目标"
+                        },
+                    ) {
+                        action = Some(next_action);
+                    }
+                }
+            });
+        }
+    });
+
+    action
+}
+
+fn legacy_group_surfaces_ui(
+    ui: &mut Ui,
+    manager: &NapcatMessageManager,
+    state: &mut TrpgGroupSettingsState,
+    chat_input_msgs: &mut Local<HashMap<String, String>>,
+    napcat_sender: Option<&NapcatIOSender>,
+    ime: &mut ImeManager,
+    mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
+    group_name: &str,
+    group: &TrpgGroup,
+) -> Option<LegacyGroupSurfaceAction> {
+    let chat_area_count = group
+        .legacy_worlds
+        .iter()
+        .map(|world| world.chat_areas.len() + world.areas.len())
+        .sum::<usize>();
+    if group.legacy_teams.is_empty()
+        && group.legacy_worlds.is_empty()
+        && group.legacy_send_panes.is_empty()
+    {
+        return None;
+    }
+
+    let mut action = None;
+    ui.collapsing("月莓旧频道/世界", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.small(format!(
+                "旧频道 {}",
+                group.legacy_teams.len()
+            ));
+            ui.small(format!(
+                "旧世界 {}",
+                group.legacy_worlds.len()
+            ));
+            ui.small(format!(
+                "虚拟讨论组 {}",
+                chat_area_count
+            ));
+            ui.small(format!(
+                "旧发送窗 {}",
+                group.legacy_send_panes.len()
+            ));
+        });
+
+        if !group.legacy_teams.is_empty() {
+            ui.label("旧频道");
+            for team in &group.legacy_teams {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(&team.name);
+                    ui.small(format!("ID {}", team.id));
+                    if team.chat_message_count > 0 {
+                        ui.small(format!(
+                            "本地聊天 {}条",
+                            team.chat_message_count
+                        ));
+                    }
+                    if team.anonymous_speakers {
+                        ui.small("匿名发言");
+                    }
+                    if team.allow_pc_nickname_repeat {
+                        ui.small("允许重名");
+                    }
+                    if !team.visible {
+                        ui.small("隐藏");
+                    }
+                    if team.window_x != 0.0
+                        || team.window_y != 0.0
+                        || team.window_width != 0.0
+                        || team.window_height != 0.0
+                    {
+                        ui.small(format!(
+                            "旧窗口 {:.0},{:.0} {:.0}x{:.0}",
+                            team.window_x, team.window_y, team.window_width, team.window_height
+                        ));
+                    }
+                    ui.small(legacy_member_preview(
+                        manager,
+                        &team.players,
+                    ));
+                    let window_key = (group_name.to_owned(), team.id.clone());
+                    let window_open = state.open_legacy_team_chat_windows.contains(&window_key);
+                    let button_text =
+                        if window_open { "独立聊天窗已开" } else { "打开独立聊天窗" };
+                    let response = ui.add_enabled(
+                        !window_open,
+                        egui::Button::new(button_text),
+                    );
+                    let clicked = response.clicked();
+                    response.on_hover_text("打开为独立旧频道聊天窗");
+                    if clicked {
+                        state.open_legacy_team_chat_windows.insert(window_key);
+                    }
+                    if ui.button("转为小队").clicked() {
+                        action = Some(LegacyGroupSurfaceAction::Promote(
+                            LegacyPartyPromotion::Team(team.id.clone()),
+                        ));
+                    }
+                });
+                if !team.chat_messages.is_empty() || team.chat_message_count > 0 {
+                    ui.indent(
+                        format!("legacy_team_chat_{}", team.id),
+                        |ui| {
+                            ui.collapsing("旧频道本地聊天", |ui| {
+                                if let Some(next_action) = legacy_team_chat_composer_ui(
+                                    ui,
+                                    manager,
+                                    group,
+                                    group_name,
+                                    team,
+                                    state,
+                                    chat_input_msgs,
+                                    napcat_sender,
+                                    ime,
+                                    2,
+                                    220.0,
+                                ) {
+                                    action = Some(next_action);
+                                }
+                            });
+                        },
+                    );
+                }
+            }
+        }
+
+        for world in &group.legacy_worlds {
+            let world_unit_ids = manager.unit_pool_ids_for_legacy_members(&world.npcs);
+            let world_unit_status_id = format!(
+                "legacy-world-units:{group_name}:{}",
+                world.id
+            );
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("旧世界：{}", world.name));
+                if !world.visible {
+                    ui.small("隐藏");
+                }
+                if !world.players.is_empty() {
+                    ui.small(format!(
+                        "PC：{}",
+                        legacy_member_preview(manager, &world.players)
+                    ));
+                }
+                if !world.npcs.is_empty() {
+                    ui.small(format!("NPC {}个", world.npcs.len()));
+                    if world_unit_ids.is_empty() {
+                        ui.small("未匹配单位模板");
+                    } else {
+                        ui.small(format!(
+                            "匹配单位 {}个",
+                            world_unit_ids.len()
+                        ));
+                    }
+                }
+                if let Some(store) = scene_store.as_deref_mut() {
+                    if ui
+                        .add_enabled(
+                            !world_unit_ids.is_empty(),
+                            egui::Button::new("放入世界NPC标记"),
+                        )
+                        .on_disabled_hover_text("旧世界NPC没有匹配的单位模板")
+                        .clicked()
+                    {
+                        let status = place_legacy_world_unit_tokens_ui(
+                            &mut *store,
+                            manager,
+                            group_name,
+                            &world.id,
+                            &world.name,
+                            &world_unit_ids,
+                            world.visible,
+                        );
+                        state
+                            .legacy_area_marker_status
+                            .insert(world_unit_status_id.clone(), status);
+                    }
+                    if ui.button("移出世界NPC标记").clicked() {
+                        let status =
+                            remove_legacy_world_unit_tokens_ui(&mut *store, group_name, &world.id);
+                        state
+                            .legacy_area_marker_status
+                            .insert(world_unit_status_id.clone(), status);
+                    }
+                }
+                if let Some(status) = state.legacy_area_marker_status.get(&world_unit_status_id) {
+                    ui.small(status);
+                }
+            });
+            for area in world.chat_areas.iter().chain(world.areas.iter()) {
+                let marker_id = legacy_area_marker_id(group_name, &world.id, &area.id);
+                let area_unit_ids = manager.unit_pool_ids_for_legacy_members(&area.members);
+                let area_unit_status_id = format!("{marker_id}:units");
+                ui.horizontal_wrapped(|ui| {
+                    ui.small(format!(
+                        "{}：{}",
+                        if area.combat { "战斗区" } else { "讨论组" },
+                        area.name
+                    ));
+                    ui.small(format!("ID {}", area.id));
+                    ui.small(format!(
+                        "成员：{}",
+                        legacy_member_preview(manager, &area.members)
+                    ));
+                    if !area_unit_ids.is_empty() {
+                        ui.small(format!(
+                            "成员单位 {}个",
+                            area_unit_ids.len()
+                        ));
+                    }
+                    if ui.button("转为小队").clicked() {
+                        action = Some(LegacyGroupSurfaceAction::Promote(
+                            LegacyPartyPromotion::ChatArea(area.id.clone()),
+                        ));
+                    }
+                    if let Some(store) = scene_store.as_deref_mut() {
+                        let has_marker =
+                            has_legacy_area_marker(store, group_name, &world.id, &area.id);
+                        let label = if has_marker { "更新场景标记" } else { "放入场景" };
+                        if ui.button(label).clicked() {
+                            let status = match place_legacy_area_marker(
+                                &mut *store,
+                                group_name,
+                                &world.id,
+                                &world.name,
+                                &area.id,
+                                &area.name,
+                                area.combat,
+                                &area.members,
+                                area.x,
+                                area.y,
+                                area.width,
+                                area.height,
+                                world.visible,
+                            ) {
+                                Ok(scene_changed) => match store.persist() {
+                                    Ok(()) => {
+                                        if scene_changed {
+                                            "已写入场景标记".to_owned()
+                                        } else {
+                                            "场景标记已是最新".to_owned()
+                                        }
+                                    },
+                                    Err(err) => format!("场景标记保存失败：{err}"),
+                                },
+                                Err(err) => format!("场景标记失败：{err}"),
+                            };
+                            state
+                                .legacy_area_marker_status
+                                .insert(marker_id.clone(), status);
+                        }
+                        if ui.button("写入体素边框").clicked() {
+                            let status = match place_legacy_area_marker(
+                                &mut *store,
+                                group_name,
+                                &world.id,
+                                &world.name,
+                                &area.id,
+                                &area.name,
+                                area.combat,
+                                &area.members,
+                                area.x,
+                                area.y,
+                                area.width,
+                                area.height,
+                                world.visible,
+                            ) {
+                                Ok(_) => match stamp_legacy_area_marker_voxel_outline(
+                                    &mut *store,
+                                    group_name,
+                                    &world.id,
+                                    &area.id,
+                                ) {
+                                    Ok(count) => match store.persist() {
+                                        Ok(()) => format!("已写入体素边框 {count} 格"),
+                                        Err(err) => format!("体素边框保存失败：{err}"),
+                                    },
+                                    Err(err) => format!("体素边框失败：{err}"),
+                                },
+                                Err(err) => format!("场景标记失败：{err}"),
+                            };
+                            state
+                                .legacy_area_marker_status
+                                .insert(marker_id.clone(), status);
+                        }
+                        if ui.button("写入体素填充").clicked() {
+                            let status = match place_legacy_area_marker(
+                                &mut *store,
+                                group_name,
+                                &world.id,
+                                &world.name,
+                                &area.id,
+                                &area.name,
+                                area.combat,
+                                &area.members,
+                                area.x,
+                                area.y,
+                                area.width,
+                                area.height,
+                                world.visible,
+                            ) {
+                                Ok(_) => match stamp_legacy_area_marker_voxel_fill(
+                                    &mut *store,
+                                    group_name,
+                                    &world.id,
+                                    &area.id,
+                                ) {
+                                    Ok(count) => match store.persist() {
+                                        Ok(()) => format!("已写入体素填充 {count} 格"),
+                                        Err(err) => format!("体素填充保存失败：{err}"),
+                                    },
+                                    Err(err) => format!("体素填充失败：{err}"),
+                                },
+                                Err(err) => format!("场景标记失败：{err}"),
+                            };
+                            state
+                                .legacy_area_marker_status
+                                .insert(marker_id.clone(), status);
+                        }
+                        if ui
+                            .add_enabled(
+                                !area_unit_ids.is_empty(),
+                                egui::Button::new("放入成员单位标记"),
+                            )
+                            .on_disabled_hover_text("旧区域成员没有匹配的单位模板")
+                            .clicked()
+                        {
+                            let status = place_legacy_area_unit_tokens_ui(
+                                &mut *store,
+                                manager,
+                                group_name,
+                                &world.id,
+                                &area.id,
+                                &area.name,
+                                &area_unit_ids,
+                                area.x,
+                                area.y,
+                                area.width,
+                                area.height,
+                                world.visible,
+                            );
+                            state
+                                .legacy_area_marker_status
+                                .insert(area_unit_status_id.clone(), status);
+                        }
+                        if ui.button("移出成员单位标记").clicked() {
+                            let status = remove_legacy_area_unit_tokens_ui(
+                                &mut *store,
+                                group_name,
+                                &world.id,
+                                &area.id,
+                            );
+                            state
+                                .legacy_area_marker_status
+                                .insert(area_unit_status_id.clone(), status);
+                        }
+                        if has_marker && ui.button("移出场景").clicked() {
+                            let removed = remove_legacy_area_marker(
+                                &mut *store,
+                                group_name,
+                                &world.id,
+                                &area.id,
+                            );
+                            let status = if removed {
+                                match store.persist() {
+                                    Ok(()) => "已移出场景标记".to_owned(),
+                                    Err(err) => format!("移出场景标记保存失败：{err}"),
+                                }
+                            } else {
+                                "场景里没有这个标记".to_owned()
+                            };
+                            state
+                                .legacy_area_marker_status
+                                .insert(marker_id.clone(), status);
+                        }
+                    } else {
+                        ui.small("场景未就绪");
+                    }
+                    if let Some(status) = state.legacy_area_marker_status.get(&marker_id) {
+                        ui.small(status);
+                    }
+                    if let Some(status) = state.legacy_area_marker_status.get(&area_unit_status_id)
+                    {
+                        ui.small(status);
+                    }
+                });
+            }
+        }
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("旧发送窗");
+            if ui.button("新增多选发送窗").clicked() {
+                action = Some(LegacyGroupSurfaceAction::AddSendPane);
+            }
+        });
+        if group.legacy_send_panes.is_empty() {
+            ui.small("还没有旧发送窗。");
+        } else {
+            for pane in &group.legacy_send_panes {
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    legacy_send_pane_composer_ui(
+                        ui,
+                        manager,
+                        group,
+                        group_name,
+                        pane,
+                        napcat_sender,
+                        chat_input_msgs,
+                        &mut state.legacy_send_pane_status,
+                        ime,
+                        2,
+                    );
+                    if let Some(next_action) =
+                        legacy_send_pane_target_editor_ui(ui, manager, group, pane)
+                    {
+                        action = Some(next_action);
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let window_key = (group_name.to_owned(), pane.key.clone());
+                        let fixed_open = !pane.closable;
+                        let window_open =
+                            fixed_open || state.open_legacy_send_pane_windows.contains(&window_key);
+                        let button_text =
+                            if window_open { "独立窗已开" } else { "打开独立窗" };
+                        let response = ui.add_enabled(
+                            !fixed_open,
+                            egui::Button::new(button_text),
+                        );
+                        let clicked = response.clicked();
+                        response.on_hover_text(if fixed_open {
+                            "这个旧发送窗会自动保持独立窗口"
+                        } else {
+                            "打开为独立浮动发送窗"
+                        });
+                        if clicked {
+                            state.open_legacy_send_pane_windows.insert(window_key);
+                        }
+                        if pane.closable && ui.button("删除发送窗").clicked() {
+                            action = Some(
+                                LegacyGroupSurfaceAction::RemoveSendPane {
+                                    pane_key: pane.key.clone(),
+                                },
+                            );
+                        }
+                    });
+                });
+            }
+        }
+    });
+    action
+}
+
+#[derive(Clone, Copy)]
+enum LegacyNegativeAction {
+    Start,
+    HalfWarning,
+    Timeout,
+    Reset,
+}
+
+fn legacy_negative_status_key(group_name: &str, target_id: &str) -> String {
+    format!("{group_name}:{target_id}")
+}
+
+fn legacy_negative_send_input_id(group_name: &str, target_id: &str, action: &str) -> String {
+    format!("legacy_negative:{group_name}:{target_id}:{action}")
+}
+
+fn legacy_negative_remaining_label(timer: Option<&TrpgLegacyNegativeTimer>) -> String {
+    let remaining_ms = timer.map(|timer| timer.remaining_ms).unwrap_or_default();
+    if remaining_ms == 0 {
+        return "未计时".to_owned();
+    }
+    let seconds = remaining_ms.div_ceil(1000);
+    format!("剩余{}秒", seconds)
+}
+
+fn legacy_negative_notice_text(action: LegacyNegativeAction) -> Option<&'static str> {
+    match action {
+        LegacyNegativeAction::Start => Some(
+            "已经有一半的玩家进入下一回合, 消极倒计时2分钟, 2分钟内未有任何回复,将会直接跳过此回合,并叠加一层消极。",
+        ),
+        LegacyNegativeAction::HalfWarning => Some("消极倒计时已经过去一半,请尽快回复。"),
+        LegacyNegativeAction::Timeout => Some("因为未回复, 你的回合已被跳过, 并叠加了一层消极"),
+        LegacyNegativeAction::Reset => None,
+    }
+}
+
+fn queue_legacy_negative_notice(
+    group_name: &str,
+    target_id: &str,
+    action: LegacyNegativeAction,
+    sender: Option<&NapcatIOSender>,
+    ime: &mut ImeManager,
+) -> Result<bool, String> {
+    let Some(text) = legacy_negative_notice_text(action) else {
+        return Ok(false);
+    };
+    let Some(sender) = sender else {
+        return Ok(false);
+    };
+    let user_id = target_id
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("消极目标不是有效QQ号：{target_id}"))?;
+    let action_label = match action {
+        LegacyNegativeAction::Start => "start",
+        LegacyNegativeAction::HalfWarning => "half",
+        LegacyNegativeAction::Timeout => "timeout",
+        LegacyNegativeAction::Reset => "reset",
+    };
+    ime.queue_text_send(
+        &legacy_negative_send_input_id(group_name, target_id, action_label),
+        text,
+        sender,
+        vec![NapcatSendTarget::Private(user_id)],
+    )?;
+    Ok(true)
+}
+
 fn trpg_group_settings_window(
     ctx: &Context,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
     deepseek_manager: &mut ResMut<Persistent<DeepseekManager>>,
-    scene_store: Option<&mut Persistent<VoxelSceneStore>>,
+    mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
     scene_runtime: Option<&mut VoxelMapRuntimeState>,
+    napcat_sender: Option<&NapcatIOSender>,
+    ime: &mut ImeManager,
+    chat_input_msgs: &mut Local<HashMap<String, String>>,
     state: &mut TrpgGroupSettingsState,
     character_edit_state: &mut CharacterEditState,
     rule_engine_state: &mut RuleEngineState,
@@ -6402,6 +10272,8 @@ fn trpg_group_settings_window(
     let mut turn_action: Option<(String, String, bool)> = None;
     let mut turn_reset: Option<String> = None;
     let mut turn_advance: Option<String> = None;
+    let mut legacy_negative_action: Option<(String, String, LegacyNegativeAction)> = None;
+    let mut legacy_surface_action: Option<(String, LegacyGroupSurfaceAction)> = None;
     let mut settings_open = state.open;
 
     egui::Window::new("TRPG设置")
@@ -6430,7 +10302,7 @@ fn trpg_group_settings_window(
                 ui,
                 manager,
                 deepseek_manager,
-                scene_store,
+                scene_store.as_deref_mut(),
                 scene_runtime,
                 state,
             );
@@ -6452,9 +10324,15 @@ fn trpg_group_settings_window(
                                 .player_characters
                                 .entry(target_id.clone())
                                 .or_default();
-                            ui.collapsing(
-                                format!("{display_name} ({target_id})"),
-                                |ui| {
+                            let pending_skill_count = pending_gm_skill_count(character);
+                            let character_label = if pending_skill_count == 0 {
+                                format!("{display_name} ({target_id})")
+                            } else {
+                                format!(
+                                    "{display_name} ({target_id}) · 待GM确认技能 {pending_skill_count}"
+                                )
+                            };
+                            ui.collapsing(character_label, |ui| {
                                     character_status_summary_ui(ui, character);
                                     ui.horizontal(|ui| {
                                         let pending_delete =
@@ -6486,8 +10364,7 @@ fn trpg_group_settings_window(
                                             stat_config,
                                         );
                                     });
-                                },
-                            );
+                                });
                         }
                     });
             }
@@ -6524,6 +10401,23 @@ fn trpg_group_settings_window(
                 manager.current_trpg_group = next_current_group;
                 changed = true;
             }
+            ui.add_space(6.0);
+
+            ui.collapsing("随机池", |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("trpg_settings_random_pool")
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        changed |= random_pool_settings_ui(
+                            ui,
+                            manager,
+                            state,
+                            &player_targets,
+                            napcat_sender,
+                            Some(&mut *ime),
+                        );
+                    });
+            });
             ui.add_space(6.0);
 
             egui::ScrollArea::vertical()
@@ -6595,6 +10489,43 @@ fn trpg_group_settings_window(
                                                 "允许入团请求",
                                             )
                                             .changed();
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut group.run_times)
+                                                    .range(0..=9999)
+                                                    .prefix("开团次数 "),
+                                            )
+                                            .changed();
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        changed |= ui
+                                            .checkbox(
+                                                &mut group.battle_sort_by_turn,
+                                                "新战斗按行动排序",
+                                            )
+                                            .changed();
+                                        if ui
+                                            .checkbox(
+                                                &mut group.battle_negative_enabled,
+                                                "新战斗启用消极",
+                                            )
+                                            .changed()
+                                        {
+                                            changed = true;
+                                            changed |= group.sync_legacy_negative_timers();
+                                        }
+                                        if group.legacy_negative_count > 0 {
+                                            ui.small(format!(
+                                                "旧消极记录 {} 条",
+                                                group.legacy_negative_count
+                                            ));
+                                        }
+                                        if !group.legacy_negative_timers.is_empty() {
+                                            ui.small(format!(
+                                                "计时器 {} 个",
+                                                group.legacy_negative_timers.len()
+                                            ));
+                                        }
                                     });
 
                                     ui.label("公开说明");
@@ -6638,6 +10569,14 @@ fn trpg_group_settings_window(
                                         turn.map(|turn| turn.turns_passed).unwrap_or_default();
                                     let acted = turn.map(|turn| turn.acted).unwrap_or_default();
                                     let skipped = turn.map(|turn| turn.skipped).unwrap_or_default();
+                                    let negative_timer = snapshot.legacy_negative_timer(target_id);
+                                    let negative_active =
+                                        negative_timer.is_some_and(|timer| timer.active());
+                                    let negative_half_warned =
+                                        negative_timer.is_some_and(|timer| timer.half_warned);
+                                    let negative_layers = negative_timer
+                                        .map(|timer| timer.negative_layers)
+                                        .unwrap_or_default();
                                     let status = if acted {
                                         "已行动"
                                     } else if skipped {
@@ -6662,6 +10601,71 @@ fn trpg_group_settings_window(
                                                 target_id.clone(),
                                                 false,
                                             ));
+                                        }
+                                        if snapshot.battle_negative_enabled
+                                            || negative_timer.is_some()
+                                        {
+                                            ui.small(legacy_negative_remaining_label(
+                                                negative_timer,
+                                            ));
+                                            if negative_layers > 0 {
+                                                ui.small(format!("消极{}层", negative_layers));
+                                            }
+                                            if negative_active {
+                                                ui.small(if negative_half_warned {
+                                                    "已半程提醒"
+                                                } else {
+                                                    "倒计时中"
+                                                });
+                                            } else if negative_timer
+                                                .is_some_and(|timer| timer.replied)
+                                            {
+                                                ui.small("已回复");
+                                            }
+                                            if ui.button("启动倒计时").clicked() {
+                                                legacy_negative_action = Some((
+                                                    group_name.clone(),
+                                                    target_id.clone(),
+                                                    LegacyNegativeAction::Start,
+                                                ));
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    negative_active && !negative_half_warned,
+                                                    egui::Button::new("半程提醒"),
+                                                )
+                                                .clicked()
+                                            {
+                                                legacy_negative_action = Some((
+                                                    group_name.clone(),
+                                                    target_id.clone(),
+                                                    LegacyNegativeAction::HalfWarning,
+                                                ));
+                                            }
+                                            if ui.button("触发消极").clicked() {
+                                                legacy_negative_action = Some((
+                                                    group_name.clone(),
+                                                    target_id.clone(),
+                                                    LegacyNegativeAction::Timeout,
+                                                ));
+                                            }
+                                            if ui.button("重置计时").clicked() {
+                                                legacy_negative_action = Some((
+                                                    group_name.clone(),
+                                                    target_id.clone(),
+                                                    LegacyNegativeAction::Reset,
+                                                ));
+                                            }
+                                            if let Some(status) =
+                                                state.legacy_negative_status.get(
+                                                    &legacy_negative_status_key(
+                                                        &group_name,
+                                                        target_id,
+                                                    ),
+                                                )
+                                            {
+                                                ui.small(status);
+                                            }
                                         }
                                     });
                                 }
@@ -6692,6 +10696,142 @@ fn trpg_group_settings_window(
                                 let mut party_names =
                                     snapshot.parties.keys().cloned().collect::<Vec<_>>();
                                 party_names.sort();
+
+                                if party_names.is_empty() {
+                                    ui.small("还没有小队。");
+                                } else {
+                                    ui.label("小队管理");
+                                    for party_name in &party_names {
+                                        let members = snapshot
+                                            .parties
+                                            .get(party_name)
+                                            .map(|party| party.players.clone())
+                                            .unwrap_or_default();
+                                        let member_label =
+                                            if members.is_empty() {
+                                                "无成员".to_owned()
+                                            } else {
+                                                members
+                                                    .iter()
+                                                    .map(|target_id| {
+                                                        target_display_name(manager, target_id)
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join("、")
+                                            };
+                                        let merge_options = party_names
+                                            .iter()
+                                            .filter(|candidate| *candidate != party_name)
+                                            .cloned()
+                                            .collect::<Vec<_>>();
+                                        let merge_key = (group_name.clone(), party_name.clone());
+                                        let mut merge_target = state
+                                            .party_merge_targets
+                                            .get(&merge_key)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        if !merge_options
+                                            .iter()
+                                            .any(|candidate| candidate == &merge_target)
+                                        {
+                                            merge_target =
+                                                merge_options.first().cloned().unwrap_or_default();
+                                        }
+                                        let pending_delete =
+                                            state.pending_party_delete.as_ref()
+                                                == Some(&merge_key);
+                                        let mut clear_merge_key = false;
+
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.strong(party_name);
+                                            ui.small(format!("成员：{member_label}"));
+                                            if merge_options.is_empty() {
+                                                ui.add_enabled(
+                                                    false,
+                                                    egui::Button::new("合并"),
+                                                )
+                                                .on_hover_text("至少需要两个小队");
+                                            } else {
+                                                egui::ComboBox::from_id_salt((
+                                                    "party_merge_target",
+                                                    &group_name,
+                                                    party_name,
+                                                ))
+                                                .selected_text(merge_target.as_str())
+                                                .show_ui(
+                                                    ui,
+                                                    |ui| {
+                                                        for candidate in &merge_options {
+                                                            ui.selectable_value(
+                                                                &mut merge_target,
+                                                                candidate.clone(),
+                                                                candidate,
+                                                            );
+                                                        }
+                                                    },
+                                                );
+                                                if ui
+                                                    .button("合并到")
+                                                    .on_hover_text(
+                                                        "把这个小队的成员移动到目标小队",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    if let Some(group) =
+                                                        manager.trpg_groups.get_mut(&group_name)
+                                                    {
+                                                        changed |= group.merge_party(
+                                                            party_name,
+                                                            &merge_target,
+                                                        );
+                                                    }
+                                                    state
+                                                        .party_merge_targets
+                                                        .remove(&merge_key);
+                                                    clear_merge_key = true;
+                                                    if state.pending_party_delete.as_ref()
+                                                        == Some(&merge_key)
+                                                    {
+                                                        state.pending_party_delete = None;
+                                                    }
+                                                }
+                                            }
+
+                                            if pending_delete {
+                                                ui.label("确认删除？");
+                                                if ui
+                                                    .button("删除小队")
+                                                    .on_hover_text("成员会变为无小队")
+                                                    .clicked()
+                                                {
+                                                    if let Some(group) =
+                                                        manager.trpg_groups.get_mut(&group_name)
+                                                    {
+                                                        changed |= group.remove_party(party_name);
+                                                    }
+                                                    state.pending_party_delete = None;
+                                                    state
+                                                        .party_merge_targets
+                                                        .remove(&merge_key);
+                                                    clear_merge_key = true;
+                                                }
+                                                if ui.button("取消").clicked() {
+                                                    state.pending_party_delete = None;
+                                                }
+                                            } else if ui.button("删除").clicked() {
+                                                state.pending_party_delete =
+                                                    Some(merge_key.clone());
+                                            }
+                                        });
+
+                                        if !clear_merge_key && !merge_target.is_empty() {
+                                            state
+                                                .party_merge_targets
+                                                .insert(merge_key, merge_target);
+                                        }
+                                    }
+                                    ui.separator();
+                                }
 
                                 if snapshot.players.is_empty() {
                                     ui.small("这个TRPG组里没有可分配的小队玩家。");
@@ -6767,6 +10907,20 @@ fn trpg_group_settings_window(
                                 }
                             });
 
+                            if let Some(promotion) = legacy_group_surfaces_ui(
+                                ui,
+                                manager,
+                                state,
+                                chat_input_msgs,
+                                napcat_sender,
+                                ime,
+                                scene_store.as_deref_mut(),
+                                &group_name,
+                                &snapshot,
+                            ) {
+                                legacy_surface_action = Some((group_name.clone(), promotion));
+                            }
+
                             ui.columns(2, |columns| {
                                 columns[0].label("玩家");
                                 for target_id in &player_targets {
@@ -6788,6 +10942,7 @@ fn trpg_group_settings_window(
                                                 selected,
                                             );
                                             group.sync_turn_players();
+                                            group.sync_legacy_negative_timers();
                                             group.sync_parties();
                                             changed = true;
                                         }
@@ -6852,6 +11007,72 @@ fn trpg_group_settings_window(
             rule_engine_state,
         );
     }
+    if let Some((group_name, target_id, action)) = legacy_negative_action {
+        let action_changed =
+            match action {
+                LegacyNegativeAction::Start => manager
+                    .trpg_groups
+                    .get_mut(&group_name)
+                    .is_some_and(|group| {
+                        group.start_legacy_negative_timer(&target_id, LEGACY_NEGATIVE_TIMEOUT_MS)
+                    }),
+                LegacyNegativeAction::HalfWarning => manager
+                    .trpg_groups
+                    .get_mut(&group_name)
+                    .is_some_and(|group| group.mark_legacy_negative_half_warned(&target_id)),
+                LegacyNegativeAction::Timeout => {
+                    let timer_changed = manager
+                        .trpg_groups
+                        .get_mut(&group_name)
+                        .is_some_and(|group| group.record_legacy_negative_timeout(&target_id));
+                    let turn_changed = if timer_changed {
+                        mark_group_player_turn(
+                            manager.as_mut(),
+                            &group_name,
+                            &target_id,
+                            false,
+                            rule_engine_state,
+                        )
+                    } else {
+                        false
+                    };
+                    timer_changed || turn_changed
+                },
+                LegacyNegativeAction::Reset => manager
+                    .trpg_groups
+                    .get_mut(&group_name)
+                    .is_some_and(|group| group.reset_legacy_negative_timer(&target_id)),
+            };
+        changed |= action_changed;
+
+        let status_key = legacy_negative_status_key(&group_name, &target_id);
+        let status = if !action_changed {
+            "没有可更新的消极计时".to_owned()
+        } else if legacy_negative_notice_text(action).is_some() {
+            match queue_legacy_negative_notice(
+                &group_name,
+                &target_id,
+                action,
+                napcat_sender,
+                ime,
+            ) {
+                Ok(true) => "已更新，提醒已加入私聊发送队列".to_owned(),
+                Ok(false) => "已更新本地计时；NapCat未连接，提醒未发送".to_owned(),
+                Err(err) => format!("已更新本地计时；提醒发送失败：{err}"),
+            }
+        } else {
+            "已更新本地计时".to_owned()
+        };
+        state.legacy_negative_status.insert(status_key, status);
+    }
+    if let Some((group_name, action)) = legacy_surface_action {
+        changed |= apply_legacy_group_surface_action(
+            manager.as_mut(),
+            state,
+            &group_name,
+            action,
+        );
+    }
 
     if let Some(group_name) = group_to_delete {
         manager.trpg_groups.remove(&group_name);
@@ -6909,6 +11130,10 @@ pub fn ui_system(
         &mut locals.chat_turn_count_drafts;
     let group_broadcast_scopes: &mut Local<HashMap<String, String>> =
         &mut locals.group_broadcast_scopes;
+    let chat_player_visible_previews: &mut Local<HashMap<String, String>> =
+        &mut locals.chat_player_visible_previews;
+    let chat_list_player_visible_filter: &mut Local<Option<String>> =
+        &mut locals.chat_list_player_visible_filter;
 
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -6994,10 +11219,38 @@ pub fn ui_system(
         &mut deepseek_manager,
         scene_store.as_deref_mut(),
         scene_runtime.as_deref_mut(),
+        napcat_sender,
+        &mut *ime,
+        chat_input_msgs,
         trpg_group_settings,
         character_edit_state,
         &mut rule_engine_state,
     );
+    legacy_send_pane_windows(
+        ctx,
+        &manager,
+        napcat_sender,
+        chat_input_msgs,
+        trpg_group_settings,
+        &mut ime,
+    );
+    if let Some((group_name, action)) = legacy_team_chat_windows(
+        ctx,
+        &manager,
+        napcat_sender,
+        chat_input_msgs,
+        trpg_group_settings,
+        &mut ime,
+    ) {
+        if apply_legacy_group_surface_action(
+            manager.as_mut(),
+            trpg_group_settings,
+            &group_name,
+            action,
+        ) {
+            manager.persist().ok();
+        }
+    }
     quick_character_windows(
         ctx,
         &mut manager,
@@ -7022,7 +11275,12 @@ pub fn ui_system(
                     &mut rule_engine_state,
                     &mut battle_round_state,
                 );
-                let pools_changed = pool_menu_button(ui, &mut manager, trpg_group_settings);
+                let pools_changed = pool_menu_button(
+                    ui,
+                    &mut manager,
+                    trpg_group_settings,
+                    scene_store.as_deref_mut(),
+                );
                 if pools_changed {
                     manager.persist().ok();
                 }
@@ -7060,6 +11318,7 @@ pub fn ui_system(
                 &mut manager,
                 chat_list_edit_target,
                 chat_list_edit_name,
+                chat_list_player_visible_filter,
                 trpg_group_settings,
             );
         });
@@ -7223,6 +11482,7 @@ pub fn ui_system(
                     image_textures,
                     active_trpg_group.as_deref(),
                     turn_count_drafts,
+                    chat_player_visible_previews,
                     &mut rule_engine_state,
                     player_view_request.as_deref_mut(),
                 );
@@ -7433,6 +11693,71 @@ mod tests {
         manager
     }
 
+    #[test]
+    fn chat_list_player_filter_hides_inaccessible_targets_and_unread_activity() {
+        let mut manager = split_party_summary_manager();
+        manager
+            .trpg_groups
+            .get_mut("table")
+            .unwrap()
+            .group_chats
+            .push("98".to_owned());
+
+        let mut red_message = test_group_message(2, "red clue");
+        red_message.data.time = 10;
+        let mut blue_message = test_group_message(3, "blue clue");
+        blue_message.data.time = 20;
+        let mut public_message = test_group_message(4, "public clue");
+        public_message.data.time = 30;
+        manager.messages.insert("99".to_owned(), vec![
+            red_message,
+            blue_message,
+            public_message,
+        ]);
+        manager.messages.insert("98".to_owned(), vec![
+            test_group_message(3, "blue only"),
+        ]);
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message(2),
+        ]);
+        manager.messages.insert("3".to_owned(), vec![
+            test_private_message(3),
+        ]);
+        manager.read_message_counts.insert("99".to_owned(), 1);
+
+        assert_eq!(
+            chat_list_player_filter_options(&manager),
+            vec!["2".to_owned(), "3".to_owned()]
+        );
+
+        let red_views = chat_list_target_views(&manager, Some(2));
+        let red_target_ids = red_views
+            .iter()
+            .map(|view| view.target_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(red_target_ids.contains(&"2"));
+        assert!(red_target_ids.contains(&"99"));
+        assert!(!red_target_ids.contains(&"3"));
+        assert!(!red_target_ids.contains(&"98"));
+
+        let group_view = red_views
+            .iter()
+            .find(|view| view.target_id == "99")
+            .unwrap();
+        assert_eq!(group_view.message_count, 2);
+        assert_eq!(group_view.total_message_count, 3);
+        assert_eq!(group_view.unread_count, 1);
+
+        let raw_views = chat_list_target_views(&manager, None);
+        let raw_target_ids = raw_views
+            .iter()
+            .map(|view| view.target_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(raw_target_ids.contains(&"3"));
+        assert!(raw_target_ids.contains(&"98"));
+    }
+
     fn buff(name: &str, turns_remaining: i32) -> BuffSpec {
         BuffSpec {
             name: name.to_owned(),
@@ -7445,6 +11770,7 @@ mod tests {
                 field: BuffField::DamageTakenModifier,
                 value: BuffValue::Set(0.5),
             }],
+            tick_actions: Vec::new(),
         }
     }
 
@@ -7573,6 +11899,345 @@ mod tests {
         );
 
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn group_broadcast_targets_expand_imported_legacy_send_pane() {
+        let mut manager = empty_manager();
+        for user_id in [10002, 10003, 10004, 10005] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message(user_id),
+            ]);
+        }
+        let group = TrpgGroup {
+            players: vec![
+                "10002".to_owned(),
+                "10003".to_owned(),
+                "10004".to_owned(),
+                "10005".to_owned(),
+            ],
+            legacy_teams: vec![crate::napcat::TrpgLegacyTeam {
+                id: "1".to_owned(),
+                name: "红队频道".to_owned(),
+                players: vec!["10002".to_owned(), "10003".to_owned()],
+                ..Default::default()
+            }],
+            legacy_worlds: vec![crate::napcat::TrpgLegacyWorld {
+                id: "world-a".to_owned(),
+                name: "旧世界".to_owned(),
+                chat_areas: vec![crate::napcat::TrpgLegacyArea {
+                    id: "area-a".to_owned(),
+                    name: "密谈区".to_owned(),
+                    members: vec!["10003".to_owned(), "10004".to_owned()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            legacy_send_panes: vec![crate::napcat::TrpgLegacySendPane {
+                key: "7".to_owned(),
+                title: "混合发送窗".to_owned(),
+                targets: vec![
+                    "1".to_owned(),
+                    "area-a".to_owned(),
+                    "10005".to_owned(),
+                    "10003".to_owned(),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let members = vec!["10002".to_owned()];
+
+        let targets = group_broadcast_targets(
+            Some(&group),
+            &members,
+            &manager,
+            &broadcast_legacy_pane_scope("7"),
+        );
+
+        assert_eq!(
+            group.legacy_send_pane_effective_targets("7"),
+            vec!["1".to_owned(), "area-a".to_owned(), "10005".to_owned(),]
+        );
+        assert_eq!(
+            group.legacy_send_pane_disabled_direct_targets("7"),
+            vec!["10003".to_owned()]
+        );
+        assert_eq!(targets, vec![
+            NapcatSendTarget::Private(10002),
+            NapcatSendTarget::Private(10003),
+            NapcatSendTarget::Private(10004),
+            NapcatSendTarget::Private(10005),
+        ]);
+    }
+
+    #[test]
+    fn legacy_send_pane_all_target_disables_other_targets() {
+        let mut manager = empty_manager();
+        for user_id in [10002, 10003] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message(user_id),
+            ]);
+        }
+        let group = TrpgGroup {
+            players: vec!["10002".to_owned(), "10003".to_owned()],
+            legacy_send_panes: vec![crate::napcat::TrpgLegacySendPane {
+                key: "all".to_owned(),
+                title: "全员发送窗".to_owned(),
+                targets: vec!["0".to_owned(), "10002".to_owned(), "10003".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            group.legacy_send_pane_effective_targets("all"),
+            vec!["0".to_owned()]
+        );
+        assert_eq!(
+            legacy_send_pane_targets(&manager, &group, "all"),
+            vec![
+                NapcatSendTarget::Private(10002),
+                NapcatSendTarget::Private(10003),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_send_pane_composer_queues_private_targets_until_ack() {
+        let mut manager = empty_manager();
+        for user_id in [10002, 10003] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message(user_id),
+            ]);
+        }
+        let group = TrpgGroup {
+            players: vec!["10002".to_owned(), "10003".to_owned()],
+            legacy_send_panes: vec![crate::napcat::TrpgLegacySendPane {
+                key: "7".to_owned(),
+                title: "密谈发送窗".to_owned(),
+                targets: vec!["10003".to_owned(), "10002".to_owned(), "10002".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+        let input_id = legacy_send_pane_input_id("table", "7");
+
+        let target_count = queue_legacy_send_pane_text(
+            &manager,
+            &group,
+            "table",
+            "7",
+            " 秘密提示 ",
+            &sender,
+            &mut ime,
+        )
+        .unwrap();
+
+        assert_eq!(target_count, 2);
+        let first = receiver.try_recv().unwrap();
+        let second = receiver.try_recv().unwrap();
+        assert_eq!(first.target_id, input_id);
+        assert_eq!(second.target_id, input_id);
+        assert!(first.message.to_string().contains("秘密提示"));
+        assert!(second.message.to_string().contains("秘密提示"));
+
+        let sent = ime.apply_send_results([
+            crate::napcat::NapcatSendResult {
+                request_id: first.request_id,
+                target_id: input_id.clone(),
+                error: None,
+            },
+            crate::napcat::NapcatSendResult {
+                request_id: second.request_id,
+                target_id: input_id.clone(),
+                error: None,
+            },
+        ]);
+
+        assert_eq!(sent, vec![(
+            input_id,
+            Some("秘密提示".to_owned()),
+            vec![
+                NapcatSendTarget::Private(10002),
+                NapcatSendTarget::Private(10003),
+            ],
+        )]);
+    }
+
+    #[test]
+    fn legacy_team_chat_composer_queues_private_targets_until_ack() {
+        let mut manager = empty_manager();
+        for user_id in [10002, 10003] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message(user_id),
+            ]);
+        }
+        let group = TrpgGroup {
+            players: vec!["10002".to_owned(), "10003".to_owned(), "10004".to_owned()],
+            legacy_teams: vec![crate::napcat::TrpgLegacyTeam {
+                id: "1".to_owned(),
+                name: "红队频道".to_owned(),
+                players: vec![
+                    "10003".to_owned(),
+                    "10002".to_owned(),
+                    "10004".to_owned(),
+                    "missing".to_owned(),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+        let input_id = legacy_team_chat_input_id("table", "1");
+
+        assert_eq!(
+            legacy_team_chat_targets(&manager, &group, "1"),
+            vec![
+                NapcatSendTarget::Private(10003),
+                NapcatSendTarget::Private(10002),
+            ]
+        );
+        let target_count = queue_legacy_team_chat_text(
+            &manager,
+            &group,
+            "table",
+            "1",
+            " 红队提示 ",
+            &sender,
+            &mut ime,
+        )
+        .unwrap();
+
+        assert_eq!(target_count, 2);
+        let first = receiver.try_recv().unwrap();
+        let second = receiver.try_recv().unwrap();
+        assert_eq!(first.target_id, input_id);
+        assert_eq!(second.target_id, input_id);
+        assert!(first.message.to_string().contains("红队提示"));
+        assert!(second.message.to_string().contains("红队提示"));
+
+        let sent = ime.apply_send_results([
+            crate::napcat::NapcatSendResult {
+                request_id: first.request_id,
+                target_id: input_id.clone(),
+                error: None,
+            },
+            crate::napcat::NapcatSendResult {
+                request_id: second.request_id,
+                target_id: input_id.clone(),
+                error: None,
+            },
+        ]);
+
+        assert_eq!(sent, vec![(
+            input_id,
+            Some("红队提示".to_owned()),
+            vec![
+                NapcatSendTarget::Private(10003),
+                NapcatSendTarget::Private(10002),
+            ],
+        )]);
+    }
+
+    #[test]
+    fn legacy_team_chat_window_entries_include_opened_old_channel_geometry() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            legacy_teams: vec![
+                crate::napcat::TrpgLegacyTeam {
+                    id: "2".to_owned(),
+                    window_x: 12.0,
+                    window_y: 34.0,
+                    window_width: 240.0,
+                    window_height: 120.0,
+                    visible: false,
+                    ..Default::default()
+                },
+                crate::napcat::TrpgLegacyTeam {
+                    id: "1".to_owned(),
+                    name: "红队频道".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut open_windows = HashSet::from([
+            ("table".to_owned(), "2".to_owned()),
+            ("table".to_owned(), "missing".to_owned()),
+        ]);
+        let entries = legacy_team_chat_window_entries(&manager, &open_windows);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].team_id, "2");
+        assert_eq!(entries[0].title, "旧频道 2");
+        assert!(!entries[0].visible);
+        assert_eq!(
+            entries[0].default_pos,
+            Some(Pos2::new(12.0, 34.0))
+        );
+        assert_eq!(
+            entries[0].default_size,
+            Vec2::new(320.0, 260.0)
+        );
+
+        open_windows.insert(("table".to_owned(), "1".to_owned()));
+        let entries = legacy_team_chat_window_entries(&manager, &open_windows);
+        let mut team_ids = entries
+            .iter()
+            .map(|entry| entry.team_id.as_str())
+            .collect::<Vec<_>>();
+        team_ids.sort();
+        assert_eq!(team_ids, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn legacy_send_pane_window_entries_include_fixed_and_open_panes() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            legacy_send_panes: vec![
+                crate::napcat::TrpgLegacySendPane {
+                    key: "fixed".to_owned(),
+                    title: "固定发送窗".to_owned(),
+                    targets: vec!["10002".to_owned()],
+                    closable: false,
+                },
+                crate::napcat::TrpgLegacySendPane {
+                    key: "closable".to_owned(),
+                    title: "可关发送窗".to_owned(),
+                    targets: vec!["10003".to_owned()],
+                    closable: true,
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut open_windows = HashSet::from([("table".to_owned(), "missing".to_owned())]);
+        let fixed_only = legacy_send_pane_window_entries(&manager, &open_windows);
+        assert_eq!(
+            fixed_only
+                .iter()
+                .map(|entry| entry.pane_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fixed"]
+        );
+
+        open_windows.insert((
+            "table".to_owned(),
+            "closable".to_owned(),
+        ));
+        let entries = legacy_send_pane_window_entries(&manager, &open_windows);
+        let mut pane_keys = entries
+            .iter()
+            .map(|entry| entry.pane_key.as_str())
+            .collect::<Vec<_>>();
+        pane_keys.sort();
+        assert_eq!(pane_keys, vec!["closable", "fixed"]);
     }
 
     #[test]
@@ -7762,6 +12427,7 @@ mod tests {
             ],
             last_pick: None,
             last_text_result: None,
+            ..Default::default()
         };
 
         assert_eq!(random_pool_total_weight(&pool), 1.0);
@@ -7796,6 +12462,212 @@ mod tests {
     }
 
     #[test]
+    fn random_pool_batch_message_formats_numbered_results() {
+        let pool = RandomPool {
+            entries: vec![RandomPoolEntry {
+                item: InventoryItem {
+                    name: "事件".to_owned(),
+                    ..Default::default()
+                },
+                result_text: "获得线索".to_owned(),
+                min_count: 2,
+                max_count: 2,
+                weight: 1.0,
+                enabled: true,
+                ..Default::default()
+            }],
+            last_pick: None,
+            last_text_result: None,
+            ..Default::default()
+        };
+
+        let results = random_pool_batch_text_results(&pool, 2);
+        let message = random_pool_text_results_message("遭遇随机", &results).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            message,
+            "遭遇随机随机结果\n1. 获得线索 x2\n2. 获得线索 x2"
+        );
+    }
+
+    #[test]
+    fn random_pool_batch_message_omits_blank_text_results() {
+        let pool = RandomPool {
+            entries: vec![RandomPoolEntry {
+                item: InventoryItem {
+                    name: "只有物品".to_owned(),
+                    ..Default::default()
+                },
+                result_text: "  ".to_owned(),
+                weight: 1.0,
+                enabled: true,
+                ..Default::default()
+            }],
+            last_pick: None,
+            last_text_result: None,
+            ..Default::default()
+        };
+
+        let results = random_pool_batch_text_results(&pool, 3);
+
+        assert!(results.is_empty());
+        assert!(random_pool_text_results_message("空池", &results).is_none());
+    }
+
+    #[test]
+    fn random_pool_legacy_group_and_tag_filters_match_metadata() {
+        let mut manager = empty_manager();
+        manager
+            .random_pools
+            .insert("探索池".to_owned(), RandomPool {
+                legacy_pool_id: Some("random-a".to_owned()),
+                legacy_group: Some(2),
+                tags: "探索 战斗 探索".to_owned(),
+                description: "旧描述".to_owned(),
+                created_at: "2024-01-02".to_owned(),
+                ..Default::default()
+            });
+        manager
+            .random_pools
+            .insert("无标签池".to_owned(), RandomPool {
+                legacy_group: None,
+                ..Default::default()
+            });
+        let pool = &manager.random_pools["探索池"];
+
+        assert_eq!(
+            random_pool_tag_tokens(&pool.tags),
+            vec!["战斗".to_owned(), "探索".to_owned()]
+        );
+        assert_eq!(
+            random_pool_metadata_summary(pool),
+            "旧团索引 2 · 标签 战斗 探索 · 创建 2024-01-02"
+        );
+        assert!(random_pool_matches_filters(
+            pool,
+            &random_pool_group_filter_value(Some(2)),
+            "探索",
+        ));
+        assert!(!random_pool_matches_filters(
+            pool,
+            &random_pool_group_filter_value(Some(3)),
+            "探索",
+        ));
+        assert!(!random_pool_matches_filters(
+            pool,
+            RANDOM_POOL_FILTER_ALL,
+            RANDOM_POOL_FILTER_UNTAGGED,
+        ));
+        assert!(random_pool_matches_filters(
+            &manager.random_pools["无标签池"],
+            RANDOM_POOL_FILTER_UNGROUPED,
+            RANDOM_POOL_FILTER_UNTAGGED,
+        ));
+
+        let (groups, tags) = random_pool_filter_options(&manager);
+        assert_eq!(groups, vec![None, Some(2)]);
+        assert_eq!(tags, vec![
+            "战斗".to_owned(),
+            "探索".to_owned()
+        ]);
+    }
+
+    #[test]
+    fn random_pool_checked_results_assign_unique_private_targets() {
+        let pool = RandomPool {
+            entries: vec![
+                RandomPoolEntry {
+                    result_text: "遭遇伏击".to_owned(),
+                    min_count: 2,
+                    max_count: 2,
+                    enabled: true,
+                    ..Default::default()
+                },
+                RandomPoolEntry {
+                    result_text: "人数不足时跳过".to_owned(),
+                    min_count: 2,
+                    max_count: 2,
+                    enabled: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let targets = vec![
+            NapcatSendTarget::Private(10002),
+            NapcatSendTarget::Private(10003),
+            NapcatSendTarget::Group(20001),
+        ];
+
+        let results = random_pool_checked_results(&pool, &targets);
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.enabled));
+        assert!(results.iter().all(|result| result.text == "遭遇伏击"));
+        let target_ids = results
+            .iter()
+            .map(|result| result.target_id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(target_ids.len(), 2);
+        assert!(target_ids.contains("10002"));
+        assert!(target_ids.contains("10003"));
+    }
+
+    #[test]
+    fn random_pool_checked_results_queue_enabled_private_rows() {
+        let pool = RandomPool {
+            checked_results: vec![
+                RandomPoolCheckedResult {
+                    enabled: true,
+                    target_id: "10002".to_owned(),
+                    text: "  你发现了线索  ".to_owned(),
+                },
+                RandomPoolCheckedResult {
+                    enabled: false,
+                    target_id: "10003".to_owned(),
+                    text: "不会发送".to_owned(),
+                },
+                RandomPoolCheckedResult {
+                    enabled: true,
+                    target_id: "10004".to_owned(),
+                    text: "   ".to_owned(),
+                },
+            ],
+            ..Default::default()
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+
+        let sent_count =
+            queue_random_pool_checked_results("遭遇随机", &pool, &sender, &mut ime).unwrap();
+
+        assert_eq!(sent_count, 1);
+        let outbound = receiver.try_recv().unwrap();
+        assert_eq!(
+            outbound.target_id,
+            random_pool_checked_send_input_id("遭遇随机", 0)
+        );
+        assert!(outbound.message.to_string().contains("send_private_msg"));
+        assert!(outbound.message.to_string().contains("10002"));
+        assert!(outbound.message.to_string().contains("你发现了线索"));
+        assert!(receiver.try_recv().is_err());
+
+        let sent = ime.apply_send_results([crate::napcat::NapcatSendResult {
+            request_id: outbound.request_id,
+            target_id: outbound.target_id,
+            error: None,
+        }]);
+
+        assert_eq!(sent, vec![(
+            random_pool_checked_send_input_id("遭遇随机", 0),
+            Some("你发现了线索".to_owned()),
+            vec![NapcatSendTarget::Private(10002)],
+        )]);
+    }
+
+    #[test]
     fn skill_pool_entry_copies_to_character_skills() {
         let mut character = PlayerCharacter::default();
         let entry = SkillPoolEntry {
@@ -7808,6 +12680,8 @@ mod tests {
             source_skill_index: Some(0),
             legacy_pool_id: Some("legacy-fire".to_owned()),
             category: Some("普通".to_owned()),
+            legacy_has_graph: true,
+            legacy_graph_json: Some(r#"{"nodes":[{"id":"n1"}]}"#.to_owned()),
             ..Default::default()
         };
 
@@ -7837,6 +12711,13 @@ mod tests {
         assert_eq!(
             character.skill_metadata[0].source_pool_label.as_deref(),
             Some("烈焰箭")
+        );
+        assert!(character.skill_metadata[0].legacy_has_buff_machine);
+        assert_eq!(
+            character.skill_metadata[0]
+                .legacy_buff_machine_json
+                .as_deref(),
+            Some(r#"{"graph":{"nodes":[{"id":"n1"}]}}"#)
         );
     }
 
@@ -7881,6 +12762,407 @@ mod tests {
     }
 
     #[test]
+    fn legacy_passive_buff_machine_applies_to_effective_character_stats() {
+        let config = TrpgBasicConfig::default();
+        let mut rule_engine_state = RuleEngineState::default();
+        let mut character = PlayerCharacter {
+            level: 1,
+            status: CharacterStatus {
+                str_: 1,
+                ..Default::default()
+            },
+            skill_metadata: vec![CharacterSkillMetadata {
+                args: vec![crate::napcat::SkillPoolArg {
+                    name: "力量".to_owned(),
+                    kind: "数字".to_owned(),
+                    value: "3".to_owned(),
+                }],
+                legacy_has_buff_machine: true,
+                legacy_buff_machine_json: Some(
+                    r#"{"buffMachine":{"被动":[{"name":"强壮","prior":1,"effect":["str","DMGModify"],"type":1,"benifit":true,"value":["力量","25%"]}]}}"#
+                        .to_owned(),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        update_character_from_status_with_config(&mut character, &config);
+        let base_max_hp = character.max_hp;
+
+        sync_character_buffs(
+            "caster",
+            &mut character,
+            &config,
+            &mut rule_engine_state,
+            &[],
+        );
+
+        assert!(character.active_buffs.is_empty());
+        assert_eq!(character.extra_status.str_, 3);
+        assert_eq!(
+            character
+                .buff_base_stats
+                .as_ref()
+                .unwrap()
+                .extra_status
+                .str_,
+            0
+        );
+        assert!((character.damage_dealt_modifier - 1.25).abs() < 0.0001);
+        assert!((character.max_hp - (base_max_hp + config.str_max_hp * 3.0)).abs() < 0.0001);
+        assert_eq!(
+            rule_engine_state.active_buff_names("caster"),
+            vec!["强壮".to_owned()]
+        );
+
+        character.skill_metadata.clear();
+        sync_character_buffs(
+            "caster",
+            &mut character,
+            &config,
+            &mut rule_engine_state,
+            &[],
+        );
+
+        assert!(character.buff_base_stats.is_none());
+        assert_eq!(character.extra_status.str_, 0);
+        assert!((character.max_hp - base_max_hp).abs() < 0.0001);
+        assert!((character.damage_dealt_modifier - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn moonberry_passive_talents_apply_to_effective_character_stats() {
+        let config = TrpgBasicConfig::default();
+        let mut rule_engine_state = RuleEngineState::default();
+        let mut character = PlayerCharacter {
+            level: 1,
+            status: CharacterStatus {
+                k: 3,
+                int_: 5,
+                wis: 4,
+                ..Default::default()
+            },
+            skill_names: vec![
+                "大魔法师".to_owned(),
+                "矢量压缩能量池".to_owned(),
+                "狡黠之思".to_owned(),
+                "人类基因工程".to_owned(),
+                "抗魔体质".to_owned(),
+            ],
+            skill_metadata: vec![
+                CharacterSkillMetadata::talent("normal_talent", "天赋"),
+                CharacterSkillMetadata::talent("support_talent", "辅助天赋"),
+                CharacterSkillMetadata::talent("support_talent", "辅助天赋"),
+                CharacterSkillMetadata::talent("normal_talent", "天赋"),
+                CharacterSkillMetadata::talent("support_talent", "辅助天赋"),
+            ],
+            ..Default::default()
+        };
+        update_character_from_status_with_config(&mut character, &config);
+        let base_max_hp = character.max_hp;
+        let base_max_mp = character.max_mp;
+        let base_mp_regen = character.mp_regen;
+
+        sync_character_buffs(
+            "caster",
+            &mut character,
+            &config,
+            &mut rule_engine_state,
+            &[],
+        );
+
+        assert!((character.max_hp - base_max_hp * 1.05).abs() < 0.0001);
+        assert!((character.max_mp - (base_max_mp + 19.0)).abs() < 0.0001);
+        assert!((character.mp_regen - (base_mp_regen + 4.0)).abs() < 0.0001);
+        let expected_healing_modifier =
+            (1.0 + 5.0 * config.int_heal_bonus + 4.0 * config.wis_heal_bonus) * 1.03;
+        assert!((character.healing_dealt_modifier - expected_healing_modifier).abs() < 0.0001);
+        let synced = rule_engine_state.character("caster").unwrap();
+        assert!((synced.magical_damage_taken_modifier - 0.9).abs() < 0.0001);
+        assert!((synced.diseased_damage_taken_modifier - 0.85).abs() < 0.0001);
+        assert!((synced.poisoning_damage_taken_modifier - 0.85).abs() < 0.0001);
+        assert_eq!(
+            character.buff_base_stats.as_ref().unwrap().max_mp,
+            base_max_mp
+        );
+        let mut active_names = rule_engine_state.active_buff_names("caster");
+        active_names.sort();
+        assert_eq!(active_names, vec![
+            "人类基因工程".to_owned(),
+            "大魔法师".to_owned(),
+            "狡黠之思".to_owned(),
+            "矢量压缩能量池".to_owned(),
+        ]);
+
+        character.skill_names.clear();
+        character.skill_metadata.clear();
+        sync_character_buffs(
+            "caster",
+            &mut character,
+            &config,
+            &mut rule_engine_state,
+            &[],
+        );
+
+        assert!(character.buff_base_stats.is_none());
+        assert!((character.max_hp - base_max_hp).abs() < 0.0001);
+        assert!((character.max_mp - base_max_mp).abs() < 0.0001);
+        assert!((character.mp_regen - base_mp_regen).abs() < 0.0001);
+        assert!((character.healing_dealt_modifier - 1.0).abs() < 0.0001);
+        let synced = rule_engine_state.character("caster").unwrap();
+        assert!((synced.magical_damage_taken_modifier - 1.0).abs() < f32::EPSILON);
+        assert!((synced.diseased_damage_taken_modifier - 1.0).abs() < f32::EPSILON);
+        assert!((synced.poisoning_damage_taken_modifier - 1.0).abs() < f32::EPSILON);
+        assert!(rule_engine_state.active_buff_names("caster").is_empty());
+    }
+
+    #[test]
+    fn legacy_granted_buff_pool_syncs_to_rule_engine() {
+        let config = TrpgBasicConfig::default();
+        let mut rule_engine_state = RuleEngineState::default();
+        let skill_pool = vec![SkillPoolEntry {
+            name: "护盾池".to_owned(),
+            legacy_pool_id: Some("shield-pool".to_owned()),
+            args: vec![crate::napcat::SkillPoolArg {
+                name: "护盾值".to_owned(),
+                kind: "数字".to_owned(),
+                value: "0.1".to_owned(),
+            }],
+            legacy_event_buff_json: Some(
+                r#"[{"event":"技能释放","buffs":[{"name":"护盾","prior":2,"life":1,"effect":["tDMGModify"],"type":0,"from":"技能目标","benifit":true,"value":["护盾值"]}]}]"#
+                    .to_owned(),
+            ),
+            ..Default::default()
+        }];
+        let caster = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            skill_names: vec!["给予护盾".to_owned()],
+            skill_notes: vec![String::new()],
+            skill_metadata: vec![CharacterSkillMetadata {
+                args: vec![
+                    crate::napcat::SkillPoolArg {
+                        name: "护盾池".to_owned(),
+                        kind: "BUFF".to_owned(),
+                        value: "shield-pool".to_owned(),
+                    },
+                    crate::napcat::SkillPoolArg {
+                        name: "减伤".to_owned(),
+                        kind: "数字".to_owned(),
+                        value: "0.25".to_owned(),
+                    },
+                ],
+                legacy_has_buff_machine: true,
+                legacy_buff_machine_json: Some(
+                    r#"{"eventBuffs":[{"event":"技能释放","buffs":[{"name":"给予护盾","life":3,"effect":["给予BUFF"],"type":0,"from":"技能目标","benifit":true,"value":["护盾池","减伤"]}]}]}"#
+                        .to_owned(),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let target = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            ..Default::default()
+        };
+
+        sync_character_skill_rules(
+            "caster",
+            &caster,
+            &config,
+            &mut rule_engine_state,
+            &skill_pool,
+        );
+        sync_character_skill_rules(
+            "target",
+            &target,
+            &config,
+            &mut rule_engine_state,
+            &skill_pool,
+        );
+        rule_engine_state.cast_skill("caster", vec!["target".to_owned()]);
+
+        assert_eq!(
+            rule_engine_state.active_buff_names("target"),
+            vec!["护盾".to_owned()]
+        );
+        let effective = rule_engine_state.character("target").unwrap();
+        assert!((effective.damage_taken_modifier - 1.25).abs() < 0.0001);
+    }
+
+    #[test]
+    fn quick_cast_legacy_granted_buff_pool_ticks_damage_on_turn_advance() {
+        let mut manager = empty_manager();
+        manager.skill_pool.push(SkillPoolEntry {
+            name: "燃烧池".to_owned(),
+            legacy_pool_id: Some("burn-pool".to_owned()),
+            args: vec![crate::napcat::SkillPoolArg {
+                name: "伤害值".to_owned(),
+                kind: "数字".to_owned(),
+                value: "1".to_owned(),
+            }],
+            legacy_event_buff_json: Some(
+                r#"[{"event":"技能释放","buffs":[{"name":"燃烧伤害","effect":["伤害"],"from":"技能目标","value":["伤害值"]}]}]"#
+                    .to_owned(),
+            ),
+            ..Default::default()
+        });
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                skill_names: vec!["点燃".to_owned()],
+                skill_notes: vec![String::new()],
+                skill_metadata: vec![CharacterSkillMetadata {
+                    args: vec![
+                        crate::napcat::SkillPoolArg {
+                            name: "燃烧池".to_owned(),
+                            kind: "BUFF".to_owned(),
+                            value: "burn-pool".to_owned(),
+                        },
+                        crate::napcat::SkillPoolArg {
+                            name: "伤害值".to_owned(),
+                            kind: "数字".to_owned(),
+                            value: "3".to_owned(),
+                        },
+                    ],
+                    legacy_has_buff_machine: true,
+                    legacy_buff_machine_json: Some(
+                        r#"{"eventBuffs":[{"event":"技能释放","buffs":[{"name":"燃烧","life":2,"effect":["给予BUFF"],"type":0,"from":"技能目标","benifit":false,"value":["燃烧池","伤害值"]}]}]}"#
+                            .to_owned(),
+                    ),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["caster".to_owned(), "target".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("party".to_owned());
+        let skill = {
+            let caster = manager.player_characters.get_mut("caster").unwrap();
+            quick_cast_skills(caster).remove(0)
+        };
+        let effect = quick_cast_effect(
+            &skill.note,
+            &skill.arg_values,
+            skill.skill_type.as_deref(),
+            skill.legacy_buff_machine_json.as_deref(),
+            &manager.skill_pool,
+        );
+        let Some(QuickCastEffect::GrantBuff { buff, .. }) = effect.as_ref() else {
+            panic!("expected legacy granted buff quick-cast effect");
+        };
+        assert_eq!(buff.tick_actions, vec![
+            BuffTickAction::Damage {
+                amount: 3.0,
+                damage_type: DamageType::Magical,
+            }
+        ]);
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect,
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        let target = &manager.player_characters["target"];
+        assert_eq!(target.active_buffs.len(), 1);
+        assert_eq!(
+            target.active_buffs[0].tick_actions,
+            vec![BuffTickAction::Damage {
+                amount: 3.0,
+                damage_type: DamageType::Magical,
+            }]
+        );
+
+        let mut rule_engine_state = RuleEngineState::default();
+        assert!(advance_group_world_turn(
+            &mut manager,
+            "party",
+            &mut rule_engine_state
+        ));
+        let target = &manager.player_characters["target"];
+        assert_eq!(target.hp, 7.0);
+        assert_eq!(target.damage_taken_this_turn, 3.0);
+        assert_eq!(
+            target.active_buffs[0].turns_remaining,
+            1
+        );
+        assert_eq!(
+            target.buff_base_stats.as_ref().unwrap().hp,
+            7.0
+        );
+
+        assert!(advance_group_world_turn(
+            &mut manager,
+            "party",
+            &mut rule_engine_state
+        ));
+        let target = &manager.player_characters["target"];
+        assert_eq!(target.hp, 7.0);
+        assert_eq!(target.damage_taken_this_turn, 0.0);
+        assert!(target.active_buffs.is_empty());
+        assert!(target.buff_base_stats.is_none());
+    }
+
+    #[test]
+    fn healing_buff_tick_applies_mutual_aid_feedback_talent() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 20.0,
+                skill_names: vec!["互帮互助".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 0.0,
+                max_hp: 20.0,
+                skill_names: vec!["互帮互助".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
+                ..Default::default()
+            });
+
+        assert!(apply_character_buff_ticks(
+            &mut manager,
+            &[CharacterBuffTick {
+                source_id: "caster".to_owned(),
+                target_id: "target".to_owned(),
+                action: BuffTickAction::Heal { amount: 4.0 },
+            }]
+        ));
+
+        let caster = &manager.player_characters["caster"];
+        assert!((caster.hp - 14.0).abs() < 0.0001);
+        assert!((caster.healing_taken_this_turn - 4.0).abs() < 0.0001);
+        let target = &manager.player_characters["target"];
+        assert!((target.hp - 4.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
     fn quick_cast_skills_exclude_unapproved_entries() {
         let mut character = PlayerCharacter {
             skill_names: vec!["已批准".to_owned(), "待批准".to_owned()],
@@ -7897,6 +13179,7 @@ mod tests {
 
         let skills = quick_cast_skills(&mut character);
 
+        assert_eq!(pending_gm_skill_count(&character), 1);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "已批准");
     }
@@ -7934,8 +13217,15 @@ mod tests {
             index: 0,
             name: "旋风斩".to_owned(),
             note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
             mp_cost: 0.0,
             cooldown_turns: 2,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
         };
         let effect = QuickCastEffect::Damage {
             amount: 1.0,
@@ -7943,6 +13233,7 @@ mod tests {
                 actor: ActorRef::Target,
                 area: None,
             },
+            damage_type: DamageType::Physical,
         };
 
         assert_eq!(
@@ -7955,14 +13246,14 @@ mod tests {
                 caster_id: "caster".to_owned(),
                 skill: skill.clone(),
                 targets: vec!["target".to_owned()],
-                effect: Some(effect),
+                effect: Some(effect.clone()),
                 cast_turn: 0,
                 force: false,
             },
         ));
         let caster = &manager.player_characters["caster"];
         assert_eq!(
-            quick_skill_cooldown_remaining(caster, 0, 2, 0),
+            quick_skill_cooldown_remaining(caster, 0, 2, None, 0),
             2
         );
 
@@ -7972,7 +13263,7 @@ mod tests {
                 caster_id: "caster".to_owned(),
                 skill: skill.clone(),
                 targets: vec!["target".to_owned()],
-                effect: Some(effect),
+                effect: Some(effect.clone()),
                 cast_turn: 0,
                 force: false,
             },
@@ -7998,5 +13289,1411 @@ mod tests {
                 force: false,
             },
         ));
+    }
+
+    #[test]
+    fn quick_cast_blocks_imported_cooldown_left() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                skill_names: vec!["护盾".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata {
+                    cooldown_left: Some(2),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        let skill = {
+            let caster = manager.player_characters.get_mut("caster").unwrap();
+            quick_cast_skills(caster).remove(0)
+        };
+        assert_eq!(skill.cooldown_left, Some(2));
+
+        assert!(!apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 1.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["target"].hp,
+            10.0
+        );
+    }
+
+    #[test]
+    fn quick_cast_limits_targets_by_metadata_target_count() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("first".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("second".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "范围测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: Some(1),
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["first".to_owned(), "second".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 1.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["first"].hp,
+            9.0
+        );
+        assert_eq!(
+            manager.player_characters["second"].hp,
+            10.0
+        );
+    }
+
+    #[test]
+    fn quick_cast_no_target_class_blocks_targets() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "无目标测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: Some(1),
+            target_class: Some("无目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 1.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["target"].hp,
+            10.0
+        );
+    }
+
+    #[test]
+    fn quick_cast_uses_numeric_skill_args_in_amounts() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                skill_names: vec!["变量伤害".to_owned()],
+                skill_notes: vec!["主动使用对目标造成伤害值点物理伤害".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata {
+                    args: vec![crate::napcat::SkillPoolArg {
+                        name: "伤害值".to_owned(),
+                        kind: "数字".to_owned(),
+                        value: "3".to_owned(),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        let skill = {
+            let caster = manager.player_characters.get_mut("caster").unwrap();
+            quick_cast_skills(caster).remove(0)
+        };
+        let effect = quick_cast_effect(
+            &skill.note,
+            &skill.arg_values,
+            skill.skill_type.as_deref(),
+            None,
+            &[],
+        );
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect,
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["target"].hp,
+            7.0
+        );
+    }
+
+    #[test]
+    fn quick_cast_uses_legacy_buff_machine_damage_when_note_unparsed() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                skill_names: vec!["旧蓝图伤害".to_owned()],
+                skill_notes: vec!["旧月莓图形技能".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata {
+                    skill_type: Some("远程".to_owned()),
+                    args: vec![crate::napcat::SkillPoolArg {
+                        name: "伤害值".to_owned(),
+                        kind: "数字".to_owned(),
+                        value: "4".to_owned(),
+                    }],
+                    legacy_has_buff_machine: true,
+                    legacy_buff_machine_json: Some(
+                        r#"{"技能释放":[{"name":"火球","effect":["伤害"],"type":7,"from":"技能目标","value":["伤害值"]}]}"#
+                            .to_owned(),
+                    ),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        let skill = {
+            let caster = manager.player_characters.get_mut("caster").unwrap();
+            quick_cast_skills(caster).remove(0)
+        };
+        let effect = quick_cast_effect(
+            &skill.note,
+            &skill.arg_values,
+            skill.skill_type.as_deref(),
+            skill.legacy_buff_machine_json.as_deref(),
+            &[],
+        );
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect,
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["target"].hp,
+            6.0
+        );
+    }
+
+    #[test]
+    fn quick_cast_uses_text_skill_args_in_rule_text() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                status: CharacterStatus {
+                    dex: 4,
+                    ..Default::default()
+                },
+                skill_names: vec!["变量类型".to_owned()],
+                skill_notes: vec!["主动使用对目标造成2点伤害类型伤害".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata {
+                    args: vec![crate::napcat::SkillPoolArg {
+                        name: "伤害类型".to_owned(),
+                        kind: "字符串".to_owned(),
+                        value: "远程".to_owned(),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["caster".to_owned(), "target".to_owned()],
+            basic_config: TrpgBasicConfig {
+                dex_range_damage_bonus: 0.5,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("party".to_owned());
+        let skill = {
+            let caster = manager.player_characters.get_mut("caster").unwrap();
+            quick_cast_skills(caster).remove(0)
+        };
+        let effect = quick_cast_effect(
+            &skill.note,
+            &skill.arg_values,
+            skill.skill_type.as_deref(),
+            None,
+            &[],
+        );
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect,
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["target"].hp,
+            4.0
+        );
+    }
+
+    #[test]
+    fn quick_cast_uses_skill_type_as_default_damage_type() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                status: CharacterStatus {
+                    dex: 4,
+                    ..Default::default()
+                },
+                skill_names: vec!["远程伤害".to_owned()],
+                skill_notes: vec!["主动使用对目标造成2点伤害".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata {
+                    skill_type: Some("远程".to_owned()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["caster".to_owned(), "target".to_owned()],
+            basic_config: TrpgBasicConfig {
+                dex_range_damage_bonus: 0.5,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("party".to_owned());
+        let skill = {
+            let caster = manager.player_characters.get_mut("caster").unwrap();
+            quick_cast_skills(caster).remove(0)
+        };
+        let effect = quick_cast_effect(
+            &skill.note,
+            &skill.arg_values,
+            skill.skill_type.as_deref(),
+            None,
+            &[],
+        );
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect,
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["target"].hp,
+            4.0
+        );
+    }
+
+    #[test]
+    fn quick_cast_range_damage_uses_converter_magic_bonus_talent() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                status: CharacterStatus {
+                    dex: 4,
+                    int_: 5,
+                    ..Default::default()
+                },
+                skill_names: vec!["远程伤害".to_owned(), "数魔转换器".to_owned()],
+                skill_notes: vec!["主动使用对目标造成2点伤害".to_owned(), String::new()],
+                skill_metadata: vec![
+                    CharacterSkillMetadata {
+                        skill_type: Some("远程".to_owned()),
+                        ..Default::default()
+                    },
+                    CharacterSkillMetadata::talent("normal_talent", "天赋"),
+                ],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["caster".to_owned(), "target".to_owned()],
+            basic_config: TrpgBasicConfig {
+                dex_range_damage_bonus: 0.5,
+                int_damage_bonus: 0.2,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("party".to_owned());
+        let skill = {
+            let caster = manager.player_characters.get_mut("caster").unwrap();
+            quick_cast_skills(caster).remove(0)
+        };
+        let effect = quick_cast_effect(
+            &skill.note,
+            &skill.arg_values,
+            skill.skill_type.as_deref(),
+            None,
+            &[],
+        );
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect,
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["target"].hp,
+            2.0
+        );
+    }
+
+    #[test]
+    fn quick_cast_targets_use_metadata_range_when_area_omits_radius() {
+        let effect = QuickCastEffect::Damage {
+            amount: 1.0,
+            target: TargetSelector {
+                actor: ActorRef::Target,
+                area: Some(crate::rule_engine::AreaSelector {
+                    radius_meters: None,
+                }),
+            },
+            damage_type: DamageType::Physical,
+        };
+        let character_targets = vec![
+            ("1".to_owned(), "施法者".to_owned()),
+            ("near".to_owned(), "近处".to_owned()),
+            ("far".to_owned(), "远处".to_owned()),
+        ];
+        let scene_positions = SceneCharacterPositions {
+            positions: HashMap::from([
+                (
+                    "near".to_owned(),
+                    Vec3::new(2.9, 0.0, 0.0),
+                ),
+                (
+                    "far".to_owned(),
+                    Vec3::new(3.1, 0.0, 0.0),
+                ),
+            ]),
+        };
+        let camera_positions = ScenePlayerCameraPositions {
+            positions: HashMap::from([(1, Vec3::ZERO)]),
+        };
+
+        let targets = quick_cast_targets(
+            "1",
+            &effect,
+            &character_targets,
+            Some(&scene_positions),
+            Some(&camera_positions),
+            skill_range_radius(Some(3)),
+            None,
+        );
+
+        assert_eq!(targets, vec!["near".to_owned()]);
+        assert_eq!(
+            quick_cast_radius(&effect, Some(3.0)),
+            Some(3.0)
+        );
+    }
+
+    #[test]
+    fn quick_cast_single_target_respects_metadata_range() {
+        let effect = QuickCastEffect::Damage {
+            amount: 1.0,
+            target: TargetSelector {
+                actor: ActorRef::Target,
+                area: None,
+            },
+            damage_type: DamageType::Physical,
+        };
+        let character_targets = vec![
+            ("1".to_owned(), "施法者".to_owned()),
+            ("far".to_owned(), "远处".to_owned()),
+        ];
+        let scene_positions = SceneCharacterPositions {
+            positions: HashMap::from([(
+                "far".to_owned(),
+                Vec3::new(3.1, 0.0, 0.0),
+            )]),
+        };
+        let camera_positions = ScenePlayerCameraPositions {
+            positions: HashMap::from([(1, Vec3::ZERO)]),
+        };
+
+        let targets = quick_cast_targets(
+            "1",
+            &effect,
+            &character_targets,
+            Some(&scene_positions),
+            Some(&camera_positions),
+            skill_range_radius(Some(3)),
+            None,
+        );
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn quick_cast_range_damage_uses_tex30_minimum_range_talent() {
+        let caster = PlayerCharacter {
+            level: 2,
+            skill_names: vec!["瞄准镜Tex-30".to_owned()],
+            skill_metadata: vec![CharacterSkillMetadata::talent("normal_talent", "天赋")],
+            ..Default::default()
+        };
+        let effect = QuickCastEffect::Damage {
+            amount: 1.0,
+            target: TargetSelector {
+                actor: ActorRef::Target,
+                area: None,
+            },
+            damage_type: DamageType::Range,
+        };
+        let character_targets = vec![
+            ("1".to_owned(), "施法者".to_owned()),
+            ("far".to_owned(), "远处".to_owned()),
+        ];
+        let scene_positions = SceneCharacterPositions {
+            positions: HashMap::from([(
+                "far".to_owned(),
+                Vec3::new(20.0, 0.0, 0.0),
+            )]),
+        };
+        let camera_positions = ScenePlayerCameraPositions {
+            positions: HashMap::from([(1, Vec3::ZERO)]),
+        };
+
+        let fallback_radius = quick_cast_skill_range_radius(&caster, &effect, Some(3));
+        assert_eq!(fallback_radius, Some(30.0));
+        let targets = quick_cast_targets(
+            "1",
+            &effect,
+            &character_targets,
+            Some(&scene_positions),
+            Some(&camera_positions),
+            fallback_radius,
+            None,
+        );
+        assert_eq!(targets, vec!["far".to_owned()]);
+
+        let physical_effect = QuickCastEffect::Damage {
+            amount: 1.0,
+            target: TargetSelector {
+                actor: ActorRef::Target,
+                area: None,
+            },
+            damage_type: DamageType::Physical,
+        };
+        assert_eq!(
+            quick_cast_skill_range_radius(&caster, &physical_effect, Some(3)),
+            Some(3.0)
+        );
+        let targets = quick_cast_targets(
+            "1",
+            &physical_effect,
+            &character_targets,
+            Some(&scene_positions),
+            Some(&camera_positions),
+            quick_cast_skill_range_radius(&caster, &physical_effect, Some(3)),
+            None,
+        );
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn quick_cast_range_target_class_expands_single_target_rule() {
+        let effect = QuickCastEffect::Damage {
+            amount: 1.0,
+            target: TargetSelector {
+                actor: ActorRef::Target,
+                area: None,
+            },
+            damage_type: DamageType::Physical,
+        };
+        let character_targets = vec![
+            ("1".to_owned(), "施法者".to_owned()),
+            ("near".to_owned(), "近处".to_owned()),
+            ("far".to_owned(), "远处".to_owned()),
+        ];
+        let scene_positions = SceneCharacterPositions {
+            positions: HashMap::from([
+                (
+                    "near".to_owned(),
+                    Vec3::new(2.9, 0.0, 0.0),
+                ),
+                (
+                    "far".to_owned(),
+                    Vec3::new(3.1, 0.0, 0.0),
+                ),
+            ]),
+        };
+        let camera_positions = ScenePlayerCameraPositions {
+            positions: HashMap::from([(1, Vec3::ZERO)]),
+        };
+
+        let targets = quick_cast_targets(
+            "1",
+            &effect,
+            &character_targets,
+            Some(&scene_positions),
+            Some(&camera_positions),
+            skill_range_radius(Some(3)),
+            Some("范围"),
+        );
+
+        assert_eq!(targets, vec!["near".to_owned()]);
+    }
+
+    #[test]
+    fn quick_cast_applies_group_attribute_and_combat_modifiers() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                status: CharacterStatus {
+                    str_: 4,
+                    agi: 51,
+                    dex: 3,
+                    int_: 5,
+                    wis: 2,
+                    ..Default::default()
+                },
+                damage_dealt_modifier: 2.0,
+                healing_dealt_modifier: 2.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                damage_taken_modifier: 0.5,
+                healing_taken_modifier: 0.5,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["caster".to_owned(), "target".to_owned()],
+            basic_config: TrpgBasicConfig {
+                str_damage_bonus: 0.25,
+                agi_damage_bonus: 0.5,
+                dex_damage_bonus: 0.1,
+                int_heal_bonus: 0.1,
+                wis_heal_bonus: 0.2,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("party".to_owned());
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill: skill.clone(),
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 2.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert!((manager.player_characters["target"].hp - 14.4).abs() < 0.0001);
+        assert!((manager.player_characters["target"].damage_taken_this_turn - 5.6).abs() < 0.0001);
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Heal {
+                    amount: 1.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert!((manager.player_characters["target"].hp - 16.3).abs() < 0.0001);
+        assert!((manager.player_characters["target"].healing_taken_this_turn - 1.9).abs() < 0.0001);
+    }
+
+    #[test]
+    fn quick_cast_applies_typed_damage_taken_talents() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                skill_names: vec!["人类基因工程".to_owned(), "抗魔体质".to_owned()],
+                skill_metadata: vec![
+                    CharacterSkillMetadata::talent("normal_talent", "天赋"),
+                    CharacterSkillMetadata::talent("support_talent", "辅助天赋"),
+                ],
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill: skill.clone(),
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 10.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Diseased,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert!((manager.player_characters["target"].hp - 11.5).abs() < 0.0001);
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 10.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Magical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert!((manager.player_characters["target"].hp - 2.5).abs() < 0.0001);
+        assert!((manager.player_characters["target"].damage_taken_this_turn - 17.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn quick_cast_applies_wound_talent_healing_taken_debuff() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                skill_names: vec!["溃伤".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("normal_talent", "天赋")],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 5.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+
+        let target = &manager.player_characters["target"];
+        assert!((target.hp - 15.0).abs() < 0.0001);
+        assert_eq!(target.active_buffs.len(), 1);
+        assert_eq!(target.active_buffs[0].name, "溃伤");
+        assert_eq!(
+            target.active_buffs[0].turns_remaining,
+            1
+        );
+
+        let mut rule_engine_state = RuleEngineState::default();
+        let config = TrpgBasicConfig::default();
+        let target = manager.player_characters.get_mut("target").unwrap();
+        sync_character_buffs(
+            "target",
+            target,
+            &config,
+            &mut rule_engine_state,
+            &[],
+        );
+        assert!((target.healing_taken_modifier - 0.75).abs() < 0.0001);
+    }
+
+    #[test]
+    fn quick_cast_physical_damage_applies_lifesteal_talent() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 9.0,
+                max_hp: 10.0,
+                skill_names: vec!["禅宗古训".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("normal_talent", "天赋")],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 4.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+
+        let caster = &manager.player_characters["caster"];
+        assert!((caster.hp - 9.6).abs() < 0.0001);
+        assert!((caster.healing_taken_this_turn - 0.6).abs() < 0.0001);
+        let target = &manager.player_characters["target"];
+        assert!((target.hp - 16.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn quick_cast_applies_large_hit_damage_reduction_talent() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                skill_names: vec!["过度免疫".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 5.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+
+        let target = &manager.player_characters["target"];
+        assert!((target.hp - 16.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn quick_cast_applies_minimum_damage_floor_talent() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                level: 4,
+                skill_names: vec!["菜鸡猛啄".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("normal_talent", "天赋")],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                damage_taken_modifier: 0.1,
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 2.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+
+        let target = &manager.player_characters["target"];
+        assert!((target.hp - 16.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn quick_cast_applies_dying_target_healing_talent() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 4.0,
+                max_hp: 20.0,
+                skill_names: vec!["生死时速".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "测试治疗".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Heal {
+                    amount: 4.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+
+        let target = &manager.player_characters["target"];
+        assert!((target.hp - 10.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 6.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn quick_cast_applies_wounded_healing_dealt_talent() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 16.0,
+                max_hp: 20.0,
+                skill_names: vec!["火源之力".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 0.0,
+                max_hp: 30.0,
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "测试治疗".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Heal {
+                    amount: 10.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+
+        let target = &manager.player_characters["target"];
+        assert!((target.hp - 12.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 12.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn quick_cast_applies_mutual_aid_healing_feedback_talent() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 20.0,
+                skill_names: vec!["互帮互助".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 0.0,
+                max_hp: 20.0,
+                skill_names: vec!["互帮互助".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "互助治疗".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Heal {
+                    amount: 4.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+
+        let caster = &manager.player_characters["caster"];
+        assert!((caster.hp - 14.0).abs() < 0.0001);
+        assert!((caster.healing_taken_this_turn - 4.0).abs() < 0.0001);
+        let target = &manager.player_characters["target"];
+        assert!((target.hp - 4.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn group_world_turn_resets_character_turn_totals() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                damage_taken_this_turn: 6.0,
+                healing_taken_this_turn: 2.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["target".to_owned()],
+            ..Default::default()
+        });
+        let mut rule_engine_state = RuleEngineState::default();
+
+        assert!(advance_group_world_turn(
+            &mut manager,
+            "party",
+            &mut rule_engine_state
+        ));
+
+        let target = &manager.player_characters["target"];
+        assert_eq!(target.damage_taken_this_turn, 0.0);
+        assert_eq!(target.healing_taken_this_turn, 0.0);
+    }
+
+    #[test]
+    fn quick_cast_applies_low_hp_damage_penalty() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 5.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 4.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["target"].hp,
+            17.0
+        );
     }
 }

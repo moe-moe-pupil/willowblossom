@@ -1,6 +1,7 @@
 mod battle_round;
 mod camera;
 mod deepseek;
+mod moonberry_talents;
 mod napcat;
 pub mod planet;
 pub mod rule_engine;
