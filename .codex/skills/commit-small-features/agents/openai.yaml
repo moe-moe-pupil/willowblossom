@@ -1,0 +1,4 @@
+interface:
+  display_name: "Commit Small Features"
+  short_description: "Commit each completed small feature safely"
+  default_prompt: "Use $commit-small-features to implement the requested small feature, validate it, and create a focused Git commit containing only that feature."
