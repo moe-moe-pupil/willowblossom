@@ -10,6 +10,7 @@ use bevy_egui::{
     EguiContexts,
     EguiPrimaryContextPass,
 };
+use rand::RngExt;
 use serde::{
     Deserialize,
     Serialize,
@@ -91,7 +92,7 @@ pub enum ValueExpr {
     EventDamage,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DamageType {
     Cursed,
@@ -1013,6 +1014,7 @@ fn legacy_buff_field(effect: &str) -> Option<BuffField> {
         "maxMP" => Some(BuffField::MaxMp),
         "hpReg" => Some(BuffField::HpRegen),
         "mpReg" => Some(BuffField::MpRegen),
+        "speed" => Some(BuffField::Speed),
         "str" => Some(BuffField::Status(StatusKey::Str)),
         "agi" => Some(BuffField::Status(StatusKey::Agi)),
         "dex" => Some(BuffField::Status(StatusKey::Dex)),
@@ -1241,13 +1243,16 @@ pub struct Character {
     pub max_mp: f32,
     pub hp_regen: f32,
     pub mp_regen: f32,
+    pub speed: f32,
     pub status: StatusBlock,
     pub damage_dealt_modifier: f32,
     pub physical_damage_dealt_modifier: f32,
     pub magical_damage_dealt_modifier: f32,
     pub range_damage_dealt_modifier: f32,
     pub physical_damage_lifesteal: f32,
+    pub physical_damage_followup_rate: f32,
     pub minimum_damage_floor: f32,
+    pub chaos_output_variance: f32,
     pub damage_taken_modifier: f32,
     pub large_hit_damage_taken_modifier: f32,
     pub magical_damage_taken_modifier: f32,
@@ -1273,6 +1278,7 @@ pub struct Combatant {
     pub max_mp: f32,
     pub hp_regen: f32,
     pub mp_regen: f32,
+    pub speed: f32,
 }
 
 #[derive(Component, Debug, Clone, Default, PartialEq)]
@@ -1372,6 +1378,10 @@ pub enum BuffTickAction {
         amount: f32,
         damage_type: DamageType,
     },
+    FixedDamage {
+        amount: f32,
+        damage_type: DamageType,
+    },
     Heal {
         amount: f32,
     },
@@ -1385,6 +1395,7 @@ pub enum BuffField {
     MaxMp,
     HpRegen,
     MpRegen,
+    Speed,
     Status(StatusKey),
     DamageDealtModifier,
     DamageTakenModifier,
@@ -1503,13 +1514,16 @@ impl RuleEngineState {
         max_mp: f32,
         hp_regen: f32,
         mp_regen: f32,
+        speed: f32,
         status: StatusBlock,
         damage_dealt_modifier: f32,
         physical_damage_dealt_modifier: f32,
         magical_damage_dealt_modifier: f32,
         range_damage_dealt_modifier: f32,
         physical_damage_lifesteal: f32,
+        physical_damage_followup_rate: f32,
         minimum_damage_floor: f32,
+        chaos_output_variance: f32,
         damage_taken_modifier: f32,
         large_hit_damage_taken_modifier: f32,
         magical_damage_taken_modifier: f32,
@@ -1529,13 +1543,16 @@ impl RuleEngineState {
         character.mp = mp.clamp(0.0, character.max_mp);
         character.hp_regen = hp_regen;
         character.mp_regen = mp_regen;
+        character.speed = speed.max(0.0);
         character.status = status;
         character.damage_dealt_modifier = damage_dealt_modifier;
         character.physical_damage_dealt_modifier = physical_damage_dealt_modifier;
         character.magical_damage_dealt_modifier = magical_damage_dealt_modifier;
         character.range_damage_dealt_modifier = range_damage_dealt_modifier;
         character.physical_damage_lifesteal = physical_damage_lifesteal.max(0.0);
+        character.physical_damage_followup_rate = physical_damage_followup_rate.max(0.0);
         character.minimum_damage_floor = minimum_damage_floor.max(0.0);
+        character.chaos_output_variance = chaos_output_variance.clamp(0.0, 1.0);
         character.damage_taken_modifier = damage_taken_modifier;
         character.large_hit_damage_taken_modifier = large_hit_damage_taken_modifier.max(0.0);
         character.magical_damage_taken_modifier = magical_damage_taken_modifier;
@@ -1579,13 +1596,16 @@ impl Character {
             max_mp: 0.0,
             hp_regen: 0.0,
             mp_regen: 0.0,
+            speed: 0.0,
             status: StatusBlock::default(),
             damage_dealt_modifier: 1.0,
             physical_damage_dealt_modifier: 1.0,
             magical_damage_dealt_modifier: 1.0,
             range_damage_dealt_modifier: 1.0,
             physical_damage_lifesteal: 0.0,
+            physical_damage_followup_rate: 0.0,
             minimum_damage_floor: 0.0,
+            chaos_output_variance: 0.0,
             damage_taken_modifier: 1.0,
             large_hit_damage_taken_modifier: 1.0,
             magical_damage_taken_modifier: 1.0,
@@ -1837,6 +1857,7 @@ impl RuleEngine {
             max_mp: character.max_mp,
             hp_regen: character.hp_regen,
             mp_regen: character.mp_regen,
+            speed: character.speed,
         };
         let status = character.status.clone();
         let modifiers = CombatModifiers {
@@ -2074,6 +2095,7 @@ impl RuleEngine {
             character.max_mp = combatant.max_mp;
             character.hp_regen = combatant.hp_regen;
             character.mp_regen = combatant.mp_regen;
+            character.speed = combatant.speed;
             character.status = status;
             character.damage_dealt_modifier = modifiers.damage_dealt;
             character.physical_damage_dealt_modifier = modifiers.physical_damage_dealt;
@@ -2102,6 +2124,7 @@ impl RuleEngine {
                 character.damage_dealt_modifier
                     * character.damage_type_modifier(damage_type)
                     * character.low_hp_damage_multiplier()
+                    * chaos_output_multiplier(character.chaos_output_variance)
             })
             .unwrap_or(1.0);
         let target_modifier = self
@@ -2143,6 +2166,15 @@ impl RuleEngine {
         } else {
             0.0
         };
+        let source_physical_damage_followup_rate = if damage_type == DamageType::Physical {
+            self.characters
+                .get(source_id)
+                .map(|character| character.physical_damage_followup_rate)
+                .unwrap_or(0.0)
+                .max(0.0)
+        } else {
+            0.0
+        };
 
         let mut hp_update = None;
         if let Some(target) = self.characters.get_mut(target_id) {
@@ -2163,6 +2195,15 @@ impl RuleEngine {
         if final_damage > f32::EPSILON {
             for buff in damage_dealt_buffs {
                 self.give_or_replace_named_buff(target_id, buff);
+            }
+            if source_physical_damage_followup_rate > f32::EPSILON {
+                self.give_buff(
+                    target_id,
+                    sousas_claw_followup_buff(
+                        source_id,
+                        final_damage * source_physical_damage_followup_rate,
+                    ),
+                );
             }
         }
         if typed_final_damage > f32::EPSILON && source_physical_damage_lifesteal > f32::EPSILON {
@@ -2200,12 +2241,54 @@ impl RuleEngine {
         self.resolve_queued_events();
     }
 
+    fn fixed_damage(
+        &mut self,
+        source_id: &str,
+        target_id: &str,
+        amount: f32,
+        damage_type: DamageType,
+    ) {
+        let final_damage = amount.max(0.0);
+        let mut hp_update = None;
+        if let Some(target) = self.characters.get_mut(target_id) {
+            target.damage_taken_this_turn += final_damage;
+            target.hp = (target.hp - final_damage).max(0.0);
+            hp_update = Some((target.hp, target.max_hp));
+            self.log.push(format!(
+                "{}受到{}点{}伤害，生命值变为 {}/{}",
+                target.name,
+                format_number(final_damage),
+                damage_type.explain(),
+                format_number(target.hp),
+                format_number(target.max_hp)
+            ));
+        }
+        if let Some((hp, max_hp)) = hp_update {
+            self.sync_character_hp_to_ecs(target_id, hp, max_hp);
+        }
+        self.queue_event(RuleEvent::DamageTaken {
+            source_id: source_id.to_owned(),
+            target_id: target_id.to_owned(),
+            amount: final_damage,
+            damage_type,
+        });
+        self.queue_event(RuleEvent::DamageDealt {
+            source_id: source_id.to_owned(),
+            target_id: target_id.to_owned(),
+            amount: final_damage,
+            damage_type,
+        });
+        self.resolve_queued_events();
+    }
+
     pub fn heal(&mut self, source_id: &str, target_id: &str, amount: f32) {
         let source_modifier = self
             .characters
             .get(source_id)
             .map(|character| {
-                character.healing_dealt_modifier * character.wounded_healing_dealt_multiplier()
+                character.healing_dealt_modifier
+                    * character.wounded_healing_dealt_multiplier()
+                    * chaos_output_multiplier(character.chaos_output_variance)
             })
             .unwrap_or(1.0);
         let target_modifier = self
@@ -2392,6 +2475,24 @@ impl RuleEngine {
                     damage_type,
                 );
             },
+            BuffTickAction::FixedDamage {
+                amount,
+                damage_type,
+            } => {
+                self.log.push(format!(
+                    "BUFF触发：{}对{}造成{}点{}伤害",
+                    source_id,
+                    target_id,
+                    format_number(amount.max(0.0)),
+                    damage_type.explain()
+                ));
+                self.fixed_damage(
+                    source_id,
+                    target_id,
+                    amount.max(0.0),
+                    damage_type,
+                );
+            },
             BuffTickAction::Heal { amount } => {
                 self.log.push(format!(
                     "BUFF触发：{}治疗{}{}点生命值",
@@ -2454,6 +2555,7 @@ fn apply_buff_effect(
         BuffField::MaxMp => apply_f32(&mut combatant.max_mp, effect.value),
         BuffField::HpRegen => apply_f32(&mut combatant.hp_regen, effect.value),
         BuffField::MpRegen => apply_f32(&mut combatant.mp_regen, effect.value),
+        BuffField::Speed => apply_f32(&mut combatant.speed, effect.value),
         BuffField::DamageDealtModifier => apply_f32(
             &mut modifiers.damage_dealt,
             effect.value,
@@ -2853,6 +2955,12 @@ fn buff_effect_field_patterns() -> Vec<(BuffField, &'static [&'static str])> {
             "法力回复",
             "回蓝",
         ]),
+        (BuffField::Speed, &[
+            "速度",
+            "移速",
+            "移动速度",
+            "speed",
+        ]),
         (BuffField::Status(StatusKey::Str), &[
             "力量", "STR", "str",
         ]),
@@ -3222,6 +3330,31 @@ fn format_number(value: f32) -> String {
         format!("{}", value as i32)
     } else {
         format!("{value:.2}")
+    }
+}
+
+fn chaos_output_multiplier(variance: f32) -> f32 {
+    let variance = variance.clamp(0.0, 1.0);
+    if variance <= f32::EPSILON {
+        1.0
+    } else {
+        rand::rng().random_range((1.0 - variance)..=(1.0 + variance))
+    }
+}
+
+fn sousas_claw_followup_buff(source_id: &str, amount: f32) -> BuffSpec {
+    BuffSpec {
+        name: "苏萨斯之爪".to_owned(),
+        kind: BuffKind::Magic,
+        priority: 0,
+        turns_remaining: 2,
+        source_id: source_id.to_owned(),
+        beneficial: false,
+        effects: Vec::new(),
+        tick_actions: vec![BuffTickAction::FixedDamage {
+            amount: amount.max(0.0),
+            damage_type: DamageType::Magical,
+        }],
     }
 }
 
@@ -3677,7 +3810,7 @@ mod tests {
     #[test]
     fn legacy_moonberry_buff_machine_converts_passive_basic_buffs() {
         let buffs = legacy_moonberry_buff_machine_passive_buffs(
-            r#"{"eventBuffs":[{"event":"被动","buffs":[{"name":"强壮","prior":4,"effect":["str","DMGModify"],"type":1,"benifit":true,"value":["力量","25%"]}]}]}"#,
+            r#"{"eventBuffs":[{"event":"被动","buffs":[{"name":"强壮","prior":4,"effect":["str","DMGModify","speed"],"type":1,"benifit":true,"value":["力量","25%","20%"]}]}]}"#,
             &[("力量".to_owned(), 3.0)],
             "alice:skill:0",
         );
@@ -3697,6 +3830,10 @@ mod tests {
                 BuffEffect {
                     field: BuffField::DamageDealtModifier,
                     value: BuffValue::AddPercent(25.0),
+                },
+                BuffEffect {
+                    field: BuffField::Speed,
+                    value: BuffValue::AddPercent(20.0),
                 },
             ],
             tick_actions: Vec::new(),
@@ -4334,6 +4471,38 @@ mod tests {
     }
 
     #[test]
+    fn chaos_output_variance_randomizes_damage_and_healing_in_range() {
+        let mut engine = RuleEngine::default();
+        let mut source = Character::new("source", "来源", 100.0);
+        source.chaos_output_variance = 0.15;
+        let mut target = Character::new("target", "目标", 100.0);
+        target.hp = 50.0;
+        engine.add_character(source);
+        engine.add_character(target);
+
+        engine.attack(
+            "source",
+            "target",
+            10.0,
+            DamageType::Physical,
+        );
+        let target = engine.characters.get("target").unwrap();
+        let damage = 50.0 - target.hp;
+        assert!(
+            (8.5..=11.5).contains(&damage),
+            "damage roll out of range: {damage}"
+        );
+
+        engine.heal("source", "target", 10.0);
+        let target = engine.characters.get("target").unwrap();
+        assert!(
+            (8.5..=11.5).contains(&target.healing_taken_this_turn),
+            "healing roll out of range: {}",
+            target.healing_taken_this_turn
+        );
+    }
+
+    #[test]
     fn attack_uses_damage_type_specific_source_modifier() {
         let mut engine = RuleEngine::default();
         let mut alice = Character::new("alice", "自己", 10.0);
@@ -4496,6 +4665,36 @@ mod tests {
                 < 0.0001
         );
         assert!((engine.characters.get("target").unwrap().hp - 12.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn physical_damage_schedules_sousas_claw_followup() {
+        let mut engine = RuleEngine::default();
+        let mut source = Character::new("source", "来源", 20.0);
+        source.physical_damage_followup_rate = 0.35;
+        engine.add_character(source);
+        engine.add_character(Character::new("target", "目标", 20.0));
+
+        engine.attack(
+            "source",
+            "target",
+            10.0,
+            DamageType::Physical,
+        );
+        assert!((engine.characters.get("target").unwrap().hp - 10.0).abs() < 0.0001);
+        assert_eq!(
+            engine.active_buff_names("target"),
+            vec!["苏萨斯之爪".to_owned()]
+        );
+
+        engine.advance_turn();
+        let target = engine.characters.get("target").unwrap();
+        assert!((target.hp - 6.5).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 3.5).abs() < 0.0001);
+
+        engine.advance_turn();
+        assert!(engine.active_buff_names("target").is_empty());
+        assert!((engine.characters.get("target").unwrap().hp - 6.5).abs() < 0.0001);
     }
 
     #[test]
@@ -4698,6 +4897,31 @@ mod tests {
             "Bless".to_owned(),
             "Brittle".to_owned(),
         ]);
+    }
+
+    #[test]
+    fn ecs_buff_can_modify_speed() {
+        let mut engine = RuleEngine::default();
+        let mut alice = Character::new("alice", "自己", 10.0);
+        alice.speed = 10.0;
+        engine.add_character(alice);
+
+        engine.give_buff("alice", BuffSpec {
+            name: "Tailwind".to_owned(),
+            kind: BuffKind::Magic,
+            priority: 0,
+            turns_remaining: 0,
+            source_id: "alice".to_owned(),
+            beneficial: true,
+            effects: vec![BuffEffect {
+                field: BuffField::Speed,
+                value: BuffValue::AddPercent(20.0),
+            }],
+            tick_actions: Vec::new(),
+        });
+
+        let alice = engine.characters.get("alice").unwrap();
+        assert!((alice.speed - 12.0).abs() < 0.0001);
     }
 
     #[test]

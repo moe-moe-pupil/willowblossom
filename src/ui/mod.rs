@@ -1,6 +1,7 @@
 mod ime;
 use std::{
     collections::{
+        hash_map::DefaultHasher,
         BTreeSet,
         HashMap,
         HashSet,
@@ -16,10 +17,6 @@ use std::{
         UNIX_EPOCH,
     },
 };
-mod components;
-
-use std::collections::hash_map::DefaultHasher;
-
 use bevy::{
     ecs::system::SystemParam,
     prelude::*,
@@ -28,7 +25,6 @@ use bevy_egui::{
     egui::{
         self,
         epaint::CircleShape,
-        menu,
         Context,
         Id,
         Memory,
@@ -49,6 +45,7 @@ use bevy_egui::{
     EguiGlobalSettings,
     EguiPlugin,
     EguiPrimaryContextPass,
+    PrimaryEguiContext,
 };
 use bevy_persistent::{
     Persistent,
@@ -118,6 +115,7 @@ use crate::{
         DEEPSEEK_SUMMARY_EXPORT_VERSION,
     },
     napcat::{
+        character_chaos_output_variance,
         character_damage_attribute_multiplier,
         character_damage_dealt_talent_buffs,
         character_damage_taken_attribute_multiplier,
@@ -128,13 +126,18 @@ use crate::{
         character_minimum_range_meters,
         character_mutual_aid_healing_rate,
         character_next_level_exp,
+        character_physical_damage_followup_rate,
         character_physical_damage_lifesteal,
+        character_spell_range_multiplier,
         character_wounded_healing_dealt_modifier,
         dying_healing_taken_multiplier,
         grant_character_experience,
         large_hit_damage_taken_multiplier,
         low_hp_damage_multiplier,
-        moonberry_effective_skill_range_radius,
+        moonberry_chaos_output_multiplier,
+        moonberry_effective_skill_range_radius_with_multiplier,
+        moonberry_physical_damage_followup_buff,
+        moonberry_skill_type_is_spell,
         normalized_random_pool_counts,
         record_character_damage_taken,
         record_character_healing_taken,
@@ -570,6 +573,8 @@ impl Plugin for UIPlugin {
 }
 
 pub fn setup_system(mut command: Commands) {
+    command.spawn((Camera2d, PrimaryEguiContext));
+
     let config_dir = Path::new(".data").join("willowblossom");
     let cached_memory = Persistent::<CachedMemory>::builder()
         .name("ui_memory")
@@ -616,7 +621,8 @@ pub fn configure_ui_fonts(mut egui_context: EguiContexts, mut fonts_configured: 
         .or_default()
         .insert(0, "cjk".to_owned());
 
-    let mut style = (*ctx.style()).clone();
+    let theme = ctx.theme();
+    let mut style = (*ctx.style_of(theme)).clone();
     style.text_styles = [
         (
             egui::TextStyle::Heading,
@@ -642,7 +648,7 @@ pub fn configure_ui_fonts(mut egui_context: EguiContexts, mut fonts_configured: 
     .into();
 
     ctx.set_fonts(fonts);
-    ctx.set_style(style);
+    ctx.set_style_of(theme, style);
     egui_extras::install_image_loaders(ctx);
     *fonts_configured = true;
 }
@@ -3736,7 +3742,12 @@ fn quick_cast_ui(
     let targets = effect
         .as_ref()
         .map(|effect| {
-            let fallback_radius = quick_cast_skill_range_radius(character, effect, skill.range);
+            let fallback_radius = quick_cast_skill_range_radius(
+                character,
+                effect,
+                skill.range,
+                skill.skill_type.as_deref(),
+            );
             limit_skill_targets(
                 quick_cast_targets(
                     caster_id,
@@ -3822,7 +3833,12 @@ fn quick_cast_ui(
                 if let Some(radius) = effect.as_ref().and_then(|effect| {
                     quick_cast_radius(
                         effect,
-                        quick_cast_skill_range_radius(character, effect, skill.range),
+                        quick_cast_skill_range_radius(
+                            character,
+                            effect,
+                            skill.range,
+                            skill.skill_type.as_deref(),
+                        ),
                     )
                 }) {
                     ui.small(format!(
@@ -4046,6 +4062,7 @@ fn quick_cast_skill_range_radius(
     character: &PlayerCharacter,
     effect: &QuickCastEffect,
     range: Option<i32>,
+    skill_type: Option<&str>,
 ) -> Option<f32> {
     let minimum_range = match effect {
         QuickCastEffect::Damage {
@@ -4054,7 +4071,12 @@ fn quick_cast_skill_range_radius(
         } => character_minimum_range_meters(character),
         _ => 0.0,
     };
-    moonberry_effective_skill_range_radius(range, minimum_range)
+    let range_multiplier = if moonberry_skill_type_is_spell(skill_type) {
+        character_spell_range_multiplier(character)
+    } else {
+        1.0
+    };
+    moonberry_effective_skill_range_radius_with_multiplier(range, minimum_range, range_multiplier)
 }
 
 fn quick_cast_radius(effect: &QuickCastEffect, fallback_radius: Option<f32>) -> Option<f32> {
@@ -4262,6 +4284,7 @@ fn apply_quick_cast_action_to_manager(
         source_damage_multiplier,
         source_healing_multiplier,
         source_physical_damage_lifesteal,
+        source_physical_damage_followup_rate,
         source_minimum_damage_floor,
         source_mutual_aid_healing_rate,
         damage_dealt_buffs,
@@ -4291,6 +4314,7 @@ fn apply_quick_cast_action_to_manager(
                         &stat_config,
                         trpg_damage_bonus_kind(damage_type),
                     )
+                    * moonberry_chaos_output_multiplier(character_chaos_output_variance(caster))
             },
             _ => caster.damage_dealt_modifier,
         };
@@ -4301,11 +4325,25 @@ fn apply_quick_cast_action_to_manager(
                 caster.max_hp,
                 character_wounded_healing_dealt_modifier(caster),
             );
+        let source_healing_multiplier = match effect {
+            Some(QuickCastEffect::Heal { .. }) => {
+                source_healing_multiplier
+                    * moonberry_chaos_output_multiplier(character_chaos_output_variance(caster))
+            },
+            _ => source_healing_multiplier,
+        };
         let source_physical_damage_lifesteal = match effect {
             Some(QuickCastEffect::Damage {
                 damage_type: DamageType::Physical,
                 ..
             }) => character_physical_damage_lifesteal(caster),
+            _ => 0.0,
+        };
+        let source_physical_damage_followup_rate = match effect {
+            Some(QuickCastEffect::Damage {
+                damage_type: DamageType::Physical,
+                ..
+            }) => character_physical_damage_followup_rate(caster),
             _ => 0.0,
         };
         let source_minimum_damage_floor = match effect {
@@ -4328,6 +4366,7 @@ fn apply_quick_cast_action_to_manager(
             source_damage_multiplier,
             source_healing_multiplier,
             source_physical_damage_lifesteal,
+            source_physical_damage_followup_rate,
             source_minimum_damage_floor,
             source_mutual_aid_healing_rate,
             damage_dealt_buffs,
@@ -4392,8 +4431,20 @@ fn apply_quick_cast_action_to_manager(
                             changed = true;
                         }
                     }
-                    pending_source_lifesteal +=
-                        typed_final_amount * source_physical_damage_lifesteal;
+                    if damage_type == DamageType::Physical {
+                        pending_source_lifesteal +=
+                            typed_final_amount * source_physical_damage_lifesteal;
+                        if source_physical_damage_followup_rate > f32::EPSILON {
+                            target
+                                .active_buffs
+                                .push(moonberry_physical_damage_followup_buff(
+                                    &action.caster_id,
+                                    final_amount * source_physical_damage_followup_rate,
+                                ));
+                            target.buff_base_stats = None;
+                            changed = true;
+                        }
+                    }
                 }
             },
             QuickCastEffect::Heal { amount, .. } => {
@@ -5494,6 +5545,7 @@ fn sync_character_skill_rules_with_stats(
         stats.max_mp,
         stats.hp_regen,
         stats.mp_regen,
+        stats.speed,
         character_status_block(&character.status.combined(&stats.extra_status)),
         stats.damage_dealt_modifier,
         character_damage_attribute_multiplier(
@@ -5512,7 +5564,9 @@ fn sync_character_skill_rules_with_stats(
             TrpgDamageBonusKind::Range,
         ),
         character_physical_damage_lifesteal(&base_character),
+        character_physical_damage_followup_rate(&base_character),
         character_minimum_damage_floor(&base_character),
+        character_chaos_output_variance(&base_character),
         stats.damage_taken_modifier,
         character_large_hit_damage_taken_modifier(&base_character),
         character_damage_taken_attribute_multiplier(
@@ -6469,6 +6523,14 @@ fn moonberry_talent_passive_effects(
                 value: BuffValue::Add(total_status.wis as f32),
             },
         ],
+        "狂风恶浪" => vec![BuffEffect {
+            field: BuffField::Speed,
+            value: BuffValue::AddPercent(20.0),
+        }],
+        "忏悔" => vec![BuffEffect {
+            field: BuffField::HealingDealtModifier,
+            value: BuffValue::AddPercent(25.0),
+        }],
         _ => Vec::new(),
     }
 }
@@ -6671,6 +6733,21 @@ fn apply_character_buff_ticks(
                     changed = true;
                 }
             },
+            BuffTickAction::FixedDamage { amount, .. } => {
+                let Some(target) = manager.player_characters.get_mut(&tick.target_id) else {
+                    continue;
+                };
+                let final_amount = amount.max(0.0);
+                changed |= record_character_damage_taken(target, final_amount);
+                let next_hp = (target.hp - final_amount).max(0.0);
+                if (target.hp - next_hp).abs() > f32::EPSILON {
+                    target.hp = next_hp;
+                    if let Some(base_stats) = target.buff_base_stats.as_mut() {
+                        base_stats.hp = (base_stats.hp - final_amount).max(0.0);
+                    }
+                    changed = true;
+                }
+            },
             BuffTickAction::Heal { amount } => {
                 let stat_config = manager.character_stat_config_for_target(&tick.source_id);
                 let (source_multiplier, source_mutual_aid_healing_rate) = manager
@@ -6771,7 +6848,7 @@ fn apply_effective_character_stats(
     character.mp = effective.mp;
     character.max_mp = (effective.max_mp + effective_derived.max_mp - base_derived.max_mp).max(0.0);
     character.mp_regen = effective.mp_regen + effective_derived.mp_regen - base_derived.mp_regen;
-    character.speed = base_stats.speed + effective_derived.speed - base_derived.speed;
+    character.speed = effective.speed + effective_derived.speed - base_derived.speed;
     character.extra_status = effective_extra_status(character, &effective.status);
     character.damage_dealt_modifier = effective.damage_dealt_modifier;
     character.damage_taken_modifier = effective.damage_taken_modifier;
@@ -6913,7 +6990,7 @@ fn buff_value_ui(ui: &mut Ui, value: &mut BuffValue) {
     };
 }
 
-fn buff_field_options() -> [BuffField; 18] {
+fn buff_field_options() -> [BuffField; 19] {
     [
         BuffField::Hp,
         BuffField::Mp,
@@ -6921,6 +6998,7 @@ fn buff_field_options() -> [BuffField; 18] {
         BuffField::MaxMp,
         BuffField::HpRegen,
         BuffField::MpRegen,
+        BuffField::Speed,
         BuffField::Status(StatusKey::Str),
         BuffField::Status(StatusKey::Agi),
         BuffField::Status(StatusKey::Dex),
@@ -6944,6 +7022,7 @@ fn buff_field_label(field: BuffField) -> &'static str {
         BuffField::MaxMp => "最大MP",
         BuffField::HpRegen => "HP回复",
         BuffField::MpRegen => "MP回复",
+        BuffField::Speed => "移动速度",
         BuffField::Status(StatusKey::Str) => "STR",
         BuffField::Status(StatusKey::Agi) => "AGI",
         BuffField::Status(StatusKey::Dex) => "DEX",
@@ -11261,10 +11340,18 @@ pub fn ui_system(
         player_camera_positions.as_deref(),
     );
 
-    egui::TopBottomPanel::top("top_panel")
+    let mut viewport_ui = egui::Ui::new(
+        ctx.clone(),
+        "viewport".into(),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(ctx.viewport_rect()),
+    );
+
+    egui::Panel::top("top_panel")
         .resizable(false)
-        .show(ctx, |ui| {
-            menu::bar(ui, |ui| {
+        .show(&mut viewport_ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 file_menu_button(
                     ui,
                     &mut new_chat_group_modal_string_open.1,
@@ -11287,9 +11374,9 @@ pub fn ui_system(
             });
         });
 
-    egui::SidePanel::right("right_panel")
+    egui::Panel::right("right_panel")
         .resizable(true)
-        .show(ctx, |ui| {
+        .show(&mut viewport_ui, |ui| {
             if napcat_sender.is_none() {
                 ui.label("NapCat websocket未连接");
             }
@@ -11307,11 +11394,11 @@ pub fn ui_system(
             summary_panel(ui, &manager, &deepseek_manager);
         });
 
-    egui::SidePanel::left("chat_list_panel")
+    egui::Panel::left("chat_list_panel")
         .resizable(true)
-        .default_width(220.0)
-        .width_range(160.0..=340.0)
-        .show(ctx, |ui| {
+        .default_size(220.0)
+        .size_range(160.0..=340.0)
+        .show(&mut viewport_ui, |ui| {
             chat_list_panel(
                 ui,
                 ctx,
@@ -11325,7 +11412,7 @@ pub fn ui_system(
 
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
-        .show(ctx, |ui| {
+        .show(&mut viewport_ui, |ui| {
             pending_chat_requests_window(
                 ctx,
                 &mut manager,
@@ -12848,10 +12935,14 @@ mod tests {
                 "狡黠之思".to_owned(),
                 "人类基因工程".to_owned(),
                 "抗魔体质".to_owned(),
+                "狂风恶浪".to_owned(),
+                "忏悔".to_owned(),
             ],
             skill_metadata: vec![
                 CharacterSkillMetadata::talent("normal_talent", "天赋"),
                 CharacterSkillMetadata::talent("support_talent", "辅助天赋"),
+                CharacterSkillMetadata::talent("support_talent", "辅助天赋"),
+                CharacterSkillMetadata::talent("normal_talent", "天赋"),
                 CharacterSkillMetadata::talent("support_talent", "辅助天赋"),
                 CharacterSkillMetadata::talent("normal_talent", "天赋"),
                 CharacterSkillMetadata::talent("support_talent", "辅助天赋"),
@@ -12862,6 +12953,7 @@ mod tests {
         let base_max_hp = character.max_hp;
         let base_max_mp = character.max_mp;
         let base_mp_regen = character.mp_regen;
+        let base_speed = character.speed;
 
         sync_character_buffs(
             "caster",
@@ -12874,8 +12966,9 @@ mod tests {
         assert!((character.max_hp - base_max_hp * 1.05).abs() < 0.0001);
         assert!((character.max_mp - (base_max_mp + 19.0)).abs() < 0.0001);
         assert!((character.mp_regen - (base_mp_regen + 4.0)).abs() < 0.0001);
+        assert!((character.speed - base_speed * 1.2).abs() < 0.0001);
         let expected_healing_modifier =
-            (1.0 + 5.0 * config.int_heal_bonus + 4.0 * config.wis_heal_bonus) * 1.03;
+            (1.0 + 5.0 * config.int_heal_bonus + 4.0 * config.wis_heal_bonus) * 1.03 * 1.25;
         assert!((character.healing_dealt_modifier - expected_healing_modifier).abs() < 0.0001);
         let synced = rule_engine_state.character("caster").unwrap();
         assert!((synced.magical_damage_taken_modifier - 0.9).abs() < 0.0001);
@@ -12890,6 +12983,8 @@ mod tests {
         assert_eq!(active_names, vec![
             "人类基因工程".to_owned(),
             "大魔法师".to_owned(),
+            "忏悔".to_owned(),
+            "狂风恶浪".to_owned(),
             "狡黠之思".to_owned(),
             "矢量压缩能量池".to_owned(),
         ]);
@@ -12908,6 +13003,7 @@ mod tests {
         assert!((character.max_hp - base_max_hp).abs() < 0.0001);
         assert!((character.max_mp - base_max_mp).abs() < 0.0001);
         assert!((character.mp_regen - base_mp_regen).abs() < 0.0001);
+        assert!((character.speed - base_speed).abs() < 0.0001);
         assert!((character.healing_dealt_modifier - 1.0).abs() < 0.0001);
         let synced = rule_engine_state.character("caster").unwrap();
         assert!((synced.magical_damage_taken_modifier - 1.0).abs() < f32::EPSILON);
@@ -13921,7 +14017,7 @@ mod tests {
             positions: HashMap::from([(1, Vec3::ZERO)]),
         };
 
-        let fallback_radius = quick_cast_skill_range_radius(&caster, &effect, Some(3));
+        let fallback_radius = quick_cast_skill_range_radius(&caster, &effect, Some(3), None);
         assert_eq!(fallback_radius, Some(30.0));
         let targets = quick_cast_targets(
             "1",
@@ -13943,7 +14039,7 @@ mod tests {
             damage_type: DamageType::Physical,
         };
         assert_eq!(
-            quick_cast_skill_range_radius(&caster, &physical_effect, Some(3)),
+            quick_cast_skill_range_radius(&caster, &physical_effect, Some(3), None),
             Some(3.0)
         );
         let targets = quick_cast_targets(
@@ -13952,7 +14048,62 @@ mod tests {
             &character_targets,
             Some(&scene_positions),
             Some(&camera_positions),
-            quick_cast_skill_range_radius(&caster, &physical_effect, Some(3)),
+            quick_cast_skill_range_radius(&caster, &physical_effect, Some(3), None),
+            None,
+        );
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn quick_cast_spell_skill_uses_magic_web_range_talent() {
+        let caster = PlayerCharacter {
+            skill_names: vec!["魔网延伸".to_owned()],
+            skill_metadata: vec![CharacterSkillMetadata::talent("normal_talent", "天赋")],
+            ..Default::default()
+        };
+        let effect = QuickCastEffect::Damage {
+            amount: 1.0,
+            target: TargetSelector {
+                actor: ActorRef::Target,
+                area: None,
+            },
+            damage_type: DamageType::Magical,
+        };
+        let character_targets = vec![
+            ("1".to_owned(), "施法者".to_owned()),
+            ("far".to_owned(), "远处".to_owned()),
+        ];
+        let scene_positions = SceneCharacterPositions {
+            positions: HashMap::from([(
+                "far".to_owned(),
+                Vec3::new(10.4, 0.0, 0.0),
+            )]),
+        };
+        let camera_positions = ScenePlayerCameraPositions {
+            positions: HashMap::from([(1, Vec3::ZERO)]),
+        };
+
+        let fallback_radius =
+            quick_cast_skill_range_radius(&caster, &effect, Some(10), Some("法术"));
+        assert_eq!(fallback_radius, Some(10.5));
+        let targets = quick_cast_targets(
+            "1",
+            &effect,
+            &character_targets,
+            Some(&scene_positions),
+            Some(&camera_positions),
+            fallback_radius,
+            None,
+        );
+        assert_eq!(targets, vec!["far".to_owned()]);
+
+        let targets = quick_cast_targets(
+            "1",
+            &effect,
+            &character_targets,
+            Some(&scene_positions),
+            Some(&camera_positions),
+            quick_cast_skill_range_radius(&caster, &effect, Some(10), None),
             None,
         );
         assert!(targets.is_empty());
@@ -14319,6 +14470,86 @@ mod tests {
     }
 
     #[test]
+    fn quick_cast_physical_damage_schedules_sousas_claw_followup() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                skill_names: vec!["苏萨斯之爪".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("normal_talent", "天赋")],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 10.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+
+        let target = &manager.player_characters["target"];
+        assert!((target.hp - 10.0).abs() < 0.0001);
+        assert_eq!(target.active_buffs.len(), 1);
+        assert_eq!(
+            target.active_buffs[0].name,
+            "苏萨斯之爪"
+        );
+
+        let mut rule_engine_state = RuleEngineState::default();
+        assert!(advance_buffs_for_players(
+            &mut manager,
+            &["target".to_owned()],
+            &mut rule_engine_state,
+        ));
+        let target = &manager.player_characters["target"];
+        assert!((target.hp - 6.5).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 13.5).abs() < 0.0001);
+        assert_eq!(target.active_buffs.len(), 1);
+
+        assert!(advance_buffs_for_players(
+            &mut manager,
+            &["target".to_owned()],
+            &mut rule_engine_state,
+        ));
+        assert!(manager.player_characters["target"].active_buffs.is_empty());
+    }
+
+    #[test]
     fn quick_cast_applies_large_hit_damage_reduction_talent() {
         let mut manager = empty_manager();
         manager
@@ -14434,6 +14665,90 @@ mod tests {
         let target = &manager.player_characters["target"];
         assert!((target.hp - 16.0).abs() < 0.0001);
         assert!((target.damage_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn quick_cast_applies_chaos_output_variance_talent() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 100.0,
+                max_hp: 100.0,
+                skill_names: vec!["混沌无序".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("normal_talent", "天赋")],
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 50.0,
+                max_hp: 100.0,
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "测试混沌".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill: skill.clone(),
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 10.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        let target = &manager.player_characters["target"];
+        assert!(
+            (8.5..=11.5).contains(&target.damage_taken_this_turn),
+            "damage roll out of range: {}",
+            target.damage_taken_this_turn
+        );
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Heal {
+                    amount: 10.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                }),
+                cast_turn: 1,
+                force: false,
+            },
+        ));
+        let target = &manager.player_characters["target"];
+        assert!(
+            (8.5..=11.5).contains(&target.healing_taken_this_turn),
+            "healing roll out of range: {}",
+            target.healing_taken_this_turn
+        );
     }
 
     #[test]

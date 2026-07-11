@@ -84,7 +84,8 @@ fn reset_egui_ime_enabled_after_commit(
     }
 
     for mut ime_state in &mut ime_states {
-        ime_state.has_sent_ime_enabled = false;
+        ime_state.is_ime_allowed = false;
+        ime_state.ime_rect = None;
     }
 }
 

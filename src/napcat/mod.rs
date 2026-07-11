@@ -34,6 +34,7 @@ use futures_util::{
     SinkExt,
     StreamExt,
 };
+use rand::RngExt;
 use serde::{
     Deserialize,
     Serialize,
@@ -67,7 +68,9 @@ use crate::{
         BuffField,
         BuffKind,
         BuffSpec,
+        BuffTickAction,
         BuffValue,
+        DamageType,
     },
     scene::{
         SceneCaptureRequest,
@@ -4758,10 +4761,12 @@ fn is_group_message_target(messages: &[NapcatMessage]) -> bool {
 impl Plugin for NapcatPlugin {
     fn build(&self, app: &mut App) {
         app.insert_state(ConnectionState::Disconnected)
-            // .insert_resource(NapcatSocket { ..default() })
             .add_systems(Startup, setup)
             .add_systems(Update, message_system)
-            .add_systems(Update, request_missing_group_info_system)
+            .add_systems(
+                Update,
+                request_missing_group_info_system,
+            )
             .add_systems(Update, send_result_system);
     }
 }
@@ -4860,7 +4865,6 @@ async fn run_napcat_connection(
 
         loop {
             tokio::select! {
-                //Receive messages from the websocket
                 msg = ws_receiver.next() => {
                     match msg {
                         Some(Ok(msg)) => {
@@ -4879,7 +4883,6 @@ async fn run_napcat_connection(
                         None => break,
                     }
                 }
-                //Receive messages from the game
                 outbound = game_to_client_receiver.recv() => {
                     let Some(outbound) = outbound else {
                         return;
@@ -5642,20 +5645,37 @@ fn moonberry_talent_effect_summary(talent: &MoonberryTalent) -> Option<&'static 
     match talent.name {
         "那美克星之慧" => Some("立即获得等级*2的知识额外值"),
         "物理专长" => Some("立即将知识基础值提升到至少2；炮塔效果需GM处理"),
+        "苏萨斯之爪" => Some("物理伤害一回合后追加35%实际伤害的魔法伤害"),
+        "役于我手" => Some("战斗轮中目标死亡时获得其5%最大生命值，上限为自身20%"),
+        "无尽痛楚" => Some("战斗轮中每次实际承伤令下一次命中追加等级*1.5无类型伤害，上限2层"),
         "溃伤" => Some("造成伤害时令目标受到治疗效果-25%，持续1回合"),
         "人类基因工程" => Some("常驻最大生命值+5%；疾病/中毒伤害-15%"),
         "大魔法师" => Some("常驻每点智力+1最大MP并+0.5%魔法伤害"),
         "矢量压缩能量池" => Some("常驻每点知识+2最大MP并+1%治疗效果"),
         "狡黠之思" => Some("常驻每点智慧+2最大MP并+1/回合MP回复"),
         "抗魔体质" => Some("常驻魔法伤害减免10%"),
+        "混沌无序" => Some("每次伤害/治疗效果随机-15%~+15%"),
         "数魔转换器" => Some("远程伤害享受正向魔法伤害加成"),
         "瞄准镜Tex-30" => Some("远程技能射程至少为等级*15米"),
+        "魔网延伸" => Some("法术技能射程+5%；召唤距离需GM处理"),
+        "狂风恶浪" => Some("常驻移动速度+20%；玩家目标存活数<=3时提升至35%"),
+        "越战越勇" => Some("战斗轮中每经过任意目标一回合伤害+2%，上限+20%"),
+        "斗志昂扬" => Some("战斗轮第1/2/3个自身回合承伤-50%/-10%/-2%"),
+        "狂妄" => Some("战斗轮中每个新伤害来源令自身伤害+10%，上限+30%"),
+        "无限专注" => Some("战斗轮中连续单体攻击同一目标时伤害逐次+10%，上限+20%"),
+        "总冠军" => Some("战斗轮中每名玩家目标淘汰令自身伤害+2%、承伤-1%"),
+        "罪上加罪" => Some("每次参与击杀获得2.5%经验加成并回复10%已损生命/魔法"),
+        "忏悔" => Some("跑团开始治疗效果+25%；每次击杀/助攻递减10%，下限0%"),
         "禅宗古训" => Some("常驻物理伤害造成15%吸血"),
         "过度免疫" => Some("单次伤害大于20%最大HP时伤害-20%"),
         "生死时速" => Some("治疗濒死目标时治疗效果+50%"),
         "菜鸡猛啄" => Some("单次伤害至少造成等级点无类型伤害"),
         "火源之力" => Some("治疗效果随自身伤势提供0%/10%/20%加成"),
         "互帮互助" => Some("治疗他人/受到治疗时50%治疗量回馈给治疗者"),
+        "一心" => Some("战斗轮中连续治疗同一目标时治疗效果每次+5%，上限+25%"),
+        "千万回忆" => Some("单体即刻治疗会在之后两回合回响15%/5%治疗量"),
+        "液态躯体" => Some("战斗轮中承伤50%延后一回合，且每回合回复上回合承伤5%"),
+        "敏锐" => Some("战斗轮中第一次范围/非指向伤害100%闪避"),
         _ => moonberry_talent_effect_category(talent.description),
     }
 }
@@ -6511,11 +6531,52 @@ pub fn character_physical_damage_lifesteal(character: &PlayerCharacter) -> f32 {
     }
 }
 
+pub fn character_physical_damage_followup_rate(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "苏萨斯之爪") {
+        0.35
+    } else {
+        0.0
+    }
+}
+
+pub fn moonberry_physical_damage_followup_buff(source_id: &str, amount: f32) -> BuffSpec {
+    BuffSpec {
+        name: "苏萨斯之爪".to_owned(),
+        kind: BuffKind::Magic,
+        priority: 0,
+        turns_remaining: 2,
+        source_id: source_id.to_owned(),
+        beneficial: false,
+        effects: Vec::new(),
+        tick_actions: vec![BuffTickAction::FixedDamage {
+            amount: amount.max(0.0),
+            damage_type: DamageType::Magical,
+        }],
+    }
+}
+
 pub fn character_minimum_damage_floor(character: &PlayerCharacter) -> f32 {
     if character_has_approved_moonberry_talent(character, "菜鸡猛啄") {
         character.level.max(0) as f32
     } else {
         0.0
+    }
+}
+
+pub fn character_chaos_output_variance(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "混沌无序") {
+        0.15
+    } else {
+        0.0
+    }
+}
+
+pub fn moonberry_chaos_output_multiplier(variance: f32) -> f32 {
+    let variance = variance.clamp(0.0, 1.0);
+    if variance <= f32::EPSILON {
+        1.0
+    } else {
+        rand::rng().random_range((1.0 - variance)..=(1.0 + variance))
     }
 }
 
@@ -6527,13 +6588,197 @@ pub fn character_minimum_range_meters(character: &PlayerCharacter) -> f32 {
     }
 }
 
-pub fn moonberry_effective_skill_range_radius(
+pub fn character_spell_range_multiplier(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "魔网延伸") {
+        1.05
+    } else {
+        1.0
+    }
+}
+
+pub fn character_gale_force_battle_speeds(character: &PlayerCharacter) -> Option<(f32, f32)> {
+    if !character_has_approved_moonberry_talent(character, "狂风恶浪") {
+        return None;
+    }
+    let base_speed = character
+        .buff_base_stats
+        .as_ref()
+        .map(|stats| stats.speed)
+        .unwrap_or(character.speed)
+        .max(0.0);
+    let normal_speed = if character.buff_base_stats.is_some() {
+        character.speed.max(0.0)
+    } else {
+        base_speed * 1.2
+    };
+    let low_survivor_speed = if character.buff_base_stats.is_some() {
+        normal_speed + base_speed * 0.15
+    } else {
+        base_speed * 1.35
+    };
+    Some((
+        normal_speed,
+        low_survivor_speed.max(normal_speed),
+    ))
+}
+
+pub fn character_valorous_battle_damage_multiplier(
+    character: &PlayerCharacter,
+    completed_turns: u32,
+) -> f32 {
+    if character_has_approved_moonberry_talent(character, "越战越勇") {
+        1.0 + (completed_turns as f32 * 0.02).min(0.20)
+    } else {
+        1.0
+    }
+}
+
+pub fn character_fighting_spirit_damage_taken_multiplier(
+    character: &PlayerCharacter,
+    completed_own_turns: u32,
+) -> f32 {
+    if !character_has_approved_moonberry_talent(character, "斗志昂扬") {
+        return 1.0;
+    }
+    match completed_own_turns {
+        0 => 0.5,
+        1 => 0.9,
+        2 => 0.98,
+        _ => 1.0,
+    }
+}
+
+pub fn character_arrogance_damage_bonus_per_source(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "狂妄") {
+        0.10
+    } else {
+        0.0
+    }
+}
+
+pub fn arrogance_damage_dealt_multiplier(bonus_per_source: f32, source_count: u32) -> f32 {
+    1.0 + (bonus_per_source.max(0.0) * source_count as f32).min(0.30)
+}
+
+pub fn character_endless_pain_bonus_damage_per_stack(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "无尽痛楚") {
+        character.level.max(0) as f32 * 1.5
+    } else {
+        0.0
+    }
+}
+
+pub fn endless_pain_bonus_damage(bonus_damage_per_stack: f32, stacks: u32) -> f32 {
+    bonus_damage_per_stack.max(0.0) * stacks.min(2) as f32
+}
+
+pub fn character_infinite_focus_damage_bonus_per_stack(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "无限专注") {
+        0.10
+    } else {
+        0.0
+    }
+}
+
+pub fn infinite_focus_damage_dealt_multiplier(bonus_per_stack: f32, stacks: u32) -> f32 {
+    1.0 + (bonus_per_stack.max(0.0) * stacks as f32).min(0.20)
+}
+
+pub fn character_champion_damage_bonus_per_stack(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "总冠军") {
+        0.02
+    } else {
+        0.0
+    }
+}
+
+pub fn character_champion_damage_reduction_per_stack(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "总冠军") {
+        0.01
+    } else {
+        0.0
+    }
+}
+
+pub fn champion_damage_dealt_multiplier(bonus_per_stack: f32, stacks: u32) -> f32 {
+    1.0 + bonus_per_stack.max(0.0) * stacks as f32
+}
+
+pub fn champion_damage_taken_multiplier(reduction_per_stack: f32, stacks: u32) -> f32 {
+    (1.0 - reduction_per_stack.max(0.0) * stacks as f32).max(0.0)
+}
+
+pub fn character_dominion_max_hp_gain_rate(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "役于我手") {
+        0.05
+    } else {
+        0.0
+    }
+}
+
+pub fn character_dominion_max_hp_bonus_cap(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "役于我手") {
+        character.max_hp.max(0.0) * 0.20
+    } else {
+        0.0
+    }
+}
+
+pub fn character_sin_on_sin_exp_bonus_per_stack(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "罪上加罪") {
+        2.5
+    } else {
+        0.0
+    }
+}
+
+pub fn character_sin_on_sin_recovery_rate(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "罪上加罪") {
+        0.10
+    } else {
+        0.0
+    }
+}
+
+pub fn sin_on_sin_exp_bonus_percent(bonus_per_stack: f32, stacks: u32) -> f32 {
+    (bonus_per_stack.max(0.0) * stacks as f32).min(10.0)
+}
+
+pub fn character_penance_healing_bonus_percent(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "忏悔") {
+        25.0
+    } else {
+        0.0
+    }
+}
+
+pub fn penance_decayed_healing_dealt_modifier(
+    current_modifier: f32,
+    initial_bonus_percent: f32,
+    kill_assist_count: u32,
+) -> f32 {
+    let current_modifier = current_modifier.max(0.0);
+    if initial_bonus_percent <= f32::EPSILON {
+        return current_modifier;
+    }
+    let initial_multiplier = 1.0 + initial_bonus_percent / 100.0;
+    let remaining_bonus_percent =
+        (initial_bonus_percent - kill_assist_count as f32 * 10.0).max(0.0);
+    current_modifier / initial_multiplier * (1.0 + remaining_bonus_percent / 100.0)
+}
+
+pub fn moonberry_skill_type_is_spell(skill_type: Option<&str>) -> bool {
+    matches!(skill_type.map(str::trim), Some("法术"))
+}
+
+pub fn moonberry_effective_skill_range_radius_with_multiplier(
     skill_range: Option<i32>,
     minimum_range_meters: f32,
+    range_multiplier: f32,
 ) -> Option<f32> {
     let skill_range = skill_range
         .filter(|range| *range > 0)
-        .map(|range| range as f32);
+        .map(|range| range as f32 * range_multiplier.max(0.0));
     if minimum_range_meters > f32::EPSILON {
         Some(skill_range.unwrap_or(0.0).max(minimum_range_meters))
     } else {
@@ -6608,6 +6853,46 @@ pub fn character_mutual_aid_healing_rate(character: &PlayerCharacter) -> f32 {
     } else {
         0.0
     }
+}
+
+pub fn character_one_heart_healing_bonus_per_stack(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "一心") {
+        0.05
+    } else {
+        0.0
+    }
+}
+
+pub fn one_heart_healing_dealt_multiplier(bonus_per_stack: f32, stacks: u32) -> f32 {
+    1.0 + (bonus_per_stack.max(0.0) * stacks as f32).min(0.25)
+}
+
+pub fn character_echoing_memory_healing_rates(character: &PlayerCharacter) -> Option<(f32, f32)> {
+    if character_has_approved_moonberry_talent(character, "千万回忆") {
+        Some((0.15, 0.05))
+    } else {
+        None
+    }
+}
+
+pub fn character_liquid_body_damage_delay_rate(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "液态躯体") {
+        0.5
+    } else {
+        0.0
+    }
+}
+
+pub fn character_liquid_body_self_healing_rate(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "液态躯体") {
+        0.05
+    } else {
+        0.0
+    }
+}
+
+pub fn character_keen_evasion_available(character: &PlayerCharacter) -> bool {
+    character_has_approved_moonberry_talent(character, "敏锐")
 }
 
 pub fn upsert_character_active_buff(character: &mut PlayerCharacter, buff: BuffSpec) -> bool {
@@ -10150,6 +10435,28 @@ mod tests {
             character_physical_damage_lifesteal(&lifestealer),
             0.0
         );
+        let mut sousas = character.clone();
+        sousas.skill_names.push("苏萨斯之爪".to_owned());
+        sousas.skill_metadata.push(CharacterSkillMetadata::talent(
+            "normal_talent",
+            "天赋",
+        ));
+        assert!((character_physical_damage_followup_rate(&sousas) - 0.35).abs() < f32::EPSILON);
+        let followup = moonberry_physical_damage_followup_buff("caster", 3.5);
+        assert_eq!(followup.name, "苏萨斯之爪");
+        assert_eq!(followup.turns_remaining, 2);
+        assert_eq!(followup.source_id, "caster");
+        assert_eq!(followup.tick_actions, vec![
+            BuffTickAction::FixedDamage {
+                amount: 3.5,
+                damage_type: DamageType::Magical,
+            }
+        ]);
+        sousas.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_physical_damage_followup_rate(&sousas),
+            0.0
+        );
         let mut chicken = character.clone();
         chicken.level = 3;
         chicken.skill_names.push("菜鸡猛啄".to_owned());
@@ -10166,6 +10473,20 @@ mod tests {
             character_minimum_damage_floor(&chicken),
             0.0
         );
+        let mut chaos = character.clone();
+        chaos.skill_names.push("混沌无序".to_owned());
+        chaos.skill_metadata.push(CharacterSkillMetadata::talent(
+            "normal_talent",
+            "天赋",
+        ));
+        assert!((character_chaos_output_variance(&chaos) - 0.15).abs() < f32::EPSILON);
+        let chaos_roll = moonberry_chaos_output_multiplier(character_chaos_output_variance(&chaos));
+        assert!((0.85..=1.15).contains(&chaos_roll));
+        chaos.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_chaos_output_variance(&chaos),
+            0.0
+        );
         let mut scoped = character.clone();
         scoped.level = 2;
         scoped.skill_names.push("瞄准镜Tex-30".to_owned());
@@ -10178,23 +10499,26 @@ mod tests {
             30.0
         );
         assert_eq!(
-            moonberry_effective_skill_range_radius(
+            moonberry_effective_skill_range_radius_with_multiplier(
                 Some(3),
-                character_minimum_range_meters(&scoped)
+                character_minimum_range_meters(&scoped),
+                1.0,
             ),
             Some(30.0)
         );
         assert_eq!(
-            moonberry_effective_skill_range_radius(
+            moonberry_effective_skill_range_radius_with_multiplier(
                 Some(45),
                 character_minimum_range_meters(&scoped),
+                1.0,
             ),
             Some(45.0)
         );
         assert_eq!(
-            moonberry_effective_skill_range_radius(
+            moonberry_effective_skill_range_radius_with_multiplier(
                 None,
-                character_minimum_range_meters(&scoped)
+                character_minimum_range_meters(&scoped),
+                1.0,
             ),
             Some(30.0)
         );
@@ -10204,11 +10528,105 @@ mod tests {
             0.0
         );
         assert_eq!(
-            moonberry_effective_skill_range_radius(
+            moonberry_effective_skill_range_radius_with_multiplier(
                 None,
-                character_minimum_range_meters(&scoped)
+                character_minimum_range_meters(&scoped),
+                1.0,
             ),
             None
+        );
+        let mut spell_reacher = character.clone();
+        spell_reacher.skill_names.push("魔网延伸".to_owned());
+        spell_reacher
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            ));
+        assert!((character_spell_range_multiplier(&spell_reacher) - 1.05).abs() < 0.0001);
+        assert!(moonberry_skill_type_is_spell(Some(
+            " 法术 "
+        )));
+        assert_eq!(
+            moonberry_effective_skill_range_radius_with_multiplier(
+                Some(20),
+                0.0,
+                character_spell_range_multiplier(&spell_reacher),
+            ),
+            Some(21.0)
+        );
+        assert_eq!(
+            moonberry_effective_skill_range_radius_with_multiplier(
+                None,
+                0.0,
+                character_spell_range_multiplier(&spell_reacher),
+            ),
+            None
+        );
+        spell_reacher.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_spell_range_multiplier(&spell_reacher),
+            1.0
+        );
+        let mut gale = character.clone();
+        gale.speed = 10.0;
+        gale.skill_names.push("狂风恶浪".to_owned());
+        gale.skill_metadata.push(CharacterSkillMetadata::talent(
+            "normal_talent",
+            "天赋",
+        ));
+        assert_eq!(
+            character_gale_force_battle_speeds(&gale),
+            Some((12.0, 13.5))
+        );
+        gale.speed = 12.0;
+        gale.buff_base_stats = Some(CharacterBuffBaseStats {
+            hp: 5.0,
+            max_hp: 5.0,
+            hp_regen: 0.0,
+            mp: 0.0,
+            max_mp: 0.0,
+            mp_regen: 0.0,
+            speed: 10.0,
+            damage_dealt_modifier: 1.0,
+            damage_taken_modifier: 1.0,
+            healing_dealt_modifier: 1.0,
+            healing_taken_modifier: 1.0,
+            extra_status: CharacterStatus::default(),
+        });
+        assert_eq!(
+            character_gale_force_battle_speeds(&gale),
+            Some((12.0, 13.5))
+        );
+        gale.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_gale_force_battle_speeds(&gale),
+            None
+        );
+        let mut penitent = character.clone();
+        penitent.skill_names.push("忏悔".to_owned());
+        penitent.skill_metadata.push(CharacterSkillMetadata::talent(
+            "support_talent",
+            "辅助天赋",
+        ));
+        assert_eq!(
+            character_penance_healing_bonus_percent(&penitent),
+            25.0
+        );
+        assert_eq!(
+            penance_decayed_healing_dealt_modifier(1.25, 25.0, 0),
+            1.25
+        );
+        assert!((penance_decayed_healing_dealt_modifier(1.25, 25.0, 1) - 1.15).abs() < 0.0001);
+        assert!((penance_decayed_healing_dealt_modifier(1.25, 25.0, 2) - 1.05).abs() < 0.0001);
+        assert_eq!(
+            penance_decayed_healing_dealt_modifier(1.25, 25.0, 3),
+            1.0
+        );
+        penitent.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_penance_healing_bonus_percent(&penitent),
+            0.0
         );
         let mut large_hit_target = character.clone();
         large_hit_target.skill_names.push("过度免疫".to_owned());

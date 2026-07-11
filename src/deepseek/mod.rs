@@ -385,7 +385,6 @@ pub fn setup(mut commands: Commands) {
 
 fn handle_tasks(mut commands: Commands, mut task: ResMut<DeepseekTask>) {
     if let Some(mut commands_queue) = block_on(future::poll_once(&mut task.0)) {
-        // append the returned command queue to have it execute later
         commands.append(&mut commands_queue);
     }
 }
@@ -405,7 +404,6 @@ async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> Comm
         .spawn(async move {
             loop {
                 tokio::select! {
-                    //Receive messages from the game
                     game_msg = game_to_deepseek_receiver.recv() => {
                         let Some(game_msg) = game_msg else {
                             break;

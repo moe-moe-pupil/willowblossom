@@ -26,17 +26,17 @@ mock_touch = []
 # The bevy engine <3
 # Default feautres are disabled because we are using audio from a different source (kira)
 # We also add trace_tracy for profiling
-bevy = { version = "=0.18.1" }
+bevy = { version = "=0.19.0" }
 
-bevy_asset_loader = { version = "0.26.0", features = [
+bevy_asset_loader = { version = "0.27.0", features = [
     "progress_tracking",
 ] } # Better asset loader
-bevy_embedded_assets = { version = "0.15.0" } # Embed assets in binary
-bevy_kira_audio = { version = "0.25.0" } # Improved audio library
-iyes_progress = { version = "0.16.0", features = [
+bevy_embedded_assets = { version = "0.16.0" } # Embed assets in binary
+bevy_kira_audio = { version = "0.26.0" } # Improved audio library
+iyes_progress = { version = "0.17.0", features = [
     "assets",
 ] } # Track loading and game state
-bevy-persistent = { version = "0.10.0", features = [
+bevy-persistent = { version = "0.11.0", features = [
     "toml",
     "all",
 ] } # Persistent values (for saving)
@@ -46,7 +46,7 @@ rand = { version = "0.10.1" }
 serde = { version = "1.0.228", features = ["derive"] }
 
 # Debug
-bevy-inspector-egui = { version = "0.36.0" } # Inspector
+bevy-inspector-egui = { version = "0.37.0" } # Inspector
 
 ## WebSocket
 url = "2.5.8"
@@ -58,13 +58,13 @@ tokio-tungstenite = "0.29.0"
 crossbeam-channel = "0.5.15"
 async-compat = "0.2.5"
 futures-lite = "2.6.1"
-bevy_egui = { version = "=0.39.0", features = ["serde"] }
-egui = { version = "=0.33.3", features = ["persistence"] }
+bevy_egui = { version = "=0.41.0", features = ["serde"] }
+egui = { version = "=0.35.0", features = ["persistence"] }
 serde_json = "1.0.150"
 dirs = "6.0.0"
-egui_extras = { version = "=0.33.3", features = ["all_loaders"] }
+egui_extras = { version = "=0.35.0", features = ["all_loaders"] }
 image = { version = "0.25.5", features = ["jpeg", "png"] }
 reqwest = { version = "0.12.14", features = ["blocking", "json"] }
 curl = "0.4.47"
-bevy_voxel_world = "0.15.0"
-avian3d = "0.6.1"
+bevy_voxel_world = "0.17.0"
+avian3d = "0.7.0"

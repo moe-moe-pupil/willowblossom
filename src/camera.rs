@@ -2,10 +2,6 @@ use bevy::prelude::*;
 
 use crate::GameState;
 
-// ······
-// Plugin
-// ······
-
 pub struct CameraPlugin;
 
 impl Plugin for CameraPlugin {
@@ -15,16 +11,8 @@ impl Plugin for CameraPlugin {
     }
 }
 
-// ··········
-// Components
-// ··········
-
 #[derive(Component)]
 pub struct GameCamera;
-
-// ·······
-// Systems
-// ·······
 
 fn resume_camera(mut cam: Query<&mut Camera, With<GameCamera>>) {
     if let Ok(mut cam) = cam.single_mut() {

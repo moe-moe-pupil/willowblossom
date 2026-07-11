@@ -1766,7 +1766,7 @@ fn setup_scene_preview(
         DirectionalLight {
             color: Color::srgb(1.0, 0.88, 0.68),
             illuminance: 68_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_translation(sun_position).looking_at(planet_center, Vec3::Y),
@@ -1857,7 +1857,7 @@ fn spawn_scene_point_light(
             intensity,
             range,
             radius: 1.8,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_translation(position),
@@ -2136,7 +2136,7 @@ fn spawn_scene_point_light_child(
             intensity,
             range,
             radius: 1.8,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_translation(position),
@@ -2876,7 +2876,7 @@ fn scene_visibility_selector_ui_with_id(
     manager: Option<&Persistent<NapcatMessageManager>>,
     visibility: &mut SceneVisibility,
     label: &str,
-    id: impl Hash,
+    id: impl Hash + std::fmt::Debug,
 ) {
     ui.label(label);
     egui::ComboBox::from_id_salt(("scene_visibility_selector", id))

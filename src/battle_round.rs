@@ -28,21 +28,52 @@ use serde::{
 
 use crate::{
     napcat::{
+        arrogance_damage_dealt_multiplier,
+        champion_damage_dealt_multiplier,
+        champion_damage_taken_multiplier,
+        character_arrogance_damage_bonus_per_source,
+        character_champion_damage_bonus_per_stack,
+        character_champion_damage_reduction_per_stack,
+        character_chaos_output_variance,
         character_damage_dealt_talent_buffs,
         character_damage_taken_attribute_multiplier,
+        character_dominion_max_hp_bonus_cap,
+        character_dominion_max_hp_gain_rate,
         character_dying_healing_taken_modifier,
+        character_echoing_memory_healing_rates,
+        character_endless_pain_bonus_damage_per_stack,
+        character_fighting_spirit_damage_taken_multiplier,
+        character_gale_force_battle_speeds,
+        character_infinite_focus_damage_bonus_per_stack,
+        character_keen_evasion_available,
         character_large_hit_damage_taken_modifier,
+        character_liquid_body_damage_delay_rate,
+        character_liquid_body_self_healing_rate,
         character_minimum_damage_floor,
         character_minimum_range_meters,
         character_moonberry_talent_damage_attribute_bonus,
         character_mutual_aid_healing_rate,
+        character_one_heart_healing_bonus_per_stack,
+        character_penance_healing_bonus_percent,
+        character_physical_damage_followup_rate,
         character_physical_damage_lifesteal,
         character_range_magic_converter_damage_bonus,
+        character_sin_on_sin_exp_bonus_per_stack,
+        character_sin_on_sin_recovery_rate,
+        character_spell_range_multiplier,
+        character_valorous_battle_damage_multiplier,
         character_wounded_healing_dealt_modifier,
         dying_healing_taken_multiplier,
+        endless_pain_bonus_damage,
+        infinite_focus_damage_dealt_multiplier,
         large_hit_damage_taken_multiplier,
         low_hp_damage_multiplier,
-        moonberry_effective_skill_range_radius,
+        moonberry_chaos_output_multiplier,
+        moonberry_effective_skill_range_radius_with_multiplier,
+        moonberry_skill_type_is_spell,
+        one_heart_healing_dealt_multiplier,
+        penance_decayed_healing_dealt_modifier,
+        sin_on_sin_exp_bonus_percent,
         skill_rule_args,
         status_damage_attribute_multiplier,
         status_healing_attribute_multiplier,
@@ -152,6 +183,8 @@ pub struct BattleParticipantSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit_template_id: Option<String>,
     #[serde(default)]
+    pub player_character: bool,
+    #[serde(default)]
     pub turn: u32,
     #[serde(default)]
     #[serde(rename = "str")]
@@ -184,6 +217,10 @@ pub struct BattleParticipantSnapshot {
     pub hp_regen: f32,
     #[serde(default)]
     pub mp_regen: f32,
+    #[serde(default)]
+    pub speed: f32,
+    #[serde(default)]
+    pub low_survivor_speed: f32,
     #[serde(default = "default_combat_modifier")]
     pub damage_dealt_modifier: f32,
     #[serde(default = "default_combat_modifier")]
@@ -193,13 +230,88 @@ pub struct BattleParticipantSnapshot {
     #[serde(default = "default_combat_modifier")]
     pub healing_taken_modifier: f32,
     #[serde(default)]
+    pub arrogance_damage_bonus_per_source: f32,
+    #[serde(default)]
+    pub arrogance_damage_source_ids: Vec<String>,
+    #[serde(default)]
+    pub endless_pain_bonus_damage_per_stack: f32,
+    #[serde(default)]
+    pub endless_pain_stacks: u32,
+    #[serde(default)]
+    pub infinite_focus_damage_bonus_per_stack: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infinite_focus_target_id: Option<String>,
+    #[serde(default)]
+    pub infinite_focus_stacks: u32,
+    #[serde(default)]
+    pub one_heart_healing_bonus_per_stack: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_heart_target_id: Option<String>,
+    #[serde(default)]
+    pub one_heart_stacks: u32,
+    #[serde(default)]
+    pub keen_evasion_enabled: bool,
+    #[serde(default)]
+    pub keen_evasion_available: bool,
+    #[serde(default)]
+    pub liquid_body_damage_delay_rate: f32,
+    #[serde(default)]
+    pub liquid_body_self_healing_rate: f32,
+    #[serde(default)]
+    pub champion_damage_bonus_per_stack: f32,
+    #[serde(default)]
+    pub champion_damage_reduction_per_stack: f32,
+    #[serde(default)]
+    pub champion_stacks: u32,
+    #[serde(default)]
+    pub dominion_max_hp_gain_rate: f32,
+    #[serde(default)]
+    pub dominion_max_hp_bonus_cap: f32,
+    #[serde(default)]
+    pub dominion_max_hp_bonus: f32,
+    #[serde(default)]
+    pub sin_on_sin_exp_bonus_per_stack: f32,
+    #[serde(default)]
+    pub sin_on_sin_recovery_rate: f32,
+    #[serde(default)]
+    pub sin_on_sin_stacks: u32,
+    #[serde(default)]
+    pub penance_healing_bonus_percent: f32,
+    #[serde(default)]
+    pub penance_kill_assist_count: u32,
+    #[serde(default)]
+    pub damage_contributors: Vec<String>,
+    #[serde(default)]
     pub wound_healing_taken_turns: i32,
+    #[serde(default)]
+    pub delayed_damage_ticks: Vec<BattleDelayedDamageTick>,
+    #[serde(default)]
+    pub delayed_healing_ticks: Vec<BattleDelayedHealingTick>,
     #[serde(default)]
     pub damage_taken_this_turn: f32,
     #[serde(default)]
     pub healing_taken_this_turn: f32,
     #[serde(default)]
     pub skill_last_used_turns: HashMap<String, u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BattleDelayedDamageTick {
+    pub name: String,
+    pub source_id: String,
+    pub source_name: String,
+    pub amount: f32,
+    pub damage_type: DamageType,
+    pub turns_remaining: i32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BattleDelayedHealingTick {
+    pub name: String,
+    pub source_id: String,
+    pub source_name: String,
+    pub amount: f32,
+    pub turns_remaining: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -289,12 +401,496 @@ fn record_participant_healing_taken(
     true
 }
 
+fn record_participant_damage_contributor(
+    participant: &mut BattleParticipantSnapshot,
+    source_id: &str,
+) {
+    if source_id.trim().is_empty() || participant.target_id == source_id {
+        return;
+    }
+    if !participant
+        .damage_contributors
+        .iter()
+        .any(|contributor| contributor == source_id)
+    {
+        participant.damage_contributors.push(source_id.to_owned());
+    }
+}
+
+fn record_participant_arrogance_damage_source(
+    participant: &mut BattleParticipantSnapshot,
+    source_id: &str,
+) {
+    if participant.arrogance_damage_bonus_per_source <= f32::EPSILON
+        || source_id.trim().is_empty()
+        || participant.target_id == source_id
+        || participant.arrogance_damage_source_ids.len() >= 3
+    {
+        return;
+    }
+    if !participant
+        .arrogance_damage_source_ids
+        .iter()
+        .any(|existing| existing == source_id)
+    {
+        participant
+            .arrogance_damage_source_ids
+            .push(source_id.to_owned());
+    }
+}
+
+fn record_participant_endless_pain_stack(participant: &mut BattleParticipantSnapshot) {
+    if participant.endless_pain_bonus_damage_per_stack <= f32::EPSILON {
+        return;
+    }
+    participant.endless_pain_stacks = participant.endless_pain_stacks.saturating_add(1).min(2);
+}
+
+fn participant_infinite_focus_damage_multiplier(
+    participant: &BattleParticipantSnapshot,
+    target_id: &str,
+) -> f32 {
+    if participant.infinite_focus_damage_bonus_per_stack <= f32::EPSILON {
+        return 1.0;
+    }
+    if participant.infinite_focus_target_id.as_deref() != Some(target_id) {
+        return 1.0;
+    }
+    infinite_focus_damage_dealt_multiplier(
+        participant.infinite_focus_damage_bonus_per_stack,
+        participant.infinite_focus_stacks,
+    )
+}
+
+fn record_participant_infinite_focus_hit(
+    participant: &mut BattleParticipantSnapshot,
+    target_id: &str,
+) {
+    if participant.infinite_focus_damage_bonus_per_stack <= f32::EPSILON
+        || target_id.trim().is_empty()
+        || participant.target_id == target_id
+    {
+        return;
+    }
+    if participant.infinite_focus_target_id.as_deref() == Some(target_id) {
+        participant.infinite_focus_stacks =
+            participant.infinite_focus_stacks.saturating_add(1).min(2);
+    } else {
+        participant.infinite_focus_target_id = Some(target_id.to_owned());
+        participant.infinite_focus_stacks = 1;
+    }
+}
+
+fn participant_one_heart_healing_multiplier(
+    participant: &BattleParticipantSnapshot,
+    target_id: &str,
+) -> f32 {
+    if participant.one_heart_healing_bonus_per_stack <= f32::EPSILON {
+        return 1.0;
+    }
+    if participant.one_heart_target_id.as_deref() != Some(target_id) {
+        return 1.0;
+    }
+    one_heart_healing_dealt_multiplier(
+        participant.one_heart_healing_bonus_per_stack,
+        participant.one_heart_stacks,
+    )
+}
+
+fn record_participant_one_heart_heal(participant: &mut BattleParticipantSnapshot, target_id: &str) {
+    if participant.one_heart_healing_bonus_per_stack <= f32::EPSILON || target_id.trim().is_empty()
+    {
+        return;
+    }
+    if participant.one_heart_target_id.as_deref() == Some(target_id) {
+        participant.one_heart_stacks = participant.one_heart_stacks.saturating_add(1).min(5);
+    } else {
+        participant.one_heart_target_id = Some(target_id.to_owned());
+        participant.one_heart_stacks = 1;
+    }
+}
+
+fn sync_participant_keen_evasion(participant: &mut BattleParticipantSnapshot, enabled: bool) {
+    if enabled && !participant.keen_evasion_enabled {
+        participant.keen_evasion_available = true;
+    } else if !enabled {
+        participant.keen_evasion_available = false;
+    }
+    participant.keen_evasion_enabled = enabled;
+}
+
+fn skill_damage_triggers_keen_evasion(target: TargetSelector, target_class: Option<&str>) -> bool {
+    target.area.is_some()
+        || skill_target_class_is_area(target_class)
+        || matches!(
+            target_class.map(str::trim),
+            Some("多目标" | "无目标")
+        )
+        || matches!(target.actor, ActorRef::Source)
+}
+
+fn participant_keen_evasion_evades_damage(
+    participant: &mut BattleParticipantSnapshot,
+    amount: f32,
+    target: TargetSelector,
+    target_class: Option<&str>,
+) -> bool {
+    if amount <= f32::EPSILON
+        || !participant.keen_evasion_enabled
+        || !participant.keen_evasion_available
+        || !skill_damage_triggers_keen_evasion(target, target_class)
+    {
+        return false;
+    }
+    participant.keen_evasion_available = false;
+    true
+}
+
+fn participant_liquid_body_split_damage(
+    participant: &BattleParticipantSnapshot,
+    amount: f32,
+) -> (f32, f32) {
+    let amount = amount.max(0.0);
+    let delay_rate = participant.liquid_body_damage_delay_rate.clamp(0.0, 1.0);
+    if amount <= f32::EPSILON || delay_rate <= f32::EPSILON {
+        return (amount, 0.0);
+    }
+    let delayed = amount * delay_rate;
+    (
+        (amount - delayed).max(0.0),
+        delayed.max(0.0),
+    )
+}
+
+fn apply_participant_liquid_body_healing(
+    participant: &mut BattleParticipantSnapshot,
+    previous_damage_taken: f32,
+) -> Option<String> {
+    if !participant.alive || participant.liquid_body_self_healing_rate <= f32::EPSILON {
+        return None;
+    }
+    let healing = previous_damage_taken.max(0.0) * participant.liquid_body_self_healing_rate;
+    if healing <= f32::EPSILON {
+        return None;
+    }
+    record_participant_healing_taken(participant, healing);
+    participant.hp = (participant.hp + healing).min(participant.max_hp);
+    participant.alive = participant.hp > 0.0;
+    Some(format!(
+        "{}触发液态躯体，回复{}点生命值",
+        participant.display_name,
+        format_number(healing)
+    ))
+}
+
+struct BattleDefeatOutcome {
+    contributors: Vec<String>,
+    defeated_player_character: bool,
+    defeated_max_hp: f32,
+}
+
+fn participant_defeat_outcome(
+    participant: &mut BattleParticipantSnapshot,
+    was_alive: bool,
+) -> Option<BattleDefeatOutcome> {
+    if !was_alive || participant.alive {
+        return None;
+    }
+    let contributors = std::mem::take(&mut participant.damage_contributors);
+    Some(BattleDefeatOutcome {
+        contributors,
+        defeated_player_character: participant.player_character,
+        defeated_max_hp: participant.max_hp,
+    })
+}
+
+fn apply_participant_damage_for_battle(
+    participant: &mut BattleParticipantSnapshot,
+    amount: f32,
+    source_id: &str,
+) -> Option<BattleDefeatOutcome> {
+    let final_amount = amount.max(0.0);
+    if final_amount <= f32::EPSILON {
+        return None;
+    }
+    let was_alive = participant.alive;
+    record_participant_damage_taken(participant, final_amount);
+    if was_alive {
+        record_participant_damage_contributor(participant, source_id);
+        record_participant_arrogance_damage_source(participant, source_id);
+        record_participant_endless_pain_stack(participant);
+    }
+    participant.hp = (participant.hp - final_amount).max(0.0);
+    participant.alive = participant.hp > 0.0;
+    participant_defeat_outcome(participant, was_alive)
+}
+
+fn apply_penance_kill_assists(
+    encounter: &mut BattleEncounter,
+    contributor_ids: impl IntoIterator<Item = String>,
+) {
+    let contributors = contributor_ids.into_iter().collect::<HashSet<_>>();
+    if contributors.is_empty() {
+        return;
+    }
+    for participant in &mut encounter.participants {
+        if contributors.contains(&participant.target_id) {
+            participant.penance_kill_assist_count =
+                participant.penance_kill_assist_count.saturating_add(1);
+        }
+    }
+}
+
+fn apply_champion_player_elimination(encounter: &mut BattleEncounter) {
+    for participant in &mut encounter.participants {
+        if !participant.alive
+            || (participant.champion_damage_bonus_per_stack <= f32::EPSILON
+                && participant.champion_damage_reduction_per_stack <= f32::EPSILON)
+        {
+            continue;
+        }
+        participant.champion_stacks = participant.champion_stacks.saturating_add(1);
+    }
+}
+
+fn apply_dominion_target_death(encounter: &mut BattleEncounter, defeated_max_hp: f32) {
+    let defeated_max_hp = defeated_max_hp.max(0.0);
+    if defeated_max_hp <= f32::EPSILON {
+        return;
+    }
+    let mut logs = Vec::new();
+    for participant in &mut encounter.participants {
+        if !participant.alive
+            || participant.dominion_max_hp_gain_rate <= f32::EPSILON
+            || participant.dominion_max_hp_bonus_cap <= f32::EPSILON
+        {
+            continue;
+        }
+        let remaining =
+            (participant.dominion_max_hp_bonus_cap - participant.dominion_max_hp_bonus).max(0.0);
+        if remaining <= f32::EPSILON {
+            continue;
+        }
+        let gained = (defeated_max_hp * participant.dominion_max_hp_gain_rate)
+            .min(remaining)
+            .max(0.0);
+        if gained <= f32::EPSILON {
+            continue;
+        }
+        participant.dominion_max_hp_bonus =
+            (participant.dominion_max_hp_bonus + gained).min(participant.dominion_max_hp_bonus_cap);
+        participant.max_hp += gained;
+        logs.push(format!(
+            "{}触发役于我手，生命上限提高{}点（{}/{}）",
+            participant.display_name,
+            format_number(gained),
+            format_number(participant.dominion_max_hp_bonus),
+            format_number(participant.dominion_max_hp_bonus_cap)
+        ));
+    }
+    encounter.action_log.extend(logs);
+}
+
+fn apply_sin_on_sin_kill_participation(
+    encounter: &mut BattleEncounter,
+    contributor_ids: &HashSet<String>,
+) {
+    if contributor_ids.is_empty() {
+        return;
+    }
+    let mut logs = Vec::new();
+    for participant in &mut encounter.participants {
+        if !participant.alive
+            || !contributor_ids.contains(&participant.target_id)
+            || (participant.sin_on_sin_exp_bonus_per_stack <= f32::EPSILON
+                && participant.sin_on_sin_recovery_rate <= f32::EPSILON)
+        {
+            continue;
+        }
+        participant.sin_on_sin_stacks = participant.sin_on_sin_stacks.saturating_add(1);
+        let hp_recovered = ((participant.max_hp - participant.hp).max(0.0)
+            * participant.sin_on_sin_recovery_rate)
+            .max(0.0);
+        let mp_recovered = ((participant.max_mp - participant.mp).max(0.0)
+            * participant.sin_on_sin_recovery_rate)
+            .max(0.0);
+        if hp_recovered > f32::EPSILON {
+            record_participant_healing_taken(participant, hp_recovered);
+            participant.hp = (participant.hp + hp_recovered).min(participant.max_hp);
+        }
+        if mp_recovered > f32::EPSILON {
+            participant.mp = (participant.mp + mp_recovered).min(participant.max_mp);
+        }
+        logs.push(format!(
+            "{}触发罪上加罪，回复{}点生命值、{}点魔法值，经验加成{}%",
+            participant.display_name,
+            format_number(hp_recovered),
+            format_number(mp_recovered),
+            format_number(sin_on_sin_exp_bonus_percent(
+                participant.sin_on_sin_exp_bonus_per_stack,
+                participant.sin_on_sin_stacks,
+            ))
+        ));
+    }
+    encounter.action_log.extend(logs);
+}
+
+fn apply_battle_defeat_outcome(encounter: &mut BattleEncounter, outcome: BattleDefeatOutcome) {
+    apply_dominion_target_death(encounter, outcome.defeated_max_hp);
+    let contributors = outcome.contributors.into_iter().collect::<HashSet<_>>();
+    if !contributors.is_empty() {
+        apply_penance_kill_assists(encounter, contributors.iter().cloned());
+        apply_sin_on_sin_kill_participation(encounter, &contributors);
+    }
+    if outcome.defeated_player_character {
+        apply_champion_player_elimination(encounter);
+    }
+}
+
 fn reset_participant_turn_totals(participant: &mut BattleParticipantSnapshot) -> bool {
     let changed = participant.damage_taken_this_turn.abs() > f32::EPSILON
         || participant.healing_taken_this_turn.abs() > f32::EPSILON;
     participant.damage_taken_this_turn = 0.0;
     participant.healing_taken_this_turn = 0.0;
     changed
+}
+
+fn completed_participant_turns(encounter: &BattleEncounter) -> u32 {
+    encounter
+        .participants
+        .iter()
+        .map(|participant| participant.turn)
+        .fold(0_u32, u32::saturating_add)
+}
+
+fn schedule_participant_delayed_damage(
+    participant: &mut BattleParticipantSnapshot,
+    source_id: &str,
+    source_name: &str,
+    name: &str,
+    amount: f32,
+    damage_type: DamageType,
+) {
+    participant
+        .delayed_damage_ticks
+        .push(BattleDelayedDamageTick {
+            name: name.to_owned(),
+            source_id: source_id.to_owned(),
+            source_name: source_name.to_owned(),
+            amount: amount.max(0.0),
+            damage_type,
+            turns_remaining: 2,
+        });
+}
+
+fn schedule_participant_delayed_healing(
+    participant: &mut BattleParticipantSnapshot,
+    source_id: &str,
+    source_name: &str,
+    name: &str,
+    amount: f32,
+    turns_remaining: i32,
+) {
+    participant
+        .delayed_healing_ticks
+        .push(BattleDelayedHealingTick {
+            name: name.to_owned(),
+            source_id: source_id.to_owned(),
+            source_name: source_name.to_owned(),
+            amount: amount.max(0.0),
+            turns_remaining: turns_remaining.max(1),
+        });
+}
+
+#[derive(Default)]
+struct BattleDelayedDamageAdvance {
+    logs: Vec<String>,
+    defeat_outcomes: Vec<BattleDefeatOutcome>,
+}
+
+fn advance_participant_delayed_damage_ticks(
+    participant: &mut BattleParticipantSnapshot,
+) -> BattleDelayedDamageAdvance {
+    if participant.delayed_damage_ticks.is_empty() {
+        return BattleDelayedDamageAdvance::default();
+    }
+    let mut advance = BattleDelayedDamageAdvance::default();
+    let display_name = participant.display_name.clone();
+    let mut due = Vec::new();
+    participant.delayed_damage_ticks.retain_mut(|tick| {
+        if tick.turns_remaining <= 0 {
+            return false;
+        }
+        tick.turns_remaining -= 1;
+        if tick.turns_remaining > 0 {
+            due.push(tick.clone());
+            true
+        } else {
+            false
+        }
+    });
+    if !participant.alive {
+        return advance;
+    }
+    for tick in due {
+        let final_amount = tick.amount.max(0.0);
+        if final_amount <= f32::EPSILON {
+            continue;
+        }
+        if let Some(outcome) = apply_participant_damage_for_battle(
+            participant,
+            final_amount,
+            &tick.source_id,
+        ) {
+            advance.defeat_outcomes.push(outcome);
+        }
+        advance.logs.push(format!(
+            "{}触发{}，对{}造成{}点{}伤害",
+            tick.source_name,
+            tick.name,
+            display_name,
+            format_number(final_amount),
+            battle_damage_type_label(tick.damage_type)
+        ));
+    }
+    advance
+}
+
+fn advance_participant_delayed_healing_ticks(
+    participant: &mut BattleParticipantSnapshot,
+) -> Vec<String> {
+    if participant.delayed_healing_ticks.is_empty() {
+        return Vec::new();
+    }
+    let display_name = participant.display_name.clone();
+    let mut due = Vec::new();
+    participant.delayed_healing_ticks.retain_mut(|tick| {
+        tick.turns_remaining -= 1;
+        if tick.turns_remaining <= 0 {
+            due.push(tick.clone());
+            false
+        } else {
+            true
+        }
+    });
+    let mut logs = Vec::new();
+    for tick in due {
+        let final_amount = tick.amount.max(0.0);
+        if final_amount <= f32::EPSILON {
+            continue;
+        }
+        record_participant_healing_taken(participant, final_amount);
+        participant.hp = (participant.hp + final_amount).min(participant.max_hp);
+        participant.alive = participant.hp > 0.0;
+        logs.push(format!(
+            "{}触发{}，为{}回复{}点生命值",
+            tick.source_name,
+            tick.name,
+            display_name,
+            format_number(final_amount)
+        ));
+    }
+    logs
 }
 
 fn setup_battle_round_store(mut commands: Commands) {
@@ -395,6 +991,7 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant.target_id.hash(&mut hasher);
             participant.display_name.hash(&mut hasher);
             participant.unit_template_id.hash(&mut hasher);
+            participant.player_character.hash(&mut hasher);
             participant.turn.hash(&mut hasher);
             participant.str_.hash(&mut hasher);
             participant.agi.hash(&mut hasher);
@@ -411,6 +1008,8 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant.max_mp.to_bits().hash(&mut hasher);
             participant.hp_regen.to_bits().hash(&mut hasher);
             participant.mp_regen.to_bits().hash(&mut hasher);
+            participant.speed.to_bits().hash(&mut hasher);
+            participant.low_survivor_speed.to_bits().hash(&mut hasher);
             participant
                 .damage_dealt_modifier
                 .to_bits()
@@ -427,7 +1026,94 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
                 .healing_taken_modifier
                 .to_bits()
                 .hash(&mut hasher);
+            participant
+                .arrogance_damage_bonus_per_source
+                .to_bits()
+                .hash(&mut hasher);
+            for source_id in &participant.arrogance_damage_source_ids {
+                source_id.hash(&mut hasher);
+            }
+            participant
+                .endless_pain_bonus_damage_per_stack
+                .to_bits()
+                .hash(&mut hasher);
+            participant.endless_pain_stacks.hash(&mut hasher);
+            participant
+                .infinite_focus_damage_bonus_per_stack
+                .to_bits()
+                .hash(&mut hasher);
+            participant.infinite_focus_target_id.hash(&mut hasher);
+            participant.infinite_focus_stacks.hash(&mut hasher);
+            participant
+                .one_heart_healing_bonus_per_stack
+                .to_bits()
+                .hash(&mut hasher);
+            participant.one_heart_target_id.hash(&mut hasher);
+            participant.one_heart_stacks.hash(&mut hasher);
+            participant.keen_evasion_enabled.hash(&mut hasher);
+            participant.keen_evasion_available.hash(&mut hasher);
+            participant
+                .liquid_body_damage_delay_rate
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .liquid_body_self_healing_rate
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .champion_damage_bonus_per_stack
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .champion_damage_reduction_per_stack
+                .to_bits()
+                .hash(&mut hasher);
+            participant.champion_stacks.hash(&mut hasher);
+            participant
+                .dominion_max_hp_gain_rate
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .dominion_max_hp_bonus_cap
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .dominion_max_hp_bonus
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .sin_on_sin_exp_bonus_per_stack
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .sin_on_sin_recovery_rate
+                .to_bits()
+                .hash(&mut hasher);
+            participant.sin_on_sin_stacks.hash(&mut hasher);
+            participant
+                .penance_healing_bonus_percent
+                .to_bits()
+                .hash(&mut hasher);
+            participant.penance_kill_assist_count.hash(&mut hasher);
+            for contributor in &participant.damage_contributors {
+                contributor.hash(&mut hasher);
+            }
             participant.wound_healing_taken_turns.hash(&mut hasher);
+            for tick in &participant.delayed_damage_ticks {
+                tick.name.hash(&mut hasher);
+                tick.source_id.hash(&mut hasher);
+                tick.source_name.hash(&mut hasher);
+                tick.amount.to_bits().hash(&mut hasher);
+                tick.damage_type.hash(&mut hasher);
+                tick.turns_remaining.hash(&mut hasher);
+            }
+            for tick in &participant.delayed_healing_ticks {
+                tick.name.hash(&mut hasher);
+                tick.source_id.hash(&mut hasher);
+                tick.source_name.hash(&mut hasher);
+                tick.amount.to_bits().hash(&mut hasher);
+                tick.turns_remaining.hash(&mut hasher);
+            }
             participant
                 .damage_taken_this_turn
                 .to_bits()
@@ -606,7 +1292,7 @@ fn encounter_ui(
                     .changed();
                 changed |= ui
                     .checkbox(&mut encounter.sort_by_turn, "排序")
-                    .on_hover_text("按AGI排序行动顺序。")
+                    .on_hover_text("按速度和AGI排序行动顺序。")
                     .changed();
                 if ui.button("刷新玩家").clicked() {
                     changed |= refresh_encounter_players(encounter, manager);
@@ -708,6 +1394,7 @@ fn encounter_roster_ui(
 
     ui.label("行动顺序");
     let order = ordered_participant_indices(encounter);
+    let living_player_count = living_player_participant_count(encounter);
     for (order_index, participant_index) in order.iter().copied().enumerate() {
         let mut remove = false;
         let participant = &mut encounter.participants[participant_index];
@@ -718,6 +1405,118 @@ fn encounter_roster_ui(
                 .text_edit_singleline(&mut participant.display_name)
                 .changed();
             ui.small(&participant.target_id);
+            ui.label("速度");
+            changed |= ui
+                .add(egui::DragValue::new(&mut participant.speed).speed(0.5))
+                .changed();
+            let effective_speed = participant_order_speed(participant, living_player_count);
+            if (effective_speed - participant.speed).abs() > f32::EPSILON {
+                ui.small(format!(
+                    "实 {}",
+                    format_number(effective_speed)
+                ));
+            }
+            if participant.penance_healing_bonus_percent > f32::EPSILON
+                && participant.penance_kill_assist_count > 0
+            {
+                ui.small(format!(
+                    "忏悔{}次",
+                    participant.penance_kill_assist_count
+                ));
+            }
+            if participant.arrogance_damage_bonus_per_source > f32::EPSILON
+                && !participant.arrogance_damage_source_ids.is_empty()
+            {
+                ui.small(format!(
+                    "狂妄{}层",
+                    participant.arrogance_damage_source_ids.len()
+                ));
+            }
+            if participant.endless_pain_bonus_damage_per_stack > f32::EPSILON
+                && participant.endless_pain_stacks > 0
+            {
+                ui.small(format!(
+                    "无尽痛楚{}层",
+                    participant.endless_pain_stacks
+                ));
+            }
+            if participant.infinite_focus_damage_bonus_per_stack > f32::EPSILON
+                && participant.infinite_focus_stacks > 0
+            {
+                ui.small(format!(
+                    "无限专注{}层",
+                    participant.infinite_focus_stacks
+                ));
+            }
+            if participant.one_heart_healing_bonus_per_stack > f32::EPSILON
+                && participant.one_heart_stacks > 0
+            {
+                ui.small(format!(
+                    "一心{}层",
+                    participant.one_heart_stacks
+                ));
+            }
+            if participant.keen_evasion_enabled && participant.keen_evasion_available {
+                ui.small("敏锐待机");
+            }
+            if participant.liquid_body_damage_delay_rate > f32::EPSILON
+                || participant.liquid_body_self_healing_rate > f32::EPSILON
+            {
+                ui.small("液态躯体");
+            }
+            let pending_delayed_damage = participant
+                .delayed_damage_ticks
+                .iter()
+                .map(|tick| tick.amount.max(0.0))
+                .sum::<f32>();
+            if pending_delayed_damage > f32::EPSILON {
+                ui.small(format!(
+                    "待伤害+{}",
+                    format_number(pending_delayed_damage)
+                ));
+            }
+            let pending_delayed_healing = participant
+                .delayed_healing_ticks
+                .iter()
+                .map(|tick| tick.amount.max(0.0))
+                .sum::<f32>();
+            if pending_delayed_healing > f32::EPSILON {
+                ui.small(format!(
+                    "待治疗+{}",
+                    format_number(pending_delayed_healing)
+                ));
+            }
+            if (participant.champion_damage_bonus_per_stack > f32::EPSILON
+                || participant.champion_damage_reduction_per_stack > f32::EPSILON)
+                && participant.champion_stacks > 0
+            {
+                ui.small(format!(
+                    "总冠军{}层",
+                    participant.champion_stacks
+                ));
+            }
+            if participant.dominion_max_hp_gain_rate > f32::EPSILON
+                && participant.dominion_max_hp_bonus > f32::EPSILON
+            {
+                ui.small(format!(
+                    "役于我手+{}/{}",
+                    format_number(participant.dominion_max_hp_bonus),
+                    format_number(participant.dominion_max_hp_bonus_cap)
+                ));
+            }
+            if (participant.sin_on_sin_exp_bonus_per_stack > f32::EPSILON
+                || participant.sin_on_sin_recovery_rate > f32::EPSILON)
+                && participant.sin_on_sin_stacks > 0
+            {
+                ui.small(format!(
+                    "罪上加罪{}层/{}%",
+                    participant.sin_on_sin_stacks,
+                    format_number(sin_on_sin_exp_bonus_percent(
+                        participant.sin_on_sin_exp_bonus_per_stack,
+                        participant.sin_on_sin_stacks,
+                    ))
+                ));
+            }
             ui.label("AGI");
             changed |= ui
                 .add(egui::DragValue::new(&mut participant.agi).speed(1))
@@ -1084,9 +1883,17 @@ impl BattleRoundStore {
             return false;
         };
         encounter.round += 1;
+        let mut delayed_logs = Vec::new();
+        let mut defeat_outcomes = Vec::new();
         for participant in &mut encounter.participants {
             participant.action_done = false;
+            let previous_damage_taken = participant.damage_taken_this_turn;
             reset_participant_turn_totals(participant);
+            if let Some(log) =
+                apply_participant_liquid_body_healing(participant, previous_damage_taken)
+            {
+                delayed_logs.push(log);
+            }
             if participant.alive {
                 if !encounter.active {
                     participant.hp =
@@ -1094,10 +1901,18 @@ impl BattleRoundStore {
                 }
                 participant.mp = (participant.mp + participant.mp_regen).min(participant.max_mp);
             }
+            let delayed = advance_participant_delayed_damage_ticks(participant);
+            delayed_logs.extend(delayed.logs);
+            defeat_outcomes.extend(delayed.defeat_outcomes);
+            delayed_logs.extend(advance_participant_delayed_healing_ticks(participant));
+        }
+        for outcome in defeat_outcomes {
+            apply_battle_defeat_outcome(encounter, outcome);
         }
         encounter
             .action_log
             .push(format!("第{}轮开始", encounter.round));
+        encounter.action_log.extend(delayed_logs);
         if encounter.negative_enabled {
             mark_negative_candidates(encounter);
         }
@@ -1190,16 +2005,18 @@ impl BattleRoundStore {
             return false;
         };
         let final_damage = damage.max(0.0);
-        record_participant_damage_taken(target, final_damage);
-        target.hp = (target.hp - final_damage).max(0.0);
-        target.alive = target.hp > 0.0;
+        let defeat_outcome = apply_participant_damage_for_battle(target, final_damage, actor_id);
+        let target_display_name = target.display_name.clone();
         encounter.action_log.push(format!(
             "{}对{}使用{}，造成{}点伤害",
             actor_name,
-            target.display_name,
+            target_display_name,
             action_name,
             format_number(final_damage)
         ));
+        if let Some(outcome) = defeat_outcome {
+            apply_battle_defeat_outcome(encounter, outcome);
+        }
         true
     }
 
@@ -1230,6 +2047,9 @@ impl BattleRoundStore {
             .unwrap_or_default();
         let actor_physical_damage_lifesteal = actor_character
             .map(character_physical_damage_lifesteal)
+            .unwrap_or(0.0);
+        let actor_physical_damage_followup_rate = actor_character
+            .map(character_physical_damage_followup_rate)
             .unwrap_or(0.0);
         let actor_minimum_damage_floor = actor_character
             .map(character_minimum_damage_floor)
@@ -1292,12 +2112,14 @@ impl BattleRoundStore {
                     &actor_snapshot,
                     actor_character,
                     &basic_config,
+                    completed_participant_turns(encounter),
                     damage_type,
                 );
                 let fallback_radius = battle_skill_damage_range_radius(
                     skill.range,
                     actor_character,
                     damage_type,
+                    skill.skill_type.as_deref(),
                 );
                 let target_ids = resolve_skill_targets(
                     target,
@@ -1315,6 +2137,12 @@ impl BattleRoundStore {
                         skill.target_class.as_deref(),
                     ),
                 );
+                let infinite_focus_target_id = infinite_focus_eligible_target_id(
+                    target,
+                    actor_id,
+                    &target_ids,
+                    skill.target_class.as_deref(),
+                );
                 if target_ids.is_empty() {
                     encounter.action_log.push(format!(
                         "{}使用{}，但范围内没有目标",
@@ -1322,6 +2150,14 @@ impl BattleRoundStore {
                     ));
                 }
                 let mut pending_actor_lifesteal = 0.0;
+                let mut pending_endless_pain_bonus_damage = endless_pain_bonus_damage(
+                    actor_snapshot.endless_pain_bonus_damage_per_stack,
+                    actor_snapshot.endless_pain_stacks,
+                );
+                let mut consumed_endless_pain_stacks = 0_u32;
+                let mut infinite_focus_hit_target_id = None::<String>;
+                let damage_target_selector = target;
+                let damage_target_class = skill.target_class.as_deref();
                 for resolved_target_id in target_ids {
                     let Some(target) = encounter
                         .participants
@@ -1332,6 +2168,10 @@ impl BattleRoundStore {
                     };
                     let target_character = character_for_participant(target, manager);
                     let target_damage_multiplier = target.damage_taken_modifier
+                        * champion_damage_taken_multiplier(
+                            target.champion_damage_reduction_per_stack,
+                            target.champion_stacks,
+                        )
                         * target_character
                             .map(|character| {
                                 character_damage_taken_attribute_multiplier(
@@ -1339,9 +2179,30 @@ impl BattleRoundStore {
                                     trpg_damage_taken_kind(damage_type),
                                 )
                             })
+                            .unwrap_or(1.0)
+                        * target_character
+                            .map(|character| {
+                                character_fighting_spirit_damage_taken_multiplier(
+                                    character,
+                                    target.turn,
+                                )
+                            })
                             .unwrap_or(1.0);
-                    let incoming_amount =
-                        (amount * actor_damage_multiplier * target_damage_multiplier).max(0.0);
+                    let infinite_focus_multiplier = if infinite_focus_target_id.as_deref()
+                        == Some(resolved_target_id.as_str())
+                    {
+                        participant_infinite_focus_damage_multiplier(
+                            &actor_snapshot,
+                            &resolved_target_id,
+                        )
+                    } else {
+                        1.0
+                    };
+                    let incoming_amount = (amount
+                        * actor_damage_multiplier
+                        * infinite_focus_multiplier
+                        * target_damage_multiplier)
+                        .max(0.0);
                     let target_large_hit_modifier = target_character
                         .map(character_large_hit_damage_taken_modifier)
                         .unwrap_or(1.0);
@@ -1352,15 +2213,47 @@ impl BattleRoundStore {
                             target_large_hit_modifier,
                         ))
                     .max(0.0);
-                    let final_amount =
+                    let mut final_amount =
                         if amount > f32::EPSILON && actor_minimum_damage_floor > f32::EPSILON {
                             typed_final_amount.max(actor_minimum_damage_floor)
                         } else {
                             typed_final_amount
                         };
-                    record_participant_damage_taken(target, final_amount);
-                    target.hp = (target.hp - final_amount).max(0.0);
-                    target.alive = target.hp > 0.0;
+                    let evaded_by_keen_evasion = participant_keen_evasion_evades_damage(
+                        target,
+                        final_amount,
+                        damage_target_selector,
+                        damage_target_class,
+                    );
+                    if evaded_by_keen_evasion {
+                        final_amount = 0.0;
+                    }
+                    let endless_pain_bonus = if final_amount > f32::EPSILON
+                        && pending_endless_pain_bonus_damage > f32::EPSILON
+                    {
+                        let bonus = pending_endless_pain_bonus_damage;
+                        pending_endless_pain_bonus_damage = 0.0;
+                        consumed_endless_pain_stacks = actor_snapshot.endless_pain_stacks.min(2);
+                        bonus
+                    } else {
+                        0.0
+                    };
+                    let resolved_amount = final_amount + endless_pain_bonus;
+                    let (final_amount, delayed_liquid_body_damage) =
+                        participant_liquid_body_split_damage(target, resolved_amount);
+                    let target_display_name = target.display_name.clone();
+                    if delayed_liquid_body_damage > f32::EPSILON {
+                        schedule_participant_delayed_damage(
+                            target,
+                            actor_id,
+                            &target_display_name,
+                            "液态躯体",
+                            delayed_liquid_body_damage,
+                            damage_type,
+                        );
+                    }
+                    let defeat_outcome =
+                        apply_participant_damage_for_battle(target, final_amount, actor_id);
                     if final_amount > f32::EPSILON
                         && actor_damage_dealt_buffs
                             .iter()
@@ -1371,14 +2264,79 @@ impl BattleRoundStore {
                     if final_amount > f32::EPSILON && damage_type == DamageType::Physical {
                         pending_actor_lifesteal +=
                             typed_final_amount * actor_physical_damage_lifesteal;
+                        if actor_physical_damage_followup_rate > f32::EPSILON {
+                            schedule_participant_delayed_damage(
+                                target,
+                                actor_id,
+                                &actor_name,
+                                "苏萨斯之爪",
+                                final_amount * actor_physical_damage_followup_rate,
+                                DamageType::Magical,
+                            );
+                        }
                     }
                     encounter.action_log.push(format!(
                         "{}对{}使用{}，造成{}点伤害",
                         actor_name,
-                        target.display_name,
+                        target_display_name,
                         skill.name,
                         format_number(final_amount)
                     ));
+                    if evaded_by_keen_evasion {
+                        encounter.action_log.push(format!(
+                            "{}触发敏锐，闪避本次伤害",
+                            target_display_name
+                        ));
+                    }
+                    if delayed_liquid_body_damage > f32::EPSILON {
+                        encounter.action_log.push(format!(
+                            "{}触发液态躯体，延后{}点伤害",
+                            target_display_name,
+                            format_number(delayed_liquid_body_damage)
+                        ));
+                    }
+                    if endless_pain_bonus > f32::EPSILON {
+                        encounter.action_log.push(format!(
+                            "{}触发无尽痛楚，追加{}点无类型伤害",
+                            actor_name,
+                            format_number(endless_pain_bonus)
+                        ));
+                    }
+                    if final_amount > f32::EPSILON
+                        && infinite_focus_target_id.as_deref() == Some(resolved_target_id.as_str())
+                    {
+                        infinite_focus_hit_target_id = Some(resolved_target_id.clone());
+                        if infinite_focus_multiplier > 1.0 + f32::EPSILON {
+                            encounter.action_log.push(format!(
+                                "{}触发无限专注，伤害提高{}%",
+                                actor_name,
+                                format_number((infinite_focus_multiplier - 1.0) * 100.0)
+                            ));
+                        }
+                    }
+                    if let Some(outcome) = defeat_outcome {
+                        apply_battle_defeat_outcome(encounter, outcome);
+                    }
+                }
+                if let Some(hit_target_id) = infinite_focus_hit_target_id {
+                    if let Some(actor) = encounter
+                        .participants
+                        .iter_mut()
+                        .find(|participant| participant.target_id == actor_id)
+                    {
+                        record_participant_infinite_focus_hit(actor, &hit_target_id);
+                    }
+                }
+                if consumed_endless_pain_stacks > 0 {
+                    if let Some(actor) = encounter
+                        .participants
+                        .iter_mut()
+                        .find(|participant| participant.target_id == actor_id)
+                    {
+                        actor.endless_pain_stacks = actor
+                            .endless_pain_stacks
+                            .saturating_sub(consumed_endless_pain_stacks);
+                    }
                 }
                 if pending_actor_lifesteal > f32::EPSILON {
                     if let Some(actor) = encounter
@@ -1406,6 +2364,8 @@ impl BattleRoundStore {
                 let actor_mutual_aid_healing_rate = actor_character
                     .map(character_mutual_aid_healing_rate)
                     .unwrap_or(0.0);
+                let actor_echoing_memory_healing_rates =
+                    actor_character.and_then(character_echoing_memory_healing_rates);
                 let target_ids = resolve_skill_targets(
                     target,
                     actor_id,
@@ -1422,6 +2382,11 @@ impl BattleRoundStore {
                         skill.target_class.as_deref(),
                     ),
                 );
+                let single_heal_target_id = one_heart_eligible_target_id(
+                    target,
+                    &target_ids,
+                    skill.target_class.as_deref(),
+                );
                 if target_ids.is_empty() {
                     encounter.action_log.push(format!(
                         "{}使用{}，但范围内没有目标",
@@ -1429,6 +2394,7 @@ impl BattleRoundStore {
                     ));
                 }
                 let mut pending_actor_mutual_aid_healing = 0.0;
+                let mut healed_one_heart_target_id = None::<String>;
                 for resolved_target_id in target_ids {
                     let Some(target) = encounter
                         .participants
@@ -1451,14 +2417,55 @@ impl BattleRoundStore {
                             target.max_hp,
                             target_dying_healing_modifier,
                         );
-                    let final_amount =
-                        (amount * actor_healing_multiplier * target_healing_multiplier).max(0.0);
+                    let one_heart_multiplier =
+                        if single_heal_target_id.as_deref() == Some(resolved_target_id.as_str()) {
+                            participant_one_heart_healing_multiplier(
+                                &actor_snapshot,
+                                &resolved_target_id,
+                            )
+                        } else {
+                            1.0
+                        };
+                    let final_amount = (amount
+                        * actor_healing_multiplier
+                        * one_heart_multiplier
+                        * target_healing_multiplier)
+                        .max(0.0);
                     record_participant_healing_taken(target, final_amount);
                     target.hp = (target.hp + final_amount).min(target.max_hp);
                     target.alive = target.hp > 0.0;
                     if resolved_target_id != actor_id && final_amount > f32::EPSILON {
                         pending_actor_mutual_aid_healing += final_amount
                             * (actor_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
+                    }
+                    if final_amount > f32::EPSILON
+                        && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
+                    {
+                        healed_one_heart_target_id = Some(resolved_target_id.clone());
+                    }
+                    if final_amount > f32::EPSILON
+                        && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
+                    {
+                        if let Some((first_echo_rate, second_echo_rate)) =
+                            actor_echoing_memory_healing_rates
+                        {
+                            schedule_participant_delayed_healing(
+                                target,
+                                actor_id,
+                                &actor_name,
+                                "千万回忆",
+                                final_amount * first_echo_rate,
+                                1,
+                            );
+                            schedule_participant_delayed_healing(
+                                target,
+                                actor_id,
+                                &actor_name,
+                                "千万回忆",
+                                final_amount * second_echo_rate,
+                                2,
+                            );
+                        }
                     }
                     encounter.action_log.push(format!(
                         "{}对{}使用{}，回复{}点生命值",
@@ -1467,6 +2474,22 @@ impl BattleRoundStore {
                         skill.name,
                         format_number(final_amount)
                     ));
+                    if one_heart_multiplier > 1.0 + f32::EPSILON {
+                        encounter.action_log.push(format!(
+                            "{}触发一心，治疗效果提高{}%",
+                            actor_name,
+                            format_number((one_heart_multiplier - 1.0) * 100.0)
+                        ));
+                    }
+                }
+                if let Some(target_id) = healed_one_heart_target_id {
+                    if let Some(actor) = encounter
+                        .participants
+                        .iter_mut()
+                        .find(|participant| participant.target_id == actor_id)
+                    {
+                        record_participant_one_heart_heal(actor, &target_id);
+                    }
                 }
                 if pending_actor_mutual_aid_healing > f32::EPSILON {
                     if let Some(actor) = encounter
@@ -1532,10 +2555,20 @@ impl BattleRoundStore {
             }
             participant.mp = (participant.mp + participant.mp_regen).min(participant.max_mp);
         }
+        let previous_damage_taken = participant.damage_taken_this_turn;
         reset_participant_turn_totals(participant);
+        let mut delayed_logs = Vec::new();
+        if let Some(log) = apply_participant_liquid_body_healing(participant, previous_damage_taken)
+        {
+            delayed_logs.push(log);
+        }
         if participant.wound_healing_taken_turns > 0 {
             participant.wound_healing_taken_turns -= 1;
         }
+        let delayed = advance_participant_delayed_damage_ticks(participant);
+        delayed_logs.extend(delayed.logs);
+        let defeat_outcomes = delayed.defeat_outcomes;
+        delayed_logs.extend(advance_participant_delayed_healing_ticks(participant));
         participant.turn += 1;
         participant.pending_negative = false;
         encounter.round = encounter
@@ -1549,6 +2582,10 @@ impl BattleRoundStore {
         if encounter.negative_enabled {
             mark_negative_candidates(encounter);
         }
+        for outcome in defeat_outcomes {
+            apply_battle_defeat_outcome(encounter, outcome);
+        }
+        encounter.action_log.extend(delayed_logs);
         true
     }
 
@@ -1614,6 +2651,7 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant.target_id.hash(&mut hasher);
         participant.display_name.hash(&mut hasher);
         participant.unit_template_id.hash(&mut hasher);
+        participant.player_character.hash(&mut hasher);
         participant.str_.hash(&mut hasher);
         participant.agi.hash(&mut hasher);
         participant.dex.hash(&mut hasher);
@@ -1627,6 +2665,8 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant.max_mp.to_bits().hash(&mut hasher);
         participant.hp_regen.to_bits().hash(&mut hasher);
         participant.mp_regen.to_bits().hash(&mut hasher);
+        participant.speed.to_bits().hash(&mut hasher);
+        participant.low_survivor_speed.to_bits().hash(&mut hasher);
         participant
             .damage_dealt_modifier
             .to_bits()
@@ -1644,6 +2684,94 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
             .to_bits()
             .hash(&mut hasher);
         participant
+            .arrogance_damage_bonus_per_source
+            .to_bits()
+            .hash(&mut hasher);
+        for source_id in &participant.arrogance_damage_source_ids {
+            source_id.hash(&mut hasher);
+        }
+        participant
+            .endless_pain_bonus_damage_per_stack
+            .to_bits()
+            .hash(&mut hasher);
+        participant.endless_pain_stacks.hash(&mut hasher);
+        participant
+            .infinite_focus_damage_bonus_per_stack
+            .to_bits()
+            .hash(&mut hasher);
+        participant.infinite_focus_target_id.hash(&mut hasher);
+        participant.infinite_focus_stacks.hash(&mut hasher);
+        participant
+            .one_heart_healing_bonus_per_stack
+            .to_bits()
+            .hash(&mut hasher);
+        participant.one_heart_target_id.hash(&mut hasher);
+        participant.one_heart_stacks.hash(&mut hasher);
+        participant.keen_evasion_enabled.hash(&mut hasher);
+        participant.keen_evasion_available.hash(&mut hasher);
+        participant
+            .liquid_body_damage_delay_rate
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .liquid_body_self_healing_rate
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .champion_damage_bonus_per_stack
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .champion_damage_reduction_per_stack
+            .to_bits()
+            .hash(&mut hasher);
+        participant.champion_stacks.hash(&mut hasher);
+        participant
+            .dominion_max_hp_gain_rate
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .dominion_max_hp_bonus_cap
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .dominion_max_hp_bonus
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .sin_on_sin_exp_bonus_per_stack
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .sin_on_sin_recovery_rate
+            .to_bits()
+            .hash(&mut hasher);
+        participant.sin_on_sin_stacks.hash(&mut hasher);
+        participant
+            .penance_healing_bonus_percent
+            .to_bits()
+            .hash(&mut hasher);
+        participant.penance_kill_assist_count.hash(&mut hasher);
+        for contributor in &participant.damage_contributors {
+            contributor.hash(&mut hasher);
+        }
+        participant.wound_healing_taken_turns.hash(&mut hasher);
+        for tick in &participant.delayed_damage_ticks {
+            tick.name.hash(&mut hasher);
+            tick.source_id.hash(&mut hasher);
+            tick.source_name.hash(&mut hasher);
+            tick.amount.to_bits().hash(&mut hasher);
+            tick.damage_type.hash(&mut hasher);
+            tick.turns_remaining.hash(&mut hasher);
+        }
+        for tick in &participant.delayed_healing_ticks {
+            tick.name.hash(&mut hasher);
+            tick.source_id.hash(&mut hasher);
+            tick.source_name.hash(&mut hasher);
+            tick.amount.to_bits().hash(&mut hasher);
+            tick.turns_remaining.hash(&mut hasher);
+        }
+        participant
             .damage_taken_this_turn
             .to_bits()
             .hash(&mut hasher);
@@ -1655,16 +2783,25 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
     hasher.finish()
 }
 
+fn character_battle_speeds(character: &PlayerCharacter) -> (f32, f32) {
+    character_gale_force_battle_speeds(character).unwrap_or_else(|| {
+        let speed = character.speed.max(0.0);
+        (speed, speed)
+    })
+}
+
 fn participant_from_character(
     target_id: &str,
     character: &PlayerCharacter,
     manager: &NapcatMessageManager,
 ) -> BattleParticipantSnapshot {
     let status = character.status.combined(&character.extra_status);
+    let (speed, low_survivor_speed) = character_battle_speeds(character);
     BattleParticipantSnapshot {
         target_id: target_id.to_owned(),
         display_name: character_display_name(target_id, character, manager),
         unit_template_id: None,
+        player_character: true,
         turn: 0,
         str_: status.str_,
         agi: status.agi,
@@ -1681,11 +2818,47 @@ fn participant_from_character(
         max_mp: character.max_mp,
         hp_regen: character.hp_regen,
         mp_regen: character.mp_regen,
+        speed,
+        low_survivor_speed,
         damage_dealt_modifier: character.damage_dealt_modifier,
         damage_taken_modifier: character.damage_taken_modifier,
         healing_dealt_modifier: character.healing_dealt_modifier,
         healing_taken_modifier: character.healing_taken_modifier,
+        arrogance_damage_bonus_per_source: character_arrogance_damage_bonus_per_source(character),
+        arrogance_damage_source_ids: Vec::new(),
+        endless_pain_bonus_damage_per_stack: character_endless_pain_bonus_damage_per_stack(
+            character,
+        ),
+        endless_pain_stacks: 0,
+        infinite_focus_damage_bonus_per_stack: character_infinite_focus_damage_bonus_per_stack(
+            character,
+        ),
+        infinite_focus_target_id: None,
+        infinite_focus_stacks: 0,
+        one_heart_healing_bonus_per_stack: character_one_heart_healing_bonus_per_stack(character),
+        one_heart_target_id: None,
+        one_heart_stacks: 0,
+        keen_evasion_enabled: character_keen_evasion_available(character),
+        keen_evasion_available: character_keen_evasion_available(character),
+        liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
+        liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
+        champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
+        champion_damage_reduction_per_stack: character_champion_damage_reduction_per_stack(
+            character,
+        ),
+        champion_stacks: 0,
+        dominion_max_hp_gain_rate: character_dominion_max_hp_gain_rate(character),
+        dominion_max_hp_bonus_cap: character_dominion_max_hp_bonus_cap(character),
+        dominion_max_hp_bonus: 0.0,
+        sin_on_sin_exp_bonus_per_stack: character_sin_on_sin_exp_bonus_per_stack(character),
+        sin_on_sin_recovery_rate: character_sin_on_sin_recovery_rate(character),
+        sin_on_sin_stacks: 0,
+        penance_healing_bonus_percent: character_penance_healing_bonus_percent(character),
+        penance_kill_assist_count: 0,
+        damage_contributors: Vec::new(),
         wound_healing_taken_turns: 0,
+        delayed_damage_ticks: Vec::new(),
+        delayed_healing_ticks: Vec::new(),
         damage_taken_this_turn: character.damage_taken_this_turn,
         healing_taken_this_turn: character.healing_taken_this_turn,
         skill_last_used_turns: HashMap::new(),
@@ -1699,10 +2872,12 @@ fn participant_from_unit_template(
 ) -> BattleParticipantSnapshot {
     let character = &unit.character;
     let status = character.status.combined(&character.extra_status);
+    let (speed, low_survivor_speed) = character_battle_speeds(character);
     BattleParticipantSnapshot {
         target_id: target_id.to_owned(),
         display_name: unit_participant_display_name(target_id, unit_id, unit),
         unit_template_id: Some(unit_id.to_owned()),
+        player_character: false,
         turn: 0,
         str_: status.str_,
         agi: status.agi,
@@ -1719,11 +2894,47 @@ fn participant_from_unit_template(
         max_mp: character.max_mp,
         hp_regen: character.hp_regen,
         mp_regen: character.mp_regen,
+        speed,
+        low_survivor_speed,
         damage_dealt_modifier: character.damage_dealt_modifier,
         damage_taken_modifier: character.damage_taken_modifier,
         healing_dealt_modifier: character.healing_dealt_modifier,
         healing_taken_modifier: character.healing_taken_modifier,
+        arrogance_damage_bonus_per_source: character_arrogance_damage_bonus_per_source(character),
+        arrogance_damage_source_ids: Vec::new(),
+        endless_pain_bonus_damage_per_stack: character_endless_pain_bonus_damage_per_stack(
+            character,
+        ),
+        endless_pain_stacks: 0,
+        infinite_focus_damage_bonus_per_stack: character_infinite_focus_damage_bonus_per_stack(
+            character,
+        ),
+        infinite_focus_target_id: None,
+        infinite_focus_stacks: 0,
+        one_heart_healing_bonus_per_stack: character_one_heart_healing_bonus_per_stack(character),
+        one_heart_target_id: None,
+        one_heart_stacks: 0,
+        keen_evasion_enabled: character_keen_evasion_available(character),
+        keen_evasion_available: character_keen_evasion_available(character),
+        liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
+        liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
+        champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
+        champion_damage_reduction_per_stack: character_champion_damage_reduction_per_stack(
+            character,
+        ),
+        champion_stacks: 0,
+        dominion_max_hp_gain_rate: character_dominion_max_hp_gain_rate(character),
+        dominion_max_hp_bonus_cap: character_dominion_max_hp_bonus_cap(character),
+        dominion_max_hp_bonus: 0.0,
+        sin_on_sin_exp_bonus_per_stack: character_sin_on_sin_exp_bonus_per_stack(character),
+        sin_on_sin_recovery_rate: character_sin_on_sin_recovery_rate(character),
+        sin_on_sin_stacks: 0,
+        penance_healing_bonus_percent: character_penance_healing_bonus_percent(character),
+        penance_kill_assist_count: 0,
+        damage_contributors: Vec::new(),
         wound_healing_taken_turns: 0,
+        delayed_damage_ticks: Vec::new(),
+        delayed_healing_ticks: Vec::new(),
         damage_taken_this_turn: character.damage_taken_this_turn,
         healing_taken_this_turn: character.healing_taken_this_turn,
         skill_last_used_turns: HashMap::new(),
@@ -1742,6 +2953,7 @@ fn participant_from_target(
         target_id: target_id.to_owned(),
         display_name: fallback_target_display_name(target_id, manager),
         unit_template_id: None,
+        player_character: false,
         turn: 0,
         str_: 0,
         agi: 0,
@@ -1758,11 +2970,41 @@ fn participant_from_target(
         max_mp: 0.0,
         hp_regen: 0.0,
         mp_regen: 0.0,
+        speed: 0.0,
+        low_survivor_speed: 0.0,
         damage_dealt_modifier: 1.0,
         damage_taken_modifier: 1.0,
         healing_dealt_modifier: 1.0,
         healing_taken_modifier: 1.0,
+        arrogance_damage_bonus_per_source: 0.0,
+        arrogance_damage_source_ids: Vec::new(),
+        endless_pain_bonus_damage_per_stack: 0.0,
+        endless_pain_stacks: 0,
+        infinite_focus_damage_bonus_per_stack: 0.0,
+        infinite_focus_target_id: None,
+        infinite_focus_stacks: 0,
+        one_heart_healing_bonus_per_stack: 0.0,
+        one_heart_target_id: None,
+        one_heart_stacks: 0,
+        keen_evasion_enabled: false,
+        keen_evasion_available: false,
+        liquid_body_damage_delay_rate: 0.0,
+        liquid_body_self_healing_rate: 0.0,
+        champion_damage_bonus_per_stack: 0.0,
+        champion_damage_reduction_per_stack: 0.0,
+        champion_stacks: 0,
+        dominion_max_hp_gain_rate: 0.0,
+        dominion_max_hp_bonus_cap: 0.0,
+        dominion_max_hp_bonus: 0.0,
+        sin_on_sin_exp_bonus_per_stack: 0.0,
+        sin_on_sin_recovery_rate: 0.0,
+        sin_on_sin_stacks: 0,
+        penance_healing_bonus_percent: 0.0,
+        penance_kill_assist_count: 0,
+        damage_contributors: Vec::new(),
         wound_healing_taken_turns: 0,
+        delayed_damage_ticks: Vec::new(),
+        delayed_healing_ticks: Vec::new(),
         damage_taken_this_turn: 0.0,
         healing_taken_this_turn: 0.0,
         skill_last_used_turns: HashMap::new(),
@@ -1777,12 +3019,16 @@ fn sync_participant_from_manager(
         if let Some(unit) = manager.unit_pool.get(unit_id) {
             let character = &unit.character;
             let status = character.status.combined(&character.extra_status);
+            let (speed, low_survivor_speed) = character_battle_speeds(character);
             participant.display_name =
                 unit_participant_display_name(&participant.target_id, unit_id, unit);
+            participant.player_character = false;
             participant.max_hp = character.max_hp;
             participant.max_mp = character.max_mp;
             participant.hp_regen = character.hp_regen;
             participant.mp_regen = character.mp_regen;
+            participant.speed = speed;
+            participant.low_survivor_speed = low_survivor_speed;
             participant.str_ = status.str_;
             participant.agi = status.agi;
             participant.dex = status.dex;
@@ -1792,6 +3038,43 @@ fn sync_participant_from_manager(
             participant.damage_taken_modifier = character.damage_taken_modifier;
             participant.healing_dealt_modifier = character.healing_dealt_modifier;
             participant.healing_taken_modifier = character.healing_taken_modifier;
+            participant.arrogance_damage_bonus_per_source =
+                character_arrogance_damage_bonus_per_source(character);
+            participant.endless_pain_bonus_damage_per_stack =
+                character_endless_pain_bonus_damage_per_stack(character);
+            participant.infinite_focus_damage_bonus_per_stack =
+                character_infinite_focus_damage_bonus_per_stack(character);
+            participant.one_heart_healing_bonus_per_stack =
+                character_one_heart_healing_bonus_per_stack(character);
+            sync_participant_keen_evasion(
+                participant,
+                character_keen_evasion_available(character),
+            );
+            participant.liquid_body_damage_delay_rate =
+                character_liquid_body_damage_delay_rate(character);
+            participant.liquid_body_self_healing_rate =
+                character_liquid_body_self_healing_rate(character);
+            participant.champion_damage_bonus_per_stack =
+                character_champion_damage_bonus_per_stack(character);
+            participant.champion_damage_reduction_per_stack =
+                character_champion_damage_reduction_per_stack(character);
+            let dominion_gain_rate = character_dominion_max_hp_gain_rate(character);
+            let dominion_bonus_cap = character_dominion_max_hp_bonus_cap(character);
+            participant.dominion_max_hp_gain_rate = dominion_gain_rate;
+            participant.dominion_max_hp_bonus_cap = dominion_bonus_cap;
+            participant.dominion_max_hp_bonus = if dominion_gain_rate > f32::EPSILON {
+                participant
+                    .dominion_max_hp_bonus
+                    .clamp(0.0, dominion_bonus_cap)
+            } else {
+                0.0
+            };
+            participant.max_hp = character.max_hp + participant.dominion_max_hp_bonus;
+            participant.sin_on_sin_exp_bonus_per_stack =
+                character_sin_on_sin_exp_bonus_per_stack(character);
+            participant.sin_on_sin_recovery_rate = character_sin_on_sin_recovery_rate(character);
+            participant.penance_healing_bonus_percent =
+                character_penance_healing_bonus_percent(character);
             participant.hp = participant.hp.min(participant.max_hp);
             participant.mp = participant.mp.min(participant.max_mp);
             participant.alive = participant.hp > 0.0;
@@ -1801,15 +3084,19 @@ fn sync_participant_from_manager(
 
     if let Some(character) = manager.player_characters.get(&participant.target_id) {
         let status = character.status.combined(&character.extra_status);
+        let (speed, low_survivor_speed) = character_battle_speeds(character);
         participant.display_name = character_display_name(
             &participant.target_id,
             character,
             manager,
         );
+        participant.player_character = true;
         participant.max_hp = character.max_hp;
         participant.max_mp = character.max_mp;
         participant.hp_regen = character.hp_regen;
         participant.mp_regen = character.mp_regen;
+        participant.speed = speed;
+        participant.low_survivor_speed = low_survivor_speed;
         participant.str_ = status.str_;
         participant.agi = status.agi;
         participant.dex = status.dex;
@@ -1819,23 +3106,102 @@ fn sync_participant_from_manager(
         participant.damage_taken_modifier = character.damage_taken_modifier;
         participant.healing_dealt_modifier = character.healing_dealt_modifier;
         participant.healing_taken_modifier = character.healing_taken_modifier;
+        participant.arrogance_damage_bonus_per_source =
+            character_arrogance_damage_bonus_per_source(character);
+        participant.endless_pain_bonus_damage_per_stack =
+            character_endless_pain_bonus_damage_per_stack(character);
+        participant.infinite_focus_damage_bonus_per_stack =
+            character_infinite_focus_damage_bonus_per_stack(character);
+        participant.one_heart_healing_bonus_per_stack =
+            character_one_heart_healing_bonus_per_stack(character);
+        sync_participant_keen_evasion(
+            participant,
+            character_keen_evasion_available(character),
+        );
+        participant.liquid_body_damage_delay_rate =
+            character_liquid_body_damage_delay_rate(character);
+        participant.liquid_body_self_healing_rate =
+            character_liquid_body_self_healing_rate(character);
+        participant.champion_damage_bonus_per_stack =
+            character_champion_damage_bonus_per_stack(character);
+        participant.champion_damage_reduction_per_stack =
+            character_champion_damage_reduction_per_stack(character);
+        let dominion_gain_rate = character_dominion_max_hp_gain_rate(character);
+        let dominion_bonus_cap = character_dominion_max_hp_bonus_cap(character);
+        participant.dominion_max_hp_gain_rate = dominion_gain_rate;
+        participant.dominion_max_hp_bonus_cap = dominion_bonus_cap;
+        participant.dominion_max_hp_bonus = if dominion_gain_rate > f32::EPSILON {
+            participant
+                .dominion_max_hp_bonus
+                .clamp(0.0, dominion_bonus_cap)
+        } else {
+            0.0
+        };
+        participant.max_hp = character.max_hp + participant.dominion_max_hp_bonus;
+        participant.sin_on_sin_exp_bonus_per_stack =
+            character_sin_on_sin_exp_bonus_per_stack(character);
+        participant.sin_on_sin_recovery_rate = character_sin_on_sin_recovery_rate(character);
+        participant.penance_healing_bonus_percent =
+            character_penance_healing_bonus_percent(character);
         participant.hp = participant.hp.min(participant.max_hp);
         participant.mp = participant.mp.min(participant.max_mp);
         participant.alive = participant.hp > 0.0;
     } else {
+        participant.player_character = false;
+        participant.low_survivor_speed = participant.speed.max(0.0);
+        participant.arrogance_damage_bonus_per_source = 0.0;
+        participant.endless_pain_bonus_damage_per_stack = 0.0;
+        participant.infinite_focus_damage_bonus_per_stack = 0.0;
+        participant.one_heart_healing_bonus_per_stack = 0.0;
+        sync_participant_keen_evasion(participant, false);
+        participant.liquid_body_damage_delay_rate = 0.0;
+        participant.liquid_body_self_healing_rate = 0.0;
+        participant.champion_damage_bonus_per_stack = 0.0;
+        participant.champion_damage_reduction_per_stack = 0.0;
+        participant.dominion_max_hp_gain_rate = 0.0;
+        participant.dominion_max_hp_bonus_cap = 0.0;
+        participant.dominion_max_hp_bonus = 0.0;
+        participant.sin_on_sin_exp_bonus_per_stack = 0.0;
+        participant.sin_on_sin_recovery_rate = 0.0;
+        participant.penance_healing_bonus_percent = 0.0;
         participant.display_name = participant_display_name(&participant.target_id, manager);
+    }
+}
+
+fn living_player_participant_count(encounter: &BattleEncounter) -> usize {
+    encounter
+        .participants
+        .iter()
+        .filter(|participant| participant.player_character && participant.alive)
+        .count()
+}
+
+fn participant_order_speed(
+    participant: &BattleParticipantSnapshot,
+    living_player_count: usize,
+) -> f32 {
+    let speed = participant.speed.max(0.0);
+    if living_player_count > 0 && living_player_count <= 3 && participant.low_survivor_speed > speed
+    {
+        participant.low_survivor_speed
+    } else {
+        speed
     }
 }
 
 fn ordered_participant_indices(encounter: &BattleEncounter) -> Vec<usize> {
     let mut indices = (0..encounter.participants.len()).collect::<Vec<_>>();
     if encounter.sort_by_turn {
+        let living_player_count = living_player_participant_count(encounter);
         indices.sort_by(|left, right| {
             let left_participant = &encounter.participants[*left];
             let right_participant = &encounter.participants[*right];
-            right_participant
-                .agi
-                .cmp(&left_participant.agi)
+            participant_order_speed(right_participant, living_player_count)
+                .total_cmp(&participant_order_speed(
+                    left_participant,
+                    living_player_count,
+                ))
+                .then_with(|| right_participant.agi.cmp(&left_participant.agi))
                 .then_with(|| {
                     left_participant
                         .action_done
@@ -2075,6 +3441,7 @@ fn participant_damage_multiplier(
     participant: &BattleParticipantSnapshot,
     character: Option<&PlayerCharacter>,
     config: &TrpgBasicConfig,
+    completed_turns: u32,
     damage_type: DamageType,
 ) -> f32 {
     let status = participant_status(participant);
@@ -2092,8 +3459,25 @@ fn participant_damage_multiplier(
         })
         .unwrap_or_default();
     participant.damage_dealt_modifier
+        * arrogance_damage_dealt_multiplier(
+            participant.arrogance_damage_bonus_per_source,
+            participant.arrogance_damage_source_ids.len() as u32,
+        )
+        * champion_damage_dealt_multiplier(
+            participant.champion_damage_bonus_per_stack,
+            participant.champion_stacks,
+        )
         * low_hp_damage_multiplier(participant.hp, participant.max_hp)
         * (status_damage_attribute_multiplier(&status, config, bonus_kind) + talent_bonus)
+        * character
+            .map(character_chaos_output_variance)
+            .map(moonberry_chaos_output_multiplier)
+            .unwrap_or(1.0)
+        * character
+            .map(|character| {
+                character_valorous_battle_damage_multiplier(character, completed_turns)
+            })
+            .unwrap_or(1.0)
 }
 
 fn participant_healing_multiplier(
@@ -2104,13 +3488,20 @@ fn participant_healing_multiplier(
     let wounded_modifier = character
         .map(character_wounded_healing_dealt_modifier)
         .unwrap_or(1.0);
-    participant.healing_dealt_modifier
-        * status_healing_attribute_multiplier(&participant_status(participant), config)
+    penance_decayed_healing_dealt_modifier(
+        participant.healing_dealt_modifier,
+        participant.penance_healing_bonus_percent,
+        participant.penance_kill_assist_count,
+    ) * status_healing_attribute_multiplier(&participant_status(participant), config)
         * wounded_healing_dealt_multiplier(
             participant.hp,
             participant.max_hp,
             wounded_modifier,
         )
+        * character
+            .map(character_chaos_output_variance)
+            .map(moonberry_chaos_output_multiplier)
+            .unwrap_or(1.0)
 }
 
 fn participant_wound_healing_multiplier(participant: &BattleParticipantSnapshot) -> f32 {
@@ -2118,6 +3509,19 @@ fn participant_wound_healing_multiplier(participant: &BattleParticipantSnapshot)
         0.75
     } else {
         1.0
+    }
+}
+
+fn battle_damage_type_label(damage_type: DamageType) -> &'static str {
+    match damage_type {
+        DamageType::Cursed => "诅咒",
+        DamageType::Diseased => "疾病",
+        DamageType::Bleed => "流血",
+        DamageType::Range => "远程",
+        DamageType::Poisoning => "中毒",
+        DamageType::Physical => "物理",
+        DamageType::Magical => "魔法",
+        DamageType::None => "无类型",
     }
 }
 
@@ -2403,6 +3807,50 @@ fn limit_skill_targets(mut targets: Vec<String>, target_count: Option<u32>) -> V
     targets
 }
 
+fn infinite_focus_eligible_target_id(
+    target: TargetSelector,
+    actor_id: &str,
+    target_ids: &[String],
+    target_class: Option<&str>,
+) -> Option<String> {
+    if target.area.is_some()
+        || matches!(target.actor, ActorRef::SelfActor)
+        || skill_target_class_is_area(target_class)
+    {
+        return None;
+    }
+    if matches!(
+        target_class.map(str::trim),
+        Some("无目标" | "多目标" | "范围")
+    ) {
+        return None;
+    }
+    let [target_id] = target_ids else {
+        return None;
+    };
+    (target_id != actor_id).then(|| target_id.clone())
+}
+
+fn one_heart_eligible_target_id(
+    target: TargetSelector,
+    target_ids: &[String],
+    target_class: Option<&str>,
+) -> Option<String> {
+    if target.area.is_some() || skill_target_class_is_area(target_class) {
+        return None;
+    }
+    if matches!(
+        target_class.map(str::trim),
+        Some("无目标" | "多目标" | "范围")
+    ) {
+        return None;
+    }
+    let [target_id] = target_ids else {
+        return None;
+    };
+    Some(target_id.clone())
+}
+
 fn skill_target_limit(target_count: Option<u32>, target_class: Option<&str>) -> Option<u32> {
     match target_class.map(str::trim) {
         Some("无目标") => Some(0),
@@ -2426,6 +3874,7 @@ fn battle_skill_damage_range_radius(
     skill_range: Option<i32>,
     actor_character: Option<&PlayerCharacter>,
     damage_type: DamageType,
+    skill_type: Option<&str>,
 ) -> Option<f32> {
     let minimum_range = if damage_type == DamageType::Range {
         actor_character
@@ -2434,7 +3883,18 @@ fn battle_skill_damage_range_radius(
     } else {
         0.0
     };
-    moonberry_effective_skill_range_radius(skill_range, minimum_range)
+    let range_multiplier = if moonberry_skill_type_is_spell(skill_type) {
+        actor_character
+            .map(character_spell_range_multiplier)
+            .unwrap_or(1.0)
+    } else {
+        1.0
+    };
+    moonberry_effective_skill_range_radius_with_multiplier(
+        skill_range,
+        minimum_range,
+        range_multiplier,
+    )
 }
 
 fn filter_battle_targets_by_range(
@@ -2564,6 +4024,7 @@ mod area_tests {
             target_id: target_id.to_owned(),
             display_name: target_id.to_owned(),
             unit_template_id: None,
+            player_character: false,
             turn: 0,
             str_: 0,
             agi: 0,
@@ -2580,11 +4041,41 @@ mod area_tests {
             max_mp: 0.0,
             hp_regen: 0.0,
             mp_regen: 0.0,
+            speed: 0.0,
+            low_survivor_speed: 0.0,
             damage_dealt_modifier: 1.0,
             damage_taken_modifier: 1.0,
             healing_dealt_modifier: 1.0,
             healing_taken_modifier: 1.0,
+            arrogance_damage_bonus_per_source: 0.0,
+            arrogance_damage_source_ids: Vec::new(),
+            endless_pain_bonus_damage_per_stack: 0.0,
+            endless_pain_stacks: 0,
+            infinite_focus_damage_bonus_per_stack: 0.0,
+            infinite_focus_target_id: None,
+            infinite_focus_stacks: 0,
+            one_heart_healing_bonus_per_stack: 0.0,
+            one_heart_target_id: None,
+            one_heart_stacks: 0,
+            keen_evasion_enabled: false,
+            keen_evasion_available: false,
+            liquid_body_damage_delay_rate: 0.0,
+            liquid_body_self_healing_rate: 0.0,
+            champion_damage_bonus_per_stack: 0.0,
+            champion_damage_reduction_per_stack: 0.0,
+            champion_stacks: 0,
+            dominion_max_hp_gain_rate: 0.0,
+            dominion_max_hp_bonus_cap: 0.0,
+            dominion_max_hp_bonus: 0.0,
+            sin_on_sin_exp_bonus_per_stack: 0.0,
+            sin_on_sin_recovery_rate: 0.0,
+            sin_on_sin_stacks: 0,
+            penance_healing_bonus_percent: 0.0,
+            penance_kill_assist_count: 0,
+            damage_contributors: Vec::new(),
             wound_healing_taken_turns: 0,
+            delayed_damage_ticks: Vec::new(),
+            delayed_healing_ticks: Vec::new(),
             damage_taken_this_turn: 0.0,
             healing_taken_this_turn: 0.0,
             skill_last_used_turns: HashMap::new(),
@@ -2620,6 +4111,7 @@ mod tests {
             target_id: id.to_owned(),
             display_name: id.to_owned(),
             unit_template_id: None,
+            player_character: false,
             turn,
             str_: 0,
             agi: 0,
@@ -2636,15 +4128,136 @@ mod tests {
             max_mp: 10.0,
             hp_regen: 1.0,
             mp_regen: 1.0,
+            speed: 0.0,
+            low_survivor_speed: 0.0,
             damage_dealt_modifier: 1.0,
             damage_taken_modifier: 1.0,
             healing_dealt_modifier: 1.0,
             healing_taken_modifier: 1.0,
+            arrogance_damage_bonus_per_source: 0.0,
+            arrogance_damage_source_ids: Vec::new(),
+            endless_pain_bonus_damage_per_stack: 0.0,
+            endless_pain_stacks: 0,
+            infinite_focus_damage_bonus_per_stack: 0.0,
+            infinite_focus_target_id: None,
+            infinite_focus_stacks: 0,
+            one_heart_healing_bonus_per_stack: 0.0,
+            one_heart_target_id: None,
+            one_heart_stacks: 0,
+            keen_evasion_enabled: false,
+            keen_evasion_available: false,
+            liquid_body_damage_delay_rate: 0.0,
+            liquid_body_self_healing_rate: 0.0,
+            champion_damage_bonus_per_stack: 0.0,
+            champion_damage_reduction_per_stack: 0.0,
+            champion_stacks: 0,
+            dominion_max_hp_gain_rate: 0.0,
+            dominion_max_hp_bonus_cap: 0.0,
+            dominion_max_hp_bonus: 0.0,
+            sin_on_sin_exp_bonus_per_stack: 0.0,
+            sin_on_sin_recovery_rate: 0.0,
+            sin_on_sin_stacks: 0,
+            penance_healing_bonus_percent: 0.0,
+            penance_kill_assist_count: 0,
+            damage_contributors: Vec::new(),
             wound_healing_taken_turns: 0,
+            delayed_damage_ticks: Vec::new(),
+            delayed_healing_ticks: Vec::new(),
             damage_taken_this_turn: 0.0,
             healing_taken_this_turn: 0.0,
             skill_last_used_turns: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn battle_order_uses_gale_force_low_survivor_speed_when_player_count_drops() {
+        let mut manager = empty_manager();
+        let gale = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            speed: 10.0,
+            status: crate::napcat::CharacterStatus {
+                agi: 99,
+                ..Default::default()
+            },
+            skill_names: vec!["狂风恶浪".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        let faster_normal = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            speed: 13.0,
+            ..Default::default()
+        };
+        let slow_player = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            speed: 1.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("gale".to_owned(), gale.clone());
+        manager
+            .player_characters
+            .insert("fast".to_owned(), faster_normal.clone());
+        manager
+            .player_characters
+            .insert("p3".to_owned(), slow_player.clone());
+        manager
+            .player_characters
+            .insert("p4".to_owned(), slow_player.clone());
+        let mut encounter = BattleEncounter {
+            sort_by_turn: true,
+            participants: vec![
+                participant_from_character("gale", &gale, &manager),
+                participant_from_character("fast", &faster_normal, &manager),
+                participant_from_character("p3", &slow_player, &manager),
+                participant_from_character("p4", &slow_player, &manager),
+            ],
+            ..Default::default()
+        };
+
+        let gale_participant = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "gale")
+            .unwrap();
+        assert_eq!(gale_participant.speed, 12.0);
+        assert_eq!(
+            gale_participant.low_survivor_speed,
+            13.5
+        );
+        assert_eq!(
+            ordered_participant_indices(&encounter)
+                .into_iter()
+                .map(|index| encounter.participants[index].target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fast", "gale", "p3", "p4"]
+        );
+
+        encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "p4")
+            .unwrap()
+            .alive = false;
+
+        assert_eq!(
+            living_player_participant_count(&encounter),
+            3
+        );
+        assert_eq!(
+            ordered_participant_indices(&encounter)
+                .into_iter()
+                .map(|index| encounter.participants[index].target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gale", "fast", "p3", "p4"]
+        );
     }
 
     #[test]
@@ -3238,6 +4851,82 @@ mod tests {
     }
 
     #[test]
+    fn parsed_battle_physical_damage_schedules_sousas_claw_followup() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            skill_names: vec!["苏萨斯之爪".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let mut target = participant("b", 0);
+        target.hp = 20.0;
+        target.max_hp = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "切割".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 10.0).abs() < 0.0001);
+        assert_eq!(target.delayed_damage_ticks.len(), 1);
+        assert_eq!(
+            target.delayed_damage_ticks[0].name,
+            "苏萨斯之爪"
+        );
+
+        assert!(store.next_round("battle"));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 6.5).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 3.5).abs() < 0.0001);
+        assert_eq!(target.delayed_damage_ticks.len(), 1);
+
+        assert!(store.next_round("battle"));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!(target.delayed_damage_ticks.is_empty());
+        assert!((target.hp - 6.5).abs() < 0.0001);
+    }
+
+    #[test]
     fn parsed_battle_skill_applies_large_hit_damage_reduction_talent() {
         let mut manager = empty_manager();
         let actor_character = PlayerCharacter {
@@ -3294,6 +4983,81 @@ mod tests {
             .unwrap();
         assert!((target.hp - 16.0).abs() < 0.0001);
         assert!((target.damage_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_skill_applies_fighting_spirit_turn_damage_reduction_talent() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["斗志昂扬".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "试探攻击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        for (turn, expected_damage) in [(0, 5.0), (1, 9.0), (2, 9.8), (3, 10.0)] {
+            {
+                let target = store
+                    .encounters
+                    .get_mut("battle")
+                    .unwrap()
+                    .participants
+                    .iter_mut()
+                    .find(|participant| participant.target_id == "b")
+                    .unwrap();
+                target.turn = turn;
+                target.hp = 100.0;
+                target.damage_taken_this_turn = 0.0;
+            }
+
+            assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+            let target = store.encounters["battle"]
+                .participants
+                .iter()
+                .find(|participant| participant.target_id == "b")
+                .unwrap();
+            assert!((target.damage_taken_this_turn - expected_damage).abs() < 0.0001);
+            assert!((target.hp - (100.0 - expected_damage)).abs() < 0.0001);
+        }
     }
 
     #[test]
@@ -3355,6 +5119,1010 @@ mod tests {
             .unwrap();
         assert!((target.hp - 16.0).abs() < 0.0001);
         assert!((target.damage_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_skill_applies_valorous_turn_damage_talent() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            skill_names: vec!["越战越勇".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let mut actor = participant_from_character("a", &actor_character, &manager);
+        actor.turn = 5;
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "越战斩".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 89.0).abs() < 0.0001);
+
+        {
+            let encounter = store.encounters.get_mut("battle").unwrap();
+            encounter
+                .participants
+                .iter_mut()
+                .find(|participant| participant.target_id == "a")
+                .unwrap()
+                .turn = 10;
+            let target = encounter
+                .participants
+                .iter_mut()
+                .find(|participant| participant.target_id == "b")
+                .unwrap();
+            target.hp = 100.0;
+            target.damage_taken_this_turn = 0.0;
+        }
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 88.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 12.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_arrogance_talent_stacks_from_unique_damage_sources() {
+        let mut manager = empty_manager();
+        let arrogant_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["狂妄".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "a".to_owned(),
+            arrogant_character.clone(),
+        );
+        let arrogant = participant_from_character("a", &arrogant_character, &manager);
+        let mut target = participant("target", 0);
+        target.hp = 100.0;
+        target.max_hp = 100.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![
+                    arrogant,
+                    participant("b", 0),
+                    participant("c", 0),
+                    participant("d", 0),
+                    participant("e", 0),
+                    target,
+                ],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "反击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.apply_action("battle", "b", "a", "试探", 1.0));
+        assert!(store.apply_action("battle", "b", "a", "试探", 1.0));
+        assert!(store.apply_action("battle", "c", "a", "试探", 1.0));
+        assert!(store.apply_action("battle", "d", "a", "试探", 1.0));
+        assert!(store.apply_action("battle", "e", "a", "试探", 1.0));
+        let arrogant = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert_eq!(
+            arrogant.arrogance_damage_source_ids,
+            vec!["b".to_owned(), "c".to_owned(), "d".to_owned()]
+        );
+
+        assert!(store.record_skill_use("battle", "a", "target", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        assert!((target.hp - 87.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 13.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_endless_pain_talent_stacks_and_consumes_next_hit_damage() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            level: 4,
+            skill_names: vec!["无尽痛楚".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let mut target = participant("target", 0);
+        target.hp = 100.0;
+        target.max_hp = 100.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![
+                    actor,
+                    participant("b", 0),
+                    participant("c", 0),
+                    participant("d", 0),
+                    target,
+                ],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "痛楚反击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.apply_action("battle", "b", "a", "试探", 1.0));
+        assert!(store.apply_action("battle", "c", "a", "试探", 1.0));
+        assert!(store.apply_action("battle", "d", "a", "试探", 1.0));
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert_eq!(actor.endless_pain_stacks, 2);
+
+        assert!(store.record_skill_use("battle", "a", "target", &skill, &manager, None,));
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        assert_eq!(actor.endless_pain_stacks, 0);
+        assert!((target.hp - 78.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 22.0).abs() < 0.0001);
+
+        assert!(store.record_skill_use("battle", "a", "target", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        assert!((target.hp - 68.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 32.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_liquid_body_talent_delays_damage_and_heals_previous_turn_damage() {
+        let mut manager = empty_manager();
+        let liquid_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            skill_names: vec!["液态躯体".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("b".to_owned(), liquid_character.clone());
+        let actor = participant("a", 0);
+        let target = participant_from_character("b", &liquid_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                active: true,
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "液态测试".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 15.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 5.0).abs() < 0.0001);
+        assert_eq!(target.delayed_damage_ticks.len(), 1);
+        assert_eq!(
+            target.delayed_damage_ticks[0].name,
+            "液态躯体"
+        );
+        assert_eq!(
+            target.delayed_damage_ticks[0].source_id,
+            "a"
+        );
+        assert!((target.delayed_damage_ticks[0].amount - 5.0).abs() < 0.0001);
+        assert!(store.encounters["battle"]
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("触发液态躯体")));
+
+        assert!(store.next_round("battle"));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 10.25).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 0.25).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 5.0).abs() < 0.0001);
+        assert_eq!(target.delayed_damage_ticks.len(), 1);
+
+        assert!(store.next_round("battle"));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 10.5).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 0.25).abs() < 0.0001);
+        assert_eq!(target.damage_taken_this_turn, 0.0);
+        assert!(target.delayed_damage_ticks.is_empty());
+    }
+
+    #[test]
+    fn parsed_battle_keen_evasion_talent_dodges_first_area_damage() {
+        let mut manager = empty_manager();
+        let keen_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            skill_names: vec!["敏锐".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("b".to_owned(), keen_character.clone());
+        let actor = participant("a", 0);
+        let target = participant_from_character("b", &keen_character, &manager);
+        let bystander = participant("c", 0);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                active: true,
+                participants: vec![actor, target, bystander],
+                ..Default::default()
+            });
+        let direct_skill = CharacterSkill {
+            index: 0,
+            name: "单点测试".to_owned(),
+            note: "主动使用对目标造成4点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let area_skill = CharacterSkill {
+            index: 1,
+            name: "范围测试".to_owned(),
+            note: "主动使用对范围内目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("范围".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &direct_skill,
+            &manager,
+            None
+        ));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 16.0).abs() < 0.0001);
+        assert!(target.keen_evasion_enabled);
+        assert!(target.keen_evasion_available);
+
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &area_skill,
+            &manager,
+            None
+        ));
+        let encounter = &store.encounters["battle"];
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 16.0).abs() < 0.0001);
+        assert!(!target.keen_evasion_available);
+        let bystander = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert_eq!(bystander.hp, 0.0);
+        assert!(encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("触发敏锐")));
+
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &area_skill,
+            &manager,
+            None
+        ));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 6.0).abs() < 0.0001);
+        assert!(!target.keen_evasion_available);
+    }
+
+    #[test]
+    fn parsed_battle_infinite_focus_talent_stacks_on_repeated_single_target_hits() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["无限专注".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let mut target_b = participant("b", 0);
+        target_b.hp = 100.0;
+        target_b.max_hp = 100.0;
+        let mut target_c = participant("c", 0);
+        target_c.hp = 100.0;
+        target_c.max_hp = 100.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target_b, target_c],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "专注打击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target_b = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(
+            actor.infinite_focus_target_id.as_deref(),
+            Some("b")
+        );
+        assert_eq!(actor.infinite_focus_stacks, 1);
+        assert!((target_b.hp - 90.0).abs() < 0.0001);
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target_b = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(actor.infinite_focus_stacks, 2);
+        assert!((target_b.hp - 79.0).abs() < 0.0001);
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target_b = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target_b.hp - 67.0).abs() < 0.0001);
+
+        assert!(store.record_skill_use("battle", "a", "c", &skill, &manager, None,));
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target_c = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert_eq!(
+            actor.infinite_focus_target_id.as_deref(),
+            Some("c")
+        );
+        assert_eq!(actor.infinite_focus_stacks, 1);
+        assert!((target_c.hp - 90.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_champion_talent_stacks_from_player_eliminations() {
+        let mut manager = empty_manager();
+        let champion_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["总冠军".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        let victim_character = PlayerCharacter {
+            hp: 5.0,
+            max_hp: 5.0,
+            ..Default::default()
+        };
+        let attacker_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "a".to_owned(),
+            champion_character.clone(),
+        );
+        manager.player_characters.insert(
+            "victim".to_owned(),
+            victim_character.clone(),
+        );
+        manager.player_characters.insert(
+            "attacker".to_owned(),
+            attacker_character.clone(),
+        );
+        let champion = participant_from_character("a", &champion_character, &manager);
+        let victim = participant_from_character("victim", &victim_character, &manager);
+        let attacker = participant_from_character(
+            "attacker",
+            &attacker_character,
+            &manager,
+        );
+        let mut target = participant("target", 0);
+        target.hp = 100.0;
+        target.max_hp = 100.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![champion, victim, attacker, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "冠军击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "victim", &skill, &manager, None,));
+        let champion = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let victim = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "victim")
+            .unwrap();
+        assert_eq!(champion.champion_stacks, 1);
+        assert!(!victim.alive);
+
+        assert!(store.record_skill_use("battle", "a", "target", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        assert!((target.hp - 89.8).abs() < 0.0001);
+
+        assert!(store.record_skill_use("battle", "attacker", "a", &skill, &manager, None,));
+        let champion = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!((champion.hp - 90.1).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_dominion_talent_gains_capped_max_hp_when_any_target_dies() {
+        let mut manager = empty_manager();
+        let dominion_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["役于我手".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        let attacker_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            ..Default::default()
+        };
+        let victim_character = PlayerCharacter {
+            hp: 5.0,
+            max_hp: 50.0,
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "a".to_owned(),
+            dominion_character.clone(),
+        );
+        manager.player_characters.insert(
+            "cap".to_owned(),
+            dominion_character.clone(),
+        );
+        manager.player_characters.insert(
+            "killer".to_owned(),
+            attacker_character.clone(),
+        );
+        manager.player_characters.insert(
+            "victim".to_owned(),
+            victim_character.clone(),
+        );
+        let fresh_holder = participant_from_character("a", &dominion_character, &manager);
+        let mut capped_holder = participant_from_character("cap", &dominion_character, &manager);
+        capped_holder.dominion_max_hp_bonus = 19.0;
+        capped_holder.max_hp += 19.0;
+        let attacker = participant_from_character("killer", &attacker_character, &manager);
+        let victim = participant_from_character("victim", &victim_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![fresh_holder, capped_holder, attacker, victim],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "收割".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "killer", "victim", &skill, &manager, None,));
+
+        let encounter = &store.encounters["battle"];
+        let fresh_holder = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!((fresh_holder.dominion_max_hp_bonus - 2.5).abs() < 0.0001);
+        assert!((fresh_holder.max_hp - 102.5).abs() < 0.0001);
+        assert!((fresh_holder.hp - 100.0).abs() < 0.0001);
+
+        let capped_holder = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "cap")
+            .unwrap();
+        assert!((capped_holder.dominion_max_hp_bonus - 20.0).abs() < 0.0001);
+        assert!((capped_holder.max_hp - 120.0).abs() < 0.0001);
+
+        let defeated = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "victim")
+            .unwrap();
+        assert!(!defeated.alive);
+        assert!(defeated.damage_contributors.is_empty());
+        assert!(encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("触发役于我手")));
+    }
+
+    #[test]
+    fn parsed_battle_sin_on_sin_talent_recovers_missing_resources_on_kill_participation() {
+        let mut manager = empty_manager();
+        let killer_character = PlayerCharacter {
+            hp: 50.0,
+            max_hp: 100.0,
+            mp: 20.0,
+            max_mp: 60.0,
+            skill_names: vec!["罪上加罪".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        let assistant_character = PlayerCharacter {
+            hp: 80.0,
+            max_hp: 100.0,
+            mp: 40.0,
+            max_mp: 60.0,
+            skill_names: vec!["罪上加罪".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        let victim_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), killer_character.clone());
+        manager.player_characters.insert(
+            "c".to_owned(),
+            assistant_character.clone(),
+        );
+        manager
+            .player_characters
+            .insert("b".to_owned(), victim_character.clone());
+        let mut killer = participant_from_character("a", &killer_character, &manager);
+        killer.sin_on_sin_stacks = 4;
+        let assistant = participant_from_character("c", &assistant_character, &manager);
+        let victim = participant_from_character("b", &victim_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![killer, assistant, victim],
+                ..Default::default()
+            });
+        let assist_damage = CharacterSkill {
+            index: 0,
+            name: "助攻".to_owned(),
+            note: "主动使用对目标造成4点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let killing_damage = CharacterSkill {
+            index: 1,
+            name: "终击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use(
+            "battle",
+            "c",
+            "b",
+            &assist_damage,
+            &manager,
+            None
+        ));
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &killing_damage,
+            &manager,
+            None
+        ));
+
+        let encounter = &store.encounters["battle"];
+        let killer = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert_eq!(killer.sin_on_sin_stacks, 5);
+        assert!((killer.hp - 55.0).abs() < 0.0001);
+        assert!((killer.mp - 24.0).abs() < 0.0001);
+        assert!((killer.healing_taken_this_turn - 5.0).abs() < 0.0001);
+        assert!(
+            (sin_on_sin_exp_bonus_percent(
+                killer.sin_on_sin_exp_bonus_per_stack,
+                killer.sin_on_sin_stacks,
+            ) - 10.0)
+                .abs()
+                < 0.0001
+        );
+
+        let assistant = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert_eq!(assistant.sin_on_sin_stacks, 1);
+        assert!((assistant.hp - 82.0).abs() < 0.0001);
+        assert!((assistant.mp - 42.0).abs() < 0.0001);
+        assert!((assistant.healing_taken_this_turn - 2.0).abs() < 0.0001);
+        assert!(
+            (sin_on_sin_exp_bonus_percent(
+                assistant.sin_on_sin_exp_bonus_per_stack,
+                assistant.sin_on_sin_stacks,
+            ) - 2.5)
+                .abs()
+                < 0.0001
+        );
+
+        let defeated = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!(!defeated.alive);
+        assert!(defeated.damage_contributors.is_empty());
+        assert!(encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("触发罪上加罪") && entry.contains("经验加成10%")));
+    }
+
+    #[test]
+    fn parsed_battle_skill_applies_chaos_output_variance_talent() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["混沌无序".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 50.0,
+            max_hp: 100.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let damage_skill = CharacterSkill {
+            index: 0,
+            name: "混沌击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let heal_skill = CharacterSkill {
+            name: "混沌疗".to_owned(),
+            note: "主动使用对目标治疗10点生命值".to_owned(),
+            ..damage_skill.clone()
+        };
+
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &damage_skill,
+            &manager,
+            None,
+        ));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!(
+            (8.5..=11.5).contains(&target.damage_taken_this_turn),
+            "damage roll out of range: {}",
+            target.damage_taken_this_turn
+        );
+
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &heal_skill,
+            &manager,
+            None,
+        ));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!(
+            (8.5..=11.5).contains(&target.healing_taken_this_turn),
+            "healing roll out of range: {}",
+            target.healing_taken_this_turn
+        );
     }
 
     #[test]
@@ -3476,6 +6244,135 @@ mod tests {
     }
 
     #[test]
+    fn parsed_battle_penance_healing_bonus_decays_on_kill_or_assist() {
+        let mut manager = empty_manager();
+        let penitent = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            healing_dealt_modifier: 1.25,
+            skill_names: vec!["忏悔".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), penitent.clone());
+        let actor = participant_from_character("a", &penitent, &manager);
+        let mut assistant = participant("c", 0);
+        assistant.hp = 10.0;
+        assistant.max_hp = 10.0;
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 10.0;
+        let mut heal_target = participant("d", 0);
+        heal_target.hp = 0.0;
+        heal_target.max_hp = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, assistant, target, heal_target],
+                ..Default::default()
+            });
+        let assist_damage = CharacterSkill {
+            index: 0,
+            name: "助攻".to_owned(),
+            note: "主动使用对目标造成4点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let killing_damage = CharacterSkill {
+            index: 1,
+            name: "终击".to_owned(),
+            note: "主动使用对目标造成6点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let heal = CharacterSkill {
+            index: 2,
+            name: "忏悔治疗".to_owned(),
+            note: "主动使用对目标治疗10点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use(
+            "battle",
+            "c",
+            "b",
+            &assist_damage,
+            &manager,
+            None
+        ));
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &killing_damage,
+            &manager,
+            None
+        ));
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert_eq!(
+            actor.penance_healing_bonus_percent,
+            25.0
+        );
+        assert_eq!(actor.penance_kill_assist_count, 1);
+        let assistant = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert_eq!(assistant.penance_kill_assist_count, 1);
+        let defeated = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!(!defeated.alive);
+        assert!(defeated.damage_contributors.is_empty());
+
+        assert!(store.record_skill_use("battle", "a", "d", &heal, &manager, None));
+        let heal_target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "d")
+            .unwrap();
+        assert!((heal_target.hp - 11.5).abs() < 0.0001);
+        assert!((heal_target.healing_taken_this_turn - 11.5).abs() < 0.0001);
+    }
+
+    #[test]
     fn parsed_battle_skill_applies_mutual_aid_healing_feedback_talent() {
         let mut manager = empty_manager();
         let actor_character = PlayerCharacter {
@@ -3544,6 +6441,213 @@ mod tests {
             .unwrap();
         assert!((target.hp - 4.0).abs() < 0.0001);
         assert!((target.healing_taken_this_turn - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_one_heart_talent_stacks_same_target_healing_and_resets_on_switch() {
+        let mut manager = empty_manager();
+        let healer_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            skill_names: vec!["一心".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), healer_character.clone());
+        let healer = participant_from_character("a", &healer_character, &manager);
+        let mut target_b = participant("b", 0);
+        target_b.hp = 0.0;
+        target_b.max_hp = 100.0;
+        let mut target_c = participant("c", 0);
+        target_c.hp = 0.0;
+        target_c.max_hp = 100.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![healer, target_b, target_c],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "专注治疗".to_owned(),
+            note: "主动使用对目标治疗10点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let encounter = &store.encounters["battle"];
+        let healer = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target_b = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(
+            healer.one_heart_target_id.as_deref(),
+            Some("b")
+        );
+        assert_eq!(healer.one_heart_stacks, 1);
+        assert!((target_b.hp - 10.0).abs() < 0.0001);
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let encounter = &store.encounters["battle"];
+        let healer = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target_b = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(healer.one_heart_stacks, 2);
+        assert!((target_b.hp - 20.5).abs() < 0.0001);
+
+        assert!(store.record_skill_use("battle", "a", "c", &skill, &manager, None));
+        let encounter = &store.encounters["battle"];
+        let healer = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target_c = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert_eq!(
+            healer.one_heart_target_id.as_deref(),
+            Some("c")
+        );
+        assert_eq!(healer.one_heart_stacks, 1);
+        assert!((target_c.hp - 10.0).abs() < 0.0001);
+        assert!(encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("触发一心")));
+    }
+
+    #[test]
+    fn parsed_battle_echoing_memory_talent_schedules_single_target_healing_echoes() {
+        let mut manager = empty_manager();
+        let healer_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            skill_names: vec!["千万回忆".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), healer_character.clone());
+        let healer = participant_from_character("a", &healer_character, &manager);
+        let mut target_b = participant("b", 0);
+        target_b.hp = 0.0;
+        target_b.max_hp = 100.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                active: true,
+                participants: vec![healer, target_b],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "回忆治疗".to_owned(),
+            note: "主动使用对目标治疗20点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let encounter = &store.encounters["battle"];
+        let target_b = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target_b.hp - 20.0).abs() < 0.0001);
+        assert_eq!(target_b.delayed_healing_ticks.len(), 2);
+        assert_eq!(
+            target_b.delayed_healing_ticks[0].name,
+            "千万回忆"
+        );
+        assert_eq!(
+            target_b.delayed_healing_ticks[0].source_id,
+            "a"
+        );
+        assert!((target_b.delayed_healing_ticks[0].amount - 3.0).abs() < 0.0001);
+        assert_eq!(
+            target_b.delayed_healing_ticks[0].turns_remaining,
+            1
+        );
+        assert!((target_b.delayed_healing_ticks[1].amount - 1.0).abs() < 0.0001);
+        assert_eq!(
+            target_b.delayed_healing_ticks[1].turns_remaining,
+            2
+        );
+
+        assert!(store.next_round("battle"));
+        let encounter = &store.encounters["battle"];
+        let target_b = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target_b.hp - 23.0).abs() < 0.0001);
+        assert!((target_b.healing_taken_this_turn - 3.0).abs() < 0.0001);
+        assert_eq!(target_b.delayed_healing_ticks.len(), 1);
+        assert!((target_b.delayed_healing_ticks[0].amount - 1.0).abs() < 0.0001);
+        assert_eq!(
+            target_b.delayed_healing_ticks[0].turns_remaining,
+            1
+        );
+        assert!(encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("触发千万回忆")));
+
+        assert!(store.next_round("battle"));
+        let target_b = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target_b.hp - 24.0).abs() < 0.0001);
+        assert!((target_b.healing_taken_this_turn - 1.0).abs() < 0.0001);
+        assert!(target_b.delayed_healing_ticks.is_empty());
     }
 
     #[test]
@@ -4089,6 +7193,68 @@ mod tests {
                 (
                     "b".to_owned(),
                     Vec3::new(20.0, 0.0, 0.0),
+                ),
+            ]),
+        };
+
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &skill,
+            &manager,
+            Some(&positions),
+        ));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 9.0);
+    }
+
+    #[test]
+    fn battle_spell_skill_uses_magic_web_range_talent() {
+        let mut manager = empty_manager();
+        let character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            mp: 10.0,
+            max_mp: 10.0,
+            skill_names: vec!["法术伤害".to_owned(), "魔网延伸".to_owned()],
+            skill_notes: vec!["主动使用对目标造成1点伤害".to_owned(), String::new()],
+            skill_metadata: vec![
+                crate::napcat::CharacterSkillMetadata {
+                    skill_type: Some("法术".to_owned()),
+                    range: Some(10),
+                    ..Default::default()
+                },
+                crate::napcat::CharacterSkillMetadata::talent("normal_talent", "天赋"),
+            ],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), character.clone());
+        let skill = character_skills(&character).remove(0);
+        let actor = participant_from_character("a", &character, &manager);
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 10.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let positions = SceneCharacterPositions {
+            positions: HashMap::from([
+                ("a".to_owned(), Vec3::ZERO),
+                (
+                    "b".to_owned(),
+                    Vec3::new(10.4, 0.0, 0.0),
                 ),
             ]),
         };

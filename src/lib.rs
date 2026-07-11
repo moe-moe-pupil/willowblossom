@@ -3,7 +3,6 @@ mod camera;
 mod deepseek;
 mod moonberry_talents;
 mod napcat;
-pub mod planet;
 pub mod rule_engine;
 mod scene;
 mod ui;
@@ -31,7 +30,6 @@ use serde::{
     Serialize,
 };
 
-// [CHANGE]: Game title and resolution
 pub const GAME_TITLE: &str = "柳絮，只是另一个跑团软件";
 const DEFAULT_WINDOW_WIDTH: u32 = 800;
 const DEFAULT_WINDOW_HEIGHT: u32 = 600;
@@ -150,7 +148,6 @@ fn load_app_settings() -> Persistent<AppSettings> {
         .expect("failed to init app settings")
 }
 
-// Game state
 #[derive(States, Debug, Default, Clone, Eq, PartialEq, Hash)]
 pub enum GameState {
     #[default]
@@ -159,12 +156,10 @@ pub enum GameState {
     Play,
 }
 
-// Main game plugin
 pub struct GamePlugin;
 
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
-        // Release only plugins (embedded assets)
         #[cfg(not(debug_assertions))]
         {
             use bevy_embedded_assets::{
@@ -176,7 +171,6 @@ impl Plugin for GamePlugin {
             });
         }
 
-        // Default plugins
         let mut app_settings = load_app_settings();
         if app_settings.normalize() {
             if let Err(err) = app_settings.persist() {
@@ -229,13 +223,11 @@ impl Plugin for GamePlugin {
         );
         app.insert_resource(app_settings);
 
-        // Game
         app.add_plugins((
             battle_round::BattleRoundPlugin,
             camera::CameraPlugin,
             napcat::NapcatPlugin,
             rule_engine::RuleEnginePlugin,
-            scene::ScenePreviewPlugin,
             ui::UIPlugin,
         ))
         .add_systems(Update, persist_primary_window_size);
