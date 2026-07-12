@@ -634,7 +634,15 @@ impl Plugin for UIPlugin {
 }
 
 pub fn setup_system(mut command: Commands) {
-    command.spawn((Camera2d, PrimaryEguiContext));
+    command.spawn((
+        Camera2d,
+        Camera {
+            order: 10,
+            clear_color: ClearColorConfig::None,
+            ..default()
+        },
+        PrimaryEguiContext,
+    ));
 
     let config_dir = Path::new(".data").join("willowblossom");
     let cached_memory = Persistent::<CachedMemory>::builder()
