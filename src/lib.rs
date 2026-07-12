@@ -6,6 +6,7 @@ mod napcat;
 pub mod rule_engine;
 mod scene;
 mod ui;
+mod voxel;
 
 use std::path::Path;
 
@@ -229,6 +230,7 @@ impl Plugin for GamePlugin {
             napcat::NapcatPlugin,
             rule_engine::RuleEnginePlugin,
             ui::UIPlugin,
+            voxel::TrpgVoxelPlugin,
         ))
         .add_systems(Update, persist_primary_window_size);
     }

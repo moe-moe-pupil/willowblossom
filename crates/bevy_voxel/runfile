@@ -1,0 +1,15 @@
+#!/bin/bash
+
+MAIN_EXAMPLE=falling_sand
+
+function run {
+  cargo run --example $MAIN_EXAMPLE
+}
+
+function dbg {
+  cargo run --example $MAIN_EXAMPLE --features bevy/debug
+}
+
+function flame {
+  cargo flamegraph --example $MAIN_EXAMPLE
+}
