@@ -255,6 +255,8 @@ pub(crate) struct ChatScrollState {
 #[derive(Default)]
 pub(crate) struct TrpgGroupSettingsState {
     open: bool,
+    pool_window_open: bool,
+    pool_window_tab: PoolWindowTab,
     new_group_name: String,
     new_random_pool_name: String,
     random_pool_award_target: String,
@@ -290,6 +292,16 @@ pub(crate) struct TrpgGroupSettingsState {
     voxel_scene_export_path: String,
     import_path: String,
     import_export_status: String,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PoolWindowTab {
+    #[default]
+    Player,
+    GroupChat,
+    Random,
+    Unit,
+    Skill,
 }
 
 #[derive(Default)]
@@ -417,113 +429,161 @@ fn tools_menu_button(
 
 fn pool_menu_button(
     ui: &mut Ui,
-    manager: &mut NapcatMessageManager,
+    manager: &NapcatMessageManager,
     state: &mut TrpgGroupSettingsState,
-    mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
-) -> bool {
-    let mut changed = false;
+) {
     let player_targets = sorted_pool_targets(manager, false);
     let group_chat_targets = sorted_pool_targets(manager, true);
 
     ui.menu_button("池", |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
 
-        ui.menu_button(
-            format!("玩家池 ({})", player_targets.len()),
-            |ui| {
-                if player_targets.is_empty() {
-                    ui.label("还没有玩家私聊。");
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt("top_player_pool_menu")
-                        .max_height(220.0)
-                        .show(ui, |ui| {
-                            for target_id in &player_targets {
-                                ui.horizontal(|ui| {
-                                    ui.label(target_display_name(manager, target_id));
-                                    ui.small(target_id);
-                                });
-                            }
-                        });
-                }
-            },
-        );
-
-        ui.menu_button(
-            format!("群聊池 ({})", group_chat_targets.len()),
-            |ui| {
-                if group_chat_targets.is_empty() {
-                    ui.label("还没有QQ群聊。");
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt("top_group_chat_pool_menu")
-                        .max_height(220.0)
-                        .show(ui, |ui| {
-                            for target_id in &group_chat_targets {
-                                ui.horizontal(|ui| {
-                                    ui.label(target_display_name(manager, target_id));
-                                    ui.small(target_id);
-                                });
-                            }
-                        });
-                }
-            },
-        );
-
-        ui.menu_button(
-            format!(
-                "随机池 ({})",
-                manager.random_pools.len()
+        for (label, tab) in [
+            (
+                format!("玩家池 ({})", player_targets.len()),
+                PoolWindowTab::Player,
             ),
-            |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("top_random_pool_menu")
-                    .max_height(420.0)
-                    .show(ui, |ui| {
+            (
+                format!("群聊池 ({})", group_chat_targets.len()),
+                PoolWindowTab::GroupChat,
+            ),
+            (
+                format!(
+                    "随机池 ({})",
+                    manager.random_pools.len()
+                ),
+                PoolWindowTab::Random,
+            ),
+            (
+                format!("单位池 ({})", manager.unit_pool.len()),
+                PoolWindowTab::Unit,
+            ),
+            (
+                format!("技能池 ({})", manager.skill_pool.len()),
+                PoolWindowTab::Skill,
+            ),
+        ] {
+            if ui.button(label).clicked() {
+                state.pool_window_tab = tab;
+                state.pool_window_open = true;
+                ui.close();
+            }
+        }
+    });
+}
+
+fn pool_management_window(
+    ctx: &Context,
+    manager: &mut Persistent<NapcatMessageManager>,
+    state: &mut TrpgGroupSettingsState,
+    napcat_sender: Option<&NapcatIOSender>,
+    ime: &mut ImeManager,
+    mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
+) {
+    if !state.pool_window_open {
+        return;
+    }
+
+    let player_targets = sorted_pool_targets(manager, false);
+    let group_chat_targets = sorted_pool_targets(manager, true);
+    let mut open = state.pool_window_open;
+    let mut changed = false;
+    egui::Window::new("池管理")
+        .id(Id::new("pool_management_window"))
+        .open(&mut open)
+        .default_size(Vec2::new(720.0, 600.0))
+        .min_size(Vec2::new(460.0, 320.0))
+        .show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(
+                    &mut state.pool_window_tab,
+                    PoolWindowTab::Player,
+                    format!("玩家 ({})", player_targets.len()),
+                );
+                ui.selectable_value(
+                    &mut state.pool_window_tab,
+                    PoolWindowTab::GroupChat,
+                    format!("群聊 ({})", group_chat_targets.len()),
+                );
+                ui.selectable_value(
+                    &mut state.pool_window_tab,
+                    PoolWindowTab::Random,
+                    format!(
+                        "随机池 ({})",
+                        manager.random_pools.len()
+                    ),
+                );
+                ui.selectable_value(
+                    &mut state.pool_window_tab,
+                    PoolWindowTab::Unit,
+                    format!("单位池 ({})", manager.unit_pool.len()),
+                );
+                ui.selectable_value(
+                    &mut state.pool_window_tab,
+                    PoolWindowTab::Skill,
+                    format!("技能池 ({})", manager.skill_pool.len()),
+                );
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("pool_management_scroll")
+                .show(ui, |ui| match state.pool_window_tab {
+                    PoolWindowTab::Player => pool_target_list_ui(
+                        ui,
+                        manager,
+                        &player_targets,
+                        "还没有玩家私聊。",
+                    ),
+                    PoolWindowTab::GroupChat => pool_target_list_ui(
+                        ui,
+                        manager,
+                        &group_chat_targets,
+                        "还没有QQ群聊。",
+                    ),
+                    PoolWindowTab::Random => {
                         changed |= random_pool_settings_ui(
                             ui,
                             manager,
                             state,
                             &player_targets,
-                            None,
-                            None,
-                        );
-                    });
-            },
-        );
-
-        ui.menu_button(
-            format!("单位池 ({})", manager.unit_pool.len()),
-            |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("top_unit_pool_menu")
-                    .max_height(420.0)
-                    .show(ui, |ui| {
+                            napcat_sender,
+                            Some(&mut *ime),
+                        )
+                    },
+                    PoolWindowTab::Unit => {
                         changed |= unit_pool_settings_ui(
                             ui,
                             manager,
                             state,
                             &player_targets,
                             scene_store.as_deref_mut(),
-                        );
-                    });
-            },
-        );
+                        )
+                    },
+                    PoolWindowTab::Skill => changed |= skill_pool_settings_ui(ui, manager, state),
+                });
+        });
+    state.pool_window_open = open;
+    if changed {
+        manager.persist().ok();
+    }
+}
 
-        ui.menu_button(
-            format!("技能池 ({})", manager.skill_pool.len()),
-            |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("top_skill_pool_menu")
-                    .max_height(420.0)
-                    .show(ui, |ui| {
-                        changed |= skill_pool_settings_ui(ui, manager, state);
-                    });
-            },
-        );
-    });
-
-    changed
+fn pool_target_list_ui(
+    ui: &mut Ui,
+    manager: &NapcatMessageManager,
+    targets: &[String],
+    empty_text: &str,
+) {
+    if targets.is_empty() {
+        ui.label(empty_text);
+        return;
+    }
+    for target_id in targets {
+        ui.horizontal(|ui| {
+            ui.label(target_display_name(manager, target_id));
+            ui.small(target_id);
+        });
+    }
 }
 
 impl Widget for CircleImageButton {
@@ -11340,6 +11400,14 @@ pub fn ui_system(
         scene_positions.as_deref(),
         player_camera_positions.as_deref(),
     );
+    pool_management_window(
+        ctx,
+        &mut manager,
+        trpg_group_settings,
+        napcat_sender,
+        &mut ime,
+        scene_store.as_deref_mut(),
+    );
 
     let mut viewport_ui = egui::Ui::new(
         ctx.clone(),
@@ -11363,15 +11431,7 @@ pub fn ui_system(
                     &mut rule_engine_state,
                     &mut battle_round_state,
                 );
-                let pools_changed = pool_menu_button(
-                    ui,
-                    &mut manager,
-                    trpg_group_settings,
-                    scene_store.as_deref_mut(),
-                );
-                if pools_changed {
-                    manager.persist().ok();
-                }
+                pool_menu_button(ui, &manager, trpg_group_settings);
             });
         });
 
