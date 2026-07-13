@@ -134,6 +134,7 @@ impl Plugin for TrpgVoxelPlugin {
         .add_systems(
             Update,
             (
+                voxel_editor_shortcuts,
                 handle_editor_requests,
                 edit_voxel_grid,
                 rebuild_voxel_geometry,
@@ -142,6 +143,26 @@ impl Plugin for TrpgVoxelPlugin {
             )
                 .chain(),
         );
+    }
+}
+
+fn voxel_editor_shortcuts(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    egui_input: Res<EguiWantsInput>,
+    mut editor: ResMut<VoxelEditorState>,
+) {
+    if egui_input.wants_any_keyboard_input() || !keyboard.just_pressed(KeyCode::KeyZ) {
+        return;
+    }
+    let control = keyboard.pressed(KeyCode::ControlLeft) || keyboard.pressed(KeyCode::ControlRight);
+    if !control {
+        return;
+    }
+    let shift = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
+    if shift {
+        editor.redo_requested = true;
+    } else {
+        editor.undo_requested = true;
     }
 }
 
@@ -774,5 +795,22 @@ mod tests {
             edited_voxel(VoxelEditMode::Paint, 0, 4),
             None
         );
+    }
+
+    #[test]
+    fn ctrl_shift_z_requests_redo() {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<EguiWantsInput>()
+            .init_resource::<VoxelEditorState>()
+            .add_systems(Update, voxel_editor_shortcuts);
+        let mut keyboard = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keyboard.press(KeyCode::ControlLeft);
+        keyboard.press(KeyCode::ShiftLeft);
+        keyboard.press(KeyCode::KeyZ);
+        app.update();
+        let editor = app.world().resource::<VoxelEditorState>();
+        assert!(editor.redo_requested);
+        assert!(!editor.undo_requested);
     }
 }
