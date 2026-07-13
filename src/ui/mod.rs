@@ -11622,7 +11622,8 @@ pub fn ui_system(
                             "WASD 移动 · 空格跳跃 · 双击空格飞行"
                         };
                         ui.small(format!(
-                            "{movement_hint} · 鼠标观察 · 左键使用当前工具 · Esc 退出"
+                            "{movement_hint} · 当前工具：{} · 滚轮切换工具 · 左键使用 · Esc 退出",
+                            voxel_editor.mode.label()
                         ));
                     }
                     let snapshot_labels = voxel_editor.scene_snapshot_labels();
@@ -11692,7 +11693,7 @@ pub fn ui_system(
                                     .range(0.25..=100.0)
                                     .speed(0.25),
                             );
-                            ui.label("左键点击爆心；最多保留40个物理碎块，超额方块会合并");
+                            ui.label("左键点击爆心；每次爆炸最多新建40个物理碎块，超额方块会合并");
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
                             }

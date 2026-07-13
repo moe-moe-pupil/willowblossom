@@ -39,7 +39,7 @@ const EDIT_REPEAT_INTERVAL: f32 = 0.09;
 const TEST_GROUND_SIZE: Vec3 = Vec3::new(256.0, 0.5, 256.0);
 const TEST_GROUND_CENTER_Y: f32 = -50.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
-const MAX_EXPLOSION_PHYSICS_BODIES: usize = 40;
+const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
 const FIRST_PERSON_RADIUS: f32 = 0.03;
 const FIRST_PERSON_BODY_LENGTH: f32 = 0.065;
 const FIRST_PERSON_EYE_OFFSET: f32 = 0.045;
@@ -120,6 +120,35 @@ pub(crate) enum VoxelEditMode {
     Push,
     Pull,
     Explode,
+}
+
+impl VoxelEditMode {
+    const ALL: [Self; 7] = [
+        Self::Add,
+        Self::Remove,
+        Self::Paint,
+        Self::Physics,
+        Self::Push,
+        Self::Pull,
+        Self::Explode,
+    ];
+
+    fn cycle(self, steps: i32) -> Self {
+        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0) as i32;
+        Self::ALL[(index + steps).rem_euclid(Self::ALL.len() as i32) as usize]
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Add => "添加",
+            Self::Remove => "删除",
+            Self::Paint => "涂色",
+            Self::Physics => "物理选区",
+            Self::Push => "推开",
+            Self::Pull => "拉近",
+            Self::Explode => "爆炸",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1588,16 +1617,16 @@ fn edit_voxel_grid(
                     },
                 )
                 .collect::<Vec<_>>();
-            let current_body_count = physics_bodies.iter().count();
-            let retained_body_count = current_body_count.saturating_sub(affected_bodies.len());
-            let fragment_budget = MAX_EXPLOSION_PHYSICS_BODIES.saturating_sub(retained_body_count);
             let source_sizes = affected_bodies
                 .iter()
                 .map(|(_, cells, ..)| cells.len())
                 .chain(std::iter::once(selected.len()))
                 .filter(|size| *size > 0)
                 .collect::<Vec<_>>();
-            let part_counts = allocate_fragment_parts(&source_sizes, fragment_budget);
+            let part_counts = allocate_fragment_parts(
+                &source_sizes,
+                MAX_EXPLOSION_NEW_PHYSICS_BODIES,
+            );
             for ((entity, cells, transform, linear_velocity, angular_velocity), part_count) in
                 affected_bodies.into_iter().zip(part_counts.iter().copied())
             {
@@ -2005,7 +2034,12 @@ fn control_voxel_camera(
     if editor.first_person_enabled {
         editor.camera_yaw -= delta.x * 0.0025;
         editor.camera_pitch = (editor.camera_pitch - delta.y * 0.0025).clamp(-1.5, 1.5);
-        wheel.clear();
+        let tool_steps = wheel.read().fold(0, |steps, event| {
+            steps - event.y.signum() as i32
+        });
+        if tool_steps != 0 {
+            editor.mode = editor.mode.cycle(tool_steps);
+        }
         let Ok((player_transform, _)) = players.single() else {
             return;
         };
@@ -2466,6 +2500,27 @@ mod tests {
     }
 
     #[test]
+    fn first_person_mouse_wheel_cycles_and_wraps_all_tools() {
+        assert_eq!(
+            VoxelEditMode::Add.cycle(1),
+            VoxelEditMode::Remove
+        );
+        assert_eq!(
+            VoxelEditMode::Add.cycle(-1),
+            VoxelEditMode::Explode
+        );
+        assert_eq!(
+            VoxelEditMode::Physics.cycle(3),
+            VoxelEditMode::Explode
+        );
+        assert_eq!(
+            VoxelEditMode::Explode.cycle(1),
+            VoxelEditMode::Add
+        );
+        assert_eq!(VoxelEditMode::Pull.label(), "拉近");
+    }
+
+    #[test]
     fn physics_selection_keeps_disconnected_solids_in_one_body_and_ignores_fluids() {
         let (mut app, entity) = test_grid();
         let mut entity_mut = app.world_mut().entity_mut(entity);
@@ -2544,7 +2599,10 @@ mod tests {
 
     #[test]
     fn explosion_fragment_budget_caps_large_areas_at_forty_parts() {
-        let counts = allocate_fragment_parts(&[8_656], MAX_EXPLOSION_PHYSICS_BODIES);
+        let counts = allocate_fragment_parts(
+            &[8_656],
+            MAX_EXPLOSION_NEW_PHYSICS_BODIES,
+        );
         assert_eq!(counts, vec![40]);
 
         let cells = (0..8_656).map(|x| (IVec3::new(x, 0, 0), 1)).collect();
@@ -2557,11 +2615,20 @@ mod tests {
     }
 
     #[test]
-    fn explosion_budget_preserves_existing_bodies_before_static_fragments() {
-        let counts = allocate_fragment_parts(&[12, 8, 8_656], 2);
+    fn each_explosion_gets_forty_new_parts_regardless_of_existing_bodies() {
+        let unaffected_existing_body_count = 250;
+        let counts = allocate_fragment_parts(
+            &[12, 8, 8_656],
+            MAX_EXPLOSION_NEW_PHYSICS_BODIES,
+        );
 
-        assert_eq!(counts, vec![1, 1, 0]);
-        assert!(counts.iter().sum::<usize>() <= 2);
+        let new_body_count = counts.iter().sum::<usize>();
+        assert_eq!(new_body_count, 40);
+        assert_eq!(
+            unaffected_existing_body_count + new_body_count,
+            290
+        );
+        assert!(counts.iter().all(|count| *count > 0));
     }
 
     #[test]
