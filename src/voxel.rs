@@ -40,6 +40,7 @@ const TEST_GROUND_SIZE: Vec3 = Vec3::new(256.0, 0.5, 256.0);
 const TEST_GROUND_CENTER_Y: f32 = -50.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
+const VOXEL_MATERIAL_COUNT: usize = 8;
 const FIRST_PERSON_RADIUS: f32 = 0.03;
 const FIRST_PERSON_BODY_LENGTH: f32 = 0.065;
 const FIRST_PERSON_EYE_OFFSET: f32 = 0.045;
@@ -57,7 +58,7 @@ pub struct TrpgVoxelConnector;
 impl Connector for TrpgVoxelConnector {
     type Item = u8;
 
-    fn solid(voxel: &Self::Item) -> bool { matches!(*voxel, 1..=3) }
+    fn solid(voxel: &Self::Item) -> bool { matches!(*voxel, 1..=3 | 6..=8) }
 }
 
 #[derive(Component)]
@@ -107,7 +108,7 @@ struct VoxelAutoDoor {
 
 #[derive(Resource)]
 struct VoxelMaterials {
-    handles: [Handle<StandardMaterial>; 5],
+    handles: [Handle<StandardMaterial>; VOXEL_MATERIAL_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -330,6 +331,7 @@ impl Plugin for TrpgVoxelPlugin {
                 populate_voxel_grid,
                 setup_voxel_auto_doors,
                 setup_voxel_interior_lights,
+                setup_voxel_sample_props,
                 setup_voxel_view,
             )
                 .chain(),
@@ -402,28 +404,62 @@ fn setup_voxel_materials(
             })
             .load(path)
     });
+    let hifi_texture = asset_server
+        .load_builder()
+        .with_settings(|settings: &mut ImageLoaderSettings| {
+            settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                address_mode_u: ImageAddressMode::ClampToEdge,
+                address_mode_v: ImageAddressMode::ClampToEdge,
+                mag_filter: ImageFilterMode::Nearest,
+                min_filter: ImageFilterMode::Nearest,
+                mipmap_filter: ImageFilterMode::Nearest,
+                ..default()
+            });
+        })
+        .load("textures/voxel_space_hifi.png");
     let handles = std::array::from_fn(|index| {
-        let mut material = StandardMaterial {
-            base_color_texture: Some(textures[index].clone()),
-            base_color: [
-                Color::srgb(0.2, 0.6, 0.3),
-                Color::srgb(0.35, 0.18, 0.08),
-                Color::srgb(0.85, 0.72, 0.4),
-                Color::srgb(0.1, 0.4, 0.85),
-                Color::srgb(1.0, 0.15, 0.01),
-            ][index],
-            perceptual_roughness: 0.9,
-            ..default()
+        let mut material = if index < textures.len() {
+            StandardMaterial {
+                base_color_texture: Some(textures[index].clone()),
+                base_color: [
+                    Color::srgb(0.2, 0.6, 0.3),
+                    Color::srgb(0.35, 0.18, 0.08),
+                    Color::srgb(0.85, 0.72, 0.4),
+                    Color::srgb(0.1, 0.4, 0.85),
+                    Color::srgb(1.0, 0.15, 0.01),
+                ][index],
+                perceptual_roughness: 0.9,
+                ..default()
+            }
+        } else {
+            let atlas_row = [2, 0, 6][index - textures.len()];
+            StandardMaterial {
+                base_color_texture: Some(hifi_texture.clone()),
+                base_color: Color::WHITE,
+                uv_transform: hifi_voxel_tile_transform(atlas_row),
+                metallic: 0.72,
+                perceptual_roughness: 0.34,
+                ..default()
+            }
         };
-        if index == 3 {
-            material.base_color = Color::srgba(0.72, 0.9, 1.0, 0.72);
-            material.alpha_mode = AlphaMode::Blend;
-            material.perceptual_roughness = 0.18;
-            material.reflectance = 0.65;
-        } else if index == 4 {
-            material.emissive_texture = Some(textures[index].clone());
-            material.emissive = LinearRgba::rgb(5.0, 0.55, 0.02);
-            material.perceptual_roughness = 0.55;
+        match index {
+            3 => {
+                material.base_color = Color::srgba(0.72, 0.9, 1.0, 0.72);
+                material.alpha_mode = AlphaMode::Blend;
+                material.perceptual_roughness = 0.18;
+                material.reflectance = 0.65;
+            },
+            4 => {
+                material.emissive_texture = Some(textures[index].clone());
+                material.emissive = LinearRgba::rgb(5.0, 0.55, 0.02);
+                material.perceptual_roughness = 0.55;
+            },
+            7 => {
+                material.emissive_texture = Some(hifi_texture.clone());
+                material.emissive = LinearRgba::rgb(3.5, 1.1, 0.12);
+                material.metallic = 0.25;
+            },
+            _ => {},
         }
         materials.add(material)
     });
@@ -433,6 +469,23 @@ fn setup_voxel_materials(
         brightness: 75.0,
         ..default()
     });
+}
+
+fn hifi_voxel_tile_transform(row: usize) -> Affine2 {
+    const ATLAS_WIDTH: f32 = 16.0;
+    const ATLAS_HEIGHT: f32 = 192.0;
+    const TILE_SIZE: f32 = 16.0;
+    Affine2::from_scale_angle_translation(
+        Vec2::new(
+            (TILE_SIZE - 1.0) / ATLAS_WIDTH,
+            (TILE_SIZE - 1.0) / ATLAS_HEIGHT,
+        ),
+        0.0,
+        Vec2::new(
+            0.5 / ATLAS_WIDTH,
+            (row as f32 * TILE_SIZE + 0.5) / ATLAS_HEIGHT,
+        ),
+    )
 }
 
 fn setup_voxel_grid(mut commands: Commands) {
@@ -465,7 +518,7 @@ fn populate_default_grid(grid: &mut Mut<Grid<u8>>) {
 fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station: bool) {
     let min = center + IVec3::new(-50, 0, -40);
     let max = center + IVec3::new(50, 36, 40);
-    build_hollow_voxel_room(grid, min, max, 3, 2);
+    build_hollow_voxel_room(grid, min, max, 6, 2);
 
     // Five full decks make each station over 100 times larger by usable floor area.
     for deck_y in [0, 9, 18, 27, 36] {
@@ -483,7 +536,7 @@ fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station:
             for y in deck_y + 1..deck_y + 9 {
                 for z in -39..=39 {
                     if !(-4..=4).contains(&z) && !(-30..=-24).contains(&z) {
-                        grid.set(center + IVec3::new(local_x, y, z), 3);
+                        grid.set(center + IVec3::new(local_x, y, z), 7);
                     }
                 }
             }
@@ -492,7 +545,7 @@ fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station:
             for y in deck_y + 1..deck_y + 9 {
                 for x in -49..=49 {
                     if !(-4..=4).contains(&x) && !(-38..=-32).contains(&x) {
-                        grid.set(center + IVec3::new(x, y, local_z), 3);
+                        grid.set(center + IVec3::new(x, y, local_z), 7);
                     }
                 }
             }
@@ -502,7 +555,7 @@ fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station:
             center + IVec3::new(-3, deck_y, -3),
             center + IVec3::new(3, deck_y + 9, 3),
         );
-        let band_material = if (deck_y / 9 + command_station as i32) % 2 == 0 { 4 } else { 5 };
+        let band_material = if (deck_y / 9 + command_station as i32) % 2 == 0 { 8 } else { 7 };
         for x in (-45..=45).step_by(5) {
             grid.set(
                 center + IVec3::new(x, deck_y + 2, -38),
@@ -520,7 +573,7 @@ fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station:
         grid,
         center + IVec3::new(-26, 37, -26),
         center + IVec3::new(26, 58, 26),
-        3,
+        6,
         2,
     );
     for y in [45, 52] {
@@ -542,7 +595,7 @@ fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station:
         grid,
         IVec3::new(dock_min_x, 0, center.z - 10),
         IVec3::new(dock_max_x, 12, center.z + 10),
-        3,
+        6,
         2,
     );
 
@@ -552,7 +605,7 @@ fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station:
             grid.set(center + IVec3::new(x, 1, z), 1);
         }
     }
-    let accent = if command_station { 5 } else { 4 };
+    let accent = if command_station { 8 } else { 7 };
     for deck_y in [1, 10, 19, 28, 38, 46, 53] {
         for z in (-32..=32).step_by(4) {
             for x in [-43, -42, 42, 43] {
@@ -584,15 +637,15 @@ fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station:
     }
     for x in (-48..=48).step_by(8) {
         for y in 0..=38 {
-            grid.set(center + IVec3::new(x, y, -41), 3);
-            grid.set(center + IVec3::new(x, y, 41), 3);
+            grid.set(center + IVec3::new(x, y, -41), 7);
+            grid.set(center + IVec3::new(x, y, 41), 7);
         }
     }
     for y in 59..=78 {
-        grid.set(center + IVec3::new(0, y, 0), 3);
+        grid.set(center + IVec3::new(0, y, 0), 7);
         if y % 4 == 0 {
             for x in -8..=8 {
-                grid.set(center + IVec3::new(x, y, 0), 4);
+                grid.set(center + IVec3::new(x, y, 0), 8);
             }
         }
     }
@@ -610,7 +663,7 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
         };
         for x in -half_width..=half_width {
             grid.set(IVec3::new(x, 0, z), 2);
-            grid.set(IVec3::new(x, 28, z), 3);
+            grid.set(IVec3::new(x, 28, z), 6);
             for deck_y in [9, 18] {
                 if x.abs() < half_width {
                     grid.set(IVec3::new(x, deck_y, z), 2);
@@ -618,8 +671,8 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
             }
         }
         for y in 1..28 {
-            grid.set(IVec3::new(-half_width, y, z), 3);
-            grid.set(IVec3::new(half_width, y, z), 3);
+            grid.set(IVec3::new(-half_width, y, z), 6);
+            grid.set(IVec3::new(half_width, y, z), 6);
         }
     }
 
@@ -628,7 +681,7 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
         for x in -27..=27 {
             for y in 1..28 {
                 if !(-4..=4).contains(&x) || !matches!(y, 1..=7 | 10..=16 | 19..=26) {
-                    grid.set(IVec3::new(x, y, z), 3);
+                    grid.set(IVec3::new(x, y, z), 7);
                 }
             }
         }
@@ -641,7 +694,7 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
                 for y in 8..=11 {
                     grid.set(
                         IVec3::new(x * side, y, z),
-                        if y == 9 { 2 } else { 3 },
+                        if y == 9 { 2 } else { 6 },
                     );
                 }
             }
@@ -650,7 +703,7 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
     for z in 175..=260 {
         for x in [-20, -12, 12, 20] {
             for y in 18..=21 {
-                grid.set(IVec3::new(x, y, z), 3);
+                grid.set(IVec3::new(x, y, z), 7);
             }
         }
     }
@@ -658,7 +711,7 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
     // Detailed bridge displays, reactor banks, engine glow, bunks, and deck lighting.
     for x in -12..=12 {
         for y in 20..=25 {
-            grid.set(IVec3::new(x, y, 202), 4);
+            grid.set(IVec3::new(x, y, 202), 8);
         }
     }
     for x in [-20, -10, 0, 10, 20] {
@@ -670,28 +723,28 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
     }
     for z in (84..=216).step_by(6) {
         for x in [-24, -16, -8, 0, 8, 16, 24] {
-            grid.set(IVec3::new(x, 1, z), 4);
-            grid.set(IVec3::new(x, 10, z), 4);
-            grid.set(IVec3::new(x, 19, z), 4);
+            grid.set(IVec3::new(x, 1, z), 8);
+            grid.set(IVec3::new(x, 10, z), 8);
+            grid.set(IVec3::new(x, 19, z), 8);
         }
     }
     for x in [-22, -14, -6, 6, 14, 22] {
         for y in 5..=23 {
-            grid.set(IVec3::new(x, y, 79), 5);
+            grid.set(IVec3::new(x, y, 79), 7);
         }
     }
 
     // Hangar guidance lanes and landing-pad markings on the lower deck.
     for z in 118..=170 {
         for x in [-14, -7, 0, 7, 14] {
-            grid.set(IVec3::new(x, 1, z), 4);
+            grid.set(IVec3::new(x, 1, z), 8);
         }
     }
     for pad_z in [126_i32, 148, 170] {
         for x in -20_i32..=20 {
             for z in pad_z - 8..=pad_z + 8 {
                 if x.abs() == 20 || (z - pad_z).abs() == 8 {
-                    grid.set(IVec3::new(x, 1, z), 5);
+                    grid.set(IVec3::new(x, 1, z), 7);
                 }
             }
         }
@@ -717,14 +770,14 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
     for x in 10..=22 {
         for z in (150..=172).step_by(4) {
             for y in 10..=14 {
-                grid.set(IVec3::new(x, y, z), 3);
+                grid.set(IVec3::new(x, y, z), 7);
             }
         }
     }
     for z in 88..=110 {
         for x in [-16, -8, 8, 16] {
-            grid.set(IVec3::new(x, 11, z), 5);
-            grid.set(IVec3::new(x, 12, z), 5);
+            grid.set(IVec3::new(x, 11, z), 8);
+            grid.set(IVec3::new(x, 12, z), 8);
         }
     }
 
@@ -735,7 +788,7 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
                 grid,
                 IVec3::new(x - 1, 19, z - 1),
                 IVec3::new(x + 1, 21, z + 1),
-                4,
+                8,
             );
         }
     }
@@ -743,16 +796,16 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
         grid,
         IVec3::new(-3, 19, 208),
         IVec3::new(3, 22, 214),
-        3,
+        7,
     );
     for (x, z) in [(-18, 130), (18, 130), (-18, 165), (18, 165)] {
         fill_voxel_box(
             grid,
             IVec3::new(x - 5, 29, z - 5),
             IVec3::new(x + 5, 33, z + 5),
-            3,
+            7,
         );
-        grid.set(IVec3::new(x, 34, z), 5);
+        grid.set(IVec3::new(x, 34, z), 8);
     }
     for z in [120, 145, 170] {
         for side in [-1, 1] {
@@ -761,16 +814,16 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
                 grid,
                 IVec3::new(x - 3, 12, z - 5),
                 IVec3::new(x + 3, 17, z + 5),
-                3,
+                6,
             );
-            grid.set(IVec3::new(x, 14, z), 5);
+            grid.set(IVec3::new(x, 14, z), 8);
         }
     }
     for y in 29..=46 {
-        grid.set(IVec3::new(0, y, 194), 3);
+        grid.set(IVec3::new(0, y, 194), 7);
         if y % 4 == 1 {
             for x in -8..=8 {
-                grid.set(IVec3::new(x, y, 194), 4);
+                grid.set(IVec3::new(x, y, 194), 8);
             }
         }
     }
@@ -893,7 +946,7 @@ fn make_voxel_auto_door(
         cells,
         trigger_center,
         trigger_radius,
-        material: 3,
+        material: 7,
         open: false,
     }
 }
@@ -960,6 +1013,99 @@ fn setup_voxel_interior_lights(mut commands: Commands) {
                 ..default()
             },
             Transform::from_translation(position),
+        ));
+    }
+}
+
+fn voxel_sample_prop_specs() -> Vec<(&'static str, Transform)> {
+    let mut specs = Vec::new();
+    let mut add = |path, position, scale, yaw| {
+        specs.push((
+            path,
+            Transform::from_translation(position)
+                .with_rotation(Quat::from_rotation_y(yaw))
+                .with_scale(Vec3::splat(scale)),
+        ));
+    };
+
+    for station_x in [-22.5, 22.5] {
+        add(
+            "models/free_sample/SatelliteDish_1.gltf",
+            Vec3::new(station_x, 14.55, 0.0),
+            2.2,
+            if station_x < 0.0 { 0.55 } else { -0.55 },
+        );
+        for (offset_x, z, yaw) in [(-4.0, -3.5, 0.2), (4.0, -3.5, -0.2), (0.0, 4.0, 0.0)] {
+            add(
+                "models/free_sample/SolarPanel_4.gltf",
+                Vec3::new(station_x + offset_x, 14.55, z),
+                2.0,
+                yaw,
+            );
+        }
+        for deck_y in [0.28, 2.53, 4.78, 7.03] {
+            for z in [-5.5, 5.5] {
+                add(
+                    "models/free_sample/Prop_15.gltf",
+                    Vec3::new(station_x, deck_y, z),
+                    1.35,
+                    if z < 0.0 { 0.0 } else { std::f32::consts::PI },
+                );
+            }
+        }
+    }
+
+    for (x, z, yaw) in [(-3.6, 31.5, 0.35), (0.0, 37.0, 0.0), (3.6, 42.0, -0.35)] {
+        add(
+            "models/free_sample/Lander.gltf",
+            Vec3::new(x, 0.28, z),
+            0.46,
+            yaw,
+        );
+    }
+    for (x, z, yaw) in [
+        (-4.8, 24.0, 0.0),
+        (4.8, 24.0, 0.0),
+        (-4.8, 26.5, 0.4),
+        (4.8, 26.5, -0.4),
+    ] {
+        add(
+            "models/free_sample/BuildingBlock_2.gltf",
+            Vec3::new(x, 0.28, z),
+            0.52,
+            yaw,
+        );
+    }
+    for deck_y in [0.28, 2.53, 4.78] {
+        for (x, z, yaw) in [(-4.7, 23.0, 0.0), (4.7, 23.0, std::f32::consts::PI)] {
+            add(
+                "models/free_sample/Prop_14.gltf",
+                Vec3::new(x, deck_y, z),
+                1.25,
+                yaw,
+            );
+        }
+    }
+    for (x, z, yaw) in [
+        (-4.0, 49.0, 0.0),
+        (0.0, 50.5, 0.0),
+        (4.0, 49.0, std::f32::consts::PI),
+    ] {
+        add(
+            "models/free_sample/Prop_15.gltf",
+            Vec3::new(x, 4.78, z),
+            1.55,
+            yaw,
+        );
+    }
+    specs
+}
+
+fn setup_voxel_sample_props(mut commands: Commands, asset_server: Res<AssetServer>) {
+    for (path, transform) in voxel_sample_prop_specs() {
+        commands.spawn((
+            WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(path))),
+            transform,
         ));
     }
 }
@@ -1147,7 +1293,7 @@ fn build_voxel_meshes_from_cells(cells: &[(IVec3, u8)]) -> (Vec<(u8, Mesh)>, Vec
         .filter_map(|(cell, material)| TrpgVoxelConnector::solid(material).then_some(*cell))
         .collect::<Vec<_>>();
 
-    for material in 1..=5 {
+    for material in 1..=VOXEL_MATERIAL_COUNT as u8 {
         let mut positions = Vec::<[f32; 3]>::new();
         let mut normals = Vec::<[f32; 3]>::new();
         let mut uvs = Vec::<[f32; 2]>::new();
@@ -2513,7 +2659,7 @@ mod tests {
         );
         assert_eq!(
             grid.get(IVec3::new(1, 28, 150)).copied(),
-            Some(3)
+            Some(6)
         );
 
         let old_station_interior_volume = 19 * 7 * 15;
@@ -2543,7 +2689,7 @@ mod tests {
         assert!(voxel_cells(grid).len() >= 100_000);
         assert_eq!(
             materials,
-            HashSet::from([1, 2, 3, 4, 5])
+            HashSet::from([1, 2, 3, 4, 5, 6, 7, 8])
         );
 
         let doors = voxel_auto_doors();
@@ -2553,7 +2699,7 @@ mod tests {
         assert!(doors
             .iter()
             .flat_map(|door| &door.cells)
-            .all(|cell| { grid.get(*cell).copied() == Some(3) }));
+            .all(|cell| { grid.get(*cell).copied() == Some(7) }));
 
         let lights = voxel_interior_lights();
         assert_eq!(lights.len(), 62);
@@ -2693,7 +2839,7 @@ mod tests {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
         let (meshes, colliders) = build_voxel_meshes(grid);
-        assert_eq!(meshes.len(), 5);
+        assert_eq!(meshes.len(), VOXEL_MATERIAL_COUNT);
         assert!(!colliders.is_empty());
         for (_, mesh) in meshes {
             assert!(mesh.attribute(Mesh::ATTRIBUTE_POSITION).is_some());
@@ -2707,6 +2853,22 @@ mod tests {
         assert!(TrpgVoxelConnector::solid(&1));
         assert!(!TrpgVoxelConnector::solid(&4));
         assert!(!TrpgVoxelConnector::solid(&5));
+        assert!(TrpgVoxelConnector::solid(&6));
+        assert!(TrpgVoxelConnector::solid(&7));
+        assert!(TrpgVoxelConnector::solid(&8));
+    }
+
+    #[test]
+    fn sample_pack_props_detail_station_roofs_and_warship_interiors() {
+        let specs = voxel_sample_prop_specs();
+        assert_eq!(specs.len(), 40);
+        assert!(specs.iter().any(|(path, _)| path.ends_with("Lander.gltf")));
+        assert!(specs
+            .iter()
+            .any(|(path, _)| path.ends_with("SatelliteDish_1.gltf")));
+        assert!(specs
+            .iter()
+            .any(|(path, _)| path.ends_with("SolarPanel_4.gltf")));
     }
 
     #[test]

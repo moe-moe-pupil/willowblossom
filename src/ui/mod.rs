@@ -11569,6 +11569,21 @@ pub fn ui_system(
                                 "岩浆",
                                 egui::Color32::from_rgb(255, 41, 4),
                             ),
+                            (
+                                6,
+                                "金属舰壳",
+                                egui::Color32::from_rgb(104, 122, 142),
+                            ),
+                            (
+                                7,
+                                "装甲板",
+                                egui::Color32::from_rgb(35, 48, 66),
+                            ),
+                            (
+                                8,
+                                "发光科技板",
+                                egui::Color32::from_rgb(255, 148, 32),
+                            ),
                         ] {
                             let (rect, response) =
                                 ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::click());
