@@ -327,6 +327,7 @@ impl Plugin for TrpgVoxelPlugin {
                 setup_voxel_grid,
                 populate_voxel_grid,
                 setup_voxel_auto_doors,
+                setup_voxel_interior_lights,
                 setup_voxel_view,
             )
                 .chain(),
@@ -560,6 +561,18 @@ fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station:
             }
         }
     }
+    for deck_y in [1, 10, 19, 28] {
+        for x in [-36, -12, 12, 36] {
+            for z in [-30, -10, 10, 30] {
+                fill_voxel_box(
+                    grid,
+                    center + IVec3::new(x - 1, deck_y, z - 1),
+                    center + IVec3::new(x + 1, deck_y + 1, z + 1),
+                    if (x + z) % 3 == 0 { 4 } else { accent },
+                );
+            }
+        }
+    }
     for x in [30, 36, 42] {
         for z in [-28, -14, 14, 28] {
             for y in 1..=7 {
@@ -665,6 +678,100 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
             grid.set(IVec3::new(x, y, 79), 5);
         }
     }
+
+    // Hangar guidance lanes and landing-pad markings on the lower deck.
+    for z in 118..=170 {
+        for x in [-14, -7, 0, 7, 14] {
+            grid.set(IVec3::new(x, 1, z), 4);
+        }
+    }
+    for pad_z in [126_i32, 148, 170] {
+        for x in -20_i32..=20 {
+            for z in pad_z - 8..=pad_z + 8 {
+                if x.abs() == 20 || (z - pad_z).abs() == 8 {
+                    grid.set(IVec3::new(x, 1, z), 5);
+                }
+            }
+        }
+    }
+
+    // Crew bunks, medbay, armory racks, and engineering conduits on separate decks.
+    for z in (120..=168).step_by(6) {
+        for x in [-22, -18, 18, 22] {
+            fill_voxel_box(
+                grid,
+                IVec3::new(x - 1, 10, z - 2),
+                IVec3::new(x + 1, 12, z + 2),
+                3,
+            );
+        }
+    }
+    fill_voxel_box(
+        grid,
+        IVec3::new(-22, 10, 150),
+        IVec3::new(-8, 10, 168),
+        1,
+    );
+    for x in 10..=22 {
+        for z in (150..=172).step_by(4) {
+            for y in 10..=14 {
+                grid.set(IVec3::new(x, y, z), 3);
+            }
+        }
+    }
+    for z in 88..=110 {
+        for x in [-16, -8, 8, 16] {
+            grid.set(IVec3::new(x, 11, z), 5);
+            grid.set(IVec3::new(x, 12, z), 5);
+        }
+    }
+
+    // Bridge consoles, captain's dais, turret machinery, escape pods, and sensor mast.
+    for x in (-18..=18).step_by(6) {
+        for z in [194, 198, 202, 206] {
+            fill_voxel_box(
+                grid,
+                IVec3::new(x - 1, 19, z - 1),
+                IVec3::new(x + 1, 21, z + 1),
+                4,
+            );
+        }
+    }
+    fill_voxel_box(
+        grid,
+        IVec3::new(-3, 19, 208),
+        IVec3::new(3, 22, 214),
+        3,
+    );
+    for (x, z) in [(-18, 130), (18, 130), (-18, 165), (18, 165)] {
+        fill_voxel_box(
+            grid,
+            IVec3::new(x - 5, 29, z - 5),
+            IVec3::new(x + 5, 33, z + 5),
+            3,
+        );
+        grid.set(IVec3::new(x, 34, z), 5);
+    }
+    for z in [120, 145, 170] {
+        for side in [-1, 1] {
+            let x = side * 30;
+            fill_voxel_box(
+                grid,
+                IVec3::new(x - 3, 12, z - 5),
+                IVec3::new(x + 3, 17, z + 5),
+                3,
+            );
+            grid.set(IVec3::new(x, 14, z), 5);
+        }
+    }
+    for y in 29..=46 {
+        grid.set(IVec3::new(0, y, 194), 3);
+        if y % 4 == 1 {
+            for x in -8..=8 {
+                grid.set(IVec3::new(x, y, 194), 4);
+            }
+        }
+    }
 }
 
 fn fill_voxel_box(grid: &mut Mut<Grid<u8>>, min: IVec3, max: IVec3, material: u8) {
@@ -709,32 +816,149 @@ fn build_hollow_voxel_room(
 }
 
 fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
-    let specs = [
-        (IVec3::new(-40, 0, 0), IVec3::Z),
-        (IVec3::new(40, 0, 0), IVec3::Z),
-        (IVec3::new(0, 0, 80), IVec3::X),
+    let mut doors = vec![
+        make_voxel_auto_door(
+            IVec3::new(-40, 0, 0),
+            IVec3::Z,
+            5,
+            8,
+            3.5,
+        ),
+        make_voxel_auto_door(
+            IVec3::new(40, 0, 0),
+            IVec3::Z,
+            5,
+            8,
+            3.5,
+        ),
+        make_voxel_auto_door(
+            IVec3::new(0, 0, 80),
+            IVec3::X,
+            5,
+            8,
+            3.5,
+        ),
     ];
-    specs
-        .into_iter()
-        .map(|(base, width_axis)| {
-            let cells = (-5..=5)
-                .flat_map(|width| (1..=8).map(move |y| base + width_axis * width + IVec3::Y * y))
-                .collect::<Vec<_>>();
-            let trigger_center = (base.as_vec3() + Vec3::new(0.5, 4.5, 0.5)) * VOXEL_SIZE;
-            VoxelAutoDoor {
-                cells,
-                trigger_center,
-                trigger_radius: 3.5,
-                material: 3,
-                open: false,
+    for station_x in [-90, 90] {
+        for deck_y in [0, 9, 18, 27] {
+            for local_x in [-25, 25] {
+                doors.push(make_voxel_auto_door(
+                    IVec3::new(station_x + local_x, deck_y, 0),
+                    IVec3::Z,
+                    4,
+                    7,
+                    1.75,
+                ));
             }
-        })
-        .collect()
+            for local_z in [-20, 20] {
+                doors.push(make_voxel_auto_door(
+                    IVec3::new(station_x, deck_y, local_z),
+                    IVec3::X,
+                    4,
+                    7,
+                    1.75,
+                ));
+            }
+        }
+    }
+    for bulkhead_z in [112, 145, 178] {
+        for deck_y in [0, 9, 18] {
+            doors.push(make_voxel_auto_door(
+                IVec3::new(0, deck_y, bulkhead_z),
+                IVec3::X,
+                4,
+                7,
+                1.75,
+            ));
+        }
+    }
+    doors
+}
+
+fn make_voxel_auto_door(
+    base: IVec3,
+    width_axis: IVec3,
+    half_width: i32,
+    height: i32,
+    trigger_radius: f32,
+) -> VoxelAutoDoor {
+    let cells = (-half_width..=half_width)
+        .flat_map(|width| (1..=height).map(move |y| base + width_axis * width + IVec3::Y * y))
+        .collect::<Vec<_>>();
+    let trigger_center =
+        (base.as_vec3() + Vec3::new(0.5, (height + 1) as f32 * 0.5, 0.5)) * VOXEL_SIZE;
+    VoxelAutoDoor {
+        cells,
+        trigger_center,
+        trigger_radius,
+        material: 3,
+        open: false,
+    }
 }
 
 fn setup_voxel_auto_doors(mut commands: Commands) {
     for door in voxel_auto_doors() {
         commands.spawn(door);
+    }
+}
+
+fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
+    let mut lights = Vec::new();
+    for (station_x, color) in [
+        (-90, Color::srgb(0.55, 0.75, 1.0)),
+        (90, Color::srgb(1.0, 0.72, 0.42)),
+    ] {
+        for deck_y in [0, 9, 18, 27] {
+            for x in [-28, 28] {
+                for z in [-22, 22] {
+                    lights.push((
+                        (Vec3::new(
+                            (station_x + x) as f32,
+                            (deck_y + 7) as f32,
+                            z as f32,
+                        ) + Vec3::splat(0.5))
+                            * VOXEL_SIZE,
+                        color,
+                    ));
+                }
+            }
+        }
+        for y in [43, 51, 56] {
+            for x in [-12, 12] {
+                lights.push((
+                    (Vec3::new((station_x + x) as f32, y as f32, 0.0) + Vec3::splat(0.5))
+                        * VOXEL_SIZE,
+                    color,
+                ));
+            }
+        }
+    }
+    for deck_y in [0, 9, 18] {
+        for z in [100, 145, 190] {
+            for x in [-14, 14] {
+                lights.push((
+                    (Vec3::new(x as f32, (deck_y + 7) as f32, z as f32) + Vec3::splat(0.5))
+                        * VOXEL_SIZE,
+                    Color::srgb(1.0, 0.42, 0.2),
+                ));
+            }
+        }
+    }
+    lights
+}
+
+fn setup_voxel_interior_lights(mut commands: Commands) {
+    for (position, color) in voxel_interior_lights() {
+        commands.spawn((
+            PointLight {
+                color,
+                intensity: 18_000.0,
+                range: 6.0,
+                shadow_maps_enabled: false,
+                ..default()
+            },
+            Transform::from_translation(position),
+        ));
     }
 }
 
@@ -2294,7 +2518,7 @@ mod tests {
     }
 
     #[test]
-    fn default_space_map_uses_all_builtin_voxel_materials_and_three_doors() {
+    fn default_space_map_uses_all_materials_and_internal_auto_doors() {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
         let materials = voxel_cells(grid)
@@ -2308,12 +2532,17 @@ mod tests {
         );
 
         let doors = voxel_auto_doors();
-        assert_eq!(doors.len(), 3);
-        assert!(doors.iter().all(|door| door.cells.len() == 88));
+        assert_eq!(doors.len(), 44);
+        assert!(doors.iter().take(3).all(|door| door.cells.len() == 88));
+        assert!(doors.iter().skip(3).all(|door| door.cells.len() == 63));
         assert!(doors
             .iter()
             .flat_map(|door| &door.cells)
             .all(|cell| { grid.get(*cell).copied() == Some(3) }));
+
+        let lights = voxel_interior_lights();
+        assert_eq!(lights.len(), 62);
+        assert!(lights.iter().all(|(position, _)| position.y > 0.0));
     }
 
     #[test]
