@@ -23,7 +23,11 @@ use bevy::{
         PrimitiveTopology,
     },
     prelude::*,
-    window::PrimaryWindow,
+    window::{
+        CursorGrabMode,
+        CursorOptions,
+        PrimaryWindow,
+    },
 };
 use bevy_egui::input::EguiWantsInput;
 use voxxelmaxx::prelude::*;
@@ -36,6 +40,12 @@ const TEST_GROUND_SIZE: Vec3 = Vec3::new(32.0, 0.5, 32.0);
 const TEST_GROUND_CENTER_Y: f32 = -2.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_PHYSICS_BODIES: usize = 40;
+const FIRST_PERSON_RADIUS: f32 = 0.12;
+const FIRST_PERSON_BODY_LENGTH: f32 = 0.26;
+const FIRST_PERSON_EYE_OFFSET: f32 = 0.18;
+const FIRST_PERSON_SPEED: f32 = 2.8;
+const FIRST_PERSON_JUMP_SPEED: f32 = 3.4;
+const FIRST_PERSON_START: Vec3 = Vec3::new(0.0, 2.45, 0.0);
 
 pub struct TrpgVoxelPlugin;
 
@@ -79,6 +89,9 @@ struct VoxelSceneSnapshot {
 
 #[derive(Component)]
 struct VoxelTestingGround;
+
+#[derive(Component)]
+struct VoxelFirstPersonPlayer;
 
 #[derive(Resource)]
 struct VoxelMaterials {
@@ -129,6 +142,7 @@ pub(crate) struct VoxelEditorState {
     pub redo_requested: bool,
     pub reset_requested: bool,
     pub view_reset_requested: bool,
+    pub first_person_enabled: bool,
     pub physics_requested: bool,
     physics_action_requested: Option<VoxelPhysicsRequest>,
     pub physics_push_pull_impulse: f32,
@@ -166,6 +180,7 @@ impl Default for VoxelEditorState {
             redo_requested: false,
             reset_requested: false,
             view_reset_requested: false,
+            first_person_enabled: false,
             physics_requested: false,
             physics_action_requested: None,
             physics_push_pull_impulse: 4.0,
@@ -280,6 +295,7 @@ impl Plugin for TrpgVoxelPlugin {
                 apply_voxel_physics_action,
                 process_voxel_scene_history,
                 rebuild_voxel_geometry,
+                control_first_person_player,
                 control_voxel_camera,
                 draw_voxel_target,
                 animate_voxel_materials,
@@ -451,6 +467,29 @@ fn setup_voxel_view(
         Transform::from_xyz(0.0, TEST_GROUND_CENTER_Y, 0.0),
         VoxelTestingGround,
     ));
+    let player_collider = Collider::capsule(
+        FIRST_PERSON_RADIUS,
+        FIRST_PERSON_BODY_LENGTH,
+    );
+    let mut ground_shape = player_collider.clone();
+    ground_shape.set_scale(Vec3::splat(0.99), 10);
+    commands.spawn((
+        VoxelFirstPersonPlayer,
+        RigidBody::Dynamic,
+        player_collider,
+        ShapeCaster::new(
+            ground_shape,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Dir3::NEG_Y,
+        )
+        .with_max_distance(0.06),
+        LockedAxes::ROTATION_LOCKED,
+        Friction::ZERO.with_combine_rule(CoefficientCombine::Min),
+        Restitution::ZERO.with_combine_rule(CoefficientCombine::Min),
+        ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
+        Transform::from_translation(FIRST_PERSON_START),
+    ));
 }
 
 fn editor_camera_transform(editor: &VoxelEditorState) -> Transform {
@@ -462,6 +501,24 @@ fn editor_camera_transform(editor: &VoxelEditorState) -> Transform {
     );
     let position = editor.camera_focus + rotation * Vec3::new(0.0, 0.0, editor.camera_distance);
     Transform::from_translation(position).looking_at(editor.camera_focus, Vec3::Y)
+}
+
+fn viewport_ray(
+    window: &Window,
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    editor: &VoxelEditorState,
+) -> Option<Ray3d> {
+    let screen_position = if editor.first_person_enabled {
+        (editor.viewport_min + editor.viewport_max) * 0.5
+    } else {
+        window
+            .cursor_position()
+            .filter(|cursor| editor.contains_cursor(*cursor))?
+    };
+    camera
+        .viewport_to_world(camera_transform, screen_position)
+        .ok()
 }
 
 fn rebuild_voxel_geometry(
@@ -1138,7 +1195,7 @@ fn edit_voxel_grid(
             editor.redo.clear();
         }
     }
-    if egui_input.wants_pointer_input() {
+    if egui_input.wants_pointer_input() && !editor.first_person_enabled {
         return;
     }
     if let Some(action) = force_tool_action(editor.mode) {
@@ -1152,13 +1209,12 @@ fn edit_voxel_grid(
         ) else {
             return;
         };
-        let Some(cursor) = window.cursor_position() else {
-            return;
-        };
-        if !editor.contains_cursor(cursor) {
-            return;
-        }
-        let Ok(ray) = camera.viewport_to_world(camera_transform, cursor) else {
+        let Some(ray) = viewport_ray(
+            window,
+            camera,
+            camera_transform,
+            &editor,
+        ) else {
             return;
         };
         let grid_hit = raycast_grid(&grid, ray);
@@ -1330,13 +1386,12 @@ fn edit_voxel_grid(
         ) else {
             return;
         };
-        let Some(cursor) = window.cursor_position() else {
-            return;
-        };
-        if !editor.contains_cursor(cursor) {
-            return;
-        }
-        let Ok(ray) = camera.viewport_to_world(camera_transform, cursor) else {
+        let Some(ray) = viewport_ray(
+            window,
+            camera,
+            camera_transform,
+            &editor,
+        ) else {
             return;
         };
         if let Some(cell) = raycast_grid(&grid, ray).and_then(|hit| hit.occupied) {
@@ -1362,13 +1417,12 @@ fn edit_voxel_grid(
     ) else {
         return;
     };
-    let Some(cursor) = window.cursor_position() else {
-        return;
-    };
-    if !editor.contains_cursor(cursor) {
-        return;
-    }
-    let Ok(ray) = camera.viewport_to_world(camera_transform, cursor) else {
+    let Some(ray) = viewport_ray(
+        window,
+        camera,
+        camera_transform,
+        &editor,
+    ) else {
         return;
     };
     let Some(hit) = raycast_grid(&grid, ray) else {
@@ -1495,21 +1549,122 @@ fn raycast_grid(grid: &Grid<u8>, ray: Ray3d) -> Option<VoxelRayHit> {
     None
 }
 
+fn control_first_person_player(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    editor: Res<VoxelEditorState>,
+    mut players: Query<
+        (
+            &mut Transform,
+            &ShapeHits,
+            &mut LinearVelocity,
+        ),
+        With<VoxelFirstPersonPlayer>,
+    >,
+) {
+    let Ok((mut transform, ground_hits, mut velocity)) = players.single_mut() else {
+        return;
+    };
+    if transform.translation.y < -10.0 {
+        transform.translation = FIRST_PERSON_START;
+        velocity.0 = Vec3::ZERO;
+    }
+    if !editor.first_person_enabled {
+        velocity.x = 0.0;
+        velocity.z = 0.0;
+        return;
+    }
+
+    let forward_input =
+        keyboard.pressed(KeyCode::KeyW) as i8 - keyboard.pressed(KeyCode::KeyS) as i8;
+    let right_input = keyboard.pressed(KeyCode::KeyD) as i8 - keyboard.pressed(KeyCode::KeyA) as i8;
+    let yaw_rotation = Quat::from_rotation_y(editor.camera_yaw);
+    let forward = yaw_rotation * Vec3::NEG_Z;
+    let right = yaw_rotation * Vec3::X;
+    let movement =
+        (forward * forward_input as f32 + right * right_input as f32).clamp_length_max(1.0);
+    velocity.x = movement.x * FIRST_PERSON_SPEED;
+    velocity.z = movement.z * FIRST_PERSON_SPEED;
+
+    let grounded = ground_hits
+        .iter()
+        .any(|hit| (-hit.normal2).angle_between(Vec3::Y).abs() <= 55.0_f32.to_radians());
+    if grounded && keyboard.just_pressed(KeyCode::Space) {
+        velocity.y = FIRST_PERSON_JUMP_SPEED;
+    }
+}
+
 fn control_voxel_camera(
+    keyboard: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut motion: MessageReader<MouseMotion>,
     mut wheel: MessageReader<MouseWheel>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    mut cameras: Query<&mut Transform, With<VoxelViewportCamera>>,
+    mut cursor_options: Query<&mut CursorOptions, With<PrimaryWindow>>,
+    mut cameras: Query<
+        &mut Transform,
+        (
+            With<VoxelViewportCamera>,
+            Without<VoxelFirstPersonPlayer>,
+        ),
+    >,
+    mut players: Query<
+        (&mut Transform, &mut LinearVelocity),
+        (
+            With<VoxelFirstPersonPlayer>,
+            Without<VoxelViewportCamera>,
+        ),
+    >,
     mut editor: ResMut<VoxelEditorState>,
     egui_input: Res<EguiWantsInput>,
 ) {
+    if keyboard.just_pressed(KeyCode::Escape) && editor.first_person_enabled {
+        editor.first_person_enabled = false;
+    }
+    if let Ok(mut cursor) = cursor_options.single_mut() {
+        if editor.first_person_enabled {
+            cursor.visible = false;
+            cursor.grab_mode = CursorGrabMode::Locked;
+        } else {
+            cursor.visible = true;
+            cursor.grab_mode = CursorGrabMode::None;
+        }
+    }
     if editor.view_reset_requested {
-        editor.camera_focus = Vec3::new(0.0, 0.75, 0.0);
-        editor.camera_distance = 20.0;
-        editor.camera_yaw = 0.7;
-        editor.camera_pitch = -0.45;
+        if editor.first_person_enabled {
+            if let Ok((mut player_transform, mut velocity)) = players.single_mut() {
+                player_transform.translation = FIRST_PERSON_START;
+                velocity.0 = Vec3::ZERO;
+            }
+        } else {
+            editor.camera_focus = Vec3::new(0.0, 0.75, 0.0);
+            editor.camera_distance = 20.0;
+            editor.camera_yaw = 0.7;
+            editor.camera_pitch = -0.45;
+        }
         editor.view_reset_requested = false;
+    }
+    let delta = motion.read().fold(Vec2::ZERO, |sum, event| {
+        sum + event.delta
+    });
+    if editor.first_person_enabled {
+        editor.camera_yaw -= delta.x * 0.0025;
+        editor.camera_pitch = (editor.camera_pitch - delta.y * 0.0025).clamp(-1.5, 1.5);
+        wheel.clear();
+        let Ok((player_transform, _)) = players.single() else {
+            return;
+        };
+        let rotation = Quat::from_euler(
+            EulerRot::YXZ,
+            editor.camera_yaw,
+            editor.camera_pitch,
+            0.0,
+        );
+        if let Ok(mut camera_transform) = cameras.single_mut() {
+            camera_transform.translation =
+                player_transform.translation + Vec3::Y * FIRST_PERSON_EYE_OFFSET;
+            camera_transform.rotation = rotation;
+        }
+        return;
     }
     let Ok(window) = windows.single() else {
         return;
@@ -1525,9 +1680,6 @@ fn control_voxel_camera(
         editor.camera_drag_started_in_viewport = false;
     }
 
-    let delta = motion.read().fold(Vec2::ZERO, |sum, event| {
-        sum + event.delta
-    });
     if editor.camera_drag_started_in_viewport && mouse.pressed(MouseButton::Right) {
         editor.camera_yaw -= delta.x * 0.006;
         editor.camera_pitch = (editor.camera_pitch - delta.y * 0.006).clamp(-1.45, 1.2);
@@ -1566,18 +1718,21 @@ fn draw_voxel_target(
     let Ok(grid) = grids.single() else {
         return;
     };
-    let (hit, explosion_origin) = if egui_input.wants_pointer_input() {
+    let (hit, explosion_origin) = if egui_input.wants_pointer_input()
+        && !editor.first_person_enabled
+    {
         (None, None)
     } else {
         let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single())
         else {
             return;
         };
-        let Some(ray) = window
-            .cursor_position()
-            .filter(|cursor| editor.contains_cursor(*cursor))
-            .and_then(|cursor| camera.viewport_to_world(camera_transform, cursor).ok())
-        else {
+        let Some(ray) = viewport_ray(
+            window,
+            camera,
+            camera_transform,
+            &editor,
+        ) else {
             return;
         };
         let hit = raycast_grid(grid, ray);

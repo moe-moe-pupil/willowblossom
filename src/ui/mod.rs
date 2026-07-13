@@ -11604,7 +11604,20 @@ pub fn ui_system(
                         if ui.button("视图复位").clicked() {
                             voxel_editor.view_reset_requested = true;
                         }
+                        if ui
+                            .selectable_label(
+                                voxel_editor.first_person_enabled,
+                                "第一人称",
+                            )
+                            .on_hover_text("进入后锁定鼠标；按 Esc 退出")
+                            .clicked()
+                        {
+                            voxel_editor.first_person_enabled = !voxel_editor.first_person_enabled;
+                        }
                     });
+                    if voxel_editor.first_person_enabled {
+                        ui.small("WASD 移动 · 空格跳跃 · 鼠标观察 · 左键使用当前工具 · Esc 退出");
+                    }
                     let snapshot_labels = voxel_editor.scene_snapshot_labels();
                     ui.collapsing(
                         format!("场景历史（{}）", snapshot_labels.len()),
@@ -11679,6 +11692,26 @@ pub fn ui_system(
                         });
                     }
                 });
+
+            if voxel_editor.first_person_enabled {
+                let center = viewport.center();
+                let painter = ui.painter();
+                let stroke = Stroke::new(2.0, egui::Color32::WHITE);
+                painter.line_segment(
+                    [
+                        center + egui::vec2(-7.0, 0.0),
+                        center + egui::vec2(7.0, 0.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        center + egui::vec2(0.0, -7.0),
+                        center + egui::vec2(0.0, 7.0),
+                    ],
+                    stroke,
+                );
+            }
 
             pending_chat_requests_window(
                 ctx,
