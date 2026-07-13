@@ -201,6 +201,7 @@ pub(crate) struct VoxelEditorState {
     camera_yaw: f32,
     camera_pitch: f32,
     camera_drag_started_in_viewport: bool,
+    left_started_over_ui: bool,
     selection_anchor: Option<IVec3>,
     selection_end: Option<IVec3>,
     physics_status: Option<String>,
@@ -241,6 +242,7 @@ impl Default for VoxelEditorState {
             camera_yaw: 0.7,
             camera_pitch: -0.45,
             camera_drag_started_in_viewport: false,
+            left_started_over_ui: false,
             selection_anchor: None,
             selection_end: None,
             physics_status: None,
@@ -1751,6 +1753,10 @@ fn edit_voxel_grid(
     mut editor: ResMut<VoxelEditorState>,
     egui_input: Res<EguiWantsInput>,
 ) {
+    let egui_owns_pointer = egui_input.wants_any_pointer_input();
+    if mouse.just_pressed(MouseButton::Left) {
+        editor.left_started_over_ui = egui_owns_pointer;
+    }
     if mouse.just_released(MouseButton::Left) {
         editor.stroke_positions.clear();
         editor.edit_hold_seconds = 0.0;
@@ -1760,8 +1766,12 @@ fn edit_voxel_grid(
             editor.undo.push(stroke);
             editor.redo.clear();
         }
+        editor.left_started_over_ui = false;
     }
-    if egui_input.wants_pointer_input() && !editor.first_person_enabled {
+    if voxel_world_pointer_blocked(
+        egui_owns_pointer,
+        editor.left_started_over_ui,
+    ) {
         return;
     }
     if let Some(action) = force_tool_action(editor.mode) {
@@ -2033,6 +2043,10 @@ fn edit_voxel_grid(
     if !stroke.is_empty() {
         editor.active_stroke.extend(stroke);
     }
+}
+
+fn voxel_world_pointer_blocked(egui_owns_pointer: bool, left_started_over_ui: bool) -> bool {
+    egui_owns_pointer || left_started_over_ui
 }
 
 fn edited_voxel(mode: VoxelEditMode, before: u8, material: u8) -> Option<u8> {
@@ -2339,9 +2353,10 @@ fn draw_voxel_target(
     let Ok(grid) = grids.single() else {
         return;
     };
-    let (hit, explosion_origin) = if egui_input.wants_pointer_input()
-        && !editor.first_person_enabled
-    {
+    let (hit, explosion_origin) = if voxel_world_pointer_blocked(
+        egui_input.wants_any_pointer_input(),
+        editor.left_started_over_ui,
+    ) {
         (None, None)
     } else {
         let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single())
@@ -2692,6 +2707,16 @@ mod tests {
         assert!(TrpgVoxelConnector::solid(&1));
         assert!(!TrpgVoxelConnector::solid(&4));
         assert!(!TrpgVoxelConnector::solid(&5));
+    }
+
+    #[test]
+    fn voxel_pointer_actions_stay_blocked_for_clicks_started_over_ui() {
+        assert!(!voxel_world_pointer_blocked(
+            false, false
+        ));
+        assert!(voxel_world_pointer_blocked(true, false));
+        assert!(voxel_world_pointer_blocked(false, true));
+        assert!(voxel_world_pointer_blocked(true, true));
     }
 
     #[test]
