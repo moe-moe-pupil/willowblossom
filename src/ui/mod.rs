@@ -11521,6 +11521,11 @@ pub fn ui_system(
                             VoxelEditMode::Paint,
                             "涂色",
                         );
+                        ui.selectable_value(
+                            &mut voxel_editor.mode,
+                            VoxelEditMode::Physics,
+                            "物理选区",
+                        );
                         ui.separator();
                         for (material, name, color) in [
                             (
@@ -11581,6 +11586,24 @@ pub fn ui_system(
                             voxel_editor.view_reset_requested = true;
                         }
                     });
+                    if voxel_editor.mode == VoxelEditMode::Physics {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(voxel_editor.physics_selection_hint());
+                            if ui
+                                .add_enabled(
+                                    voxel_editor.has_physics_selection(),
+                                    egui::Button::new("生成物理体"),
+                                )
+                                .on_hover_text("选区中的每个独立固体会成为单独的动态物理体")
+                                .clicked()
+                            {
+                                voxel_editor.physics_requested = true;
+                            }
+                            if let Some(status) = voxel_editor.physics_status() {
+                                ui.small(status);
+                            }
+                        });
+                    }
                 });
 
             pending_chat_requests_window(
