@@ -11617,7 +11617,7 @@ pub fn ui_system(
                     });
                     if voxel_editor.first_person_enabled {
                         let movement_hint = if voxel_editor.first_person_flying {
-                            "飞行中 · WASD 移动 · 空格上升 · Shift 下降"
+                            "创造飞行/穿墙中 · WASD 移动 · 空格上升 · Shift 下降"
                         } else {
                             "WASD 移动 · 空格跳跃 · 双击空格飞行"
                         };

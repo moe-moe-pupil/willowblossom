@@ -37,7 +37,7 @@ const MAX_RAY_DISTANCE: f32 = 80.0;
 const EDIT_REPEAT_DELAY: f32 = 0.32;
 const EDIT_REPEAT_INTERVAL: f32 = 0.09;
 const TEST_GROUND_SIZE: Vec3 = Vec3::new(32.0, 0.5, 32.0);
-const TEST_GROUND_CENTER_Y: f32 = -2.25;
+const TEST_GROUND_CENTER_Y: f32 = -12.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_PHYSICS_BODIES: usize = 40;
 const FIRST_PERSON_RADIUS: f32 = 0.12;
@@ -48,7 +48,7 @@ const FIRST_PERSON_JUMP_SPEED: f32 = 3.4;
 const FIRST_PERSON_FLY_SPEED: f32 = 3.5;
 const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
-const FIRST_PERSON_START: Vec3 = Vec3::new(0.0, 2.45, 0.0);
+const FIRST_PERSON_START: Vec3 = Vec3::new(-6.0, 0.55, 0.0);
 
 pub struct TrpgVoxelPlugin;
 
@@ -95,6 +95,15 @@ struct VoxelTestingGround;
 
 #[derive(Component)]
 struct VoxelFirstPersonPlayer;
+
+#[derive(Component, Clone)]
+struct VoxelAutoDoor {
+    cells: Vec<IVec3>,
+    trigger_center: Vec3,
+    trigger_radius: f32,
+    material: u8,
+    open: bool,
+}
 
 #[derive(Resource)]
 struct VoxelMaterials {
@@ -288,6 +297,7 @@ impl Plugin for TrpgVoxelPlugin {
                 setup_voxel_materials,
                 setup_voxel_grid,
                 populate_voxel_grid,
+                setup_voxel_auto_doors,
                 setup_voxel_view,
             )
                 .chain(),
@@ -301,6 +311,7 @@ impl Plugin for TrpgVoxelPlugin {
                 make_selection_physical,
                 apply_voxel_physics_action,
                 process_voxel_scene_history,
+                animate_voxel_auto_doors,
                 rebuild_voxel_geometry,
                 control_first_person_player,
                 control_voxel_camera,
@@ -409,24 +420,188 @@ fn populate_voxel_grid(mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>) {
 }
 
 fn populate_default_grid(grid: &mut Mut<Grid<u8>>) {
-    for x in -7..=7 {
-        for z in -7..=7 {
-            let height = 1 + ((x * x + z * z) % 3 == 0) as i32;
-            for y in 0..height {
-                grid.set(IVec3::new(x, y, z), 1);
-            }
+    build_space_station(grid, IVec3::new(-24, 0, 0), false);
+    build_space_station(grid, IVec3::new(24, 0, 0), true);
+    build_combat_spaceship(grid);
+    for door in voxel_auto_doors() {
+        for cell in door.cells {
+            grid.set(cell, door.material);
+        }
+    }
+}
+
+fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station: bool) {
+    let min = center + IVec3::new(-10, 0, -8);
+    let max = center + IVec3::new(10, 8, 8);
+    build_hollow_voxel_room(grid, min, max, 3, 2);
+
+    // Observation crown and a hollow docking corridor facing the center of the map.
+    build_hollow_voxel_room(
+        grid,
+        center + IVec3::new(-4, 9, -4),
+        center + IVec3::new(4, 13, 4),
+        3,
+        2,
+    );
+    let dock_min_x = if center.x < 0 { center.x + 10 } else { center.x - 16 };
+    let dock_max_x = if center.x < 0 { center.x + 16 } else { center.x - 10 };
+    build_hollow_voxel_room(
+        grid,
+        IVec3::new(dock_min_x, 0, center.z - 3),
+        IVec3::new(dock_max_x, 4, center.z + 3),
+        3,
+        2,
+    );
+
+    // Interior consoles, reactor lighting, and a small life-support garden.
+    for x in -5..=-2 {
+        for z in -3..=3 {
+            grid.set(center + IVec3::new(x, 1, z), 1);
+        }
+    }
+    let accent = if command_station { 5 } else { 4 };
+    for z in [-5, 5] {
+        for x in -4..=4 {
+            grid.set(center + IVec3::new(x, 2, z), accent);
+        }
+    }
+    for y in 1..=5 {
+        grid.set(center + IVec3::new(6, y, 0), 5);
+        grid.set(center + IVec3::new(7, y, 0), 5);
+    }
+}
+
+fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
+    // A tapered, walkable warship hull with a continuous internal deck.
+    for z in 18..=46 {
+        let half_width = if z < 23 {
+            4 + (z - 18) / 2
+        } else if z > 38 {
+            (7 - (z - 38)).max(1)
+        } else {
+            7
+        };
+        for x in -half_width..=half_width {
+            grid.set(IVec3::new(x, 0, z), 2);
+            grid.set(IVec3::new(x, 7, z), 3);
+        }
+        for y in 1..7 {
+            grid.set(IVec3::new(-half_width, y, z), 3);
+            grid.set(IVec3::new(half_width, y, z), 3);
         }
     }
 
-    for y in 2_i32..=7 {
-        let radius = 8 - y;
-        for x in -radius..=radius {
-            for z in -radius..=radius {
-                if x.abs() + z.abs() <= radius && (x + z + y) % 2 == 0 {
-                    grid.set(IVec3::new(x, y, z), 2);
+    // Wings and twin forward cannons make the ship readable as a combat craft.
+    for z in 26..=36 {
+        for x in 8..=14 {
+            for side in [-1, 1] {
+                grid.set(IVec3::new(x * side, 2, z), 3);
+                grid.set(IVec3::new(x * side, 3, z), 2);
+            }
+        }
+    }
+    for z in 40..=55 {
+        for x in [-5, 5] {
+            grid.set(IVec3::new(x, 3, z), 3);
+            grid.set(IVec3::new(x, 4, z), 3);
+        }
+    }
+
+    // Cockpit displays and four glowing engine/reactor blocks.
+    for x in -2..=2 {
+        grid.set(IVec3::new(x, 2, 42), 4);
+    }
+    for x in [-3, 3] {
+        for y in 2..=4 {
+            grid.set(IVec3::new(x, y, 17), 5);
+        }
+    }
+    for z in 24..=34 {
+        grid.set(IVec3::new(0, 1, z), 4);
+    }
+}
+
+fn build_hollow_voxel_room(
+    grid: &mut Mut<Grid<u8>>,
+    min: IVec3,
+    max: IVec3,
+    wall_material: u8,
+    floor_material: u8,
+) {
+    for x in min.x..=max.x {
+        for y in min.y..=max.y {
+            for z in min.z..=max.z {
+                let on_boundary = x == min.x
+                    || x == max.x
+                    || y == min.y
+                    || y == max.y
+                    || z == min.z
+                    || z == max.z;
+                if on_boundary {
+                    grid.set(
+                        IVec3::new(x, y, z),
+                        if y == min.y { floor_material } else { wall_material },
+                    );
                 }
             }
         }
+    }
+}
+
+fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
+    let specs = [
+        (IVec3::new(-14, 0, 0), IVec3::Z),
+        (IVec3::new(14, 0, 0), IVec3::Z),
+        (IVec3::new(0, 0, 18), IVec3::X),
+    ];
+    specs
+        .into_iter()
+        .map(|(base, width_axis)| {
+            let cells = (-1..=1)
+                .flat_map(|width| (1..=3).map(move |y| base + width_axis * width + IVec3::Y * y))
+                .collect::<Vec<_>>();
+            let trigger_center = (base.as_vec3() + Vec3::new(0.5, 2.0, 0.5)) * VOXEL_SIZE;
+            VoxelAutoDoor {
+                cells,
+                trigger_center,
+                trigger_radius: 1.25,
+                material: 3,
+                open: false,
+            }
+        })
+        .collect()
+}
+
+fn setup_voxel_auto_doors(mut commands: Commands) {
+    for door in voxel_auto_doors() {
+        commands.spawn(door);
+    }
+}
+
+fn animate_voxel_auto_doors(
+    editor: Res<VoxelEditorState>,
+    players: Query<&Transform, With<VoxelFirstPersonPlayer>>,
+    mut doors: Query<&mut VoxelAutoDoor>,
+    mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+) {
+    let (Ok(player), Ok(mut grid)) = (players.single(), grids.single_mut()) else {
+        return;
+    };
+    for mut door in &mut doors {
+        let should_open = editor.first_person_enabled
+            && player.translation.distance(door.trigger_center) <= door.trigger_radius;
+        let desired_material = if should_open { 0 } else { door.material };
+        let cells_need_update = door
+            .cells
+            .iter()
+            .any(|cell| grid.get(*cell).copied().unwrap_or(0) != desired_material);
+        if should_open == door.open && !cells_need_update {
+            continue;
+        }
+        for cell in &door.cells {
+            grid.set(*cell, desired_material);
+        }
+        door.open = should_open;
     }
 }
 
@@ -1557,20 +1732,24 @@ fn raycast_grid(grid: &Grid<u8>, ray: Ray3d) -> Option<VoxelRayHit> {
 }
 
 fn control_first_person_player(
+    mut commands: Commands,
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut editor: ResMut<VoxelEditorState>,
     mut players: Query<
         (
+            Entity,
             &mut Transform,
             &ShapeHits,
             &mut LinearVelocity,
             &mut ConstantLinearAcceleration,
+            Has<Sensor>,
         ),
         With<VoxelFirstPersonPlayer>,
     >,
 ) {
-    let Ok((mut transform, ground_hits, mut velocity, mut acceleration)) = players.single_mut()
+    let Ok((entity, mut transform, ground_hits, mut velocity, mut acceleration, is_sensor)) =
+        players.single_mut()
     else {
         return;
     };
@@ -1581,6 +1760,9 @@ fn control_first_person_player(
     if !editor.first_person_enabled {
         editor.first_person_flying = false;
         editor.first_person_space_tap_elapsed = f32::INFINITY;
+        if is_sensor {
+            commands.entity(entity).remove::<Sensor>();
+        }
         acceleration.0 = Vec3::new(0.0, -9.81, 0.0);
         velocity.x = 0.0;
         velocity.z = 0.0;
@@ -1592,6 +1774,13 @@ fn control_first_person_player(
         && register_first_person_space_tap(&mut editor.first_person_space_tap_elapsed)
     {
         editor.first_person_flying = !editor.first_person_flying;
+    }
+    if editor.first_person_flying != is_sensor {
+        if editor.first_person_flying {
+            commands.entity(entity).insert(Sensor);
+        } else {
+            commands.entity(entity).remove::<Sensor>();
+        }
     }
 
     let forward_input =
@@ -1893,6 +2082,59 @@ mod tests {
     }
 
     #[test]
+    fn default_space_map_has_two_station_interiors_and_a_warship_interior() {
+        let (app, entity) = test_grid();
+        let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
+
+        for station_center in [IVec3::new(-24, 0, 0), IVec3::new(24, 0, 0)] {
+            assert_eq!(
+                grid.get(station_center).copied(),
+                Some(2)
+            );
+            assert_eq!(
+                grid.get(station_center + IVec3::new(0, 4, 0))
+                    .copied()
+                    .unwrap_or(0),
+                0
+            );
+        }
+        assert_eq!(
+            grid.get(IVec3::new(1, 0, 30)).copied(),
+            Some(2)
+        );
+        assert_eq!(
+            grid.get(IVec3::new(1, 3, 30)).copied().unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            grid.get(IVec3::new(1, 7, 30)).copied(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn default_space_map_uses_all_builtin_voxel_materials_and_three_doors() {
+        let (app, entity) = test_grid();
+        let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
+        let materials = voxel_cells(grid)
+            .into_iter()
+            .map(|(_, material)| material)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            materials,
+            HashSet::from([1, 2, 3, 4, 5])
+        );
+
+        let doors = voxel_auto_doors();
+        assert_eq!(doors.len(), 3);
+        assert!(doors.iter().all(|door| door.cells.len() == 9));
+        assert!(doors
+            .iter()
+            .flat_map(|door| &door.cells)
+            .all(|cell| { grid.get(*cell).copied() == Some(3) }));
+    }
+
+    #[test]
     fn scene_snapshot_cells_include_solid_and_fluid_materials() {
         let (mut app, entity) = test_grid();
         let mut entity_mut = app.world_mut().entity_mut(entity);
@@ -2012,7 +2254,7 @@ mod tests {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
         let ray = Ray3d::new(
-            Vec3::new(0.125, 4.0, 0.125),
+            Vec3::new(-5.875, 4.0, 0.125),
             Dir3::NEG_Y,
         );
         let hit = raycast_grid(grid, ray).unwrap();
@@ -2025,7 +2267,7 @@ mod tests {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
         let (meshes, colliders) = build_voxel_meshes(grid);
-        assert_eq!(meshes.len(), 2);
+        assert_eq!(meshes.len(), 5);
         assert!(!colliders.is_empty());
         for (_, mesh) in meshes {
             assert!(mesh.attribute(Mesh::ATTRIBUTE_POSITION).is_some());
