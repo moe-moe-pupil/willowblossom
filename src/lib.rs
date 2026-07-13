@@ -11,6 +11,7 @@ mod voxel;
 use std::path::Path;
 
 use bevy::{
+    asset::AssetPlugin,
     log::LogPlugin,
     prelude::*,
     window::{
@@ -220,6 +221,13 @@ impl Plugin for GamePlugin {
                     ..default()
                 })
                 .set(window_plugin)
+                .set(AssetPlugin {
+                    file_path: Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("assets")
+                        .to_string_lossy()
+                        .into_owned(),
+                    ..default()
+                })
                 .set(image_plugin),
         );
         app.insert_resource(app_settings);

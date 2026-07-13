@@ -3,10 +3,18 @@ use std::collections::HashSet;
 use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
+    image::{
+        ImageAddressMode,
+        ImageFilterMode,
+        ImageLoaderSettings,
+        ImageSampler,
+        ImageSamplerDescriptor,
+    },
     input::mouse::{
         MouseMotion,
         MouseWheel,
     },
+    math::Affine2,
     mesh::{
         Indices,
         PrimitiveTopology,
@@ -29,7 +37,7 @@ pub struct TrpgVoxelConnector;
 impl Connector for TrpgVoxelConnector {
     type Item = u8;
 
-    fn solid(voxel: &Self::Item) -> bool { *voxel != 0 }
+    fn solid(voxel: &Self::Item) -> bool { matches!(*voxel, 1..=3) }
 }
 
 #[derive(Component)]
@@ -40,6 +48,11 @@ struct VoxelViewportCamera;
 
 #[derive(Component)]
 struct VoxelGeometry;
+
+#[derive(Resource)]
+struct VoxelMaterials {
+    handles: [Handle<StandardMaterial>; 5],
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum VoxelEditMode {
@@ -125,6 +138,7 @@ impl Plugin for TrpgVoxelPlugin {
         .add_systems(
             Startup,
             (
+                setup_voxel_materials,
                 setup_voxel_grid,
                 populate_voxel_grid,
                 setup_voxel_view,
@@ -140,6 +154,7 @@ impl Plugin for TrpgVoxelPlugin {
                 rebuild_voxel_geometry,
                 control_voxel_camera,
                 draw_voxel_target,
+                animate_voxel_materials,
             )
                 .chain(),
         );
@@ -164,6 +179,66 @@ fn voxel_editor_shortcuts(
     } else {
         editor.undo_requested = true;
     }
+}
+
+fn setup_voxel_materials(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let paths = [
+        "textures/voxel_grass.png",
+        "textures/voxel_dirt.png",
+        "textures/voxel_sand.png",
+        "textures/voxel_water.png",
+        "textures/voxel_lava.png",
+    ];
+    let textures = paths.map(|path| {
+        asset_server
+            .load_builder()
+            .with_settings(|settings: &mut ImageLoaderSettings| {
+                settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                    address_mode_u: ImageAddressMode::Repeat,
+                    address_mode_v: ImageAddressMode::Repeat,
+                    mag_filter: ImageFilterMode::Nearest,
+                    min_filter: ImageFilterMode::Nearest,
+                    mipmap_filter: ImageFilterMode::Nearest,
+                    ..default()
+                });
+            })
+            .load(path)
+    });
+    let handles = std::array::from_fn(|index| {
+        let mut material = StandardMaterial {
+            base_color_texture: Some(textures[index].clone()),
+            base_color: [
+                Color::srgb(0.2, 0.6, 0.3),
+                Color::srgb(0.35, 0.18, 0.08),
+                Color::srgb(0.85, 0.72, 0.4),
+                Color::srgb(0.1, 0.4, 0.85),
+                Color::srgb(1.0, 0.15, 0.01),
+            ][index],
+            perceptual_roughness: 0.9,
+            ..default()
+        };
+        if index == 3 {
+            material.base_color = Color::srgba(0.72, 0.9, 1.0, 0.72);
+            material.alpha_mode = AlphaMode::Blend;
+            material.perceptual_roughness = 0.18;
+            material.reflectance = 0.65;
+        } else if index == 4 {
+            material.emissive_texture = Some(textures[index].clone());
+            material.emissive = LinearRgba::rgb(5.0, 0.55, 0.02);
+            material.perceptual_roughness = 0.55;
+        }
+        materials.add(material)
+    });
+    commands.insert_resource(VoxelMaterials { handles });
+    commands.insert_resource(GlobalAmbientLight {
+        color: Color::srgb(0.34, 0.42, 0.55),
+        brightness: 75.0,
+        ..default()
+    });
 }
 
 fn setup_voxel_grid(mut commands: Commands) {
@@ -241,7 +316,7 @@ fn rebuild_voxel_geometry(
     grids: Query<&Grid<u8>, (With<TrpgVoxelGrid>, Changed<Grid<u8>>)>,
     old_geometry: Query<Entity, With<VoxelGeometry>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    materials: Res<VoxelMaterials>,
 ) {
     let Ok(grid) = grids.single() else {
         return;
@@ -251,55 +326,76 @@ fn rebuild_voxel_geometry(
         commands.entity(entity).despawn();
     }
 
-    let (mesh, colliders) = build_voxel_mesh(grid);
-    if colliders.is_empty() {
-        return;
+    let (material_meshes, colliders) = build_voxel_meshes(grid);
+    for (material_id, mesh) in material_meshes {
+        commands.spawn((
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
+            VoxelGeometry,
+        ));
     }
-    let material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 0.76,
-        ..default()
-    });
-    commands.spawn((
-        Mesh3d(meshes.add(mesh)),
-        MeshMaterial3d(material),
-        VoxelGeometry,
-    ));
-    commands.spawn((
-        RigidBody::Static,
-        Collider::compound(colliders),
-        VoxelGeometry,
-    ));
+    if !colliders.is_empty() {
+        commands.spawn((
+            RigidBody::Static,
+            Collider::compound(colliders),
+            VoxelGeometry,
+        ));
+    }
 }
 
-fn build_voxel_mesh(
+fn build_voxel_meshes(
     grid: &Grid<u8>,
 ) -> (
-    Mesh,
+    Vec<(u8, Mesh)>,
     Vec<(Position, Rotation, Collider)>,
 ) {
-    let mut positions = Vec::<[f32; 3]>::new();
-    let mut normals = Vec::<[f32; 3]>::new();
-    let mut colors = Vec::<[f32; 4]>::new();
-    let mut indices = Vec::<u32>::new();
+    let mut material_meshes = Vec::new();
     let mut colliders = Vec::new();
+
+    for material in 1..=5 {
+        let mut positions = Vec::<[f32; 3]>::new();
+        let mut normals = Vec::<[f32; 3]>::new();
+        let mut uvs = Vec::<[f32; 2]>::new();
+        let mut indices = Vec::<u32>::new();
+        for (chunk_position, chunk) in grid.iter() {
+            for local in prism(IVec3::ZERO, DIMS) {
+                if chunk[local] != material {
+                    continue;
+                }
+                let cell = *chunk_position * DIMS + local;
+                append_voxel_faces(
+                    grid,
+                    cell,
+                    &mut positions,
+                    &mut normals,
+                    &mut uvs,
+                    &mut indices,
+                );
+            }
+        }
+        if positions.is_empty() {
+            continue;
+        }
+        material_meshes.push((material, {
+            let colors = vec![[1.0, 1.0, 1.0, 1.0]; positions.len()];
+            Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+            )
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+            .with_inserted_indices(Indices::U32(indices))
+        }));
+    }
 
     for (chunk_position, chunk) in grid.iter() {
         for local in prism(IVec3::ZERO, DIMS) {
-            let material = chunk[local];
-            if material == 0 {
+            if !matches!(chunk[local], 1..=3) {
                 continue;
             }
             let cell = *chunk_position * DIMS + local;
-            append_voxel_faces(
-                grid,
-                cell,
-                material,
-                &mut positions,
-                &mut normals,
-                &mut colors,
-                &mut indices,
-            );
             let center = (cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
             colliders.push((
                 Position::new(center),
@@ -308,25 +404,15 @@ fn build_voxel_mesh(
             ));
         }
     }
-
-    let mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-    .with_inserted_indices(Indices::U32(indices));
-    (mesh, colliders)
+    (material_meshes, colliders)
 }
 
 fn append_voxel_faces(
     grid: &Grid<u8>,
     cell: IVec3,
-    material: u8,
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
-    colors: &mut Vec<[f32; 4]>,
+    uvs: &mut Vec<[f32; 2]>,
     indices: &mut Vec<u32>,
 ) {
     const FACES: [(IVec3, [[f32; 3]; 4]); 6] = [
@@ -367,26 +453,42 @@ fn append_voxel_faces(
             [1., 0., 0.],
         ]),
     ];
-    let color = match material {
-        1 => [0.22, 0.62, 0.32, 1.0],
-        2 => [0.38, 0.20, 0.09, 1.0],
-        3 => [0.86, 0.72, 0.38, 1.0],
-        4 => [0.08, 0.38, 0.82, 0.88],
-        5 => [1.0, 0.16, 0.015, 1.0],
-        _ => [0.46, 0.48, 0.52, 1.0],
-    };
-
     for (normal, corners) in FACES {
         if grid.get(cell + normal).copied().unwrap_or(0) != 0 {
             continue;
         }
         let base = positions.len() as u32;
-        for corner in corners {
+        for (corner, uv) in corners
+            .into_iter()
+            .zip([[0., 1.], [0., 0.], [1., 0.], [1., 1.]])
+        {
             positions.push(((cell.as_vec3() + Vec3::from(corner)) * VOXEL_SIZE).to_array());
             normals.push(normal.as_vec3().to_array());
-            colors.push(color);
+            uvs.push(uv);
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
+fn animate_voxel_materials(
+    time: Res<Time>,
+    voxel_materials: Res<VoxelMaterials>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let seconds = time.elapsed_secs();
+    if let Some(mut water) = materials.get_mut(&voxel_materials.handles[3]) {
+        water.uv_transform = Affine2::from_translation(Vec2::new(
+            seconds * 0.035,
+            (seconds * 0.021).sin() * 0.08,
+        ));
+    }
+    if let Some(mut lava) = materials.get_mut(&voxel_materials.handles[4]) {
+        lava.uv_transform = Affine2::from_translation(Vec2::new(
+            seconds * -0.018,
+            seconds * 0.027,
+        ));
+        let pulse = 4.5 + (seconds * 2.4).sin() * 1.2;
+        lava.emissive = LinearRgba::rgb(pulse, pulse * 0.11, 0.015);
     }
 }
 
@@ -756,10 +858,24 @@ mod tests {
     }
 
     #[test]
+    fn textured_meshes_cover_populated_materials() {
+        let (app, entity) = test_grid();
+        let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
+        let (meshes, colliders) = build_voxel_meshes(grid);
+        assert_eq!(meshes.len(), 2);
+        assert!(!colliders.is_empty());
+        for (_, mesh) in meshes {
+            assert!(mesh.attribute(Mesh::ATTRIBUTE_POSITION).is_some());
+            assert!(mesh.attribute(Mesh::ATTRIBUTE_UV_0).is_some());
+        }
+    }
+
+    #[test]
     fn connector_treats_zero_as_air() {
         assert!(!TrpgVoxelConnector::solid(&0));
         assert!(TrpgVoxelConnector::solid(&1));
-        assert!(TrpgVoxelConnector::solid(&u8::MAX));
+        assert!(!TrpgVoxelConnector::solid(&4));
+        assert!(!TrpgVoxelConnector::solid(&5));
     }
 
     #[test]
