@@ -1,7 +1,6 @@
 use std::collections::{
     HashMap,
     HashSet,
-    VecDeque,
 };
 
 use avian3d::prelude::*;
@@ -599,65 +598,37 @@ fn make_selection_physical(
         return;
     };
 
-    let components = selected_solid_components(&grid, min, max);
-    let voxel_count = components.iter().map(Vec::len).sum::<usize>();
+    let selected_voxels = selected_solid_voxels(&grid, min, max);
+    let voxel_count = selected_voxels.len();
     if voxel_count == 0 {
         editor.physics_status = Some("选区内没有可物理化的固体方块".to_owned());
         return;
     }
 
-    for component in &components {
-        for (cell, _) in component {
-            grid.set(*cell, 0);
-        }
+    for (cell, _) in &selected_voxels {
+        grid.set(*cell, 0);
     }
-    let body_count = components.len();
-    for component in components {
-        spawn_voxel_physics_body(
-            &mut commands,
-            &mut meshes,
-            &materials,
-            component,
-        );
-    }
+    spawn_voxel_physics_body(
+        &mut commands,
+        &mut meshes,
+        &materials,
+        selected_voxels,
+    );
 
     editor.selection_anchor = None;
     editor.selection_end = None;
     editor.physics_status = Some(format!(
-        "已将 {voxel_count} 个方块生成 {body_count} 个物理体"
+        "已将 {voxel_count} 个方块生成 1 个物理体"
     ));
 }
 
-fn selected_solid_components(grid: &Grid<u8>, min: IVec3, max: IVec3) -> Vec<Vec<(IVec3, u8)>> {
-    let mut unvisited = prism(min, max + IVec3::ONE)
-        .filter(|cell| grid.get(*cell).is_some_and(TrpgVoxelConnector::solid))
-        .collect::<HashSet<_>>();
-    let mut components = Vec::new();
-    const NEIGHBORS: [IVec3; 6] = [
-        IVec3::X,
-        IVec3::NEG_X,
-        IVec3::Y,
-        IVec3::NEG_Y,
-        IVec3::Z,
-        IVec3::NEG_Z,
-    ];
-
-    while let Some(start) = unvisited.iter().next().copied() {
-        unvisited.remove(&start);
-        let mut queue = VecDeque::from([start]);
-        let mut component = Vec::new();
-        while let Some(cell) = queue.pop_front() {
-            let material = grid.get(cell).copied().unwrap_or_default();
-            component.push((cell, material));
-            for neighbor in NEIGHBORS.map(|offset| cell + offset) {
-                if unvisited.remove(&neighbor) {
-                    queue.push_back(neighbor);
-                }
-            }
-        }
-        components.push(component);
-    }
-    components
+fn selected_solid_voxels(grid: &Grid<u8>, min: IVec3, max: IVec3) -> Vec<(IVec3, u8)> {
+    prism(min, max + IVec3::ONE)
+        .filter_map(|cell| {
+            let material = grid.get(cell).copied()?;
+            TrpgVoxelConnector::solid(&material).then_some((cell, material))
+        })
+        .collect()
 }
 
 fn spawn_voxel_physics_body(
@@ -968,32 +939,28 @@ fn draw_voxel_target(
     editor: Res<VoxelEditorState>,
     egui_input: Res<EguiWantsInput>,
 ) {
-    if egui_input.wants_pointer_input() {
-        return;
-    }
-    let (Ok(window), Ok((camera, camera_transform)), Ok(grid)) = (
-        windows.single(),
-        cameras.single(),
-        grids.single(),
-    ) else {
+    let Ok(grid) = grids.single() else {
         return;
     };
-    let Some(cursor) = window.cursor_position() else {
-        return;
+    let hit = if egui_input.wants_pointer_input() {
+        None
+    } else {
+        let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single())
+        else {
+            return;
+        };
+        window
+            .cursor_position()
+            .filter(|cursor| editor.contains_cursor(*cursor))
+            .and_then(|cursor| camera.viewport_to_world(camera_transform, cursor).ok())
+            .and_then(|ray| raycast_grid(grid, ray))
     };
-    if !editor.contains_cursor(cursor) {
-        return;
-    }
-    let Ok(ray) = camera.viewport_to_world(camera_transform, cursor) else {
-        return;
-    };
-    let Some(hit) = raycast_grid(grid, ray) else {
-        return;
-    };
-    let target = match editor.mode {
-        VoxelEditMode::Add => hit.add,
-        VoxelEditMode::Remove | VoxelEditMode::Paint => hit.occupied,
-        VoxelEditMode::Physics => hit.occupied,
+    let target = match (editor.mode, hit) {
+        (VoxelEditMode::Add, Some(hit)) => hit.add,
+        (VoxelEditMode::Remove | VoxelEditMode::Paint | VoxelEditMode::Physics, Some(hit)) => {
+            hit.occupied
+        },
+        (_, None) => None,
     };
     if editor.mode == VoxelEditMode::Physics {
         let selection_end = editor.selection_end.or(target);
@@ -1005,6 +972,16 @@ fn draw_voxel_target(
                 Transform::from_translation(center).with_scale(size),
                 Color::srgb(0.15, 0.9, 1.0),
             );
+            if editor.selection_end.is_some() {
+                for (cell, _) in selected_solid_voxels(grid, min, max) {
+                    let center = (cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
+                    gizmos.cube(
+                        Transform::from_translation(center)
+                            .with_scale(Vec3::splat(VOXEL_SIZE * 0.88)),
+                        Color::srgb(0.2, 1.0, 0.65),
+                    );
+                }
+            }
         }
     }
     if let Some(target) = target {
@@ -1117,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn physics_selection_splits_solid_components_and_ignores_fluids() {
+    fn physics_selection_keeps_disconnected_solids_in_one_body_and_ignores_fluids() {
         let (mut app, entity) = test_grid();
         let mut entity_mut = app.world_mut().entity_mut(entity);
         let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
@@ -1129,12 +1106,16 @@ mod tests {
         grid.set(IVec3::new(4, 0, 0), 3);
         grid.set(IVec3::new(2, 0, 0), 4);
 
-        let mut sizes = selected_solid_components(&grid, IVec3::ZERO, IVec3::new(4, 0, 0))
-            .into_iter()
-            .map(|component| component.len())
-            .collect::<Vec<_>>();
-        sizes.sort_unstable();
-        assert_eq!(sizes, vec![1, 2]);
+        let selected = selected_solid_voxels(&grid, IVec3::ZERO, IVec3::new(4, 0, 0));
+        assert_eq!(selected.len(), 3);
+        assert!(selected.iter().any(|(cell, _)| *cell == IVec3::ZERO));
+        assert!(selected.iter().any(|(cell, _)| *cell == IVec3::X));
+        assert!(selected
+            .iter()
+            .any(|(cell, _)| *cell == IVec3::new(4, 0, 0)));
+        assert!(!selected
+            .iter()
+            .any(|(cell, _)| *cell == IVec3::new(2, 0, 0)));
     }
 
     #[test]

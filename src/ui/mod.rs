@@ -11594,7 +11594,7 @@ pub fn ui_system(
                                     voxel_editor.has_physics_selection(),
                                     egui::Button::new("生成物理体"),
                                 )
-                                .on_hover_text("选区中的每个独立固体会成为单独的动态物理体")
+                                .on_hover_text("选区内所有固体方块会合并为一个动态物理体")
                                 .clicked()
                             {
                                 voxel_editor.physics_requested = true;
