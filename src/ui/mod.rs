@@ -60,6 +60,11 @@ use serde::{
 };
 use tokio_tungstenite::tungstenite::protocol::Message;
 
+use crate::voxel::{
+    VoxelEditMode,
+    VoxelEditorState,
+};
+
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
 const CHAT_WINDOW_MIN_SIZE: Vec2 = Vec2::new(260.0, 260.0);
 const CHAT_WINDOW_MAX_SIZE: Vec2 = Vec2::new(720.0, 720.0);
@@ -342,7 +347,7 @@ impl Default for BuffDraft {
 }
 
 #[derive(SystemParam)]
-pub struct UiSystemLocals<'s> {
+pub struct UiSystemLocals<'w, 's> {
     has_run_once: Local<'s, bool>,
     new_chat_group_modal_string_open: Local<'s, (String, bool)>,
     chat_input_msgs: Local<'s, HashMap<String, String>>,
@@ -358,6 +363,7 @@ pub struct UiSystemLocals<'s> {
     group_broadcast_scopes: Local<'s, HashMap<String, String>>,
     chat_player_visible_previews: Local<'s, HashMap<String, String>>,
     chat_list_player_visible_filter: Local<'s, Option<String>>,
+    voxel_editor: ResMut<'w, VoxelEditorState>,
 }
 
 pub struct CircleImageButton {
@@ -11282,6 +11288,7 @@ pub fn ui_system(
         &mut locals.chat_player_visible_previews;
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
+    let voxel_editor: &mut VoxelEditorState = &mut locals.voxel_editor;
 
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -11482,6 +11489,77 @@ pub fn ui_system(
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(&mut viewport_ui, |ui| {
+            let viewport = ui.max_rect();
+            let pixels_per_point = ctx.pixels_per_point();
+            voxel_editor.viewport_min = bevy::prelude::Vec2::new(
+                viewport.min.x * pixels_per_point,
+                viewport.min.y * pixels_per_point,
+            );
+            voxel_editor.viewport_max = bevy::prelude::Vec2::new(
+                viewport.max.x * pixels_per_point,
+                viewport.max.y * pixels_per_point,
+            );
+
+            egui::Frame::new()
+                .fill(egui::Color32::from_black_alpha(210))
+                .corner_radius(4)
+                .inner_margin(6)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut voxel_editor.mode,
+                            VoxelEditMode::Add,
+                            "添加",
+                        );
+                        ui.selectable_value(
+                            &mut voxel_editor.mode,
+                            VoxelEditMode::Remove,
+                            "删除",
+                        );
+                        ui.selectable_value(
+                            &mut voxel_editor.mode,
+                            VoxelEditMode::Paint,
+                            "涂色",
+                        );
+                        ui.separator();
+                        for (material, color) in [
+                            (1, egui::Color32::from_rgb(56, 158, 122)),
+                            (2, egui::Color32::from_rgb(245, 117, 46)),
+                            (3, egui::Color32::from_rgb(92, 148, 235)),
+                        ] {
+                            let (rect, response) =
+                                ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::click());
+                            ui.painter().rect_filled(rect, 3, color);
+                            if voxel_editor.material == material {
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    3,
+                                    Stroke::new(2.0, egui::Color32::WHITE),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            if response.clicked() {
+                                voxel_editor.material = material;
+                            }
+                        }
+                        ui.separator();
+                        ui.label("笔刷");
+                        ui.add(egui::DragValue::new(&mut voxel_editor.brush_radius).range(0..=3));
+                        if ui.button("撤销").clicked() {
+                            voxel_editor.undo_requested = true;
+                        }
+                        if ui.button("重做").clicked() {
+                            voxel_editor.redo_requested = true;
+                        }
+                        if ui.button("重置").clicked() {
+                            voxel_editor.reset_requested = true;
+                        }
+                        if ui.button("视图复位").clicked() {
+                            voxel_editor.view_reset_requested = true;
+                        }
+                    });
+                });
+
             pending_chat_requests_window(
                 ctx,
                 &mut manager,
