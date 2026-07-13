@@ -11616,7 +11616,14 @@ pub fn ui_system(
                         }
                     });
                     if voxel_editor.first_person_enabled {
-                        ui.small("WASD 移动 · 空格跳跃 · 鼠标观察 · 左键使用当前工具 · Esc 退出");
+                        let movement_hint = if voxel_editor.first_person_flying {
+                            "飞行中 · WASD 移动 · 空格上升 · Shift 下降"
+                        } else {
+                            "WASD 移动 · 空格跳跃 · 双击空格飞行"
+                        };
+                        ui.small(format!(
+                            "{movement_hint} · 鼠标观察 · 左键使用当前工具 · Esc 退出"
+                        ));
                     }
                     let snapshot_labels = voxel_editor.scene_snapshot_labels();
                     ui.collapsing(

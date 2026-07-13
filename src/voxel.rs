@@ -45,6 +45,9 @@ const FIRST_PERSON_BODY_LENGTH: f32 = 0.26;
 const FIRST_PERSON_EYE_OFFSET: f32 = 0.18;
 const FIRST_PERSON_SPEED: f32 = 2.8;
 const FIRST_PERSON_JUMP_SPEED: f32 = 3.4;
+const FIRST_PERSON_FLY_SPEED: f32 = 3.5;
+const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
+const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const FIRST_PERSON_START: Vec3 = Vec3::new(0.0, 2.45, 0.0);
 
 pub struct TrpgVoxelPlugin;
@@ -143,6 +146,7 @@ pub(crate) struct VoxelEditorState {
     pub reset_requested: bool,
     pub view_reset_requested: bool,
     pub first_person_enabled: bool,
+    pub first_person_flying: bool,
     pub physics_requested: bool,
     physics_action_requested: Option<VoxelPhysicsRequest>,
     pub physics_push_pull_impulse: f32,
@@ -166,6 +170,7 @@ pub(crate) struct VoxelEditorState {
     next_scene_snapshot_number: u64,
     save_scene_requested: bool,
     restore_scene_requested: Option<usize>,
+    first_person_space_tap_elapsed: f32,
 }
 
 impl Default for VoxelEditorState {
@@ -181,6 +186,7 @@ impl Default for VoxelEditorState {
             reset_requested: false,
             view_reset_requested: false,
             first_person_enabled: false,
+            first_person_flying: false,
             physics_requested: false,
             physics_action_requested: None,
             physics_push_pull_impulse: 4.0,
@@ -204,6 +210,7 @@ impl Default for VoxelEditorState {
             next_scene_snapshot_number: 1,
             save_scene_requested: false,
             restore_scene_requested: None,
+            first_person_space_tap_elapsed: f32::INFINITY,
         }
     }
 }
@@ -1550,18 +1557,21 @@ fn raycast_grid(grid: &Grid<u8>, ray: Ray3d) -> Option<VoxelRayHit> {
 }
 
 fn control_first_person_player(
+    time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
-    editor: Res<VoxelEditorState>,
+    mut editor: ResMut<VoxelEditorState>,
     mut players: Query<
         (
             &mut Transform,
             &ShapeHits,
             &mut LinearVelocity,
+            &mut ConstantLinearAcceleration,
         ),
         With<VoxelFirstPersonPlayer>,
     >,
 ) {
-    let Ok((mut transform, ground_hits, mut velocity)) = players.single_mut() else {
+    let Ok((mut transform, ground_hits, mut velocity, mut acceleration)) = players.single_mut()
+    else {
         return;
     };
     if transform.translation.y < -10.0 {
@@ -1569,9 +1579,19 @@ fn control_first_person_player(
         velocity.0 = Vec3::ZERO;
     }
     if !editor.first_person_enabled {
+        editor.first_person_flying = false;
+        editor.first_person_space_tap_elapsed = f32::INFINITY;
+        acceleration.0 = Vec3::new(0.0, -9.81, 0.0);
         velocity.x = 0.0;
         velocity.z = 0.0;
         return;
+    }
+
+    editor.first_person_space_tap_elapsed += time.delta_secs();
+    if keyboard.just_pressed(KeyCode::Space)
+        && register_first_person_space_tap(&mut editor.first_person_space_tap_elapsed)
+    {
+        editor.first_person_flying = !editor.first_person_flying;
     }
 
     let forward_input =
@@ -1585,12 +1605,27 @@ fn control_first_person_player(
     velocity.x = movement.x * FIRST_PERSON_SPEED;
     velocity.z = movement.z * FIRST_PERSON_SPEED;
 
+    if editor.first_person_flying {
+        acceleration.0 = Vec3::ZERO;
+        let vertical_input = keyboard.pressed(KeyCode::Space) as i8
+            - (keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight)) as i8;
+        velocity.y = vertical_input as f32 * FIRST_PERSON_FLY_SPEED;
+        return;
+    }
+    acceleration.0 = Vec3::new(0.0, -9.81, 0.0);
+
     let grounded = ground_hits
         .iter()
         .any(|hit| (-hit.normal2).angle_between(Vec3::Y).abs() <= 55.0_f32.to_radians());
     if grounded && keyboard.just_pressed(KeyCode::Space) {
         velocity.y = FIRST_PERSON_JUMP_SPEED;
     }
+}
+
+fn register_first_person_space_tap(elapsed: &mut f32) -> bool {
+    let double_tap = *elapsed <= FIRST_PERSON_DOUBLE_TAP_SECONDS;
+    *elapsed = if double_tap { f32::INFINITY } else { 0.0 };
+    double_tap
 }
 
 fn control_voxel_camera(
@@ -1601,7 +1636,7 @@ fn control_voxel_camera(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cursor_options: Query<&mut CursorOptions, With<PrimaryWindow>>,
     mut cameras: Query<
-        &mut Transform,
+        (&mut Transform, &mut Projection),
         (
             With<VoxelViewportCamera>,
             Without<VoxelFirstPersonPlayer>,
@@ -1619,6 +1654,7 @@ fn control_voxel_camera(
 ) {
     if keyboard.just_pressed(KeyCode::Escape) && editor.first_person_enabled {
         editor.first_person_enabled = false;
+        editor.first_person_flying = false;
     }
     if let Ok(mut cursor) = cursor_options.single_mut() {
         if editor.first_person_enabled {
@@ -1659,10 +1695,13 @@ fn control_voxel_camera(
             editor.camera_pitch,
             0.0,
         );
-        if let Ok(mut camera_transform) = cameras.single_mut() {
+        if let Ok((mut camera_transform, mut projection)) = cameras.single_mut() {
             camera_transform.translation =
                 player_transform.translation + Vec3::Y * FIRST_PERSON_EYE_OFFSET;
             camera_transform.rotation = rotation;
+            if let Projection::Perspective(perspective) = &mut *projection {
+                perspective.fov = FIRST_PERSON_FOV_RADIANS;
+            }
         }
         return;
     }
@@ -1700,8 +1739,11 @@ fn control_voxel_camera(
         wheel.clear();
     }
 
-    if let Ok(mut transform) = cameras.single_mut() {
+    if let Ok((mut transform, mut projection)) = cameras.single_mut() {
         *transform = editor_camera_transform(&editor);
+        if let Projection::Perspective(perspective) = &mut *projection {
+            perspective.fov = PerspectiveProjection::default().fov;
+        }
     }
 }
 
@@ -2218,6 +2260,26 @@ mod tests {
             edited_voxel(VoxelEditMode::Paint, 0, 4),
             None
         );
+    }
+
+    #[test]
+    fn first_person_flight_requires_two_quick_space_taps() {
+        let mut elapsed = f32::INFINITY;
+        assert!(!register_first_person_space_tap(
+            &mut elapsed
+        ));
+        assert_eq!(elapsed, 0.0);
+
+        elapsed = FIRST_PERSON_DOUBLE_TAP_SECONDS * 0.5;
+        assert!(register_first_person_space_tap(
+            &mut elapsed
+        ));
+        assert!(elapsed.is_infinite());
+
+        elapsed = FIRST_PERSON_DOUBLE_TAP_SECONDS + 0.01;
+        assert!(!register_first_person_space_tap(
+            &mut elapsed
+        ));
     }
 
     #[test]
