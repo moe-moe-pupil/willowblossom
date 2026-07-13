@@ -480,7 +480,7 @@ fn edit_voxel_grid(
     };
 
     let mut stroke = Vec::new();
-    let brush_radius = if just_pressed { 0 } else { editor.brush_radius };
+    let brush_radius = editor.brush_radius;
     for x in -brush_radius..=brush_radius {
         for y in -brush_radius..=brush_radius {
             for z in -brush_radius..=brush_radius {
@@ -489,9 +489,8 @@ fn edit_voxel_grid(
                     continue;
                 }
                 let before = grid.get(position).copied().unwrap_or(0);
-                let after = match editor.mode {
-                    VoxelEditMode::Add | VoxelEditMode::Paint => editor.material,
-                    VoxelEditMode::Remove => 0,
+                let Some(after) = edited_voxel(editor.mode, before, editor.material) else {
+                    continue;
                 };
                 if before != after {
                     grid.set(position, after);
@@ -506,6 +505,14 @@ fn edit_voxel_grid(
     }
     if !stroke.is_empty() {
         editor.active_stroke.extend(stroke);
+    }
+}
+
+fn edited_voxel(mode: VoxelEditMode, before: u8, material: u8) -> Option<u8> {
+    match mode {
+        VoxelEditMode::Add => Some(material),
+        VoxelEditMode::Remove => Some(0),
+        VoxelEditMode::Paint => (before != 0).then_some(material),
     }
 }
 
@@ -755,5 +762,17 @@ mod tests {
             0.05,
             &mut editor
         ));
+    }
+
+    #[test]
+    fn paint_changes_solids_without_creating_voxels() {
+        assert_eq!(
+            edited_voxel(VoxelEditMode::Paint, 1, 4),
+            Some(4)
+        );
+        assert_eq!(
+            edited_voxel(VoxelEditMode::Paint, 0, 4),
+            None
+        );
     }
 }

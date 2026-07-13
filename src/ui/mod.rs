@@ -11566,7 +11566,7 @@ pub fn ui_system(
                             response.on_hover_text(name);
                         }
                         ui.separator();
-                        ui.label("笔刷");
+                        ui.label("笔刷大小");
                         ui.add(egui::DragValue::new(&mut voxel_editor.brush_radius).range(0..=3));
                         if ui.button("撤销").clicked() {
                             voxel_editor.undo_requested = true;
