@@ -11651,7 +11651,7 @@ pub fn ui_system(
                                     .range(0.25..=100.0)
                                     .speed(0.25),
                             );
-                            ui.label("左键点击爆心；爆炸半径内的静态方块会自动物理化为一个物理体");
+                            ui.label("左键点击爆心；半径内方块会自动物理化并炸成独立碎块");
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
                             }

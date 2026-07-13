@@ -57,6 +57,7 @@ struct VoxelGeometry;
 #[derive(Component)]
 struct VoxelPhysicsBody {
     local_center: Vec3,
+    cells: Vec<(IVec3, u8)>,
 }
 
 #[derive(Component)]
@@ -710,6 +711,23 @@ fn selected_solid_voxels_in_radius(grid: &Grid<u8>, origin: Vec3, radius: f32) -
         .collect()
 }
 
+fn physics_body_intersects_radius(
+    body: &VoxelPhysicsBody,
+    transform: &Transform,
+    origin: Vec3,
+    radius: f32,
+) -> bool {
+    let radius_squared = radius.max(VOXEL_SIZE).powi(2);
+    let affine = transform.compute_affine();
+    body.cells.iter().any(|(cell, _)| {
+        let local_center = (cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
+        affine
+            .transform_point3(local_center)
+            .distance_squared(origin)
+            <= radius_squared
+    })
+}
+
 fn spawn_voxel_physics_body(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -721,14 +739,33 @@ fn spawn_voxel_physics_body(
         .map(|(cell, _)| *cell)
         .reduce(IVec3::min)
         .unwrap_or(IVec3::ZERO);
-    let mut collider_voxels = Vec::with_capacity(component.len());
     let mut local_cells = Vec::with_capacity(component.len());
     for (cell, material) in component {
         let local = cell - origin;
         local_cells.push((local, material));
-        collider_voxels.push(local);
     }
-    let (material_meshes, _) = build_voxel_meshes_from_cells(&local_cells);
+    spawn_voxel_physics_body_at(
+        commands,
+        meshes,
+        materials,
+        local_cells,
+        Transform::from_translation(origin.as_vec3() * VOXEL_SIZE),
+        LinearVelocity::ZERO,
+        AngularVelocity::ZERO,
+    )
+}
+
+fn spawn_voxel_physics_body_at(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &VoxelMaterials,
+    cells: Vec<(IVec3, u8)>,
+    transform: Transform,
+    linear_velocity: LinearVelocity,
+    angular_velocity: AngularVelocity,
+) -> Entity {
+    let collider_voxels = cells.iter().map(|(cell, _)| *cell).collect::<Vec<_>>();
+    let (material_meshes, _) = build_voxel_meshes_from_cells(&cells);
     let local_max = collider_voxels
         .iter()
         .copied()
@@ -737,16 +774,21 @@ fn spawn_voxel_physics_body(
     let local_center = (local_max + IVec3::ONE).as_vec3() * VOXEL_SIZE * 0.5;
     commands
         .spawn((
-            VoxelPhysicsBody { local_center },
+            VoxelPhysicsBody {
+                local_center,
+                cells,
+            },
             RigidBody::Dynamic,
             Collider::voxels(
                 Vec3::splat(VOXEL_SIZE),
                 &collider_voxels,
             ),
             ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
+            linear_velocity,
+            angular_velocity,
             LinearDamping(0.15),
             AngularDamping(0.35),
-            Transform::from_translation(origin.as_vec3() * VOXEL_SIZE),
+            transform,
         ))
         .with_children(|parent| {
             for (material_id, mesh) in material_meshes {
@@ -875,7 +917,13 @@ fn edit_voxel_grid(
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
-    physics_bodies: Query<(), With<VoxelPhysicsBody>>,
+    physics_bodies: Query<(
+        Entity,
+        &VoxelPhysicsBody,
+        &Transform,
+        &LinearVelocity,
+        &AngularVelocity,
+    )>,
     spatial_query: SpatialQuery,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
@@ -943,24 +991,55 @@ fn edit_voxel_grid(
         };
         let interaction_point = ray.origin + *ray.direction * interaction_distance;
         let target = if action == VoxelPhysicsAction::Explode {
+            let explosion_radius = editor.physics_explosion_radius.max(VOXEL_SIZE);
+            let mut target = clicked_body;
             let selected = selected_solid_voxels_in_radius(
                 &grid,
                 interaction_point,
-                editor.physics_explosion_radius,
+                explosion_radius,
             );
-            if selected.is_empty() {
-                clicked_body
-            } else {
-                for (cell, _) in &selected {
-                    grid.set(*cell, 0);
-                }
-                Some(spawn_voxel_physics_body(
+            for (cell, material) in selected {
+                grid.set(cell, 0);
+                let fragment = spawn_voxel_physics_body(
                     &mut commands,
                     &mut meshes,
                     &materials,
-                    selected,
-                ))
+                    vec![(cell, material)],
+                );
+                target.get_or_insert(fragment);
             }
+            for (entity, body, transform, linear_velocity, angular_velocity) in &physics_bodies {
+                if body.cells.len() <= 1
+                    || !physics_body_intersects_radius(
+                        body,
+                        transform,
+                        interaction_point,
+                        explosion_radius,
+                    )
+                {
+                    continue;
+                }
+                commands.entity(entity).despawn();
+                if target == Some(entity) {
+                    target = None;
+                }
+                for (cell, material) in &body.cells {
+                    let fragment_transform = Transform::from_matrix(
+                        transform.to_matrix() * Mat4::from_translation(cell.as_vec3() * VOXEL_SIZE),
+                    );
+                    let fragment = spawn_voxel_physics_body_at(
+                        &mut commands,
+                        &mut meshes,
+                        &materials,
+                        vec![(IVec3::ZERO, *material)],
+                        fragment_transform,
+                        *linear_velocity,
+                        *angular_velocity,
+                    );
+                    target.get_or_insert(fragment);
+                }
+            }
+            target
         } else if let Some(entity) = clicked_body {
             Some(entity)
         } else {
@@ -1234,24 +1313,53 @@ fn draw_voxel_target(
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
     grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
+    physics_bodies: Query<(), With<VoxelPhysicsBody>>,
+    spatial_query: SpatialQuery,
     editor: Res<VoxelEditorState>,
     egui_input: Res<EguiWantsInput>,
 ) {
     let Ok(grid) = grids.single() else {
         return;
     };
-    let hit = if egui_input.wants_pointer_input() {
-        None
+    let (hit, explosion_origin) = if egui_input.wants_pointer_input() {
+        (None, None)
     } else {
         let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single())
         else {
             return;
         };
-        window
+        let Some(ray) = window
             .cursor_position()
             .filter(|cursor| editor.contains_cursor(*cursor))
             .and_then(|cursor| camera.viewport_to_world(camera_transform, cursor).ok())
-            .and_then(|ray| raycast_grid(grid, ray))
+        else {
+            return;
+        };
+        let hit = raycast_grid(grid, ray);
+        let explosion_origin = if editor.mode == VoxelEditMode::Explode {
+            let body_hit = spatial_query.cast_ray_predicate(
+                ray.origin,
+                ray.direction,
+                MAX_RAY_DISTANCE,
+                true,
+                &SpatialQueryFilter::default(),
+                &|entity| physics_bodies.contains(entity),
+            );
+            let static_distance = hit
+                .as_ref()
+                .filter(|hit| hit.occupied.is_some())
+                .map(|hit| hit.distance);
+            body_hit
+                .as_ref()
+                .filter(|body_hit| {
+                    static_distance.is_none_or(|distance| body_hit.distance < distance)
+                })
+                .map(|body_hit| ray.origin + *ray.direction * body_hit.distance)
+                .or_else(|| static_distance.map(|distance| ray.origin + *ray.direction * distance))
+        } else {
+            None
+        };
+        (hit, explosion_origin)
     };
     let target = match (editor.mode, hit) {
         (VoxelEditMode::Add, Some(hit)) => hit.add,
@@ -1288,8 +1396,18 @@ fn draw_voxel_target(
             }
         }
     }
+    if let Some(origin) = explosion_origin {
+        gizmos.sphere(
+            Isometry3d::from_translation(origin),
+            editor.physics_explosion_radius.max(VOXEL_SIZE),
+            Color::srgb(1.0, 0.3, 0.08),
+        );
+    }
     if let Some(target) = target {
-        let size = if editor.mode == VoxelEditMode::Physics {
+        let size = if matches!(
+            editor.mode,
+            VoxelEditMode::Physics | VoxelEditMode::Explode
+        ) {
             VOXEL_SIZE
         } else {
             (editor.brush_radius * 2 + 1) as f32 * VOXEL_SIZE
@@ -1465,6 +1583,33 @@ mod tests {
             .iter()
             .any(|(cell, _)| *cell == IVec3::new(2, 0, 0)));
         assert!(!selected.iter().any(|(cell, _)| *cell == IVec3::Y));
+    }
+
+    #[test]
+    fn explosion_radius_detects_voxels_inside_a_moving_body() {
+        let body = VoxelPhysicsBody {
+            local_center: Vec3::splat(VOXEL_SIZE),
+            cells: vec![(IVec3::ZERO, 1), (IVec3::X, 2)],
+        };
+        let transform = Transform::from_xyz(4.0, 2.0, -3.0).with_rotation(Quat::from_rotation_y(
+            std::f32::consts::FRAC_PI_2,
+        ));
+        let first_center = transform
+            .compute_affine()
+            .transform_point3(Vec3::splat(0.5) * VOXEL_SIZE);
+
+        assert!(physics_body_intersects_radius(
+            &body,
+            &transform,
+            first_center,
+            VOXEL_SIZE,
+        ));
+        assert!(!physics_body_intersects_radius(
+            &body,
+            &transform,
+            Vec3::ZERO,
+            VOXEL_SIZE,
+        ));
     }
 
     #[test]
