@@ -11672,7 +11672,7 @@ pub fn ui_system(
                                     .range(0.25..=100.0)
                                     .speed(0.25),
                             );
-                            ui.label("左键点击爆心；半径内方块会自动物理化并炸成独立碎块");
+                            ui.label("左键点击爆心；最多保留40个物理碎块，超额方块会合并");
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
                             }

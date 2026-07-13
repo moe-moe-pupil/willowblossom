@@ -35,6 +35,7 @@ const EDIT_REPEAT_INTERVAL: f32 = 0.09;
 const TEST_GROUND_SIZE: Vec3 = Vec3::new(32.0, 0.5, 32.0);
 const TEST_GROUND_CENTER_Y: f32 = -2.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
+const MAX_EXPLOSION_PHYSICS_BODIES: usize = 40;
 
 pub struct TrpgVoxelPlugin;
 
@@ -775,6 +776,51 @@ fn physics_body_intersects_radius(
     })
 }
 
+fn allocate_fragment_parts(source_sizes: &[usize], max_parts: usize) -> Vec<usize> {
+    let mut counts = vec![0; source_sizes.len()];
+    let initial_parts = source_sizes
+        .iter()
+        .filter(|size| **size > 0)
+        .count()
+        .min(max_parts);
+    for (count, _) in counts
+        .iter_mut()
+        .zip(source_sizes.iter())
+        .filter(|(_, size)| **size > 0)
+        .take(initial_parts)
+    {
+        *count = 1;
+    }
+
+    let mut remaining = max_parts.saturating_sub(initial_parts);
+    while remaining > 0 {
+        let Some(index) = (0..source_sizes.len())
+            .filter(|index| counts[*index] > 0 && counts[*index] < source_sizes[*index])
+            .max_by(|left, right| {
+                (source_sizes[*left] * counts[*right]).cmp(&(source_sizes[*right] * counts[*left]))
+            })
+        else {
+            break;
+        };
+        counts[index] += 1;
+        remaining -= 1;
+    }
+    counts
+}
+
+fn split_voxel_cells(cells: Vec<(IVec3, u8)>, requested_parts: usize) -> Vec<Vec<(IVec3, u8)>> {
+    let part_count = requested_parts.min(cells.len());
+    if part_count == 0 {
+        return Vec::new();
+    }
+    let cell_count = cells.len();
+    let mut parts = vec![Vec::new(); part_count];
+    for (index, cell) in cells.into_iter().enumerate() {
+        parts[index * part_count / cell_count].push(cell);
+    }
+    parts
+}
+
 fn spawn_voxel_physics_body(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -1150,43 +1196,90 @@ fn edit_voxel_grid(
                 interaction_point,
                 explosion_radius,
             );
-            for (cell, material) in selected {
-                grid.set(cell, 0);
-                let fragment = spawn_voxel_physics_body(
-                    &mut commands,
-                    &mut meshes,
-                    &materials,
-                    vec![(cell, material)],
-                );
-                target.get_or_insert(fragment);
-            }
-            for (entity, body, transform, linear_velocity, angular_velocity) in &physics_bodies {
-                if body.cells.len() <= 1
-                    || !physics_body_intersects_radius(
-                        body,
-                        transform,
-                        interaction_point,
-                        explosion_radius,
-                    )
-                {
+            let affected_bodies = physics_bodies
+                .iter()
+                .filter(|(_, body, transform, ..)| {
+                    body.cells.len() > 1
+                        && physics_body_intersects_radius(
+                            body,
+                            transform,
+                            interaction_point,
+                            explosion_radius,
+                        )
+                })
+                .map(
+                    |(entity, body, transform, linear_velocity, angular_velocity)| {
+                        (
+                            entity,
+                            body.cells.clone(),
+                            *transform,
+                            *linear_velocity,
+                            *angular_velocity,
+                        )
+                    },
+                )
+                .collect::<Vec<_>>();
+            let current_body_count = physics_bodies.iter().count();
+            let retained_body_count = current_body_count.saturating_sub(affected_bodies.len());
+            let fragment_budget = MAX_EXPLOSION_PHYSICS_BODIES.saturating_sub(retained_body_count);
+            let source_sizes = affected_bodies
+                .iter()
+                .map(|(_, cells, ..)| cells.len())
+                .chain(std::iter::once(selected.len()))
+                .filter(|size| *size > 0)
+                .collect::<Vec<_>>();
+            let part_counts = allocate_fragment_parts(&source_sizes, fragment_budget);
+            for ((entity, cells, transform, linear_velocity, angular_velocity), part_count) in
+                affected_bodies.into_iter().zip(part_counts.iter().copied())
+            {
+                if part_count == 0 {
                     continue;
                 }
                 commands.entity(entity).despawn();
                 if target == Some(entity) {
                     target = None;
                 }
-                for (cell, material) in &body.cells {
+                for cells in split_voxel_cells(cells, part_count) {
+                    let origin = cells
+                        .iter()
+                        .map(|(cell, _)| *cell)
+                        .reduce(IVec3::min)
+                        .unwrap_or(IVec3::ZERO);
+                    let local_cells = cells
+                        .into_iter()
+                        .map(|(cell, material)| (cell - origin, material))
+                        .collect();
                     let fragment_transform = Transform::from_matrix(
-                        transform.to_matrix() * Mat4::from_translation(cell.as_vec3() * VOXEL_SIZE),
+                        transform.to_matrix()
+                            * Mat4::from_translation(origin.as_vec3() * VOXEL_SIZE),
                     );
                     let fragment = spawn_voxel_physics_body_at(
                         &mut commands,
                         &mut meshes,
                         &materials,
-                        vec![(IVec3::ZERO, *material)],
+                        local_cells,
                         fragment_transform,
-                        *linear_velocity,
-                        *angular_velocity,
+                        linear_velocity,
+                        angular_velocity,
+                    );
+                    target.get_or_insert(fragment);
+                }
+            }
+            let static_part_count = part_counts
+                .get(source_sizes.len().saturating_sub(1))
+                .copied()
+                .filter(|_| !selected.is_empty())
+                .unwrap_or(0);
+            if static_part_count > 0 {
+                for (cell, _) in &selected {
+                    grid.set(*cell, 0);
+                }
+                for cells in split_voxel_cells(selected, static_part_count) {
+                    let fragment = spawn_voxel_physics_body(
+                        &mut commands,
+                        &mut meshes,
+                        &materials,
+                        cells,
                     );
                     target.get_or_insert(fragment);
                 }
@@ -1860,6 +1953,28 @@ mod tests {
             Vec3::ZERO,
             VOXEL_SIZE,
         ));
+    }
+
+    #[test]
+    fn explosion_fragment_budget_caps_large_areas_at_forty_parts() {
+        let counts = allocate_fragment_parts(&[8_656], MAX_EXPLOSION_PHYSICS_BODIES);
+        assert_eq!(counts, vec![40]);
+
+        let cells = (0..8_656).map(|x| (IVec3::new(x, 0, 0), 1)).collect();
+        let parts = split_voxel_cells(cells, counts[0]);
+        assert_eq!(parts.len(), 40);
+        assert_eq!(
+            parts.iter().map(Vec::len).sum::<usize>(),
+            8_656
+        );
+    }
+
+    #[test]
+    fn explosion_budget_preserves_existing_bodies_before_static_fragments() {
+        let counts = allocate_fragment_parts(&[12, 8, 8_656], 2);
+
+        assert_eq!(counts, vec![1, 1, 0]);
+        assert!(counts.iter().sum::<usize>() <= 2);
     }
 
     #[test]
