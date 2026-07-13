@@ -11598,10 +11598,31 @@ pub fn ui_system(
                         if ui.button("重置").clicked() {
                             voxel_editor.reset_requested = true;
                         }
+                        if ui.button("保存当前场景").clicked() {
+                            voxel_editor.request_scene_snapshot();
+                        }
                         if ui.button("视图复位").clicked() {
                             voxel_editor.view_reset_requested = true;
                         }
                     });
+                    let snapshot_labels = voxel_editor.scene_snapshot_labels();
+                    ui.collapsing(
+                        format!("场景历史（{}）", snapshot_labels.len()),
+                        |ui| {
+                            if snapshot_labels.is_empty() {
+                                ui.small("还没有场景快照");
+                            }
+                            for (index, label) in snapshot_labels.iter().enumerate().rev() {
+                                if ui
+                                    .button(label)
+                                    .on_hover_text("点击恢复体素和物理体到这个状态")
+                                    .clicked()
+                                {
+                                    voxel_editor.request_scene_restore(index);
+                                }
+                            }
+                        },
+                    );
                     if voxel_editor.mode == VoxelEditMode::Physics {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(voxel_editor.physics_selection_hint());

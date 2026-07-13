@@ -34,6 +34,7 @@ const EDIT_REPEAT_DELAY: f32 = 0.32;
 const EDIT_REPEAT_INTERVAL: f32 = 0.09;
 const TEST_GROUND_SIZE: Vec3 = Vec3::new(32.0, 0.5, 32.0);
 const TEST_GROUND_CENTER_Y: f32 = -2.25;
+const MAX_SCENE_SNAPSHOTS: usize = 20;
 
 pub struct TrpgVoxelPlugin;
 
@@ -54,10 +55,25 @@ struct VoxelViewportCamera;
 #[derive(Component)]
 struct VoxelGeometry;
 
-#[derive(Component)]
+#[derive(Component, Clone)]
 struct VoxelPhysicsBody {
     local_center: Vec3,
     cells: Vec<(IVec3, u8)>,
+}
+
+#[derive(Clone)]
+struct VoxelPhysicsBodySnapshot {
+    body: VoxelPhysicsBody,
+    transform: Transform,
+    linear_velocity: LinearVelocity,
+    angular_velocity: AngularVelocity,
+}
+
+#[derive(Clone)]
+struct VoxelSceneSnapshot {
+    name: String,
+    voxels: Vec<(IVec3, u8)>,
+    physics_bodies: Vec<VoxelPhysicsBodySnapshot>,
 }
 
 #[derive(Component)]
@@ -131,6 +147,10 @@ pub(crate) struct VoxelEditorState {
     selection_anchor: Option<IVec3>,
     selection_end: Option<IVec3>,
     physics_status: Option<String>,
+    scene_snapshots: Vec<VoxelSceneSnapshot>,
+    next_scene_snapshot_number: u64,
+    save_scene_requested: bool,
+    restore_scene_requested: Option<usize>,
 }
 
 impl Default for VoxelEditorState {
@@ -164,6 +184,10 @@ impl Default for VoxelEditorState {
             selection_anchor: None,
             selection_end: None,
             physics_status: None,
+            scene_snapshots: Vec::new(),
+            next_scene_snapshot_number: 1,
+            save_scene_requested: false,
+            restore_scene_requested: None,
         }
     }
 }
@@ -186,6 +210,28 @@ impl VoxelEditorState {
     }
 
     pub(crate) fn physics_status(&self) -> Option<&str> { self.physics_status.as_deref() }
+
+    pub(crate) fn request_scene_snapshot(&mut self) { self.save_scene_requested = true; }
+
+    pub(crate) fn scene_snapshot_labels(&self) -> Vec<String> {
+        self.scene_snapshots
+            .iter()
+            .map(|snapshot| {
+                format!(
+                    "{}（{} 方块 / {} 物理体）",
+                    snapshot.name,
+                    snapshot.voxels.len(),
+                    snapshot.physics_bodies.len()
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn request_scene_restore(&mut self, index: usize) {
+        if index < self.scene_snapshots.len() {
+            self.restore_scene_requested = Some(index);
+        }
+    }
 
     fn selection_bounds(&self) -> Option<(IVec3, IVec3)> {
         let start = self.selection_anchor?;
@@ -231,6 +277,7 @@ impl Plugin for TrpgVoxelPlugin {
                 edit_voxel_grid,
                 make_selection_physical,
                 apply_voxel_physics_action,
+                process_voxel_scene_history,
                 rebuild_voxel_geometry,
                 control_voxel_camera,
                 draw_voxel_target,
@@ -799,6 +846,111 @@ fn spawn_voxel_physics_body_at(
             }
         })
         .id()
+}
+
+fn process_voxel_scene_history(
+    mut commands: Commands,
+    mut editor: ResMut<VoxelEditorState>,
+    mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    physics_bodies: Query<(
+        Entity,
+        &VoxelPhysicsBody,
+        &Transform,
+        &LinearVelocity,
+        &AngularVelocity,
+    )>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
+) {
+    if editor.save_scene_requested {
+        editor.save_scene_requested = false;
+        let Ok(grid) = grids.single() else {
+            return;
+        };
+        let voxels = voxel_cells(grid);
+        let physics_bodies = physics_bodies
+            .iter()
+            .map(
+                |(_, body, transform, linear_velocity, angular_velocity)| {
+                    VoxelPhysicsBodySnapshot {
+                        body: body.clone(),
+                        transform: *transform,
+                        linear_velocity: *linear_velocity,
+                        angular_velocity: *angular_velocity,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        let snapshot_number = editor.next_scene_snapshot_number;
+        editor.next_scene_snapshot_number += 1;
+        editor.scene_snapshots.push(VoxelSceneSnapshot {
+            name: format!("场景快照 {snapshot_number}"),
+            voxels,
+            physics_bodies,
+        });
+        if editor.scene_snapshots.len() > MAX_SCENE_SNAPSHOTS {
+            editor.scene_snapshots.remove(0);
+        }
+        let snapshot = editor.scene_snapshots.last().unwrap();
+        editor.physics_status = Some(format!(
+            "已保存 {}：{} 个方块，{} 个物理体",
+            snapshot.name,
+            snapshot.voxels.len(),
+            snapshot.physics_bodies.len()
+        ));
+    }
+
+    let Some(snapshot_index) = editor.restore_scene_requested.take() else {
+        return;
+    };
+    let Some(snapshot) = editor.scene_snapshots.get(snapshot_index).cloned() else {
+        return;
+    };
+    let Ok(mut grid) = grids.single_mut() else {
+        return;
+    };
+    for cell in occupied_cells(&grid) {
+        grid.set(cell, 0);
+    }
+    for (cell, material) in &snapshot.voxels {
+        grid.set(*cell, *material);
+    }
+    for (entity, ..) in &physics_bodies {
+        commands.entity(entity).despawn();
+    }
+    for body in &snapshot.physics_bodies {
+        spawn_voxel_physics_body_at(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            body.body.cells.clone(),
+            body.transform,
+            body.linear_velocity,
+            body.angular_velocity,
+        );
+    }
+
+    editor.undo.clear();
+    editor.redo.clear();
+    editor.active_stroke.clear();
+    editor.stroke_positions.clear();
+    editor.selection_anchor = None;
+    editor.selection_end = None;
+    editor.physics_action_requested = None;
+    editor.physics_status = Some(format!("已恢复 {}", snapshot.name));
+}
+
+fn voxel_cells(grid: &Grid<u8>) -> Vec<(IVec3, u8)> {
+    grid.iter()
+        .flat_map(|(chunk_position, chunk)| {
+            prism(IVec3::ZERO, DIMS)
+                .filter_map(|local| {
+                    let material = chunk[local];
+                    (material != 0).then_some((*chunk_position * DIMS + local, material))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn apply_voxel_physics_action(
@@ -1448,6 +1600,104 @@ mod tests {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
         assert!(grid.count() > 225);
+    }
+
+    #[test]
+    fn scene_snapshot_cells_include_solid_and_fluid_materials() {
+        let (mut app, entity) = test_grid();
+        let mut entity_mut = app.world_mut().entity_mut(entity);
+        let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
+        grid.set(IVec3::new(50, 4, 2), 2);
+        grid.set(IVec3::new(51, 4, 2), 4);
+
+        let cells = voxel_cells(&grid).into_iter().collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            cells.get(&IVec3::new(50, 4, 2)),
+            Some(&2)
+        );
+        assert_eq!(
+            cells.get(&IVec3::new(51, 4, 2)),
+            Some(&4)
+        );
+    }
+
+    #[test]
+    fn scene_history_entries_request_direct_restore() {
+        let mut editor = VoxelEditorState::default();
+        editor.scene_snapshots.push(VoxelSceneSnapshot {
+            name: "场景快照 1".to_owned(),
+            voxels: vec![(IVec3::ZERO, 1)],
+            physics_bodies: Vec::new(),
+        });
+
+        assert_eq!(editor.scene_snapshot_labels(), vec![
+            "场景快照 1（1 方块 / 0 物理体）"
+        ]);
+        editor.request_scene_restore(0);
+        assert_eq!(editor.restore_scene_requested, Some(0));
+    }
+
+    #[test]
+    fn scene_history_restores_grid_and_physics_body_state() {
+        let (mut app, grid_entity) = test_grid();
+        app.init_resource::<VoxelEditorState>()
+            .init_resource::<Assets<Mesh>>()
+            .insert_resource(VoxelMaterials {
+                handles: std::array::from_fn(|_| Handle::default()),
+            })
+            .add_systems(Update, process_voxel_scene_history);
+        let saved_position = IVec3::new(50, 6, 3);
+        app.world_mut()
+            .entity_mut(grid_entity)
+            .get_mut::<Grid<u8>>()
+            .unwrap()
+            .set(saved_position, 3);
+        app.world_mut().spawn((
+            VoxelPhysicsBody {
+                local_center: Vec3::splat(0.5),
+                cells: vec![(IVec3::ZERO, 2)],
+            },
+            Transform::from_translation(Vec3::new(2.0, 3.0, 4.0)),
+            LinearVelocity(Vec3::X),
+            AngularVelocity(Vec3::Y),
+        ));
+        app.world_mut()
+            .resource_mut::<VoxelEditorState>()
+            .request_scene_snapshot();
+        app.update();
+
+        app.world_mut()
+            .entity_mut(grid_entity)
+            .get_mut::<Grid<u8>>()
+            .unwrap()
+            .set(saved_position, 0);
+        let body_entity = app
+            .world_mut()
+            .query_filtered::<Entity, With<VoxelPhysicsBody>>()
+            .single(app.world())
+            .unwrap();
+        app.world_mut()
+            .entity_mut(body_entity)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation = Vec3::splat(99.0);
+        app.world_mut()
+            .resource_mut::<VoxelEditorState>()
+            .request_scene_restore(0);
+        app.update();
+
+        let grid = app.world().entity(grid_entity).get::<Grid<u8>>().unwrap();
+        assert_eq!(grid.get(saved_position), Some(&3));
+        let transform = app
+            .world_mut()
+            .query_filtered::<&Transform, With<VoxelPhysicsBody>>()
+            .single(app.world())
+            .unwrap();
+        assert_eq!(
+            transform.translation,
+            Vec3::new(2.0, 3.0, 4.0)
+        );
     }
 
     #[test]
