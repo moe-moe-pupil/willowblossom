@@ -32,6 +32,8 @@ const VOXEL_SIZE: f32 = 0.25;
 const MAX_RAY_DISTANCE: f32 = 80.0;
 const EDIT_REPEAT_DELAY: f32 = 0.32;
 const EDIT_REPEAT_INTERVAL: f32 = 0.09;
+const TEST_GROUND_SIZE: Vec3 = Vec3::new(32.0, 0.5, 32.0);
+const TEST_GROUND_CENTER_Y: f32 = -2.25;
 
 pub struct TrpgVoxelPlugin;
 
@@ -56,6 +58,9 @@ struct VoxelGeometry;
 struct VoxelPhysicsBody {
     local_center: Vec3,
 }
+
+#[derive(Component)]
+struct VoxelTestingGround;
 
 #[derive(Resource)]
 struct VoxelMaterials {
@@ -353,7 +358,12 @@ fn populate_default_grid(grid: &mut Mut<Grid<u8>>) {
     }
 }
 
-fn setup_voxel_view(mut commands: Commands, editor: Res<VoxelEditorState>) {
+fn setup_voxel_view(
+    mut commands: Commands,
+    editor: Res<VoxelEditorState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
     commands.spawn((
         DirectionalLight {
             illuminance: 8_500.0,
@@ -371,6 +381,26 @@ fn setup_voxel_view(mut commands: Commands, editor: Res<VoxelEditorState>) {
         },
         editor_camera_transform(&editor),
         VoxelViewportCamera,
+    ));
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(
+            TEST_GROUND_SIZE.x,
+            TEST_GROUND_SIZE.y,
+            TEST_GROUND_SIZE.z,
+        ))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.16, 0.18, 0.2),
+            perceptual_roughness: 0.95,
+            ..default()
+        })),
+        RigidBody::Static,
+        Collider::cuboid(
+            TEST_GROUND_SIZE.x,
+            TEST_GROUND_SIZE.y,
+            TEST_GROUND_SIZE.z,
+        ),
+        Transform::from_xyz(0.0, TEST_GROUND_CENTER_Y, 0.0),
+        VoxelTestingGround,
     ));
 }
 
