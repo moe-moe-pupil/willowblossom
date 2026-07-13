@@ -11613,19 +11613,17 @@ pub fn ui_system(
                             );
                             if ui
                                 .button("推开")
-                                .on_hover_text("从相机向外推开全部物理体")
+                                .on_hover_text("自动物理化当前选区，再从相机向外推开全部物理体")
                                 .clicked()
                             {
-                                voxel_editor.physics_action_requested =
-                                    Some(VoxelPhysicsAction::Push);
+                                voxel_editor.request_physics_action(VoxelPhysicsAction::Push);
                             }
                             if ui
                                 .button("拉近")
-                                .on_hover_text("将全部物理体拉向相机")
+                                .on_hover_text("自动物理化当前选区，再将全部物理体拉向相机")
                                 .clicked()
                             {
-                                voxel_editor.physics_action_requested =
-                                    Some(VoxelPhysicsAction::Pull);
+                                voxel_editor.request_physics_action(VoxelPhysicsAction::Pull);
                             }
                             ui.separator();
                             ui.label("爆炸冲量");
@@ -11642,11 +11640,10 @@ pub fn ui_system(
                             );
                             if ui
                                 .button("爆炸")
-                                .on_hover_text("以当前相机焦点为中心施加带距离衰减的爆炸冲量")
+                                .on_hover_text("自动物理化当前选区，再以相机焦点为中心施加爆炸冲量")
                                 .clicked()
                             {
-                                voxel_editor.physics_action_requested =
-                                    Some(VoxelPhysicsAction::Explode);
+                                voxel_editor.request_physics_action(VoxelPhysicsAction::Explode);
                             }
                         });
                     }

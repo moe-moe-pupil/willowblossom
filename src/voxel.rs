@@ -169,6 +169,13 @@ impl VoxelEditorState {
 
     pub(crate) fn physics_status(&self) -> Option<&str> { self.physics_status.as_deref() }
 
+    pub(crate) fn request_physics_action(&mut self, action: VoxelPhysicsAction) {
+        if self.has_physics_selection() {
+            self.physics_requested = true;
+        }
+        self.physics_action_requested = Some(action);
+    }
+
     fn selection_bounds(&self) -> Option<(IVec3, IVec3)> {
         let start = self.selection_anchor?;
         let end = self.selection_end?;
@@ -692,7 +699,7 @@ fn spawn_voxel_physics_body(
 fn apply_voxel_physics_action(
     mut editor: ResMut<VoxelEditorState>,
     cameras: Query<&GlobalTransform, With<VoxelViewportCamera>>,
-    mut bodies: Query<(Forces, &GlobalTransform), With<VoxelPhysicsBody>>,
+    mut bodies: Query<(Forces, &Transform), With<VoxelPhysicsBody>>,
 ) {
     let Some(action) = editor.physics_action_requested.take() else {
         return;
@@ -710,7 +717,7 @@ fn apply_voxel_physics_action(
     for (mut forces, transform) in &mut bodies {
         let Some(impulse) = physics_action_impulse(
             action,
-            transform.translation(),
+            transform.translation,
             camera_position,
             explosion_origin,
             push_pull_impulse,
@@ -1178,6 +1185,19 @@ mod tests {
                 IVec3::new(-1, 1, -2),
                 IVec3::new(4, 3, 5)
             ))
+        );
+    }
+
+    #[test]
+    fn physics_action_auto_requests_selected_voxels_become_physical() {
+        let mut editor = VoxelEditorState::default();
+        editor.select_physics_corner(IVec3::ZERO);
+        editor.select_physics_corner(IVec3::ONE);
+        editor.request_physics_action(VoxelPhysicsAction::Explode);
+        assert!(editor.physics_requested);
+        assert_eq!(
+            editor.physics_action_requested,
+            Some(VoxelPhysicsAction::Explode)
         );
     }
 
