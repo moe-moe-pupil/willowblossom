@@ -63,6 +63,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use crate::voxel::{
     VoxelEditMode,
     VoxelEditorState,
+    VoxelPhysicsAction,
 };
 
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
@@ -11601,6 +11602,51 @@ pub fn ui_system(
                             }
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("推拉冲量");
+                            ui.add(
+                                egui::DragValue::new(&mut voxel_editor.physics_push_pull_impulse)
+                                    .range(0.1..=200.0)
+                                    .speed(0.25),
+                            );
+                            if ui
+                                .button("推开")
+                                .on_hover_text("从相机向外推开全部物理体")
+                                .clicked()
+                            {
+                                voxel_editor.physics_action_requested =
+                                    Some(VoxelPhysicsAction::Push);
+                            }
+                            if ui
+                                .button("拉近")
+                                .on_hover_text("将全部物理体拉向相机")
+                                .clicked()
+                            {
+                                voxel_editor.physics_action_requested =
+                                    Some(VoxelPhysicsAction::Pull);
+                            }
+                            ui.separator();
+                            ui.label("爆炸冲量");
+                            ui.add(
+                                egui::DragValue::new(&mut voxel_editor.physics_explosion_impulse)
+                                    .range(0.1..=500.0)
+                                    .speed(0.5),
+                            );
+                            ui.label("半径");
+                            ui.add(
+                                egui::DragValue::new(&mut voxel_editor.physics_explosion_radius)
+                                    .range(0.25..=100.0)
+                                    .speed(0.25),
+                            );
+                            if ui
+                                .button("爆炸")
+                                .on_hover_text("以当前相机焦点为中心施加带距离衰减的爆炸冲量")
+                                .clicked()
+                            {
+                                voxel_editor.physics_action_requested =
+                                    Some(VoxelPhysicsAction::Explode);
                             }
                         });
                     }

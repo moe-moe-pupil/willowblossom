@@ -69,6 +69,13 @@ pub(crate) enum VoxelEditMode {
     Physics,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VoxelPhysicsAction {
+    Push,
+    Pull,
+    Explode,
+}
+
 #[derive(Clone)]
 struct VoxelChange {
     position: IVec3,
@@ -88,6 +95,10 @@ pub(crate) struct VoxelEditorState {
     pub reset_requested: bool,
     pub view_reset_requested: bool,
     pub physics_requested: bool,
+    pub physics_action_requested: Option<VoxelPhysicsAction>,
+    pub physics_push_pull_impulse: f32,
+    pub physics_explosion_impulse: f32,
+    pub physics_explosion_radius: f32,
     undo: Vec<Vec<VoxelChange>>,
     redo: Vec<Vec<VoxelChange>>,
     stroke_positions: HashSet<IVec3>,
@@ -117,6 +128,10 @@ impl Default for VoxelEditorState {
             reset_requested: false,
             view_reset_requested: false,
             physics_requested: false,
+            physics_action_requested: None,
+            physics_push_pull_impulse: 4.0,
+            physics_explosion_impulse: 14.0,
+            physics_explosion_radius: 6.0,
             undo: Vec::new(),
             redo: Vec::new(),
             stroke_positions: HashSet::new(),
@@ -197,6 +212,7 @@ impl Plugin for TrpgVoxelPlugin {
                 handle_editor_requests,
                 edit_voxel_grid,
                 make_selection_physical,
+                apply_voxel_physics_action,
                 rebuild_voxel_geometry,
                 control_voxel_camera,
                 draw_voxel_target,
@@ -673,6 +689,78 @@ fn spawn_voxel_physics_body(
         });
 }
 
+fn apply_voxel_physics_action(
+    mut editor: ResMut<VoxelEditorState>,
+    cameras: Query<&GlobalTransform, With<VoxelViewportCamera>>,
+    mut bodies: Query<(Forces, &GlobalTransform), With<VoxelPhysicsBody>>,
+) {
+    let Some(action) = editor.physics_action_requested.take() else {
+        return;
+    };
+    let Ok(camera_transform) = cameras.single() else {
+        return;
+    };
+    let camera_position = camera_transform.translation();
+    let explosion_origin = editor.camera_focus;
+    let push_pull_impulse = editor.physics_push_pull_impulse.max(0.0);
+    let explosion_impulse = editor.physics_explosion_impulse.max(0.0);
+    let explosion_radius = editor.physics_explosion_radius.max(VOXEL_SIZE);
+    let mut affected = 0;
+
+    for (mut forces, transform) in &mut bodies {
+        let Some(impulse) = physics_action_impulse(
+            action,
+            transform.translation(),
+            camera_position,
+            explosion_origin,
+            push_pull_impulse,
+            explosion_impulse,
+            explosion_radius,
+        ) else {
+            continue;
+        };
+        forces.apply_linear_impulse(impulse);
+        affected += 1;
+    }
+
+    let action_name = match action {
+        VoxelPhysicsAction::Push => "推开",
+        VoxelPhysicsAction::Pull => "拉近",
+        VoxelPhysicsAction::Explode => "爆炸",
+    };
+    editor.physics_status = Some(format!(
+        "{action_name}已作用于 {affected} 个物理体"
+    ));
+}
+
+fn physics_action_impulse(
+    action: VoxelPhysicsAction,
+    body_position: Vec3,
+    camera_position: Vec3,
+    explosion_origin: Vec3,
+    push_pull_impulse: f32,
+    explosion_impulse: f32,
+    explosion_radius: f32,
+) -> Option<Vec3> {
+    match action {
+        VoxelPhysicsAction::Push | VoxelPhysicsAction::Pull => {
+            let away = (body_position - camera_position).try_normalize()?;
+            let direction = if action == VoxelPhysicsAction::Push { away } else { -away };
+            Some(direction * push_pull_impulse)
+        },
+        VoxelPhysicsAction::Explode => {
+            let offset = body_position - explosion_origin;
+            let distance = offset.length();
+            if distance > explosion_radius {
+                return None;
+            }
+            let direction = offset.try_normalize().unwrap_or(Vec3::Y);
+            let falloff = 1.0 - distance / explosion_radius.max(f32::EPSILON);
+            Some(direction * explosion_impulse * falloff)
+        },
+    }
+}
+
 fn occupied_cells(grid: &Grid<u8>) -> Vec<IVec3> {
     grid.iter()
         .flat_map(|(chunk_position, chunk)| {
@@ -1116,6 +1204,59 @@ mod tests {
         assert!(!selected
             .iter()
             .any(|(cell, _)| *cell == IVec3::new(2, 0, 0)));
+    }
+
+    #[test]
+    fn push_and_pull_impulses_are_relative_to_camera() {
+        let body = Vec3::new(3.0, 0.0, 0.0);
+        let camera = Vec3::ZERO;
+        let push = physics_action_impulse(
+            VoxelPhysicsAction::Push,
+            body,
+            camera,
+            Vec3::ZERO,
+            4.0,
+            10.0,
+            6.0,
+        )
+        .unwrap();
+        let pull = physics_action_impulse(
+            VoxelPhysicsAction::Pull,
+            body,
+            camera,
+            Vec3::ZERO,
+            4.0,
+            10.0,
+            6.0,
+        )
+        .unwrap();
+        assert_eq!(push, Vec3::X * 4.0);
+        assert_eq!(pull, Vec3::NEG_X * 4.0);
+    }
+
+    #[test]
+    fn explosion_impulse_falls_off_and_stops_at_radius() {
+        let inside = physics_action_impulse(
+            VoxelPhysicsAction::Explode,
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            4.0,
+            10.0,
+            6.0,
+        )
+        .unwrap();
+        assert_eq!(inside, Vec3::X * 5.0);
+        assert!(physics_action_impulse(
+            VoxelPhysicsAction::Explode,
+            Vec3::new(7.0, 0.0, 0.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            4.0,
+            10.0,
+            6.0,
+        )
+        .is_none());
     }
 
     #[test]
