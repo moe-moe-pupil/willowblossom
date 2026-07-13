@@ -11651,7 +11651,7 @@ pub fn ui_system(
                                     .range(0.25..=100.0)
                                     .speed(0.25),
                             );
-                            ui.label("左键点击爆心；静态方块会按笔刷大小自动物理化");
+                            ui.label("左键点击爆心；爆炸半径内的静态方块会自动物理化为一个物理体");
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
                             }

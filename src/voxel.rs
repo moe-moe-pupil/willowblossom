@@ -659,6 +659,27 @@ fn selected_solid_voxels(grid: &Grid<u8>, min: IVec3, max: IVec3) -> Vec<(IVec3,
         .collect()
 }
 
+fn selected_solid_voxels_in_radius(grid: &Grid<u8>, origin: Vec3, radius: f32) -> Vec<(IVec3, u8)> {
+    let radius = radius.max(VOXEL_SIZE);
+    let min = ((origin - Vec3::splat(radius)) / VOXEL_SIZE)
+        .floor()
+        .as_ivec3();
+    let max = ((origin + Vec3::splat(radius)) / VOXEL_SIZE)
+        .floor()
+        .as_ivec3();
+    let radius_squared = radius * radius;
+    prism(min, max + IVec3::ONE)
+        .filter_map(|cell| {
+            let material = grid.get(cell).copied()?;
+            if !TrpgVoxelConnector::solid(&material) {
+                return None;
+            }
+            let center = (cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
+            (center.distance_squared(origin) <= radius_squared).then_some((cell, material))
+        })
+        .collect()
+}
+
 fn spawn_voxel_physics_body(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -881,14 +902,39 @@ fn edit_voxel_grid(
             .as_ref()
             .is_some_and(|hit| static_distance.is_none_or(|distance| hit.distance < distance));
 
-        let (target, interaction_distance) = if body_is_closest {
+        let (clicked_body, static_cell, interaction_distance) = if body_is_closest {
             let hit = body_hit.unwrap();
-            (Some(hit.entity), hit.distance)
+            (Some(hit.entity), None, hit.distance)
         } else {
             let Some(hit) = grid_hit.filter(|hit| hit.occupied.is_some()) else {
                 return;
             };
-            let center = hit.occupied.unwrap();
+            (None, hit.occupied, hit.distance)
+        };
+        let interaction_point = ray.origin + *ray.direction * interaction_distance;
+        let target = if action == VoxelPhysicsAction::Explode {
+            let selected = selected_solid_voxels_in_radius(
+                &grid,
+                interaction_point,
+                editor.physics_explosion_radius,
+            );
+            if selected.is_empty() {
+                clicked_body
+            } else {
+                for (cell, _) in &selected {
+                    grid.set(*cell, 0);
+                }
+                Some(spawn_voxel_physics_body(
+                    &mut commands,
+                    &mut meshes,
+                    &materials,
+                    selected,
+                ))
+            }
+        } else if let Some(entity) = clicked_body {
+            Some(entity)
+        } else {
+            let center = static_cell.unwrap();
             let radius = editor.brush_radius.max(0);
             let selected = selected_solid_voxels(
                 &grid,
@@ -907,12 +953,14 @@ fn edit_voxel_grid(
                 &materials,
                 selected,
             );
-            (Some(entity), hit.distance)
+            Some(entity)
         };
-        let interaction_point = ray.origin + *ray.direction * interaction_distance;
+        let Some(target) = target else {
+            return;
+        };
         editor.physics_action_requested = Some(VoxelPhysicsRequest {
             action,
-            target,
+            target: Some(target),
             origin: interaction_point,
         });
         return;
@@ -1362,6 +1410,31 @@ mod tests {
         assert!(!selected
             .iter()
             .any(|(cell, _)| *cell == IVec3::new(2, 0, 0)));
+    }
+
+    #[test]
+    fn explosion_radius_selects_all_static_solids_inside_it() {
+        let (mut app, entity) = test_grid();
+        let mut entity_mut = app.world_mut().entity_mut(entity);
+        let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
+        for cell in occupied_cells(&grid) {
+            grid.set(cell, 0);
+        }
+        grid.set(IVec3::ZERO, 1);
+        grid.set(IVec3::X, 2);
+        grid.set(IVec3::new(2, 0, 0), 3);
+        grid.set(IVec3::Y, 4);
+
+        let origin = Vec3::splat(0.5) * VOXEL_SIZE;
+        let selected = selected_solid_voxels_in_radius(&grid, origin, 0.3);
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().any(|(cell, _)| *cell == IVec3::ZERO));
+        assert!(selected.iter().any(|(cell, _)| *cell == IVec3::X));
+        assert!(!selected
+            .iter()
+            .any(|(cell, _)| *cell == IVec3::new(2, 0, 0)));
+        assert!(!selected.iter().any(|(cell, _)| *cell == IVec3::Y));
     }
 
     #[test]
