@@ -63,7 +63,6 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use crate::voxel::{
     VoxelEditMode,
     VoxelEditorState,
-    VoxelPhysicsAction,
 };
 
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
@@ -11528,6 +11527,22 @@ pub fn ui_system(
                             "物理选区",
                         );
                         ui.separator();
+                        ui.selectable_value(
+                            &mut voxel_editor.mode,
+                            VoxelEditMode::Push,
+                            "推开",
+                        );
+                        ui.selectable_value(
+                            &mut voxel_editor.mode,
+                            VoxelEditMode::Pull,
+                            "拉近",
+                        );
+                        ui.selectable_value(
+                            &mut voxel_editor.mode,
+                            VoxelEditMode::Explode,
+                            "爆炸",
+                        );
+                        ui.separator();
                         for (material, name, color) in [
                             (
                                 1,
@@ -11604,6 +11619,11 @@ pub fn ui_system(
                                 ui.small(status);
                             }
                         });
+                    }
+                    if matches!(
+                        voxel_editor.mode,
+                        VoxelEditMode::Push | VoxelEditMode::Pull
+                    ) {
                         ui.horizontal_wrapped(|ui| {
                             ui.label("推拉冲量");
                             ui.add(
@@ -11611,21 +11631,14 @@ pub fn ui_system(
                                     .range(0.1..=200.0)
                                     .speed(0.25),
                             );
-                            if ui
-                                .button("推开")
-                                .on_hover_text("自动物理化当前选区，再从相机向外推开全部物理体")
-                                .clicked()
-                            {
-                                voxel_editor.request_physics_action(VoxelPhysicsAction::Push);
+                            ui.label("左键点击方块或物理体；静态方块会按笔刷大小自动物理化");
+                            if let Some(status) = voxel_editor.physics_status() {
+                                ui.small(status);
                             }
-                            if ui
-                                .button("拉近")
-                                .on_hover_text("自动物理化当前选区，再将全部物理体拉向相机")
-                                .clicked()
-                            {
-                                voxel_editor.request_physics_action(VoxelPhysicsAction::Pull);
-                            }
-                            ui.separator();
+                        });
+                    }
+                    if voxel_editor.mode == VoxelEditMode::Explode {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("爆炸冲量");
                             ui.add(
                                 egui::DragValue::new(&mut voxel_editor.physics_explosion_impulse)
@@ -11638,12 +11651,9 @@ pub fn ui_system(
                                     .range(0.25..=100.0)
                                     .speed(0.25),
                             );
-                            if ui
-                                .button("爆炸")
-                                .on_hover_text("自动物理化当前选区，再以相机焦点为中心施加爆炸冲量")
-                                .clicked()
-                            {
-                                voxel_editor.request_physics_action(VoxelPhysicsAction::Explode);
+                            ui.label("左键点击爆心；静态方块会按笔刷大小自动物理化");
+                            if let Some(status) = voxel_editor.physics_status() {
+                                ui.small(status);
                             }
                         });
                     }

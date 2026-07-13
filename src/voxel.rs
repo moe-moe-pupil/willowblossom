@@ -53,7 +53,9 @@ struct VoxelViewportCamera;
 struct VoxelGeometry;
 
 #[derive(Component)]
-struct VoxelPhysicsBody;
+struct VoxelPhysicsBody {
+    local_center: Vec3,
+}
 
 #[derive(Resource)]
 struct VoxelMaterials {
@@ -67,6 +69,9 @@ pub(crate) enum VoxelEditMode {
     Remove,
     Paint,
     Physics,
+    Push,
+    Pull,
+    Explode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +79,13 @@ pub(crate) enum VoxelPhysicsAction {
     Push,
     Pull,
     Explode,
+}
+
+#[derive(Clone, Copy)]
+struct VoxelPhysicsRequest {
+    action: VoxelPhysicsAction,
+    target: Option<Entity>,
+    origin: Vec3,
 }
 
 #[derive(Clone)]
@@ -95,7 +107,7 @@ pub(crate) struct VoxelEditorState {
     pub reset_requested: bool,
     pub view_reset_requested: bool,
     pub physics_requested: bool,
-    pub physics_action_requested: Option<VoxelPhysicsAction>,
+    physics_action_requested: Option<VoxelPhysicsRequest>,
     pub physics_push_pull_impulse: f32,
     pub physics_explosion_impulse: f32,
     pub physics_explosion_radius: f32,
@@ -168,13 +180,6 @@ impl VoxelEditorState {
     }
 
     pub(crate) fn physics_status(&self) -> Option<&str> { self.physics_status.as_deref() }
-
-    pub(crate) fn request_physics_action(&mut self, action: VoxelPhysicsAction) {
-        if self.has_physics_selection() {
-            self.physics_requested = true;
-        }
-        self.physics_action_requested = Some(action);
-    }
 
     fn selection_bounds(&self) -> Option<(IVec3, IVec3)> {
         let start = self.selection_anchor?;
@@ -659,7 +664,7 @@ fn spawn_voxel_physics_body(
     meshes: &mut Assets<Mesh>,
     materials: &VoxelMaterials,
     component: Vec<(IVec3, u8)>,
-) {
+) -> Entity {
     let origin = component
         .iter()
         .map(|(cell, _)| *cell)
@@ -673,9 +678,15 @@ fn spawn_voxel_physics_body(
         collider_voxels.push(local);
     }
     let (material_meshes, _) = build_voxel_meshes_from_cells(&local_cells);
+    let local_max = collider_voxels
+        .iter()
+        .copied()
+        .reduce(IVec3::max)
+        .unwrap_or(IVec3::ZERO);
+    let local_center = (local_max + IVec3::ONE).as_vec3() * VOXEL_SIZE * 0.5;
     commands
         .spawn((
-            VoxelPhysicsBody,
+            VoxelPhysicsBody { local_center },
             RigidBody::Dynamic,
             Collider::voxels(
                 Vec3::splat(VOXEL_SIZE),
@@ -693,33 +704,51 @@ fn spawn_voxel_physics_body(
                     MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
                 ));
             }
-        });
+        })
+        .id()
 }
 
 fn apply_voxel_physics_action(
     mut editor: ResMut<VoxelEditorState>,
     cameras: Query<&GlobalTransform, With<VoxelViewportCamera>>,
-    mut bodies: Query<(Forces, &Transform), With<VoxelPhysicsBody>>,
+    mut bodies: Query<(
+        Entity,
+        Forces,
+        &Transform,
+        &VoxelPhysicsBody,
+    )>,
 ) {
-    let Some(action) = editor.physics_action_requested.take() else {
+    let Some(request) = editor.physics_action_requested else {
         return;
     };
+    if request
+        .target
+        .is_some_and(|target| !bodies.contains(target))
+    {
+        return;
+    }
+    editor.physics_action_requested = None;
     let Ok(camera_transform) = cameras.single() else {
         return;
     };
     let camera_position = camera_transform.translation();
-    let explosion_origin = editor.camera_focus;
     let push_pull_impulse = editor.physics_push_pull_impulse.max(0.0);
     let explosion_impulse = editor.physics_explosion_impulse.max(0.0);
     let explosion_radius = editor.physics_explosion_radius.max(VOXEL_SIZE);
     let mut affected = 0;
 
-    for (mut forces, transform) in &mut bodies {
+    for (entity, mut forces, transform, body) in &mut bodies {
+        if request.action != VoxelPhysicsAction::Explode && request.target != Some(entity) {
+            continue;
+        }
+        let body_position = transform
+            .compute_affine()
+            .transform_point3(body.local_center);
         let Some(impulse) = physics_action_impulse(
-            action,
-            transform.translation,
+            request.action,
+            body_position,
             camera_position,
-            explosion_origin,
+            request.origin,
             push_pull_impulse,
             explosion_impulse,
             explosion_radius,
@@ -730,7 +759,7 @@ fn apply_voxel_physics_action(
         affected += 1;
     }
 
-    let action_name = match action {
+    let action_name = match request.action {
         VoxelPhysicsAction::Push => "推开",
         VoxelPhysicsAction::Pull => "拉近",
         VoxelPhysicsAction::Explode => "爆炸",
@@ -789,11 +818,16 @@ fn apply_stroke(grid: &mut Mut<Grid<u8>>, stroke: &[VoxelChange], forward: bool)
 }
 
 fn edit_voxel_grid(
+    mut commands: Commands,
     time: Res<Time>,
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    physics_bodies: Query<(), With<VoxelPhysicsBody>>,
+    spatial_query: SpatialQuery,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
     mut editor: ResMut<VoxelEditorState>,
     egui_input: Res<EguiWantsInput>,
 ) {
@@ -808,6 +842,79 @@ fn edit_voxel_grid(
         }
     }
     if egui_input.wants_pointer_input() {
+        return;
+    }
+    if let Some(action) = force_tool_action(editor.mode) {
+        if !mouse.just_pressed(MouseButton::Left) {
+            return;
+        }
+        let (Ok(window), Ok((camera, camera_transform)), Ok(mut grid)) = (
+            windows.single(),
+            cameras.single(),
+            grids.single_mut(),
+        ) else {
+            return;
+        };
+        let Some(cursor) = window.cursor_position() else {
+            return;
+        };
+        if !editor.contains_cursor(cursor) {
+            return;
+        }
+        let Ok(ray) = camera.viewport_to_world(camera_transform, cursor) else {
+            return;
+        };
+        let grid_hit = raycast_grid(&grid, ray);
+        let body_hit = spatial_query.cast_ray_predicate(
+            ray.origin,
+            ray.direction,
+            MAX_RAY_DISTANCE,
+            true,
+            &SpatialQueryFilter::default(),
+            &|entity| physics_bodies.contains(entity),
+        );
+        let static_distance = grid_hit
+            .as_ref()
+            .filter(|hit| hit.occupied.is_some())
+            .map(|hit| hit.distance);
+        let body_is_closest = body_hit
+            .as_ref()
+            .is_some_and(|hit| static_distance.is_none_or(|distance| hit.distance < distance));
+
+        let (target, interaction_distance) = if body_is_closest {
+            let hit = body_hit.unwrap();
+            (Some(hit.entity), hit.distance)
+        } else {
+            let Some(hit) = grid_hit.filter(|hit| hit.occupied.is_some()) else {
+                return;
+            };
+            let center = hit.occupied.unwrap();
+            let radius = editor.brush_radius.max(0);
+            let selected = selected_solid_voxels(
+                &grid,
+                center - IVec3::splat(radius),
+                center + IVec3::splat(radius),
+            );
+            if selected.is_empty() {
+                return;
+            }
+            for (cell, _) in &selected {
+                grid.set(*cell, 0);
+            }
+            let entity = spawn_voxel_physics_body(
+                &mut commands,
+                &mut meshes,
+                &materials,
+                selected,
+            );
+            (Some(entity), hit.distance)
+        };
+        let interaction_point = ray.origin + *ray.direction * interaction_distance;
+        editor.physics_action_requested = Some(VoxelPhysicsRequest {
+            action,
+            target,
+            origin: interaction_point,
+        });
         return;
     }
     if editor.mode == VoxelEditMode::Physics {
@@ -868,7 +975,10 @@ fn edit_voxel_grid(
     let center = match editor.mode {
         VoxelEditMode::Add => hit.add,
         VoxelEditMode::Remove | VoxelEditMode::Paint => hit.occupied,
-        VoxelEditMode::Physics => unreachable!(),
+        VoxelEditMode::Physics
+        | VoxelEditMode::Push
+        | VoxelEditMode::Pull
+        | VoxelEditMode::Explode => unreachable!(),
     };
     let Some(center) = center else {
         return;
@@ -908,13 +1018,26 @@ fn edited_voxel(mode: VoxelEditMode, before: u8, material: u8) -> Option<u8> {
         VoxelEditMode::Add => Some(material),
         VoxelEditMode::Remove => Some(0),
         VoxelEditMode::Paint => (before != 0).then_some(material),
-        VoxelEditMode::Physics => None,
+        VoxelEditMode::Physics
+        | VoxelEditMode::Push
+        | VoxelEditMode::Pull
+        | VoxelEditMode::Explode => None,
+    }
+}
+
+fn force_tool_action(mode: VoxelEditMode) -> Option<VoxelPhysicsAction> {
+    match mode {
+        VoxelEditMode::Push => Some(VoxelPhysicsAction::Push),
+        VoxelEditMode::Pull => Some(VoxelPhysicsAction::Pull),
+        VoxelEditMode::Explode => Some(VoxelPhysicsAction::Explode),
+        _ => None,
     }
 }
 
 struct VoxelRayHit {
     occupied: Option<IVec3>,
     add: Option<IVec3>,
+    distance: f32,
 }
 
 fn edit_repeat_due(just_pressed: bool, delta_seconds: f32, editor: &mut VoxelEditorState) -> bool {
@@ -948,6 +1071,7 @@ fn raycast_grid(grid: &Grid<u8>, ray: Ray3d) -> Option<VoxelRayHit> {
             return Some(VoxelRayHit {
                 occupied: Some(cell),
                 add: Some(previous),
+                distance,
             });
         }
         previous = cell;
@@ -963,6 +1087,7 @@ fn raycast_grid(grid: &Grid<u8>, ray: Ray3d) -> Option<VoxelRayHit> {
                 0,
                 (point.z / VOXEL_SIZE).floor() as i32,
             )),
+            distance: plane_distance,
         });
     }
     None
@@ -1052,9 +1177,15 @@ fn draw_voxel_target(
     };
     let target = match (editor.mode, hit) {
         (VoxelEditMode::Add, Some(hit)) => hit.add,
-        (VoxelEditMode::Remove | VoxelEditMode::Paint | VoxelEditMode::Physics, Some(hit)) => {
-            hit.occupied
-        },
+        (
+            VoxelEditMode::Remove
+            | VoxelEditMode::Paint
+            | VoxelEditMode::Physics
+            | VoxelEditMode::Push
+            | VoxelEditMode::Pull
+            | VoxelEditMode::Explode,
+            Some(hit),
+        ) => hit.occupied,
         (_, None) => None,
     };
     if editor.mode == VoxelEditMode::Physics {
@@ -1189,15 +1320,22 @@ mod tests {
     }
 
     #[test]
-    fn physics_action_auto_requests_selected_voxels_become_physical() {
-        let mut editor = VoxelEditorState::default();
-        editor.select_physics_corner(IVec3::ZERO);
-        editor.select_physics_corner(IVec3::ONE);
-        editor.request_physics_action(VoxelPhysicsAction::Explode);
-        assert!(editor.physics_requested);
+    fn force_tools_map_to_left_click_actions() {
         assert_eq!(
-            editor.physics_action_requested,
+            force_tool_action(VoxelEditMode::Push),
+            Some(VoxelPhysicsAction::Push)
+        );
+        assert_eq!(
+            force_tool_action(VoxelEditMode::Pull),
+            Some(VoxelPhysicsAction::Pull)
+        );
+        assert_eq!(
+            force_tool_action(VoxelEditMode::Explode),
             Some(VoxelPhysicsAction::Explode)
+        );
+        assert_eq!(
+            force_tool_action(VoxelEditMode::Physics),
+            None
         );
     }
 
