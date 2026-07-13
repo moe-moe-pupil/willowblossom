@@ -19,6 +19,8 @@ use voxxelmaxx::prelude::*;
 
 const VOXEL_SIZE: f32 = 0.25;
 const MAX_RAY_DISTANCE: f32 = 80.0;
+const EDIT_REPEAT_DELAY: f32 = 0.32;
+const EDIT_REPEAT_INTERVAL: f32 = 0.09;
 
 pub struct TrpgVoxelPlugin;
 
@@ -69,6 +71,8 @@ pub(crate) struct VoxelEditorState {
     redo: Vec<Vec<VoxelChange>>,
     stroke_positions: HashSet<IVec3>,
     active_stroke: Vec<VoxelChange>,
+    edit_hold_seconds: f32,
+    edit_repeat_seconds: f32,
     camera_focus: Vec3,
     camera_distance: f32,
     camera_yaw: f32,
@@ -92,6 +96,8 @@ impl Default for VoxelEditorState {
             redo: Vec::new(),
             stroke_positions: HashSet::new(),
             active_stroke: Vec::new(),
+            edit_hold_seconds: 0.0,
+            edit_repeat_seconds: 0.0,
             camera_focus: Vec3::new(0.0, 0.75, 0.0),
             camera_distance: 20.0,
             camera_yaw: 0.7,
@@ -341,9 +347,12 @@ fn append_voxel_faces(
         ]),
     ];
     let color = match material {
-        1 => [0.22, 0.62, 0.48, 1.0],
-        2 => [0.96, 0.46, 0.18, 1.0],
-        _ => [0.36, 0.58, 0.92, 1.0],
+        1 => [0.22, 0.62, 0.32, 1.0],
+        2 => [0.38, 0.20, 0.09, 1.0],
+        3 => [0.86, 0.72, 0.38, 1.0],
+        4 => [0.08, 0.38, 0.82, 0.88],
+        5 => [1.0, 0.16, 0.015, 1.0],
+        _ => [0.46, 0.48, 0.52, 1.0],
     };
 
     for (normal, corners) in FACES {
@@ -414,6 +423,7 @@ fn apply_stroke(grid: &mut Mut<Grid<u8>>, stroke: &[VoxelChange], forward: bool)
 }
 
 fn edit_voxel_grid(
+    time: Res<Time>,
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
@@ -423,6 +433,8 @@ fn edit_voxel_grid(
 ) {
     if mouse.just_released(MouseButton::Left) {
         editor.stroke_positions.clear();
+        editor.edit_hold_seconds = 0.0;
+        editor.edit_repeat_seconds = 0.0;
         if !editor.active_stroke.is_empty() {
             let stroke = std::mem::take(&mut editor.active_stroke);
             editor.undo.push(stroke);
@@ -430,6 +442,14 @@ fn edit_voxel_grid(
         }
     }
     if !mouse.pressed(MouseButton::Left) || egui_input.wants_pointer_input() {
+        return;
+    }
+    let just_pressed = mouse.just_pressed(MouseButton::Left);
+    if !edit_repeat_due(
+        just_pressed,
+        time.delta_secs(),
+        &mut editor,
+    ) {
         return;
     }
     let (Ok(window), Ok((camera, camera_transform)), Ok(mut grid)) = (
@@ -460,9 +480,10 @@ fn edit_voxel_grid(
     };
 
     let mut stroke = Vec::new();
-    for x in -editor.brush_radius..=editor.brush_radius {
-        for y in -editor.brush_radius..=editor.brush_radius {
-            for z in -editor.brush_radius..=editor.brush_radius {
+    let brush_radius = if just_pressed { 0 } else { editor.brush_radius };
+    for x in -brush_radius..=brush_radius {
+        for y in -brush_radius..=brush_radius {
+            for z in -brush_radius..=brush_radius {
                 let position = center + IVec3::new(x, y, z);
                 if !editor.stroke_positions.insert(position) {
                     continue;
@@ -491,6 +512,24 @@ fn edit_voxel_grid(
 struct VoxelRayHit {
     occupied: Option<IVec3>,
     add: Option<IVec3>,
+}
+
+fn edit_repeat_due(just_pressed: bool, delta_seconds: f32, editor: &mut VoxelEditorState) -> bool {
+    if just_pressed {
+        editor.edit_hold_seconds = 0.0;
+        editor.edit_repeat_seconds = 0.0;
+        return true;
+    }
+    editor.edit_hold_seconds += delta_seconds;
+    if editor.edit_hold_seconds < EDIT_REPEAT_DELAY {
+        return false;
+    }
+    editor.edit_repeat_seconds += delta_seconds;
+    if editor.edit_repeat_seconds < EDIT_REPEAT_INTERVAL {
+        return false;
+    }
+    editor.edit_repeat_seconds %= EDIT_REPEAT_INTERVAL;
+    true
 }
 
 fn raycast_grid(grid: &Grid<u8>, ray: Ray3d) -> Option<VoxelRayHit> {
@@ -693,5 +732,28 @@ mod tests {
         assert!(!TrpgVoxelConnector::solid(&0));
         assert!(TrpgVoxelConnector::solid(&1));
         assert!(TrpgVoxelConnector::solid(&u8::MAX));
+    }
+
+    #[test]
+    fn edit_repeat_waits_before_repeating() {
+        let mut editor = VoxelEditorState::default();
+        assert!(edit_repeat_due(true, 0.0, &mut editor));
+        for _ in 0..18 {
+            assert!(!edit_repeat_due(
+                false,
+                0.016,
+                &mut editor
+            ));
+        }
+        assert!(!edit_repeat_due(
+            false,
+            0.04,
+            &mut editor
+        ));
+        assert!(edit_repeat_due(
+            false,
+            0.05,
+            &mut editor
+        ));
     }
 }

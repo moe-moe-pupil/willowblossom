@@ -11522,10 +11522,32 @@ pub fn ui_system(
                             "涂色",
                         );
                         ui.separator();
-                        for (material, color) in [
-                            (1, egui::Color32::from_rgb(56, 158, 122)),
-                            (2, egui::Color32::from_rgb(245, 117, 46)),
-                            (3, egui::Color32::from_rgb(92, 148, 235)),
+                        for (material, name, color) in [
+                            (
+                                1,
+                                "草地",
+                                egui::Color32::from_rgb(56, 158, 82),
+                            ),
+                            (
+                                2,
+                                "泥土",
+                                egui::Color32::from_rgb(97, 51, 23),
+                            ),
+                            (
+                                3,
+                                "沙子",
+                                egui::Color32::from_rgb(219, 184, 97),
+                            ),
+                            (
+                                4,
+                                "水",
+                                egui::Color32::from_rgb(20, 97, 209),
+                            ),
+                            (
+                                5,
+                                "岩浆",
+                                egui::Color32::from_rgb(255, 41, 4),
+                            ),
                         ] {
                             let (rect, response) =
                                 ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::click());
@@ -11541,6 +11563,7 @@ pub fn ui_system(
                             if response.clicked() {
                                 voxel_editor.material = material;
                             }
+                            response.on_hover_text(name);
                         }
                         ui.separator();
                         ui.label("笔刷");
