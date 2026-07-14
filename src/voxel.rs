@@ -40,7 +40,7 @@ const TEST_GROUND_SIZE: Vec3 = Vec3::new(256.0, 0.5, 256.0);
 const TEST_GROUND_CENTER_Y: f32 = -50.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
-const VOXEL_MATERIAL_COUNT: usize = 8;
+const VOXEL_MATERIAL_COUNT: usize = 9;
 const FIRST_PERSON_RADIUS: f32 = 0.03;
 const FIRST_PERSON_BODY_LENGTH: f32 = 0.065;
 const FIRST_PERSON_EYE_OFFSET: f32 = 0.045;
@@ -49,7 +49,9 @@ const FIRST_PERSON_JUMP_SPEED: f32 = 3.4;
 const FIRST_PERSON_FLY_SPEED: f32 = 3.5;
 const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
-const FIRST_PERSON_START: Vec3 = Vec3::new(-19.875, 0.32, 2.625);
+const FIRST_PERSON_START: Vec3 = Vec3::new(-6.5, 0.32, 41.25);
+const DEFAULT_SCENE_CAMERA_FOCUS: Vec3 = Vec3::new(0.0, 2.5, 37.5);
+const DEFAULT_SCENE_CAMERA_DISTANCE: f32 = 42.0;
 
 pub struct TrpgVoxelPlugin;
 
@@ -238,8 +240,8 @@ impl Default for VoxelEditorState {
             active_stroke: Vec::new(),
             edit_hold_seconds: 0.0,
             edit_repeat_seconds: 0.0,
-            camera_focus: Vec3::new(0.0, 4.0, 20.0),
-            camera_distance: 80.0,
+            camera_focus: DEFAULT_SCENE_CAMERA_FOCUS,
+            camera_distance: DEFAULT_SCENE_CAMERA_DISTANCE,
             camera_yaw: 0.7,
             camera_pitch: -0.45,
             camera_drag_started_in_viewport: false,
@@ -431,7 +433,7 @@ fn setup_voxel_materials(
                 perceptual_roughness: 0.9,
                 ..default()
             }
-        } else {
+        } else if index < 8 {
             let atlas_row = [2, 0, 6][index - textures.len()];
             StandardMaterial {
                 base_color_texture: Some(hifi_texture.clone()),
@@ -439,6 +441,13 @@ fn setup_voxel_materials(
                 uv_transform: hifi_voxel_tile_transform(atlas_row),
                 metallic: 0.72,
                 perceptual_roughness: 0.34,
+                ..default()
+            }
+        } else {
+            StandardMaterial {
+                base_color: Color::srgb(0.28, 0.008, 0.014),
+                metallic: 0.72,
+                perceptual_roughness: 0.44,
                 ..default()
             }
         };
@@ -453,6 +462,10 @@ fn setup_voxel_materials(
                 material.emissive_texture = Some(textures[index].clone());
                 material.emissive = LinearRgba::rgb(5.0, 0.55, 0.02);
                 material.perceptual_roughness = 0.55;
+            },
+            6 => {
+                material.emissive = LinearRgba::rgb(0.018, 0.022, 0.028);
+                material.perceptual_roughness = 0.48;
             },
             7 => {
                 material.base_color = Color::srgb(0.48, 0.92, 1.0);
@@ -654,9 +667,9 @@ fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station:
 
 fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
     const CENTER: IVec3 = IVec3::new(0, 0, 150);
-    for x in -24..=24 {
-        for y in 0..=23 {
-            for z in -48..=48 {
+    for x in -28..=28 {
+        for y in -5..=25 {
+            for z in -80..=80 {
                 let local = IVec3::new(x, y, z);
                 if let Some(material) = combat_corvette_voxel(local) {
                     grid.set(CENTER + local, material);
@@ -669,212 +682,290 @@ fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
 fn combat_corvette_voxel(position: IVec3) -> Option<u8> {
     const FLOOR: u8 = 2;
     const METAL: u8 = 3;
-    const RED: u8 = 5;
+    const RED: u8 = 9;
     const HULL: u8 = 6;
     const DARK: u8 = 7;
     const CYAN: u8 = 8;
 
     let (x, y, z) = (position.x, position.y, position.z);
     let mut material = None;
-    let half_width = if z >= 34 {
-        18 - (z - 34)
-    } else if z <= -36 {
-        10 + (z + 48) / 2
+    let half_width = corvette_half_width(z);
+    let roof_y = corvette_roof_y(z);
+    let vertical_inset = if y <= 1 || y >= roof_y - 1 {
+        2
+    } else if y <= 3 || y >= roof_y - 3 {
+        1
     } else {
-        18
-    }
-    .clamp(4, 18);
-    let roof_y = if z >= 40 {
-        15
-    } else if z <= -42 {
-        17
-    } else {
-        21
+        0
     };
+    let section_width = (half_width - vertical_inset).max(2);
 
-    if (-48..=48).contains(&z) && x.abs() <= half_width && (0..=roof_y).contains(&y) {
-        let outer_shell = x.abs() == half_width || y == 0 || y == roof_y;
-        let deck = matches!(y, 7 | 14) && x.abs() < half_width;
+    if (-80..=80).contains(&z) && (0..=roof_y).contains(&y) && x.abs() <= section_width {
+        let outer_shell = x.abs() == section_width || y == 0 || y == roof_y;
+        let deck = matches!(y, 7 | 14) && y < roof_y && x.abs() < section_width;
         if outer_shell || deck {
             material = Some(if y == 0 || deck { FLOOR } else { HULL });
         }
     }
 
-    // Sealed room divisions retain a centered route through all three decks.
-    for bulkhead_z in [-34, -18, 6, 24, 36] {
+    // Six room divisions with broad doors through every deck that reaches the section.
+    for bulkhead_z in [-55, -35, -10, 15, 38, 55] {
         let doorway = x.abs() <= 2 && matches!(y, 1..=5 | 8..=12 | 15..=19);
-        if z == bulkhead_z && x.abs() < half_width && (1..roof_y).contains(&y) && !doorway {
+        if z == bulkhead_z && x.abs() < half_width - 1 && (1..roof_y).contains(&y) && !doorway {
             material = Some(DARK);
         }
     }
 
-    // Layered armor, landing outriggers, dorsal sensor spine, and raised red hull bands.
-    for side in [-1, 1] {
-        if voxel_point_in_box(
-            position,
-            IVec3::new(side * 24, 4, -10),
-            IVec3::new(side * 19, 10, 26),
-        ) {
-            material = Some(if y == 7 || z % 12 == 0 { HULL } else { DARK });
+    // Thin, tapered armor rails replace the previous solid rectangular side slabs.
+    if (-24..=34).contains(&z) {
+        let wing_reach = 22 + (12 - (z - 5).abs()).max(0) / 4;
+        for side in [-1, 1] {
+            let side_x = x * side;
+            let on_rail = (21..=wing_reach).contains(&side_x)
+                && (4..=9).contains(&y)
+                && (matches!(y, 4 | 9)
+                    || matches!(side_x, 21)
+                    || side_x == wing_reach
+                    || (z - 5).rem_euclid(10) == 0);
+            if on_rail {
+                material = Some(if y == 9 && z.rem_euclid(12) < 5 { RED } else { DARK });
+            }
         }
-        if x == side * (half_width + 1) && matches!(y, 3 | 4 | 17 | 18) && (-30..=34).contains(&z) {
+    }
+
+    // Port-side airlock vestibule joins the hull and frames the automatic outer door.
+    if voxel_point_in_hollow_box(
+        position,
+        IVec3::new(-24, 0, 10),
+        IVec3::new(-18, 7, 20),
+    ) {
+        material = Some(DARK);
+    }
+    if x == -18 && (1..=5).contains(&y) && (12..=18).contains(&z) {
+        material = None;
+    }
+
+    // Raised red armor bands and cyan side ports follow the tapered hull instead of flattening it.
+    for side in [-1, 1] {
+        if x == side * (section_width + 1)
+            && matches!(y, 3 | 4 | 17)
+            && matches!(z, -48..=-34 | -22..=-8 | 5..=18 | 29..=42)
+        {
             material = Some(RED);
         }
-        if x == side * half_width
+        if x == side * section_width
             && (9..=11).contains(&y)
-            && matches!(z, -28..=-25 | -10..=-7 | 10..=13 | 28..=31)
+            && matches!(z, -42..=-38 | -20..=-16 | 3..=7 | 25..=29 | 45..=49)
         {
             material = Some(CYAN);
         }
     }
+
+    // Broad top plates provide large red fields instead of repetitive glowing stripes.
+    if y == roof_y + 1 && x.abs() <= (half_width - 9).max(1) {
+        if matches!(z, -44..=-34 | -16..=-7 | 11..=19 | 34..=41) {
+            material = Some(RED);
+        } else if matches!(z, -55..=-50 | -27..=-23 | 24..=28 | 46..=50) {
+            material = Some(HULL);
+        }
+    }
+
+    // Three long engine nacelles with layered casings, cyan bells, and red drive cores.
+    for engine_x in [-16, 0, 16] {
+        let dx = (x - engine_x).abs();
+        if dx <= 4 && (4..=12).contains(&y) && (-80..=-58).contains(&z) {
+            let casing = dx == 4
+                || matches!(y, 4 | 12)
+                || z == -58
+                || (z + 80).rem_euclid(6) == 0 && dx >= 3;
+            if casing {
+                material = Some(DARK);
+            }
+            if z <= -72 && dx <= 2 && (6..=10).contains(&y) {
+                material = Some(if z == -80 { CYAN } else { RED });
+            }
+            if z == -61 && dx <= 3 && (6..=10).contains(&y) {
+                material = Some(HULL);
+            }
+        }
+    }
+
+    // Layered dorsal command spine, sensor mast, twin turret, and forward gun rails.
     if voxel_point_in_hollow_box(
         position,
-        IVec3::new(-7, 21, -4),
-        IVec3::new(7, 23, 18),
+        IVec3::new(-7, 22, -18),
+        IVec3::new(7, 23, 20),
     ) {
         material = Some(HULL);
     }
     if voxel_point_in_box(
         position,
-        IVec3::new(-1, 22, 4),
-        IVec3::new(1, 23, 13),
+        IVec3::new(-4, 24, -7),
+        IVec3::new(4, 25, 7),
+    ) {
+        material = Some(DARK);
+    }
+    if voxel_point_in_box(
+        position,
+        IVec3::new(-1, 23, -28),
+        IVec3::new(1, 25, -9),
+    ) || voxel_point_in_box(
+        position,
+        IVec3::new(-1, 23, 7),
+        IVec3::new(1, 25, 30),
     ) {
         material = Some(RED);
     }
+    for gun_x in [-5, 5] {
+        if voxel_point_in_box(
+            position,
+            IVec3::new(gun_x - 1, 22, 18),
+            IVec3::new(gun_x + 1, 24, 30),
+        ) {
+            material = Some(DARK);
+        }
+    }
+    if x == 0 && y == 25 && (-2..=2).contains(&z) {
+        material = Some(CYAN);
+    }
 
-    // Three cyan engine bells with red drive cores and armored nacelles.
-    for engine_x in [-15, 0, 15] {
-        let dx = (x - engine_x).abs();
-        if dx <= 4 && (4..=12).contains(&y) && (-48..=-38).contains(&z) {
-            if dx == 4 || matches!(y, 4 | 12) || z == -38 {
+    // Four landing struts and broad feet make the ship read as a vehicle rather than a building.
+    for leg_x in [-13, 13] {
+        for leg_z in [-28, 22] {
+            if (x - leg_x).abs() <= 1 && z == leg_z && (-4..=-1).contains(&y) {
                 material = Some(DARK);
             }
-            if z <= -44 && dx <= 2 && (6..=10).contains(&y) {
-                material = Some(if z == -48 { CYAN } else { RED });
+            if (x - leg_x).abs() <= 3 && (z - leg_z).abs() <= 2 && y == -5 {
+                material = Some(HULL);
             }
         }
     }
 
-    // Panoramic forward bridge glazing.
-    if z >= 41
-        && x.abs() <= half_width
-        && (4..=11).contains(&y)
-        && (z == 48 || x.abs() == half_width)
+    // Tapered panoramic bridge glazing and inset pilot consoles in the forward middle deck.
+    if z >= 68
+        && x.abs() <= section_width
+        && (6..=9).contains(&y)
+        && ((z == 80 && x.abs() <= 1) || x.abs() == section_width)
     {
         material = Some(CYAN);
     }
 
-    // Functional rooms and tactical cover across engineering, cargo, crew, and bridge decks.
+    // Playable room dressing and tactical cover, kept off the central circulation route.
     for (min, max, prop) in [
         (
-            IVec3::new(-2, 1, -31),
-            IVec3::new(2, 5, -25),
+            IVec3::new(-2, 1, -52),
+            IVec3::new(2, 5, -44),
             CYAN,
         ),
         (
-            IVec3::new(-12, 1, -30),
-            IVec3::new(-9, 3, -26),
+            IVec3::new(-13, 1, -51),
+            IVec3::new(-9, 4, -45),
             RED,
+        ),
+        (
+            IVec3::new(9, 1, -51),
+            IVec3::new(13, 4, -45),
+            RED,
+        ),
+        (
+            IVec3::new(-15, 1, -31),
+            IVec3::new(-10, 4, -25),
+            METAL,
         ),
         (
             IVec3::new(9, 1, -30),
-            IVec3::new(12, 3, -26),
-            RED,
-        ),
-        (
-            IVec3::new(-14, 1, -13),
-            IVec3::new(-10, 4, -9),
+            IVec3::new(15, 3, -23),
             METAL,
         ),
         (
-            IVec3::new(8, 1, -12),
-            IVec3::new(13, 3, -7),
+            IVec3::new(-15, 1, -18),
+            IVec3::new(-10, 3, -12),
+            HULL,
+        ),
+        (
+            IVec3::new(10, 1, -17),
+            IVec3::new(15, 4, -12),
+            HULL,
+        ),
+        (
+            IVec3::new(-17, 2, -3),
+            IVec3::new(-15, 5, 7),
+            DARK,
+        ),
+        (
+            IVec3::new(-16, 8, -31),
+            IVec3::new(-11, 9, -25),
+            HULL,
+        ),
+        (
+            IVec3::new(-16, 11, -31),
+            IVec3::new(-11, 12, -25),
+            HULL,
+        ),
+        (
+            IVec3::new(-16, 8, -22),
+            IVec3::new(-11, 9, -16),
+            HULL,
+        ),
+        (
+            IVec3::new(-16, 11, -22),
+            IVec3::new(-11, 12, -16),
+            HULL,
+        ),
+        (
+            IVec3::new(9, 8, -29),
+            IVec3::new(15, 9, -22),
             METAL,
         ),
         (
-            IVec3::new(-13, 1, -3),
-            IVec3::new(-9, 3, 2),
-            HULL,
-        ),
-        (
-            IVec3::new(9, 1, -1),
-            IVec3::new(13, 4, 3),
-            HULL,
-        ),
-        (
-            IVec3::new(-17, 2, 10),
-            IVec3::new(-15, 5, 18),
+            IVec3::new(11, 8, -5),
+            IVec3::new(16, 12, -3),
             DARK,
         ),
         (
-            IVec3::new(-15, 8, -12),
-            IVec3::new(-11, 9, -7),
+            IVec3::new(-16, 8, -5),
+            IVec3::new(-12, 11, 5),
+            DARK,
+        ),
+        (
+            IVec3::new(-14, 15, -8),
+            IVec3::new(-10, 17, -2),
             HULL,
         ),
         (
-            IVec3::new(-15, 11, -12),
-            IVec3::new(-11, 12, -7),
+            IVec3::new(10, 15, -8),
+            IVec3::new(14, 17, -2),
             HULL,
         ),
         (
-            IVec3::new(-15, 8, -3),
-            IVec3::new(-11, 9, 2),
-            HULL,
-        ),
-        (
-            IVec3::new(-15, 11, -3),
-            IVec3::new(-11, 12, 2),
-            HULL,
-        ),
-        (
-            IVec3::new(9, 8, -10),
-            IVec3::new(15, 9, -4),
+            IVec3::new(-6, 15, 20),
+            IVec3::new(6, 16, 27),
             METAL,
         ),
         (
-            IVec3::new(10, 8, 10),
-            IVec3::new(15, 12, 12),
+            IVec3::new(-14, 15, 31),
+            IVec3::new(-9, 17, 36),
             DARK,
         ),
         (
-            IVec3::new(-15, 8, 10),
-            IVec3::new(-11, 11, 17),
+            IVec3::new(9, 15, 31),
+            IVec3::new(14, 17, 36),
             DARK,
         ),
         (
-            IVec3::new(-13, 15, -8),
-            IVec3::new(-9, 17, -3),
-            HULL,
-        ),
-        (
-            IVec3::new(9, 15, -8),
-            IVec3::new(13, 17, -3),
-            HULL,
-        ),
-        (
-            IVec3::new(-6, 15, 9),
-            IVec3::new(6, 16, 15),
-            METAL,
-        ),
-        (
-            IVec3::new(-12, 15, 28),
-            IVec3::new(-8, 17, 33),
-            DARK,
-        ),
-        (
-            IVec3::new(8, 15, 28),
-            IVec3::new(12, 17, 33),
-            DARK,
-        ),
-        (
-            IVec3::new(-9, 8, 39),
-            IVec3::new(-4, 10, 43),
+            IVec3::new(-9, 8, 52),
+            IVec3::new(-4, 10, 60),
             CYAN,
         ),
         (
-            IVec3::new(4, 8, 39),
-            IVec3::new(9, 10, 43),
+            IVec3::new(4, 8, 52),
+            IVec3::new(9, 10, 60),
             CYAN,
+        ),
+        (
+            IVec3::new(-2, 8, 64),
+            IVec3::new(2, 9, 69),
+            DARK,
         ),
     ] {
         if voxel_point_in_box(position, min, max) {
@@ -882,8 +973,8 @@ fn combat_corvette_voxel(position: IVec3) -> Option<u8> {
         }
     }
 
-    // Ladder/lift trunks connect decks without blocking the main corridor.
-    for trunk_z in [-20, 20] {
+    // Two ladder/lift trunks provide vertical routes without blocking the main corridor.
+    for trunk_z in [-36, 32] {
         if voxel_point_in_box(
             position,
             IVec3::new(4, 1, trunk_z),
@@ -895,6 +986,29 @@ fn combat_corvette_voxel(position: IVec3) -> Option<u8> {
     }
 
     material
+}
+
+fn corvette_half_width(z: i32) -> i32 {
+    if z >= 20 {
+        20 - (z - 20) * 18 / 60
+    } else if z <= -52 {
+        14 + (z + 80) * 6 / 28
+    } else {
+        20
+    }
+    .clamp(2, 20)
+}
+
+fn corvette_roof_y(z: i32) -> i32 {
+    if z >= 60 {
+        12
+    } else if z >= 42 {
+        16
+    } else if z <= -62 {
+        18
+    } else {
+        22
+    }
 }
 
 fn voxel_point_in_box(position: IVec3, min: IVec3, max: IVec3) -> bool {
@@ -973,7 +1087,7 @@ fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
             3.5,
         ),
         make_voxel_auto_door(
-            IVec3::new(-18, 0, 160),
+            IVec3::new(-24, 0, 165),
             IVec3::Z,
             3,
             5,
@@ -1002,7 +1116,7 @@ fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
             }
         }
     }
-    for bulkhead_z in [116, 132, 156, 174, 186] {
+    for bulkhead_z in [95, 115, 140, 165, 188, 205] {
         for deck_y in [0, 7, 14] {
             doors.push(make_voxel_auto_door(
                 IVec3::new(0, deck_y, bulkhead_z),
@@ -1075,7 +1189,7 @@ fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
         }
     }
     for deck_y in [0, 7, 14] {
-        for z in [120, 150, 184] {
+        for z in [105, 150, 205] {
             for x in [-10, 10] {
                 lights.push((
                     (Vec3::new(x as f32, (deck_y + 5) as f32, z as f32) + Vec3::splat(0.5))
@@ -1177,9 +1291,9 @@ fn voxel_sample_prop_specs() -> Vec<(&'static str, Transform)> {
         }
     }
     for (x, z, yaw) in [
-        (-2.0, 47.0, 0.0),
-        (0.0, 48.0, 0.0),
-        (2.0, 47.0, std::f32::consts::PI),
+        (-1.8, 52.5, 0.0),
+        (0.0, 54.0, 0.0),
+        (1.8, 52.5, std::f32::consts::PI),
     ] {
         add(
             "models/free_sample/Prop_15.gltf",
@@ -2495,8 +2609,8 @@ fn control_voxel_camera(
                 velocity.0 = Vec3::ZERO;
             }
         } else {
-            editor.camera_focus = Vec3::new(0.0, 4.0, 20.0);
-            editor.camera_distance = 80.0;
+            editor.camera_focus = DEFAULT_SCENE_CAMERA_FOCUS;
+            editor.camera_distance = DEFAULT_SCENE_CAMERA_DISTANCE;
             editor.camera_yaw = 0.7;
             editor.camera_pitch = -0.45;
         }
@@ -2774,22 +2888,26 @@ mod tests {
                 None
             );
             assert_eq!(
-                combat_corvette_voxel(IVec3::new(0, walkway_y, 6)),
+                combat_corvette_voxel(IVec3::new(0, walkway_y, 15)),
                 None
             );
         }
 
         for (position, expected_material) in [
-            (IVec3::new(0, 3, -28), 8),
-            (IVec3::new(-12, 2, -11), 3),
-            (IVec3::new(-13, 8, -10), 6),
-            (IVec3::new(11, 8, -8), 3),
+            (IVec3::new(0, 3, -48), 8),
+            (IVec3::new(-12, 2, -28), 3),
+            (IVec3::new(-13, 8, -28), 6),
+            (IVec3::new(11, 8, -25), 3),
             (IVec3::new(10, 15, -5), 6),
-            (IVec3::new(0, 15, 12), 3),
-            (IVec3::new(6, 8, 41), 8),
-            (IVec3::new(15, 8, -48), 8),
-            (IVec3::new(19, 3, 0), 5),
-            (IVec3::new(18, 10, 10), 8),
+            (IVec3::new(0, 15, 23), 3),
+            (IVec3::new(6, 8, 55), 8),
+            (IVec3::new(16, 8, -80), 8),
+            (IVec3::new(20, 3, 5), 9),
+            (IVec3::new(20, 10, 5), 8),
+            (IVec3::new(13, -5, -28), 6),
+            (IVec3::new(0, 24, 0), 7),
+            (IVec3::new(5, 23, 25), 7),
+            (IVec3::new(23, 4, 5), 7),
         ] {
             assert_eq!(
                 combat_corvette_voxel(position),
@@ -2798,9 +2916,16 @@ mod tests {
             );
         }
         assert_eq!(
-            combat_corvette_voxel(IVec3::new(0, 11, 42)),
+            combat_corvette_voxel(IVec3::new(0, 11, 65)),
             None
         );
+        assert_eq!(
+            combat_corvette_voxel(IVec3::new(23, 6, 6)),
+            None
+        );
+        assert_eq!(corvette_half_width(-80), 14);
+        assert_eq!(corvette_half_width(0), 20);
+        assert_eq!(corvette_half_width(80), 2);
     }
 
     #[test]
@@ -2822,11 +2947,11 @@ mod tests {
         assert!(voxel_cells(grid).len() >= 100_000);
         assert_eq!(
             materials,
-            HashSet::from([1, 2, 3, 4, 5, 6, 7, 8])
+            HashSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9])
         );
 
         let doors = voxel_auto_doors();
-        assert_eq!(doors.len(), 50);
+        assert_eq!(doors.len(), 53);
         assert!(doors.iter().take(2).all(|door| door.cells.len() == 88));
         assert_eq!(doors[2].cells.len(), 35);
         assert!(doors[3..35].iter().all(|door| door.cells.len() == 63));

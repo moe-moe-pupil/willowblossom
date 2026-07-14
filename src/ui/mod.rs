@@ -11584,6 +11584,11 @@ pub fn ui_system(
                                 "发光科技板",
                                 egui::Color32::from_rgb(255, 148, 32),
                             ),
+                            (
+                                9,
+                                "深红舰甲",
+                                egui::Color32::from_rgb(112, 18, 24),
+                            ),
                         ] {
                             let (rect, response) =
                                 ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::click());
