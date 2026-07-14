@@ -54,8 +54,8 @@ const EDIT_REPEAT_INTERVAL: f32 = 0.09;
 const TRPG_PHYSICS_SUBSTEPS: u32 = 2;
 const ORBITAL_PLANET_RADIUS: f32 = 240.0;
 const ORBITAL_PLANET_CENTER: Vec3 = Vec3::new(0.0, -360.0, 0.0);
-const ORBITAL_PLANET_VOXEL_RADIUS: i32 = 24;
-const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.5;
+const ORBITAL_PLANET_VOXEL_RADIUS: i32 = 48;
+const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
 const VOXEL_MATERIAL_COUNT: usize = 10;
@@ -140,7 +140,19 @@ struct VoxelSceneSnapshot {
 }
 
 #[derive(Component)]
-struct VoxelOrbitalPlanet;
+struct VoxelOrbitalPlanet {
+    cells: HashMap<IVec3, u8>,
+    removed: HashSet<IVec3>,
+    mesh_entities: Vec<Entity>,
+    mesh_handles: Vec<Handle<Mesh>>,
+    voxel_size: f32,
+    dirty: bool,
+}
+
+struct VoxelPlanetRayHit {
+    occupied: IVec3,
+    distance: f32,
+}
 
 #[derive(Component)]
 struct VoxelKeyLight;
@@ -632,6 +644,7 @@ impl Plugin for TrpgVoxelPlugin {
                 place_creative_light,
                 sync_selected_voxel_light,
                 edit_voxel_grid,
+                rebuild_voxel_orbital_planet,
                 make_selection_physical,
                 apply_voxel_physics_action,
                 process_voxel_scene_history,
@@ -2287,24 +2300,91 @@ fn voxel_orbital_planet_cells() -> Vec<(IVec3, u8)> {
                 if !(inner_squared..=outer_squared).contains(&distance_squared) {
                     continue;
                 }
-                let continental = (x as f32 * 0.19).sin()
-                    + (z as f32 * 0.16).cos()
-                    + ((x + z) as f32 * 0.11).sin()
-                    + (y as f32 * 0.23).cos() * 0.35;
-                let material = if y.abs() >= ORBITAL_PLANET_VOXEL_RADIUS - 3 {
-                    3
-                } else if continental > 0.72 {
-                    1
-                } else if continental > 0.52 {
-                    3
-                } else {
-                    4
-                };
-                cells.push((IVec3::new(x, y, z), material));
+                let cell = IVec3::new(x, y, z);
+                if let Some(material) = procedural_planet_material(cell) {
+                    cells.push((cell, material));
+                }
             }
         }
     }
     cells
+}
+
+fn procedural_planet_material(cell: IVec3) -> Option<u8> {
+    let radius = ORBITAL_PLANET_VOXEL_RADIUS as f32 + 0.5;
+    let distance = cell.as_vec3().length();
+    if distance > radius {
+        return None;
+    }
+    let depth = radius - distance;
+    if depth > 5.0 {
+        return Some(6);
+    }
+    if depth > 1.5 {
+        return Some(2);
+    }
+    let continental = (cell.x as f32 * 0.095).sin()
+        + (cell.z as f32 * 0.08).cos()
+        + ((cell.x + cell.z) as f32 * 0.055).sin()
+        + (cell.y as f32 * 0.115).cos() * 0.35;
+    Some(
+        if cell.y.abs() >= ORBITAL_PLANET_VOXEL_RADIUS - 4 {
+            3
+        } else if continental > 0.72 {
+            1
+        } else if continental > 0.52 {
+            3
+        } else {
+            4
+        },
+    )
+}
+
+fn dig_planet_voxel(planet: &mut VoxelOrbitalPlanet, cell: IVec3) -> bool {
+    if planet.cells.remove(&cell).is_none() {
+        return false;
+    }
+    planet.removed.insert(cell);
+
+    // Keep the planet sparse: only materialize the buried cells next to the
+    // newly exposed cavity. Deleted cells stay in `removed`, so procedural
+    // generation can never fill a tunnel back in behind the player.
+    for x in -1..=1 {
+        for y in -1..=1 {
+            for z in -1..=1 {
+                let neighbor = cell + IVec3::new(x, y, z);
+                if neighbor == cell
+                    || planet.removed.contains(&neighbor)
+                    || planet.cells.contains_key(&neighbor)
+                {
+                    continue;
+                }
+                if let Some(material) = procedural_planet_material(neighbor) {
+                    planet.cells.insert(neighbor, material);
+                }
+            }
+        }
+    }
+    planet.dirty = true;
+    true
+}
+
+fn sorted_planet_cells(planet: &VoxelOrbitalPlanet) -> Vec<(IVec3, u8)> {
+    let mut cells = planet
+        .cells
+        .iter()
+        .map(|(cell, material)| (*cell, *material))
+        .collect::<Vec<_>>();
+    cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
+    cells
+}
+
+fn planet_material_handle(materials: &VoxelMaterials, material_id: u8) -> Handle<StandardMaterial> {
+    if material_id == 4 {
+        materials.planet_ocean.clone()
+    } else {
+        materials.handles[material_id as usize - 1].clone()
+    }
 }
 
 fn spawn_voxel_orbital_planet(
@@ -2314,32 +2394,103 @@ fn spawn_voxel_orbital_planet(
 ) -> Entity {
     let cells = voxel_orbital_planet_cells();
     let (material_meshes, _) = build_voxel_meshes_from_cells(&cells);
-    let voxel_scale =
-        ORBITAL_PLANET_RADIUS / ((ORBITAL_PLANET_VOXEL_RADIUS as f32 + 0.5) * VOXEL_SIZE);
+    let voxel_size = ORBITAL_PLANET_RADIUS / (ORBITAL_PLANET_VOXEL_RADIUS as f32 + 0.5);
+    let voxel_scale = voxel_size / VOXEL_SIZE;
     let mesh_center_offset = Vec3::splat(-0.5 * VOXEL_SIZE * voxel_scale);
-    commands
+    let collider_cells = cells.iter().map(|(cell, _)| *cell).collect::<Vec<_>>();
+    let entity = commands
         .spawn((
-            VoxelOrbitalPlanet,
             RigidBody::Static,
-            Collider::sphere(ORBITAL_PLANET_RADIUS),
+            Collider::voxels(Vec3::splat(voxel_size), &collider_cells),
             Transform::from_translation(ORBITAL_PLANET_CENTER),
         ))
-        .with_children(|parent| {
+        .id();
+    let mut mesh_entities = Vec::new();
+    let mut mesh_handles = Vec::new();
+    commands.entity(entity).with_children(|parent| {
+        for (material_id, mesh) in material_meshes {
+            let mesh_handle = meshes.add(mesh);
+            mesh_handles.push(mesh_handle.clone());
+            mesh_entities.push(
+                parent
+                    .spawn((
+                        Mesh3d(mesh_handle),
+                        MeshMaterial3d(planet_material_handle(
+                            materials,
+                            material_id,
+                        )),
+                        Transform::from_translation(mesh_center_offset)
+                            .with_scale(Vec3::splat(voxel_scale)),
+                    ))
+                    .id(),
+            );
+        }
+    });
+    commands.entity(entity).insert(VoxelOrbitalPlanet {
+        cells: cells.into_iter().collect(),
+        removed: HashSet::new(),
+        mesh_entities,
+        mesh_handles,
+        voxel_size,
+        dirty: false,
+    });
+    entity
+}
+
+fn rebuild_voxel_orbital_planet(
+    mut commands: Commands,
+    mut planets: Query<(
+        Entity,
+        &mut VoxelOrbitalPlanet,
+        &mut Collider,
+    )>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
+) {
+    for (entity, mut planet, mut collider) in &mut planets {
+        if !planet.dirty {
+            continue;
+        }
+        for mesh_entity in planet.mesh_entities.drain(..) {
+            commands.entity(mesh_entity).despawn();
+        }
+        for mesh_handle in planet.mesh_handles.drain(..) {
+            meshes.remove(mesh_handle.id());
+        }
+        let cells = sorted_planet_cells(&planet);
+        let collider_cells = cells.iter().map(|(cell, _)| *cell).collect::<Vec<_>>();
+        *collider = Collider::voxels(
+            Vec3::splat(planet.voxel_size),
+            &collider_cells,
+        );
+        let (material_meshes, _) = build_voxel_meshes_from_cells(&cells);
+        let voxel_scale = planet.voxel_size / VOXEL_SIZE;
+        let mesh_center_offset = Vec3::splat(-0.5 * planet.voxel_size);
+        let mut mesh_entities = Vec::new();
+        let mut mesh_handles = Vec::new();
+        commands.entity(entity).with_children(|parent| {
             for (material_id, mesh) in material_meshes {
-                let material = if material_id == 4 {
-                    materials.planet_ocean.clone()
-                } else {
-                    materials.handles[material_id as usize - 1].clone()
-                };
-                parent.spawn((
-                    Mesh3d(meshes.add(mesh)),
-                    MeshMaterial3d(material),
-                    Transform::from_translation(mesh_center_offset)
-                        .with_scale(Vec3::splat(voxel_scale)),
-                ));
+                let mesh_handle = meshes.add(mesh);
+                mesh_handles.push(mesh_handle.clone());
+                mesh_entities.push(
+                    parent
+                        .spawn((
+                            Mesh3d(mesh_handle),
+                            MeshMaterial3d(planet_material_handle(
+                                &materials,
+                                material_id,
+                            )),
+                            Transform::from_translation(mesh_center_offset)
+                                .with_scale(Vec3::splat(voxel_scale)),
+                        ))
+                        .id(),
+                );
             }
-        })
-        .id()
+        });
+        planet.mesh_entities = mesh_entities;
+        planet.mesh_handles = mesh_handles;
+        planet.dirty = false;
+    }
 }
 
 fn editor_camera_transform(editor: &VoxelEditorState) -> Transform {
@@ -3301,6 +3452,10 @@ fn edit_voxel_grid(
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    mut planets: Query<(
+        &mut VoxelOrbitalPlanet,
+        &GlobalTransform,
+    )>,
     physics_bodies: Query<(
         Entity,
         &VoxelPhysicsBody,
@@ -3592,6 +3747,23 @@ fn edit_voxel_grid(
         return;
     };
     let grid_hit = raycast_grid(&grid, ray);
+    if input_mode == VoxelEditMode::Remove {
+        let grid_distance = grid_hit
+            .as_ref()
+            .filter(|hit| hit.occupied.is_some())
+            .map(|hit| hit.distance);
+        if let Ok((mut planet, planet_transform)) = planets.single_mut() {
+            if let Some(planet_hit) = raycast_voxel_planet(&planet, planet_transform, ray)
+                .filter(|hit| grid_distance.is_none_or(|distance| hit.distance < distance))
+            {
+                if dig_planet_voxel(&mut planet, planet_hit.occupied) {
+                    editor.physics_status =
+                        Some("已挖掘行星体素；新的地下体素已按需生成".to_owned());
+                    return;
+                }
+            }
+        }
+    }
     if input_mode == VoxelEditMode::Remove && just_pressed {
         let door_hit = spatial_query.cast_ray_predicate(
             ray.origin,
@@ -3762,6 +3934,40 @@ fn raycast_grid(grid: &Grid<u8>, ray: Ray3d) -> Option<VoxelRayHit> {
             )),
             distance: plane_distance,
         });
+    }
+    None
+}
+
+fn raycast_voxel_planet(
+    planet: &VoxelOrbitalPlanet,
+    transform: &GlobalTransform,
+    ray: Ray3d,
+) -> Option<VoxelPlanetRayHit> {
+    let inverse = transform.affine().inverse();
+    let local_origin = inverse.transform_point3(ray.origin);
+    let local_direction = inverse
+        .transform_vector3(*ray.direction)
+        .normalize_or_zero();
+    if local_direction == Vec3::ZERO {
+        return None;
+    }
+
+    let step = (planet.voxel_size * 0.2).max(VOXEL_SIZE);
+    let mut distance = 0.0;
+    while distance <= MAX_RAY_DISTANCE {
+        let local_point = local_origin + local_direction * distance;
+        // Planet cells are centered on integer coordinates, unlike the main
+        // grid whose cell coordinate identifies its minimum corner.
+        let cell = (local_point / planet.voxel_size + Vec3::splat(0.5))
+            .floor()
+            .as_ivec3();
+        if planet.cells.contains_key(&cell) {
+            return Some(VoxelPlanetRayHit {
+                occupied: cell,
+                distance,
+            });
+        }
+        distance += step;
     }
     None
 }
@@ -4452,17 +4658,63 @@ mod tests {
         }
 
         let planet_cells = voxel_orbital_planet_cells();
-        assert!((10_000..=30_000).contains(&planet_cells.len()));
+        assert!((40_000..=100_000).contains(&planet_cells.len()));
         assert_eq!(
             planet_cells
                 .iter()
                 .map(|(_, material)| *material)
                 .collect::<HashSet<_>>(),
-            HashSet::from([1, 3, 4])
+            HashSet::from([1, 2, 3, 4])
         );
-        assert!(planet_cells
-            .iter()
-            .all(|(cell, _)| { cell.abs().max_element() <= ORBITAL_PLANET_VOXEL_RADIUS }));
+        assert!(
+            planet_cells
+                .iter()
+                .all(|(cell, _)| { cell.abs().max_element() <= ORBITAL_PLANET_VOXEL_RADIUS })
+        );
+        let voxel_size = ORBITAL_PLANET_RADIUS / (ORBITAL_PLANET_VOXEL_RADIUS as f32 + 0.5);
+        assert!(voxel_size < 5.0);
+    }
+
+    #[test]
+    fn digging_planet_voxels_generates_buried_neighbors_without_refilling_holes() {
+        let surface = IVec3::new(0, ORBITAL_PLANET_VOXEL_RADIUS, 0);
+        let mut planet = VoxelOrbitalPlanet {
+            cells: HashMap::from([(surface, 3)]),
+            removed: HashSet::new(),
+            mesh_entities: Vec::new(),
+            mesh_handles: Vec::new(),
+            voxel_size: 1.0,
+            dirty: false,
+        };
+
+        assert!(dig_planet_voxel(&mut planet, surface));
+        assert!(planet.dirty);
+        assert!(planet.removed.contains(&surface));
+        assert!(!planet.cells.contains_key(&surface));
+        assert!(planet.cells.contains_key(&(surface + IVec3::new(0, -1, 0))));
+
+        let next = surface + IVec3::new(0, -1, 0);
+        assert!(dig_planet_voxel(&mut planet, next));
+        assert!(!planet.cells.contains_key(&surface));
+        assert!(planet.cells.contains_key(&(surface + IVec3::new(0, -2, 0))));
+    }
+
+    #[test]
+    fn planet_raycast_uses_centered_voxel_cells_in_planet_space() {
+        let planet = VoxelOrbitalPlanet {
+            cells: HashMap::from([(IVec3::ZERO, 2)]),
+            removed: HashSet::new(),
+            mesh_entities: Vec::new(),
+            mesh_handles: Vec::new(),
+            voxel_size: 2.0,
+            dirty: false,
+        };
+        let transform = GlobalTransform::from(Transform::from_xyz(0.0, -10.0, 0.0));
+        let ray = Ray3d::new(Vec3::ZERO, Dir3::NEG_Y);
+
+        let hit = raycast_voxel_planet(&planet, &transform, ray).unwrap();
+        assert_eq!(hit.occupied, IVec3::ZERO);
+        assert!((8.0..=10.0).contains(&hit.distance));
     }
 
     #[test]
