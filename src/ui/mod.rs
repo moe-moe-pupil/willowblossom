@@ -12075,7 +12075,12 @@ pub fn ui_system(
                             "WASD 移动 · 空格跳跃 · 双击空格飞行"
                         };
                         ui.small(format!(
-                            "{movement_hint} · 当前工具：{} · 滚轮选择快捷栏 · 左键使用 · Esc 退出",
+                            "{movement_hint} · 当前工具：{} · 左键拆除 · 右键放置/使用 · 滚轮选择快捷栏 · Esc 退出",
+                            voxel_editor.active_tool_label()
+                        ));
+                    } else {
+                        ui.small(format!(
+                            "当前工具：{} · 左键拆除 · 右键放置/使用 · 中键旋转 · Shift+中键平移",
                             voxel_editor.active_tool_label()
                         ));
                     }
@@ -12149,7 +12154,7 @@ pub fn ui_system(
                                         );
                                     });
                                 } else {
-                                    ui.small("先用左键选择场景中的点光、方块灯、聚光灯或物理灯");
+                                    ui.small("先用右键选择场景中的点光、方块灯、聚光灯或物理灯");
                                 }
                             });
                     }
@@ -12200,7 +12205,7 @@ pub fn ui_system(
                                     .range(0.1..=200.0)
                                     .speed(0.25),
                             );
-                            ui.label("左键点击方块或物理体；静态方块会按笔刷大小自动物理化");
+                            ui.label("右键点击方块或物理体；静态方块会按笔刷大小自动物理化");
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
                             }
@@ -12220,7 +12225,7 @@ pub fn ui_system(
                                     .range(0.25..=100.0)
                                     .speed(0.25),
                             );
-                            ui.label("左键点击爆心；每次爆炸最多新建40个物理碎块，超额方块会合并");
+                            ui.label("右键点击爆心；每次爆炸最多新建40个物理碎块，超额方块会合并");
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
                             }

@@ -340,6 +340,7 @@ pub(crate) struct VoxelEditorState {
     camera_pitch: f32,
     camera_drag_started_in_viewport: bool,
     left_started_over_ui: bool,
+    right_started_over_ui: bool,
     selection_anchor: Option<IVec3>,
     selection_end: Option<IVec3>,
     physics_status: Option<String>,
@@ -401,6 +402,7 @@ impl Default for VoxelEditorState {
             camera_pitch: -0.45,
             camera_drag_started_in_viewport: false,
             left_started_over_ui: false,
+            right_started_over_ui: false,
             selection_anchor: None,
             selection_end: None,
             physics_status: None,
@@ -423,11 +425,11 @@ impl VoxelEditorState {
 
     pub(crate) fn physics_selection_hint(&self) -> &str {
         if self.selection_anchor.is_none() {
-            "依次点击两个方块，框选物理区域"
+            "依次右键点击两个方块，框选物理区域"
         } else if self.selection_end.is_none() {
-            "再点击一个方块，确定选区另一角"
+            "再右键点击一个方块，确定选区另一角"
         } else {
-            "选区已确定；可重新点击起点或生成物理体"
+            "选区已确定；可重新右键点击起点或生成物理体"
         }
     }
 
@@ -3041,10 +3043,10 @@ fn place_creative_light(
         return;
     };
     if editor.creative_inventory_open
-        || !mouse.just_pressed(MouseButton::Left)
+        || !mouse.just_pressed(MouseButton::Right)
         || voxel_world_pointer_blocked(
             egui_input.wants_any_pointer_input(),
-            editor.left_started_over_ui,
+            editor.right_started_over_ui,
         )
     {
         return;
@@ -3214,7 +3216,19 @@ fn edit_voxel_grid(
     if mouse.just_pressed(MouseButton::Left) {
         editor.left_started_over_ui = egui_owns_pointer;
     }
+    if mouse.just_pressed(MouseButton::Right) {
+        editor.right_started_over_ui = egui_owns_pointer;
+    }
     if mouse.just_released(MouseButton::Left) {
+        editor.left_started_over_ui = false;
+    }
+    if mouse.just_released(MouseButton::Right) {
+        editor.right_started_over_ui = false;
+    }
+    if (mouse.just_released(MouseButton::Left) || mouse.just_released(MouseButton::Right))
+        && !mouse.pressed(MouseButton::Left)
+        && !mouse.pressed(MouseButton::Right)
+    {
         editor.stroke_positions.clear();
         editor.edit_hold_seconds = 0.0;
         editor.edit_repeat_seconds = 0.0;
@@ -3223,25 +3237,28 @@ fn edit_voxel_grid(
             editor.undo.push(stroke);
             editor.redo.clear();
         }
-        editor.left_started_over_ui = false;
     }
     if editor.creative_inventory_open {
         return;
     }
-    if editor.equipped_item.is_none() {
+    let left_pressed = mouse.pressed(MouseButton::Left);
+    let right_pressed = mouse.pressed(MouseButton::Right);
+    if editor.equipped_item.is_none() && !left_pressed {
         return;
     }
-    if editor.light_tool.is_some() {
+    if editor.light_tool.is_some() && !left_pressed {
         return;
     }
-    if voxel_world_pointer_blocked(
-        egui_owns_pointer,
-        editor.left_started_over_ui,
-    ) {
+    let started_over_ui = if left_pressed {
+        editor.left_started_over_ui
+    } else {
+        editor.right_started_over_ui
+    };
+    if voxel_world_pointer_blocked(egui_owns_pointer, started_over_ui) {
         return;
     }
-    if let Some(action) = force_tool_action(editor.mode) {
-        if !mouse.just_pressed(MouseButton::Left) {
+    if let Some(action) = force_tool_action(editor.mode).filter(|_| !left_pressed) {
+        if !mouse.just_pressed(MouseButton::Right) {
             return;
         }
         let (Ok(window), Ok((camera, camera_transform)), Ok(mut grid)) = (
@@ -3417,8 +3434,8 @@ fn edit_voxel_grid(
         });
         return;
     }
-    if editor.mode == VoxelEditMode::Physics {
-        if !mouse.just_pressed(MouseButton::Left) {
+    if editor.mode == VoxelEditMode::Physics && !left_pressed {
+        if !mouse.just_pressed(MouseButton::Right) {
             return;
         }
         let (Ok(window), Ok((camera, camera_transform)), Ok(grid)) = (
@@ -3441,10 +3458,14 @@ fn edit_voxel_grid(
         }
         return;
     }
-    if !mouse.pressed(MouseButton::Left) {
+    let Some(input_mode) = voxel_edit_input_mode(editor.mode, left_pressed, right_pressed) else {
         return;
-    }
-    let just_pressed = mouse.just_pressed(MouseButton::Left);
+    };
+    let just_pressed = if left_pressed {
+        mouse.just_pressed(MouseButton::Left)
+    } else {
+        mouse.just_pressed(MouseButton::Right)
+    };
     if !edit_repeat_due(
         just_pressed,
         time.delta_secs(),
@@ -3468,7 +3489,7 @@ fn edit_voxel_grid(
         return;
     };
     let grid_hit = raycast_grid(&grid, ray);
-    if editor.mode == VoxelEditMode::Remove && just_pressed {
+    if input_mode == VoxelEditMode::Remove && just_pressed {
         let door_hit = spatial_query.cast_ray_predicate(
             ray.origin,
             ray.direction,
@@ -3503,7 +3524,7 @@ fn edit_voxel_grid(
     let Some(hit) = grid_hit else {
         return;
     };
-    let center = match editor.mode {
+    let center = match input_mode {
         VoxelEditMode::Add => hit.add,
         VoxelEditMode::Remove | VoxelEditMode::Paint => hit.occupied,
         VoxelEditMode::Physics
@@ -3525,7 +3546,7 @@ fn edit_voxel_grid(
                     continue;
                 }
                 let before = grid.get(position).copied().unwrap_or(0);
-                let Some(after) = edited_voxel(editor.mode, before, editor.material) else {
+                let Some(after) = edited_voxel(input_mode, before, editor.material) else {
                     continue;
                 };
                 if before != after {
@@ -3544,8 +3565,22 @@ fn edit_voxel_grid(
     }
 }
 
-fn voxel_world_pointer_blocked(egui_owns_pointer: bool, left_started_over_ui: bool) -> bool {
-    egui_owns_pointer || left_started_over_ui
+fn voxel_world_pointer_blocked(egui_owns_pointer: bool, interaction_started_over_ui: bool) -> bool {
+    egui_owns_pointer || interaction_started_over_ui
+}
+
+fn voxel_edit_input_mode(
+    equipped_mode: VoxelEditMode,
+    left_pressed: bool,
+    right_pressed: bool,
+) -> Option<VoxelEditMode> {
+    if left_pressed {
+        Some(VoxelEditMode::Remove)
+    } else if right_pressed {
+        Some(equipped_mode)
+    } else {
+        None
+    }
 }
 
 fn edited_voxel(mode: VoxelEditMode, before: u8, material: u8) -> Option<u8> {
@@ -3858,26 +3893,27 @@ fn control_voxel_camera(
     let cursor_in_viewport = window
         .cursor_position()
         .is_some_and(|cursor| editor.contains_cursor(cursor));
-    if mouse.just_pressed(MouseButton::Right) || mouse.just_pressed(MouseButton::Middle) {
+    if mouse.just_pressed(MouseButton::Middle) {
         editor.camera_drag_started_in_viewport =
             cursor_in_viewport && !egui_input.wants_pointer_input();
     }
-    if !mouse.pressed(MouseButton::Right) && !mouse.pressed(MouseButton::Middle) {
+    if !mouse.pressed(MouseButton::Middle) {
         editor.camera_drag_started_in_viewport = false;
     }
 
-    if editor.camera_drag_started_in_viewport && mouse.pressed(MouseButton::Right) {
-        editor.camera_yaw -= delta.x * 0.006;
-        editor.camera_pitch = (editor.camera_pitch - delta.y * 0.006).clamp(-1.45, 1.2);
-    }
     if editor.camera_drag_started_in_viewport && mouse.pressed(MouseButton::Middle) {
-        let rotation = Quat::from_euler(
-            EulerRot::YXZ,
-            editor.camera_yaw,
-            editor.camera_pitch,
-            0.0,
-        );
-        editor.camera_focus += rotation * Vec3::new(delta.x, -delta.y, 0.0) * 0.006;
+        if keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight) {
+            let rotation = Quat::from_euler(
+                EulerRot::YXZ,
+                editor.camera_yaw,
+                editor.camera_pitch,
+                0.0,
+            );
+            editor.camera_focus += rotation * Vec3::new(delta.x, -delta.y, 0.0) * 0.006;
+        } else {
+            editor.camera_yaw -= delta.x * 0.006;
+            editor.camera_pitch = (editor.camera_pitch - delta.y * 0.006).clamp(-1.45, 1.2);
+        }
     }
     if cursor_in_viewport && !egui_input.wants_pointer_input() {
         let scroll = wheel.read().map(|event| event.y).sum::<f32>();
@@ -3912,7 +3948,7 @@ fn draw_voxel_target(
     let (hit, explosion_origin) = if editor.creative_inventory_open
         || voxel_world_pointer_blocked(
             egui_input.wants_any_pointer_input(),
-            editor.left_started_over_ui,
+            editor.left_started_over_ui || editor.right_started_over_ui,
         ) {
         (None, None)
     } else {
@@ -4884,6 +4920,26 @@ mod tests {
             0.05,
             &mut editor
         ));
+    }
+
+    #[test]
+    fn minecraft_mouse_buttons_remove_with_left_and_use_equipped_mode_with_right() {
+        assert_eq!(
+            voxel_edit_input_mode(VoxelEditMode::Add, true, false),
+            Some(VoxelEditMode::Remove)
+        );
+        assert_eq!(
+            voxel_edit_input_mode(VoxelEditMode::Paint, false, true),
+            Some(VoxelEditMode::Paint)
+        );
+        assert_eq!(
+            voxel_edit_input_mode(VoxelEditMode::Add, true, true),
+            Some(VoxelEditMode::Remove)
+        );
+        assert_eq!(
+            voxel_edit_input_mode(VoxelEditMode::Add, false, false),
+            None
+        );
     }
 
     #[test]
