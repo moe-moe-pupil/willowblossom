@@ -60,6 +60,7 @@ use serde::{
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::voxel::{
+    VoxelCreativeItem,
     VoxelEditMode,
     VoxelEditorState,
     VoxelLightTool,
@@ -188,6 +189,85 @@ fn voxel_material_slot(
     let clicked = response.clicked();
     response.on_hover_text(format!("{name} · 创造模式无限使用"));
     clicked
+}
+
+fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::Color32) {
+    match item {
+        VoxelCreativeItem::Material(material) => voxel_material_choices()
+            .into_iter()
+            .find(|(candidate, ..)| *candidate == material)
+            .map(|(_, name, color)| (name, color))
+            .unwrap_or(("未知方块", egui::Color32::DARK_GRAY)),
+        VoxelCreativeItem::Light(tool) => match tool {
+            VoxelLightTool::Point => (
+                "点光源",
+                egui::Color32::from_rgb(255, 205, 112),
+            ),
+            VoxelLightTool::DarkPoint => (
+                "暗色点光",
+                egui::Color32::from_rgb(74, 31, 112),
+            ),
+            VoxelLightTool::Cube => (
+                "方块灯",
+                egui::Color32::from_rgb(62, 218, 255),
+            ),
+            VoxelLightTool::Spot => (
+                "聚光灯",
+                egui::Color32::from_rgb(255, 241, 192),
+            ),
+            VoxelLightTool::Physics => (
+                "物理灯",
+                egui::Color32::from_rgb(72, 147, 255),
+            ),
+            VoxelLightTool::Remove => (
+                "移除灯光",
+                egui::Color32::from_rgb(150, 42, 42),
+            ),
+        },
+    }
+}
+
+fn voxel_creative_item_slot(
+    ui: &mut Ui,
+    item: Option<VoxelCreativeItem>,
+    selected: bool,
+    size: f32,
+    shortcut: Option<&str>,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::click());
+    let (name, color) = item.map(voxel_creative_item_visual).unwrap_or((
+        "空快捷栏格",
+        egui::Color32::from_gray(35),
+    ));
+    ui.painter().rect_filled(rect, 3, color);
+    ui.painter().rect_stroke(
+        rect,
+        3,
+        Stroke::new(
+            if selected { 3.0 } else { 1.0 },
+            if selected { egui::Color32::WHITE } else { egui::Color32::from_gray(90) },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    if let Some(shortcut) = shortcut {
+        ui.painter().text(
+            rect.left_top() + egui::vec2(3.0, 2.0),
+            egui::Align2::LEFT_TOP,
+            shortcut,
+            egui::FontId::proportional(10.0),
+            egui::Color32::WHITE,
+        );
+    }
+    if let Some(VoxelCreativeItem::Light(_)) = item {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "✦",
+            egui::FontId::proportional(size * 0.45),
+            egui::Color32::WHITE,
+        );
+    }
+    response.on_hover_text(name)
 }
 const MOONBERRY_SKILL_TYPES: &[&str] = &[
     "法术",
@@ -11823,26 +11903,24 @@ pub fn ui_system(
                         .inner_margin(4)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                for (material, name, color) in voxel_material_choices() {
-                                    let shortcut = if material == 10 {
+                                for slot in 0..voxel_editor.creative_hotbar.len() {
+                                    let shortcut = if slot == 9 {
                                         "0".to_owned()
                                     } else {
-                                        material.to_string()
+                                        (slot + 1).to_string()
                                     };
-                                    if voxel_material_slot(
+                                    let response = voxel_creative_item_slot(
                                         ui,
-                                        material,
-                                        name,
-                                        color,
-                                        if voxel_editor.light_tool.is_none() {
-                                            voxel_editor.material
-                                        } else {
-                                            0
-                                        },
+                                        voxel_editor.creative_hotbar[slot],
+                                        voxel_editor.selected_hotbar_slot == slot,
                                         38.0,
                                         Some(&shortcut),
-                                    ) {
-                                        voxel_editor.select_material(material);
+                                    );
+                                    if response.clicked() {
+                                        voxel_editor.select_hotbar_slot(slot);
+                                    }
+                                    if response.secondary_clicked() {
+                                        voxel_editor.delete_hotbar_slot(slot);
                                     }
                                 }
                             });
@@ -11850,10 +11928,8 @@ pub fn ui_system(
                 });
 
             if voxel_editor.creative_inventory_open {
-                let current_material = voxel_editor.material;
-                let current_light_tool = voxel_editor.light_tool;
-                let mut selected_material = None;
-                let mut selected_light_tool = None;
+                let mut picked_item = None;
+                let mut delete_selected = false;
                 let mut window_open = true;
                 egui::Window::new("创造模式物品栏")
                     .id(egui::Id::new("voxel_creative_inventory"))
@@ -11862,30 +11938,43 @@ pub fn ui_system(
                     .resizable(false)
                     .open(&mut window_open)
                     .show(ctx, |ui| {
-                        ui.label("所有材料无限使用 · 点击选择 · 无堆叠数量");
+                        ui.label("浏览全部物品 · 点击取得到当前快捷栏格 · 创造模式无限数量");
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "当前快捷栏：{}",
+                                if voxel_editor.selected_hotbar_slot == 9 {
+                                    "0".to_owned()
+                                } else {
+                                    (voxel_editor.selected_hotbar_slot + 1).to_string()
+                                }
+                            ));
+                            if ui.button("删除当前格物品").clicked() {
+                                delete_selected = true;
+                            }
+                        });
                         ui.add_space(6.0);
+                        ui.strong("建筑方块");
                         egui::Grid::new("voxel_creative_inventory_grid")
                             .num_columns(5)
                             .spacing(egui::vec2(10.0, 10.0))
                             .show(ui, |ui| {
-                                for (index, (material, name, color)) in
+                                for (index, (material, name, _color)) in
                                     voxel_material_choices().into_iter().enumerate()
                                 {
                                     ui.vertical_centered(|ui| {
-                                        if voxel_material_slot(
+                                        let item = VoxelCreativeItem::Material(material);
+                                        if voxel_creative_item_slot(
                                             ui,
-                                            material,
-                                            name,
-                                            color,
-                                            if current_light_tool.is_none() {
-                                                current_material
-                                            } else {
-                                                0
-                                            },
+                                            Some(item),
+                                            voxel_editor.creative_hotbar
+                                                [voxel_editor.selected_hotbar_slot]
+                                                == Some(item),
                                             56.0,
                                             None,
-                                        ) {
-                                            selected_material = Some(material);
+                                        )
+                                        .clicked()
+                                        {
+                                            picked_item = Some(item);
                                         }
                                         ui.small(name);
                                     });
@@ -11895,28 +11984,43 @@ pub fn ui_system(
                                 }
                             });
                         ui.separator();
-                        ui.label("灯光工具");
-                        ui.horizontal_wrapped(|ui| {
-                            for tool in VoxelLightTool::ALL {
-                                if ui
-                                    .selectable_label(
-                                        current_light_tool == Some(tool),
-                                        tool.label(),
-                                    )
-                                    .on_hover_text(match tool {
-                                        VoxelLightTool::Point => "放置向四周发光的点光源",
-                                        VoxelLightTool::Cube => {
-                                            "放置发光科技板体素，并从方块中心照亮四周"
-                                        },
-                                        VoxelLightTool::Spot => "沿墙面朝外放置定向聚光灯",
-                                        VoxelLightTool::Remove => "瞄准已放置的灯光并点击移除",
-                                    })
-                                    .clicked()
-                                {
-                                    selected_light_tool = Some(tool);
+                        ui.strong("灯光与工具");
+                        egui::Grid::new("voxel_creative_light_inventory_grid")
+                            .num_columns(3)
+                            .spacing(egui::vec2(10.0, 10.0))
+                            .show(ui, |ui| {
+                                for (index, tool) in VoxelLightTool::ALL.into_iter().enumerate() {
+                                    let item = VoxelCreativeItem::Light(tool);
+                                    let (name, _) = voxel_creative_item_visual(item);
+                                    ui.vertical_centered(|ui| {
+                                        if voxel_creative_item_slot(
+                                            ui,
+                                            Some(item),
+                                            voxel_editor.creative_hotbar
+                                                [voxel_editor.selected_hotbar_slot]
+                                                == Some(item),
+                                            56.0,
+                                            None,
+                                        )
+                                        .on_hover_text(match tool {
+                                            VoxelLightTool::Point => "暖色全向点光源",
+                                            VoxelLightTool::DarkPoint => "低亮度暗紫色点光源",
+                                            VoxelLightTool::Cube => "发光体素方块灯",
+                                            VoxelLightTool::Spot => "沿放置表面朝外的聚光灯",
+                                            VoxelLightTool::Physics => "可掉落、碰撞和移动的实体灯",
+                                            VoxelLightTool::Remove => "瞄准已放置灯光并移除",
+                                        })
+                                        .clicked()
+                                        {
+                                            picked_item = Some(item);
+                                        }
+                                        ui.small(name);
+                                    });
+                                    if (index + 1) % 3 == 0 {
+                                        ui.end_row();
+                                    }
                                 }
-                            }
-                        });
+                            });
                         ui.horizontal_wrapped(|ui| {
                             ui.label("新灯颜色");
                             ui.color_edit_button_rgb(&mut voxel_editor.placed_light_color);
@@ -11937,13 +12041,14 @@ pub fn ui_system(
                             ui.small(status);
                         }
                         ui.add_space(4.0);
-                        ui.small("左键放置或移除灯光 · 1–9、0 返回材料快捷栏 · E 或 Esc 关闭");
+                        ui.small("先选快捷栏格，再从目录取得物品 · 右键快捷栏也可删除 · E 或 Esc 关闭");
                     });
-                if let Some(material) = selected_material {
-                    voxel_editor.select_material(material);
+                if delete_selected {
+                    let slot = voxel_editor.selected_hotbar_slot;
+                    voxel_editor.delete_hotbar_slot(slot);
                 }
-                if let Some(tool) = selected_light_tool {
-                    voxel_editor.light_tool = Some(tool);
+                if let Some(item) = picked_item {
+                    voxel_editor.put_in_selected_hotbar(item);
                 }
                 if !window_open {
                     voxel_editor.creative_inventory_open = false;

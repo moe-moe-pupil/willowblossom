@@ -135,22 +135,50 @@ struct VoxelFillLight;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VoxelLightTool {
     Point,
+    DarkPoint,
     Cube,
     Spot,
+    Physics,
     Remove,
 }
 
 impl VoxelLightTool {
-    pub(crate) const ALL: [Self; 4] = [Self::Point, Self::Cube, Self::Spot, Self::Remove];
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Point,
+        Self::DarkPoint,
+        Self::Cube,
+        Self::Spot,
+        Self::Physics,
+        Self::Remove,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Point => "点光源",
+            Self::DarkPoint => "暗色点光",
             Self::Cube => "方块灯",
             Self::Spot => "聚光灯",
+            Self::Physics => "物理灯",
             Self::Remove => "移除灯光",
         }
     }
+
+    fn preset(self) -> Option<([f32; 3], f32, f32)> {
+        match self {
+            Self::Point => Some(([1.0, 0.78, 0.48], 1_800.0, 8.0)),
+            Self::DarkPoint => Some(([0.18, 0.08, 0.32], 420.0, 4.0)),
+            Self::Cube => Some(([0.2, 0.82, 1.0], 2_200.0, 8.0)),
+            Self::Spot => Some(([1.0, 0.9, 0.72], 2_500.0, 10.0)),
+            Self::Physics => Some(([0.28, 0.72, 1.0], 1_600.0, 7.0)),
+            Self::Remove => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VoxelCreativeItem {
+    Material(u8),
+    Light(VoxelLightTool),
 }
 
 #[derive(Component, Clone)]
@@ -279,6 +307,8 @@ pub(crate) struct VoxelEditorState {
     pub first_person_enabled: bool,
     pub first_person_flying: bool,
     pub creative_inventory_open: bool,
+    pub creative_hotbar: [Option<VoxelCreativeItem>; 10],
+    pub selected_hotbar_slot: usize,
     pub light_tool: Option<VoxelLightTool>,
     pub placed_light_color: [f32; 3],
     pub placed_light_intensity: f32,
@@ -332,6 +362,12 @@ impl Default for VoxelEditorState {
             first_person_enabled: false,
             first_person_flying: false,
             creative_inventory_open: false,
+            creative_hotbar: std::array::from_fn(|index| {
+                Some(VoxelCreativeItem::Material(
+                    index as u8 + 1,
+                ))
+            }),
+            selected_hotbar_slot: 0,
             light_tool: None,
             placed_light_color: [1.0, 0.78, 0.48],
             placed_light_intensity: 1_800.0,
@@ -394,6 +430,44 @@ impl VoxelEditorState {
     pub(crate) fn select_material(&mut self, material: u8) {
         self.material = material;
         self.light_tool = None;
+    }
+
+    pub(crate) fn equip_creative_item(&mut self, item: VoxelCreativeItem) {
+        match item {
+            VoxelCreativeItem::Material(material) => self.select_material(material),
+            VoxelCreativeItem::Light(tool) => {
+                self.light_tool = Some(tool);
+                if let Some((color, intensity, range)) = tool.preset() {
+                    self.placed_light_color = color;
+                    self.placed_light_intensity = intensity;
+                    self.placed_light_range = range;
+                }
+            },
+        }
+    }
+
+    pub(crate) fn select_hotbar_slot(&mut self, slot: usize) {
+        if slot >= self.creative_hotbar.len() {
+            return;
+        }
+        self.selected_hotbar_slot = slot;
+        if let Some(item) = self.creative_hotbar[slot] {
+            self.equip_creative_item(item);
+        }
+    }
+
+    pub(crate) fn put_in_selected_hotbar(&mut self, item: VoxelCreativeItem) {
+        self.creative_hotbar[self.selected_hotbar_slot] = Some(item);
+        self.equip_creative_item(item);
+    }
+
+    pub(crate) fn delete_hotbar_slot(&mut self, slot: usize) {
+        if slot < self.creative_hotbar.len() {
+            self.creative_hotbar[slot] = None;
+            if slot == self.selected_hotbar_slot {
+                self.light_tool = None;
+            }
+        }
     }
 
     pub(crate) fn active_tool_label(&self) -> &'static str {
@@ -519,20 +593,20 @@ fn voxel_editor_shortcuts(
     if keyboard.just_pressed(KeyCode::KeyE) {
         editor.creative_inventory_open = !editor.creative_inventory_open;
     }
-    for (key, material) in [
-        (KeyCode::Digit1, 1),
-        (KeyCode::Digit2, 2),
-        (KeyCode::Digit3, 3),
-        (KeyCode::Digit4, 4),
-        (KeyCode::Digit5, 5),
-        (KeyCode::Digit6, 6),
-        (KeyCode::Digit7, 7),
-        (KeyCode::Digit8, 8),
-        (KeyCode::Digit9, 9),
-        (KeyCode::Digit0, 10),
+    for (key, slot) in [
+        (KeyCode::Digit1, 0),
+        (KeyCode::Digit2, 1),
+        (KeyCode::Digit3, 2),
+        (KeyCode::Digit4, 3),
+        (KeyCode::Digit5, 4),
+        (KeyCode::Digit6, 5),
+        (KeyCode::Digit7, 6),
+        (KeyCode::Digit8, 7),
+        (KeyCode::Digit9, 8),
+        (KeyCode::Digit0, 9),
     ] {
         if keyboard.just_pressed(key) {
-            editor.select_material(material);
+            editor.select_hotbar_slot(slot);
         }
     }
     if !keyboard.just_pressed(KeyCode::KeyZ) {
@@ -1515,6 +1589,17 @@ fn voxel_door_transform_and_size(cells: &[IVec3]) -> (Vec3, Vec3) {
     (translation, size)
 }
 
+fn voxel_auto_door_panel_size(panel: &VoxelAutoDoor) -> Vec3 {
+    let (_, mut size) = voxel_door_transform_and_size(&panel.cells);
+    let depth = VOXEL_SIZE * 0.45;
+    if panel.width_axis == IVec3::X {
+        size.z = depth;
+    } else {
+        size.x = depth;
+    }
+    size
+}
+
 fn setup_voxel_auto_doors(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -1522,7 +1607,7 @@ fn setup_voxel_auto_doors(
 ) {
     for door in voxel_auto_doors() {
         for panel in voxel_auto_door_panels(&door) {
-            let (_, size) = voxel_door_transform_and_size(&panel.cells);
+            let size = voxel_auto_door_panel_size(&panel);
             let translation = panel.closed_translation;
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
@@ -2461,7 +2546,12 @@ fn process_voxel_scene_history(
         );
     }
     for light in &snapshot.placed_lights {
-        spawn_voxel_placed_light(&mut commands, light.clone());
+        spawn_voxel_placed_light(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            light.clone(),
+        );
     }
 
     editor.undo.clear();
@@ -2596,7 +2686,12 @@ fn apply_stroke(grid: &mut Mut<Grid<u8>>, stroke: &[VoxelChange], forward: bool)
     }
 }
 
-fn spawn_voxel_placed_light(commands: &mut Commands, light: VoxelPlacedLight) -> Entity {
+fn spawn_voxel_placed_light(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &VoxelMaterials,
+    light: VoxelPlacedLight,
+) -> Entity {
     let position = (light.cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
     let color = Color::srgb(
         light.color[0],
@@ -2604,7 +2699,7 @@ fn spawn_voxel_placed_light(commands: &mut Commands, light: VoxelPlacedLight) ->
         light.color[2],
     );
     match light.kind {
-        VoxelLightTool::Point | VoxelLightTool::Cube => commands
+        VoxelLightTool::Point | VoxelLightTool::DarkPoint | VoxelLightTool::Cube => commands
             .spawn((
                 PointLight {
                     color,
@@ -2640,6 +2735,35 @@ fn spawn_voxel_placed_light(commands: &mut Commands, light: VoxelPlacedLight) ->
                 ))
                 .id()
         },
+        VoxelLightTool::Physics => commands
+            .spawn((
+                PointLight {
+                    color,
+                    intensity: light.intensity.max(0.0),
+                    range: light.range.max(VOXEL_SIZE),
+                    radius: VOXEL_SIZE * 0.18,
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                Mesh3d(
+                    meshes.add(Cuboid::from_size(Vec3::splat(
+                        VOXEL_SIZE * 0.8,
+                    ))),
+                ),
+                MeshMaterial3d(materials.handles[7].clone()),
+                Transform::from_translation(position),
+                RigidBody::Dynamic,
+                Collider::cuboid(
+                    VOXEL_SIZE * 0.8,
+                    VOXEL_SIZE * 0.8,
+                    VOXEL_SIZE * 0.8,
+                ),
+                ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
+                LinearDamping(0.2),
+                AngularDamping(0.35),
+                light,
+            ))
+            .id(),
         VoxelLightTool::Remove => Entity::PLACEHOLDER,
     }
 }
@@ -2655,6 +2779,8 @@ fn place_creative_light(
         &GlobalTransform,
         &VoxelPlacedLight,
     )>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
     mut editor: ResMut<VoxelEditorState>,
     egui_input: Res<EguiWantsInput>,
 ) {
@@ -2739,14 +2865,19 @@ fn place_creative_light(
             grid.set(cell, 8);
         }
     }
-    spawn_voxel_placed_light(&mut commands, VoxelPlacedLight {
-        kind: tool,
-        cell,
-        color: editor.placed_light_color,
-        intensity: editor.placed_light_intensity,
-        range: editor.placed_light_range,
-        direction,
-    });
+    spawn_voxel_placed_light(
+        &mut commands,
+        &mut meshes,
+        &materials,
+        VoxelPlacedLight {
+            kind: tool,
+            cell,
+            color: editor.placed_light_color,
+            intensity: editor.placed_light_intensity,
+            range: editor.placed_light_range,
+            direction,
+        },
+    );
     editor.physics_status = Some(format!("已放置{}", tool.label()));
 }
 
@@ -2764,6 +2895,7 @@ fn edit_voxel_grid(
         &LinearVelocity,
         &AngularVelocity,
     )>,
+    auto_doors: Query<(Entity, &VoxelAutoDoor)>,
     spatial_query: SpatialQuery,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
@@ -3024,7 +3156,40 @@ fn edit_voxel_grid(
     ) else {
         return;
     };
-    let Some(hit) = raycast_grid(&grid, ray) else {
+    let grid_hit = raycast_grid(&grid, ray);
+    if editor.mode == VoxelEditMode::Remove && just_pressed {
+        let door_hit = spatial_query.cast_ray_predicate(
+            ray.origin,
+            ray.direction,
+            MAX_RAY_DISTANCE,
+            true,
+            &SpatialQueryFilter::default(),
+            &|entity| auto_doors.contains(entity),
+        );
+        let grid_distance = grid_hit
+            .as_ref()
+            .filter(|hit| hit.occupied.is_some())
+            .map(|hit| hit.distance);
+        if let Some(hit) = door_hit.filter(|hit| {
+            grid_distance.is_none_or(|distance| hit.distance <= distance + VOXEL_SIZE)
+        }) {
+            if let Ok((_, clicked_door)) = auto_doors.get(hit.entity) {
+                let trigger_center = clicked_door.trigger_center;
+                let mut removed = 0;
+                for (entity, door) in &auto_doors {
+                    if door.trigger_center == trigger_center {
+                        commands.entity(entity).despawn();
+                        removed += 1;
+                    }
+                }
+                editor.physics_status = Some(format!(
+                    "已拆除自动门（{removed} 扇门板）"
+                ));
+                return;
+            }
+        }
+    }
+    let Some(hit) = grid_hit else {
         return;
     };
     let center = match editor.mode {
@@ -3160,7 +3325,6 @@ fn control_first_person_player(
     mut players: Query<
         (
             Entity,
-            &mut Transform,
             &ShapeHits,
             &mut LinearVelocity,
             &mut ConstantLinearAcceleration,
@@ -3169,15 +3333,10 @@ fn control_first_person_player(
         With<VoxelFirstPersonPlayer>,
     >,
 ) {
-    let Ok((entity, mut transform, ground_hits, mut velocity, mut acceleration, is_sensor)) =
-        players.single_mut()
+    let Ok((entity, ground_hits, mut velocity, mut acceleration, is_sensor)) = players.single_mut()
     else {
         return;
     };
-    if transform.translation.y < -10.0 {
-        transform.translation = FIRST_PERSON_START;
-        velocity.0 = Vec3::ZERO;
-    }
     if !editor.first_person_enabled {
         editor.first_person_flying = false;
         editor.first_person_space_tap_elapsed = f32::INFINITY;
@@ -3896,6 +4055,11 @@ mod tests {
             assert!(panels.iter().all(|panel| {
                 (panel.open_translation.y - panel.closed_translation.y).abs() < f32::EPSILON
             }));
+            for panel in &panels {
+                let size = voxel_auto_door_panel_size(panel);
+                let depth = if panel.width_axis == IVec3::X { size.z } else { size.x };
+                assert!((depth - VOXEL_SIZE * 0.45).abs() < f32::EPSILON);
+            }
             let left_delta = panels[0].open_translation - panels[0].closed_translation;
             let right_delta = panels[1].open_translation - panels[1].closed_translation;
             assert!(left_delta.dot(door.width_axis.as_vec3()) < 0.0);
@@ -4508,5 +4672,32 @@ mod tests {
             app.world().resource::<VoxelEditorState>().light_tool,
             None
         );
+    }
+
+    #[test]
+    fn creative_catalog_items_can_replace_and_delete_hotbar_slots() {
+        let mut editor = VoxelEditorState::default();
+        editor.select_hotbar_slot(3);
+        editor.put_in_selected_hotbar(VoxelCreativeItem::Light(
+            VoxelLightTool::DarkPoint,
+        ));
+        assert_eq!(
+            editor.creative_hotbar[3],
+            Some(VoxelCreativeItem::Light(
+                VoxelLightTool::DarkPoint
+            ))
+        );
+        assert_eq!(
+            editor.light_tool,
+            Some(VoxelLightTool::DarkPoint)
+        );
+        assert_eq!(editor.placed_light_color, [
+            0.18, 0.08, 0.32
+        ]);
+        assert_eq!(editor.placed_light_intensity, 420.0);
+
+        editor.delete_hotbar_slot(3);
+        assert_eq!(editor.creative_hotbar[3], None);
+        assert_eq!(editor.light_tool, None);
     }
 }
