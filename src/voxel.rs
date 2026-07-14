@@ -455,8 +455,9 @@ fn setup_voxel_materials(
                 material.perceptual_roughness = 0.55;
             },
             7 => {
+                material.base_color = Color::srgb(0.48, 0.92, 1.0);
                 material.emissive_texture = Some(hifi_texture.clone());
-                material.emissive = LinearRgba::rgb(3.5, 1.1, 0.12);
+                material.emissive = LinearRgba::rgb(0.2, 3.2, 4.4);
                 material.metallic = 0.25;
             },
             _ => {},
@@ -652,181 +653,266 @@ fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station:
 }
 
 fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
-    // A four-deck tapered capital warship with a continuous walkable interior.
-    for z in 80..=220 {
-        let half_width = if z < 110 {
-            18 + (z - 80) / 3
-        } else if z > 180 {
-            (28 - (z - 180) * 2 / 3).max(2)
-        } else {
-            28
-        };
-        for x in -half_width..=half_width {
-            grid.set(IVec3::new(x, 0, z), 2);
-            grid.set(IVec3::new(x, 28, z), 6);
-            for deck_y in [9, 18] {
-                if x.abs() < half_width {
-                    grid.set(IVec3::new(x, deck_y, z), 2);
-                }
-            }
-        }
-        for y in 1..28 {
-            grid.set(IVec3::new(-half_width, y, z), 6);
-            grid.set(IVec3::new(half_width, y, z), 6);
-        }
-    }
-
-    // Bulkheads divide engineering, hangars, crew decks, bridge, and weapons control.
-    for z in [112, 145, 178] {
-        for x in -27..=27 {
-            for y in 1..28 {
-                if !(-4..=4).contains(&x) || !matches!(y, 1..=7 | 10..=16 | 19..=26) {
-                    grid.set(IVec3::new(x, y, z), 7);
+    const CENTER: IVec3 = IVec3::new(0, 0, 150);
+    for x in -24..=24 {
+        for y in 0..=23 {
+            for z in -48..=48 {
+                let local = IVec3::new(x, y, z);
+                if let Some(material) = combat_corvette_voxel(local) {
+                    grid.set(CENTER + local, material);
                 }
             }
         }
     }
+}
 
-    // Broad armored wings, launch rails, and four long forward cannons.
-    for z in 125..=175 {
-        for x in 29..=62 {
-            for side in [-1, 1] {
-                for y in 8..=11 {
-                    grid.set(
-                        IVec3::new(x * side, y, z),
-                        if y == 9 { 2 } else { 6 },
-                    );
-                }
-            }
-        }
-    }
-    for z in 175..=260 {
-        for x in [-20, -12, 12, 20] {
-            for y in 18..=21 {
-                grid.set(IVec3::new(x, y, z), 7);
-            }
-        }
-    }
+fn combat_corvette_voxel(position: IVec3) -> Option<u8> {
+    const FLOOR: u8 = 2;
+    const METAL: u8 = 3;
+    const RED: u8 = 5;
+    const HULL: u8 = 6;
+    const DARK: u8 = 7;
+    const CYAN: u8 = 8;
 
-    // Detailed bridge displays, reactor banks, engine glow, bunks, and deck lighting.
-    for x in -12..=12 {
-        for y in 20..=25 {
-            grid.set(IVec3::new(x, y, 202), 8);
-        }
+    let (x, y, z) = (position.x, position.y, position.z);
+    let mut material = None;
+    let half_width = if z >= 34 {
+        18 - (z - 34)
+    } else if z <= -36 {
+        10 + (z + 48) / 2
+    } else {
+        18
     }
-    for x in [-20, -10, 0, 10, 20] {
-        for z in 88..=104 {
-            for y in 2..=7 {
-                grid.set(IVec3::new(x, y, z), 5);
-            }
-        }
-    }
-    for z in (84..=216).step_by(6) {
-        for x in [-24, -16, -8, 0, 8, 16, 24] {
-            grid.set(IVec3::new(x, 1, z), 8);
-            grid.set(IVec3::new(x, 10, z), 8);
-            grid.set(IVec3::new(x, 19, z), 8);
-        }
-    }
-    for x in [-22, -14, -6, 6, 14, 22] {
-        for y in 5..=23 {
-            grid.set(IVec3::new(x, y, 79), 7);
+    .clamp(4, 18);
+    let roof_y = if z >= 40 {
+        15
+    } else if z <= -42 {
+        17
+    } else {
+        21
+    };
+
+    if (-48..=48).contains(&z) && x.abs() <= half_width && (0..=roof_y).contains(&y) {
+        let outer_shell = x.abs() == half_width || y == 0 || y == roof_y;
+        let deck = matches!(y, 7 | 14) && x.abs() < half_width;
+        if outer_shell || deck {
+            material = Some(if y == 0 || deck { FLOOR } else { HULL });
         }
     }
 
-    // Hangar guidance lanes and landing-pad markings on the lower deck.
-    for z in 118..=170 {
-        for x in [-14, -7, 0, 7, 14] {
-            grid.set(IVec3::new(x, 1, z), 8);
+    // Sealed room divisions retain a centered route through all three decks.
+    for bulkhead_z in [-34, -18, 6, 24, 36] {
+        let doorway = x.abs() <= 2 && matches!(y, 1..=5 | 8..=12 | 15..=19);
+        if z == bulkhead_z && x.abs() < half_width && (1..roof_y).contains(&y) && !doorway {
+            material = Some(DARK);
         }
     }
-    for pad_z in [126_i32, 148, 170] {
-        for x in -20_i32..=20 {
-            for z in pad_z - 8..=pad_z + 8 {
-                if x.abs() == 20 || (z - pad_z).abs() == 8 {
-                    grid.set(IVec3::new(x, 1, z), 7);
-                }
+
+    // Layered armor, landing outriggers, dorsal sensor spine, and raised red hull bands.
+    for side in [-1, 1] {
+        if voxel_point_in_box(
+            position,
+            IVec3::new(side * 24, 4, -10),
+            IVec3::new(side * 19, 10, 26),
+        ) {
+            material = Some(if y == 7 || z % 12 == 0 { HULL } else { DARK });
+        }
+        if x == side * (half_width + 1) && matches!(y, 3 | 4 | 17 | 18) && (-30..=34).contains(&z) {
+            material = Some(RED);
+        }
+        if x == side * half_width
+            && (9..=11).contains(&y)
+            && matches!(z, -28..=-25 | -10..=-7 | 10..=13 | 28..=31)
+        {
+            material = Some(CYAN);
+        }
+    }
+    if voxel_point_in_hollow_box(
+        position,
+        IVec3::new(-7, 21, -4),
+        IVec3::new(7, 23, 18),
+    ) {
+        material = Some(HULL);
+    }
+    if voxel_point_in_box(
+        position,
+        IVec3::new(-1, 22, 4),
+        IVec3::new(1, 23, 13),
+    ) {
+        material = Some(RED);
+    }
+
+    // Three cyan engine bells with red drive cores and armored nacelles.
+    for engine_x in [-15, 0, 15] {
+        let dx = (x - engine_x).abs();
+        if dx <= 4 && (4..=12).contains(&y) && (-48..=-38).contains(&z) {
+            if dx == 4 || matches!(y, 4 | 12) || z == -38 {
+                material = Some(DARK);
+            }
+            if z <= -44 && dx <= 2 && (6..=10).contains(&y) {
+                material = Some(if z == -48 { CYAN } else { RED });
             }
         }
     }
 
-    // Crew bunks, medbay, armory racks, and engineering conduits on separate decks.
-    for z in (120..=168).step_by(6) {
-        for x in [-22, -18, 18, 22] {
-            fill_voxel_box(
-                grid,
-                IVec3::new(x - 1, 10, z - 2),
-                IVec3::new(x + 1, 12, z + 2),
-                3,
-            );
-        }
+    // Panoramic forward bridge glazing.
+    if z >= 41
+        && x.abs() <= half_width
+        && (4..=11).contains(&y)
+        && (z == 48 || x.abs() == half_width)
+    {
+        material = Some(CYAN);
     }
-    fill_voxel_box(
-        grid,
-        IVec3::new(-22, 10, 150),
-        IVec3::new(-8, 10, 168),
-        1,
-    );
-    for x in 10..=22 {
-        for z in (150..=172).step_by(4) {
-            for y in 10..=14 {
-                grid.set(IVec3::new(x, y, z), 7);
-            }
-        }
-    }
-    for z in 88..=110 {
-        for x in [-16, -8, 8, 16] {
-            grid.set(IVec3::new(x, 11, z), 8);
-            grid.set(IVec3::new(x, 12, z), 8);
+
+    // Functional rooms and tactical cover across engineering, cargo, crew, and bridge decks.
+    for (min, max, prop) in [
+        (
+            IVec3::new(-2, 1, -31),
+            IVec3::new(2, 5, -25),
+            CYAN,
+        ),
+        (
+            IVec3::new(-12, 1, -30),
+            IVec3::new(-9, 3, -26),
+            RED,
+        ),
+        (
+            IVec3::new(9, 1, -30),
+            IVec3::new(12, 3, -26),
+            RED,
+        ),
+        (
+            IVec3::new(-14, 1, -13),
+            IVec3::new(-10, 4, -9),
+            METAL,
+        ),
+        (
+            IVec3::new(8, 1, -12),
+            IVec3::new(13, 3, -7),
+            METAL,
+        ),
+        (
+            IVec3::new(-13, 1, -3),
+            IVec3::new(-9, 3, 2),
+            HULL,
+        ),
+        (
+            IVec3::new(9, 1, -1),
+            IVec3::new(13, 4, 3),
+            HULL,
+        ),
+        (
+            IVec3::new(-17, 2, 10),
+            IVec3::new(-15, 5, 18),
+            DARK,
+        ),
+        (
+            IVec3::new(-15, 8, -12),
+            IVec3::new(-11, 9, -7),
+            HULL,
+        ),
+        (
+            IVec3::new(-15, 11, -12),
+            IVec3::new(-11, 12, -7),
+            HULL,
+        ),
+        (
+            IVec3::new(-15, 8, -3),
+            IVec3::new(-11, 9, 2),
+            HULL,
+        ),
+        (
+            IVec3::new(-15, 11, -3),
+            IVec3::new(-11, 12, 2),
+            HULL,
+        ),
+        (
+            IVec3::new(9, 8, -10),
+            IVec3::new(15, 9, -4),
+            METAL,
+        ),
+        (
+            IVec3::new(10, 8, 10),
+            IVec3::new(15, 12, 12),
+            DARK,
+        ),
+        (
+            IVec3::new(-15, 8, 10),
+            IVec3::new(-11, 11, 17),
+            DARK,
+        ),
+        (
+            IVec3::new(-13, 15, -8),
+            IVec3::new(-9, 17, -3),
+            HULL,
+        ),
+        (
+            IVec3::new(9, 15, -8),
+            IVec3::new(13, 17, -3),
+            HULL,
+        ),
+        (
+            IVec3::new(-6, 15, 9),
+            IVec3::new(6, 16, 15),
+            METAL,
+        ),
+        (
+            IVec3::new(-12, 15, 28),
+            IVec3::new(-8, 17, 33),
+            DARK,
+        ),
+        (
+            IVec3::new(8, 15, 28),
+            IVec3::new(12, 17, 33),
+            DARK,
+        ),
+        (
+            IVec3::new(-9, 8, 39),
+            IVec3::new(-4, 10, 43),
+            CYAN,
+        ),
+        (
+            IVec3::new(4, 8, 39),
+            IVec3::new(9, 10, 43),
+            CYAN,
+        ),
+    ] {
+        if voxel_point_in_box(position, min, max) {
+            material = Some(prop);
         }
     }
 
-    // Bridge consoles, captain's dais, turret machinery, escape pods, and sensor mast.
-    for x in (-18..=18).step_by(6) {
-        for z in [194, 198, 202, 206] {
-            fill_voxel_box(
-                grid,
-                IVec3::new(x - 1, 19, z - 1),
-                IVec3::new(x + 1, 21, z + 1),
-                8,
-            );
+    // Ladder/lift trunks connect decks without blocking the main corridor.
+    for trunk_z in [-20, 20] {
+        if voxel_point_in_box(
+            position,
+            IVec3::new(4, 1, trunk_z),
+            IVec3::new(5, 20, trunk_z + 1),
+        ) && y % 2 == 1
+        {
+            material = Some(DARK);
         }
     }
-    fill_voxel_box(
-        grid,
-        IVec3::new(-3, 19, 208),
-        IVec3::new(3, 22, 214),
-        7,
-    );
-    for (x, z) in [(-18, 130), (18, 130), (-18, 165), (18, 165)] {
-        fill_voxel_box(
-            grid,
-            IVec3::new(x - 5, 29, z - 5),
-            IVec3::new(x + 5, 33, z + 5),
-            7,
-        );
-        grid.set(IVec3::new(x, 34, z), 8);
-    }
-    for z in [120, 145, 170] {
-        for side in [-1, 1] {
-            let x = side * 30;
-            fill_voxel_box(
-                grid,
-                IVec3::new(x - 3, 12, z - 5),
-                IVec3::new(x + 3, 17, z + 5),
-                6,
-            );
-            grid.set(IVec3::new(x, 14, z), 8);
-        }
-    }
-    for y in 29..=46 {
-        grid.set(IVec3::new(0, y, 194), 7);
-        if y % 4 == 1 {
-            for x in -8..=8 {
-                grid.set(IVec3::new(x, y, 194), 8);
-            }
-        }
-    }
+
+    material
+}
+
+fn voxel_point_in_box(position: IVec3, min: IVec3, max: IVec3) -> bool {
+    let normalized_min = min.min(max);
+    let normalized_max = min.max(max);
+    position.cmpge(normalized_min).all() && position.cmple(normalized_max).all()
+}
+
+fn voxel_point_in_hollow_box(position: IVec3, min: IVec3, max: IVec3) -> bool {
+    let normalized_min = min.min(max);
+    let normalized_max = min.max(max);
+    voxel_point_in_box(position, normalized_min, normalized_max)
+        && (position.x == normalized_min.x
+            || position.x == normalized_max.x
+            || position.y == normalized_min.y
+            || position.y == normalized_max.y
+            || position.z == normalized_min.z
+            || position.z == normalized_max.z)
 }
 
 fn fill_voxel_box(grid: &mut Mut<Grid<u8>>, min: IVec3, max: IVec3, material: u8) {
@@ -887,10 +973,10 @@ fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
             3.5,
         ),
         make_voxel_auto_door(
-            IVec3::new(0, 0, 80),
-            IVec3::X,
+            IVec3::new(-18, 0, 160),
+            IVec3::Z,
+            3,
             5,
-            8,
             3.5,
         ),
     ];
@@ -916,13 +1002,13 @@ fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
             }
         }
     }
-    for bulkhead_z in [112, 145, 178] {
-        for deck_y in [0, 9, 18] {
+    for bulkhead_z in [116, 132, 156, 174, 186] {
+        for deck_y in [0, 7, 14] {
             doors.push(make_voxel_auto_door(
                 IVec3::new(0, deck_y, bulkhead_z),
                 IVec3::X,
-                4,
-                7,
+                2,
+                5,
                 1.75,
             ));
         }
@@ -988,13 +1074,17 @@ fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
             }
         }
     }
-    for deck_y in [0, 9, 18] {
-        for z in [100, 145, 190] {
-            for x in [-14, 14] {
+    for deck_y in [0, 7, 14] {
+        for z in [120, 150, 184] {
+            for x in [-10, 10] {
                 lights.push((
-                    (Vec3::new(x as f32, (deck_y + 7) as f32, z as f32) + Vec3::splat(0.5))
+                    (Vec3::new(x as f32, (deck_y + 5) as f32, z as f32) + Vec3::splat(0.5))
                         * VOXEL_SIZE,
-                    Color::srgb(1.0, 0.42, 0.2),
+                    if deck_y == 0 {
+                        Color::srgb(0.3, 0.85, 1.0)
+                    } else {
+                        Color::srgb(1.0, 0.66, 0.42)
+                    },
                 ));
             }
         }
@@ -1064,10 +1154,10 @@ fn voxel_sample_prop_specs() -> Vec<(&'static str, Transform)> {
         );
     }
     for (x, z, yaw) in [
-        (-4.8, 24.0, 0.0),
-        (4.8, 24.0, 0.0),
-        (-4.8, 26.5, 0.4),
-        (4.8, 26.5, -0.4),
+        (-3.2, 34.0, 0.0),
+        (3.2, 34.0, 0.0),
+        (-3.2, 36.5, 0.4),
+        (3.2, 36.5, -0.4),
     ] {
         add(
             "models/free_sample/BuildingBlock_2.gltf",
@@ -1076,8 +1166,8 @@ fn voxel_sample_prop_specs() -> Vec<(&'static str, Transform)> {
             yaw,
         );
     }
-    for deck_y in [0.28, 2.53, 4.78] {
-        for (x, z, yaw) in [(-4.7, 23.0, 0.0), (4.7, 23.0, std::f32::consts::PI)] {
+    for deck_y in [0.28, 2.03, 3.78] {
+        for (x, z, yaw) in [(-3.7, 29.5, 0.0), (3.7, 29.5, std::f32::consts::PI)] {
             add(
                 "models/free_sample/Prop_14.gltf",
                 Vec3::new(x, deck_y, z),
@@ -1087,13 +1177,13 @@ fn voxel_sample_prop_specs() -> Vec<(&'static str, Transform)> {
         }
     }
     for (x, z, yaw) in [
-        (-4.0, 49.0, 0.0),
-        (0.0, 50.5, 0.0),
-        (4.0, 49.0, std::f32::consts::PI),
+        (-2.0, 47.0, 0.0),
+        (0.0, 48.0, 0.0),
+        (2.0, 47.0, std::f32::consts::PI),
     ] {
         add(
             "models/free_sample/Prop_15.gltf",
-            Vec3::new(x, 4.78, z),
+            Vec3::new(x, 2.03, z),
             1.55,
             yaw,
         );
@@ -2633,7 +2723,7 @@ mod tests {
     }
 
     #[test]
-    fn default_space_map_has_two_station_interiors_and_a_warship_interior() {
+    fn default_space_map_has_two_station_interiors_and_a_corvette_interior() {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
 
@@ -2658,8 +2748,8 @@ mod tests {
             0
         );
         assert_eq!(
-            grid.get(IVec3::new(1, 28, 150)).copied(),
-            Some(6)
+            grid.get(IVec3::new(1, 14, 150)).copied(),
+            Some(2)
         );
 
         let old_station_interior_volume = 19 * 7 * 15;
@@ -2668,6 +2758,49 @@ mod tests {
         let new_station_floor_area = 99 * 79 * 5;
         assert!(new_station_interior_volume >= old_station_interior_volume * 100);
         assert!(new_station_floor_area >= old_station_floor_area * 100);
+    }
+
+    #[test]
+    fn combat_corvette_matches_the_three_deck_trpg_layout() {
+        for floor_y in [0, 7, 14] {
+            assert_eq!(
+                combat_corvette_voxel(IVec3::new(0, floor_y, 0)),
+                Some(2)
+            );
+        }
+        for walkway_y in [4, 11, 18] {
+            assert_eq!(
+                combat_corvette_voxel(IVec3::new(0, walkway_y, 0)),
+                None
+            );
+            assert_eq!(
+                combat_corvette_voxel(IVec3::new(0, walkway_y, 6)),
+                None
+            );
+        }
+
+        for (position, expected_material) in [
+            (IVec3::new(0, 3, -28), 8),
+            (IVec3::new(-12, 2, -11), 3),
+            (IVec3::new(-13, 8, -10), 6),
+            (IVec3::new(11, 8, -8), 3),
+            (IVec3::new(10, 15, -5), 6),
+            (IVec3::new(0, 15, 12), 3),
+            (IVec3::new(6, 8, 41), 8),
+            (IVec3::new(15, 8, -48), 8),
+            (IVec3::new(19, 3, 0), 5),
+            (IVec3::new(18, 10, 10), 8),
+        ] {
+            assert_eq!(
+                combat_corvette_voxel(position),
+                Some(expected_material),
+                "unexpected corvette voxel at {position:?}"
+            );
+        }
+        assert_eq!(
+            combat_corvette_voxel(IVec3::new(0, 11, 42)),
+            None
+        );
     }
 
     #[test]
@@ -2693,9 +2826,11 @@ mod tests {
         );
 
         let doors = voxel_auto_doors();
-        assert_eq!(doors.len(), 44);
-        assert!(doors.iter().take(3).all(|door| door.cells.len() == 88));
-        assert!(doors.iter().skip(3).all(|door| door.cells.len() == 63));
+        assert_eq!(doors.len(), 50);
+        assert!(doors.iter().take(2).all(|door| door.cells.len() == 88));
+        assert_eq!(doors[2].cells.len(), 35);
+        assert!(doors[3..35].iter().all(|door| door.cells.len() == 63));
+        assert!(doors[35..].iter().all(|door| door.cells.len() == 25));
         assert!(doors
             .iter()
             .flat_map(|door| &door.cells)
@@ -2859,7 +2994,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_pack_props_detail_station_roofs_and_warship_interiors() {
+    fn sample_pack_props_detail_station_roofs_and_corvette_interiors() {
         let specs = voxel_sample_prop_specs();
         assert_eq!(specs.len(), 40);
         assert!(specs.iter().any(|(path, _)| path.ends_with("Lander.gltf")));
