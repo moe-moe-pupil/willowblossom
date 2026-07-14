@@ -41,6 +41,7 @@ const TEST_GROUND_CENTER_Y: f32 = -50.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
 const VOXEL_MATERIAL_COUNT: usize = 10;
+const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
 const FIRST_PERSON_RADIUS: f32 = VOXEL_SIZE * 0.5;
 const FIRST_PERSON_BODY_LENGTH: f32 = VOXEL_SIZE;
 const FIRST_PERSON_EYE_OFFSET: f32 = VOXEL_SIZE;
@@ -56,6 +57,14 @@ const DEFAULT_SCENE_CAMERA_DISTANCE: f32 = 42.0;
 pub struct TrpgVoxelPlugin;
 
 pub struct TrpgVoxelConnector;
+
+fn voxel_emissive(red: f32, green: f32, blue: f32) -> LinearRgba {
+    LinearRgba::rgb(
+        red * VOXEL_EMISSIVE_SCALE,
+        green * VOXEL_EMISSIVE_SCALE,
+        blue * VOXEL_EMISSIVE_SCALE,
+    )
+}
 
 impl Connector for TrpgVoxelConnector {
     type Item = u8;
@@ -457,7 +466,7 @@ fn setup_voxel_materials(
         } else {
             StandardMaterial {
                 base_color: Color::srgb(0.46, 0.12, 0.018),
-                emissive: LinearRgba::rgb(0.42, 0.075, 0.008),
+                emissive: voxel_emissive(0.42, 0.075, 0.008),
                 metallic: 0.62,
                 perceptual_roughness: 0.32,
                 ..default()
@@ -465,42 +474,42 @@ fn setup_voxel_materials(
         };
         match index {
             0 => {
-                material.emissive = LinearRgba::rgb(0.04, 0.1, 0.045);
+                material.emissive = voxel_emissive(0.04, 0.1, 0.045);
             },
             1 => {
-                material.emissive = LinearRgba::rgb(0.045, 0.022, 0.01);
+                material.emissive = voxel_emissive(0.045, 0.022, 0.01);
             },
             2 => {
-                material.emissive = LinearRgba::rgb(0.11, 0.085, 0.035);
+                material.emissive = voxel_emissive(0.11, 0.085, 0.035);
             },
             3 => {
                 material.base_color = Color::srgba(0.72, 0.9, 1.0, 0.72);
                 material.alpha_mode = AlphaMode::Blend;
                 material.perceptual_roughness = 0.18;
                 material.reflectance = 0.65;
-                material.emissive = LinearRgba::rgb(0.025, 0.08, 0.16);
+                material.emissive = voxel_emissive(0.025, 0.08, 0.16);
             },
             4 => {
                 material.emissive_texture = Some(textures[index].clone());
-                material.emissive = LinearRgba::rgb(5.0, 0.55, 0.02);
+                material.emissive = voxel_emissive(5.0, 0.55, 0.02);
                 material.perceptual_roughness = 0.55;
             },
             5 => {
-                material.emissive = LinearRgba::rgb(0.11, 0.14, 0.19);
+                material.emissive = voxel_emissive(0.11, 0.14, 0.19);
                 material.perceptual_roughness = 0.4;
             },
             6 => {
-                material.emissive = LinearRgba::rgb(0.055, 0.07, 0.09);
+                material.emissive = voxel_emissive(0.055, 0.07, 0.09);
                 material.perceptual_roughness = 0.48;
             },
             7 => {
                 material.base_color = Color::srgb(0.48, 0.92, 1.0);
                 material.emissive_texture = Some(hifi_texture.clone());
-                material.emissive = LinearRgba::rgb(0.2, 3.2, 4.4);
+                material.emissive = voxel_emissive(0.2, 3.2, 4.4);
                 material.metallic = 0.25;
             },
             8 => {
-                material.emissive = LinearRgba::rgb(0.085, 0.002, 0.004);
+                material.emissive = voxel_emissive(0.085, 0.002, 0.004);
             },
             _ => {},
         }
@@ -1711,7 +1720,7 @@ fn animate_voxel_materials(
             seconds * 0.027,
         ));
         let pulse = 4.5 + (seconds * 2.4).sin() * 1.2;
-        lava.emissive = LinearRgba::rgb(pulse, pulse * 0.11, 0.015);
+        lava.emissive = voxel_emissive(pulse, pulse * 0.11, 0.015);
     }
 }
 
@@ -1810,23 +1819,25 @@ fn selected_solid_voxels(grid: &Grid<u8>, min: IVec3, max: IVec3) -> Vec<(IVec3,
 
 fn selected_solid_voxels_in_radius(grid: &Grid<u8>, origin: Vec3, radius: f32) -> Vec<(IVec3, u8)> {
     let radius = radius.max(VOXEL_SIZE);
-    let min = ((origin - Vec3::splat(radius)) / VOXEL_SIZE)
-        .floor()
-        .as_ivec3();
-    let max = ((origin + Vec3::splat(radius)) / VOXEL_SIZE)
-        .floor()
-        .as_ivec3();
     let radius_squared = radius * radius;
-    prism(min, max + IVec3::ONE)
-        .filter_map(|cell| {
-            let material = grid.get(cell).copied()?;
-            if !TrpgVoxelConnector::solid(&material) {
-                return None;
-            }
-            let center = (cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
-            (center.distance_squared(origin) <= radius_squared).then_some((cell, material))
+    let mut selected = grid
+        .iter()
+        .flat_map(|(chunk_position, chunk)| {
+            prism(IVec3::ZERO, DIMS).filter_map(move |local| {
+                let material = chunk[local];
+                if !TrpgVoxelConnector::solid(&material) {
+                    return None;
+                }
+                let cell = *chunk_position * DIMS + local;
+                let center = (cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
+                (center.distance_squared(origin) <= radius_squared).then_some((cell, material))
+            })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    // Hash-map chunk iteration is unordered. Preserve the old prism traversal order so
+    // fragment allocation remains deterministic while avoiding a radius-cubed scan.
+    selected.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
+    selected
 }
 
 fn physics_body_intersects_radius(
@@ -3077,6 +3088,14 @@ mod tests {
     }
 
     #[test]
+    fn voxel_emissive_output_is_reduced_to_thirty_percent() {
+        let emissive = voxel_emissive(5.0, 2.0, 1.0);
+        assert!((emissive.red - 1.5).abs() < f32::EPSILON);
+        assert!((emissive.green - 0.6).abs() < f32::EPSILON);
+        assert!((emissive.blue - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn default_space_map_uses_all_materials_and_internal_auto_doors() {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
@@ -3431,6 +3450,28 @@ mod tests {
             .iter()
             .any(|(cell, _)| *cell == IVec3::new(2, 0, 0)));
         assert!(!selected.iter().any(|(cell, _)| *cell == IVec3::Y));
+    }
+
+    #[test]
+    fn huge_explosion_radius_scans_allocated_voxels_instead_of_empty_space() {
+        let (mut app, entity) = test_grid();
+        let mut entity_mut = app.world_mut().entity_mut(entity);
+        let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
+        for cell in occupied_cells(&grid) {
+            grid.set(cell, 0);
+        }
+        grid.set(IVec3::new(-20_000, 0, 0), 1);
+        grid.set(IVec3::ZERO, 2);
+        grid.set(IVec3::new(20_000, 0, 0), 3);
+        grid.set(IVec3::Y, 4);
+
+        let selected = selected_solid_voxels_in_radius(&grid, Vec3::ZERO, 10_000.0);
+
+        assert_eq!(selected, vec![
+            (IVec3::new(-20_000, 0, 0), 1),
+            (IVec3::ZERO, 2),
+            (IVec3::new(20_000, 0, 0), 3),
+        ]);
     }
 
     #[test]
