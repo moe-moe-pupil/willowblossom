@@ -6,8 +6,6 @@ use std::collections::{
 use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
-    camera::Hdr,
-    core_pipeline::tonemapping::Tonemapping,
     image::{
         ImageAddressMode,
         ImageFilterMode,
@@ -19,17 +17,11 @@ use bevy::{
         MouseMotion,
         MouseWheel,
     },
-    light::{
-        FogVolume,
-        VolumetricFog,
-        VolumetricLight,
-    },
     math::Affine2,
     mesh::{
         Indices,
         PrimitiveTopology,
     },
-    post_process::bloom::Bloom,
     prelude::*,
     window::{
         CursorGrabMode,
@@ -117,9 +109,6 @@ struct VoxelAutoDoor {
     open_translation: Vec3,
     open: bool,
 }
-
-#[derive(Component)]
-struct VoxelRadianceCascade;
 
 #[derive(Resource)]
 struct VoxelMaterials {
@@ -346,7 +335,6 @@ impl Plugin for TrpgVoxelPlugin {
                 populate_voxel_grid,
                 setup_voxel_auto_doors,
                 setup_voxel_interior_lights,
-                setup_voxel_radiance_cascades,
                 setup_voxel_sample_props,
                 setup_voxel_view,
             )
@@ -1270,8 +1258,8 @@ fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
 }
 
 fn setup_voxel_interior_lights(mut commands: Commands) {
-    for (index, (position, color)) in voxel_interior_lights().into_iter().enumerate() {
-        let mut light = commands.spawn((
+    for (position, color) in voxel_interior_lights() {
+        commands.spawn((
             PointLight {
                 color,
                 intensity: 18_000.0,
@@ -1280,48 +1268,6 @@ fn setup_voxel_interior_lights(mut commands: Commands) {
                 ..default()
             },
             Transform::from_translation(position),
-        ));
-        if index % 6 == 0 {
-            light.insert(VolumetricLight);
-        }
-    }
-}
-
-fn setup_voxel_radiance_cascades(mut commands: Commands) {
-    let center = Vec3::new(0.0, 4.0, 18.0);
-    for (scale, density, tint, light_intensity) in [
-        (
-            Vec3::new(18.0, 10.0, 44.0),
-            0.008,
-            Color::srgb(0.72, 0.86, 1.0),
-            0.75,
-        ),
-        (
-            Vec3::new(42.0, 20.0, 62.0),
-            0.004,
-            Color::srgb(0.82, 0.88, 1.0),
-            0.48,
-        ),
-        (
-            Vec3::new(72.0, 34.0, 82.0),
-            0.0015,
-            Color::srgb(0.9, 0.93, 1.0),
-            0.25,
-        ),
-    ] {
-        commands.spawn((
-            FogVolume {
-                fog_color: tint,
-                density_factor: density,
-                absorption: 0.04,
-                scattering: 0.72,
-                scattering_asymmetry: 0.28,
-                light_tint: tint,
-                light_intensity,
-                ..default()
-            },
-            Transform::from_translation(center).with_scale(scale),
-            VoxelRadianceCascade,
         ));
     }
 }
@@ -1466,7 +1412,15 @@ fn setup_voxel_view(
             ..default()
         },
         Transform::from_xyz(8.0, 16.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
-        VolumetricLight,
+    ));
+    commands.spawn((
+        DirectionalLight {
+            color: Color::srgb(0.5, 0.65, 1.0),
+            illuminance: 3_200.0,
+            shadow_maps_enabled: false,
+            ..default()
+        },
+        Transform::from_xyz(-12.0, 8.0, -18.0).looking_at(Vec3::new(0.0, 2.0, 30.0), Vec3::Y),
     ));
     commands.spawn((
         Camera3d::default(),
@@ -1476,18 +1430,6 @@ fn setup_voxel_view(
             ..default()
         },
         editor_camera_transform(&editor),
-        Hdr,
-        Tonemapping::TonyMcMapface,
-        Bloom {
-            intensity: 0.08,
-            ..Bloom::NATURAL
-        },
-        VolumetricFog {
-            ambient_color: Color::srgb(0.62, 0.72, 0.9),
-            ambient_intensity: 0.11,
-            jitter: 0.0,
-            step_count: 48,
-        },
         VoxelViewportCamera,
     ));
     commands.spawn((
