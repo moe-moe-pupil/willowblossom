@@ -73,6 +73,9 @@ const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const FIRST_PERSON_START: Vec3 = Vec3::new(-6.5, 0.5, 41.25);
 const DEFAULT_SCENE_CAMERA_FOCUS: Vec3 = Vec3::new(0.0, 2.5, 37.5);
 const DEFAULT_SCENE_CAMERA_DISTANCE: f32 = 42.0;
+const RESEARCH_STATION_CENTER: IVec3 = IVec3::new(-100, 0, 0);
+const SENSOR_STATION_CENTER: IVec3 = IVec3::new(100, 0, 0);
+const CANNON_STATION_CENTER: IVec3 = IVec3::new(0, 0, -150);
 
 pub struct TrpgVoxelPlugin;
 
@@ -139,16 +142,18 @@ pub(crate) enum VoxelLightTool {
     Cube,
     Spot,
     Physics,
+    Edit,
     Remove,
 }
 
 impl VoxelLightTool {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Point,
         Self::DarkPoint,
         Self::Cube,
         Self::Spot,
         Self::Physics,
+        Self::Edit,
         Self::Remove,
     ];
 
@@ -159,6 +164,7 @@ impl VoxelLightTool {
             Self::Cube => "方块灯",
             Self::Spot => "聚光灯",
             Self::Physics => "物理灯",
+            Self::Edit => "灯光编辑器",
             Self::Remove => "移除灯光",
         }
     }
@@ -170,7 +176,7 @@ impl VoxelLightTool {
             Self::Cube => Some(([0.2, 0.82, 1.0], 2_200.0, 8.0)),
             Self::Spot => Some(([1.0, 0.9, 0.72], 2_500.0, 10.0)),
             Self::Physics => Some(([0.28, 0.72, 1.0], 1_600.0, 7.0)),
-            Self::Remove => None,
+            Self::Edit | Self::Remove => None,
         }
     }
 }
@@ -179,6 +185,7 @@ impl VoxelLightTool {
 pub(crate) enum VoxelCreativeItem {
     Material(u8),
     Light(VoxelLightTool),
+    Mode(VoxelEditMode),
 }
 
 #[derive(Component, Clone)]
@@ -244,7 +251,7 @@ pub(crate) enum VoxelEditMode {
 }
 
 impl VoxelEditMode {
-    const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Add,
         Self::Remove,
         Self::Paint,
@@ -253,11 +260,6 @@ impl VoxelEditMode {
         Self::Pull,
         Self::Explode,
     ];
-
-    fn cycle(self, steps: i32) -> Self {
-        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0) as i32;
-        Self::ALL[(index + steps).rem_euclid(Self::ALL.len() as i32) as usize]
-    }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -309,10 +311,12 @@ pub(crate) struct VoxelEditorState {
     pub creative_inventory_open: bool,
     pub creative_hotbar: [Option<VoxelCreativeItem>; 10],
     pub selected_hotbar_slot: usize,
+    equipped_item: Option<VoxelCreativeItem>,
     pub light_tool: Option<VoxelLightTool>,
     pub placed_light_color: [f32; 3],
     pub placed_light_intensity: f32,
     pub placed_light_range: f32,
+    selected_light: Option<Entity>,
     pub physics_requested: bool,
     physics_action_requested: Option<VoxelPhysicsRequest>,
     pub physics_push_pull_impulse: f32,
@@ -368,10 +372,12 @@ impl Default for VoxelEditorState {
                 ))
             }),
             selected_hotbar_slot: 0,
+            equipped_item: Some(VoxelCreativeItem::Material(1)),
             light_tool: None,
             placed_light_color: [1.0, 0.78, 0.48],
             placed_light_intensity: 1_800.0,
             placed_light_range: 8.0,
+            selected_light: None,
             physics_requested: false,
             physics_action_requested: None,
             physics_push_pull_impulse: 4.0,
@@ -427,21 +433,33 @@ impl VoxelEditorState {
 
     pub(crate) fn physics_status(&self) -> Option<&str> { self.physics_status.as_deref() }
 
+    pub(crate) fn has_selected_light(&self) -> bool { self.selected_light.is_some() }
+
     pub(crate) fn select_material(&mut self, material: u8) {
+        self.equipped_item = Some(VoxelCreativeItem::Material(material));
         self.material = material;
+        self.mode = VoxelEditMode::Add;
         self.light_tool = None;
+        self.selected_light = None;
     }
 
     pub(crate) fn equip_creative_item(&mut self, item: VoxelCreativeItem) {
+        self.equipped_item = Some(item);
         match item {
             VoxelCreativeItem::Material(material) => self.select_material(material),
             VoxelCreativeItem::Light(tool) => {
                 self.light_tool = Some(tool);
+                self.selected_light = None;
                 if let Some((color, intensity, range)) = tool.preset() {
                     self.placed_light_color = color;
                     self.placed_light_intensity = intensity;
                     self.placed_light_range = range;
                 }
+            },
+            VoxelCreativeItem::Mode(mode) => {
+                self.mode = mode;
+                self.light_tool = None;
+                self.selected_light = None;
             },
         }
     }
@@ -453,6 +471,10 @@ impl VoxelEditorState {
         self.selected_hotbar_slot = slot;
         if let Some(item) = self.creative_hotbar[slot] {
             self.equip_creative_item(item);
+        } else {
+            self.equipped_item = None;
+            self.light_tool = None;
+            self.selected_light = None;
         }
     }
 
@@ -465,12 +487,37 @@ impl VoxelEditorState {
         if slot < self.creative_hotbar.len() {
             self.creative_hotbar[slot] = None;
             if slot == self.selected_hotbar_slot {
+                self.equipped_item = None;
                 self.light_tool = None;
+                self.selected_light = None;
             }
         }
     }
 
+    pub(crate) fn swap_hotbar_slots(&mut self, source: usize, destination: usize) {
+        if source >= self.creative_hotbar.len() || destination >= self.creative_hotbar.len() {
+            return;
+        }
+        self.creative_hotbar.swap(source, destination);
+        if source == self.selected_hotbar_slot || destination == self.selected_hotbar_slot {
+            if let Some(item) = self.creative_hotbar[self.selected_hotbar_slot] {
+                self.equip_creative_item(item);
+            } else {
+                self.equipped_item = None;
+                self.light_tool = None;
+                self.selected_light = None;
+            }
+        }
+    }
+
+    pub(crate) fn select_mode(&mut self, mode: VoxelEditMode) {
+        self.equip_creative_item(VoxelCreativeItem::Mode(mode));
+    }
+
     pub(crate) fn active_tool_label(&self) -> &'static str {
+        if self.equipped_item.is_none() {
+            return "空手";
+        }
         self.light_tool.map_or_else(
             || self.mode.label(),
             VoxelLightTool::label,
@@ -564,6 +611,7 @@ impl Plugin for TrpgVoxelPlugin {
                 voxel_editor_shortcuts,
                 handle_editor_requests,
                 place_creative_light,
+                sync_selected_voxel_light,
                 edit_voxel_grid,
                 make_selection_physical,
                 apply_voxel_physics_action,
@@ -944,12 +992,155 @@ fn populate_voxel_grid(mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>) {
 }
 
 fn populate_default_grid(grid: &mut Mut<Grid<u8>>) {
-    build_space_station(grid, IVec3::new(-90, 0, 0), false);
-    build_space_station(grid, IVec3::new(90, 0, 0), true);
+    build_space_station(grid, RESEARCH_STATION_CENTER, false);
+    build_space_station(grid, SENSOR_STATION_CENTER, true);
+    build_space_cannon_station(grid, CANNON_STATION_CENTER);
     build_combat_spaceship(grid);
     for door in voxel_auto_doors() {
         for cell in door.cells {
             grid.set(cell, 0);
+        }
+    }
+}
+
+fn build_space_cannon_station(grid: &mut Mut<Grid<u8>>, center: IVec3) {
+    // A compact fortified station with three playable decks and a central fire-control chamber.
+    build_hollow_voxel_room(
+        grid,
+        center + IVec3::new(-45, 0, -28),
+        center + IVec3::new(45, 30, 28),
+        7,
+        2,
+    );
+    for deck_y in [0, 10, 20, 30] {
+        fill_voxel_box(
+            grid,
+            center + IVec3::new(-44, deck_y, -27),
+            center + IVec3::new(44, deck_y, 27),
+            2,
+        );
+    }
+    for deck_y in [0, 10, 20] {
+        for local_x in [-20, 20] {
+            fill_voxel_box(
+                grid,
+                center + IVec3::new(local_x, deck_y + 1, -27),
+                center + IVec3::new(local_x, deck_y + 9, 27),
+                7,
+            );
+            clear_voxel_box(
+                grid,
+                center + IVec3::new(local_x, deck_y + 1, -4),
+                center + IVec3::new(local_x, deck_y + 7, 4),
+            );
+        }
+        fill_voxel_box(
+            grid,
+            center + IVec3::new(-44, deck_y + 1, 0),
+            center + IVec3::new(44, deck_y + 9, 0),
+            7,
+        );
+        clear_voxel_box(
+            grid,
+            center + IVec3::new(-4, deck_y + 1, 0),
+            center + IVec3::new(4, deck_y + 7, 0),
+        );
+    }
+
+    // Reactor vaults, ammunition stores, and an illuminated firing-control dais.
+    for side in [-1, 1] {
+        let reactor_center = center + IVec3::new(side * 32, 1, 14);
+        build_hollow_voxel_room(
+            grid,
+            reactor_center + IVec3::new(-8, 0, -7),
+            reactor_center + IVec3::new(8, 8, 7),
+            6,
+            2,
+        );
+        for y in 2..=7 {
+            for z in -4..=4 {
+                grid.set(reactor_center + IVec3::new(0, y, z), 8);
+            }
+        }
+        for z in (-22..=-8).step_by(4) {
+            fill_voxel_box(
+                grid,
+                center + IVec3::new(side * 33 - 2, 11, z),
+                center + IVec3::new(side * 33 + 2, 14, z + 2),
+                9,
+            );
+        }
+    }
+    fill_voxel_box(
+        grid,
+        center + IVec3::new(-10, 21, -20),
+        center + IVec3::new(10, 22, -8),
+        6,
+    );
+    for x in (-8..=8).step_by(4) {
+        grid.set(center + IVec3::new(x, 23, -12), 8);
+        grid.set(center + IVec3::new(x, 23, -16), 10);
+    }
+
+    // The spinal spatial-artillery barrel leaves the aft hull and tapers toward a bright muzzle.
+    let axis_y = center.y + 22;
+    let hull_back_z = center.z - 28;
+    for z in center.z - 112..=hull_back_z {
+        let distance = hull_back_z - z;
+        let radius = (12 - distance / 16).clamp(6, 12);
+        for x in -radius..=radius {
+            for y in -radius..=radius {
+                let edge = x.abs().max(y.abs()) == radius;
+                let brace = (z - center.z).rem_euclid(10) == 0
+                    && (x.abs() == radius - 1 || y.abs() == radius - 1);
+                let energy_rail = (x == 0 && y.abs() == radius) || (y == 0 && x.abs() == radius);
+                if edge || brace || energy_rail {
+                    let material = if energy_rail || (z - center.z).rem_euclid(20) == 0 {
+                        8
+                    } else if brace {
+                        9
+                    } else {
+                        6
+                    };
+                    grid.set(
+                        IVec3::new(center.x + x, axis_y + y, z),
+                        material,
+                    );
+                }
+            }
+        }
+    }
+    let muzzle_z = center.z - 112;
+    for z in muzzle_z - 4..=muzzle_z + 4 {
+        for x in -15_i32..=15 {
+            for y in -15_i32..=15 {
+                if x.abs().max(y.abs()) >= 12 {
+                    grid.set(
+                        IVec3::new(center.x + x, axis_y + y, z),
+                        if z == muzzle_z || x.abs().max(y.abs()) == 15 { 9 } else { 6 },
+                    );
+                }
+            }
+        }
+    }
+    for z in muzzle_z - 3..=muzzle_z + 3 {
+        grid.set(IVec3::new(center.x, axis_y, z), 8);
+    }
+
+    // A sensor crown and targeting vanes distinguish the cannon station at long range.
+    build_hollow_voxel_room(
+        grid,
+        center + IVec3::new(-14, 31, -10),
+        center + IVec3::new(14, 43, 10),
+        6,
+        2,
+    );
+    for y in 44..=58 {
+        grid.set(center + IVec3::new(0, y, 0), 7);
+        if y % 4 == 0 {
+            for x in -12..=12 {
+                grid.set(center + IVec3::new(x, y, 0), 8);
+            }
         }
     }
 }
@@ -1519,7 +1710,7 @@ fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
             3.5,
         ),
     ];
-    for station_x in [-90, 90] {
+    for station_x in [RESEARCH_STATION_CENTER.x, SENSOR_STATION_CENTER.x] {
         for deck_y in [0, 9, 18, 27] {
             for local_x in [-25, 25] {
                 doors.push(make_voxel_auto_door(
@@ -1551,6 +1742,33 @@ fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
                 1.75,
             ));
         }
+    }
+    for deck_y in [0, 10, 20] {
+        for local_x in [-20, 20] {
+            doors.push(make_voxel_auto_door(
+                CANNON_STATION_CENTER + IVec3::new(local_x, deck_y, 0),
+                IVec3::Z,
+                4,
+                7,
+                1.75,
+            ));
+        }
+        doors.push(make_voxel_auto_door(
+            CANNON_STATION_CENTER + IVec3::new(0, deck_y, 0),
+            IVec3::X,
+            4,
+            7,
+            1.75,
+        ));
+    }
+    for local_z in [-28, 28] {
+        doors.push(make_voxel_auto_door(
+            CANNON_STATION_CENTER + IVec3::new(0, 0, local_z),
+            IVec3::X,
+            4,
+            7,
+            2.5,
+        ));
     }
     doors
 }
@@ -1682,8 +1900,14 @@ fn voxel_auto_door_should_open(door: &VoxelAutoDoor, player_position: Vec3) -> b
 fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
     let mut lights = Vec::new();
     for (station_x, color) in [
-        (-90, Color::srgb(0.55, 0.75, 1.0)),
-        (90, Color::srgb(1.0, 0.72, 0.42)),
+        (
+            RESEARCH_STATION_CENTER.x,
+            Color::srgb(0.55, 0.75, 1.0),
+        ),
+        (
+            SENSOR_STATION_CENTER.x,
+            Color::srgb(1.0, 0.72, 0.42),
+        ),
     ] {
         for deck_y in [0, 9, 18, 27] {
             for x in [-28, 28] {
@@ -1725,6 +1949,30 @@ fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
             }
         }
     }
+    for deck_y in [0, 10, 20] {
+        for x in [-32, 0, 32] {
+            for z in [-18, 18] {
+                lights.push((
+                    (CANNON_STATION_CENTER.as_vec3()
+                        + Vec3::new(x as f32, (deck_y + 7) as f32, z as f32)
+                        + Vec3::splat(0.5))
+                        * VOXEL_SIZE,
+                    Color::srgb(0.45, 0.8, 1.0),
+                ));
+            }
+        }
+    }
+    for local_z in [-48, -64, -80, -96] {
+        for x in [-6, 6] {
+            lights.push((
+                (CANNON_STATION_CENTER.as_vec3()
+                    + Vec3::new(x as f32, 22.0, local_z as f32)
+                    + Vec3::splat(0.5))
+                    * VOXEL_SIZE,
+                Color::srgb(0.25, 0.75, 1.0),
+            ));
+        }
+    }
     lights
 }
 
@@ -1764,7 +2012,10 @@ fn voxel_physics_prop_specs() -> Vec<(Vec<(IVec3, u8)>, Transform)> {
         ));
     };
 
-    for station_x in [-22.5, 22.5] {
+    for station_x in [
+        RESEARCH_STATION_CENTER.x as f32 * VOXEL_SIZE,
+        SENSOR_STATION_CENTER.x as f32 * VOXEL_SIZE,
+    ] {
         add(
             Vec3::new(station_x, 14.55, 0.0),
             IVec3::new(5, 3, 3),
@@ -2225,6 +2476,7 @@ fn handle_editor_requests(
         editor.redo.clear();
         editor.selection_anchor = None;
         editor.selection_end = None;
+        editor.selected_light = None;
         editor.physics_status = None;
         editor.reset_requested = false;
     }
@@ -2560,6 +2812,7 @@ fn process_voxel_scene_history(
     editor.stroke_positions.clear();
     editor.selection_anchor = None;
     editor.selection_end = None;
+    editor.selected_light = None;
     editor.physics_action_requested = None;
     editor.physics_status = Some(format!("已恢复 {}", snapshot.name));
 }
@@ -2764,7 +3017,7 @@ fn spawn_voxel_placed_light(
                 light,
             ))
             .id(),
-        VoxelLightTool::Remove => Entity::PLACEHOLDER,
+        VoxelLightTool::Edit | VoxelLightTool::Remove => Entity::PLACEHOLDER,
     }
 }
 
@@ -2812,7 +3065,10 @@ fn place_creative_light(
         return;
     };
 
-    if tool == VoxelLightTool::Remove {
+    if matches!(
+        tool,
+        VoxelLightTool::Edit | VoxelLightTool::Remove
+    ) {
         let mut closest = None;
         for (entity, transform, light) in &placed_lights {
             let offset = transform.translation() - ray.origin;
@@ -2835,6 +3091,17 @@ fn place_creative_light(
             editor.physics_status = Some("没有瞄准已放置的灯光".to_owned());
             return;
         };
+        if tool == VoxelLightTool::Edit {
+            editor.placed_light_color = light.color;
+            editor.placed_light_intensity = light.intensity;
+            editor.placed_light_range = light.range;
+            editor.selected_light = Some(entity);
+            editor.physics_status = Some(format!(
+                "已选择{}；可调整颜色、亮度和范围",
+                light.kind.label()
+            ));
+            return;
+        }
         commands.entity(entity).despawn();
         if light.kind == VoxelLightTool::Cube {
             if grid.get(light.cell).copied().unwrap_or(0) != 0 {
@@ -2860,6 +3127,9 @@ fn place_creative_light(
         .map(|occupied| (cell - occupied).as_vec3())
         .and_then(Vec3::try_normalize)
         .unwrap_or(Vec3::Y);
+    let Some((color, intensity, range)) = tool.preset() else {
+        return;
+    };
     if tool == VoxelLightTool::Cube {
         if grid.get(cell).copied().unwrap_or(0) != 8 {
             grid.set(cell, 8);
@@ -2872,13 +3142,51 @@ fn place_creative_light(
         VoxelPlacedLight {
             kind: tool,
             cell,
-            color: editor.placed_light_color,
-            intensity: editor.placed_light_intensity,
-            range: editor.placed_light_range,
+            color,
+            intensity,
+            range,
             direction,
         },
     );
     editor.physics_status = Some(format!("已放置{}", tool.label()));
+}
+
+fn sync_selected_voxel_light(
+    editor: Res<VoxelEditorState>,
+    mut lights: Query<(
+        Entity,
+        &mut VoxelPlacedLight,
+        Option<&mut PointLight>,
+        Option<&mut SpotLight>,
+    )>,
+) {
+    if editor.light_tool != Some(VoxelLightTool::Edit) || !editor.is_changed() {
+        return;
+    }
+    let Some(selected) = editor.selected_light else {
+        return;
+    };
+    let Ok((_, mut light, point_light, spot_light)) = lights.get_mut(selected) else {
+        return;
+    };
+    light.color = editor.placed_light_color;
+    light.intensity = editor.placed_light_intensity.max(0.0);
+    light.range = editor.placed_light_range.max(VOXEL_SIZE);
+    let color = Color::srgb(
+        light.color[0],
+        light.color[1],
+        light.color[2],
+    );
+    if let Some(mut point_light) = point_light {
+        point_light.color = color;
+        point_light.intensity = light.intensity;
+        point_light.range = light.range;
+    }
+    if let Some(mut spot_light) = spot_light {
+        spot_light.color = color;
+        spot_light.intensity = light.intensity;
+        spot_light.range = light.range;
+    }
 }
 
 fn edit_voxel_grid(
@@ -2918,6 +3226,9 @@ fn edit_voxel_grid(
         editor.left_started_over_ui = false;
     }
     if editor.creative_inventory_open {
+        return;
+    }
+    if editor.equipped_item.is_none() {
         return;
     }
     if editor.light_tool.is_some() {
@@ -3406,8 +3717,11 @@ fn register_first_person_space_tap(elapsed: &mut f32) -> bool {
     double_tap
 }
 
-fn adjusted_explosion_radius(radius: f32, wheel_steps: i32) -> f32 {
-    (radius + wheel_steps as f32 * 0.5).clamp(VOXEL_SIZE, 100.0)
+fn cycled_hotbar_slot(current: usize, wheel_steps: i32, slot_count: usize) -> usize {
+    if slot_count == 0 {
+        return 0;
+    }
+    (current as i32 - wheel_steps).rem_euclid(slot_count as i32) as usize
 }
 
 fn first_person_player_position(camera_position: Vec3) -> Vec3 {
@@ -3511,18 +3825,13 @@ fn control_voxel_camera(
         let wheel_steps = wheel.read().fold(0, |steps, event| {
             steps + event.y.signum() as i32
         });
-        if !editor.creative_inventory_open {
-            let shift =
-                keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
-            if shift && editor.mode == VoxelEditMode::Explode {
-                editor.physics_explosion_radius = adjusted_explosion_radius(
-                    editor.physics_explosion_radius,
-                    wheel_steps,
-                );
-            } else if wheel_steps != 0 {
-                editor.mode = editor.mode.cycle(-wheel_steps);
-                editor.light_tool = None;
-            }
+        if !editor.creative_inventory_open && wheel_steps != 0 {
+            let slot = cycled_hotbar_slot(
+                editor.selected_hotbar_slot,
+                wheel_steps,
+                editor.creative_hotbar.len(),
+            );
+            editor.select_hotbar_slot(slot);
         }
         let Ok((player_transform, _)) = players.single() else {
             return;
@@ -3919,11 +4228,11 @@ mod tests {
     }
 
     #[test]
-    fn default_space_map_has_two_station_interiors_and_a_corvette_interior() {
+    fn default_space_map_has_three_station_interiors_and_a_corvette_interior() {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
 
-        for station_center in [IVec3::new(-90, 0, 0), IVec3::new(90, 0, 0)] {
+        for station_center in [RESEARCH_STATION_CENTER, SENSOR_STATION_CENTER] {
             assert_eq!(
                 grid.get(station_center + IVec3::new(10, 0, 10)).copied(),
                 Some(2)
@@ -3946,6 +4255,27 @@ mod tests {
         assert_eq!(
             grid.get(IVec3::new(1, 14, 150)).copied(),
             Some(2)
+        );
+        assert_eq!(
+            grid.get(CANNON_STATION_CENTER + IVec3::new(10, 0, 10))
+                .copied(),
+            Some(2)
+        );
+        assert_eq!(
+            grid.get(CANNON_STATION_CENTER + IVec3::new(10, 4, 10))
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            grid.get(CANNON_STATION_CENTER + IVec3::new(0, 22, -112))
+                .copied(),
+            Some(8)
+        );
+        assert_eq!(
+            grid.get(CANNON_STATION_CENTER + IVec3::new(15, 22, -112))
+                .copied(),
+            Some(9)
         );
 
         let old_station_interior_volume = 19 * 7 * 15;
@@ -4037,15 +4367,16 @@ mod tests {
         assert!(voxel_cells(grid).len() >= 100_000);
         assert_eq!(
             materials,
-            HashSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9])
+            HashSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         );
 
         let doors = voxel_auto_doors();
-        assert_eq!(doors.len(), 53);
+        assert_eq!(doors.len(), 64);
         assert!(doors.iter().take(2).all(|door| door.cells.len() == 88));
         assert_eq!(doors[2].cells.len(), 35);
         assert!(doors[3..35].iter().all(|door| door.cells.len() == 63));
-        assert!(doors[35..].iter().all(|door| door.cells.len() == 25));
+        assert!(doors[35..53].iter().all(|door| door.cells.len() == 25));
+        assert!(doors[53..].iter().all(|door| door.cells.len() == 63));
         assert!(doors
             .iter()
             .flat_map(|door| &door.cells)
@@ -4075,7 +4406,7 @@ mod tests {
         }
 
         let lights = voxel_interior_lights();
-        assert_eq!(lights.len(), 62);
+        assert_eq!(lights.len(), 88);
         assert!(lights.iter().all(|(position, _)| position.y > 0.0));
     }
 
@@ -4233,8 +4564,7 @@ mod tests {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
         let (meshes, colliders) = build_voxel_meshes(grid);
-        // The tenth material belongs to independent door meshes, not the voxel grid.
-        assert_eq!(meshes.len(), VOXEL_MATERIAL_COUNT - 1);
+        assert_eq!(meshes.len(), VOXEL_MATERIAL_COUNT);
         assert!(!colliders.is_empty());
         for (_, mesh) in meshes {
             assert!(mesh.attribute(Mesh::ATTRIBUTE_POSITION).is_some());
@@ -4315,38 +4645,11 @@ mod tests {
     }
 
     #[test]
-    fn first_person_mouse_wheel_cycles_and_wraps_all_tools() {
-        assert_eq!(
-            VoxelEditMode::Add.cycle(1),
-            VoxelEditMode::Remove
-        );
-        assert_eq!(
-            VoxelEditMode::Add.cycle(-1),
-            VoxelEditMode::Explode
-        );
-        assert_eq!(
-            VoxelEditMode::Physics.cycle(3),
-            VoxelEditMode::Explode
-        );
-        assert_eq!(
-            VoxelEditMode::Explode.cycle(1),
-            VoxelEditMode::Add
-        );
-        assert_eq!(VoxelEditMode::Pull.label(), "拉近");
-    }
-
-    #[test]
-    fn first_person_shift_wheel_resizes_explosion_radius() {
-        assert_eq!(adjusted_explosion_radius(6.0, 2), 7.0);
-        assert_eq!(adjusted_explosion_radius(6.0, -2), 5.0);
-        assert_eq!(
-            adjusted_explosion_radius(VOXEL_SIZE, -1),
-            VOXEL_SIZE
-        );
-        assert_eq!(
-            adjusted_explosion_radius(100.0, 1),
-            100.0
-        );
+    fn first_person_mouse_wheel_selects_and_wraps_hotbar_slots() {
+        assert_eq!(cycled_hotbar_slot(0, -1, 10), 1);
+        assert_eq!(cycled_hotbar_slot(0, 1, 10), 9);
+        assert_eq!(cycled_hotbar_slot(9, -1, 10), 0);
+        assert_eq!(cycled_hotbar_slot(5, 3, 10), 2);
     }
 
     #[test]
@@ -4696,8 +4999,63 @@ mod tests {
         ]);
         assert_eq!(editor.placed_light_intensity, 420.0);
 
+        editor.creative_hotbar[5] = Some(VoxelCreativeItem::Mode(
+            VoxelEditMode::Explode,
+        ));
+        editor.swap_hotbar_slots(3, 5);
+        assert_eq!(
+            editor.creative_hotbar[3],
+            Some(VoxelCreativeItem::Mode(
+                VoxelEditMode::Explode
+            ))
+        );
+        editor.select_hotbar_slot(3);
+        assert_eq!(editor.mode, VoxelEditMode::Explode);
+
         editor.delete_hotbar_slot(3);
         assert_eq!(editor.creative_hotbar[3], None);
         assert_eq!(editor.light_tool, None);
+        assert_eq!(editor.active_tool_label(), "空手");
+    }
+
+    #[test]
+    fn light_editor_tool_updates_the_selected_scene_light() {
+        let mut app = App::new();
+        app.init_resource::<VoxelEditorState>()
+            .add_systems(Update, sync_selected_voxel_light);
+        let entity = app
+            .world_mut()
+            .spawn((
+                VoxelPlacedLight {
+                    kind: VoxelLightTool::Point,
+                    cell: IVec3::ZERO,
+                    color: [1.0, 1.0, 1.0],
+                    intensity: 100.0,
+                    range: 2.0,
+                    direction: Vec3::Y,
+                },
+                PointLight::default(),
+            ))
+            .id();
+        {
+            let mut editor = app.world_mut().resource_mut::<VoxelEditorState>();
+            editor.equip_creative_item(VoxelCreativeItem::Light(
+                VoxelLightTool::Edit,
+            ));
+            editor.selected_light = Some(entity);
+            editor.placed_light_color = [0.2, 0.4, 0.8];
+            editor.placed_light_intensity = 3_200.0;
+            editor.placed_light_range = 12.0;
+        }
+        app.update();
+
+        let entity_ref = app.world().entity(entity);
+        let placed = entity_ref.get::<VoxelPlacedLight>().unwrap();
+        let point = entity_ref.get::<PointLight>().unwrap();
+        assert_eq!(placed.color, [0.2, 0.4, 0.8]);
+        assert_eq!(placed.intensity, 3_200.0);
+        assert_eq!(placed.range, 12.0);
+        assert_eq!(point.intensity, 3_200.0);
+        assert_eq!(point.range, 12.0);
     }
 }

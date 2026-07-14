@@ -219,12 +219,52 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
                 "物理灯",
                 egui::Color32::from_rgb(72, 147, 255),
             ),
+            VoxelLightTool::Edit => (
+                "灯光编辑器",
+                egui::Color32::from_rgb(212, 110, 255),
+            ),
             VoxelLightTool::Remove => (
                 "移除灯光",
                 egui::Color32::from_rgb(150, 42, 42),
             ),
         },
+        VoxelCreativeItem::Mode(mode) => match mode {
+            VoxelEditMode::Add => (
+                "添加工具",
+                egui::Color32::from_rgb(62, 162, 88),
+            ),
+            VoxelEditMode::Remove => (
+                "删除工具",
+                egui::Color32::from_rgb(164, 54, 54),
+            ),
+            VoxelEditMode::Paint => (
+                "涂色工具",
+                egui::Color32::from_rgb(206, 144, 52),
+            ),
+            VoxelEditMode::Physics => (
+                "物理化工具",
+                egui::Color32::from_rgb(95, 112, 138),
+            ),
+            VoxelEditMode::Push => (
+                "推开工具",
+                egui::Color32::from_rgb(61, 132, 196),
+            ),
+            VoxelEditMode::Pull => (
+                "拉近工具",
+                egui::Color32::from_rgb(102, 88, 190),
+            ),
+            VoxelEditMode::Explode => (
+                "爆炸工具",
+                egui::Color32::from_rgb(225, 83, 28),
+            ),
+        },
     }
+}
+
+#[derive(Clone, Copy)]
+enum VoxelCreativeDragPayload {
+    Catalog(VoxelCreativeItem),
+    Hotbar { slot: usize },
 }
 
 fn voxel_creative_item_slot(
@@ -268,6 +308,21 @@ fn voxel_creative_item_slot(
         );
     }
     response.on_hover_text(name)
+}
+
+fn voxel_creative_drag_source(
+    ui: &mut Ui,
+    id: egui::Id,
+    payload: VoxelCreativeDragPayload,
+    item: VoxelCreativeItem,
+    selected: bool,
+    size: f32,
+    shortcut: Option<&str>,
+) -> egui::Response {
+    ui.dnd_drag_source(id, payload, |ui| {
+        voxel_creative_item_slot(ui, Some(item), selected, size, shortcut)
+    })
+    .inner
 }
 const MOONBERRY_SKILL_TYPES: &[&str] = &[
     "法术",
@@ -11763,7 +11818,8 @@ pub fn ui_system(
                         }
                     });
                     if voxel_editor.mode != mode_before_toolbar {
-                        voxel_editor.light_tool = None;
+                        let mode = voxel_editor.mode;
+                        voxel_editor.select_mode(mode);
                     }
                     if voxel_editor.first_person_enabled {
                         let movement_hint = if voxel_editor.first_person_flying {
@@ -11772,7 +11828,7 @@ pub fn ui_system(
                             "WASD 移动 · 空格跳跃 · 双击空格飞行"
                         };
                         ui.small(format!(
-                            "{movement_hint} · 当前工具：{} · 滚轮切换工具 · 爆炸工具下 Shift+滚轮调半径 · 左键使用 · Esc 退出",
+                            "{movement_hint} · 当前工具：{} · 滚轮选择快捷栏 · 左键使用 · Esc 退出",
                             voxel_editor.active_tool_label()
                         ));
                     }
@@ -11818,6 +11874,38 @@ pub fn ui_system(
                             }
                         });
                     });
+                    if voxel_editor.light_tool == Some(VoxelLightTool::Edit) {
+                        egui::CollapsingHeader::new("灯光编辑工具")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                if voxel_editor.has_selected_light() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("颜色");
+                                        ui.color_edit_button_rgb(
+                                            &mut voxel_editor.placed_light_color,
+                                        );
+                                        ui.label("亮度");
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut voxel_editor.placed_light_intensity,
+                                            )
+                                            .range(0.0..=100_000.0)
+                                            .speed(100.0),
+                                        );
+                                        ui.label("范围");
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut voxel_editor.placed_light_range,
+                                            )
+                                            .range(0.25..=100.0)
+                                            .speed(0.25),
+                                        );
+                                    });
+                                } else {
+                                    ui.small("先用左键选择场景中的点光、方块灯、聚光灯或物理灯");
+                                }
+                            });
+                    }
                     let snapshot_labels = voxel_editor.scene_snapshot_labels();
                     ui.collapsing(
                         format!("场景历史（{}）", snapshot_labels.len()),
@@ -11893,8 +11981,14 @@ pub fn ui_system(
                     }
                 });
 
-            egui::Area::new(egui::Id::new("voxel_creative_hotbar"))
-                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
+            let mut hotbar_drop = None;
+            let mut hotbar_clicked = None;
+            let mut hotbar_delete = None;
+            let hotbar_area = egui::Area::new(egui::Id::new("voxel_creative_hotbar"))
+                .anchor(
+                    egui::Align2::CENTER_BOTTOM,
+                    egui::vec2(0.0, -12.0),
+                )
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     egui::Frame::new()
@@ -11909,36 +12003,67 @@ pub fn ui_system(
                                     } else {
                                         (slot + 1).to_string()
                                     };
-                                    let response = voxel_creative_item_slot(
-                                        ui,
-                                        voxel_editor.creative_hotbar[slot],
-                                        voxel_editor.selected_hotbar_slot == slot,
-                                        38.0,
-                                        Some(&shortcut),
-                                    );
+                                    let (drop_zone, dropped) = ui
+                                        .dnd_drop_zone::<VoxelCreativeDragPayload, _>(
+                                            egui::Frame::new(),
+                                            |ui| {
+                                                if let Some(item) =
+                                                    voxel_editor.creative_hotbar[slot]
+                                                {
+                                                    voxel_creative_drag_source(
+                                                        ui,
+                                                        egui::Id::new(("voxel_hotbar_drag", slot)),
+                                                        VoxelCreativeDragPayload::Hotbar { slot },
+                                                        item,
+                                                        voxel_editor.selected_hotbar_slot == slot,
+                                                        38.0,
+                                                        Some(&shortcut),
+                                                    )
+                                                } else {
+                                                    voxel_creative_item_slot(
+                                                        ui,
+                                                        None,
+                                                        voxel_editor.selected_hotbar_slot == slot,
+                                                        38.0,
+                                                        Some(&shortcut),
+                                                    )
+                                                }
+                                            },
+                                        );
+                                    let response = drop_zone.inner;
                                     if response.clicked() {
-                                        voxel_editor.select_hotbar_slot(slot);
+                                        hotbar_clicked = Some(slot);
                                     }
                                     if response.secondary_clicked() {
-                                        voxel_editor.delete_hotbar_slot(slot);
+                                        hotbar_delete = Some(slot);
+                                    }
+                                    if let Some(payload) = dropped {
+                                        hotbar_drop = Some((slot, *payload));
                                     }
                                 }
                             });
                         });
                 });
+            let hotbar_rect = hotbar_area.response.rect;
 
+            let mut inventory_rect = None;
             if voxel_editor.creative_inventory_open {
                 let mut picked_item = None;
                 let mut delete_selected = false;
                 let mut window_open = true;
-                egui::Window::new("创造模式物品栏")
-                    .id(egui::Id::new("voxel_creative_inventory"))
-                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                let inventory_window = egui::Window::new("创造模式物品栏")
+                    .id(egui::Id::new(
+                        "voxel_creative_inventory",
+                    ))
+                    .anchor(
+                        egui::Align2::CENTER_CENTER,
+                        egui::Vec2::ZERO,
+                    )
                     .collapsible(false)
                     .resizable(false)
                     .open(&mut window_open)
                     .show(ctx, |ui| {
-                        ui.label("浏览全部物品 · 点击取得到当前快捷栏格 · 创造模式无限数量");
+                        ui.label("浏览全部物品 · 拖入快捷栏 · 拖出物品栏删除 · 创造模式无限数量");
                         ui.horizontal(|ui| {
                             ui.label(format!(
                                 "当前快捷栏：{}",
@@ -11963,9 +12088,11 @@ pub fn ui_system(
                                 {
                                     ui.vertical_centered(|ui| {
                                         let item = VoxelCreativeItem::Material(material);
-                                        if voxel_creative_item_slot(
+                                        if voxel_creative_drag_source(
                                             ui,
-                                            Some(item),
+                                            egui::Id::new(("voxel_catalog_material", material)),
+                                            VoxelCreativeDragPayload::Catalog(item),
+                                            item,
                                             voxel_editor.creative_hotbar
                                                 [voxel_editor.selected_hotbar_slot]
                                                 == Some(item),
@@ -11993,9 +12120,11 @@ pub fn ui_system(
                                     let item = VoxelCreativeItem::Light(tool);
                                     let (name, _) = voxel_creative_item_visual(item);
                                     ui.vertical_centered(|ui| {
-                                        if voxel_creative_item_slot(
+                                        if voxel_creative_drag_source(
                                             ui,
-                                            Some(item),
+                                            egui::Id::new(("voxel_catalog_light", index)),
+                                            VoxelCreativeDragPayload::Catalog(item),
+                                            item,
                                             voxel_editor.creative_hotbar
                                                 [voxel_editor.selected_hotbar_slot]
                                                 == Some(item),
@@ -12008,6 +12137,9 @@ pub fn ui_system(
                                             VoxelLightTool::Cube => "发光体素方块灯",
                                             VoxelLightTool::Spot => "沿放置表面朝外的聚光灯",
                                             VoxelLightTool::Physics => "可掉落、碰撞和移动的实体灯",
+                                            VoxelLightTool::Edit => {
+                                                "选择场景灯光并编辑颜色、亮度和范围"
+                                            },
                                             VoxelLightTool::Remove => "瞄准已放置灯光并移除",
                                         })
                                         .clicked()
@@ -12021,28 +12153,47 @@ pub fn ui_system(
                                     }
                                 }
                             });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("新灯颜色");
-                            ui.color_edit_button_rgb(&mut voxel_editor.placed_light_color);
-                            ui.label("亮度");
-                            ui.add(
-                                egui::DragValue::new(&mut voxel_editor.placed_light_intensity)
-                                    .range(0.0..=100_000.0)
-                                    .speed(100.0),
-                            );
-                            ui.label("范围");
-                            ui.add(
-                                egui::DragValue::new(&mut voxel_editor.placed_light_range)
-                                    .range(0.25..=100.0)
-                                    .speed(0.25),
-                            );
-                        });
+                        ui.separator();
+                        ui.strong("编辑工具");
+                        egui::Grid::new("voxel_creative_mode_inventory_grid")
+                            .num_columns(4)
+                            .spacing(egui::vec2(10.0, 10.0))
+                            .show(ui, |ui| {
+                                for (index, mode) in VoxelEditMode::ALL.into_iter().enumerate() {
+                                    let item = VoxelCreativeItem::Mode(mode);
+                                    let (name, _) = voxel_creative_item_visual(item);
+                                    ui.vertical_centered(|ui| {
+                                        if voxel_creative_drag_source(
+                                            ui,
+                                            egui::Id::new(("voxel_catalog_mode", index)),
+                                            VoxelCreativeDragPayload::Catalog(item),
+                                            item,
+                                            voxel_editor.creative_hotbar
+                                                [voxel_editor.selected_hotbar_slot]
+                                                == Some(item),
+                                            48.0,
+                                            None,
+                                        )
+                                        .clicked()
+                                        {
+                                            picked_item = Some(item);
+                                        }
+                                        ui.small(name);
+                                    });
+                                    if (index + 1) % 4 == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
                         if let Some(status) = voxel_editor.physics_status() {
                             ui.small(status);
                         }
                         ui.add_space(4.0);
-                        ui.small("先选快捷栏格，再从目录取得物品 · 右键快捷栏也可删除 · E 或 Esc 关闭");
+                        ui.small("拖动物品到任意快捷栏格 · 快捷栏内拖动可换位 · 拖到物品栏外删除");
                     });
+                inventory_rect = inventory_window
+                    .as_ref()
+                    .map(|response| response.response.rect);
                 if delete_selected {
                     let slot = voxel_editor.selected_hotbar_slot;
                     voxel_editor.delete_hotbar_slot(slot);
@@ -12052,6 +12203,38 @@ pub fn ui_system(
                 }
                 if !window_open {
                     voxel_editor.creative_inventory_open = false;
+                }
+            }
+
+            if let Some(slot) = hotbar_clicked {
+                voxel_editor.select_hotbar_slot(slot);
+            }
+            if let Some(slot) = hotbar_delete {
+                voxel_editor.delete_hotbar_slot(slot);
+            }
+            if let Some((destination, payload)) = hotbar_drop {
+                match payload {
+                    VoxelCreativeDragPayload::Catalog(item) => {
+                        voxel_editor.selected_hotbar_slot = destination;
+                        voxel_editor.put_in_selected_hotbar(item);
+                    },
+                    VoxelCreativeDragPayload::Hotbar { slot } => {
+                        voxel_editor.swap_hotbar_slots(slot, destination);
+                    },
+                }
+            } else if ctx.input(|input| input.pointer.any_released()) {
+                if let Some(payload) = egui::DragAndDrop::payload::<VoxelCreativeDragPayload>(ctx) {
+                    if let VoxelCreativeDragPayload::Hotbar { slot } = *payload {
+                        let pointer = ctx.pointer_interact_pos();
+                        let outside_hotbar =
+                            pointer.is_none_or(|position| !hotbar_rect.contains(position));
+                        let outside_inventory = inventory_rect.is_none_or(|rect| {
+                            pointer.is_none_or(|position| !rect.contains(position))
+                        });
+                        if outside_hotbar && outside_inventory {
+                            voxel_editor.delete_hotbar_slot(slot);
+                        }
+                    }
                 }
             }
 
