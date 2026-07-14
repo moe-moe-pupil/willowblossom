@@ -7,6 +7,7 @@ pub mod rule_engine;
 mod scene;
 mod ui;
 mod voxel;
+mod voxel_radiance;
 
 use std::path::Path;
 

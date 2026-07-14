@@ -6,6 +6,7 @@ use std::collections::{
 use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
+    core_pipeline::prepass::DepthPrepass,
     image::{
         ImageAddressMode,
         ImageFilterMode,
@@ -23,6 +24,11 @@ use bevy::{
         PrimitiveTopology,
     },
     prelude::*,
+    render::render_resource::{
+        Extent3d,
+        TextureDimension,
+        TextureFormat,
+    },
     window::{
         CursorGrabMode,
         CursorOptions,
@@ -31,6 +37,12 @@ use bevy::{
 };
 use bevy_egui::input::EguiWantsInput;
 use voxxelmaxx::prelude::*;
+
+use crate::voxel_radiance::{
+    VoxelRadianceCascade,
+    VoxelRadianceCascadePlugin,
+    VoxelRadianceCascadeUniform,
+};
 
 const VOXEL_SIZE: f32 = 0.25;
 const MAX_RAY_DISTANCE: f32 = 200.0;
@@ -42,6 +54,7 @@ const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
 const VOXEL_MATERIAL_COUNT: usize = 10;
 const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
+const VOXEL_RADIANCE_MAX_DIMENSION: i32 = 192;
 const FIRST_PERSON_RADIUS: f32 = VOXEL_SIZE * 0.5;
 const FIRST_PERSON_BODY_LENGTH: f32 = VOXEL_SIZE;
 const FIRST_PERSON_EYE_OFFSET: f32 = VOXEL_SIZE;
@@ -122,6 +135,25 @@ struct VoxelAutoDoor {
 #[derive(Resource)]
 struct VoxelMaterials {
     handles: [Handle<StandardMaterial>; VOXEL_MATERIAL_COUNT],
+}
+
+#[derive(Resource, Default)]
+struct VoxelRadianceVolume {
+    image: Handle<Image>,
+    volume_min: Vec3,
+    voxel_world_size: f32,
+    volume_dimensions: Vec3,
+}
+
+impl VoxelRadianceVolume {
+    fn uniform(&self) -> VoxelRadianceCascadeUniform {
+        VoxelRadianceCascadeUniform {
+            volume_min: self.volume_min,
+            voxel_world_size: self.voxel_world_size,
+            volume_dimensions: self.volume_dimensions,
+            intensity: 0.22,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -335,15 +367,18 @@ impl Plugin for TrpgVoxelPlugin {
             PhysicsPlugins::default(),
             VoxelPlugin::<u8>::default(),
             ConnectivityPlugin::<TrpgVoxelConnector>::default(),
+            VoxelRadianceCascadePlugin,
         ))
         .insert_resource(Gravity::ZERO)
         .init_resource::<VoxelEditorState>()
+        .init_resource::<VoxelRadianceVolume>()
         .add_systems(
             Startup,
             (
                 setup_voxel_materials,
                 setup_voxel_grid,
                 populate_voxel_grid,
+                setup_voxel_radiance_volume,
                 setup_voxel_auto_doors,
                 setup_voxel_interior_lights,
                 setup_voxel_sample_props,
@@ -362,6 +397,7 @@ impl Plugin for TrpgVoxelPlugin {
                 process_voxel_scene_history,
                 animate_voxel_auto_doors,
                 rebuild_voxel_geometry,
+                sync_voxel_radiance_volume,
                 control_first_person_player,
                 control_voxel_camera,
                 draw_voxel_target,
@@ -538,6 +574,127 @@ fn hifi_voxel_tile_transform(row: usize) -> Affine2 {
             (row as f32 * TILE_SIZE + 0.5) / ATLAS_HEIGHT,
         ),
     )
+}
+
+fn radiance_voxel_color(material: u8) -> [u8; 4] {
+    match material {
+        1 => [42, 96, 54, 255],
+        2 => [62, 35, 20, 255],
+        3 => [108, 88, 48, 255],
+        5 => [255, 72, 8, 255],
+        6 => [82, 94, 112, 255],
+        7 => [34, 46, 62, 255],
+        8 => [34, 176, 220, 255],
+        9 => [112, 20, 28, 255],
+        10 => [196, 78, 18, 255],
+        _ => [0, 0, 0, 0],
+    }
+}
+
+fn build_voxel_radiance_image(grid: &Grid<u8>) -> (Image, Vec3, f32, Vec3) {
+    let solid_cells = grid
+        .iter()
+        .flat_map(|(chunk_position, chunk)| {
+            prism(IVec3::ZERO, DIMS).filter_map(move |local| {
+                let material = chunk[local];
+                TrpgVoxelConnector::solid(&material)
+                    .then_some((*chunk_position * DIMS + local, material))
+            })
+        })
+        .collect::<Vec<_>>();
+    let min = solid_cells
+        .iter()
+        .map(|(cell, _)| *cell)
+        .reduce(IVec3::min)
+        .unwrap_or(IVec3::ZERO);
+    let max = solid_cells
+        .iter()
+        .map(|(cell, _)| *cell)
+        .reduce(IVec3::max)
+        .unwrap_or(IVec3::ZERO);
+    let extent = max - min + IVec3::ONE;
+    let stride = ((extent.max_element() + VOXEL_RADIANCE_MAX_DIMENSION - 1)
+        / VOXEL_RADIANCE_MAX_DIMENSION)
+        .max(1);
+    let dimensions = (extent + IVec3::splat(stride - 1)) / stride;
+    let texel_count = dimensions.x as usize * dimensions.y as usize * dimensions.z as usize;
+    let mut data = vec![0; texel_count * 4];
+    for (cell, material) in solid_cells {
+        let local = (cell - min) / stride;
+        let index = (local.x + dimensions.x * (local.y + dimensions.y * local.z)) as usize * 4;
+        let color = radiance_voxel_color(material);
+        let old_energy = data[index] as u16 + data[index + 1] as u16 + data[index + 2] as u16;
+        let new_energy = color[0] as u16 + color[1] as u16 + color[2] as u16;
+        if data[index + 3] == 0 || new_energy >= old_energy {
+            data[index..index + 4].copy_from_slice(&color);
+        }
+    }
+    let size = Extent3d {
+        width: dimensions.x.max(1) as u32,
+        height: dimensions.y.max(1) as u32,
+        depth_or_array_layers: dimensions.z.max(1) as u32,
+    };
+    let mut image = Image::new(
+        size,
+        TextureDimension::D3,
+        data,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::ClampToEdge,
+        address_mode_v: ImageAddressMode::ClampToEdge,
+        address_mode_w: ImageAddressMode::ClampToEdge,
+        mag_filter: ImageFilterMode::Nearest,
+        min_filter: ImageFilterMode::Nearest,
+        mipmap_filter: ImageFilterMode::Nearest,
+        ..default()
+    });
+    (
+        image,
+        min.as_vec3() * VOXEL_SIZE,
+        VOXEL_SIZE * stride as f32,
+        dimensions.as_vec3(),
+    )
+}
+
+fn setup_voxel_radiance_volume(
+    grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
+    mut images: ResMut<Assets<Image>>,
+    mut volume: ResMut<VoxelRadianceVolume>,
+) {
+    let Ok(grid) = grids.single() else {
+        return;
+    };
+    let (image, volume_min, voxel_world_size, volume_dimensions) = build_voxel_radiance_image(grid);
+    volume.image = images.add(image);
+    volume.volume_min = volume_min;
+    volume.voxel_world_size = voxel_world_size;
+    volume.volume_dimensions = volume_dimensions;
+}
+
+fn sync_voxel_radiance_volume(
+    grids: Query<&Grid<u8>, (With<TrpgVoxelGrid>, Changed<Grid<u8>>)>,
+    mut images: ResMut<Assets<Image>>,
+    mut volume: ResMut<VoxelRadianceVolume>,
+    mut cameras: Query<&mut VoxelRadianceCascadeUniform, With<VoxelViewportCamera>>,
+) {
+    let Ok(grid) = grids.single() else {
+        return;
+    };
+    let (image, volume_min, voxel_world_size, volume_dimensions) = build_voxel_radiance_image(grid);
+    if images.contains(&volume.image) {
+        *images.get_mut(&volume.image).unwrap() = image;
+    } else {
+        volume.image = images.add(image);
+    }
+    volume.volume_min = volume_min;
+    volume.voxel_world_size = voxel_world_size;
+    volume.volume_dimensions = volume_dimensions;
+    let uniform = volume.uniform();
+    for mut camera_uniform in &mut cameras {
+        *camera_uniform = uniform;
+    }
 }
 
 fn setup_voxel_grid(mut commands: Commands) {
@@ -1439,6 +1596,7 @@ fn animate_voxel_auto_doors(
 fn setup_voxel_view(
     mut commands: Commands,
     editor: Res<VoxelEditorState>,
+    radiance_volume: Res<VoxelRadianceVolume>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -1461,6 +1619,11 @@ fn setup_voxel_view(
     ));
     commands.spawn((
         Camera3d::default(),
+        DepthPrepass,
+        // The radiance-cascade pass samples the viewport depth buffer directly.
+        // Keep this camera single-sampled so that depth is available as a normal
+        // texture instead of an unresolved multisampled attachment.
+        Msaa::Off,
         Camera {
             order: 0,
             clear_color: ClearColorConfig::Custom(Color::srgb(0.055, 0.065, 0.075)),
@@ -1468,6 +1631,10 @@ fn setup_voxel_view(
         },
         editor_camera_transform(&editor),
         VoxelViewportCamera,
+        VoxelRadianceCascade {
+            volume: radiance_volume.image.clone(),
+        },
+        radiance_volume.uniform(),
     ));
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(
@@ -2985,6 +3152,35 @@ mod tests {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
         assert!(grid.count() > 225);
+    }
+
+    #[test]
+    fn radiance_volume_contains_scene_voxels_and_stays_gpu_bounded() {
+        let (app, entity) = test_grid();
+        let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
+        let (image, _volume_min, voxel_world_size, volume_dimensions) =
+            build_voxel_radiance_image(grid);
+
+        assert_eq!(
+            image.texture_descriptor.dimension,
+            TextureDimension::D3
+        );
+        assert!(volume_dimensions.max_element() <= VOXEL_RADIANCE_MAX_DIMENSION as f32);
+        assert!(voxel_world_size >= VOXEL_SIZE);
+        assert_eq!(
+            image.texture_descriptor.size.width,
+            volume_dimensions.x as u32
+        );
+        assert_eq!(
+            image.texture_descriptor.size.height,
+            volume_dimensions.y as u32
+        );
+        assert_eq!(
+            image.texture_descriptor.size.depth_or_array_layers,
+            volume_dimensions.z as u32
+        );
+        let data = image.data.as_ref().expect("radiance volume has CPU texels");
+        assert!(data.chunks_exact(4).any(|rgba| rgba[3] != 0));
     }
 
     #[test]
