@@ -6,10 +6,8 @@ use std::collections::{
 use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
-    core_pipeline::fullscreen_material::{
-        FullscreenMaterial,
-        FullscreenMaterialPlugin,
-    },
+    camera::Hdr,
+    core_pipeline::tonemapping::Tonemapping,
     image::{
         ImageAddressMode,
         ImageFilterMode,
@@ -21,17 +19,18 @@ use bevy::{
         MouseMotion,
         MouseWheel,
     },
+    light::{
+        FogVolume,
+        VolumetricFog,
+        VolumetricLight,
+    },
     math::Affine2,
     mesh::{
         Indices,
         PrimitiveTopology,
     },
+    post_process::bloom::Bloom,
     prelude::*,
-    render::{
-        extract_component::ExtractComponent,
-        render_resource::ShaderType,
-    },
-    shader::ShaderRef,
     window::{
         CursorGrabMode,
         CursorOptions,
@@ -61,32 +60,8 @@ const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const FIRST_PERSON_START: Vec3 = Vec3::new(-6.5, 0.32, 41.25);
 const DEFAULT_SCENE_CAMERA_FOCUS: Vec3 = Vec3::new(0.0, 2.5, 37.5);
 const DEFAULT_SCENE_CAMERA_DISTANCE: f32 = 42.0;
-const VOXEL_CARTOON_SHADER: &str = "shaders/voxel_kuwahara.wgsl";
 
 pub struct TrpgVoxelPlugin;
-
-#[derive(Component, ExtractComponent, Clone, Copy, ShaderType)]
-struct VoxelCartoonFilter {
-    radius: f32,
-    brightness: f32,
-    saturation: f32,
-    edge_strength: f32,
-}
-
-impl Default for VoxelCartoonFilter {
-    fn default() -> Self {
-        Self {
-            radius: 2.0,
-            brightness: 1.16,
-            saturation: 1.08,
-            edge_strength: 0.1,
-        }
-    }
-}
-
-impl FullscreenMaterial for VoxelCartoonFilter {
-    fn fragment_shader() -> ShaderRef { VOXEL_CARTOON_SHADER.into() }
-}
 
 pub struct TrpgVoxelConnector;
 
@@ -138,8 +113,13 @@ struct VoxelAutoDoor {
     trigger_center: Vec3,
     trigger_radius: f32,
     material: u8,
+    closed_translation: Vec3,
+    open_translation: Vec3,
     open: bool,
 }
+
+#[derive(Component)]
+struct VoxelRadianceCascade;
 
 #[derive(Resource)]
 struct VoxelMaterials {
@@ -355,7 +335,6 @@ impl Plugin for TrpgVoxelPlugin {
             PhysicsPlugins::default(),
             VoxelPlugin::<u8>::default(),
             ConnectivityPlugin::<TrpgVoxelConnector>::default(),
-            FullscreenMaterialPlugin::<VoxelCartoonFilter>::default(),
         ))
         .insert_resource(Gravity::ZERO)
         .init_resource::<VoxelEditorState>()
@@ -367,6 +346,7 @@ impl Plugin for TrpgVoxelPlugin {
                 populate_voxel_grid,
                 setup_voxel_auto_doors,
                 setup_voxel_interior_lights,
+                setup_voxel_radiance_cascades,
                 setup_voxel_sample_props,
                 setup_voxel_view,
             )
@@ -583,7 +563,7 @@ fn populate_default_grid(grid: &mut Mut<Grid<u8>>) {
     build_combat_spaceship(grid);
     for door in voxel_auto_doors() {
         for cell in door.cells {
-            grid.set(cell, door.material);
+            grid.set(cell, 0);
         }
     }
 }
@@ -1201,18 +1181,42 @@ fn make_voxel_auto_door(
         .collect::<Vec<_>>();
     let trigger_center =
         (base.as_vec3() + Vec3::new(0.5, (height + 1) as f32 * 0.5, 0.5)) * VOXEL_SIZE;
+    let (closed_translation, size) = voxel_door_transform_and_size(&cells);
     VoxelAutoDoor {
         cells,
         trigger_center,
         trigger_radius,
         material: 10,
+        closed_translation,
+        open_translation: closed_translation + Vec3::Y * (size.y + VOXEL_SIZE),
         open: false,
     }
 }
 
-fn setup_voxel_auto_doors(mut commands: Commands) {
+fn voxel_door_transform_and_size(cells: &[IVec3]) -> (Vec3, Vec3) {
+    let min = cells.iter().copied().reduce(IVec3::min).unwrap_or_default();
+    let max = cells.iter().copied().reduce(IVec3::max).unwrap_or_default();
+    let size = (max - min + IVec3::ONE).as_vec3() * VOXEL_SIZE;
+    let translation = (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE;
+    (translation, size)
+}
+
+fn setup_voxel_auto_doors(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
+) {
     for door in voxel_auto_doors() {
-        commands.spawn(door);
+        let (_, size) = voxel_door_transform_and_size(&door.cells);
+        let translation = door.closed_translation;
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+            MeshMaterial3d(materials.handles[door.material as usize - 1].clone()),
+            Transform::from_translation(translation),
+            RigidBody::Kinematic,
+            Collider::cuboid(size.x, size.y, size.z),
+            door,
+        ));
     }
 }
 
@@ -1266,8 +1270,8 @@ fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
 }
 
 fn setup_voxel_interior_lights(mut commands: Commands) {
-    for (position, color) in voxel_interior_lights() {
-        commands.spawn((
+    for (index, (position, color)) in voxel_interior_lights().into_iter().enumerate() {
+        let mut light = commands.spawn((
             PointLight {
                 color,
                 intensity: 18_000.0,
@@ -1276,6 +1280,48 @@ fn setup_voxel_interior_lights(mut commands: Commands) {
                 ..default()
             },
             Transform::from_translation(position),
+        ));
+        if index % 6 == 0 {
+            light.insert(VolumetricLight);
+        }
+    }
+}
+
+fn setup_voxel_radiance_cascades(mut commands: Commands) {
+    let center = Vec3::new(0.0, 4.0, 18.0);
+    for (scale, density, tint, light_intensity) in [
+        (
+            Vec3::new(18.0, 10.0, 44.0),
+            0.008,
+            Color::srgb(0.72, 0.86, 1.0),
+            0.75,
+        ),
+        (
+            Vec3::new(42.0, 20.0, 62.0),
+            0.004,
+            Color::srgb(0.82, 0.88, 1.0),
+            0.48,
+        ),
+        (
+            Vec3::new(72.0, 34.0, 82.0),
+            0.0015,
+            Color::srgb(0.9, 0.93, 1.0),
+            0.25,
+        ),
+    ] {
+        commands.spawn((
+            FogVolume {
+                fog_color: tint,
+                density_factor: density,
+                absorption: 0.04,
+                scattering: 0.72,
+                scattering_asymmetry: 0.28,
+                light_tint: tint,
+                light_intensity,
+                ..default()
+            },
+            Transform::from_translation(center).with_scale(scale),
+            VoxelRadianceCascade,
         ));
     }
 }
@@ -1374,27 +1420,34 @@ fn setup_voxel_sample_props(mut commands: Commands, asset_server: Res<AssetServe
 }
 
 fn animate_voxel_auto_doors(
+    time: Res<Time>,
     editor: Res<VoxelEditorState>,
-    players: Query<&Transform, With<VoxelFirstPersonPlayer>>,
-    mut doors: Query<&mut VoxelAutoDoor>,
-    mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    players: Query<
+        &Transform,
+        (
+            With<VoxelFirstPersonPlayer>,
+            Without<VoxelAutoDoor>,
+        ),
+    >,
+    mut doors: Query<
+        (&mut VoxelAutoDoor, &mut Transform),
+        (
+            With<VoxelAutoDoor>,
+            Without<VoxelFirstPersonPlayer>,
+        ),
+    >,
 ) {
-    let (Ok(player), Ok(mut grid)) = (players.single(), grids.single_mut()) else {
+    let Ok(player) = players.single() else {
         return;
     };
-    for mut door in &mut doors {
+    let response = 1.0 - (-14.0 * time.delta_secs()).exp();
+    for (mut door, mut transform) in &mut doors {
         let should_open = editor.first_person_enabled
             && player.translation.distance(door.trigger_center) <= door.trigger_radius;
-        let desired_material = if should_open { 0 } else { door.material };
-        let cells_need_update = door
-            .cells
-            .iter()
-            .any(|cell| grid.get(*cell).copied().unwrap_or(0) != desired_material);
-        if should_open == door.open && !cells_need_update {
-            continue;
-        }
-        for cell in &door.cells {
-            grid.set(*cell, desired_material);
+        let target = if should_open { door.open_translation } else { door.closed_translation };
+        transform.translation = transform.translation.lerp(target, response);
+        if transform.translation.distance_squared(target) < 0.000_001 {
+            transform.translation = target;
         }
         door.open = should_open;
     }
@@ -1413,6 +1466,7 @@ fn setup_voxel_view(
             ..default()
         },
         Transform::from_xyz(8.0, 16.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
+        VolumetricLight,
     ));
     commands.spawn((
         Camera3d::default(),
@@ -1422,7 +1476,18 @@ fn setup_voxel_view(
             ..default()
         },
         editor_camera_transform(&editor),
-        VoxelCartoonFilter::default(),
+        Hdr,
+        Tonemapping::TonyMcMapface,
+        Bloom {
+            intensity: 0.08,
+            ..Bloom::NATURAL
+        },
+        VolumetricFog {
+            ambient_color: Color::srgb(0.62, 0.72, 0.9),
+            ambient_intensity: 0.11,
+            jitter: 0.0,
+            step_count: 48,
+        },
         VoxelViewportCamera,
     ));
     commands.spawn((
@@ -3007,7 +3072,7 @@ mod tests {
         assert!(voxel_cells(grid).len() >= 100_000);
         assert_eq!(
             materials,
-            HashSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+            HashSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9])
         );
 
         let doors = voxel_auto_doors();
@@ -3019,7 +3084,10 @@ mod tests {
         assert!(doors
             .iter()
             .flat_map(|door| &door.cells)
-            .all(|cell| { grid.get(*cell).copied() == Some(10) }));
+            .all(|cell| { grid.get(*cell).copied().unwrap_or(0) == 0 }));
+        assert!(doors
+            .iter()
+            .all(|door| door.open_translation.y > door.closed_translation.y));
 
         let lights = voxel_interior_lights();
         assert_eq!(lights.len(), 62);
@@ -3159,7 +3227,8 @@ mod tests {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
         let (meshes, colliders) = build_voxel_meshes(grid);
-        assert_eq!(meshes.len(), VOXEL_MATERIAL_COUNT);
+        // The tenth material belongs to independent door meshes, not the voxel grid.
+        assert_eq!(meshes.len(), VOXEL_MATERIAL_COUNT - 1);
         assert!(!colliders.is_empty());
         for (_, mesh) in meshes {
             assert!(mesh.attribute(Mesh::ATTRIBUTE_POSITION).is_some());
