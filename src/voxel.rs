@@ -54,6 +54,8 @@ const EDIT_REPEAT_INTERVAL: f32 = 0.09;
 const TRPG_PHYSICS_SUBSTEPS: u32 = 2;
 const ORBITAL_PLANET_RADIUS: f32 = 240.0;
 const ORBITAL_PLANET_CENTER: Vec3 = Vec3::new(0.0, -360.0, 0.0);
+const ORBITAL_PLANET_VOXEL_RADIUS: i32 = 24;
+const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.5;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
 const VOXEL_MATERIAL_COUNT: usize = 10;
@@ -2176,7 +2178,7 @@ fn setup_voxel_view(
     editor: Res<VoxelEditorState>,
     radiance_volume: Res<VoxelRadianceVolume>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    voxel_materials: Res<VoxelMaterials>,
 ) {
     commands.spawn((
         DirectionalLight {
@@ -2223,20 +2225,11 @@ fn setup_voxel_view(
         },
         radiance_volume.uniform(editor.radiance_intensity),
     ));
-    commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(ORBITAL_PLANET_RADIUS))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.035, 0.14, 0.24),
-            emissive: LinearRgba::rgb(0.003, 0.012, 0.025),
-            metallic: 0.08,
-            perceptual_roughness: 0.9,
-            ..default()
-        })),
-        RigidBody::Static,
-        Collider::sphere(ORBITAL_PLANET_RADIUS),
-        Transform::from_translation(ORBITAL_PLANET_CENTER),
-        VoxelOrbitalPlanet,
-    ));
+    spawn_voxel_orbital_planet(
+        &mut commands,
+        &mut meshes,
+        &voxel_materials,
+    );
     let player_collider = Collider::capsule(
         FIRST_PERSON_RADIUS,
         FIRST_PERSON_BODY_LENGTH,
@@ -2260,6 +2253,69 @@ fn setup_voxel_view(
         ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
         Transform::from_translation(FIRST_PERSON_START),
     ));
+}
+
+fn voxel_orbital_planet_cells() -> Vec<(IVec3, u8)> {
+    let radius = ORBITAL_PLANET_VOXEL_RADIUS as f32;
+    let inner_radius = radius - ORBITAL_PLANET_SHELL_THICKNESS;
+    let outer_squared = (radius + 0.5).powi(2);
+    let inner_squared = inner_radius.powi(2);
+    let mut cells = Vec::new();
+    for x in -ORBITAL_PLANET_VOXEL_RADIUS..=ORBITAL_PLANET_VOXEL_RADIUS {
+        for y in -ORBITAL_PLANET_VOXEL_RADIUS..=ORBITAL_PLANET_VOXEL_RADIUS {
+            for z in -ORBITAL_PLANET_VOXEL_RADIUS..=ORBITAL_PLANET_VOXEL_RADIUS {
+                let distance_squared = IVec3::new(x, y, z).as_vec3().length_squared();
+                if !(inner_squared..=outer_squared).contains(&distance_squared) {
+                    continue;
+                }
+                let continental = (x as f32 * 0.19).sin()
+                    + (z as f32 * 0.16).cos()
+                    + ((x + z) as f32 * 0.11).sin()
+                    + (y as f32 * 0.23).cos() * 0.35;
+                let material = if y.abs() >= ORBITAL_PLANET_VOXEL_RADIUS - 3 {
+                    3
+                } else if continental > 0.72 {
+                    1
+                } else if continental > 0.52 {
+                    3
+                } else {
+                    4
+                };
+                cells.push((IVec3::new(x, y, z), material));
+            }
+        }
+    }
+    cells
+}
+
+fn spawn_voxel_orbital_planet(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &VoxelMaterials,
+) -> Entity {
+    let cells = voxel_orbital_planet_cells();
+    let (material_meshes, _) = build_voxel_meshes_from_cells(&cells);
+    let voxel_scale =
+        ORBITAL_PLANET_RADIUS / ((ORBITAL_PLANET_VOXEL_RADIUS as f32 + 0.5) * VOXEL_SIZE);
+    let mesh_center_offset = Vec3::splat(-0.5 * VOXEL_SIZE * voxel_scale);
+    commands
+        .spawn((
+            VoxelOrbitalPlanet,
+            RigidBody::Static,
+            Collider::sphere(ORBITAL_PLANET_RADIUS),
+            Transform::from_translation(ORBITAL_PLANET_CENTER),
+        ))
+        .with_children(|parent| {
+            for (material_id, mesh) in material_meshes {
+                parent.spawn((
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
+                    Transform::from_translation(mesh_center_offset)
+                        .with_scale(Vec3::splat(voxel_scale)),
+                ));
+            }
+        })
+        .id()
 }
 
 fn editor_camera_transform(editor: &VoxelEditorState) -> Transform {
@@ -4367,6 +4423,19 @@ mod tests {
             let horizontal = center.as_vec3() * VOXEL_SIZE - ORBITAL_PLANET_CENTER;
             assert!(Vec2::new(horizontal.x, horizontal.z).length() < ORBITAL_PLANET_RADIUS);
         }
+
+        let planet_cells = voxel_orbital_planet_cells();
+        assert!((10_000..=30_000).contains(&planet_cells.len()));
+        assert_eq!(
+            planet_cells
+                .iter()
+                .map(|(_, material)| *material)
+                .collect::<HashSet<_>>(),
+            HashSet::from([1, 3, 4])
+        );
+        assert!(planet_cells
+            .iter()
+            .all(|(cell, _)| { cell.abs().max_element() <= ORBITAL_PLANET_VOXEL_RADIUS }));
     }
 
     #[test]
