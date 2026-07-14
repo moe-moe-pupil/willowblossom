@@ -11651,6 +11651,44 @@ pub fn ui_system(
                             voxel_editor.mode.label()
                         ));
                     }
+                    ui.collapsing("光照编辑器", |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("环境光");
+                            ui.add(
+                                egui::DragValue::new(&mut voxel_editor.ambient_brightness)
+                                    .range(0.0..=500.0)
+                                    .speed(1.0),
+                            );
+                            ui.label("主光");
+                            ui.add(
+                                egui::DragValue::new(&mut voxel_editor.key_light_illuminance)
+                                    .range(0.0..=50_000.0)
+                                    .speed(100.0),
+                            );
+                            ui.label("补光");
+                            ui.add(
+                                egui::DragValue::new(&mut voxel_editor.fill_light_illuminance)
+                                    .range(0.0..=50_000.0)
+                                    .speed(100.0),
+                            );
+                            ui.label("辐射级联");
+                            ui.add(
+                                egui::DragValue::new(&mut voxel_editor.radiance_intensity)
+                                    .range(0.0..=3.0)
+                                    .speed(0.02),
+                            );
+                            if ui
+                                .button("仅检查级联")
+                                .on_hover_text("关闭环境光、主光和补光，只显示体素发光与间接光")
+                                .clicked()
+                            {
+                                voxel_editor.inspect_radiance_lighting();
+                            }
+                            if ui.button("恢复默认光照").clicked() {
+                                voxel_editor.reset_lighting();
+                            }
+                        });
+                    });
                     let snapshot_labels = voxel_editor.scene_snapshot_labels();
                     ui.collapsing(
                         format!("场景历史（{}）", snapshot_labels.len()),

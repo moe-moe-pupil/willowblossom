@@ -55,6 +55,10 @@ const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
 const VOXEL_MATERIAL_COUNT: usize = 10;
 const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
 const VOXEL_RADIANCE_MAX_DIMENSION: i32 = 192;
+const DEFAULT_AMBIENT_BRIGHTNESS: f32 = 72.0;
+const DEFAULT_KEY_LIGHT_ILLUMINANCE: f32 = 8_500.0;
+const DEFAULT_FILL_LIGHT_ILLUMINANCE: f32 = 1_600.0;
+const DEFAULT_RADIANCE_INTENSITY: f32 = 0.55;
 const FIRST_PERSON_RADIUS: f32 = VOXEL_SIZE * 0.5;
 const FIRST_PERSON_BODY_LENGTH: f32 = VOXEL_SIZE;
 const FIRST_PERSON_EYE_OFFSET: f32 = VOXEL_SIZE;
@@ -119,6 +123,12 @@ struct VoxelSceneSnapshot {
 struct VoxelTestingGround;
 
 #[derive(Component)]
+struct VoxelKeyLight;
+
+#[derive(Component)]
+struct VoxelFillLight;
+
+#[derive(Component)]
 struct VoxelFirstPersonPlayer;
 
 #[derive(Component, Clone)]
@@ -146,12 +156,12 @@ struct VoxelRadianceVolume {
 }
 
 impl VoxelRadianceVolume {
-    fn uniform(&self) -> VoxelRadianceCascadeUniform {
+    fn uniform(&self, intensity: f32) -> VoxelRadianceCascadeUniform {
         VoxelRadianceCascadeUniform {
             volume_min: self.volume_min,
             voxel_world_size: self.voxel_world_size,
             volume_dimensions: self.volume_dimensions,
-            intensity: 0.22,
+            intensity,
         }
     }
 }
@@ -236,6 +246,10 @@ pub(crate) struct VoxelEditorState {
     pub physics_push_pull_impulse: f32,
     pub physics_explosion_impulse: f32,
     pub physics_explosion_radius: f32,
+    pub ambient_brightness: f32,
+    pub key_light_illuminance: f32,
+    pub fill_light_illuminance: f32,
+    pub radiance_intensity: f32,
     undo: Vec<Vec<VoxelChange>>,
     redo: Vec<Vec<VoxelChange>>,
     stroke_positions: HashSet<IVec3>,
@@ -278,6 +292,10 @@ impl Default for VoxelEditorState {
             physics_push_pull_impulse: 4.0,
             physics_explosion_impulse: 14.0,
             physics_explosion_radius: 6.0,
+            ambient_brightness: DEFAULT_AMBIENT_BRIGHTNESS,
+            key_light_illuminance: DEFAULT_KEY_LIGHT_ILLUMINANCE,
+            fill_light_illuminance: DEFAULT_FILL_LIGHT_ILLUMINANCE,
+            radiance_intensity: DEFAULT_RADIANCE_INTENSITY,
             undo: Vec::new(),
             redo: Vec::new(),
             stroke_positions: HashSet::new(),
@@ -359,6 +377,20 @@ impl VoxelEditorState {
         }
         self.physics_status = None;
     }
+
+    pub(crate) fn inspect_radiance_lighting(&mut self) {
+        self.ambient_brightness = 0.0;
+        self.key_light_illuminance = 0.0;
+        self.fill_light_illuminance = 0.0;
+        self.radiance_intensity = 1.2;
+    }
+
+    pub(crate) fn reset_lighting(&mut self) {
+        self.ambient_brightness = DEFAULT_AMBIENT_BRIGHTNESS;
+        self.key_light_illuminance = DEFAULT_KEY_LIGHT_ILLUMINANCE;
+        self.fill_light_illuminance = DEFAULT_FILL_LIGHT_ILLUMINANCE;
+        self.radiance_intensity = DEFAULT_RADIANCE_INTENSITY;
+    }
 }
 
 impl Plugin for TrpgVoxelPlugin {
@@ -398,6 +430,7 @@ impl Plugin for TrpgVoxelPlugin {
                 animate_voxel_auto_doors,
                 rebuild_voxel_geometry,
                 sync_voxel_radiance_volume,
+                sync_voxel_lighting,
                 control_first_person_player,
                 control_voxel_camera,
                 draw_voxel_target,
@@ -554,7 +587,7 @@ fn setup_voxel_materials(
     commands.insert_resource(VoxelMaterials { handles });
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.48, 0.56, 0.68),
-        brightness: 145.0,
+        brightness: DEFAULT_AMBIENT_BRIGHTNESS,
         ..default()
     });
 }
@@ -672,6 +705,7 @@ fn setup_voxel_radiance_volume(
 
 fn sync_voxel_radiance_volume(
     grids: Query<&Grid<u8>, (With<TrpgVoxelGrid>, Changed<Grid<u8>>)>,
+    editor: Res<VoxelEditorState>,
     mut images: ResMut<Assets<Image>>,
     mut volume: ResMut<VoxelRadianceVolume>,
     mut cameras: Query<&mut VoxelRadianceCascadeUniform, With<VoxelViewportCamera>>,
@@ -688,9 +722,35 @@ fn sync_voxel_radiance_volume(
     volume.volume_min = volume_min;
     volume.voxel_world_size = voxel_world_size;
     volume.volume_dimensions = volume_dimensions;
-    let uniform = volume.uniform();
+    let uniform = volume.uniform(editor.radiance_intensity);
     for mut camera_uniform in &mut cameras {
         *camera_uniform = uniform;
+    }
+}
+
+fn sync_voxel_lighting(
+    editor: Res<VoxelEditorState>,
+    mut ambient: ResMut<GlobalAmbientLight>,
+    mut lights: Query<(
+        &mut DirectionalLight,
+        Option<&VoxelKeyLight>,
+        Option<&VoxelFillLight>,
+    )>,
+    mut cameras: Query<&mut VoxelRadianceCascadeUniform, With<VoxelViewportCamera>>,
+) {
+    if !editor.is_changed() {
+        return;
+    }
+    ambient.brightness = editor.ambient_brightness.max(0.0);
+    for (mut light, key, fill) in &mut lights {
+        if key.is_some() {
+            light.illuminance = editor.key_light_illuminance.max(0.0);
+        } else if fill.is_some() {
+            light.illuminance = editor.fill_light_illuminance.max(0.0);
+        }
+    }
+    for mut uniform in &mut cameras {
+        uniform.intensity = editor.radiance_intensity.max(0.0);
     }
 }
 
@@ -1599,19 +1659,21 @@ fn setup_voxel_view(
 ) {
     commands.spawn((
         DirectionalLight {
-            illuminance: 8_500.0,
+            illuminance: DEFAULT_KEY_LIGHT_ILLUMINANCE,
             shadow_maps_enabled: true,
             ..default()
         },
+        VoxelKeyLight,
         Transform::from_xyz(8.0, 16.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
         DirectionalLight {
             color: Color::srgb(0.5, 0.65, 1.0),
-            illuminance: 3_200.0,
+            illuminance: DEFAULT_FILL_LIGHT_ILLUMINANCE,
             shadow_maps_enabled: false,
             ..default()
         },
+        VoxelFillLight,
         Transform::from_xyz(-12.0, 8.0, -18.0).looking_at(Vec3::new(0.0, 2.0, 30.0), Vec3::Y),
     ));
     commands.spawn((
@@ -1631,7 +1693,7 @@ fn setup_voxel_view(
         VoxelRadianceCascade {
             volume: radiance_volume.image.clone(),
         },
-        radiance_volume.uniform(),
+        radiance_volume.uniform(editor.radiance_intensity),
     ));
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(
@@ -3192,6 +3254,104 @@ mod tests {
             34, 176, 220, 255
         ]);
         assert_eq!(radiance_voxel_color(0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn radiance_inspection_preset_disables_direct_lighting() {
+        let mut editor = VoxelEditorState::default();
+        editor.inspect_radiance_lighting();
+        assert_eq!(editor.ambient_brightness, 0.0);
+        assert_eq!(editor.key_light_illuminance, 0.0);
+        assert_eq!(editor.fill_light_illuminance, 0.0);
+        assert_eq!(editor.radiance_intensity, 1.2);
+
+        editor.reset_lighting();
+        assert_eq!(
+            editor.ambient_brightness,
+            DEFAULT_AMBIENT_BRIGHTNESS
+        );
+        assert_eq!(
+            editor.key_light_illuminance,
+            DEFAULT_KEY_LIGHT_ILLUMINANCE
+        );
+        assert_eq!(
+            editor.fill_light_illuminance,
+            DEFAULT_FILL_LIGHT_ILLUMINANCE
+        );
+        assert_eq!(
+            editor.radiance_intensity,
+            DEFAULT_RADIANCE_INTENSITY
+        );
+    }
+
+    #[test]
+    fn lighting_editor_values_sync_to_scene_components() {
+        let mut app = App::new();
+        let mut editor = VoxelEditorState::default();
+        editor.ambient_brightness = 12.0;
+        editor.key_light_illuminance = 3_000.0;
+        editor.fill_light_illuminance = 900.0;
+        editor.radiance_intensity = 0.8;
+        app.insert_resource(editor)
+            .insert_resource(GlobalAmbientLight::default())
+            .add_systems(Update, sync_voxel_lighting);
+        let key = app
+            .world_mut()
+            .spawn((
+                DirectionalLight::default(),
+                VoxelKeyLight,
+            ))
+            .id();
+        let fill = app
+            .world_mut()
+            .spawn((
+                DirectionalLight::default(),
+                VoxelFillLight,
+            ))
+            .id();
+        let camera = app
+            .world_mut()
+            .spawn((
+                VoxelViewportCamera,
+                VoxelRadianceCascadeUniform {
+                    volume_min: Vec3::ZERO,
+                    voxel_world_size: VOXEL_SIZE,
+                    volume_dimensions: Vec3::ONE,
+                    intensity: 0.0,
+                },
+            ))
+            .id();
+
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<GlobalAmbientLight>().brightness,
+            12.0
+        );
+        assert_eq!(
+            app.world()
+                .entity(key)
+                .get::<DirectionalLight>()
+                .unwrap()
+                .illuminance,
+            3_000.0
+        );
+        assert_eq!(
+            app.world()
+                .entity(fill)
+                .get::<DirectionalLight>()
+                .unwrap()
+                .illuminance,
+            900.0
+        );
+        assert_eq!(
+            app.world()
+                .entity(camera)
+                .get::<VoxelRadianceCascadeUniform>()
+                .unwrap()
+                .intensity,
+            0.8
+        );
     }
 
     #[test]

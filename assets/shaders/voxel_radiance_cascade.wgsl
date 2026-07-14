@@ -74,7 +74,10 @@ fn cascade_radiance(origin: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
             if weight > 0.05 {
                 let traced = trace_interval(origin, direction, interval_start, interval_end);
                 radiance += traced.rgb * weight;
-                weight_sum += weight * traced.a;
+                // Missed and occluded rays are black samples and must remain in
+                // the hemisphere average. Normalizing by hits alone amplified a
+                // single emissive hit into the yellow center-screen speckles.
+                weight_sum += weight;
             }
         }
         if weight_sum > 0.0 {
