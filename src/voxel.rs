@@ -51,6 +51,7 @@ const VOXEL_SIZE: f32 = 0.25;
 const MAX_RAY_DISTANCE: f32 = 200.0;
 const EDIT_REPEAT_DELAY: f32 = 0.32;
 const EDIT_REPEAT_INTERVAL: f32 = 0.09;
+const TRPG_PHYSICS_SUBSTEPS: u32 = 2;
 const ORBITAL_PLANET_RADIUS: f32 = 240.0;
 const ORBITAL_PLANET_CENTER: Vec3 = Vec3::new(0.0, -360.0, 0.0);
 const MAX_SCENE_SNAPSHOTS: usize = 20;
@@ -600,6 +601,9 @@ impl Plugin for TrpgVoxelPlugin {
             ConnectivityPlugin::<TrpgVoxelConnector>::default(),
             VoxelRadianceCascadePlugin,
         ))
+        // Avian defaults to six substeps. Two is sufficient for this creative TRPG scene and
+        // avoids repeating the solver six times when an explosion creates many fragments.
+        .insert_resource(SubstepCount(TRPG_PHYSICS_SUBSTEPS))
         .insert_resource(Gravity::ZERO)
         .init_resource::<VoxelEditorState>()
         .init_resource::<VoxelRadianceVolume>()
@@ -4425,6 +4429,12 @@ mod tests {
         assert!((total_height - VOXEL_SIZE * 2.0).abs() < f32::EPSILON);
         assert!((FIRST_PERSON_RADIUS * 2.0 - VOXEL_SIZE).abs() < f32::EPSILON);
         assert!((FIRST_PERSON_EYE_OFFSET - VOXEL_SIZE).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn trpg_physics_uses_fewer_substeps_than_avian_default() {
+        assert_eq!(TRPG_PHYSICS_SUBSTEPS, 2);
+        assert!(TRPG_PHYSICS_SUBSTEPS < SubstepCount::default().0);
     }
 
     #[test]
