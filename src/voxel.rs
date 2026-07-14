@@ -6,6 +6,10 @@ use std::collections::{
 use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
+    core_pipeline::fullscreen_material::{
+        FullscreenMaterial,
+        FullscreenMaterialPlugin,
+    },
     image::{
         ImageAddressMode,
         ImageFilterMode,
@@ -23,6 +27,11 @@ use bevy::{
         PrimitiveTopology,
     },
     prelude::*,
+    render::{
+        extract_component::ExtractComponent,
+        render_resource::ShaderType,
+    },
+    shader::ShaderRef,
     window::{
         CursorGrabMode,
         CursorOptions,
@@ -40,7 +49,7 @@ const TEST_GROUND_SIZE: Vec3 = Vec3::new(256.0, 0.5, 256.0);
 const TEST_GROUND_CENTER_Y: f32 = -50.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
-const VOXEL_MATERIAL_COUNT: usize = 9;
+const VOXEL_MATERIAL_COUNT: usize = 10;
 const FIRST_PERSON_RADIUS: f32 = 0.03;
 const FIRST_PERSON_BODY_LENGTH: f32 = 0.065;
 const FIRST_PERSON_EYE_OFFSET: f32 = 0.045;
@@ -52,15 +61,39 @@ const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const FIRST_PERSON_START: Vec3 = Vec3::new(-6.5, 0.32, 41.25);
 const DEFAULT_SCENE_CAMERA_FOCUS: Vec3 = Vec3::new(0.0, 2.5, 37.5);
 const DEFAULT_SCENE_CAMERA_DISTANCE: f32 = 42.0;
+const VOXEL_CARTOON_SHADER: &str = "shaders/voxel_kuwahara.wgsl";
 
 pub struct TrpgVoxelPlugin;
+
+#[derive(Component, ExtractComponent, Clone, Copy, ShaderType)]
+struct VoxelCartoonFilter {
+    radius: f32,
+    brightness: f32,
+    saturation: f32,
+    edge_strength: f32,
+}
+
+impl Default for VoxelCartoonFilter {
+    fn default() -> Self {
+        Self {
+            radius: 2.0,
+            brightness: 1.16,
+            saturation: 1.08,
+            edge_strength: 0.1,
+        }
+    }
+}
+
+impl FullscreenMaterial for VoxelCartoonFilter {
+    fn fragment_shader() -> ShaderRef { VOXEL_CARTOON_SHADER.into() }
+}
 
 pub struct TrpgVoxelConnector;
 
 impl Connector for TrpgVoxelConnector {
     type Item = u8;
 
-    fn solid(voxel: &Self::Item) -> bool { matches!(*voxel, 1..=3 | 6..=8) }
+    fn solid(voxel: &Self::Item) -> bool { matches!(*voxel, 1..=3 | 6..=10) }
 }
 
 #[derive(Component)]
@@ -322,6 +355,7 @@ impl Plugin for TrpgVoxelPlugin {
             PhysicsPlugins::default(),
             VoxelPlugin::<u8>::default(),
             ConnectivityPlugin::<TrpgVoxelConnector>::default(),
+            FullscreenMaterialPlugin::<VoxelCartoonFilter>::default(),
         ))
         .insert_resource(Gravity::ZERO)
         .init_resource::<VoxelEditorState>()
@@ -443,28 +477,50 @@ fn setup_voxel_materials(
                 perceptual_roughness: 0.34,
                 ..default()
             }
-        } else {
+        } else if index == 8 {
             StandardMaterial {
                 base_color: Color::srgb(0.28, 0.008, 0.014),
                 metallic: 0.72,
                 perceptual_roughness: 0.44,
                 ..default()
             }
+        } else {
+            StandardMaterial {
+                base_color: Color::srgb(0.46, 0.12, 0.018),
+                emissive: LinearRgba::rgb(0.42, 0.075, 0.008),
+                metallic: 0.62,
+                perceptual_roughness: 0.32,
+                ..default()
+            }
         };
         match index {
+            0 => {
+                material.emissive = LinearRgba::rgb(0.04, 0.1, 0.045);
+            },
+            1 => {
+                material.emissive = LinearRgba::rgb(0.045, 0.022, 0.01);
+            },
+            2 => {
+                material.emissive = LinearRgba::rgb(0.11, 0.085, 0.035);
+            },
             3 => {
                 material.base_color = Color::srgba(0.72, 0.9, 1.0, 0.72);
                 material.alpha_mode = AlphaMode::Blend;
                 material.perceptual_roughness = 0.18;
                 material.reflectance = 0.65;
+                material.emissive = LinearRgba::rgb(0.025, 0.08, 0.16);
             },
             4 => {
                 material.emissive_texture = Some(textures[index].clone());
                 material.emissive = LinearRgba::rgb(5.0, 0.55, 0.02);
                 material.perceptual_roughness = 0.55;
             },
+            5 => {
+                material.emissive = LinearRgba::rgb(0.11, 0.14, 0.19);
+                material.perceptual_roughness = 0.4;
+            },
             6 => {
-                material.emissive = LinearRgba::rgb(0.018, 0.022, 0.028);
+                material.emissive = LinearRgba::rgb(0.055, 0.07, 0.09);
                 material.perceptual_roughness = 0.48;
             },
             7 => {
@@ -473,14 +529,17 @@ fn setup_voxel_materials(
                 material.emissive = LinearRgba::rgb(0.2, 3.2, 4.4);
                 material.metallic = 0.25;
             },
+            8 => {
+                material.emissive = LinearRgba::rgb(0.085, 0.002, 0.004);
+            },
             _ => {},
         }
         materials.add(material)
     });
     commands.insert_resource(VoxelMaterials { handles });
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.34, 0.42, 0.55),
-        brightness: 75.0,
+        color: Color::srgb(0.48, 0.56, 0.68),
+        brightness: 145.0,
         ..default()
     });
 }
@@ -1146,7 +1205,7 @@ fn make_voxel_auto_door(
         cells,
         trigger_center,
         trigger_radius,
-        material: 7,
+        material: 10,
         open: false,
     }
 }
@@ -1363,6 +1422,7 @@ fn setup_voxel_view(
             ..default()
         },
         editor_camera_transform(&editor),
+        VoxelCartoonFilter::default(),
         VoxelViewportCamera,
     ));
     commands.spawn((
@@ -2947,7 +3007,7 @@ mod tests {
         assert!(voxel_cells(grid).len() >= 100_000);
         assert_eq!(
             materials,
-            HashSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9])
+            HashSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         );
 
         let doors = voxel_auto_doors();
@@ -2959,7 +3019,7 @@ mod tests {
         assert!(doors
             .iter()
             .flat_map(|door| &door.cells)
-            .all(|cell| { grid.get(*cell).copied() == Some(7) }));
+            .all(|cell| { grid.get(*cell).copied() == Some(10) }));
 
         let lights = voxel_interior_lights();
         assert_eq!(lights.len(), 62);
@@ -3116,6 +3176,8 @@ mod tests {
         assert!(TrpgVoxelConnector::solid(&6));
         assert!(TrpgVoxelConnector::solid(&7));
         assert!(TrpgVoxelConnector::solid(&8));
+        assert!(TrpgVoxelConnector::solid(&9));
+        assert!(TrpgVoxelConnector::solid(&10));
     }
 
     #[test]
