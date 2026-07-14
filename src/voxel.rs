@@ -51,8 +51,8 @@ const VOXEL_SIZE: f32 = 0.25;
 const MAX_RAY_DISTANCE: f32 = 200.0;
 const EDIT_REPEAT_DELAY: f32 = 0.32;
 const EDIT_REPEAT_INTERVAL: f32 = 0.09;
-const TEST_GROUND_SIZE: Vec3 = Vec3::new(256.0, 0.5, 256.0);
-const TEST_GROUND_CENTER_Y: f32 = -50.25;
+const ORBITAL_PLANET_RADIUS: f32 = 240.0;
+const ORBITAL_PLANET_CENTER: Vec3 = Vec3::new(0.0, -360.0, 0.0);
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
 const VOXEL_MATERIAL_COUNT: usize = 10;
@@ -70,12 +70,22 @@ const FIRST_PERSON_JUMP_SPEED: f32 = 3.4;
 const FIRST_PERSON_FLY_SPEED: f32 = 3.5;
 const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
-const FIRST_PERSON_START: Vec3 = Vec3::new(-6.5, 0.5, 41.25);
-const DEFAULT_SCENE_CAMERA_FOCUS: Vec3 = Vec3::new(0.0, 2.5, 37.5);
-const DEFAULT_SCENE_CAMERA_DISTANCE: f32 = 42.0;
-const RESEARCH_STATION_CENTER: IVec3 = IVec3::new(-100, 0, 0);
-const SENSOR_STATION_CENTER: IVec3 = IVec3::new(100, 0, 0);
-const CANNON_STATION_CENTER: IVec3 = IVec3::new(0, 0, -150);
+const ORBITAL_LAYOUT_SCALE: i32 = 5;
+const RESEARCH_STATION_CENTER: IVec3 = IVec3::new(-100 * ORBITAL_LAYOUT_SCALE, 0, 0);
+const SENSOR_STATION_CENTER: IVec3 = IVec3::new(100 * ORBITAL_LAYOUT_SCALE, 0, 0);
+const CANNON_STATION_CENTER: IVec3 = IVec3::new(0, 0, -150 * ORBITAL_LAYOUT_SCALE);
+const COMBAT_SPACESHIP_CENTER: IVec3 = IVec3::new(0, 0, 150 * ORBITAL_LAYOUT_SCALE);
+const FIRST_PERSON_START: Vec3 = Vec3::new(
+    -6.5,
+    0.5,
+    (COMBAT_SPACESHIP_CENTER.z as f32 + 15.0) * VOXEL_SIZE,
+);
+const DEFAULT_SCENE_CAMERA_FOCUS: Vec3 = Vec3::new(
+    0.0,
+    2.5,
+    COMBAT_SPACESHIP_CENTER.z as f32 * VOXEL_SIZE,
+);
+const DEFAULT_SCENE_CAMERA_DISTANCE: f32 = 50.0;
 
 pub struct TrpgVoxelPlugin;
 
@@ -127,7 +137,7 @@ struct VoxelSceneSnapshot {
 }
 
 #[derive(Component)]
-struct VoxelTestingGround;
+struct VoxelOrbitalPlanet;
 
 #[derive(Component)]
 struct VoxelKeyLight;
@@ -1284,13 +1294,15 @@ fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station:
 }
 
 fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
-    const CENTER: IVec3 = IVec3::new(0, 0, 150);
     for x in -28..=28 {
         for y in -5..=25 {
             for z in -80..=80 {
                 let local = IVec3::new(x, y, z);
                 if let Some(material) = combat_corvette_voxel(local) {
-                    grid.set(CENTER + local, material);
+                    grid.set(
+                        COMBAT_SPACESHIP_CENTER + local,
+                        material,
+                    );
                 }
             }
         }
@@ -1691,21 +1703,21 @@ fn build_hollow_voxel_room(
 fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
     let mut doors = vec![
         make_voxel_auto_door(
-            IVec3::new(-40, 0, 0),
+            RESEARCH_STATION_CENTER + IVec3::new(50, 0, 0),
             IVec3::Z,
             5,
             8,
             3.5,
         ),
         make_voxel_auto_door(
-            IVec3::new(40, 0, 0),
+            SENSOR_STATION_CENTER + IVec3::new(-50, 0, 0),
             IVec3::Z,
             5,
             8,
             3.5,
         ),
         make_voxel_auto_door(
-            IVec3::new(-24, 0, 165),
+            COMBAT_SPACESHIP_CENTER + IVec3::new(-24, 0, 15),
             IVec3::Z,
             3,
             5,
@@ -1734,10 +1746,10 @@ fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
             }
         }
     }
-    for bulkhead_z in [95, 115, 140, 165, 188, 205] {
+    for local_z in [-55, -35, -10, 15, 38, 55] {
         for deck_y in [0, 7, 14] {
             doors.push(make_voxel_auto_door(
-                IVec3::new(0, deck_y, bulkhead_z),
+                COMBAT_SPACESHIP_CENTER + IVec3::new(0, deck_y, local_z),
                 IVec3::X,
                 2,
                 5,
@@ -1937,10 +1949,16 @@ fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
         }
     }
     for deck_y in [0, 7, 14] {
-        for z in [105, 150, 205] {
+        for local_z in [-45, 0, 55] {
             for x in [-10, 10] {
                 lights.push((
-                    (Vec3::new(x as f32, (deck_y + 5) as f32, z as f32) + Vec3::splat(0.5))
+                    (COMBAT_SPACESHIP_CENTER.as_vec3()
+                        + Vec3::new(
+                            x as f32,
+                            (deck_y + 5) as f32,
+                            local_z as f32,
+                        )
+                        + Vec3::splat(0.5))
                         * VOXEL_SIZE,
                     if deck_y == 0 {
                         Color::srgb(0.3, 0.85, 1.0)
@@ -2187,6 +2205,10 @@ fn setup_voxel_view(
             clear_color: ClearColorConfig::Custom(Color::srgb(0.055, 0.065, 0.075)),
             ..default()
         },
+        Projection::Perspective(PerspectiveProjection {
+            far: 2_500.0,
+            ..default()
+        }),
         editor_camera_transform(&editor),
         VoxelViewportCamera,
         // Render egui through this camera's target so the 3D clear pass resets
@@ -2198,24 +2220,18 @@ fn setup_voxel_view(
         radiance_volume.uniform(editor.radiance_intensity),
     ));
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(
-            TEST_GROUND_SIZE.x,
-            TEST_GROUND_SIZE.y,
-            TEST_GROUND_SIZE.z,
-        ))),
+        Mesh3d(meshes.add(Sphere::new(ORBITAL_PLANET_RADIUS))),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.16, 0.18, 0.2),
-            perceptual_roughness: 0.95,
+            base_color: Color::srgb(0.035, 0.14, 0.24),
+            emissive: LinearRgba::rgb(0.003, 0.012, 0.025),
+            metallic: 0.08,
+            perceptual_roughness: 0.9,
             ..default()
         })),
         RigidBody::Static,
-        Collider::cuboid(
-            TEST_GROUND_SIZE.x,
-            TEST_GROUND_SIZE.y,
-            TEST_GROUND_SIZE.z,
-        ),
-        Transform::from_xyz(0.0, TEST_GROUND_CENTER_Y, 0.0),
-        VoxelTestingGround,
+        Collider::sphere(ORBITAL_PLANET_RADIUS),
+        Transform::from_translation(ORBITAL_PLANET_CENTER),
+        VoxelOrbitalPlanet,
     ));
     let player_collider = Collider::capsule(
         FIRST_PERSON_RADIUS,
@@ -3918,7 +3934,7 @@ fn control_voxel_camera(
     if cursor_in_viewport && !egui_input.wants_pointer_input() {
         let scroll = wheel.read().map(|event| event.y).sum::<f32>();
         editor.camera_distance =
-            (editor.camera_distance * (-scroll * 0.12).exp()).clamp(8.0, 180.0);
+            (editor.camera_distance * (-scroll * 0.12).exp()).clamp(8.0, 900.0);
     } else {
         wheel.clear();
     }
@@ -4281,15 +4297,19 @@ mod tests {
             );
         }
         assert_eq!(
-            grid.get(IVec3::new(1, 0, 150)).copied(),
+            grid.get(COMBAT_SPACESHIP_CENTER + IVec3::new(1, 0, 0))
+                .copied(),
             Some(2)
         );
         assert_eq!(
-            grid.get(IVec3::new(1, 4, 150)).copied().unwrap_or(0),
+            grid.get(COMBAT_SPACESHIP_CENTER + IVec3::new(1, 4, 0))
+                .copied()
+                .unwrap_or(0),
             0
         );
         assert_eq!(
-            grid.get(IVec3::new(1, 14, 150)).copied(),
+            grid.get(COMBAT_SPACESHIP_CENTER + IVec3::new(1, 14, 0))
+                .copied(),
             Some(2)
         );
         assert_eq!(
@@ -4320,6 +4340,29 @@ mod tests {
         let new_station_floor_area = 99 * 79 * 5;
         assert!(new_station_interior_volume >= old_station_interior_volume * 100);
         assert!(new_station_floor_area >= old_station_floor_area * 100);
+    }
+
+    #[test]
+    fn orbital_layout_is_five_times_wider_and_clear_of_the_planet() {
+        assert_eq!(ORBITAL_LAYOUT_SCALE, 5);
+        assert_eq!(
+            SENSOR_STATION_CENTER.x - RESEARCH_STATION_CENTER.x,
+            1_000
+        );
+        assert_eq!(COMBAT_SPACESHIP_CENTER.z, 750);
+        assert_eq!(CANNON_STATION_CENTER.z, -750);
+
+        let planet_top = ORBITAL_PLANET_CENTER.y + ORBITAL_PLANET_RADIUS;
+        assert!(planet_top <= -100.0);
+        for center in [
+            RESEARCH_STATION_CENTER,
+            SENSOR_STATION_CENTER,
+            CANNON_STATION_CENTER,
+            COMBAT_SPACESHIP_CENTER,
+        ] {
+            let horizontal = center.as_vec3() * VOXEL_SIZE - ORBITAL_PLANET_CENTER;
+            assert!(Vec2::new(horizontal.x, horizontal.z).length() < ORBITAL_PLANET_RADIUS);
+        }
     }
 
     #[test]
@@ -4587,7 +4630,7 @@ mod tests {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
         let ray = Ray3d::new(
-            Vec3::new(-19.875, 30.0, 2.625),
+            (RESEARCH_STATION_CENTER.as_vec3() + Vec3::new(20.5, 120.0, 10.5)) * VOXEL_SIZE,
             Dir3::NEG_Y,
         );
         let hit = raycast_grid(grid, ray).unwrap();
@@ -4661,7 +4704,7 @@ mod tests {
     }
 
     #[test]
-    fn force_tools_map_to_left_click_actions() {
+    fn force_tools_map_to_right_click_actions() {
         assert_eq!(
             force_tool_action(VoxelEditMode::Push),
             Some(VoxelPhysicsAction::Push)
