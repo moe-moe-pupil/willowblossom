@@ -241,6 +241,7 @@ pub(crate) struct VoxelEditorState {
     pub view_reset_requested: bool,
     pub first_person_enabled: bool,
     pub first_person_flying: bool,
+    pub creative_inventory_open: bool,
     pub physics_requested: bool,
     physics_action_requested: Option<VoxelPhysicsRequest>,
     pub physics_push_pull_impulse: f32,
@@ -287,6 +288,7 @@ impl Default for VoxelEditorState {
             view_reset_requested: false,
             first_person_enabled: false,
             first_person_flying: false,
+            creative_inventory_open: false,
             physics_requested: false,
             physics_action_requested: None,
             physics_push_pull_impulse: 4.0,
@@ -446,7 +448,29 @@ fn voxel_editor_shortcuts(
     egui_input: Res<EguiWantsInput>,
     mut editor: ResMut<VoxelEditorState>,
 ) {
-    if egui_input.wants_any_keyboard_input() || !keyboard.just_pressed(KeyCode::KeyZ) {
+    if egui_input.wants_any_keyboard_input() {
+        return;
+    }
+    if keyboard.just_pressed(KeyCode::KeyE) {
+        editor.creative_inventory_open = !editor.creative_inventory_open;
+    }
+    for (key, material) in [
+        (KeyCode::Digit1, 1),
+        (KeyCode::Digit2, 2),
+        (KeyCode::Digit3, 3),
+        (KeyCode::Digit4, 4),
+        (KeyCode::Digit5, 5),
+        (KeyCode::Digit6, 6),
+        (KeyCode::Digit7, 7),
+        (KeyCode::Digit8, 8),
+        (KeyCode::Digit9, 9),
+        (KeyCode::Digit0, 10),
+    ] {
+        if keyboard.just_pressed(key) {
+            editor.material = material;
+        }
+    }
+    if !keyboard.just_pressed(KeyCode::KeyZ) {
         return;
     }
     let control = keyboard.pressed(KeyCode::ControlLeft) || keyboard.pressed(KeyCode::ControlRight);
@@ -2450,6 +2474,9 @@ fn edit_voxel_grid(
         }
         editor.left_started_over_ui = false;
     }
+    if editor.creative_inventory_open {
+        return;
+    }
     if voxel_world_pointer_blocked(
         egui_owns_pointer,
         editor.left_started_over_ui,
@@ -2848,6 +2875,15 @@ fn control_first_person_player(
         velocity.z = 0.0;
         return;
     }
+    if editor.creative_inventory_open {
+        velocity.x = 0.0;
+        velocity.z = 0.0;
+        if editor.first_person_flying {
+            velocity.y = 0.0;
+            acceleration.0 = Vec3::ZERO;
+        }
+        return;
+    }
 
     editor.first_person_space_tap_elapsed += time.delta_secs();
     if keyboard.just_pressed(KeyCode::Space)
@@ -2939,9 +2975,13 @@ fn control_voxel_camera(
     mut editor: ResMut<VoxelEditorState>,
     egui_input: Res<EguiWantsInput>,
 ) {
-    if keyboard.just_pressed(KeyCode::Escape) && editor.first_person_enabled {
-        editor.first_person_enabled = false;
-        editor.first_person_flying = false;
+    if keyboard.just_pressed(KeyCode::Escape) {
+        if editor.creative_inventory_open {
+            editor.creative_inventory_open = false;
+        } else if editor.first_person_enabled {
+            editor.first_person_enabled = false;
+            editor.first_person_flying = false;
+        }
     }
     let entering_first_person = editor.first_person_enabled && !editor.first_person_was_enabled;
     let exiting_first_person = !editor.first_person_enabled && editor.first_person_was_enabled;
@@ -2965,7 +3005,7 @@ fn control_voxel_camera(
     }
     editor.first_person_was_enabled = editor.first_person_enabled;
     if let Ok(mut cursor) = cursor_options.single_mut() {
-        if editor.first_person_enabled {
+        if editor.first_person_enabled && !editor.creative_inventory_open {
             cursor.visible = false;
             cursor.grab_mode = CursorGrabMode::Locked;
         } else {
@@ -2991,19 +3031,24 @@ fn control_voxel_camera(
         sum + event.delta
     });
     if editor.first_person_enabled {
-        editor.camera_yaw -= delta.x * 0.0025;
-        editor.camera_pitch = (editor.camera_pitch - delta.y * 0.0025).clamp(-1.5, 1.5);
+        if !editor.creative_inventory_open {
+            editor.camera_yaw -= delta.x * 0.0025;
+            editor.camera_pitch = (editor.camera_pitch - delta.y * 0.0025).clamp(-1.5, 1.5);
+        }
         let wheel_steps = wheel.read().fold(0, |steps, event| {
             steps + event.y.signum() as i32
         });
-        let shift = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
-        if shift && editor.mode == VoxelEditMode::Explode {
-            editor.physics_explosion_radius = adjusted_explosion_radius(
-                editor.physics_explosion_radius,
-                wheel_steps,
-            );
-        } else if wheel_steps != 0 {
-            editor.mode = editor.mode.cycle(-wheel_steps);
+        if !editor.creative_inventory_open {
+            let shift =
+                keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
+            if shift && editor.mode == VoxelEditMode::Explode {
+                editor.physics_explosion_radius = adjusted_explosion_radius(
+                    editor.physics_explosion_radius,
+                    wheel_steps,
+                );
+            } else if wheel_steps != 0 {
+                editor.mode = editor.mode.cycle(-wheel_steps);
+            }
         }
         let Ok((player_transform, _)) = players.single() else {
             return;
@@ -3080,10 +3125,11 @@ fn draw_voxel_target(
     let Ok(grid) = grids.single() else {
         return;
     };
-    let (hit, explosion_origin) = if voxel_world_pointer_blocked(
-        egui_input.wants_any_pointer_input(),
-        editor.left_started_over_ui,
-    ) {
+    let (hit, explosion_origin) = if editor.creative_inventory_open
+        || voxel_world_pointer_blocked(
+            egui_input.wants_any_pointer_input(),
+            editor.left_started_over_ui,
+        ) {
         (None, None)
     } else {
         let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single())
@@ -4025,5 +4071,40 @@ mod tests {
         let editor = app.world().resource::<VoxelEditorState>();
         assert!(editor.redo_requested);
         assert!(!editor.undo_requested);
+    }
+
+    #[test]
+    fn e_opens_creative_inventory() {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<EguiWantsInput>()
+            .init_resource::<VoxelEditorState>()
+            .add_systems(Update, voxel_editor_shortcuts);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyE);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<VoxelEditorState>()
+                .creative_inventory_open
+        );
+    }
+
+    #[test]
+    fn zero_selects_tenth_creative_material() {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<EguiWantsInput>()
+            .init_resource::<VoxelEditorState>()
+            .add_systems(Update, voxel_editor_shortcuts);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Digit0);
+        app.update();
+        assert_eq!(
+            app.world().resource::<VoxelEditorState>().material,
+            10
+        );
     }
 }

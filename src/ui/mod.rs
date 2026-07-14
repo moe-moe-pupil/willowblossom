@@ -98,6 +98,97 @@ const NAPCAT_MOONBERRY_LEGACY_IMPORT_DEFAULT_PATH: &str =
 const DEEPSEEK_SUMMARY_EXPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/exports/deepseek_summaries_export.json";
 const VOXEL_SCENE_EXPORT_DEFAULT_PATH: &str = ".data/willowblossom/exports/voxel_scene_export.json";
+
+fn voxel_material_choices() -> [(u8, &'static str, egui::Color32); 10] {
+    [
+        (
+            1,
+            "草地",
+            egui::Color32::from_rgb(56, 158, 82),
+        ),
+        (
+            2,
+            "泥土",
+            egui::Color32::from_rgb(97, 51, 23),
+        ),
+        (
+            3,
+            "沙子",
+            egui::Color32::from_rgb(219, 184, 97),
+        ),
+        (
+            4,
+            "水",
+            egui::Color32::from_rgb(20, 97, 209),
+        ),
+        (
+            5,
+            "岩浆",
+            egui::Color32::from_rgb(255, 41, 4),
+        ),
+        (
+            6,
+            "金属舰壳",
+            egui::Color32::from_rgb(104, 122, 142),
+        ),
+        (
+            7,
+            "装甲板",
+            egui::Color32::from_rgb(35, 48, 66),
+        ),
+        (
+            8,
+            "发光科技板",
+            egui::Color32::from_rgb(40, 190, 235),
+        ),
+        (
+            9,
+            "深红舰甲",
+            egui::Color32::from_rgb(112, 18, 24),
+        ),
+        (
+            10,
+            "发光舱门",
+            egui::Color32::from_rgb(205, 92, 24),
+        ),
+    ]
+}
+
+fn voxel_material_slot(
+    ui: &mut Ui,
+    material: u8,
+    name: &str,
+    color: egui::Color32,
+    selected_material: u8,
+    size: f32,
+    shortcut: Option<&str>,
+) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::click());
+    ui.painter().rect_filled(rect, 3, color);
+    let stroke = if selected_material == material {
+        Stroke::new(3.0, egui::Color32::WHITE)
+    } else {
+        Stroke::new(1.0, egui::Color32::from_gray(90))
+    };
+    ui.painter().rect_stroke(
+        rect,
+        3,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    if let Some(shortcut) = shortcut {
+        ui.painter().text(
+            rect.left_top() + egui::vec2(3.0, 2.0),
+            egui::Align2::LEFT_TOP,
+            shortcut,
+            egui::FontId::proportional(10.0),
+            egui::Color32::WHITE,
+        );
+    }
+    let clicked = response.clicked();
+    response.on_hover_text(format!("{name} · 创造模式无限使用"));
+    clicked
+}
 const MOONBERRY_SKILL_TYPES: &[&str] = &[
     "法术",
     "道具",
@@ -11543,73 +11634,18 @@ pub fn ui_system(
                             "爆炸",
                         );
                         ui.separator();
-                        for (material, name, color) in [
-                            (
-                                1,
-                                "草地",
-                                egui::Color32::from_rgb(56, 158, 82),
-                            ),
-                            (
-                                2,
-                                "泥土",
-                                egui::Color32::from_rgb(97, 51, 23),
-                            ),
-                            (
-                                3,
-                                "沙子",
-                                egui::Color32::from_rgb(219, 184, 97),
-                            ),
-                            (
-                                4,
-                                "水",
-                                egui::Color32::from_rgb(20, 97, 209),
-                            ),
-                            (
-                                5,
-                                "岩浆",
-                                egui::Color32::from_rgb(255, 41, 4),
-                            ),
-                            (
-                                6,
-                                "金属舰壳",
-                                egui::Color32::from_rgb(104, 122, 142),
-                            ),
-                            (
-                                7,
-                                "装甲板",
-                                egui::Color32::from_rgb(35, 48, 66),
-                            ),
-                            (
-                                8,
-                                "发光科技板",
-                                egui::Color32::from_rgb(255, 148, 32),
-                            ),
-                            (
-                                9,
-                                "深红舰甲",
-                                egui::Color32::from_rgb(112, 18, 24),
-                            ),
-                            (
-                                10,
-                                "发光舱门",
-                                egui::Color32::from_rgb(205, 92, 24),
-                            ),
-                        ] {
-                            let (rect, response) =
-                                ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::click());
-                            ui.painter().rect_filled(rect, 3, color);
-                            if voxel_editor.material == material {
-                                ui.painter().rect_stroke(
-                                    rect,
-                                    3,
-                                    Stroke::new(2.0, egui::Color32::WHITE),
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
-                            if response.clicked() {
+                        for (material, name, color) in voxel_material_choices() {
+                            if voxel_material_slot(
+                                ui,
+                                material,
+                                name,
+                                color,
+                                voxel_editor.material,
+                                22.0,
+                                None,
+                            ) {
                                 voxel_editor.material = material;
                             }
-                            response.on_hover_text(name);
                         }
                         ui.separator();
                         ui.label("笔刷大小");
@@ -11638,6 +11674,17 @@ pub fn ui_system(
                             .clicked()
                         {
                             voxel_editor.first_person_enabled = !voxel_editor.first_person_enabled;
+                        }
+                        if ui
+                            .selectable_label(
+                                voxel_editor.creative_inventory_open,
+                                "创造物品栏",
+                            )
+                            .on_hover_text("按 E 打开或关闭；材料无限使用，不计数量")
+                            .clicked()
+                        {
+                            voxel_editor.creative_inventory_open =
+                                !voxel_editor.creative_inventory_open;
                         }
                     });
                     if voxel_editor.first_person_enabled {
@@ -11764,7 +11811,89 @@ pub fn ui_system(
                     }
                 });
 
-            if voxel_editor.first_person_enabled {
+            egui::Area::new(egui::Id::new("voxel_creative_hotbar"))
+                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_black_alpha(210))
+                        .corner_radius(4)
+                        .inner_margin(4)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (material, name, color) in voxel_material_choices() {
+                                    let shortcut = if material == 10 {
+                                        "0".to_owned()
+                                    } else {
+                                        material.to_string()
+                                    };
+                                    if voxel_material_slot(
+                                        ui,
+                                        material,
+                                        name,
+                                        color,
+                                        voxel_editor.material,
+                                        38.0,
+                                        Some(&shortcut),
+                                    ) {
+                                        voxel_editor.material = material;
+                                    }
+                                }
+                            });
+                        });
+                });
+
+            if voxel_editor.creative_inventory_open {
+                let current_material = voxel_editor.material;
+                let mut selected_material = None;
+                let mut window_open = true;
+                egui::Window::new("创造模式物品栏")
+                    .id(egui::Id::new("voxel_creative_inventory"))
+                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut window_open)
+                    .show(ctx, |ui| {
+                        ui.label("所有材料无限使用 · 点击选择 · 无堆叠数量");
+                        ui.add_space(6.0);
+                        egui::Grid::new("voxel_creative_inventory_grid")
+                            .num_columns(5)
+                            .spacing(egui::vec2(10.0, 10.0))
+                            .show(ui, |ui| {
+                                for (index, (material, name, color)) in
+                                    voxel_material_choices().into_iter().enumerate()
+                                {
+                                    ui.vertical_centered(|ui| {
+                                        if voxel_material_slot(
+                                            ui,
+                                            material,
+                                            name,
+                                            color,
+                                            current_material,
+                                            56.0,
+                                            None,
+                                        ) {
+                                            selected_material = Some(material);
+                                        }
+                                        ui.small(name);
+                                    });
+                                    if (index + 1) % 5 == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                        ui.add_space(4.0);
+                        ui.small("快捷键：1–9、0 选择快捷栏；E 或 Esc 关闭");
+                    });
+                if let Some(material) = selected_material {
+                    voxel_editor.material = material;
+                }
+                if !window_open {
+                    voxel_editor.creative_inventory_open = false;
+                }
+            }
+
+            if voxel_editor.first_person_enabled && !voxel_editor.creative_inventory_open {
                 let center = viewport.center();
                 let painter = ui.painter();
                 let stroke = Stroke::new(2.0, egui::Color32::WHITE);
