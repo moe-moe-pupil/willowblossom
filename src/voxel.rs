@@ -41,15 +41,15 @@ const TEST_GROUND_CENTER_Y: f32 = -50.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
 const VOXEL_MATERIAL_COUNT: usize = 10;
-const FIRST_PERSON_RADIUS: f32 = 0.03;
-const FIRST_PERSON_BODY_LENGTH: f32 = 0.065;
-const FIRST_PERSON_EYE_OFFSET: f32 = 0.045;
+const FIRST_PERSON_RADIUS: f32 = VOXEL_SIZE * 0.5;
+const FIRST_PERSON_BODY_LENGTH: f32 = VOXEL_SIZE;
+const FIRST_PERSON_EYE_OFFSET: f32 = VOXEL_SIZE;
 const FIRST_PERSON_SPEED: f32 = 2.8;
 const FIRST_PERSON_JUMP_SPEED: f32 = 3.4;
 const FIRST_PERSON_FLY_SPEED: f32 = 3.5;
 const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
-const FIRST_PERSON_START: Vec3 = Vec3::new(-6.5, 0.32, 41.25);
+const FIRST_PERSON_START: Vec3 = Vec3::new(-6.5, 0.5, 41.25);
 const DEFAULT_SCENE_CAMERA_FOCUS: Vec3 = Vec3::new(0.0, 2.5, 37.5);
 const DEFAULT_SCENE_CAMERA_DISTANCE: f32 = 42.0;
 
@@ -215,6 +215,7 @@ pub(crate) struct VoxelEditorState {
     save_scene_requested: bool,
     restore_scene_requested: Option<usize>,
     first_person_space_tap_elapsed: f32,
+    first_person_was_enabled: bool,
 }
 
 impl Default for VoxelEditorState {
@@ -256,6 +257,7 @@ impl Default for VoxelEditorState {
             save_scene_requested: false,
             restore_scene_requested: None,
             first_person_space_tap_elapsed: f32::INFINITY,
+            first_person_was_enabled: false,
         }
     }
 }
@@ -1272,38 +1274,51 @@ fn setup_voxel_interior_lights(mut commands: Commands) {
     }
 }
 
-fn voxel_sample_prop_specs() -> Vec<(&'static str, Transform)> {
+fn voxel_prop_cells(size: IVec3, base_material: u8, accent_material: u8) -> Vec<(IVec3, u8)> {
+    prism(IVec3::ZERO, size)
+        .map(|cell| {
+            let accent = cell.y == size.y - 1 && (cell.x + cell.z) % 2 == 0;
+            (
+                cell,
+                if accent { accent_material } else { base_material },
+            )
+        })
+        .collect()
+}
+
+fn voxel_physics_prop_specs() -> Vec<(Vec<(IVec3, u8)>, Transform)> {
     let mut specs = Vec::new();
-    let mut add = |path, position, scale, yaw| {
+    let mut add = |position, size, base_material, accent_material, yaw| {
         specs.push((
-            path,
-            Transform::from_translation(position)
-                .with_rotation(Quat::from_rotation_y(yaw))
-                .with_scale(Vec3::splat(scale)),
+            voxel_prop_cells(size, base_material, accent_material),
+            Transform::from_translation(position).with_rotation(Quat::from_rotation_y(yaw)),
         ));
     };
 
     for station_x in [-22.5, 22.5] {
         add(
-            "models/free_sample/SatelliteDish_1.gltf",
             Vec3::new(station_x, 14.55, 0.0),
-            2.2,
+            IVec3::new(5, 3, 3),
+            6,
+            8,
             if station_x < 0.0 { 0.55 } else { -0.55 },
         );
         for (offset_x, z, yaw) in [(-4.0, -3.5, 0.2), (4.0, -3.5, -0.2), (0.0, 4.0, 0.0)] {
             add(
-                "models/free_sample/SolarPanel_4.gltf",
                 Vec3::new(station_x + offset_x, 14.55, z),
-                2.0,
+                IVec3::new(5, 1, 2),
+                7,
+                8,
                 yaw,
             );
         }
         for deck_y in [0.28, 2.53, 4.78, 7.03] {
             for z in [-5.5, 5.5] {
                 add(
-                    "models/free_sample/Prop_15.gltf",
                     Vec3::new(station_x, deck_y, z),
-                    1.35,
+                    IVec3::new(3, 2, 2),
+                    6,
+                    10,
                     if z < 0.0 { 0.0 } else { std::f32::consts::PI },
                 );
             }
@@ -1312,9 +1327,10 @@ fn voxel_sample_prop_specs() -> Vec<(&'static str, Transform)> {
 
     for (x, z, yaw) in [(-3.6, 31.5, 0.35), (0.0, 37.0, 0.0), (3.6, 42.0, -0.35)] {
         add(
-            "models/free_sample/Lander.gltf",
             Vec3::new(x, 0.28, z),
-            0.46,
+            IVec3::new(5, 3, 5),
+            6,
+            8,
             yaw,
         );
     }
@@ -1325,18 +1341,20 @@ fn voxel_sample_prop_specs() -> Vec<(&'static str, Transform)> {
         (3.2, 36.5, -0.4),
     ] {
         add(
-            "models/free_sample/BuildingBlock_2.gltf",
             Vec3::new(x, 0.28, z),
-            0.52,
+            IVec3::new(3, 2, 3),
+            2,
+            8,
             yaw,
         );
     }
     for deck_y in [0.28, 2.03, 3.78] {
         for (x, z, yaw) in [(-3.7, 29.5, 0.0), (3.7, 29.5, std::f32::consts::PI)] {
             add(
-                "models/free_sample/Prop_14.gltf",
                 Vec3::new(x, deck_y, z),
-                1.25,
+                IVec3::new(2, 3, 2),
+                7,
+                10,
                 yaw,
             );
         }
@@ -1347,21 +1365,31 @@ fn voxel_sample_prop_specs() -> Vec<(&'static str, Transform)> {
         (1.8, 52.5, std::f32::consts::PI),
     ] {
         add(
-            "models/free_sample/Prop_15.gltf",
             Vec3::new(x, 2.03, z),
-            1.55,
+            IVec3::new(3, 2, 2),
+            6,
+            8,
             yaw,
         );
     }
     specs
 }
 
-fn setup_voxel_sample_props(mut commands: Commands, asset_server: Res<AssetServer>) {
-    for (path, transform) in voxel_sample_prop_specs() {
-        commands.spawn((
-            WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(path))),
+fn setup_voxel_sample_props(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
+) {
+    for (cells, transform) in voxel_physics_prop_specs() {
+        spawn_voxel_physics_body_at(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            cells,
             transform,
-        ));
+            LinearVelocity::ZERO,
+            AngularVelocity::ZERO,
+        );
     }
 }
 
@@ -2632,6 +2660,24 @@ fn register_first_person_space_tap(elapsed: &mut f32) -> bool {
     double_tap
 }
 
+fn adjusted_explosion_radius(radius: f32, wheel_steps: i32) -> f32 {
+    (radius + wheel_steps as f32 * 0.5).clamp(VOXEL_SIZE, 100.0)
+}
+
+fn first_person_player_position(camera_position: Vec3) -> Vec3 {
+    camera_position - Vec3::Y * FIRST_PERSON_EYE_OFFSET
+}
+
+fn orbit_focus_preserving_camera_position(
+    camera_position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+) -> Vec3 {
+    let rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
+    camera_position + rotation * Vec3::NEG_Z * distance
+}
+
 fn control_voxel_camera(
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
@@ -2660,6 +2706,27 @@ fn control_voxel_camera(
         editor.first_person_enabled = false;
         editor.first_person_flying = false;
     }
+    let entering_first_person = editor.first_person_enabled && !editor.first_person_was_enabled;
+    let exiting_first_person = !editor.first_person_enabled && editor.first_person_was_enabled;
+    if entering_first_person {
+        if let (Ok((camera_transform, _)), Ok((mut player_transform, mut velocity))) =
+            (cameras.single(), players.single_mut())
+        {
+            player_transform.translation =
+                first_person_player_position(camera_transform.translation);
+            velocity.0 = Vec3::ZERO;
+        }
+    } else if exiting_first_person {
+        if let Ok((camera_transform, _)) = cameras.single() {
+            editor.camera_focus = orbit_focus_preserving_camera_position(
+                camera_transform.translation,
+                editor.camera_yaw,
+                editor.camera_pitch,
+                editor.camera_distance,
+            );
+        }
+    }
+    editor.first_person_was_enabled = editor.first_person_enabled;
     if let Ok(mut cursor) = cursor_options.single_mut() {
         if editor.first_person_enabled {
             cursor.visible = false;
@@ -2689,11 +2756,17 @@ fn control_voxel_camera(
     if editor.first_person_enabled {
         editor.camera_yaw -= delta.x * 0.0025;
         editor.camera_pitch = (editor.camera_pitch - delta.y * 0.0025).clamp(-1.5, 1.5);
-        let tool_steps = wheel.read().fold(0, |steps, event| {
-            steps - event.y.signum() as i32
+        let wheel_steps = wheel.read().fold(0, |steps, event| {
+            steps + event.y.signum() as i32
         });
-        if tool_steps != 0 {
-            editor.mode = editor.mode.cycle(tool_steps);
+        let shift = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
+        if shift && editor.mode == VoxelEditMode::Explode {
+            editor.physics_explosion_radius = adjusted_explosion_radius(
+                editor.physics_explosion_radius,
+                wheel_steps,
+            );
+        } else if wheel_steps != 0 {
+            editor.mode = editor.mode.cycle(-wheel_steps);
         }
         let Ok((player_transform, _)) = players.single() else {
             return;
@@ -2996,11 +3069,11 @@ mod tests {
     }
 
     #[test]
-    fn first_person_character_is_exactly_quarter_scale() {
+    fn first_person_character_is_two_voxels_tall_and_one_voxel_wide() {
         let total_height = FIRST_PERSON_BODY_LENGTH + FIRST_PERSON_RADIUS * 2.0;
-        assert!((total_height - 0.125).abs() < f32::EPSILON);
-        assert!((FIRST_PERSON_RADIUS - 0.03).abs() < f32::EPSILON);
-        assert!((FIRST_PERSON_EYE_OFFSET - 0.045).abs() < f32::EPSILON);
+        assert!((total_height - VOXEL_SIZE * 2.0).abs() < f32::EPSILON);
+        assert!((FIRST_PERSON_RADIUS * 2.0 - VOXEL_SIZE).abs() < f32::EPSILON);
+        assert!((FIRST_PERSON_EYE_OFFSET - VOXEL_SIZE).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -3192,16 +3265,18 @@ mod tests {
     }
 
     #[test]
-    fn sample_pack_props_detail_station_roofs_and_corvette_interiors() {
-        let specs = voxel_sample_prop_specs();
+    fn voxel_physics_props_detail_station_roofs_and_corvette_interiors() {
+        let specs = voxel_physics_prop_specs();
         assert_eq!(specs.len(), 40);
-        assert!(specs.iter().any(|(path, _)| path.ends_with("Lander.gltf")));
-        assert!(specs
-            .iter()
-            .any(|(path, _)| path.ends_with("SatelliteDish_1.gltf")));
-        assert!(specs
-            .iter()
-            .any(|(path, _)| path.ends_with("SolarPanel_4.gltf")));
+        assert!(specs.iter().all(|(cells, _)| !cells.is_empty()));
+        assert!(specs.iter().all(
+            |(cells, _)| cells.iter().all(
+                |(_, material)| TrpgVoxelConnector::solid(material)
+                    && (1..=VOXEL_MATERIAL_COUNT as u8).contains(material)
+            )
+        ));
+        assert!(specs.iter().any(|(cells, _)| cells.len() == 5 * 3 * 5));
+        assert!(specs.iter().any(|(cells, _)| cells.len() == 5 * 1 * 2));
     }
 
     #[test]
@@ -3267,6 +3342,45 @@ mod tests {
             VoxelEditMode::Add
         );
         assert_eq!(VoxelEditMode::Pull.label(), "拉近");
+    }
+
+    #[test]
+    fn first_person_shift_wheel_resizes_explosion_radius() {
+        assert_eq!(adjusted_explosion_radius(6.0, 2), 7.0);
+        assert_eq!(adjusted_explosion_radius(6.0, -2), 5.0);
+        assert_eq!(
+            adjusted_explosion_radius(VOXEL_SIZE, -1),
+            VOXEL_SIZE
+        );
+        assert_eq!(
+            adjusted_explosion_radius(100.0, 1),
+            100.0
+        );
+    }
+
+    #[test]
+    fn first_person_transitions_preserve_camera_position() {
+        let camera_position = Vec3::new(4.0, 7.0, -2.0);
+        let player_position = first_person_player_position(camera_position);
+        assert_eq!(
+            player_position + Vec3::Y * FIRST_PERSON_EYE_OFFSET,
+            camera_position
+        );
+
+        let yaw = 0.7;
+        let pitch = -0.45;
+        let distance = 42.0;
+        let focus = orbit_focus_preserving_camera_position(camera_position, yaw, pitch, distance);
+        let editor = VoxelEditorState {
+            camera_focus: focus,
+            camera_distance: distance,
+            camera_yaw: yaw,
+            camera_pitch: pitch,
+            ..default()
+        };
+        assert!(editor_camera_transform(&editor)
+            .translation
+            .abs_diff_eq(camera_position, 0.000_01));
     }
 
     #[test]

@@ -11647,7 +11647,7 @@ pub fn ui_system(
                             "WASD 移动 · 空格跳跃 · 双击空格飞行"
                         };
                         ui.small(format!(
-                            "{movement_hint} · 当前工具：{} · 滚轮切换工具 · 左键使用 · Esc 退出",
+                            "{movement_hint} · 当前工具：{} · 滚轮切换工具 · 爆炸工具下 Shift+滚轮调半径 · 左键使用 · Esc 退出",
                             voxel_editor.mode.label()
                         ));
                     }
