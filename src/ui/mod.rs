@@ -155,6 +155,253 @@ fn voxel_material_choices() -> [(u8, &'static str, egui::Color32); 10] {
     ]
 }
 
+fn paint_voxel_creative_item_icon(
+    ui: &Ui,
+    rect: egui::Rect,
+    item: VoxelCreativeItem,
+    background: egui::Color32,
+) {
+    let painter = ui.painter();
+    let scale = rect.width().min(rect.height()) * 0.32;
+    let center = rect.center() + egui::vec2(0.0, rect.height() * 0.035);
+    let point = |x: f32, y: f32| center + egui::vec2(x * scale, y * scale);
+    let luminance = u32::from(background.r()) * 299
+        + u32::from(background.g()) * 587
+        + u32::from(background.b()) * 114;
+    let ink = if luminance > 150_000 {
+        egui::Color32::from_gray(28)
+    } else {
+        egui::Color32::WHITE
+    };
+    let stroke = Stroke::new(
+        (rect.width() * 0.055).clamp(1.5, 3.0),
+        ink,
+    );
+    let thin = Stroke::new((stroke.width * 0.65).max(1.0), ink);
+    let line = |a: (f32, f32), b: (f32, f32)| {
+        painter.line_segment(
+            [point(a.0, a.1), point(b.0, b.1)],
+            stroke,
+        );
+    };
+    let thin_line = |a: (f32, f32), b: (f32, f32)| {
+        painter.line_segment([point(a.0, a.1), point(b.0, b.1)], thin);
+    };
+    let circle = |x: f32, y: f32, radius: f32| {
+        painter.circle_stroke(point(x, y), radius * scale, stroke);
+    };
+    let dot = |x: f32, y: f32, radius: f32| {
+        painter.circle_filled(point(x, y), radius * scale, ink);
+    };
+    let box_outline = |min: (f32, f32), max: (f32, f32)| {
+        painter.rect_stroke(
+            egui::Rect::from_two_pos(point(min.0, min.1), point(max.0, max.1)),
+            1.0,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+    };
+    let plus = |x: f32, y: f32, radius: f32| {
+        line((x - radius, y), (x + radius, y));
+        line((x, y - radius), (x, y + radius));
+    };
+    let cross = |x: f32, y: f32, radius: f32| {
+        line(
+            (x - radius, y - radius),
+            (x + radius, y + radius),
+        );
+        line(
+            (x + radius, y - radius),
+            (x - radius, y + radius),
+        );
+    };
+    let rays = |radius: f32| {
+        for (a, b) in [
+            ((0.0, -radius), (0.0, -1.0)),
+            ((0.0, radius), (0.0, 1.0)),
+            ((-radius, 0.0), (-1.0, 0.0)),
+            ((radius, 0.0), (1.0, 0.0)),
+            (
+                (-radius * 0.72, -radius * 0.72),
+                (-0.72, -0.72),
+            ),
+            (
+                (radius * 0.72, -radius * 0.72),
+                (0.72, -0.72),
+            ),
+            (
+                (-radius * 0.72, radius * 0.72),
+                (-0.72, 0.72),
+            ),
+            (
+                (radius * 0.72, radius * 0.72),
+                (0.72, 0.72),
+            ),
+        ] {
+            thin_line(a, b);
+        }
+    };
+
+    match item {
+        VoxelCreativeItem::Material(1) => {
+            line((-0.9, 0.72), (0.9, 0.72));
+            line((-0.55, 0.68), (-0.72, -0.3));
+            line((-0.15, 0.68), (0.0, -0.72));
+            line((0.3, 0.68), (0.7, -0.42));
+        },
+        VoxelCreativeItem::Material(2) => {
+            for (x, y, radius) in [
+                (-0.55, -0.5, 0.16),
+                (0.35, -0.58, 0.12),
+                (-0.1, 0.0, 0.2),
+                (0.6, 0.25, 0.15),
+                (-0.5, 0.55, 0.12),
+            ] {
+                dot(x, y, radius);
+            }
+        },
+        VoxelCreativeItem::Material(3) => {
+            thin_line((-0.9, -0.5), (0.25, -0.5));
+            thin_line((-0.25, 0.0), (0.9, 0.0));
+            thin_line((-0.9, 0.5), (0.45, 0.5));
+        },
+        VoxelCreativeItem::Material(4) => {
+            for y in [-0.42, 0.18, 0.72] {
+                thin_line((-0.95, y), (-0.55, y - 0.2));
+                thin_line((-0.55, y - 0.2), (-0.1, y));
+                thin_line((-0.1, y), (0.35, y + 0.2));
+                thin_line((0.35, y + 0.2), (0.9, y));
+            }
+        },
+        VoxelCreativeItem::Material(5) => {
+            line((-0.15, -0.95), (-0.45, -0.15));
+            line((-0.45, -0.15), (0.05, 0.02));
+            line((0.05, 0.02), (-0.2, 0.9));
+            line((0.05, 0.02), (0.72, -0.45));
+            thin_line((0.05, 0.02), (0.72, 0.58));
+        },
+        VoxelCreativeItem::Material(6) => {
+            box_outline((-0.86, -0.86), (0.86, 0.86));
+            for (x, y) in [(-0.58, -0.58), (0.58, -0.58), (-0.58, 0.58), (0.58, 0.58)] {
+                dot(x, y, 0.1);
+            }
+        },
+        VoxelCreativeItem::Material(7) => {
+            for (a, b) in [
+                ((0.0, -0.92), (-0.72, -0.62)),
+                ((-0.72, -0.62), (-0.58, 0.42)),
+                ((-0.58, 0.42), (0.0, 0.9)),
+                ((0.0, 0.9), (0.58, 0.42)),
+                ((0.58, 0.42), (0.72, -0.62)),
+                ((0.72, -0.62), (0.0, -0.92)),
+            ] {
+                line(a, b);
+            }
+        },
+        VoxelCreativeItem::Material(8) => {
+            box_outline((-0.48, -0.48), (0.48, 0.48));
+            rays(0.7);
+        },
+        VoxelCreativeItem::Material(9) => {
+            box_outline((-0.82, -0.82), (0.82, 0.82));
+            line((-0.42, 0.82), (0.42, -0.82));
+            thin_line((-0.82, 0.25), (0.25, -0.82));
+        },
+        VoxelCreativeItem::Material(10) => {
+            box_outline((-0.72, -0.92), (0.72, 0.92));
+            line((0.0, -0.86), (0.0, 0.86));
+            dot(-0.28, 0.08, 0.09);
+            dot(0.28, 0.08, 0.09);
+        },
+        VoxelCreativeItem::Material(_) => cross(0.0, 0.0, 0.65),
+        VoxelCreativeItem::Light(VoxelLightTool::Point) => {
+            circle(0.0, 0.0, 0.4);
+            rays(0.62);
+        },
+        VoxelCreativeItem::Light(VoxelLightTool::DarkPoint) => {
+            circle(0.0, 0.0, 0.68);
+            painter.circle_filled(
+                point(0.3, -0.2),
+                0.52 * scale,
+                background,
+            );
+            dot(-0.52, -0.48, 0.08);
+        },
+        VoxelCreativeItem::Light(VoxelLightTool::Cube) => {
+            box_outline((-0.55, -0.55), (0.55, 0.55));
+            rays(0.72);
+        },
+        VoxelCreativeItem::Light(VoxelLightTool::Spot) => {
+            box_outline((-0.82, -0.28), (-0.2, 0.28));
+            line((-0.2, -0.28), (0.82, -0.72));
+            line((-0.2, 0.28), (0.82, 0.72));
+            line((-0.82, 0.48), (-0.82, 0.82));
+        },
+        VoxelCreativeItem::Light(VoxelLightTool::Physics) => {
+            circle(0.0, -0.25, 0.45);
+            rays(0.62);
+            painter.arrow(
+                point(0.0, 0.35),
+                egui::vec2(0.0, 0.58 * scale),
+                stroke,
+            );
+        },
+        VoxelCreativeItem::Light(VoxelLightTool::Edit) => {
+            circle(-0.28, -0.28, 0.4);
+            rays(0.58);
+            line((0.0, 0.82), (0.78, 0.04));
+            line((0.55, 0.27), (0.82, 0.54));
+        },
+        VoxelCreativeItem::Light(VoxelLightTool::Remove) => {
+            circle(-0.25, -0.25, 0.42);
+            rays(0.58);
+            cross(0.45, 0.45, 0.42);
+        },
+        VoxelCreativeItem::Mode(VoxelEditMode::Add) => {
+            box_outline((-0.75, -0.75), (0.35, 0.35));
+            plus(0.48, 0.48, 0.4);
+        },
+        VoxelCreativeItem::Mode(VoxelEditMode::Remove) => {
+            box_outline((-0.75, -0.75), (0.35, 0.35));
+            cross(0.48, 0.48, 0.4);
+        },
+        VoxelCreativeItem::Mode(VoxelEditMode::Paint) => {
+            line((-0.72, 0.72), (0.42, -0.42));
+            line((-0.42, 0.9), (0.58, -0.1));
+            line((0.35, -0.5), (0.78, -0.82));
+            thin_line((-0.82, 0.88), (-0.42, 0.9));
+        },
+        VoxelCreativeItem::Mode(VoxelEditMode::Physics) => {
+            box_outline((-0.58, -0.78), (0.58, 0.35));
+            painter.arrow(
+                point(0.0, 0.38),
+                egui::vec2(0.0, 0.55 * scale),
+                stroke,
+            );
+        },
+        VoxelCreativeItem::Mode(VoxelEditMode::Push) => {
+            box_outline((-0.85, -0.48), (-0.15, 0.48));
+            painter.arrow(
+                point(-0.02, 0.0),
+                egui::vec2(0.9 * scale, 0.0),
+                stroke,
+            );
+        },
+        VoxelCreativeItem::Mode(VoxelEditMode::Pull) => {
+            box_outline((0.15, -0.48), (0.85, 0.48));
+            painter.arrow(
+                point(0.02, 0.0),
+                egui::vec2(-0.9 * scale, 0.0),
+                stroke,
+            );
+        },
+        VoxelCreativeItem::Mode(VoxelEditMode::Explode) => {
+            dot(0.0, 0.0, 0.18);
+            rays(0.3);
+        },
+    }
+}
+
 fn voxel_material_slot(
     ui: &mut Ui,
     material: u8,
@@ -176,6 +423,12 @@ fn voxel_material_slot(
         3,
         stroke,
         egui::StrokeKind::Inside,
+    );
+    paint_voxel_creative_item_icon(
+        ui,
+        rect,
+        VoxelCreativeItem::Material(material),
+        color,
     );
     if let Some(shortcut) = shortcut {
         ui.painter().text(
@@ -289,21 +542,15 @@ fn voxel_creative_item_slot(
         ),
         egui::StrokeKind::Inside,
     );
+    if let Some(item) = item {
+        paint_voxel_creative_item_icon(ui, rect, item, color);
+    }
     if let Some(shortcut) = shortcut {
         ui.painter().text(
             rect.left_top() + egui::vec2(3.0, 2.0),
             egui::Align2::LEFT_TOP,
             shortcut,
             egui::FontId::proportional(10.0),
-            egui::Color32::WHITE,
-        );
-    }
-    if let Some(VoxelCreativeItem::Light(_)) = item {
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "✦",
-            egui::FontId::proportional(size * 0.45),
             egui::Color32::WHITE,
         );
     }
