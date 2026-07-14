@@ -1,4 +1,4 @@
-#import bevy_render::view::{View, position_ndc_to_world, uv_to_ndc}
+#import bevy_render::view::{View, frag_coord_to_ndc, position_ndc_to_world}
 
 @group(0) @binding(0) var source_texture: texture_2d<f32>;
 @group(0) @binding(1) var source_sampler: sampler;
@@ -26,12 +26,16 @@ const CUBEMAP_DIRECTIONS = array<vec3<f32>, 6>(
 );
 
 fn volume_sample(world_position: vec3<f32>) -> vec4<f32> {
-    let volume_extent = settings.volume_dimensions * settings.voxel_world_size;
-    let uvw = (world_position - settings.volume_min) / volume_extent;
-    if any(uvw < vec3(0.0)) || any(uvw >= vec3(1.0)) {
+    // Convert through the exact effective voxel size instead of normalized UVs.
+    // textureLoad avoids filtering neighboring occupied cells at voxel boundaries.
+    let cell = vec3<i32>(floor(
+        (world_position - settings.volume_min) / settings.voxel_world_size,
+    ));
+    let dimensions = vec3<i32>(settings.volume_dimensions);
+    if any(cell < vec3(0)) || any(cell >= dimensions) {
         return vec4(0.0);
     }
-    return textureSampleLevel(voxel_volume, volume_sampler, uvw, 0.0);
+    return textureLoad(voxel_volume, cell, 0);
 }
 
 fn trace_interval(
@@ -84,17 +88,20 @@ fn cascade_radiance(origin: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
 }
 
 @fragment
-fn fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+fn fragment(
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+) -> @location(0) vec4<f32> {
     let source = textureSample(source_texture, source_sampler, uv);
     let dimensions = vec2<i32>(textureDimensions(depth_texture));
-    let pixel = clamp(vec2<i32>(uv * vec2<f32>(dimensions)), vec2(0), dimensions - vec2(1));
+    let pixel = clamp(vec2<i32>(position.xy), vec2(0), dimensions - vec2(1));
     let depth = textureLoad(depth_texture, pixel, 0);
     if depth <= 0.000001 || settings.intensity <= 0.0 {
         return source;
     }
 
     let world_position = position_ndc_to_world(
-        vec3(uv_to_ndc(uv), depth),
+        frag_coord_to_ndc(vec4(position.xy, depth, 1.0), view.viewport),
         view.world_from_clip,
     );
     let world_dx = dpdx(world_position);

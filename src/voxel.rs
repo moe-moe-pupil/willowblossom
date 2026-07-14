@@ -578,15 +578,12 @@ fn hifi_voxel_tile_transform(row: usize) -> Affine2 {
 
 fn radiance_voxel_color(material: u8) -> [u8; 4] {
     match material {
-        1 => [42, 96, 54, 255],
-        2 => [62, 35, 20, 255],
-        3 => [108, 88, 48, 255],
+        // Alpha stores occupancy for visibility. RGB stores emitted radiance,
+        // not albedo, so ordinary walls do not incorrectly cast brown light.
         5 => [255, 72, 8, 255],
-        6 => [82, 94, 112, 255],
-        7 => [34, 46, 62, 255],
         8 => [34, 176, 220, 255],
-        9 => [112, 20, 28, 255],
         10 => [196, 78, 18, 255],
+        _ if TrpgVoxelConnector::solid(&material) => [0, 0, 0, 255],
         _ => [0, 0, 0, 0],
     }
 }
@@ -3107,7 +3104,9 @@ fn draw_voxel_target(
             Color::srgb(1.0, 0.3, 0.08),
         );
     }
-    if let Some(target) = target {
+    // First person already has a centered crosshair. Drawing the world-space
+    // yellow selection cube there makes it look like a shader artifact.
+    if let Some(target) = target.filter(|_| !editor.first_person_enabled) {
         let size = if matches!(
             editor.mode,
             VoxelEditMode::Physics | VoxelEditMode::Explode
@@ -3181,6 +3180,18 @@ mod tests {
         );
         let data = image.data.as_ref().expect("radiance volume has CPU texels");
         assert!(data.chunks_exact(4).any(|rgba| rgba[3] != 0));
+    }
+
+    #[test]
+    fn radiance_palette_separates_occupancy_from_emission() {
+        assert_eq!(radiance_voxel_color(2), [0, 0, 0, 255]);
+        assert_eq!(radiance_voxel_color(5), [
+            255, 72, 8, 255
+        ]);
+        assert_eq!(radiance_voxel_color(8), [
+            34, 176, 220, 255
+        ]);
+        assert_eq!(radiance_voxel_color(0), [0, 0, 0, 0]);
     }
 
     #[test]
