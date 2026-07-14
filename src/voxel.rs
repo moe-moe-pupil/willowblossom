@@ -35,7 +35,10 @@ use bevy::{
         PrimaryWindow,
     },
 };
-use bevy_egui::input::EguiWantsInput;
+use bevy_egui::{
+    input::EguiWantsInput,
+    PrimaryEguiContext,
+};
 use voxxelmaxx::prelude::*;
 
 use crate::voxel_radiance::{
@@ -1714,6 +1717,9 @@ fn setup_voxel_view(
         },
         editor_camera_transform(&editor),
         VoxelViewportCamera,
+        // Render egui through this camera's target so the 3D clear pass resets
+        // the UI every frame before egui is composited after post-processing.
+        PrimaryEguiContext,
         VoxelRadianceCascade {
             volume: radiance_volume.image.clone(),
         },

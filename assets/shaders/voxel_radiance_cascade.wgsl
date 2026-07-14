@@ -25,11 +25,6 @@ const CUBEMAP_DIRECTIONS = array<vec3<f32>, 6>(
     vec3(0.0, 0.0, -1.0),
 );
 
-// Linear form of the voxel camera's sRGB clear color (0.055, 0.065, 0.075).
-// No-depth pixels must be reset instead of copied because egui is composited
-// into the same ping-pong target after this pass.
-const SCENE_CLEAR_COLOR = vec4<f32>(0.00439, 0.00550, 0.00657, 1.0);
-
 fn volume_sample(world_position: vec3<f32>) -> vec4<f32> {
     // Convert through the exact effective voxel size instead of normalized UVs.
     // textureLoad avoids filtering neighboring occupied cells at voxel boundaries.
@@ -105,9 +100,6 @@ fn fragment(
     let pixel = clamp(vec2<i32>(position.xy), vec2(0), dimensions - vec2(1));
     let depth = textureLoad(depth_texture, pixel, 0);
     if depth <= 0.000001 || settings.intensity <= 0.0 {
-        if depth <= 0.000001 {
-            return SCENE_CLEAR_COLOR;
-        }
         return source;
     }
 

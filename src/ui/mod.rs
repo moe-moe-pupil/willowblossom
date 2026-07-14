@@ -46,7 +46,6 @@ use bevy_egui::{
     EguiGlobalSettings,
     EguiPlugin,
     EguiPrimaryContextPass,
-    PrimaryEguiContext,
 };
 use bevy_persistent::{
     Persistent,
@@ -731,16 +730,6 @@ impl Plugin for UIPlugin {
 }
 
 pub fn setup_system(mut command: Commands) {
-    command.spawn((
-        Camera2d,
-        Camera {
-            order: 10,
-            clear_color: ClearColorConfig::None,
-            ..default()
-        },
-        PrimaryEguiContext,
-    ));
-
     let config_dir = Path::new(".data").join("willowblossom");
     let cached_memory = Persistent::<CachedMemory>::builder()
         .name("ui_memory")
