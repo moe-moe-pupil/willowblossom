@@ -230,6 +230,7 @@ struct VoxelAutoDoor {
 #[derive(Resource)]
 struct VoxelMaterials {
     handles: [Handle<StandardMaterial>; VOXEL_MATERIAL_COUNT],
+    planet_ocean: Handle<StandardMaterial>,
 }
 
 #[derive(Resource, Default)]
@@ -813,12 +814,30 @@ fn setup_voxel_materials(
         }
         materials.add(material)
     });
-    commands.insert_resource(VoxelMaterials { handles });
+    let planet_ocean = materials.add(opaque_planet_ocean_material(
+        textures[3].clone(),
+    ));
+    commands.insert_resource(VoxelMaterials {
+        handles,
+        planet_ocean,
+    });
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.48, 0.56, 0.68),
         brightness: DEFAULT_AMBIENT_BRIGHTNESS,
         ..default()
     });
+}
+
+fn opaque_planet_ocean_material(texture: Handle<Image>) -> StandardMaterial {
+    StandardMaterial {
+        base_color_texture: Some(texture),
+        base_color: Color::srgb(0.08, 0.38, 0.72),
+        alpha_mode: AlphaMode::Opaque,
+        perceptual_roughness: 0.32,
+        reflectance: 0.55,
+        emissive: voxel_emissive(0.025, 0.08, 0.16),
+        ..default()
+    }
 }
 
 fn hifi_voxel_tile_transform(row: usize) -> Affine2 {
@@ -2307,9 +2326,14 @@ fn spawn_voxel_orbital_planet(
         ))
         .with_children(|parent| {
             for (material_id, mesh) in material_meshes {
+                let material = if material_id == 4 {
+                    materials.planet_ocean.clone()
+                } else {
+                    materials.handles[material_id as usize - 1].clone()
+                };
                 parent.spawn((
                     Mesh3d(meshes.add(mesh)),
-                    MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
+                    MeshMaterial3d(material),
                     Transform::from_translation(mesh_center_offset)
                         .with_scale(Vec3::splat(voxel_scale)),
                 ));
@@ -2512,11 +2536,14 @@ fn animate_voxel_materials(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let seconds = time.elapsed_secs();
-    if let Some(mut water) = materials.get_mut(&voxel_materials.handles[3]) {
-        water.uv_transform = Affine2::from_translation(Vec2::new(
-            seconds * 0.035,
-            (seconds * 0.021).sin() * 0.08,
-        ));
+    let water_uv = Affine2::from_translation(Vec2::new(
+        seconds * 0.035,
+        (seconds * 0.021).sin() * 0.08,
+    ));
+    for handle in [&voxel_materials.handles[3], &voxel_materials.planet_ocean] {
+        if let Some(mut water) = materials.get_mut(handle) {
+            water.uv_transform = water_uv;
+        }
     }
     if let Some(mut lava) = materials.get_mut(&voxel_materials.handles[4]) {
         lava.uv_transform = Affine2::from_translation(Vec2::new(
@@ -4515,6 +4542,16 @@ mod tests {
     }
 
     #[test]
+    fn planet_ocean_material_is_opaque() {
+        let material = opaque_planet_ocean_material(Handle::default());
+        assert!(matches!(
+            material.alpha_mode,
+            AlphaMode::Opaque
+        ));
+        assert!(material.base_color_texture.is_some());
+    }
+
+    #[test]
     fn default_space_map_uses_all_materials_and_internal_auto_doors() {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
@@ -4612,6 +4649,7 @@ mod tests {
             .init_resource::<Assets<Mesh>>()
             .insert_resource(VoxelMaterials {
                 handles: std::array::from_fn(|_| Handle::default()),
+                planet_ocean: Handle::default(),
             })
             .add_systems(Update, process_voxel_scene_history);
         let saved_position = IVec3::new(50, 6, 3);
