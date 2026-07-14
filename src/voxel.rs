@@ -120,6 +120,7 @@ struct VoxelSceneSnapshot {
     name: String,
     voxels: Vec<(IVec3, u8)>,
     physics_bodies: Vec<VoxelPhysicsBodySnapshot>,
+    placed_lights: Vec<VoxelPlacedLight>,
 }
 
 #[derive(Component)]
@@ -131,6 +132,37 @@ struct VoxelKeyLight;
 #[derive(Component)]
 struct VoxelFillLight;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VoxelLightTool {
+    Point,
+    Cube,
+    Spot,
+    Remove,
+}
+
+impl VoxelLightTool {
+    pub(crate) const ALL: [Self; 4] = [Self::Point, Self::Cube, Self::Spot, Self::Remove];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Point => "点光源",
+            Self::Cube => "方块灯",
+            Self::Spot => "聚光灯",
+            Self::Remove => "移除灯光",
+        }
+    }
+}
+
+#[derive(Component, Clone)]
+struct VoxelPlacedLight {
+    kind: VoxelLightTool,
+    cell: IVec3,
+    color: [f32; 3],
+    intensity: f32,
+    range: f32,
+    direction: Vec3,
+}
+
 #[derive(Component)]
 struct VoxelFirstPersonPlayer;
 
@@ -139,6 +171,8 @@ struct VoxelAutoDoor {
     cells: Vec<IVec3>,
     trigger_center: Vec3,
     trigger_radius: f32,
+    trigger_half_height: f32,
+    width_axis: IVec3,
     material: u8,
     closed_translation: Vec3,
     open_translation: Vec3,
@@ -245,6 +279,10 @@ pub(crate) struct VoxelEditorState {
     pub first_person_enabled: bool,
     pub first_person_flying: bool,
     pub creative_inventory_open: bool,
+    pub light_tool: Option<VoxelLightTool>,
+    pub placed_light_color: [f32; 3],
+    pub placed_light_intensity: f32,
+    pub placed_light_range: f32,
     pub physics_requested: bool,
     physics_action_requested: Option<VoxelPhysicsRequest>,
     pub physics_push_pull_impulse: f32,
@@ -252,7 +290,9 @@ pub(crate) struct VoxelEditorState {
     pub physics_explosion_radius: f32,
     pub ambient_brightness: f32,
     pub key_light_illuminance: f32,
+    pub key_light_color: [f32; 3],
     pub fill_light_illuminance: f32,
+    pub fill_light_color: [f32; 3],
     pub radiance_intensity: f32,
     undo: Vec<Vec<VoxelChange>>,
     redo: Vec<Vec<VoxelChange>>,
@@ -292,6 +332,10 @@ impl Default for VoxelEditorState {
             first_person_enabled: false,
             first_person_flying: false,
             creative_inventory_open: false,
+            light_tool: None,
+            placed_light_color: [1.0, 0.78, 0.48],
+            placed_light_intensity: 1_800.0,
+            placed_light_range: 8.0,
             physics_requested: false,
             physics_action_requested: None,
             physics_push_pull_impulse: 4.0,
@@ -299,7 +343,9 @@ impl Default for VoxelEditorState {
             physics_explosion_radius: 6.0,
             ambient_brightness: DEFAULT_AMBIENT_BRIGHTNESS,
             key_light_illuminance: DEFAULT_KEY_LIGHT_ILLUMINANCE,
+            key_light_color: [1.0, 1.0, 1.0],
             fill_light_illuminance: DEFAULT_FILL_LIGHT_ILLUMINANCE,
+            fill_light_color: [0.5, 0.65, 1.0],
             radiance_intensity: DEFAULT_RADIANCE_INTENSITY,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -345,6 +391,18 @@ impl VoxelEditorState {
 
     pub(crate) fn physics_status(&self) -> Option<&str> { self.physics_status.as_deref() }
 
+    pub(crate) fn select_material(&mut self, material: u8) {
+        self.material = material;
+        self.light_tool = None;
+    }
+
+    pub(crate) fn active_tool_label(&self) -> &'static str {
+        self.light_tool.map_or_else(
+            || self.mode.label(),
+            VoxelLightTool::label,
+        )
+    }
+
     pub(crate) fn request_scene_snapshot(&mut self) { self.save_scene_requested = true; }
 
     pub(crate) fn scene_snapshot_labels(&self) -> Vec<String> {
@@ -352,10 +410,11 @@ impl VoxelEditorState {
             .iter()
             .map(|snapshot| {
                 format!(
-                    "{}（{} 方块 / {} 物理体）",
+                    "{}（{} 方块 / {} 物理体 / {} 灯光）",
                     snapshot.name,
                     snapshot.voxels.len(),
-                    snapshot.physics_bodies.len()
+                    snapshot.physics_bodies.len(),
+                    snapshot.placed_lights.len()
                 )
             })
             .collect()
@@ -393,7 +452,9 @@ impl VoxelEditorState {
     pub(crate) fn reset_lighting(&mut self) {
         self.ambient_brightness = DEFAULT_AMBIENT_BRIGHTNESS;
         self.key_light_illuminance = DEFAULT_KEY_LIGHT_ILLUMINANCE;
+        self.key_light_color = [1.0, 1.0, 1.0];
         self.fill_light_illuminance = DEFAULT_FILL_LIGHT_ILLUMINANCE;
+        self.fill_light_color = [0.5, 0.65, 1.0];
         self.radiance_intensity = DEFAULT_RADIANCE_INTENSITY;
     }
 }
@@ -428,6 +489,7 @@ impl Plugin for TrpgVoxelPlugin {
             (
                 voxel_editor_shortcuts,
                 handle_editor_requests,
+                place_creative_light,
                 edit_voxel_grid,
                 make_selection_physical,
                 apply_voxel_physics_action,
@@ -470,7 +532,7 @@ fn voxel_editor_shortcuts(
         (KeyCode::Digit0, 10),
     ] {
         if keyboard.just_pressed(key) {
-            editor.material = material;
+            editor.select_material(material);
         }
     }
     if !keyboard.just_pressed(KeyCode::KeyZ) {
@@ -772,8 +834,18 @@ fn sync_voxel_lighting(
     for (mut light, key, fill) in &mut lights {
         if key.is_some() {
             light.illuminance = editor.key_light_illuminance.max(0.0);
+            light.color = Color::srgb(
+                editor.key_light_color[0],
+                editor.key_light_color[1],
+                editor.key_light_color[2],
+            );
         } else if fill.is_some() {
             light.illuminance = editor.fill_light_illuminance.max(0.0);
+            light.color = Color::srgb(
+                editor.fill_light_color[0],
+                editor.fill_light_color[1],
+                editor.fill_light_color[2],
+            );
         }
     }
     for mut uniform in &mut cameras {
@@ -1421,14 +1493,16 @@ fn make_voxel_auto_door(
         .collect::<Vec<_>>();
     let trigger_center =
         (base.as_vec3() + Vec3::new(0.5, (height + 1) as f32 * 0.5, 0.5)) * VOXEL_SIZE;
-    let (closed_translation, size) = voxel_door_transform_and_size(&cells);
+    let (closed_translation, _) = voxel_door_transform_and_size(&cells);
     VoxelAutoDoor {
         cells,
         trigger_center,
         trigger_radius,
+        trigger_half_height: (height as f32 * VOXEL_SIZE * 0.65).max(VOXEL_SIZE * 3.0),
+        width_axis,
         material: 10,
         closed_translation,
-        open_translation: closed_translation + Vec3::Y * (size.y + VOXEL_SIZE),
+        open_translation: closed_translation,
         open: false,
     }
 }
@@ -1447,17 +1521,77 @@ fn setup_voxel_auto_doors(
     materials: Res<VoxelMaterials>,
 ) {
     for door in voxel_auto_doors() {
-        let (_, size) = voxel_door_transform_and_size(&door.cells);
-        let translation = door.closed_translation;
-        commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
-            MeshMaterial3d(materials.handles[door.material as usize - 1].clone()),
-            Transform::from_translation(translation),
-            RigidBody::Kinematic,
-            Collider::cuboid(size.x, size.y, size.z),
-            door,
-        ));
+        for panel in voxel_auto_door_panels(&door) {
+            let (_, size) = voxel_door_transform_and_size(&panel.cells);
+            let translation = panel.closed_translation;
+            commands.spawn((
+                Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+                MeshMaterial3d(materials.handles[panel.material as usize - 1].clone()),
+                Transform::from_translation(translation),
+                RigidBody::Kinematic,
+                Collider::cuboid(size.x, size.y, size.z),
+                panel,
+            ));
+        }
     }
+}
+
+fn voxel_auto_door_panels(door: &VoxelAutoDoor) -> [VoxelAutoDoor; 2] {
+    let axis = door.width_axis;
+    let projection = |cell: IVec3| cell.dot(axis);
+    let min = door
+        .cells
+        .iter()
+        .copied()
+        .map(projection)
+        .min()
+        .unwrap_or(0);
+    let max = door
+        .cells
+        .iter()
+        .copied()
+        .map(projection)
+        .max()
+        .unwrap_or(0);
+    let midpoint = (min + max) / 2;
+    let left_cells = door
+        .cells
+        .iter()
+        .copied()
+        .filter(|cell| projection(*cell) <= midpoint)
+        .collect::<Vec<_>>();
+    let right_cells = door
+        .cells
+        .iter()
+        .copied()
+        .filter(|cell| projection(*cell) > midpoint)
+        .collect::<Vec<_>>();
+    let make_panel = |cells: Vec<IVec3>, direction: f32| {
+        let (closed_translation, size) = voxel_door_transform_and_size(&cells);
+        let panel_width = size.dot(axis.as_vec3().abs());
+        VoxelAutoDoor {
+            cells,
+            trigger_center: door.trigger_center,
+            trigger_radius: door.trigger_radius,
+            trigger_half_height: door.trigger_half_height,
+            width_axis: axis,
+            material: door.material,
+            closed_translation,
+            open_translation: closed_translation
+                + axis.as_vec3() * direction * (panel_width + VOXEL_SIZE * 0.5),
+            open: false,
+        }
+    };
+    [make_panel(left_cells, -1.0), make_panel(right_cells, 1.0)]
+}
+
+fn voxel_auto_door_should_open(door: &VoxelAutoDoor, player_position: Vec3) -> bool {
+    let horizontal = Vec2::new(
+        player_position.x - door.trigger_center.x,
+        player_position.z - door.trigger_center.z,
+    );
+    horizontal.length() <= door.trigger_radius
+        && (player_position.y - door.trigger_center.y).abs() <= door.trigger_half_height
 }
 
 fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
@@ -1666,8 +1800,8 @@ fn animate_voxel_auto_doors(
     };
     let response = 1.0 - (-14.0 * time.delta_secs()).exp();
     for (mut door, mut transform) in &mut doors {
-        let should_open = editor.first_person_enabled
-            && player.translation.distance(door.trigger_center) <= door.trigger_radius;
+        let should_open =
+            editor.first_person_enabled && voxel_auto_door_should_open(&door, player.translation);
         let target = if should_open { door.open_translation } else { door.closed_translation };
         transform.translation = transform.translation.lerp(target, response);
         if transform.translation.distance_squared(target) < 0.000_001 {
@@ -1985,12 +2119,16 @@ fn handle_editor_requests(
     mut editor: ResMut<VoxelEditorState>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     physics_bodies: Query<Entity, With<VoxelPhysicsBody>>,
+    placed_lights: Query<Entity, With<VoxelPlacedLight>>,
 ) {
     let Ok(mut grid) = grids.single_mut() else {
         return;
     };
     if editor.reset_requested {
         for entity in &physics_bodies {
+            commands.entity(entity).despawn();
+        }
+        for entity in &placed_lights {
             commands.entity(entity).despawn();
         }
         let occupied = occupied_cells(&grid);
@@ -2242,6 +2380,7 @@ fn process_voxel_scene_history(
         &LinearVelocity,
         &AngularVelocity,
     )>,
+    placed_lights: Query<(Entity, &VoxelPlacedLight)>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
@@ -2264,22 +2403,28 @@ fn process_voxel_scene_history(
                 },
             )
             .collect::<Vec<_>>();
+        let placed_lights = placed_lights
+            .iter()
+            .map(|(_, light)| light.clone())
+            .collect::<Vec<_>>();
         let snapshot_number = editor.next_scene_snapshot_number;
         editor.next_scene_snapshot_number += 1;
         editor.scene_snapshots.push(VoxelSceneSnapshot {
             name: format!("场景快照 {snapshot_number}"),
             voxels,
             physics_bodies,
+            placed_lights,
         });
         if editor.scene_snapshots.len() > MAX_SCENE_SNAPSHOTS {
             editor.scene_snapshots.remove(0);
         }
         let snapshot = editor.scene_snapshots.last().unwrap();
         editor.physics_status = Some(format!(
-            "已保存 {}：{} 个方块，{} 个物理体",
+            "已保存 {}：{} 个方块，{} 个物理体，{} 盏灯",
             snapshot.name,
             snapshot.voxels.len(),
-            snapshot.physics_bodies.len()
+            snapshot.physics_bodies.len(),
+            snapshot.placed_lights.len()
         ));
     }
 
@@ -2301,6 +2446,9 @@ fn process_voxel_scene_history(
     for (entity, ..) in &physics_bodies {
         commands.entity(entity).despawn();
     }
+    for (entity, _) in &placed_lights {
+        commands.entity(entity).despawn();
+    }
     for body in &snapshot.physics_bodies {
         spawn_voxel_physics_body_at(
             &mut commands,
@@ -2311,6 +2459,9 @@ fn process_voxel_scene_history(
             body.linear_velocity,
             body.angular_velocity,
         );
+    }
+    for light in &snapshot.placed_lights {
+        spawn_voxel_placed_light(&mut commands, light.clone());
     }
 
     editor.undo.clear();
@@ -2445,6 +2596,160 @@ fn apply_stroke(grid: &mut Mut<Grid<u8>>, stroke: &[VoxelChange], forward: bool)
     }
 }
 
+fn spawn_voxel_placed_light(commands: &mut Commands, light: VoxelPlacedLight) -> Entity {
+    let position = (light.cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
+    let color = Color::srgb(
+        light.color[0],
+        light.color[1],
+        light.color[2],
+    );
+    match light.kind {
+        VoxelLightTool::Point | VoxelLightTool::Cube => commands
+            .spawn((
+                PointLight {
+                    color,
+                    intensity: light.intensity.max(0.0),
+                    range: light.range.max(VOXEL_SIZE),
+                    radius: if light.kind == VoxelLightTool::Cube {
+                        VOXEL_SIZE * 0.45
+                    } else {
+                        VOXEL_SIZE * 0.12
+                    },
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                Transform::from_translation(position),
+                light,
+            ))
+            .id(),
+        VoxelLightTool::Spot => {
+            let direction = light.direction.try_normalize().unwrap_or(Vec3::NEG_Z);
+            let up = if direction.dot(Vec3::Y).abs() > 0.95 { Vec3::X } else { Vec3::Y };
+            commands
+                .spawn((
+                    SpotLight {
+                        color,
+                        intensity: light.intensity.max(0.0),
+                        range: light.range.max(VOXEL_SIZE),
+                        radius: VOXEL_SIZE * 0.1,
+                        shadow_maps_enabled: false,
+                        ..default()
+                    },
+                    Transform::from_translation(position).looking_to(direction, up),
+                    light,
+                ))
+                .id()
+        },
+        VoxelLightTool::Remove => Entity::PLACEHOLDER,
+    }
+}
+
+fn place_creative_light(
+    mut commands: Commands,
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
+    mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    placed_lights: Query<(
+        Entity,
+        &GlobalTransform,
+        &VoxelPlacedLight,
+    )>,
+    mut editor: ResMut<VoxelEditorState>,
+    egui_input: Res<EguiWantsInput>,
+) {
+    let Some(tool) = editor.light_tool else {
+        return;
+    };
+    if editor.creative_inventory_open
+        || !mouse.just_pressed(MouseButton::Left)
+        || voxel_world_pointer_blocked(
+            egui_input.wants_any_pointer_input(),
+            editor.left_started_over_ui,
+        )
+    {
+        return;
+    }
+    let (Ok(window), Ok((camera, camera_transform)), Ok(mut grid)) = (
+        windows.single(),
+        cameras.single(),
+        grids.single_mut(),
+    ) else {
+        return;
+    };
+    let Some(ray) = viewport_ray(
+        window,
+        camera,
+        camera_transform,
+        &editor,
+    ) else {
+        return;
+    };
+
+    if tool == VoxelLightTool::Remove {
+        let mut closest = None;
+        for (entity, transform, light) in &placed_lights {
+            let offset = transform.translation() - ray.origin;
+            let distance = offset.dot(*ray.direction);
+            if !(0.0..=MAX_RAY_DISTANCE).contains(&distance) {
+                continue;
+            }
+            let nearest = ray.origin + *ray.direction * distance;
+            if transform.translation().distance(nearest) > VOXEL_SIZE * 1.5 {
+                continue;
+            }
+            if closest
+                .as_ref()
+                .is_none_or(|(_, closest_distance, _)| distance < *closest_distance)
+            {
+                closest = Some((entity, distance, light.clone()));
+            }
+        }
+        let Some((entity, _, light)) = closest else {
+            editor.physics_status = Some("没有瞄准已放置的灯光".to_owned());
+            return;
+        };
+        commands.entity(entity).despawn();
+        if light.kind == VoxelLightTool::Cube {
+            if grid.get(light.cell).copied().unwrap_or(0) != 0 {
+                grid.set(light.cell, 0);
+            }
+        }
+        editor.physics_status = Some(format!("已移除{}", light.kind.label()));
+        return;
+    }
+
+    let Some(hit) = raycast_grid(&grid, ray) else {
+        return;
+    };
+    let Some(cell) = hit.add else {
+        return;
+    };
+    if placed_lights.iter().any(|(_, _, light)| light.cell == cell) {
+        editor.physics_status = Some("这个位置已经有灯光".to_owned());
+        return;
+    }
+    let direction = hit
+        .occupied
+        .map(|occupied| (cell - occupied).as_vec3())
+        .and_then(Vec3::try_normalize)
+        .unwrap_or(Vec3::Y);
+    if tool == VoxelLightTool::Cube {
+        if grid.get(cell).copied().unwrap_or(0) != 8 {
+            grid.set(cell, 8);
+        }
+    }
+    spawn_voxel_placed_light(&mut commands, VoxelPlacedLight {
+        kind: tool,
+        cell,
+        color: editor.placed_light_color,
+        intensity: editor.placed_light_intensity,
+        range: editor.placed_light_range,
+        direction,
+    });
+    editor.physics_status = Some(format!("已放置{}", tool.label()));
+}
+
 fn edit_voxel_grid(
     mut commands: Commands,
     time: Res<Time>,
@@ -2481,6 +2786,9 @@ fn edit_voxel_grid(
         editor.left_started_over_ui = false;
     }
     if editor.creative_inventory_open {
+        return;
+    }
+    if editor.light_tool.is_some() {
         return;
     }
     if voxel_world_pointer_blocked(
@@ -3054,6 +3362,7 @@ fn control_voxel_camera(
                 );
             } else if wheel_steps != 0 {
                 editor.mode = editor.mode.cycle(-wheel_steps);
+                editor.light_tool = None;
             }
         }
         let Ok((player_transform, _)) = players.single() else {
@@ -3124,6 +3433,7 @@ fn draw_voxel_target(
     cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
     grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
     physics_bodies: Query<(), With<VoxelPhysicsBody>>,
+    placed_lights: Query<(&GlobalTransform, &VoxelPlacedLight)>,
     spatial_query: SpatialQuery,
     editor: Res<VoxelEditorState>,
     egui_input: Res<EguiWantsInput>,
@@ -3176,9 +3486,12 @@ fn draw_voxel_target(
         };
         (hit, explosion_origin)
     };
-    let target = match (editor.mode, hit) {
-        (VoxelEditMode::Add, Some(hit)) => hit.add,
+    let target = match (editor.light_tool, editor.mode, hit) {
+        (Some(VoxelLightTool::Remove), ..) => None,
+        (Some(_), _, Some(hit)) => hit.add,
+        (None, VoxelEditMode::Add, Some(hit)) => hit.add,
         (
+            None,
             VoxelEditMode::Remove
             | VoxelEditMode::Paint
             | VoxelEditMode::Physics
@@ -3187,8 +3500,30 @@ fn draw_voxel_target(
             | VoxelEditMode::Explode,
             Some(hit),
         ) => hit.occupied,
-        (_, None) => None,
+        (_, _, None) => None,
     };
+    if editor.light_tool.is_some() {
+        for (transform, light) in &placed_lights {
+            let position = transform.translation();
+            let color = Color::srgb(
+                light.color[0],
+                light.color[1],
+                light.color[2],
+            );
+            gizmos.sphere(
+                Isometry3d::from_translation(position),
+                VOXEL_SIZE * 0.65,
+                color,
+            );
+            if light.kind == VoxelLightTool::Spot {
+                gizmos.arrow(
+                    position,
+                    position + light.direction.normalize_or_zero() * VOXEL_SIZE * 3.0,
+                    color,
+                );
+            }
+        }
+    }
     if editor.mode == VoxelEditMode::Physics {
         let selection_end = editor.selection_end.or(target);
         if let (Some(start), Some(end)) = (editor.selection_anchor, selection_end) {
@@ -3342,7 +3677,9 @@ mod tests {
         let mut editor = VoxelEditorState::default();
         editor.ambient_brightness = 12.0;
         editor.key_light_illuminance = 3_000.0;
+        editor.key_light_color = [0.9, 0.7, 0.5];
         editor.fill_light_illuminance = 900.0;
+        editor.fill_light_color = [0.2, 0.4, 0.8];
         editor.radiance_intensity = 0.8;
         app.insert_resource(editor)
             .insert_resource(GlobalAmbientLight::default())
@@ -3395,6 +3732,22 @@ mod tests {
                 .unwrap()
                 .illuminance,
             900.0
+        );
+        assert_eq!(
+            app.world()
+                .entity(key)
+                .get::<DirectionalLight>()
+                .unwrap()
+                .color,
+            Color::srgb(0.9, 0.7, 0.5)
+        );
+        assert_eq!(
+            app.world()
+                .entity(fill)
+                .get::<DirectionalLight>()
+                .unwrap()
+                .color,
+            Color::srgb(0.2, 0.4, 0.8)
         );
         assert_eq!(
             app.world()
@@ -3538,9 +3891,24 @@ mod tests {
             .iter()
             .flat_map(|door| &door.cells)
             .all(|cell| { grid.get(*cell).copied().unwrap_or(0) == 0 }));
-        assert!(doors
-            .iter()
-            .all(|door| door.open_translation.y > door.closed_translation.y));
+        for door in &doors {
+            let panels = voxel_auto_door_panels(door);
+            assert!(panels.iter().all(|panel| {
+                (panel.open_translation.y - panel.closed_translation.y).abs() < f32::EPSILON
+            }));
+            let left_delta = panels[0].open_translation - panels[0].closed_translation;
+            let right_delta = panels[1].open_translation - panels[1].closed_translation;
+            assert!(left_delta.dot(door.width_axis.as_vec3()) < 0.0);
+            assert!(right_delta.dot(door.width_axis.as_vec3()) > 0.0);
+            assert!(voxel_auto_door_should_open(
+                door,
+                door.trigger_center
+            ));
+            assert!(!voxel_auto_door_should_open(
+                door,
+                door.trigger_center + Vec3::Y * (door.trigger_half_height + 0.01)
+            ));
+        }
 
         let lights = voxel_interior_lights();
         assert_eq!(lights.len(), 62);
@@ -3574,10 +3942,11 @@ mod tests {
             name: "场景快照 1".to_owned(),
             voxels: vec![(IVec3::ZERO, 1)],
             physics_bodies: Vec::new(),
+            placed_lights: Vec::new(),
         });
 
         assert_eq!(editor.scene_snapshot_labels(), vec![
-            "场景快照 1（1 方块 / 0 物理体）"
+            "场景快照 1（1 方块 / 0 物理体 / 0 灯光）"
         ]);
         editor.request_scene_restore(0);
         assert_eq!(editor.restore_scene_requested, Some(0));
@@ -3607,6 +3976,18 @@ mod tests {
             LinearVelocity(Vec3::X),
             AngularVelocity(Vec3::Y),
         ));
+        let saved_light_cell = IVec3::new(52, 8, 3);
+        let saved_light = app
+            .world_mut()
+            .spawn(VoxelPlacedLight {
+                kind: VoxelLightTool::Point,
+                cell: saved_light_cell,
+                color: [1.0, 0.5, 0.25],
+                intensity: 2_400.0,
+                range: 7.5,
+                direction: Vec3::Y,
+            })
+            .id();
         app.world_mut()
             .resource_mut::<VoxelEditorState>()
             .request_scene_snapshot();
@@ -3627,6 +4008,7 @@ mod tests {
             .get_mut::<Transform>()
             .unwrap()
             .translation = Vec3::splat(99.0);
+        app.world_mut().despawn(saved_light);
         app.world_mut()
             .resource_mut::<VoxelEditorState>()
             .request_scene_restore(0);
@@ -3643,6 +4025,13 @@ mod tests {
             transform.translation,
             Vec3::new(2.0, 3.0, 4.0)
         );
+        let restored_light = app
+            .world_mut()
+            .query_filtered::<&VoxelPlacedLight, With<PointLight>>()
+            .single(app.world())
+            .unwrap();
+        assert_eq!(restored_light.cell, saved_light_cell);
+        assert_eq!(restored_light.color, [1.0, 0.5, 0.25]);
     }
 
     #[test]
@@ -4105,12 +4494,19 @@ mod tests {
             .init_resource::<VoxelEditorState>()
             .add_systems(Update, voxel_editor_shortcuts);
         app.world_mut()
+            .resource_mut::<VoxelEditorState>()
+            .light_tool = Some(VoxelLightTool::Point);
+        app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::Digit0);
         app.update();
         assert_eq!(
             app.world().resource::<VoxelEditorState>().material,
             10
+        );
+        assert_eq!(
+            app.world().resource::<VoxelEditorState>().light_tool,
+            None
         );
     }
 }

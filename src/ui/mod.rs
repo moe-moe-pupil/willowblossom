@@ -62,6 +62,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use crate::voxel::{
     VoxelEditMode,
     VoxelEditorState,
+    VoxelLightTool,
 };
 
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
@@ -11585,6 +11586,7 @@ pub fn ui_system(
                 .corner_radius(4)
                 .inner_margin(6)
                 .show(ui, |ui| {
+                    let mode_before_toolbar = voxel_editor.mode;
                     ui.horizontal(|ui| {
                         ui.selectable_value(
                             &mut voxel_editor.mode,
@@ -11629,11 +11631,15 @@ pub fn ui_system(
                                 material,
                                 name,
                                 color,
-                                voxel_editor.material,
+                                if voxel_editor.light_tool.is_none() {
+                                    voxel_editor.material
+                                } else {
+                                    0
+                                },
                                 22.0,
                                 None,
                             ) {
-                                voxel_editor.material = material;
+                                voxel_editor.select_material(material);
                             }
                         }
                         ui.separator();
@@ -11676,6 +11682,9 @@ pub fn ui_system(
                                 !voxel_editor.creative_inventory_open;
                         }
                     });
+                    if voxel_editor.mode != mode_before_toolbar {
+                        voxel_editor.light_tool = None;
+                    }
                     if voxel_editor.first_person_enabled {
                         let movement_hint = if voxel_editor.first_person_flying {
                             "创造飞行/穿墙中 · WASD 移动 · 空格上升 · Shift 下降"
@@ -11684,7 +11693,7 @@ pub fn ui_system(
                         };
                         ui.small(format!(
                             "{movement_hint} · 当前工具：{} · 滚轮切换工具 · 爆炸工具下 Shift+滚轮调半径 · 左键使用 · Esc 退出",
-                            voxel_editor.mode.label()
+                            voxel_editor.active_tool_label()
                         ));
                     }
                     ui.collapsing("光照编辑器", |ui| {
@@ -11701,12 +11710,16 @@ pub fn ui_system(
                                     .range(0.0..=50_000.0)
                                     .speed(100.0),
                             );
+                            ui.label("主光颜色");
+                            ui.color_edit_button_rgb(&mut voxel_editor.key_light_color);
                             ui.label("补光");
                             ui.add(
                                 egui::DragValue::new(&mut voxel_editor.fill_light_illuminance)
                                     .range(0.0..=50_000.0)
                                     .speed(100.0),
                             );
+                            ui.label("补光颜色");
+                            ui.color_edit_button_rgb(&mut voxel_editor.fill_light_color);
                             ui.label("辐射级联");
                             ui.add(
                                 egui::DragValue::new(&mut voxel_editor.radiance_intensity)
@@ -11821,11 +11834,15 @@ pub fn ui_system(
                                         material,
                                         name,
                                         color,
-                                        voxel_editor.material,
+                                        if voxel_editor.light_tool.is_none() {
+                                            voxel_editor.material
+                                        } else {
+                                            0
+                                        },
                                         38.0,
                                         Some(&shortcut),
                                     ) {
-                                        voxel_editor.material = material;
+                                        voxel_editor.select_material(material);
                                     }
                                 }
                             });
@@ -11834,7 +11851,9 @@ pub fn ui_system(
 
             if voxel_editor.creative_inventory_open {
                 let current_material = voxel_editor.material;
+                let current_light_tool = voxel_editor.light_tool;
                 let mut selected_material = None;
+                let mut selected_light_tool = None;
                 let mut window_open = true;
                 egui::Window::new("创造模式物品栏")
                     .id(egui::Id::new("voxel_creative_inventory"))
@@ -11858,7 +11877,11 @@ pub fn ui_system(
                                             material,
                                             name,
                                             color,
-                                            current_material,
+                                            if current_light_tool.is_none() {
+                                                current_material
+                                            } else {
+                                                0
+                                            },
                                             56.0,
                                             None,
                                         ) {
@@ -11871,11 +11894,56 @@ pub fn ui_system(
                                     }
                                 }
                             });
+                        ui.separator();
+                        ui.label("灯光工具");
+                        ui.horizontal_wrapped(|ui| {
+                            for tool in VoxelLightTool::ALL {
+                                if ui
+                                    .selectable_label(
+                                        current_light_tool == Some(tool),
+                                        tool.label(),
+                                    )
+                                    .on_hover_text(match tool {
+                                        VoxelLightTool::Point => "放置向四周发光的点光源",
+                                        VoxelLightTool::Cube => {
+                                            "放置发光科技板体素，并从方块中心照亮四周"
+                                        },
+                                        VoxelLightTool::Spot => "沿墙面朝外放置定向聚光灯",
+                                        VoxelLightTool::Remove => "瞄准已放置的灯光并点击移除",
+                                    })
+                                    .clicked()
+                                {
+                                    selected_light_tool = Some(tool);
+                                }
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("新灯颜色");
+                            ui.color_edit_button_rgb(&mut voxel_editor.placed_light_color);
+                            ui.label("亮度");
+                            ui.add(
+                                egui::DragValue::new(&mut voxel_editor.placed_light_intensity)
+                                    .range(0.0..=100_000.0)
+                                    .speed(100.0),
+                            );
+                            ui.label("范围");
+                            ui.add(
+                                egui::DragValue::new(&mut voxel_editor.placed_light_range)
+                                    .range(0.25..=100.0)
+                                    .speed(0.25),
+                            );
+                        });
+                        if let Some(status) = voxel_editor.physics_status() {
+                            ui.small(status);
+                        }
                         ui.add_space(4.0);
-                        ui.small("快捷键：1–9、0 选择快捷栏；E 或 Esc 关闭");
+                        ui.small("左键放置或移除灯光 · 1–9、0 返回材料快捷栏 · E 或 Esc 关闭");
                     });
                 if let Some(material) = selected_material {
-                    voxel_editor.material = material;
+                    voxel_editor.select_material(material);
+                }
+                if let Some(tool) = selected_light_tool {
+                    voxel_editor.light_tool = Some(tool);
                 }
                 if !window_open {
                     voxel_editor.creative_inventory_open = false;
