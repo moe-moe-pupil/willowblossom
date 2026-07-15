@@ -1,11 +1,15 @@
-use std::collections::{
-    HashMap,
-    HashSet,
+use std::{
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    path::Path,
 };
 
 use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
+    camera::RenderTarget,
     core_pipeline::prepass::DepthPrepass,
     image::{
         ImageAddressMode,
@@ -24,10 +28,17 @@ use bevy::{
         PrimitiveTopology,
     },
     prelude::*,
-    render::render_resource::{
-        Extent3d,
-        TextureDimension,
-        TextureFormat,
+    render::{
+        render_resource::{
+            Extent3d,
+            TextureDimension,
+            TextureFormat,
+            TextureUsages,
+        },
+        view::screenshot::{
+            Screenshot,
+            ScreenshotCaptured,
+        },
     },
     window::{
         CursorGrabMode,
@@ -36,15 +47,36 @@ use bevy::{
     },
 };
 use bevy_egui::{
+    egui,
     input::EguiWantsInput,
+    EguiContexts,
+    EguiPrimaryContextPass,
     PrimaryEguiContext,
 };
+use bevy_persistent::{
+    Persistent,
+    StorageFormat,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::json;
+use tokio_tungstenite::tungstenite::protocol::Message;
 use voxxelmaxx::prelude::*;
 
-use crate::voxel_radiance::{
-    VoxelRadianceCascade,
-    VoxelRadianceCascadePlugin,
-    VoxelRadianceCascadeUniform,
+use crate::{
+    napcat::{
+        NapcatIOSender,
+        NapcatMessageManager,
+        NapcatOutboundMessage,
+    },
+    scene::SceneCaptureRequests,
+    voxel_radiance::{
+        VoxelRadianceCascade,
+        VoxelRadianceCascadePlugin,
+        VoxelRadianceCascadeUniform,
+    },
 };
 
 const VOXEL_SIZE: f32 = 0.25;
@@ -93,6 +125,9 @@ const DEFAULT_SCENE_CAMERA_FOCUS: Vec3 = Vec3::new(
     COMBAT_SPACESHIP_CENTER.z as f32 * VOXEL_SIZE,
 );
 const DEFAULT_SCENE_CAMERA_DISTANCE: f32 = 50.0;
+const PLAYER_CAPTURE_WIDTH: u32 = 1024;
+const PLAYER_CAPTURE_HEIGHT: u32 = 768;
+const PLAYER_CAPTURE_PREPARE_FRAMES: u8 = 3;
 
 pub struct TrpgVoxelPlugin;
 
@@ -117,6 +152,56 @@ pub struct TrpgVoxelGrid;
 
 #[derive(Component)]
 struct VoxelViewportCamera;
+
+#[derive(Component)]
+struct VoxelPlayerCaptureCamera {
+    user_id: u64,
+}
+
+#[derive(Clone)]
+struct VoxelPlayerCameraRuntime {
+    entity: Entity,
+    target: Handle<Image>,
+}
+
+#[derive(Resource, Default)]
+struct VoxelPlayerCameraRuntimes {
+    cameras: HashMap<u64, VoxelPlayerCameraRuntime>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedVoxelPlayerCamera {
+    user_id: u64,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+}
+
+#[derive(Resource, Default, Serialize, Deserialize)]
+struct VoxelPlayerCameraStore {
+    cameras: Vec<PersistedVoxelPlayerCamera>,
+}
+
+#[derive(Resource, Default)]
+struct VoxelPlayerCameraEditor {
+    selected_user_id: Option<u64>,
+    new_user_id: String,
+}
+
+#[derive(Resource, Default)]
+struct VoxelPlayerCaptureState {
+    next_request_id: u64,
+    pending: Vec<PendingVoxelPlayerCapture>,
+}
+
+struct PendingVoxelPlayerCapture {
+    request_id: u64,
+    user_id: u64,
+    camera_entity: Entity,
+    target: Handle<Image>,
+    output_path: std::path::PathBuf,
+    prepare_frames_remaining: u8,
+    activated: bool,
+}
 
 #[derive(Component)]
 struct VoxelGeometry;
@@ -617,6 +702,17 @@ impl VoxelEditorState {
 
 impl Plugin for TrpgVoxelPlugin {
     fn build(&self, app: &mut App) {
+        let player_camera_store = Persistent::<VoxelPlayerCameraStore>::builder()
+            .name("voxel_player_cameras")
+            .format(StorageFormat::Toml)
+            .path(
+                Path::new(".data")
+                    .join("willowblossom")
+                    .join("voxel_player_cameras.toml"),
+            )
+            .default(VoxelPlayerCameraStore::default())
+            .build()
+            .expect("failed to initialize voxel player camera store");
         app.add_plugins((
             PhysicsPlugins::default(),
             VoxelPlugin::<u8>::default(),
@@ -629,6 +725,11 @@ impl Plugin for TrpgVoxelPlugin {
         .insert_resource(Gravity::ZERO)
         .init_resource::<VoxelEditorState>()
         .init_resource::<VoxelRadianceVolume>()
+        .init_resource::<SceneCaptureRequests>()
+        .init_resource::<VoxelPlayerCameraRuntimes>()
+        .init_resource::<VoxelPlayerCameraEditor>()
+        .init_resource::<VoxelPlayerCaptureState>()
+        .insert_resource(player_camera_store)
         .add_systems(
             Startup,
             (
@@ -640,6 +741,7 @@ impl Plugin for TrpgVoxelPlugin {
                 setup_voxel_interior_lights,
                 setup_voxel_sample_props,
                 setup_voxel_view,
+                setup_voxel_player_cameras,
             )
                 .chain(),
         )
@@ -661,11 +763,14 @@ impl Plugin for TrpgVoxelPlugin {
                 sync_voxel_lighting,
                 control_first_person_player,
                 control_voxel_camera,
+                sync_voxel_player_cameras,
+                capture_voxel_player_view,
                 draw_voxel_target,
                 animate_voxel_materials,
             )
                 .chain(),
-        );
+        )
+        .add_systems(EguiPrimaryContextPass, voxel_player_camera_panel);
     }
 }
 
@@ -2292,6 +2397,486 @@ fn setup_voxel_view(
         ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
         Transform::from_translation(FIRST_PERSON_START),
     ));
+}
+
+fn setup_voxel_player_cameras(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    store: Res<Persistent<VoxelPlayerCameraStore>>,
+    mut runtimes: ResMut<VoxelPlayerCameraRuntimes>,
+) {
+    for camera in &store.cameras {
+        spawn_voxel_player_camera(
+            &mut commands,
+            &mut images,
+            &mut runtimes,
+            camera.user_id,
+            voxel_player_camera_transform(camera),
+        );
+    }
+}
+
+fn sync_voxel_player_cameras(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    requests: Res<SceneCaptureRequests>,
+    viewport_camera: Query<
+        &Transform,
+        (
+            With<VoxelViewportCamera>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
+    mut runtimes: ResMut<VoxelPlayerCameraRuntimes>,
+    mut store: ResMut<Persistent<VoxelPlayerCameraStore>>,
+) {
+    let mut user_ids = requests
+        .requests
+        .iter()
+        .filter(|request| voxel_observation_player_allowed(manager.as_deref(), request.user_id))
+        .map(|request| request.user_id)
+        .collect::<HashSet<_>>();
+    if let Some(manager) = manager.as_deref() {
+        if let Some(group) = manager.current_group() {
+            user_ids.extend(
+                group
+                    .players
+                    .iter()
+                    .filter_map(|target_id| target_id.parse::<u64>().ok()),
+            );
+        }
+    }
+    let default_transform = viewport_camera
+        .single()
+        .copied()
+        .unwrap_or_else(|_| Transform::from_translation(FIRST_PERSON_START));
+    let mut changed = false;
+    for user_id in user_ids {
+        if runtimes.cameras.contains_key(&user_id) {
+            continue;
+        }
+        let transform = persisted_voxel_player_camera(&store, user_id)
+            .map(voxel_player_camera_transform)
+            .unwrap_or(default_transform);
+        spawn_voxel_player_camera(
+            &mut commands,
+            &mut images,
+            &mut runtimes,
+            user_id,
+            transform,
+        );
+        if persisted_voxel_player_camera(&store, user_id).is_none() {
+            upsert_voxel_player_camera(&mut store, user_id, &transform);
+            changed = true;
+        }
+    }
+    if changed {
+        if let Err(err) = store.persist() {
+            eprintln!("failed to persist voxel player cameras: {err}");
+        }
+    }
+}
+
+fn voxel_player_camera_panel(
+    mut commands: Commands,
+    mut contexts: EguiContexts,
+    mut images: ResMut<Assets<Image>>,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    mut editor: ResMut<VoxelPlayerCameraEditor>,
+    mut runtimes: ResMut<VoxelPlayerCameraRuntimes>,
+    mut store: ResMut<Persistent<VoxelPlayerCameraStore>>,
+    viewport_camera: Query<
+        &Transform,
+        (
+            With<VoxelViewportCamera>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
+    mut capture_cameras: Query<
+        (
+            &VoxelPlayerCaptureCamera,
+            &mut Transform,
+        ),
+        (
+            With<VoxelPlayerCaptureCamera>,
+            Without<VoxelViewportCamera>,
+        ),
+    >,
+) {
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    let mut user_ids = runtimes.cameras.keys().copied().collect::<Vec<_>>();
+    user_ids.sort_unstable();
+    if editor
+        .selected_user_id
+        .is_none_or(|selected| !runtimes.cameras.contains_key(&selected))
+    {
+        editor.selected_user_id = user_ids.first().copied();
+    }
+
+    egui::Window::new("玩家观察相机")
+        .default_pos(egui::pos2(12.0, 270.0))
+        .default_width(300.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.small("玩家发送 .观察 后，将私聊收到此相机的第一人称画面。");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut editor.new_user_id).hint_text("玩家QQ号"));
+                let new_user_id = editor.new_user_id.trim().parse::<u64>().ok();
+                if ui.button("创建").clicked() {
+                    let Some(user_id) = new_user_id else { return };
+                    if runtimes.cameras.contains_key(&user_id) {
+                        return;
+                    }
+                    let transform = viewport_camera
+                        .single()
+                        .copied()
+                        .unwrap_or_else(|_| Transform::from_translation(FIRST_PERSON_START));
+                    spawn_voxel_player_camera(
+                        &mut commands,
+                        &mut images,
+                        &mut runtimes,
+                        user_id,
+                        transform,
+                    );
+                    upsert_voxel_player_camera(&mut store, user_id, &transform);
+                    if let Err(err) = store.persist() {
+                        eprintln!("failed to persist voxel player camera: {err}");
+                    }
+                    editor.selected_user_id = Some(user_id);
+                    editor.new_user_id.clear();
+                }
+            });
+            if user_ids.is_empty() {
+                ui.label("还没有玩家观察相机");
+                return;
+            }
+
+            let mut selected = editor.selected_user_id.unwrap_or(user_ids[0]);
+            egui::ComboBox::from_label("玩家")
+                .selected_text(voxel_player_display_name(
+                    manager.as_deref(),
+                    selected,
+                ))
+                .show_ui(ui, |ui| {
+                    for user_id in &user_ids {
+                        ui.selectable_value(
+                            &mut selected,
+                            *user_id,
+                            voxel_player_display_name(manager.as_deref(), *user_id),
+                        );
+                    }
+                });
+            editor.selected_user_id = Some(selected);
+
+            let Some((_, mut transform)) = capture_cameras
+                .iter_mut()
+                .find(|(camera, _)| camera.user_id == selected)
+            else {
+                return;
+            };
+            let mut changed = false;
+            if ui.button("使用当前GM视角").clicked() {
+                if let Ok(viewport_transform) = viewport_camera.single() {
+                    *transform = *viewport_transform;
+                    changed = true;
+                }
+            }
+            ui.label("位置");
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(egui::DragValue::new(&mut transform.translation.x).prefix("X "))
+                    .changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut transform.translation.y).prefix("Y "))
+                    .changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut transform.translation.z).prefix("Z "))
+                    .changed();
+            });
+            let (yaw, pitch, roll) = transform.rotation.to_euler(EulerRot::YXZ);
+            let (mut yaw, mut pitch, mut roll) = (
+                yaw.to_degrees(),
+                pitch.to_degrees(),
+                roll.to_degrees(),
+            );
+            ui.label("朝向");
+            let rotation_changed = ui
+                .horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut yaw).prefix("Y "))
+                        .changed()
+                        | ui.add(egui::DragValue::new(&mut pitch).prefix("P "))
+                            .changed()
+                        | ui.add(egui::DragValue::new(&mut roll).prefix("R "))
+                            .changed()
+                })
+                .inner;
+            if rotation_changed {
+                transform.rotation = Quat::from_euler(
+                    EulerRot::YXZ,
+                    yaw.to_radians(),
+                    pitch.to_radians(),
+                    roll.to_radians(),
+                );
+                changed = true;
+            }
+            if changed {
+                upsert_voxel_player_camera(&mut store, selected, &transform);
+                if let Err(err) = store.persist() {
+                    eprintln!("failed to persist voxel player camera: {err}");
+                }
+            }
+        });
+}
+
+fn capture_voxel_player_view(
+    mut commands: Commands,
+    mut requests: ResMut<SceneCaptureRequests>,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    runtimes: Res<VoxelPlayerCameraRuntimes>,
+    mut state: ResMut<VoxelPlayerCaptureState>,
+    mut cameras: Query<&mut Camera, With<VoxelPlayerCaptureCamera>>,
+) {
+    let incoming = requests.requests.drain(..).collect::<Vec<_>>();
+    for request in incoming {
+        let Some(camera) = runtimes.cameras.get(&request.user_id) else {
+            if voxel_observation_player_allowed(manager.as_deref(), request.user_id) {
+                requests.requests.push(request);
+            } else {
+                eprintln!(
+                    "ignored voxel observation request from unconfigured user {}",
+                    request.user_id
+                );
+            }
+            continue;
+        };
+        let output_dir = Path::new(".data")
+            .join("willowblossom")
+            .join("scene_captures");
+        if let Err(err) = std::fs::create_dir_all(&output_dir) {
+            eprintln!("failed to create scene capture directory: {err}");
+            continue;
+        }
+        let request_id = state.next_request_id;
+        state.next_request_id += 1;
+        state.pending.push(PendingVoxelPlayerCapture {
+            request_id,
+            user_id: request.user_id,
+            camera_entity: camera.entity,
+            target: camera.target.clone(),
+            output_path: output_dir.join(format!(
+                "player_{}.png",
+                request.user_id
+            )),
+            prepare_frames_remaining: PLAYER_CAPTURE_PREPARE_FRAMES,
+            activated: false,
+        });
+    }
+
+    let Some(current) = state.pending.first_mut() else { return };
+    if !current.activated {
+        if let Ok(mut camera) = cameras.get_mut(current.camera_entity) {
+            camera.is_active = true;
+        }
+        current.activated = true;
+        return;
+    }
+    if current.prepare_frames_remaining > 0 {
+        current.prepare_frames_remaining -= 1;
+        return;
+    }
+    let pending = state.pending.remove(0);
+    if let Ok(mut camera) = cameras.get_mut(pending.camera_entity) {
+        camera.is_active = false;
+    }
+    commands
+        .spawn(Screenshot::image(
+            pending.target.clone(),
+        ))
+        .observe(
+            move |screenshot: On<ScreenshotCaptured>,
+                  napcat_sender: Option<Res<NapcatIOSender>>| {
+                let save_result = screenshot
+                    .image
+                    .clone()
+                    .try_into_dynamic()
+                    .map_err(|err| err.to_string())
+                    .and_then(|image| {
+                        image
+                            .to_rgb8()
+                            .save(&pending.output_path)
+                            .map_err(|err| err.to_string())
+                    });
+                if let Err(err) = save_result {
+                    eprintln!("failed to save voxel player capture: {err}");
+                    return;
+                }
+                let Some(napcat_sender) = napcat_sender else { return };
+                let file = match voxel_capture_file_uri(&pending.output_path) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        eprintln!("failed to build voxel capture file URI: {err}");
+                        return;
+                    },
+                };
+                let message = Message::Text(
+                    json!({
+                        "action": "send_private_msg",
+                        "params": {
+                            "user_id": pending.user_id,
+                            "message": [{
+                                "type": "image",
+                                "data": { "file": file, "summary": "场景观察" }
+                            }]
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                );
+                if let Err(err) = napcat_sender.0.try_send(NapcatOutboundMessage {
+                    request_id: pending.request_id,
+                    target_id: pending.user_id.to_string(),
+                    message,
+                }) {
+                    eprintln!("failed to queue voxel player capture: {err}");
+                }
+            },
+        );
+}
+
+fn spawn_voxel_player_camera(
+    commands: &mut Commands,
+    images: &mut Assets<Image>,
+    runtimes: &mut VoxelPlayerCameraRuntimes,
+    user_id: u64,
+    transform: Transform,
+) {
+    let target = images.add(voxel_player_capture_image());
+    let entity = commands
+        .spawn((
+            Camera3d::default(),
+            Msaa::Off,
+            Camera {
+                is_active: false,
+                order: -1,
+                clear_color: ClearColorConfig::Custom(Color::srgb(0.055, 0.065, 0.075)),
+                ..default()
+            },
+            Projection::Perspective(PerspectiveProjection {
+                fov: FIRST_PERSON_FOV_RADIANS,
+                far: 2_500.0,
+                ..default()
+            }),
+            RenderTarget::Image(target.clone().into()),
+            transform,
+            VoxelPlayerCaptureCamera { user_id },
+        ))
+        .id();
+    runtimes.cameras.insert(user_id, VoxelPlayerCameraRuntime {
+        entity,
+        target,
+    });
+}
+
+fn voxel_player_capture_image() -> Image {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: PLAYER_CAPTURE_WIDTH,
+            height: PLAYER_CAPTURE_HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 255],
+        TextureFormat::Bgra8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+        | TextureUsages::COPY_DST
+        | TextureUsages::COPY_SRC
+        | TextureUsages::RENDER_ATTACHMENT;
+    image
+}
+
+fn persisted_voxel_player_camera(
+    store: &VoxelPlayerCameraStore,
+    user_id: u64,
+) -> Option<&PersistedVoxelPlayerCamera> {
+    store
+        .cameras
+        .iter()
+        .find(|camera| camera.user_id == user_id)
+}
+
+fn voxel_player_camera_transform(camera: &PersistedVoxelPlayerCamera) -> Transform {
+    Transform {
+        translation: Vec3::from(camera.translation),
+        rotation: Quat::from_array(camera.rotation),
+        scale: Vec3::ONE,
+    }
+}
+
+fn upsert_voxel_player_camera(
+    store: &mut VoxelPlayerCameraStore,
+    user_id: u64,
+    transform: &Transform,
+) {
+    let persisted = PersistedVoxelPlayerCamera {
+        user_id,
+        translation: transform.translation.to_array(),
+        rotation: transform.rotation.to_array(),
+    };
+    if let Some(camera) = store
+        .cameras
+        .iter_mut()
+        .find(|camera| camera.user_id == user_id)
+    {
+        *camera = persisted;
+    } else {
+        store.cameras.push(persisted);
+    }
+}
+
+fn voxel_player_display_name(
+    manager: Option<&Persistent<NapcatMessageManager>>,
+    user_id: u64,
+) -> String {
+    let target_id = user_id.to_string();
+    let Some(manager) = manager else { return target_id };
+    if let Some(character) = manager.player_characters.get(&target_id) {
+        let name = if character.nickname.trim().is_empty() {
+            character.name.trim()
+        } else {
+            character.nickname.trim()
+        };
+        if !name.is_empty() {
+            return format!("{name} ({target_id})");
+        }
+    }
+    target_id
+}
+
+fn voxel_observation_player_allowed(
+    manager: Option<&Persistent<NapcatMessageManager>>,
+    user_id: u64,
+) -> bool {
+    let Some(manager) = manager else { return false };
+    let target_id = user_id.to_string();
+    manager.player_characters.contains_key(&target_id)
+        || manager
+            .current_group()
+            .is_some_and(|group| group.players.iter().any(|player| player == &target_id))
+}
+
+fn voxel_capture_file_uri(path: &Path) -> Result<String, String> {
+    let path = std::fs::canonicalize(path).map_err(|err| err.to_string())?;
+    url::Url::from_file_path(&path)
+        .map(|url| url.to_string())
+        .map_err(|_| {
+            format!(
+                "path cannot be represented as a file URI: {}",
+                path.display()
+            )
+        })
 }
 
 fn voxel_orbital_planet_cells() -> Vec<(IVec3, u8)> {
@@ -4636,6 +5221,38 @@ mod tests {
     }
 
     #[test]
+    fn player_camera_store_upserts_without_duplicating_users() {
+        let mut store = VoxelPlayerCameraStore::default();
+        let first = Transform::from_xyz(1.0, 2.0, 3.0);
+        let second = Transform::from_xyz(4.0, 5.0, 6.0).with_rotation(Quat::from_rotation_y(0.5));
+
+        upsert_voxel_player_camera(&mut store, 42, &first);
+        upsert_voxel_player_camera(&mut store, 42, &second);
+
+        assert_eq!(store.cameras.len(), 1);
+        let restored = voxel_player_camera_transform(&store.cameras[0]);
+        assert_eq!(restored.translation, second.translation);
+        assert_eq!(restored.rotation, second.rotation);
+    }
+
+    #[test]
+    fn player_capture_target_supports_render_and_readback() {
+        let image = voxel_player_capture_image();
+        assert_eq!(
+            image.texture_descriptor.size.width,
+            PLAYER_CAPTURE_WIDTH
+        );
+        assert_eq!(
+            image.texture_descriptor.size.height,
+            PLAYER_CAPTURE_HEIGHT
+        );
+        assert!(image
+            .texture_descriptor
+            .usage
+            .contains(TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC));
+    }
+
+    #[test]
     fn initializes_populated_trpg_grid() {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
@@ -4893,11 +5510,9 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from([1, 2, 3, 4])
         );
-        assert!(
-            planet_cells
-                .iter()
-                .all(|(cell, _)| { cell.abs().max_element() <= ORBITAL_PLANET_VOXEL_RADIUS })
-        );
+        assert!(planet_cells
+            .iter()
+            .all(|(cell, _)| { cell.abs().max_element() <= ORBITAL_PLANET_VOXEL_RADIUS }));
         assert_eq!(VOXEL_SIZE, 0.25);
         assert_eq!(
             ORBITAL_PLANET_LOD_VOXEL_SIZE / ORBITAL_PLANET_LOD_SUBDIVISIONS as f32,

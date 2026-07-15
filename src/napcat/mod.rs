@@ -5322,10 +5322,13 @@ fn append_local_private_text_response(
 }
 
 fn is_scene_capture_command(message: &NapcatMessage) -> bool {
-    let text = message_text(message);
+    is_scene_capture_command_text(&message_text(message))
+}
+
+pub(crate) fn is_scene_capture_command_text(text: &str) -> bool {
     matches!(
         text.trim(),
-        "#观察" | "#gc" | ".观察" | ".gc"
+        "#观察" | "#gc" | ".观察" | ".gc" | "。观察" | "。gc"
     )
 }
 
@@ -9591,7 +9594,7 @@ mod tests {
 
     #[test]
     fn scene_capture_command_accepts_hash_and_dot_aliases() {
-        for command in ["#观察", "#gc", ".观察", ".gc"] {
+        for command in ["#观察", "#gc", ".观察", ".gc", "。观察", "。gc"] {
             let message = test_message_with_text(NapcatMessageType::Private, command);
             assert!(
                 is_scene_capture_command(&message),

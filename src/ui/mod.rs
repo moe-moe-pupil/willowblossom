@@ -611,6 +611,7 @@ use crate::{
         character_wounded_healing_dealt_modifier,
         dying_healing_taken_multiplier,
         grant_character_experience,
+        is_scene_capture_command_text,
         large_hit_damage_taken_multiplier,
         low_hp_damage_multiplier,
         moonberry_chaos_output_multiplier,
@@ -3106,10 +3107,7 @@ fn player_text_lines(messages: &[CampaignMessage]) -> Vec<PlayerTextLine> {
         player_message_count += 1;
         lines.push(PlayerTextLine {
             player_message_count,
-            summary_eligible: !matches!(
-                text.trim(),
-                "#观察" | "#gc" | ".观察" | ".gc"
-            ),
+            summary_eligible: !is_scene_capture_command_text(text),
             text: format!("{}: {}", message.sender_name, text),
         });
     }
