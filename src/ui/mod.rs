@@ -4145,6 +4145,13 @@ enum QuickCastEffect {
         target: TargetSelector,
         buff: crate::rule_engine::RuleBuffTemplate,
     },
+    Sequence(Vec<QuickCastResolvedEffect>),
+}
+
+#[derive(Clone)]
+struct QuickCastResolvedEffect {
+    effect: QuickCastEffect,
+    targets: Vec<String>,
 }
 
 struct QuickCastAction {
@@ -4287,7 +4294,7 @@ fn quick_cast_ui(
         *selected = 0;
     }
     let skill = skills[*selected].clone();
-    let effect = quick_cast_effect(
+    let mut effect = quick_cast_effect(
         &skill.note,
         &skill.arg_values,
         skill.skill_type.as_deref(),
@@ -4302,28 +4309,16 @@ fn quick_cast_ui(
         cast_turn,
     );
     let targets = effect
-        .as_ref()
+        .as_mut()
         .map(|effect| {
-            let fallback_radius = quick_cast_skill_range_radius(
+            resolve_quick_cast_effect_targets(
+                caster_id,
                 character,
                 effect,
-                skill.range,
-                skill.skill_type.as_deref(),
-            );
-            limit_skill_targets(
-                quick_cast_targets(
-                    caster_id,
-                    effect,
-                    character_targets,
-                    scene_positions,
-                    player_camera_positions,
-                    fallback_radius,
-                    skill.target_class.as_deref(),
-                ),
-                skill_target_limit(
-                    skill.target_count,
-                    skill.target_class.as_deref(),
-                ),
+                character_targets,
+                scene_positions,
+                player_camera_positions,
+                &skill,
             )
         })
         .unwrap_or_default();
@@ -4415,6 +4410,7 @@ fn quick_cast_ui(
                     QuickCastEffect::Damage { .. } => "范围内目标",
                     QuickCastEffect::Heal { .. } => "可影响角色",
                     QuickCastEffect::GrantBuff { .. } => "可获得状态",
+                    QuickCastEffect::Sequence(_) => "可影响角色",
                 };
                 if targets.is_empty() {
                     ui.small("范围内没有可影响角色。");
@@ -4598,26 +4594,43 @@ fn quick_cast_effect(
             )
         })
     })?;
-    ast.actions.into_iter().find_map(|action| match action {
-        Action::Damage {
-            target,
-            amount: ValueExpr::Number(amount),
-            damage_type,
-        } => Some(QuickCastEffect::Damage {
-            amount: amount.max(0.0),
-            target,
-            damage_type,
-        }),
-        Action::Heal {
-            target,
-            amount: ValueExpr::Number(amount),
-        } => Some(QuickCastEffect::Heal {
-            amount: amount.max(0.0),
-            target,
-        }),
-        Action::GrantBuff { target, buff } => Some(QuickCastEffect::GrantBuff { target, buff }),
-        _ => None,
-    })
+    let mut effects = ast
+        .actions
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::Damage {
+                target,
+                amount: ValueExpr::Number(amount),
+                damage_type,
+            } => Some(QuickCastEffect::Damage {
+                amount: amount.max(0.0),
+                target,
+                damage_type,
+            }),
+            Action::Heal {
+                target,
+                amount: ValueExpr::Number(amount),
+            } => Some(QuickCastEffect::Heal {
+                amount: amount.max(0.0),
+                target,
+            }),
+            Action::GrantBuff { target, buff } => Some(QuickCastEffect::GrantBuff { target, buff }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    match effects.len() {
+        0 => None,
+        1 => effects.pop(),
+        _ => Some(QuickCastEffect::Sequence(
+            effects
+                .into_iter()
+                .map(|effect| QuickCastResolvedEffect {
+                    effect,
+                    targets: Vec::new(),
+                })
+                .collect(),
+        )),
+    }
 }
 
 fn quick_cast_skill_range_radius(
@@ -4631,6 +4644,19 @@ fn quick_cast_skill_range_radius(
             damage_type: DamageType::Range,
             ..
         } => character_minimum_range_meters(character),
+        QuickCastEffect::Sequence(effects) => {
+            return effects
+                .iter()
+                .filter_map(|resolved| {
+                    quick_cast_skill_range_radius(
+                        character,
+                        &resolved.effect,
+                        range,
+                        skill_type,
+                    )
+                })
+                .max_by(f32::total_cmp);
+        },
         _ => 0.0,
     };
     let range_multiplier = if moonberry_skill_type_is_spell(skill_type) {
@@ -4642,10 +4668,17 @@ fn quick_cast_skill_range_radius(
 }
 
 fn quick_cast_radius(effect: &QuickCastEffect, fallback_radius: Option<f32>) -> Option<f32> {
+    if let QuickCastEffect::Sequence(effects) = effect {
+        return effects
+            .iter()
+            .filter_map(|resolved| quick_cast_radius(&resolved.effect, fallback_radius))
+            .max_by(f32::total_cmp);
+    }
     let target = match effect {
         QuickCastEffect::Damage { target, .. }
         | QuickCastEffect::Heal { target, .. }
         | QuickCastEffect::GrantBuff { target, .. } => target,
+        QuickCastEffect::Sequence(_) => unreachable!("sequence handled above"),
     };
     target
         .area
@@ -4682,6 +4715,60 @@ fn trpg_damage_taken_kind(damage_type: DamageType) -> TrpgDamageTakenKind {
     }
 }
 
+fn resolve_quick_cast_effect_targets(
+    caster_id: &str,
+    character: &PlayerCharacter,
+    effect: &mut QuickCastEffect,
+    character_targets: &[(String, String)],
+    scene_positions: Option<&SceneCharacterPositions>,
+    player_camera_positions: Option<&ScenePlayerCameraPositions>,
+    skill: &QuickCastSkill,
+) -> Vec<String> {
+    if let QuickCastEffect::Sequence(effects) = effect {
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+        for resolved in effects {
+            resolved.targets = resolve_quick_cast_effect_targets(
+                caster_id,
+                character,
+                &mut resolved.effect,
+                character_targets,
+                scene_positions,
+                player_camera_positions,
+                skill,
+            );
+            for target_id in &resolved.targets {
+                if seen.insert(target_id.clone()) {
+                    targets.push(target_id.clone());
+                }
+            }
+        }
+        return targets;
+    }
+
+    let fallback_radius = quick_cast_skill_range_radius(
+        character,
+        effect,
+        skill.range,
+        skill.skill_type.as_deref(),
+    );
+    limit_skill_targets(
+        quick_cast_targets(
+            caster_id,
+            effect,
+            character_targets,
+            scene_positions,
+            player_camera_positions,
+            fallback_radius,
+            skill.target_class.as_deref(),
+        ),
+        skill_target_limit(
+            skill.target_count,
+            skill.target_class.as_deref(),
+        ),
+    )
+}
+
 fn quick_cast_targets(
     caster_id: &str,
     effect: &QuickCastEffect,
@@ -4695,6 +4782,16 @@ fn quick_cast_targets(
         QuickCastEffect::Damage { target, .. }
         | QuickCastEffect::Heal { target, .. }
         | QuickCastEffect::GrantBuff { target, .. } => target,
+        QuickCastEffect::Sequence(effects) => {
+            let mut targets = Vec::new();
+            let mut seen = HashSet::new();
+            for target_id in effects.iter().flat_map(|resolved| &resolved.targets) {
+                if seen.insert(target_id.clone()) {
+                    targets.push(target_id.clone());
+                }
+            }
+            return targets;
+        },
     };
     let force_area =
         skill_target_class_is_area(target_class) && !matches!(target.actor, ActorRef::SelfActor);
@@ -4838,8 +4935,39 @@ fn apply_quick_cast_action(
 
 fn apply_quick_cast_action_to_manager(
     manager: &mut NapcatMessageManager,
-    action: QuickCastAction,
+    mut action: QuickCastAction,
 ) -> bool {
+    let sequence = match action.effect.take() {
+        Some(QuickCastEffect::Sequence(effects)) => Some(effects),
+        effect => {
+            action.effect = effect;
+            None
+        },
+    };
+    if let Some(effects) = sequence {
+        let mut changed = false;
+        for (index, resolved) in effects.into_iter().enumerate() {
+            let mut skill = action.skill.clone();
+            if index > 0 {
+                skill.mp_cost = 0.0;
+                skill.cooldown_turns = 0;
+                skill.cooldown_left = None;
+            }
+            let applied = apply_quick_cast_action_to_manager(manager, QuickCastAction {
+                caster_id: action.caster_id.clone(),
+                skill,
+                targets: resolved.targets,
+                effect: Some(resolved.effect),
+                cast_turn: action.cast_turn,
+                force: action.force || index > 0,
+            });
+            if index == 0 && !applied {
+                return false;
+            }
+            changed |= applied;
+        }
+        return changed;
+    }
     let stat_config = manager.character_stat_config_for_target(&action.caster_id);
     let effect = action.effect;
     let (
@@ -5040,6 +5168,7 @@ fn apply_quick_cast_action_to_manager(
                 target.buff_base_stats = None;
                 changed = true;
             },
+            QuickCastEffect::Sequence(_) => unreachable!("sequence expanded before resolution"),
         }
     }
     let pending_source_healing = pending_source_lifesteal + pending_source_mutual_aid_healing;
@@ -14629,6 +14758,97 @@ mod tests {
             manager.player_characters["target"].hp,
             10.0
         );
+    }
+
+    #[test]
+    fn quick_cast_executes_multi_action_effects_with_distinct_targets_and_single_cost() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 15.0,
+                max_hp: 20.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 20.0,
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "连段".to_owned(),
+            note: "主动使用对目标造成3点物理伤害，对自己回复2点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 3.0,
+            cooldown_turns: 2,
+            cooldown_left: None,
+            target_count: Some(1),
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let mut effect = quick_cast_effect(
+            &skill.note,
+            &skill.arg_values,
+            skill.skill_type.as_deref(),
+            skill.legacy_buff_machine_json.as_deref(),
+            &[],
+        )
+        .expect("multi-action skill should parse");
+        let character_targets = vec![
+            ("caster".to_owned(), "Caster".to_owned()),
+            ("target".to_owned(), "Target".to_owned()),
+        ];
+        let resolved_targets = resolve_quick_cast_effect_targets(
+            "caster",
+            &manager.player_characters["caster"],
+            &mut effect,
+            &character_targets,
+            None,
+            None,
+            &skill,
+        );
+        assert_eq!(resolved_targets, vec![
+            "target".to_owned(),
+            "caster".to_owned()
+        ]);
+        let QuickCastEffect::Sequence(effects) = effect else {
+            panic!("multi-action skill should preserve its effect sequence");
+        };
+        assert_eq!(effects.len(), 2);
+        assert_eq!(effects[0].targets, vec![
+            "target".to_owned()
+        ]);
+        assert_eq!(effects[1].targets, vec![
+            "caster".to_owned()
+        ]);
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned(), "caster".to_owned()],
+                effect: Some(QuickCastEffect::Sequence(effects)),
+                cast_turn: 4,
+                force: false,
+            },
+        ));
+
+        let caster = &manager.player_characters["caster"];
+        assert_eq!(caster.hp, 17.0);
+        assert_eq!(caster.mp, 7.0);
+        assert_eq!(
+            caster.skill_last_cast_turns.get("0"),
+            Some(&4)
+        );
+        assert!((manager.player_characters["target"].hp - 7.075).abs() < 0.0001);
     }
 
     #[test]
