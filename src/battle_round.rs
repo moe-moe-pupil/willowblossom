@@ -95,10 +95,13 @@ use crate::{
         Action,
         ActorRef,
         DamageType,
+        RuleBuffTemplate,
+        RuleEngineState,
         TargetSelector,
         ValueExpr,
     },
     scene::SceneCharacterPositions,
+    ui::sync_character_buffs,
 };
 
 pub struct BattleRoundPlugin;
@@ -1270,7 +1273,7 @@ fn encounter_ui(
     ui: &mut egui::Ui,
     ui_state: &mut BattleRoundUiState,
     store: &mut BattleRoundStore,
-    manager: &NapcatMessageManager,
+    manager: &mut NapcatMessageManager,
     scene_positions: Option<&SceneCharacterPositions>,
     encounter_entity: &BattleEncounterEntity,
 ) -> bool {
@@ -1655,7 +1658,7 @@ fn encounter_action_ui(
     ui_state: &mut BattleRoundUiState,
     encounter_id: &str,
     store: &mut BattleRoundStore,
-    manager: &NapcatMessageManager,
+    manager: &mut NapcatMessageManager,
     scene_positions: Option<&SceneCharacterPositions>,
 ) -> bool {
     let mut changed = false;
@@ -1798,7 +1801,7 @@ fn encounter_action_ui(
             let can_use = cooldown_remaining == 0 && can_pay;
             let response = ui.add_enabled(can_use, egui::Button::new("使用技能"));
             if response.clicked() {
-                changed |= store.record_skill_use(
+                changed |= store.record_skill_use_with_buffs(
                     encounter_id,
                     &actor.target_id,
                     target,
@@ -2537,6 +2540,42 @@ impl BattleRoundStore {
                         }
                     }
                 },
+                SkillEffect::GrantBuff { target, buff } => {
+                    let target_ids = resolve_skill_targets(
+                        target,
+                        actor_id,
+                        target_id,
+                        encounter,
+                        scene_positions,
+                        skill_range_radius(skill.range),
+                        skill.target_class.as_deref(),
+                    );
+                    let target_ids = limit_skill_targets(
+                        target_ids,
+                        skill_target_limit(
+                            skill.target_count,
+                            skill.target_class.as_deref(),
+                        ),
+                    );
+                    if target_ids.is_empty() {
+                        encounter.action_log.push(format!(
+                            "{}使用{}，但范围内没有目标",
+                            actor_name, skill.name
+                        ));
+                    }
+                    for resolved_target_id in target_ids {
+                        let target_name = encounter
+                            .participants
+                            .iter()
+                            .find(|participant| participant.target_id == resolved_target_id)
+                            .map(|participant| participant.display_name.clone())
+                            .unwrap_or_else(|| resolved_target_id.clone());
+                        encounter.action_log.push(format!(
+                            "{}对{}使用{}，施加{}状态",
+                            actor_name, target_name, skill.name, buff.name
+                        ));
+                    }
+                },
             }
         }
         if mp_cost > 0.0 {
@@ -2545,6 +2584,131 @@ impl BattleRoundStore {
                 actor_name,
                 format_number(mp_cost)
             ));
+        }
+        true
+    }
+
+    fn record_skill_use_with_buffs(
+        &mut self,
+        encounter_id: &str,
+        actor_id: &str,
+        target_id: &str,
+        skill: &CharacterSkill,
+        manager: &mut NapcatMessageManager,
+        scene_positions: Option<&SceneCharacterPositions>,
+    ) -> bool {
+        if !self.record_skill_use(
+            encounter_id,
+            actor_id,
+            target_id,
+            skill,
+            manager,
+            scene_positions,
+        ) {
+            return false;
+        }
+
+        let effects = static_skill_effects(
+            &skill.note,
+            &skill.arg_values,
+            skill.skill_type.as_deref(),
+            skill.legacy_buff_machine_json.as_deref(),
+        );
+        let granted_buffs = {
+            let Some(encounter) = self.encounters.get(encounter_id) else {
+                return true;
+            };
+            effects
+                .into_iter()
+                .filter_map(|effect| {
+                    let SkillEffect::GrantBuff { target, buff } = effect else {
+                        return None;
+                    };
+                    let targets = resolve_skill_targets(
+                        target,
+                        actor_id,
+                        target_id,
+                        encounter,
+                        scene_positions,
+                        skill_range_radius(skill.range),
+                        skill.target_class.as_deref(),
+                    );
+                    Some((
+                        limit_skill_targets(
+                            targets,
+                            skill_target_limit(
+                                skill.target_count,
+                                skill.target_class.as_deref(),
+                            ),
+                        ),
+                        buff,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        if granted_buffs.is_empty() {
+            return true;
+        }
+
+        let _ = sync_encounter_to_manager(
+            self.encounters.get(encounter_id),
+            manager,
+        );
+        let skill_pool = manager.skill_pool.clone();
+        let mut rule_engine_state = RuleEngineState::default();
+        for (target_ids, buff) in granted_buffs {
+            for resolved_target_id in target_ids {
+                let unit_template_id = self
+                    .encounters
+                    .get(encounter_id)
+                    .and_then(|encounter| {
+                        encounter
+                            .participants
+                            .iter()
+                            .find(|participant| participant.target_id == resolved_target_id)
+                    })
+                    .and_then(|participant| participant.unit_template_id.clone());
+                let stat_config = manager.character_stat_config_for_target(&resolved_target_id);
+                let buff = buff.to_buff_spec(actor_id);
+                if let Some(unit_template_id) = unit_template_id {
+                    if let Some(encounter) = self.encounters.get_mut(encounter_id) {
+                        let target_name = encounter
+                            .participants
+                            .iter()
+                            .find(|participant| participant.target_id == resolved_target_id)
+                            .map(|participant| participant.display_name.clone())
+                            .unwrap_or(resolved_target_id.clone());
+                        encounter.action_log.push(format!(
+                            "{}是战斗单位；{}状态未写入共享单位模板{}",
+                            target_name, buff.name, unit_template_id
+                        ));
+                    }
+                    continue;
+                } else {
+                    let Some(character) = manager.player_characters.get_mut(&resolved_target_id)
+                    else {
+                        continue;
+                    };
+                    character.active_buffs.push(buff);
+                    sync_character_buffs(
+                        &resolved_target_id,
+                        character,
+                        &stat_config,
+                        &mut rule_engine_state,
+                        &skill_pool,
+                    );
+                }
+                if let Some(participant) =
+                    self.encounters.get_mut(encounter_id).and_then(|encounter| {
+                        encounter
+                            .participants
+                            .iter_mut()
+                            .find(|participant| participant.target_id == resolved_target_id)
+                    })
+                {
+                    sync_participant_from_manager(participant, manager);
+                }
+            }
         }
         true
     }
@@ -3675,6 +3839,10 @@ enum SkillEffect {
         amount: f32,
         target: TargetSelector,
     },
+    GrantBuff {
+        target: TargetSelector,
+        buff: RuleBuffTemplate,
+    },
 }
 
 fn static_skill_effects(
@@ -3721,6 +3889,7 @@ fn static_skill_effects(
                 amount: amount.max(0.0),
                 target,
             }),
+            Action::GrantBuff { target, buff } => Some(SkillEffect::GrantBuff { target, buff }),
             _ => None,
         })
         .collect()
@@ -4710,6 +4879,97 @@ mod tests {
             .unwrap();
         assert_eq!(target.damage_taken_this_turn, 0.0);
         assert_eq!(target.healing_taken_this_turn, 0.0);
+    }
+
+    #[test]
+    fn parsed_battle_skill_grants_buff_to_canonical_character_and_encounter() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![
+                    participant_from_character("a", &actor_character, &manager),
+                    participant_from_character("b", &target_character, &manager),
+                ],
+                ..Default::default()
+            });
+        let guard = CharacterSkill {
+            index: 0,
+            name: "守护术".to_owned(),
+            note: "主动使用给予目标2回合守护状态使承伤设为0.5".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let damage = CharacterSkill {
+            index: 1,
+            name: "打击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use_with_buffs(
+            "battle",
+            "a",
+            "b",
+            &guard,
+            &mut manager,
+            None,
+        ));
+
+        let target_character = &manager.player_characters["b"];
+        assert_eq!(target_character.active_buffs.len(), 1);
+        assert_eq!(
+            target_character.active_buffs[0].name,
+            "守护"
+        );
+        assert!((target_character.damage_taken_modifier - 0.5).abs() < 0.0001);
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.damage_taken_modifier - 0.5).abs() < 0.0001);
+
+        assert!(store.record_skill_use("battle", "a", "b", &damage, &manager, None));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 15.0).abs() < 0.0001);
     }
 
     #[test]

@@ -7077,7 +7077,7 @@ fn equipment_slot_label(slot: EquipmentSlot) -> &'static str {
     }
 }
 
-fn sync_character_buffs(
+pub(crate) fn sync_character_buffs(
     target_id: &str,
     character: &mut PlayerCharacter,
     stat_config: &TrpgBasicConfig,
