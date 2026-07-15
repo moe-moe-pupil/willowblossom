@@ -1,9 +1,18 @@
 use std::{
     collections::{
+        hash_map::DefaultHasher,
         HashMap,
         HashSet,
     },
-    path::Path,
+    fs,
+    hash::{
+        Hash,
+        Hasher,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 use avian3d::prelude::*;
@@ -128,6 +137,7 @@ const DEFAULT_SCENE_CAMERA_DISTANCE: f32 = 50.0;
 const PLAYER_CAPTURE_WIDTH: u32 = 1024;
 const PLAYER_CAPTURE_HEIGHT: u32 = 768;
 const PLAYER_CAPTURE_PREPARE_FRAMES: u8 = 3;
+const PLAYER_STANDEE_HEIGHT: f32 = FIRST_PERSON_BODY_LENGTH + FIRST_PERSON_RADIUS * 2.0;
 
 pub struct TrpgVoxelPlugin;
 
@@ -156,6 +166,19 @@ struct VoxelViewportCamera;
 #[derive(Component)]
 struct VoxelPlayerCaptureCamera {
     user_id: u64,
+}
+
+#[derive(Component)]
+struct VoxelPlayerStandee {
+    user_id: u64,
+    image_source: String,
+}
+
+#[derive(Resource, Default)]
+struct VoxelPlayerStandeeAssets {
+    entities: HashMap<u64, Entity>,
+    textures: HashMap<String, Handle<Image>>,
+    failed_sources: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -201,6 +224,7 @@ struct PendingVoxelPlayerCapture {
     output_path: std::path::PathBuf,
     prepare_frames_remaining: u8,
     activated: bool,
+    hidden_standees: Vec<(Entity, Visibility)>,
 }
 
 #[derive(Component)]
@@ -729,6 +753,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPlayerCameraRuntimes>()
         .init_resource::<VoxelPlayerCameraEditor>()
         .init_resource::<VoxelPlayerCaptureState>()
+        .init_resource::<VoxelPlayerStandeeAssets>()
         .insert_resource(player_camera_store)
         .add_systems(
             Startup,
@@ -764,6 +789,7 @@ impl Plugin for TrpgVoxelPlugin {
                 control_first_person_player,
                 control_voxel_camera,
                 sync_voxel_player_cameras,
+                sync_voxel_player_standees,
                 capture_voxel_player_view,
                 draw_voxel_target,
                 animate_voxel_materials,
@@ -2629,13 +2655,253 @@ fn voxel_player_camera_panel(
         });
 }
 
+fn sync_voxel_player_standees(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut assets: ResMut<VoxelPlayerStandeeAssets>,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    existing: Query<(Entity, &VoxelPlayerStandee)>,
+    capture_cameras: Query<
+        (&Transform, &VoxelPlayerCaptureCamera),
+        (
+            With<VoxelPlayerCaptureCamera>,
+            Without<VoxelPlayerStandee>,
+        ),
+    >,
+    mut standee_transforms: Query<
+        &mut Transform,
+        (
+            With<VoxelPlayerStandee>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
+) {
+    let Some(manager) = manager else { return };
+    assets.entities.clear();
+    for (entity, standee) in &existing {
+        assets.entities.insert(standee.user_id, entity);
+    }
+    let camera_transforms = capture_cameras
+        .iter()
+        .map(|(transform, camera)| (camera.user_id, *transform))
+        .collect::<HashMap<_, _>>();
+    let active = manager
+        .player_characters
+        .iter()
+        .filter_map(|(target_id, character)| {
+            let user_id = target_id.parse::<u64>().ok()?;
+            let image_source = character.image.trim();
+            (character.inited
+                && !image_source.is_empty()
+                && camera_transforms.contains_key(&user_id))
+            .then(|| (user_id, image_source.to_owned()))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for (entity, standee) in &existing {
+        if active.contains_key(&standee.user_id) {
+            continue;
+        }
+        commands.entity(entity).despawn();
+        assets.entities.remove(&standee.user_id);
+    }
+
+    for (user_id, image_source) in active {
+        let camera_transform = camera_transforms[&user_id];
+        if let Some(entity) = assets.entities.get(&user_id).copied() {
+            if let Ok((_, standee)) = existing.get(entity) {
+                if standee.image_source == image_source {
+                    if let Ok(mut transform) = standee_transforms.get_mut(entity) {
+                        *transform = voxel_player_standee_transform(&camera_transform);
+                    }
+                    continue;
+                }
+                assets.failed_sources.remove(&standee.image_source);
+            }
+            commands.entity(entity).despawn();
+            assets.entities.remove(&user_id);
+        }
+        if assets.failed_sources.contains(&image_source) {
+            continue;
+        }
+
+        match load_voxel_player_standee_texture(
+            &image_source,
+            &mut images,
+            &mut assets.textures,
+        ) {
+            Ok((texture, image_size)) => {
+                let size = voxel_player_standee_size(image_size);
+                let entity = commands
+                    .spawn((
+                        Mesh3d(meshes.add(Plane3d::new(Vec3::Z, size * 0.5).mesh())),
+                        MeshMaterial3d(materials.add(StandardMaterial {
+                            base_color: Color::WHITE,
+                            base_color_texture: Some(texture),
+                            alpha_mode: AlphaMode::Blend,
+                            cull_mode: None,
+                            unlit: true,
+                            ..default()
+                        })),
+                        voxel_player_standee_transform(&camera_transform),
+                        Visibility::Visible,
+                        VoxelPlayerStandee {
+                            user_id,
+                            image_source,
+                        },
+                    ))
+                    .id();
+                assets.entities.insert(user_id, entity);
+            },
+            Err(err) => {
+                assets.failed_sources.insert(image_source);
+                eprintln!("failed to load voxel player standee for {user_id}: {err}");
+            },
+        }
+    }
+}
+
+fn voxel_player_standee_transform(camera_transform: &Transform) -> Transform { *camera_transform }
+
+fn voxel_player_standee_size(image_size: Vec2) -> Vec2 {
+    let width = (image_size.x / image_size.y.max(1.0) * PLAYER_STANDEE_HEIGHT)
+        .clamp(VOXEL_SIZE, VOXEL_SIZE * 3.0);
+    Vec2::new(width, PLAYER_STANDEE_HEIGHT)
+}
+
+fn load_voxel_player_standee_texture(
+    source: &str,
+    images: &mut Assets<Image>,
+    cache: &mut HashMap<String, Handle<Image>>,
+) -> Result<(Handle<Image>, Vec2), String> {
+    if let Some(texture) = cache.get(source) {
+        let Some(image) = images.get(texture) else {
+            return Err("cached texture handle no longer exists".to_owned());
+        };
+        return Ok((
+            texture.clone(),
+            Vec2::new(
+                image.texture_descriptor.size.width as f32,
+                image.texture_descriptor.size.height as f32,
+            ),
+        ));
+    }
+    let path = cached_or_local_voxel_standee_path(source)?;
+    let bytes = fs::read(&path).map_err(|err| err.to_string())?;
+    let decoded = image::load_from_memory(&bytes)
+        .map_err(|err| err.to_string())?
+        .to_rgba8();
+    let size = Extent3d {
+        width: decoded.width(),
+        height: decoded.height(),
+        depth_or_array_layers: 1,
+    };
+    let mut image = Image::new(
+        size,
+        TextureDimension::D2,
+        decoded.into_raw(),
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+    let texture = images.add(image);
+    cache.insert(source.to_owned(), texture.clone());
+    Ok((
+        texture,
+        Vec2::new(size.width as f32, size.height as f32),
+    ))
+}
+
+fn cached_or_local_voxel_standee_path(source: &str) -> Result<PathBuf, String> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err("empty image source".to_owned());
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return cache_remote_voxel_standee_image(source);
+    }
+    if let Ok(url) = url::Url::parse(source) {
+        if url.scheme() == "file" {
+            return url
+                .to_file_path()
+                .map_err(|_| format!("file URI is not a local path: {source}"));
+        }
+    }
+    let path = PathBuf::from(source);
+    if path.exists() {
+        return Ok(path);
+    }
+    Err(format!(
+        "image source is not a local path or URL: {source}"
+    ))
+}
+
+fn cache_remote_voxel_standee_image(url: &str) -> Result<PathBuf, String> {
+    let mut hasher = DefaultHasher::new();
+    url.hash(&mut hasher);
+    let cache_name = format!("{:016x}", hasher.finish());
+    for cache_dir in [
+        Path::new(".data")
+            .join("willowblossom")
+            .join("character_standees"),
+        Path::new(".data").join("willowblossom").join("image_cache"),
+    ] {
+        let base_path = cache_dir.join(&cache_name);
+        for extension in ["png", "jpg", "jpeg", "webp", "bmp"] {
+            let path = base_path.with_extension(extension);
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
+    let cache_dir = Path::new(".data")
+        .join("willowblossom")
+        .join("character_standees");
+    fs::create_dir_all(&cache_dir).map_err(|err| err.to_string())?;
+    let response = reqwest::blocking::get(url).map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let bytes = response.bytes().map_err(|err| err.to_string())?;
+    let format = image::guess_format(&bytes).map_err(|err| err.to_string())?;
+    let extension = match format {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Jpeg => "jpg",
+        image::ImageFormat::WebP => "webp",
+        image::ImageFormat::Bmp => "bmp",
+        _ => "img",
+    };
+    let path = cache_dir.join(cache_name).with_extension(extension);
+    fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+    Ok(path)
+}
+
 fn capture_voxel_player_view(
     mut commands: Commands,
     mut requests: ResMut<SceneCaptureRequests>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
     runtimes: Res<VoxelPlayerCameraRuntimes>,
     mut state: ResMut<VoxelPlayerCaptureState>,
-    mut cameras: Query<&mut Camera, With<VoxelPlayerCaptureCamera>>,
+    mut cameras: Query<
+        &mut Camera,
+        (
+            With<VoxelPlayerCaptureCamera>,
+            Without<VoxelPlayerStandee>,
+        ),
+    >,
+    mut standees: Query<
+        (
+            Entity,
+            &VoxelPlayerStandee,
+            &mut Visibility,
+        ),
+        (
+            With<VoxelPlayerStandee>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
 ) {
     let incoming = requests.requests.drain(..).collect::<Vec<_>>();
     for request in incoming {
@@ -2670,6 +2936,7 @@ fn capture_voxel_player_view(
             )),
             prepare_frames_remaining: PLAYER_CAPTURE_PREPARE_FRAMES,
             activated: false,
+            hidden_standees: Vec::new(),
         });
     }
 
@@ -2677,6 +2944,17 @@ fn capture_voxel_player_view(
     if !current.activated {
         if let Ok(mut camera) = cameras.get_mut(current.camera_entity) {
             camera.is_active = true;
+        }
+        for (entity, standee, mut visibility) in &mut standees {
+            if voxel_player_standee_visible_to(
+                manager.as_deref(),
+                current.user_id,
+                standee.user_id,
+            ) {
+                continue;
+            }
+            current.hidden_standees.push((entity, visibility.clone()));
+            *visibility = Visibility::Hidden;
         }
         current.activated = true;
         return;
@@ -2688,6 +2966,11 @@ fn capture_voxel_player_view(
     let pending = state.pending.remove(0);
     if let Ok(mut camera) = cameras.get_mut(pending.camera_entity) {
         camera.is_active = false;
+    }
+    for (entity, visibility) in &pending.hidden_standees {
+        if let Ok((_, _, mut current_visibility)) = standees.get_mut(*entity) {
+            *current_visibility = visibility.clone();
+        }
     }
     commands
         .spawn(Screenshot::image(
@@ -2865,6 +3148,20 @@ fn voxel_observation_player_allowed(
         || manager
             .current_group()
             .is_some_and(|group| group.players.iter().any(|player| player == &target_id))
+}
+
+fn voxel_player_standee_visible_to(
+    manager: Option<&Persistent<NapcatMessageManager>>,
+    requester_id: u64,
+    standee_user_id: u64,
+) -> bool {
+    let Some(manager) = manager else { return false };
+    let requester = manager.player_access_for_user(requester_id);
+    if requester.is_gm || requester_id == standee_user_id {
+        return true;
+    }
+    let standee = manager.player_access_for_user(standee_user_id);
+    requester.party_id.is_some() && requester.party_id == standee.party_id
 }
 
 fn voxel_capture_file_uri(path: &Path) -> Result<String, String> {
@@ -5250,6 +5547,29 @@ mod tests {
             .texture_descriptor
             .usage
             .contains(TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC));
+    }
+
+    #[test]
+    fn player_standee_follows_capture_camera_exactly() {
+        let camera = Transform::from_xyz(4.0, 5.0, 6.0).with_rotation(Quat::from_euler(
+            EulerRot::YXZ,
+            0.4,
+            -0.2,
+            0.1,
+        ));
+
+        let standee = voxel_player_standee_transform(&camera);
+
+        assert_eq!(standee.translation, camera.translation);
+        assert_eq!(standee.rotation, camera.rotation);
+    }
+
+    #[test]
+    fn player_standee_uses_canonical_two_voxel_height() {
+        let size = voxel_player_standee_size(Vec2::new(300.0, 600.0));
+
+        assert_eq!(size.y, VOXEL_SIZE * 2.0);
+        assert_eq!(size.x, VOXEL_SIZE);
     }
 
     #[test]
