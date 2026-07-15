@@ -5573,11 +5573,14 @@ fn control_first_person_player(
     {
         editor.first_person_flying = !editor.first_person_flying;
     }
-    // Creative flight controls acceleration, not collision. Keeping the player
-    // collider active allows landing on the planet and standing on moving voxel
-    // bodies without requiring flight to be toggled off first.
-    if is_sensor {
-        commands.entity(entity).remove::<Sensor>();
+    // Creative flight uses the existing collider as a sensor for noclip. This
+    // keeps its shape ready so normal collision can be restored immediately.
+    if editor.first_person_flying != is_sensor {
+        if editor.first_person_flying {
+            commands.entity(entity).insert(Sensor);
+        } else {
+            commands.entity(entity).remove::<Sensor>();
+        }
     }
 
     let forward_input =
@@ -7189,7 +7192,7 @@ mod tests {
     }
 
     #[test]
-    fn first_person_flight_keeps_collision_enabled() {
+    fn first_person_flight_enables_noclip_and_restores_collision_on_exit() {
         let mut editor = VoxelEditorState::default();
         editor.first_person_enabled = true;
         editor.first_person_flying = true;
@@ -7206,10 +7209,16 @@ mod tests {
                 ShapeHits::default(),
                 LinearVelocity::ZERO,
                 ConstantLinearAcceleration::new(0.0, 0.0, 0.0),
-                Sensor,
             ))
             .id();
 
+        app.update();
+
+        assert!(app.world().entity(player).contains::<Sensor>());
+
+        app.world_mut()
+            .resource_mut::<VoxelEditorState>()
+            .first_person_flying = false;
         app.update();
 
         assert!(!app.world().entity(player).contains::<Sensor>());
