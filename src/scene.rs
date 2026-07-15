@@ -1,3 +1,8 @@
+// The active voxel renderer lives in `voxel.rs`. This module remains compiled
+// for shared persistence types, migrations, and legacy regression tests, so
+// most of its old runtime systems are intentionally not scheduled.
+#![allow(dead_code)]
+
 use std::{
     collections::{
         hash_map::DefaultHasher,
