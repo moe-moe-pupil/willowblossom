@@ -142,6 +142,8 @@ const TOOL_GUN_DRAG_RESPONSE: f32 = 12.0;
 const TOOL_GUN_DRAG_MAX_SPEED: f32 = 24.0;
 const PLANET_CLOUD_ALTITUDE: f32 = 3.5;
 const PLANET_CLOUD_PUFF_COUNT: usize = 24;
+const PLANET_SCIENCE_LAB_CENTER: IVec2 = IVec2::new(-45, 20);
+const PLANET_SCIENCE_LAB_FLOOR_Y: i32 = 485;
 
 pub struct TrpgVoxelPlugin;
 
@@ -3377,17 +3379,12 @@ fn voxel_capture_file_uri(path: &Path) -> Result<String, String> {
 fn voxel_orbital_planet_cells() -> Vec<(IVec3, u8)> {
     let radius = ORBITAL_PLANET_RADIUS / VOXEL_SIZE - 0.5;
     let inner_radius = radius - ORBITAL_PLANET_SHELL_THICKNESS;
-    let outer_squared = radius.powi(2);
     let inner_squared = inner_radius.powi(2);
     let mut cells = Vec::new();
-    let cap_squared = ORBITAL_PLANET_CAP_RADIUS.pow(2);
     for x in -ORBITAL_PLANET_CAP_RADIUS..=ORBITAL_PLANET_CAP_RADIUS {
         for z in -ORBITAL_PLANET_CAP_RADIUS..=ORBITAL_PLANET_CAP_RADIUS {
+            let Some(outer_y) = planet_surface_y(x, z) else { continue };
             let horizontal_squared = x * x + z * z;
-            if horizontal_squared > cap_squared {
-                continue;
-            }
-            let outer_y = (outer_squared - horizontal_squared as f32).sqrt().floor() as i32;
             let inner_y = (inner_squared - horizontal_squared as f32).sqrt().ceil() as i32;
             for y in inner_y..=outer_y {
                 let cell = IVec3::new(x, y, z);
@@ -3397,6 +3394,187 @@ fn voxel_orbital_planet_cells() -> Vec<(IVec3, u8)> {
             }
         }
     }
+    cells.extend(planet_science_lab_cells());
+    let mut cells = cells
+        .into_iter()
+        .collect::<HashMap<_, _>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
+    cells
+}
+
+fn planet_surface_y(x: i32, z: i32) -> Option<i32> {
+    let horizontal_squared = x * x + z * z;
+    if horizontal_squared > ORBITAL_PLANET_CAP_RADIUS.pow(2) {
+        return None;
+    }
+    let radius = ORBITAL_PLANET_RADIUS / VOXEL_SIZE - 0.5;
+    Some((radius.powi(2) - horizontal_squared as f32).sqrt().floor() as i32)
+}
+
+fn planet_science_lab_cells() -> Vec<(IVec3, u8)> {
+    let center_x = PLANET_SCIENCE_LAB_CENTER.x;
+    let center_z = PLANET_SCIENCE_LAB_CENTER.y;
+    let floor_y = PLANET_SCIENCE_LAB_FLOOR_Y;
+    let half_width = 22;
+    let half_depth = 16;
+    let wall_height = 20;
+    let roof_y = floor_y + wall_height + 1;
+    let mut cells = Vec::new();
+
+    // Level the curved surface with a solid canonical-voxel foundation.
+    for local_x in -half_width..=half_width {
+        for local_z in -half_depth..=half_depth {
+            let x = center_x + local_x;
+            let z = center_z + local_z;
+            let Some(surface_y) = planet_surface_y(x, z) else { continue };
+            for y in surface_y + 1..=floor_y {
+                cells.push((IVec3::new(x, y, z), 6));
+            }
+        }
+    }
+
+    // An enclosed shell with a tall front doorway and luminous window bands.
+    for local_x in -half_width..=half_width {
+        for local_z in -half_depth..=half_depth {
+            if local_x.abs() != half_width && local_z.abs() != half_depth {
+                continue;
+            }
+            for local_y in 1..=wall_height {
+                let doorway = local_z == -half_depth && local_x.abs() <= 3 && local_y <= 10;
+                if doorway {
+                    continue;
+                }
+                let corner = local_x.abs() == half_width && local_z.abs() == half_depth;
+                let trim = local_y <= 2 || local_y >= wall_height - 1;
+                let front_window = local_z == -half_depth
+                    && (7..=18).contains(&local_x.abs())
+                    && (7..=13).contains(&local_y);
+                let rear_window =
+                    local_z == half_depth && local_x.abs() <= 16 && (7..=13).contains(&local_y);
+                let side_window = local_x.abs() == half_width
+                    && local_z.abs() <= 10
+                    && (7..=13).contains(&local_y);
+                let material = if front_window || rear_window || side_window {
+                    8
+                } else if corner || trim {
+                    6
+                } else {
+                    7
+                };
+                cells.push((
+                    IVec3::new(
+                        center_x + local_x,
+                        floor_y + local_y,
+                        center_z + local_z,
+                    ),
+                    material,
+                ));
+            }
+        }
+    }
+
+    // Roof, glowing skylight, and bright entrance frame.
+    for local_x in -half_width..=half_width {
+        for local_z in -half_depth..=half_depth {
+            let skylight = local_x.abs() <= 10 && local_z.abs() <= 6;
+            cells.push((
+                IVec3::new(
+                    center_x + local_x,
+                    roof_y,
+                    center_z + local_z,
+                ),
+                if skylight { 8 } else { 6 },
+            ));
+        }
+    }
+    for local_y in 1..=11 {
+        for local_x in [-4, 4] {
+            cells.push((
+                IVec3::new(
+                    center_x + local_x,
+                    floor_y + local_y,
+                    center_z - half_depth,
+                ),
+                10,
+            ));
+        }
+    }
+    for local_x in -4..=4 {
+        cells.push((
+            IVec3::new(
+                center_x + local_x,
+                floor_y + 11,
+                center_z - half_depth,
+            ),
+            10,
+        ));
+    }
+
+    // Two usable laboratory benches leave a broad central aisle.
+    for bench_z in [-6, 6] {
+        for local_x in -15..=15 {
+            cells.push((
+                IVec3::new(
+                    center_x + local_x,
+                    floor_y + 3,
+                    center_z + bench_z,
+                ),
+                8,
+            ));
+        }
+        for local_x in (-15..=15).step_by(10) {
+            for local_y in 1..=2 {
+                cells.push((
+                    IVec3::new(
+                        center_x + local_x,
+                        floor_y + local_y,
+                        center_z + bench_z,
+                    ),
+                    6,
+                ));
+            }
+        }
+    }
+
+    // Wide stairs meet the curved ground instead of leaving a floating door.
+    for depth in 1..=6 {
+        let step_y = floor_y - (depth - 1) / 2;
+        for local_x in -5..=5 {
+            cells.push((
+                IVec3::new(
+                    center_x + local_x,
+                    step_y,
+                    center_z - half_depth - depth,
+                ),
+                6,
+            ));
+        }
+    }
+
+    // A rooftop telemetry mast makes the building recognizable at a distance.
+    for local_y in 1..=12 {
+        cells.push((
+            IVec3::new(
+                center_x - 14,
+                roof_y + local_y,
+                center_z + 7,
+            ),
+            if local_y >= 10 { 8 } else { 6 },
+        ));
+    }
+    for offset in -4..=4 {
+        cells.push((
+            IVec3::new(
+                center_x - 14 + offset,
+                roof_y + 9,
+                center_z + 7,
+            ),
+            8,
+        ));
+    }
+
     cells
 }
 
@@ -6401,11 +6579,16 @@ mod tests {
                 .iter()
                 .map(|(_, material)| *material)
                 .collect::<HashSet<_>>(),
-            HashSet::from([1, 2, 3, 4])
+            HashSet::from([1, 2, 3, 4, 6, 7, 8, 10])
         );
-        assert!(planet_cells
-            .iter()
-            .all(|(cell, _)| { cell.abs().max_element() <= ORBITAL_PLANET_VOXEL_RADIUS }));
+        let lab_cells = planet_science_lab_cells()
+            .into_iter()
+            .map(|(cell, _)| cell)
+            .collect::<HashSet<_>>();
+        assert!(
+            planet_cells.iter().all(|(cell, _)| lab_cells.contains(cell)
+                || cell.abs().max_element() <= ORBITAL_PLANET_VOXEL_RADIUS)
+        );
         assert!(planet_cells.iter().all(|(cell, _)| {
             cell.y >= 0 && cell.x * cell.x + cell.z * cell.z <= ORBITAL_PLANET_CAP_RADIUS.pow(2)
         }));
@@ -6416,6 +6599,82 @@ mod tests {
         assert!(procedural_planet_material(IVec3::new(129, 470, 0)).is_none());
         assert_eq!(PLANET_CLOUD_PUFF_COUNT, 24);
         assert!(PLANET_CLOUD_ALTITUDE > 0.0);
+    }
+
+    #[test]
+    fn planet_science_lab_is_canonical_editable_planet_geometry() {
+        let lab_cells = planet_science_lab_cells()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let planet_cells = voxel_orbital_planet_cells()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let center_x = PLANET_SCIENCE_LAB_CENTER.x;
+        let center_z = PLANET_SCIENCE_LAB_CENTER.y;
+        let floor_y = PLANET_SCIENCE_LAB_FLOOR_Y;
+
+        assert!(lab_cells.len() > 5_000);
+        assert!(lab_cells
+            .iter()
+            .all(|(cell, material)| planet_cells.get(cell) == Some(material)));
+        assert!(lab_cells
+            .values()
+            .all(|material| (6..=10).contains(material)));
+        assert_eq!(
+            lab_cells.get(&IVec3::new(center_x, floor_y, center_z)),
+            Some(&6)
+        );
+        assert_eq!(
+            lab_cells.get(&IVec3::new(
+                center_x + 22,
+                floor_y + 8,
+                center_z
+            )),
+            Some(&8)
+        );
+        assert_eq!(
+            lab_cells.get(&IVec3::new(
+                center_x,
+                floor_y + 3,
+                center_z + 6
+            )),
+            Some(&8)
+        );
+        assert_eq!(
+            lab_cells.get(&IVec3::new(
+                center_x + 4,
+                floor_y + 5,
+                center_z - 16
+            )),
+            Some(&10)
+        );
+        assert!(!planet_cells.contains_key(&IVec3::new(
+            center_x,
+            floor_y + 5,
+            center_z - 16,
+        )));
+
+        let window = IVec3::new(center_x + 22, floor_y + 8, center_z);
+        let mut planet = VoxelOrbitalPlanet {
+            cells: lab_cells,
+            removed: HashSet::new(),
+            collider_entity: Entity::PLACEHOLDER,
+            mesh_entities: Vec::new(),
+            mesh_handles: Vec::new(),
+            voxel_size: VOXEL_SIZE,
+            dirty: false,
+        };
+        let removed = explode_planet_voxels(
+            &mut planet,
+            window.as_vec3() * VOXEL_SIZE,
+            VOXEL_SIZE,
+        );
+        assert!(removed
+            .iter()
+            .any(|(cell, material)| *cell == window && *material == 8));
+        assert!(planet.removed.contains(&window));
+        assert!(!planet.cells.contains_key(&window));
+        assert!(planet.dirty);
     }
 
     #[test]
