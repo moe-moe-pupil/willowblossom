@@ -5522,6 +5522,10 @@ fn skill_pool_entry_label(entry: &SkillPoolEntry) -> String {
     }
 }
 
+fn character_skill_ui_id(target_id: &str, index: usize) -> egui::Id {
+    egui::Id::new(("character_skill", target_id, index))
+}
+
 fn character_skill_editor_ui(
     ui: &mut Ui,
     target_id: &str,
@@ -5567,77 +5571,85 @@ fn character_skill_editor_ui(
             &arg_values,
             metadata.and_then(|metadata| metadata.skill_type.as_deref()),
         );
-        ui.horizontal(|ui| {
-            let width = (ui.available_width() - 28.0).clamp(160.0, CHARACTER_FIELD_MAX_WIDTH);
-            ui.vertical(|ui| {
+        ui.push_id(
+            character_skill_ui_id(target_id, index),
+            |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("技能名");
-                    changed |= ui
-                        .add(
-                            egui::TextEdit::singleline(&mut character.skill_names[index])
-                                .desired_width((width - 78.0).max(82.0)),
-                        )
-                        .changed();
-                });
-                ui.horizontal_wrapped(|ui| {
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut character.skill_mp_costs[index])
-                                .range(0.0..=9999.0)
-                                .speed(1.0)
-                                .prefix("MP "),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut character.skill_cooldown_turns[index])
-                                .range(0..=999)
-                                .speed(1)
-                                .prefix("冷却 "),
-                        )
-                        .changed();
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let metadata = &mut character.skill_metadata[index];
-                    changed |= ui.checkbox(&mut metadata.pc_approved, "PC确认").changed();
-                    changed |= ui.checkbox(&mut metadata.st_approved, "GM确认").changed();
-                    if metadata.pc_approved && !metadata.st_approved {
-                        ui.small("待GM确认");
+                    let width =
+                        (ui.available_width() - 28.0).clamp(160.0, CHARACTER_FIELD_MAX_WIDTH);
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("技能名");
+                            changed |= ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut character.skill_names[index])
+                                        .desired_width((width - 78.0).max(82.0)),
+                                )
+                                .changed();
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut character.skill_mp_costs[index])
+                                        .range(0.0..=9999.0)
+                                        .speed(1.0)
+                                        .prefix("MP "),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(
+                                        &mut character.skill_cooldown_turns[index],
+                                    )
+                                    .range(0..=999)
+                                    .speed(1)
+                                    .prefix("冷却 "),
+                                )
+                                .changed();
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            let metadata = &mut character.skill_metadata[index];
+                            changed |= ui.checkbox(&mut metadata.pc_approved, "PC确认").changed();
+                            changed |= ui.checkbox(&mut metadata.st_approved, "GM确认").changed();
+                            if metadata.pc_approved && !metadata.st_approved {
+                                ui.small("待GM确认");
+                            }
+                            if let Some(source) = character_skill_metadata_source_label(metadata) {
+                                ui.small(source);
+                            }
+                        });
+                        let metadata = &mut character.skill_metadata[index];
+                        ui.collapsing("技能结构", |ui| {
+                            changed |= character_skill_shape_metadata_ui(ui, metadata);
+                        });
+                        let response = ui.add(
+                            egui::TextEdit::multiline(&mut character.skill_notes[index])
+                                .desired_rows(2)
+                                .desired_width(width),
+                        );
+                        if response.changed() {
+                            changed = true;
+                        }
+                        if validation.is_err() {
+                            let y = response.rect.bottom() - 2.0;
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(response.rect.left(), y),
+                                    egui::pos2(response.rect.right(), y),
+                                ],
+                                Stroke::new(1.5, egui::Color32::RED),
+                            );
+                        }
+                    });
+                    if ui.button("-").on_hover_text("移除技能描述").clicked() {
+                        remove_index = Some(index);
                     }
-                    if let Some(source) = character_skill_metadata_source_label(metadata) {
-                        ui.small(source);
-                    }
                 });
-                let metadata = &mut character.skill_metadata[index];
-                ui.collapsing("技能结构", |ui| {
-                    changed |= character_skill_shape_metadata_ui(ui, metadata);
-                });
-                let response = ui.add(
-                    egui::TextEdit::multiline(&mut character.skill_notes[index])
-                        .desired_rows(2)
-                        .desired_width(width),
-                );
-                if response.changed() {
-                    changed = true;
+                if let Err(err) = &validation {
+                    ui.colored_label(egui::Color32::RED, err);
                 }
-                if validation.is_err() {
-                    let y = response.rect.bottom() - 2.0;
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(response.rect.left(), y),
-                            egui::pos2(response.rect.right(), y),
-                        ],
-                        Stroke::new(1.5, egui::Color32::RED),
-                    );
-                }
-            });
-            if ui.button("-").on_hover_text("移除技能描述").clicked() {
-                remove_index = Some(index);
-            }
-        });
-        if let Err(err) = validation {
-            ui.colored_label(egui::Color32::RED, err);
-        }
+            },
+        );
     }
 
     if let Some(index) = remove_index {
@@ -12852,6 +12864,18 @@ fn append_local_sent_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_character_skill_rows_have_distinct_widget_ids() {
+        assert_ne!(
+            character_skill_ui_id("player", 0),
+            character_skill_ui_id("player", 1)
+        );
+        assert_ne!(
+            character_skill_ui_id("player", 0),
+            character_skill_ui_id("other-player", 0)
+        );
+    }
 
     fn empty_manager() -> NapcatMessageManager {
         NapcatMessageManager {
