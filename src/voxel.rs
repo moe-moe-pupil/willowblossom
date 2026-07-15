@@ -140,7 +140,7 @@ const PLAYER_STANDEE_HEIGHT: f32 = FIRST_PERSON_BODY_LENGTH + FIRST_PERSON_RADIU
 const TOOL_GUN_DRAG_RESPONSE: f32 = 12.0;
 const TOOL_GUN_DRAG_MAX_SPEED: f32 = 24.0;
 const PLANET_CLOUD_ALTITUDE: f32 = 3.5;
-const PLANET_CLOUD_PUFF_COUNT: usize = 48;
+const PLANET_CLOUD_PUFF_COUNT: usize = 24;
 
 pub struct TrpgVoxelPlugin;
 
@@ -6405,7 +6405,7 @@ mod tests {
         assert_eq!(ORBITAL_PLANET_CAP_RADIUS, 128);
         assert!(procedural_planet_material(IVec3::new(0, -1, 0)).is_none());
         assert!(procedural_planet_material(IVec3::new(129, 470, 0)).is_none());
-        assert_eq!(PLANET_CLOUD_PUFF_COUNT, 48);
+        assert_eq!(PLANET_CLOUD_PUFF_COUNT, 24);
         assert!(PLANET_CLOUD_ALTITUDE > 0.0);
     }
 
