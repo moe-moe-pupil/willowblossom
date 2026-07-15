@@ -4257,7 +4257,7 @@ fn quick_character_windows(
             closed_targets.push(target_id);
         }
         if let Some(action) = cast_action {
-            changed |= apply_quick_cast_action(manager, action);
+            changed |= apply_quick_cast_action(manager, rule_engine_state, action);
         }
         if changed {
             manager.persist().ok();
@@ -4928,9 +4928,34 @@ fn quick_cast_character_targets(manager: &NapcatMessageManager) -> Vec<(String, 
 
 fn apply_quick_cast_action(
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+    rule_engine_state: &mut RuleEngineState,
     action: QuickCastAction,
 ) -> bool {
-    apply_quick_cast_action_to_manager(manager.as_mut(), action)
+    let mut affected_ids = action.targets.clone();
+    if !affected_ids
+        .iter()
+        .any(|target_id| target_id == &action.caster_id)
+    {
+        affected_ids.push(action.caster_id.clone());
+    }
+    let changed = apply_quick_cast_action_to_manager(manager.as_mut(), action);
+    if changed {
+        let skill_pool = manager.skill_pool.clone();
+        for target_id in affected_ids {
+            let stat_config = manager.character_stat_config_for_target(&target_id);
+            let Some(character) = manager.player_characters.get_mut(&target_id) else {
+                continue;
+            };
+            sync_character_buffs(
+                &target_id,
+                character,
+                &stat_config,
+                rule_engine_state,
+                &skill_pool,
+            );
+        }
+    }
+    changed
 }
 
 fn apply_quick_cast_action_to_manager(
@@ -5117,7 +5142,6 @@ fn apply_quick_cast_action_to_manager(
                 if final_amount > f32::EPSILON {
                     for buff in damage_dealt_buffs.iter().cloned() {
                         if upsert_character_active_buff(target, buff) {
-                            target.buff_base_stats = None;
                             changed = true;
                         }
                     }
@@ -5131,7 +5155,6 @@ fn apply_quick_cast_action_to_manager(
                                     &action.caster_id,
                                     final_amount * source_physical_damage_followup_rate,
                                 ));
-                            target.buff_base_stats = None;
                             changed = true;
                         }
                     }
@@ -5165,7 +5188,6 @@ fn apply_quick_cast_action_to_manager(
                 target
                     .active_buffs
                     .push(buff.to_buff_spec(&action.caster_id));
-                target.buff_base_stats = None;
                 changed = true;
             },
             QuickCastEffect::Sequence(_) => unreachable!("sequence expanded before resolution"),
@@ -15957,6 +15979,116 @@ mod tests {
             &mut rule_engine_state,
         ));
         assert!(manager.player_characters["target"].active_buffs.is_empty());
+    }
+
+    #[test]
+    fn quick_cast_stacked_buffs_recompute_from_original_base_stats() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 100.0,
+                max_hp: 100.0,
+                ..Default::default()
+            });
+        let skill = |index| QuickCastSkill {
+            index,
+            name: format!("测试{index}"),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let target_selector = TargetSelector::single(ActorRef::Target);
+        let max_hp_buff = crate::rule_engine::RuleBuffTemplate {
+            name: "巨人之力".to_owned(),
+            kind: BuffKind::Magic,
+            priority: 0,
+            turns_remaining: 3,
+            beneficial: true,
+            effects: vec![BuffEffect {
+                field: BuffField::MaxHp,
+                value: BuffValue::AddPercent(100.0),
+            }],
+            tick_actions: Vec::new(),
+        };
+        let guard_buff = crate::rule_engine::RuleBuffTemplate {
+            name: "守护".to_owned(),
+            kind: BuffKind::Magic,
+            priority: 1,
+            turns_remaining: 3,
+            beneficial: true,
+            effects: vec![BuffEffect {
+                field: BuffField::DamageTakenModifier,
+                value: BuffValue::AddPercent(-50.0),
+            }],
+            tick_actions: Vec::new(),
+        };
+        let mut rule_engine_state = RuleEngineState::default();
+        let config = TrpgBasicConfig::default();
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill: skill(0),
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::GrantBuff {
+                    target: target_selector,
+                    buff: max_hp_buff,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        sync_character_buffs(
+            "target",
+            manager.player_characters.get_mut("target").unwrap(),
+            &config,
+            &mut rule_engine_state,
+            &[],
+        );
+        assert!((manager.player_characters["target"].max_hp - 200.0).abs() < 0.0001);
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill: skill(1),
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::GrantBuff {
+                    target: target_selector,
+                    buff: guard_buff,
+                }),
+                cast_turn: 0,
+                force: false,
+            },
+        ));
+        sync_character_buffs(
+            "target",
+            manager.player_characters.get_mut("target").unwrap(),
+            &config,
+            &mut rule_engine_state,
+            &[],
+        );
+
+        let target = &manager.player_characters["target"];
+        assert!((target.max_hp - 200.0).abs() < 0.0001);
+        assert!((target.damage_taken_modifier - 0.5).abs() < 0.0001);
+        assert!((target.buff_base_stats.as_ref().unwrap().max_hp - 100.0).abs() < 0.0001);
     }
 
     #[test]
