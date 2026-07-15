@@ -7303,7 +7303,7 @@ fn set_group_player_waiting(
     true
 }
 
-fn advance_buffs_for_players(
+pub(crate) fn advance_buffs_for_players(
     manager: &mut NapcatMessageManager,
     players: &[String],
     rule_engine_state: &mut RuleEngineState,

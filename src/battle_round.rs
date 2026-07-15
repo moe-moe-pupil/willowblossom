@@ -101,7 +101,10 @@ use crate::{
         ValueExpr,
     },
     scene::SceneCharacterPositions,
-    ui::sync_character_buffs,
+    ui::{
+        advance_buffs_for_players,
+        sync_character_buffs,
+    },
 };
 
 pub struct BattleRoundPlugin;
@@ -1135,6 +1138,7 @@ fn battle_round_panel(
     mut ui_state: ResMut<BattleRoundUiState>,
     mut store: Option<ResMut<Persistent<BattleRoundStore>>>,
     mut manager: Option<ResMut<Persistent<NapcatMessageManager>>>,
+    mut rule_engine_state: ResMut<RuleEngineState>,
     scene_positions: Option<Res<SceneCharacterPositions>>,
     encounters: Query<&BattleEncounterEntity>,
 ) {
@@ -1182,6 +1186,7 @@ fn battle_round_panel(
                             &mut ui_state,
                             store,
                             manager,
+                            &mut rule_engine_state,
                             scene_positions.as_deref(),
                             encounter_entity,
                         );
@@ -1274,11 +1279,17 @@ fn encounter_ui(
     ui_state: &mut BattleRoundUiState,
     store: &mut BattleRoundStore,
     manager: &mut NapcatMessageManager,
+    rule_engine_state: &mut RuleEngineState,
     scene_positions: Option<&SceneCharacterPositions>,
     encounter_entity: &BattleEncounterEntity,
 ) -> bool {
     let mut changed = false;
     let encounter_id = encounter_entity.id.as_str();
+    let initial_round = store
+        .encounters
+        .get(encounter_id)
+        .map(|encounter| encounter.round)
+        .unwrap_or_default();
     let mut remove = false;
     if !store.encounters.contains_key(encounter_id) {
         return false;
@@ -1373,6 +1384,14 @@ fn encounter_ui(
         ui.separator();
         encounter_log_ui(ui, store, encounter_id);
     });
+
+    changed |= sync_battle_round_buff_advancement(
+        store,
+        encounter_id,
+        initial_round,
+        manager,
+        rule_engine_state,
+    );
 
     if remove {
         store.encounters.remove(encounter_id);
@@ -2921,6 +2940,54 @@ fn sync_encounter_to_manager(
     }
     changed |= group.refresh_legacy_negative_timers();
     changed
+}
+
+fn sync_battle_round_buff_advancement(
+    store: &mut BattleRoundStore,
+    encounter_id: &str,
+    previous_round: u32,
+    manager: &mut NapcatMessageManager,
+    rule_engine_state: &mut RuleEngineState,
+) -> bool {
+    let Some(encounter) = store.encounters.get(encounter_id) else {
+        return false;
+    };
+    if encounter.round <= previous_round {
+        return false;
+    }
+    let canonical_round = encounter
+        .trpg_group
+        .as_deref()
+        .and_then(|group_name| manager.trpg_groups.get(group_name))
+        .map(|group| group.world_turn)
+        .unwrap_or(previous_round);
+    let rounds_to_advance = encounter
+        .round
+        .saturating_sub(canonical_round.max(previous_round));
+    let player_ids = encounter
+        .participants
+        .iter()
+        .filter(|participant| participant.player_character)
+        .map(|participant| participant.target_id.clone())
+        .collect::<Vec<_>>();
+
+    let mut changed = sync_encounter_to_manager(Some(encounter), manager);
+    for _ in 0..rounds_to_advance {
+        changed |= advance_buffs_for_players(manager, &player_ids, rule_engine_state);
+    }
+    if rounds_to_advance == 0 {
+        return changed;
+    }
+    if let Some(encounter) = store.encounters.get_mut(encounter_id) {
+        for participant in encounter
+            .participants
+            .iter_mut()
+            .filter(|participant| participant.player_character)
+        {
+            sync_participant_from_manager(participant, manager);
+        }
+    }
+    true
 }
 
 fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) -> u64 {
@@ -4970,6 +5037,38 @@ mod tests {
             .find(|participant| participant.target_id == "b")
             .unwrap();
         assert!((target.hp - 15.0).abs() < 0.0001);
+
+        let mut rule_engine_state = RuleEngineState::default();
+        assert!(store.next_round("battle"));
+        assert!(sync_battle_round_buff_advancement(
+            &mut store,
+            "battle",
+            0,
+            &mut manager,
+            &mut rule_engine_state,
+        ));
+        assert_eq!(
+            manager.player_characters["b"].active_buffs[0].turns_remaining,
+            1
+        );
+        assert!((manager.player_characters["b"].damage_taken_modifier - 0.5).abs() < 0.0001);
+
+        assert!(store.next_round("battle"));
+        assert!(sync_battle_round_buff_advancement(
+            &mut store,
+            "battle",
+            1,
+            &mut manager,
+            &mut rule_engine_state,
+        ));
+        assert!(manager.player_characters["b"].active_buffs.is_empty());
+        assert!((manager.player_characters["b"].damage_taken_modifier - 1.0).abs() < 0.0001);
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.damage_taken_modifier - 1.0).abs() < 0.0001);
     }
 
     #[test]
