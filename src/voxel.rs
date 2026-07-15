@@ -263,11 +263,15 @@ struct VoxelSceneSnapshot {
 struct VoxelOrbitalPlanet {
     cells: HashMap<IVec3, u8>,
     removed: HashSet<IVec3>,
+    collider_entity: Entity,
     mesh_entities: Vec<Entity>,
     mesh_handles: Vec<Handle<Mesh>>,
     voxel_size: f32,
     dirty: bool,
 }
+
+#[derive(Component)]
+struct VoxelPlanetCollider;
 
 #[derive(Clone, Copy)]
 struct VoxelPlanetRayHit {
@@ -3507,14 +3511,18 @@ fn spawn_voxel_orbital_planet(
     let entity = commands
         .spawn((
             RigidBody::Static,
-            Collider::compound(vec![(
-                center_offset,
-                Quat::IDENTITY,
-                Collider::voxels(Vec3::splat(VOXEL_SIZE), &collider_cells),
-            )]),
             Transform::from_translation(ORBITAL_PLANET_CENTER),
         ))
         .id();
+    let collider_entity = commands
+        .spawn((
+            canonical_voxel_collider(&collider_cells),
+            Friction::new(0.8),
+            Transform::from_translation(center_offset),
+            VoxelPlanetCollider,
+        ))
+        .id();
+    commands.entity(entity).add_child(collider_entity);
     let mut mesh_entities = Vec::new();
     let mut mesh_handles = Vec::new();
     commands.entity(entity).with_children(|parent| {
@@ -3538,6 +3546,7 @@ fn spawn_voxel_orbital_planet(
     commands.entity(entity).insert(VoxelOrbitalPlanet {
         cells: cells.into_iter().collect(),
         removed: HashSet::new(),
+        collider_entity,
         mesh_entities,
         mesh_handles,
         voxel_size: VOXEL_SIZE,
@@ -3550,11 +3559,7 @@ fn rebuild_voxel_orbital_planet(
     mut commands: Commands,
     mouse: Res<ButtonInput<MouseButton>>,
     editor: Res<VoxelEditorState>,
-    mut planets: Query<(
-        Entity,
-        &mut VoxelOrbitalPlanet,
-        &mut Collider,
-    )>,
+    mut planets: Query<(Entity, &mut VoxelOrbitalPlanet)>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
@@ -3564,7 +3569,7 @@ fn rebuild_voxel_orbital_planet(
             VoxelEditMode::Add | VoxelEditMode::Remove | VoxelEditMode::Paint
         )
         && (mouse.pressed(MouseButton::Left) || mouse.pressed(MouseButton::Right));
-    for (entity, mut planet, mut collider) in &mut planets {
+    for (entity, mut planet) in &mut planets {
         if !planet.dirty || batching_edits {
             continue;
         }
@@ -3576,11 +3581,18 @@ fn rebuild_voxel_orbital_planet(
         }
         let cells = sorted_planet_cells(&planet);
         let (material_meshes, collider_cells) = build_voxel_meshes_from_cells(&cells);
-        *collider = Collider::compound(vec![(
-            Vec3::splat(-0.5 * VOXEL_SIZE),
-            Quat::IDENTITY,
-            Collider::voxels(Vec3::splat(VOXEL_SIZE), &collider_cells),
-        )]);
+        if collider_cells.is_empty() {
+            commands
+                .entity(planet.collider_entity)
+                .insert(ColliderDisabled);
+        } else {
+            commands
+                .entity(planet.collider_entity)
+                .insert(canonical_voxel_collider(
+                    &collider_cells,
+                ))
+                .remove::<ColliderDisabled>();
+        }
         let mut mesh_entities = Vec::new();
         let mut mesh_handles = Vec::new();
         commands.entity(entity).with_children(|parent| {
@@ -3662,10 +3674,7 @@ fn rebuild_voxel_geometry(
     if !collider_voxels.is_empty() {
         commands.spawn((
             RigidBody::Static,
-            Collider::voxels(
-                Vec3::splat(VOXEL_SIZE),
-                &collider_voxels,
-            ),
+            canonical_voxel_collider(&collider_voxels),
             VoxelGeometry,
         ));
     }
@@ -3684,6 +3693,10 @@ fn build_voxel_meshes(grid: &Grid<u8>) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
         })
         .collect::<Vec<_>>();
     build_voxel_meshes_from_cells(&cells)
+}
+
+fn canonical_voxel_collider(cells: &[IVec3]) -> Collider {
+    Collider::voxels(Vec3::splat(VOXEL_SIZE), cells)
 }
 
 fn build_voxel_meshes_from_cells(cells: &[(IVec3, u8)]) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
@@ -4115,11 +4128,9 @@ fn spawn_voxel_physics_body_at(
                 cells,
             },
             RigidBody::Dynamic,
-            Collider::voxels(
-                Vec3::splat(VOXEL_SIZE),
-                &collider_voxels,
-            ),
+            canonical_voxel_collider(&collider_voxels),
             ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
+            Friction::new(0.8),
             linear_velocity,
             angular_velocity,
             LinearDamping(0.15),
@@ -6285,6 +6296,7 @@ mod tests {
         let mut planet = VoxelOrbitalPlanet {
             cells: HashMap::from([(surface, 3)]),
             removed: HashSet::new(),
+            collider_entity: Entity::PLACEHOLDER,
             mesh_entities: Vec::new(),
             mesh_handles: Vec::new(),
             voxel_size: 1.0,
@@ -6308,6 +6320,7 @@ mod tests {
         let planet = VoxelOrbitalPlanet {
             cells: HashMap::from([(IVec3::ZERO, 2)]),
             removed: HashSet::new(),
+            collider_entity: Entity::PLACEHOLDER,
             mesh_entities: Vec::new(),
             mesh_handles: Vec::new(),
             voxel_size: 2.0,
@@ -6327,6 +6340,7 @@ mod tests {
         let mut planet = VoxelOrbitalPlanet {
             cells: HashMap::from([(surface, 3)]),
             removed: HashSet::new(),
+            collider_entity: Entity::PLACEHOLDER,
             mesh_entities: Vec::new(),
             mesh_handles: Vec::new(),
             voxel_size: VOXEL_SIZE,
@@ -6406,6 +6420,20 @@ mod tests {
         assert!((total_height - VOXEL_SIZE * 2.0).abs() < f32::EPSILON);
         assert!((FIRST_PERSON_RADIUS * 2.0 - VOXEL_SIZE).abs() < f32::EPSILON);
         assert!((FIRST_PERSON_EYE_OFFSET - VOXEL_SIZE).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn canonical_voxel_colliders_keep_quarter_scale_voxel_geometry() {
+        let collider = canonical_voxel_collider(&[IVec3::ZERO, IVec3::X]);
+        let voxels = collider
+            .shape()
+            .as_voxels()
+            .expect("canonical voxel bodies must use a real voxel collider");
+
+        assert_eq!(
+            voxels.voxel_size(),
+            Vec3::splat(VOXEL_SIZE)
+        );
     }
 
     #[test]
@@ -7195,6 +7223,7 @@ mod tests {
                 VoxelOrbitalPlanet {
                     cells: HashMap::from([(selected_cell, 1)]),
                     removed: HashSet::new(),
+                    collider_entity: Entity::PLACEHOLDER,
                     mesh_entities: Vec::new(),
                     mesh_handles: Vec::new(),
                     voxel_size: VOXEL_SIZE,
@@ -7214,9 +7243,15 @@ mod tests {
         assert!(!planet.cells.contains_key(&selected_cell));
         assert!(planet.removed.contains(&selected_cell));
         assert!(!planet.cells.is_empty());
-        let mut bodies = app.world_mut().query::<(&VoxelPhysicsBody, &Transform)>();
-        let (body, transform) = bodies.single(app.world()).unwrap();
+        let mut bodies = app.world_mut().query::<(
+            &VoxelPhysicsBody,
+            &Transform,
+            &Collider,
+            &Friction,
+        )>();
+        let (body, transform, collider, _) = bodies.single(app.world()).unwrap();
         assert_eq!(body.cells, vec![(IVec3::ZERO, 1)]);
+        assert!(collider.shape().as_voxels().is_some());
         assert_eq!(
             transform.translation + Vec3::splat(VOXEL_SIZE * 0.5),
             Vec3::new(10.0, 20.0, 30.0)
