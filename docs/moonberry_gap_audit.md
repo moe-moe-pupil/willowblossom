@@ -35,6 +35,8 @@ Additional 2026-06-26 update: `敏锐` approved-talent parsed battle now preserv
 
 Additional 2026-07-16 update: `奥术护盾` approved-talent battle participants now enter each encounter with a persisted shield equal to 10% of maximum MP. The central battle damage path consumes the shield before HP for manual damage, parsed skills, and scheduled damage; fully absorbed hits do not count as HP damage or damage-source contributions. Focused verification passes with `cargo test --lib -j 1 arcane_shield -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 386 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 update: `过度治疗` approved-talent battle healing now converts overheal into an encounter-local shield capped at 30% of the target's maximum HP. The shield is persisted, consumed before other HP damage, and remains through the following full battle round; parsed skills, delayed healing, buff ticks, lifesteal, mutual-aid feedback, liquid-body recovery, and kill recovery share the same healing path while passive regeneration remains excluded. Focused verification passes with `cargo test --lib -j 1 overhealing -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 387 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -329,6 +331,8 @@ Additional implemented talent execution: `液态躯体` now records parsed-battl
 Additional implemented talent execution: `敏锐` now records a parsed-battle once-per-battle dodge charge and spends it on the first positive range/non-targeted incoming skill damage, leaving ordinary single-target damage untouched.
 
 Additional implemented talent execution: `奥术护盾` now grants battle entrants 10% of maximum MP as encounter-local shielding and consumes it before HP damage across the shared battle damage path.
+
+Additional implemented talent execution: `过度治疗` now converts battle overheal into one-round encounter-local shielding capped at 30% of the healed target's maximum HP across immediate and delayed healing paths.
 
 6. Import/export is partial.
 

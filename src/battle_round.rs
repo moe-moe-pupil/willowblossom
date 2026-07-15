@@ -65,6 +65,7 @@ use crate::{
         character_moonberry_talent_damage_attribute_bonus,
         character_mutual_aid_healing_rate,
         character_one_heart_healing_bonus_per_stack,
+        character_overhealing_shield_cap_rate,
         character_penance_healing_bonus_percent,
         character_physical_damage_followup_rate,
         character_physical_damage_lifesteal,
@@ -276,6 +277,12 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub arcane_shield: f32,
     #[serde(default)]
+    pub overhealing_shield_cap_rate: f32,
+    #[serde(default)]
+    pub overhealing_shield: f32,
+    #[serde(default)]
+    pub overhealing_shield_turns_remaining: u32,
+    #[serde(default)]
     pub liquid_body_damage_delay_rate: f32,
     #[serde(default)]
     pub liquid_body_self_healing_rate: f32,
@@ -333,6 +340,8 @@ pub struct BattleDelayedHealingTick {
     pub source_id: String,
     pub source_name: String,
     pub amount: f32,
+    #[serde(default)]
+    pub overhealing_shield_cap_rate: f32,
     pub turns_remaining: i32,
 }
 
@@ -421,6 +430,43 @@ fn record_participant_healing_taken(
     }
     participant.healing_taken_this_turn += amount;
     true
+}
+
+fn apply_participant_healing_for_battle(
+    participant: &mut BattleParticipantSnapshot,
+    amount: f32,
+    overhealing_shield_cap_rate: f32,
+) {
+    let amount = amount.max(0.0);
+    if amount <= f32::EPSILON {
+        return;
+    }
+    record_participant_healing_taken(participant, amount);
+    let missing_hp = (participant.max_hp - participant.hp).max(0.0);
+    let applied_healing = amount.min(missing_hp);
+    participant.hp = (participant.hp + applied_healing).min(participant.max_hp);
+    participant.alive = participant.hp > 0.0;
+
+    let overhealing = (amount - applied_healing).max(0.0);
+    let shield_cap = participant.max_hp.max(0.0) * overhealing_shield_cap_rate.max(0.0);
+    if overhealing > f32::EPSILON && shield_cap > f32::EPSILON {
+        participant.overhealing_shield =
+            (participant.overhealing_shield.max(0.0) + overhealing).min(shield_cap);
+        participant.overhealing_shield_turns_remaining = 2;
+    }
+}
+
+fn advance_participant_overhealing_shield(participant: &mut BattleParticipantSnapshot) {
+    participant.overhealing_shield = participant
+        .overhealing_shield
+        .max(0.0)
+        .min(participant.max_hp.max(0.0) * 0.30);
+    if participant.overhealing_shield_turns_remaining > 0 {
+        participant.overhealing_shield_turns_remaining -= 1;
+    }
+    if participant.overhealing_shield_turns_remaining == 0 {
+        participant.overhealing_shield = 0.0;
+    }
 }
 
 fn record_participant_damage_contributor(
@@ -595,9 +641,8 @@ fn apply_participant_liquid_body_healing(
     if healing <= f32::EPSILON {
         return None;
     }
-    record_participant_healing_taken(participant, healing);
-    participant.hp = (participant.hp + healing).min(participant.max_hp);
-    participant.alive = participant.hp > 0.0;
+    let shield_cap_rate = participant.overhealing_shield_cap_rate;
+    apply_participant_healing_for_battle(participant, healing, shield_cap_rate);
     Some(format!(
         "{}触发液态躯体，回复{}点生命值",
         participant.display_name,
@@ -632,10 +677,18 @@ fn apply_participant_damage_for_battle(
     source_id: &str,
 ) -> Option<BattleDefeatOutcome> {
     let incoming_amount = amount.max(0.0);
+    let available_overhealing_shield = participant.overhealing_shield.max(0.0);
+    let overhealing_absorbed = available_overhealing_shield.min(incoming_amount);
+    participant.overhealing_shield = available_overhealing_shield - overhealing_absorbed;
+    if participant.overhealing_shield <= f32::EPSILON {
+        participant.overhealing_shield = 0.0;
+        participant.overhealing_shield_turns_remaining = 0;
+    }
+    let after_overhealing_shield = (incoming_amount - overhealing_absorbed).max(0.0);
     let available_shield = participant.arcane_shield.max(0.0);
-    let absorbed = available_shield.min(incoming_amount);
+    let absorbed = available_shield.min(after_overhealing_shield);
     participant.arcane_shield = available_shield - absorbed;
-    let final_amount = (incoming_amount - absorbed).max(0.0);
+    let final_amount = (after_overhealing_shield - absorbed).max(0.0);
     if final_amount <= f32::EPSILON {
         return None;
     }
@@ -741,8 +794,12 @@ fn apply_sin_on_sin_kill_participation(
             * participant.sin_on_sin_recovery_rate)
             .max(0.0);
         if hp_recovered > f32::EPSILON {
-            record_participant_healing_taken(participant, hp_recovered);
-            participant.hp = (participant.hp + hp_recovered).min(participant.max_hp);
+            let shield_cap_rate = participant.overhealing_shield_cap_rate;
+            apply_participant_healing_for_battle(
+                participant,
+                hp_recovered,
+                shield_cap_rate,
+            );
         }
         if mp_recovered > f32::EPSILON {
             participant.mp = (participant.mp + mp_recovered).min(participant.max_mp);
@@ -815,6 +872,7 @@ fn schedule_participant_delayed_healing(
     source_name: &str,
     name: &str,
     amount: f32,
+    overhealing_shield_cap_rate: f32,
     turns_remaining: i32,
 ) {
     participant
@@ -824,6 +882,7 @@ fn schedule_participant_delayed_healing(
             source_id: source_id.to_owned(),
             source_name: source_name.to_owned(),
             amount: amount.max(0.0),
+            overhealing_shield_cap_rate: overhealing_shield_cap_rate.max(0.0),
             turns_remaining: turns_remaining.max(1),
         });
 }
@@ -905,9 +964,11 @@ fn advance_participant_delayed_healing_ticks(
         if final_amount <= f32::EPSILON {
             continue;
         }
-        record_participant_healing_taken(participant, final_amount);
-        participant.hp = (participant.hp + final_amount).min(participant.max_hp);
-        participant.alive = participant.hp > 0.0;
+        apply_participant_healing_for_battle(
+            participant,
+            final_amount,
+            tick.overhealing_shield_cap_rate,
+        );
         logs.push(format!(
             "{}触发{}，为{}回复{}点生命值",
             tick.source_name,
@@ -1080,6 +1141,14 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant.keen_evasion_available.hash(&mut hasher);
             participant.arcane_shield.to_bits().hash(&mut hasher);
             participant
+                .overhealing_shield_cap_rate
+                .to_bits()
+                .hash(&mut hasher);
+            participant.overhealing_shield.to_bits().hash(&mut hasher);
+            participant
+                .overhealing_shield_turns_remaining
+                .hash(&mut hasher);
+            participant
                 .liquid_body_damage_delay_rate
                 .to_bits()
                 .hash(&mut hasher);
@@ -1139,6 +1208,7 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
                 tick.source_id.hash(&mut hasher);
                 tick.source_name.hash(&mut hasher);
                 tick.amount.to_bits().hash(&mut hasher);
+                tick.overhealing_shield_cap_rate.to_bits().hash(&mut hasher);
                 tick.turns_remaining.hash(&mut hasher);
             }
             participant
@@ -1509,6 +1579,12 @@ fn encounter_roster_ui(
                 ui.small(format!(
                     "奥术护盾{}",
                     format_number(participant.arcane_shield)
+                ));
+            }
+            if participant.overhealing_shield > f32::EPSILON {
+                ui.small(format!(
+                    "过量治疗护盾{}",
+                    format_number(participant.overhealing_shield)
                 ));
             }
             if participant.liquid_body_damage_delay_rate > f32::EPSILON
@@ -1936,6 +2012,7 @@ impl BattleRoundStore {
         let mut defeat_outcomes = Vec::new();
         for participant in &mut encounter.participants {
             participant.action_done = false;
+            advance_participant_overhealing_shield(participant);
             let previous_damage_taken = participant.damage_taken_this_turn;
             reset_participant_turn_totals(participant);
             if let Some(log) =
@@ -2425,9 +2502,11 @@ impl BattleRoundStore {
                             .iter_mut()
                             .find(|participant| participant.target_id == actor_id)
                         {
-                            record_participant_healing_taken(actor, pending_actor_lifesteal);
-                            actor.hp = (actor.hp + pending_actor_lifesteal).min(actor.max_hp);
-                            actor.alive = actor.hp > 0.0;
+                            apply_participant_healing_for_battle(
+                                actor,
+                                pending_actor_lifesteal,
+                                actor_snapshot.overhealing_shield_cap_rate,
+                            );
                             encounter.action_log.push(format!(
                                 "{}触发禅宗古训，回复{}点生命值",
                                 actor_name,
@@ -2517,9 +2596,11 @@ impl BattleRoundStore {
                             * one_heart_multiplier
                             * target_healing_multiplier)
                             .max(0.0);
-                        record_participant_healing_taken(target, final_amount);
-                        target.hp = (target.hp + final_amount).min(target.max_hp);
-                        target.alive = target.hp > 0.0;
+                        apply_participant_healing_for_battle(
+                            target,
+                            final_amount,
+                            actor_snapshot.overhealing_shield_cap_rate,
+                        );
                         if resolved_target_id != actor_id && final_amount > f32::EPSILON {
                             pending_actor_mutual_aid_healing += final_amount
                                 * (actor_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
@@ -2541,6 +2622,7 @@ impl BattleRoundStore {
                                     &actor_name,
                                     "千万回忆",
                                     final_amount * first_echo_rate,
+                                    actor_snapshot.overhealing_shield_cap_rate,
                                     1,
                                 );
                                 schedule_participant_delayed_healing(
@@ -2549,6 +2631,7 @@ impl BattleRoundStore {
                                     &actor_name,
                                     "千万回忆",
                                     final_amount * second_echo_rate,
+                                    actor_snapshot.overhealing_shield_cap_rate,
                                     2,
                                 );
                             }
@@ -2583,13 +2666,12 @@ impl BattleRoundStore {
                             .iter_mut()
                             .find(|participant| participant.target_id == actor_id)
                         {
-                            record_participant_healing_taken(
+                            let shield_cap_rate = actor.overhealing_shield_cap_rate;
+                            apply_participant_healing_for_battle(
                                 actor,
                                 pending_actor_mutual_aid_healing,
+                                shield_cap_rate,
                             );
-                            actor.hp =
-                                (actor.hp + pending_actor_mutual_aid_healing).min(actor.max_hp);
-                            actor.alive = actor.hp > 0.0;
                             encounter.action_log.push(format!(
                                 "{}触发互帮互助，回复{}点生命值",
                                 actor_name,
@@ -2800,6 +2882,7 @@ impl BattleRoundStore {
         }
         let previous_damage_taken = participant.damage_taken_this_turn;
         reset_participant_turn_totals(participant);
+        advance_participant_overhealing_shield(participant);
         let mut delayed_logs = Vec::new();
         if let Some(log) = apply_participant_liquid_body_healing(participant, previous_damage_taken)
         {
@@ -3217,6 +3300,10 @@ fn apply_battle_buff_ticks(
                         .unwrap_or(1.0);
                 let final_amount =
                     (amount.max(0.0) * source_multiplier * target_multiplier).max(0.0);
+                let source_overhealing_shield_cap_rate = source_character
+                    .as_ref()
+                    .map(character_overhealing_shield_cap_rate)
+                    .unwrap_or(0.0);
                 let mutual_aid_healing =
                     if tick.source_id != tick.target_id && final_amount > f32::EPSILON {
                         final_amount
@@ -3232,9 +3319,11 @@ fn apply_battle_buff_ticks(
                         0.0
                     };
                 let target = &mut encounter.participants[target_index];
-                record_participant_healing_taken(target, final_amount);
-                target.hp = (target.hp + final_amount).min(target.max_hp);
-                target.alive = target.hp > 0.0;
+                apply_participant_healing_for_battle(
+                    target,
+                    final_amount,
+                    source_overhealing_shield_cap_rate,
+                );
                 encounter.action_log.push(format!(
                     "状态触发：{}为{}回复{}点生命值",
                     source_name,
@@ -3247,9 +3336,12 @@ fn apply_battle_buff_ticks(
                         .iter_mut()
                         .find(|participant| participant.target_id == tick.source_id)
                     {
-                        record_participant_healing_taken(source, mutual_aid_healing);
-                        source.hp = (source.hp + mutual_aid_healing).min(source.max_hp);
-                        source.alive = source.hp > 0.0;
+                        let shield_cap_rate = source.overhealing_shield_cap_rate;
+                        apply_participant_healing_for_battle(
+                            source,
+                            mutual_aid_healing,
+                            shield_cap_rate,
+                        );
                         encounter.action_log.push(format!(
                             "{}触发互帮互助，回复{}点生命值",
                             source_name,
@@ -3333,6 +3425,14 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant.keen_evasion_available.hash(&mut hasher);
         participant.arcane_shield.to_bits().hash(&mut hasher);
         participant
+            .overhealing_shield_cap_rate
+            .to_bits()
+            .hash(&mut hasher);
+        participant.overhealing_shield.to_bits().hash(&mut hasher);
+        participant
+            .overhealing_shield_turns_remaining
+            .hash(&mut hasher);
+        participant
             .liquid_body_damage_delay_rate
             .to_bits()
             .hash(&mut hasher);
@@ -3392,6 +3492,7 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
             tick.source_id.hash(&mut hasher);
             tick.source_name.hash(&mut hasher);
             tick.amount.to_bits().hash(&mut hasher);
+            tick.overhealing_shield_cap_rate.to_bits().hash(&mut hasher);
             tick.turns_remaining.hash(&mut hasher);
         }
         participant
@@ -3465,6 +3566,9 @@ fn participant_from_character(
         keen_evasion_enabled: character_keen_evasion_available(character),
         keen_evasion_available: character_keen_evasion_available(character),
         arcane_shield: character_arcane_shield_amount(character),
+        overhealing_shield_cap_rate: character_overhealing_shield_cap_rate(character),
+        overhealing_shield: 0.0,
+        overhealing_shield_turns_remaining: 0,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
@@ -3543,6 +3647,9 @@ fn participant_from_unit_template(
         keen_evasion_enabled: character_keen_evasion_available(character),
         keen_evasion_available: character_keen_evasion_available(character),
         arcane_shield: character_arcane_shield_amount(character),
+        overhealing_shield_cap_rate: character_overhealing_shield_cap_rate(character),
+        overhealing_shield: 0.0,
+        overhealing_shield_turns_remaining: 0,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
@@ -3617,6 +3724,9 @@ fn participant_from_target(
         keen_evasion_enabled: false,
         keen_evasion_available: false,
         arcane_shield: 0.0,
+        overhealing_shield_cap_rate: 0.0,
+        overhealing_shield: 0.0,
+        overhealing_shield_turns_remaining: 0,
         liquid_body_damage_delay_rate: 0.0,
         liquid_body_self_healing_rate: 0.0,
         champion_damage_bonus_per_stack: 0.0,
@@ -3689,6 +3799,8 @@ fn sync_participant_from_manager(
                 participant,
                 character_keen_evasion_available(&character),
             );
+            participant.overhealing_shield_cap_rate =
+                character_overhealing_shield_cap_rate(&character);
             participant.liquid_body_damage_delay_rate =
                 character_liquid_body_damage_delay_rate(&character);
             participant.liquid_body_self_healing_rate =
@@ -3763,6 +3875,7 @@ fn sync_participant_from_manager(
             participant,
             character_keen_evasion_available(character),
         );
+        participant.overhealing_shield_cap_rate = character_overhealing_shield_cap_rate(character);
         participant.liquid_body_damage_delay_rate =
             character_liquid_body_damage_delay_rate(character);
         participant.liquid_body_self_healing_rate =
@@ -3799,6 +3912,7 @@ fn sync_participant_from_manager(
         participant.infinite_focus_damage_bonus_per_stack = 0.0;
         participant.one_heart_healing_bonus_per_stack = 0.0;
         sync_participant_keen_evasion(participant, false);
+        participant.overhealing_shield_cap_rate = 0.0;
         participant.liquid_body_damage_delay_rate = 0.0;
         participant.liquid_body_self_healing_rate = 0.0;
         participant.champion_damage_bonus_per_stack = 0.0;
@@ -4811,6 +4925,9 @@ mod area_tests {
             keen_evasion_enabled: false,
             keen_evasion_available: false,
             arcane_shield: 0.0,
+            overhealing_shield_cap_rate: 0.0,
+            overhealing_shield: 0.0,
+            overhealing_shield_turns_remaining: 0,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             champion_damage_bonus_per_stack: 0.0,
@@ -4900,6 +5017,9 @@ mod tests {
             keen_evasion_enabled: false,
             keen_evasion_available: false,
             arcane_shield: 0.0,
+            overhealing_shield_cap_rate: 0.0,
+            overhealing_shield: 0.0,
+            overhealing_shield_turns_remaining: 0,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             champion_damage_bonus_per_stack: 0.0,
@@ -6964,6 +7084,143 @@ mod tests {
         let persisted = serde_json::to_string(&participant).unwrap();
         let restored: BattleParticipantSnapshot = serde_json::from_str(&persisted).unwrap();
         assert!((restored.arcane_shield - participant.arcane_shield).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_overhealing_talent_grants_capped_expiring_shield() {
+        let mut manager = empty_manager();
+        let healer_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            skill_names: vec!["过度治疗".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 95.0,
+            max_hp: 100.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), healer_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let healer = participant_from_character("a", &healer_character, &manager);
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![healer, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "过量治疗测试".to_owned(),
+            note: "主动使用对目标回复20点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let target = store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 100.0).abs() < 0.0001);
+        assert!((target.overhealing_shield - 30.0).abs() < 0.0001);
+        assert_eq!(
+            target.overhealing_shield_turns_remaining,
+            2
+        );
+        assert!(apply_participant_damage_for_battle(target, 20.0, "enemy").is_none());
+        assert!((target.hp - 100.0).abs() < 0.0001);
+        assert!((target.overhealing_shield - 10.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 0.0).abs() < 0.0001);
+
+        let persisted = serde_json::to_string(target).unwrap();
+        let restored: BattleParticipantSnapshot = serde_json::from_str(&persisted).unwrap();
+        assert!((restored.overhealing_shield - 10.0).abs() < 0.0001);
+        assert_eq!(
+            restored.overhealing_shield_turns_remaining,
+            2
+        );
+
+        assert!(store.next_round("battle"));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.overhealing_shield - 10.0).abs() < 0.0001);
+        assert_eq!(
+            target.overhealing_shield_turns_remaining,
+            1
+        );
+
+        assert!(store.next_round("battle"));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.overhealing_shield - 0.0).abs() < 0.0001);
+        assert_eq!(
+            target.overhealing_shield_turns_remaining,
+            0
+        );
+
+        let target = store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        schedule_participant_delayed_healing(
+            target,
+            "a",
+            "healer",
+            "延迟治疗",
+            10.0,
+            0.30,
+            1,
+        );
+        let persisted = serde_json::to_string(target).unwrap();
+        let restored: BattleParticipantSnapshot = serde_json::from_str(&persisted).unwrap();
+        assert!(
+            (restored.delayed_healing_ticks[0].overhealing_shield_cap_rate - 0.30).abs() < 0.0001
+        );
+        assert!(store.next_round("battle"));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.overhealing_shield - 10.0).abs() < 0.0001);
+        assert_eq!(
+            target.overhealing_shield_turns_remaining,
+            2
+        );
     }
 
     #[test]

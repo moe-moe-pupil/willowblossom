@@ -6906,6 +6906,14 @@ pub fn character_arcane_shield_amount(character: &PlayerCharacter) -> f32 {
     }
 }
 
+pub fn character_overhealing_shield_cap_rate(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "过度治疗") {
+        0.30
+    } else {
+        0.0
+    }
+}
+
 pub fn upsert_character_active_buff(character: &mut PlayerCharacter, buff: BuffSpec) -> bool {
     if let Some(existing) = character
         .active_buffs
