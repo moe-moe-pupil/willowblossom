@@ -94,13 +94,11 @@ const PLANET_MAX_RAY_DISTANCE: f32 = 600.0;
 const EDIT_REPEAT_DELAY: f32 = 0.32;
 const EDIT_REPEAT_INTERVAL: f32 = 0.09;
 const TRPG_PHYSICS_SUBSTEPS: u32 = 2;
-const ORBITAL_PLANET_LOD_SUBDIVISIONS: i32 = 10;
-const ORBITAL_PLANET_LOD_VOXEL_SIZE: f32 = VOXEL_SIZE * ORBITAL_PLANET_LOD_SUBDIVISIONS as f32;
-const ORBITAL_PLANET_RADIUS: f32 =
-    (ORBITAL_PLANET_VOXEL_RADIUS as f32 + 0.5) * ORBITAL_PLANET_LOD_VOXEL_SIZE;
-// Preserve the old upper surface height while growing the radius tenfold.
+const ORBITAL_PLANET_RADIUS: f32 = 12.125 * 10.0;
+// Keep the old upper surface at the same scene height after increasing radius.
 const ORBITAL_PLANET_CENTER: Vec3 = Vec3::new(0.0, -251.125, 0.0);
-const ORBITAL_PLANET_VOXEL_RADIUS: i32 = 48;
+const ORBITAL_PLANET_VOXEL_RADIUS: i32 = 485;
+const ORBITAL_PLANET_CAP_RADIUS: i32 = 128;
 const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
@@ -141,9 +139,8 @@ const PLAYER_CAPTURE_PREPARE_FRAMES: u8 = 3;
 const PLAYER_STANDEE_HEIGHT: f32 = FIRST_PERSON_BODY_LENGTH + FIRST_PERSON_RADIUS * 2.0;
 const TOOL_GUN_DRAG_RESPONSE: f32 = 12.0;
 const TOOL_GUN_DRAG_MAX_SPEED: f32 = 24.0;
-const PLANET_AUTO_REFINEMENTS_PER_FRAME: usize = 2;
 const PLANET_CLOUD_ALTITUDE: f32 = 3.5;
-const PLANET_CLOUD_PUFF_COUNT: usize = 64;
+const PLANET_CLOUD_PUFF_COUNT: usize = 48;
 
 pub struct TrpgVoxelPlugin;
 
@@ -267,17 +264,13 @@ struct VoxelSceneSnapshot {
 
 #[derive(Component)]
 struct VoxelOrbitalPlanet {
-    lod_cells: HashMap<IVec3, u8>,
-    refined_lod_cells: HashSet<IVec3>,
     cells: HashMap<IVec3, u8>,
     removed: HashSet<IVec3>,
-    lod_collider_entity: Entity,
     collider_entity: Entity,
     mesh_entities: Vec<Entity>,
     mesh_handles: Vec<Handle<Mesh>>,
     voxel_size: f32,
     dirty: bool,
-    auto_refine_pending: bool,
 }
 
 #[derive(Component)]
@@ -291,7 +284,6 @@ struct VoxelPlanetRayHit {
     occupied: IVec3,
     normal: IVec3,
     distance: f32,
-    lod: bool,
 }
 
 #[derive(Component)]
@@ -895,7 +887,6 @@ impl Plugin for TrpgVoxelPlugin {
                     handle_editor_requests,
                     place_creative_light,
                     sync_selected_voxel_light,
-                    refine_visible_planet_voxels,
                     edit_voxel_grid,
                     drag_voxel_physics_body,
                     make_selection_physical,
@@ -3383,20 +3374,23 @@ fn voxel_capture_file_uri(path: &Path) -> Result<String, String> {
 }
 
 fn voxel_orbital_planet_cells() -> Vec<(IVec3, u8)> {
-    let radius = ORBITAL_PLANET_VOXEL_RADIUS as f32;
+    let radius = ORBITAL_PLANET_RADIUS / VOXEL_SIZE - 0.5;
     let inner_radius = radius - ORBITAL_PLANET_SHELL_THICKNESS;
-    let outer_squared = (radius + 0.5).powi(2);
+    let outer_squared = radius.powi(2);
     let inner_squared = inner_radius.powi(2);
     let mut cells = Vec::new();
-    for x in -ORBITAL_PLANET_VOXEL_RADIUS..=ORBITAL_PLANET_VOXEL_RADIUS {
-        for y in -ORBITAL_PLANET_VOXEL_RADIUS..=ORBITAL_PLANET_VOXEL_RADIUS {
-            for z in -ORBITAL_PLANET_VOXEL_RADIUS..=ORBITAL_PLANET_VOXEL_RADIUS {
-                let distance_squared = IVec3::new(x, y, z).as_vec3().length_squared();
-                if !(inner_squared..=outer_squared).contains(&distance_squared) {
-                    continue;
-                }
+    let cap_squared = ORBITAL_PLANET_CAP_RADIUS.pow(2);
+    for x in -ORBITAL_PLANET_CAP_RADIUS..=ORBITAL_PLANET_CAP_RADIUS {
+        for z in -ORBITAL_PLANET_CAP_RADIUS..=ORBITAL_PLANET_CAP_RADIUS {
+            let horizontal_squared = x * x + z * z;
+            if horizontal_squared > cap_squared {
+                continue;
+            }
+            let outer_y = (outer_squared - horizontal_squared as f32).sqrt().floor() as i32;
+            let inner_y = (inner_squared - horizontal_squared as f32).sqrt().ceil() as i32;
+            for y in inner_y..=outer_y {
                 let cell = IVec3::new(x, y, z);
-                if let Some(material) = procedural_planet_lod_material(cell) {
+                if let Some(material) = procedural_planet_material(cell) {
                     cells.push((cell, material));
                 }
             }
@@ -3405,17 +3399,20 @@ fn voxel_orbital_planet_cells() -> Vec<(IVec3, u8)> {
     cells
 }
 
-fn procedural_planet_lod_material(cell: IVec3) -> Option<u8> {
-    let radius = ORBITAL_PLANET_VOXEL_RADIUS as f32 + 0.5;
-    let distance = cell.as_vec3().length();
-    if distance > radius {
+fn procedural_planet_material(cell: IVec3) -> Option<u8> {
+    if cell.y < 0 || cell.x * cell.x + cell.z * cell.z > ORBITAL_PLANET_CAP_RADIUS.pow(2) {
         return None;
     }
-    let depth = radius - distance;
-    if depth > 5.0 {
+    let local_position = cell.as_vec3() * VOXEL_SIZE;
+    let distance = local_position.length();
+    if distance > ORBITAL_PLANET_RADIUS - VOXEL_SIZE * 0.5 {
+        return None;
+    }
+    let depth = ORBITAL_PLANET_RADIUS - distance;
+    if depth > 5.0 * VOXEL_SIZE {
         return Some(6);
     }
-    if depth > 1.5 {
+    if depth > 1.5 * VOXEL_SIZE {
         return Some(2);
     }
     let continental = (cell.x as f32 * 0.095).sin()
@@ -3423,7 +3420,7 @@ fn procedural_planet_lod_material(cell: IVec3) -> Option<u8> {
         + ((cell.x + cell.z) as f32 * 0.055).sin()
         + (cell.y as f32 * 0.115).cos() * 0.35;
     Some(
-        if cell.y.abs() >= ORBITAL_PLANET_VOXEL_RADIUS - 4 {
+        if cell.y >= ORBITAL_PLANET_VOXEL_RADIUS - 4 {
             3
         } else if continental > 0.72 {
             1
@@ -3433,72 +3430,6 @@ fn procedural_planet_lod_material(cell: IVec3) -> Option<u8> {
             4
         },
     )
-}
-
-fn planet_lod_cell_center(cell: IVec3) -> Vec3 {
-    cell.as_vec3() * ORBITAL_PLANET_LOD_VOXEL_SIZE - Vec3::splat(0.5 * VOXEL_SIZE)
-}
-
-fn procedural_planet_material(cell: IVec3) -> Option<u8> {
-    let local_position = cell.as_vec3() * VOXEL_SIZE;
-    let distance = local_position.length();
-    if distance > ORBITAL_PLANET_RADIUS - VOXEL_SIZE * 0.5 {
-        return None;
-    }
-    let depth = ORBITAL_PLANET_RADIUS - distance;
-    if depth > 5.0 * ORBITAL_PLANET_LOD_VOXEL_SIZE {
-        return Some(6);
-    }
-    if depth > 1.5 * ORBITAL_PLANET_LOD_VOXEL_SIZE {
-        return Some(2);
-    }
-    let continental = (local_position.x * 0.019).sin()
-        + (local_position.z * 0.016).cos()
-        + ((local_position.x + local_position.z) * 0.011).sin()
-        + (local_position.y * 0.023).cos() * 0.35;
-    Some(
-        if local_position.y.abs() >= ORBITAL_PLANET_RADIUS - 20.0 {
-            3
-        } else if continental > 0.72 {
-            1
-        } else if continental > 0.52 {
-            3
-        } else {
-            4
-        },
-    )
-}
-
-fn refine_planet_lod_cell(planet: &mut VoxelOrbitalPlanet, lod_cell: IVec3) -> bool {
-    if planet.lod_cells.remove(&lod_cell).is_none() {
-        return false;
-    }
-    planet.refined_lod_cells.insert(lod_cell);
-    let min = lod_cell * ORBITAL_PLANET_LOD_SUBDIVISIONS
-        - IVec3::splat(ORBITAL_PLANET_LOD_SUBDIVISIONS / 2);
-    let max = min + IVec3::splat(ORBITAL_PLANET_LOD_SUBDIVISIONS - 1);
-    for cell in prism(min, max + IVec3::ONE) {
-        if planet.removed.contains(&cell) || planet.cells.contains_key(&cell) {
-            continue;
-        }
-        if let Some(material) = procedural_planet_material(cell) {
-            planet.cells.insert(cell, material);
-        }
-    }
-    planet.dirty = true;
-    true
-}
-
-fn refine_planet_lod_neighborhood(planet: &mut VoxelOrbitalPlanet, center: IVec3) {
-    let requested = prism(
-        center - IVec3::ONE,
-        center + IVec3::splat(2),
-    )
-    .filter(|cell| planet.lod_cells.contains_key(cell))
-    .collect::<Vec<_>>();
-    for cell in requested {
-        refine_planet_lod_cell(planet, cell);
-    }
 }
 
 fn dig_planet_voxel(planet: &mut VoxelOrbitalPlanet, cell: IVec3) -> bool {
@@ -3546,18 +3477,6 @@ fn explode_planet_voxels(
     radius: f32,
 ) -> Vec<(IVec3, u8)> {
     let radius = radius.max(VOXEL_SIZE);
-    let lod_reach = radius + ORBITAL_PLANET_LOD_VOXEL_SIZE * 3.0_f32.sqrt() * 0.5;
-    let lod_to_refine = planet
-        .lod_cells
-        .keys()
-        .copied()
-        .filter(|cell| {
-            planet_lod_cell_center(*cell).distance_squared(local_origin) <= lod_reach * lod_reach
-        })
-        .collect::<Vec<_>>();
-    for cell in lod_to_refine {
-        refine_planet_lod_cell(planet, cell);
-    }
     let radius_squared = radius * radius;
     let mut selected = planet
         .cells
@@ -3592,39 +3511,6 @@ fn sorted_planet_cells(planet: &VoxelOrbitalPlanet) -> Vec<(IVec3, u8)> {
     cells
 }
 
-fn sorted_planet_lod_cells(planet: &VoxelOrbitalPlanet) -> Vec<(IVec3, u8)> {
-    let mut cells = planet
-        .lod_cells
-        .iter()
-        .map(|(cell, material)| (*cell, *material))
-        .collect::<Vec<_>>();
-    cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
-    cells
-}
-
-fn exposed_solid_voxel_cells(cells: &[(IVec3, u8)]) -> Vec<IVec3> {
-    let solids = cells
-        .iter()
-        .filter_map(|(cell, material)| TrpgVoxelConnector::solid(material).then_some(*cell))
-        .collect::<HashSet<_>>();
-    solids
-        .iter()
-        .copied()
-        .filter(|cell| {
-            [
-                IVec3::X,
-                IVec3::NEG_X,
-                IVec3::Y,
-                IVec3::NEG_Y,
-                IVec3::Z,
-                IVec3::NEG_Z,
-            ]
-            .iter()
-            .any(|normal| !solids.contains(&(*cell + *normal)))
-        })
-        .collect()
-}
-
 fn planet_material_handle(materials: &VoxelMaterials, material_id: u8) -> Handle<StandardMaterial> {
     if material_id == 4 {
         materials.planet_ocean.clone()
@@ -3638,40 +3524,24 @@ fn spawn_voxel_orbital_planet(
     meshes: &mut Assets<Mesh>,
     materials: &VoxelMaterials,
 ) -> Entity {
-    let lod_cells = voxel_orbital_planet_cells();
-    let (material_meshes, _) = build_voxel_meshes_from_cells(&lod_cells);
-    let collider_cells = exposed_solid_voxel_cells(&lod_cells);
-    let center_offset = Vec3::splat(-0.5 * ORBITAL_PLANET_LOD_VOXEL_SIZE - 0.5 * VOXEL_SIZE);
-    let voxel_scale = ORBITAL_PLANET_LOD_VOXEL_SIZE / VOXEL_SIZE;
+    let cells = voxel_orbital_planet_cells();
+    let (material_meshes, collider_cells) = build_voxel_meshes_from_cells(&cells);
+    let center_offset = Vec3::splat(-0.5 * VOXEL_SIZE);
     let entity = commands
         .spawn((
             RigidBody::Static,
             Transform::from_translation(ORBITAL_PLANET_CENTER),
         ))
         .id();
-    let lod_collider_entity = commands
+    let collider_entity = commands
         .spawn((
-            voxel_collider(
-                ORBITAL_PLANET_LOD_VOXEL_SIZE,
-                &collider_cells,
-            ),
+            canonical_voxel_collider(&collider_cells),
             Friction::new(0.8),
             Transform::from_translation(center_offset),
             VoxelPlanetCollider,
         ))
         .id();
-    let collider_entity = commands
-        .spawn((
-            Collider::cuboid(VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE),
-            ColliderDisabled,
-            Friction::new(0.8),
-            Transform::from_translation(Vec3::splat(-0.5 * VOXEL_SIZE)),
-            VoxelPlanetCollider,
-        ))
-        .id();
-    commands
-        .entity(entity)
-        .add_children(&[lod_collider_entity, collider_entity]);
+    commands.entity(entity).add_child(collider_entity);
     let mut mesh_entities = Vec::new();
     let mut mesh_handles = Vec::new();
     commands.entity(entity).with_children(|parent| {
@@ -3686,25 +3556,20 @@ fn spawn_voxel_orbital_planet(
                             materials,
                             material_id,
                         )),
-                        Transform::from_translation(center_offset)
-                            .with_scale(Vec3::splat(voxel_scale)),
+                        Transform::from_translation(center_offset),
                     ))
                     .id(),
             );
         }
     });
     commands.entity(entity).insert(VoxelOrbitalPlanet {
-        lod_cells: lod_cells.into_iter().collect(),
-        refined_lod_cells: HashSet::new(),
-        cells: HashMap::new(),
+        cells: cells.into_iter().collect(),
         removed: HashSet::new(),
-        lod_collider_entity,
         collider_entity,
         mesh_entities,
         mesh_handles,
         voxel_size: VOXEL_SIZE,
         dirty: false,
-        auto_refine_pending: false,
     });
     entity
 }
@@ -3732,7 +3597,8 @@ fn spawn_planet_clouds(
     commands.entity(layer).with_children(|parent| {
         let golden_angle = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
         for index in 0..PLANET_CLOUD_PUFF_COUNT {
-            let y = 1.0 - 2.0 * (index as f32 + 0.5) / PLANET_CLOUD_PUFF_COUNT as f32;
+            let fraction = (index as f32 + 0.5) / PLANET_CLOUD_PUFF_COUNT as f32;
+            let y = 0.965 + fraction * 0.035;
             let radial = (1.0 - y * y).sqrt();
             let angle = golden_angle * index as f32;
             let direction = Vec3::new(
@@ -3741,8 +3607,8 @@ fn spawn_planet_clouds(
                 radial * angle.sin(),
             );
             let tangent = Quat::from_rotation_arc(Vec3::Y, direction);
-            let width = 4.5 + ((index * 17 % 9) as f32) * 0.65;
-            let depth = 3.0 + ((index * 11 % 7) as f32) * 0.45;
+            let width = 2.5 + ((index * 17 % 9) as f32) * 0.32;
+            let depth = 1.7 + ((index * 11 % 7) as f32) * 0.24;
             parent.spawn((
                 Mesh3d(cloud_mesh.clone()),
                 MeshMaterial3d(cloud_material.clone()),
@@ -3750,7 +3616,7 @@ fn spawn_planet_clouds(
                     direction * (ORBITAL_PLANET_RADIUS + PLANET_CLOUD_ALTITUDE),
                 )
                 .with_rotation(tangent)
-                .with_scale(Vec3::new(width, 0.7, depth)),
+                .with_scale(Vec3::new(width, 0.4, depth)),
             ));
         }
     });
@@ -3781,7 +3647,7 @@ fn rebuild_voxel_orbital_planet(
         )
         && (mouse.pressed(MouseButton::Left) || mouse.pressed(MouseButton::Right));
     for (entity, mut planet) in &mut planets {
-        if !planet.dirty || batching_edits || planet.auto_refine_pending {
+        if !planet.dirty || batching_edits {
             continue;
         }
         for mesh_entity in planet.mesh_entities.drain(..) {
@@ -3791,23 +3657,7 @@ fn rebuild_voxel_orbital_planet(
             meshes.remove(mesh_handle.id());
         }
         let cells = sorted_planet_cells(&planet);
-        let lod_cells = sorted_planet_lod_cells(&planet);
-        let (fine_material_meshes, collider_cells) = build_voxel_meshes_from_cells(&cells);
-        let (lod_material_meshes, _) = build_voxel_meshes_from_cells(&lod_cells);
-        let lod_collider_cells = exposed_solid_voxel_cells(&lod_cells);
-        if lod_collider_cells.is_empty() {
-            commands
-                .entity(planet.lod_collider_entity)
-                .insert(ColliderDisabled);
-        } else {
-            commands
-                .entity(planet.lod_collider_entity)
-                .insert(voxel_collider(
-                    ORBITAL_PLANET_LOD_VOXEL_SIZE,
-                    &lod_collider_cells,
-                ))
-                .remove::<ColliderDisabled>();
-        }
+        let (material_meshes, collider_cells) = build_voxel_meshes_from_cells(&cells);
         if collider_cells.is_empty() {
             commands
                 .entity(planet.collider_entity)
@@ -3823,28 +3673,7 @@ fn rebuild_voxel_orbital_planet(
         let mut mesh_entities = Vec::new();
         let mut mesh_handles = Vec::new();
         commands.entity(entity).with_children(|parent| {
-            for (material_id, mesh) in lod_material_meshes {
-                let mesh_handle = meshes.add(mesh);
-                mesh_handles.push(mesh_handle.clone());
-                mesh_entities.push(
-                    parent
-                        .spawn((
-                            Mesh3d(mesh_handle),
-                            MeshMaterial3d(planet_material_handle(
-                                &materials,
-                                material_id,
-                            )),
-                            Transform::from_translation(Vec3::splat(
-                                -0.5 * ORBITAL_PLANET_LOD_VOXEL_SIZE - 0.5 * VOXEL_SIZE,
-                            ))
-                            .with_scale(Vec3::splat(
-                                ORBITAL_PLANET_LOD_VOXEL_SIZE / VOXEL_SIZE,
-                            )),
-                        ))
-                        .id(),
-                );
-            }
-            for (material_id, mesh) in fine_material_meshes {
+            for (material_id, mesh) in material_meshes {
                 let mesh_handle = meshes.add(mesh);
                 mesh_handles.push(mesh_handle.clone());
                 mesh_entities.push(
@@ -3943,11 +3772,9 @@ fn build_voxel_meshes(grid: &Grid<u8>) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
     build_voxel_meshes_from_cells(&cells)
 }
 
-fn voxel_collider(voxel_size: f32, cells: &[IVec3]) -> Collider {
-    Collider::voxels(Vec3::splat(voxel_size), cells)
+fn canonical_voxel_collider(cells: &[IVec3]) -> Collider {
+    Collider::voxels(Vec3::splat(VOXEL_SIZE), cells)
 }
-
-fn canonical_voxel_collider(cells: &[IVec3]) -> Collider { voxel_collider(VOXEL_SIZE, cells) }
 
 fn build_voxel_meshes_from_cells(cells: &[(IVec3, u8)]) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
     let mut material_meshes = Vec::new();
@@ -4920,43 +4747,6 @@ fn sync_selected_voxel_light(
     }
 }
 
-fn refine_visible_planet_voxels(
-    cameras: Query<&GlobalTransform, With<VoxelViewportCamera>>,
-    mut planets: Query<(
-        &mut VoxelOrbitalPlanet,
-        &GlobalTransform,
-    )>,
-) {
-    let (Ok(camera_transform), Ok((mut planet, planet_transform))) =
-        (cameras.single(), planets.single_mut())
-    else {
-        return;
-    };
-    let local_camera = planet_transform
-        .affine()
-        .inverse()
-        .transform_point3(camera_transform.translation());
-    let direction = local_camera.try_normalize().unwrap_or(Vec3::Y);
-    let surface = direction * ORBITAL_PLANET_RADIUS;
-    let center = ((surface + Vec3::splat(0.5 * VOXEL_SIZE)) / ORBITAL_PLANET_LOD_VOXEL_SIZE)
-        .round()
-        .as_ivec3();
-    let mut requested = prism(
-        center - IVec3::ONE,
-        center + IVec3::splat(2),
-    )
-    .filter(|cell| planet.lod_cells.contains_key(cell))
-    .collect::<Vec<_>>();
-    requested.sort_unstable_by_key(|cell| cell.distance_squared(center));
-    planet.auto_refine_pending = requested.len() > PLANET_AUTO_REFINEMENTS_PER_FRAME;
-    for cell in requested
-        .into_iter()
-        .take(PLANET_AUTO_REFINEMENTS_PER_FRAME)
-    {
-        refine_planet_lod_cell(&mut planet, cell);
-    }
-}
-
 fn drag_voxel_physics_body(
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -5363,14 +5153,8 @@ fn edit_voxel_grid(
             .as_ref()
             .filter(|hit| hit.occupied.is_some())
             .map(|hit| hit.distance);
-        if let Ok((mut planet, planet_transform)) = planets.single_mut() {
-            let mut planet_hit = raycast_voxel_planet(&planet, planet_transform, ray);
-            if let Some(hit) = planet_hit.filter(|hit| hit.lod) {
-                refine_planet_lod_neighborhood(&mut planet, hit.occupied);
-                planet_hit = raycast_voxel_planet(&planet, planet_transform, ray);
-            }
-            if let Some(hit) = planet_hit
-                .filter(|hit| !hit.lod)
+        if let Ok((planet, planet_transform)) = planets.single_mut() {
+            if let Some(hit) = raycast_voxel_planet(&planet, planet_transform, ray)
                 .filter(|hit| grid_distance.is_none_or(|distance| hit.distance < distance))
             {
                 editor.select_physics_corner(hit.occupied, true);
@@ -5423,14 +5207,9 @@ fn edit_voxel_grid(
         .filter(|hit| hit.occupied.is_some())
         .map(|hit| hit.distance);
     if let Ok((mut planet, planet_transform)) = planets.single_mut() {
-        let mut planet_hit = raycast_voxel_planet(&planet, planet_transform, ray)
+        let planet_hit = raycast_voxel_planet(&planet, planet_transform, ray)
             .filter(|hit| grid_distance.is_none_or(|distance| hit.distance < distance));
-        if let Some(hit) = planet_hit.filter(|hit| hit.lod) {
-            refine_planet_lod_neighborhood(&mut planet, hit.occupied);
-            planet_hit = raycast_voxel_planet(&planet, planet_transform, ray)
-                .filter(|hit| grid_distance.is_none_or(|distance| hit.distance < distance));
-        }
-        if let Some(hit) = planet_hit.filter(|hit| !hit.lod) {
+        if let Some(hit) = planet_hit {
             let center = if input_mode == VoxelEditMode::Add {
                 hit.occupied + hit.normal
             } else {
@@ -5663,15 +5442,22 @@ fn raycast_voxel_planet(
         return None;
     }
 
-    let radius = ORBITAL_PLANET_RADIUS + ORBITAL_PLANET_LOD_VOXEL_SIZE;
-    let projection = -local_origin.dot(local_direction);
-    let closest_squared = (local_origin + local_direction * projection).length_squared();
-    if closest_squared > radius * radius || projection + radius < 0.0 {
-        return None;
-    }
-    let half_chord = (radius * radius - closest_squared).max(0.0).sqrt();
-    let mut distance = (projection - half_chord).max(0.0);
-    let end = (projection + half_chord).min(PLANET_MAX_RAY_DISTANCE);
+    let horizontal = ORBITAL_PLANET_CAP_RADIUS as f32 * VOXEL_SIZE + VOXEL_SIZE * 0.5;
+    let (mut distance, end) = ray_aabb_distance_range(
+        local_origin,
+        local_direction,
+        Vec3::new(
+            -horizontal,
+            -VOXEL_SIZE * 0.5,
+            -horizontal,
+        ),
+        Vec3::new(
+            horizontal,
+            ORBITAL_PLANET_RADIUS,
+            horizontal,
+        ),
+        PLANET_MAX_RAY_DISTANCE,
+    )?;
     let step = planet.voxel_size * 0.2;
     while distance <= end {
         let local_point = local_origin + local_direction * distance;
@@ -5683,25 +5469,38 @@ fn raycast_voxel_planet(
                 occupied: cell,
                 normal: voxel_face_normal_against_ray(local_direction),
                 distance,
-                lod: false,
-            });
-        }
-        let lod_cell = ((local_point + Vec3::splat(0.5 * VOXEL_SIZE))
-            / ORBITAL_PLANET_LOD_VOXEL_SIZE
-            + Vec3::splat(0.5))
-        .floor()
-        .as_ivec3();
-        if planet.lod_cells.contains_key(&lod_cell) {
-            return Some(VoxelPlanetRayHit {
-                occupied: lod_cell,
-                normal: voxel_face_normal_against_ray(local_direction),
-                distance,
-                lod: true,
             });
         }
         distance += step;
     }
     None
+}
+
+fn ray_aabb_distance_range(
+    origin: Vec3,
+    direction: Vec3,
+    min: Vec3,
+    max: Vec3,
+    max_distance: f32,
+) -> Option<(f32, f32)> {
+    let mut near: f32 = 0.0;
+    let mut far = max_distance;
+    for axis in 0..3 {
+        if direction[axis].abs() <= f32::EPSILON {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] {
+                return None;
+            }
+            continue;
+        }
+        let first = (min[axis] - origin[axis]) / direction[axis];
+        let second = (max[axis] - origin[axis]) / direction[axis];
+        near = near.max(first.min(second));
+        far = far.min(first.max(second));
+        if near > far {
+            return None;
+        }
+    }
+    Some((near, far))
 }
 
 fn voxel_face_normal_against_ray(direction: Vec3) -> IVec3 {
@@ -6037,10 +5836,8 @@ fn draw_voxel_target(
         let planet_hit = planet_hit_any;
         let planet_cell_target = planet_hit
             .filter(|(planet_hit, _)| {
-                !planet_hit.lod
-                    && hit
-                        .as_ref()
-                        .is_none_or(|grid_hit| planet_hit.distance < grid_hit.distance)
+                hit.as_ref()
+                    .is_none_or(|grid_hit| planet_hit.distance < grid_hit.distance)
             })
             .and_then(|(planet_hit, _)| {
                 Some(match editor.mode {
@@ -6589,7 +6386,7 @@ mod tests {
         assert!(planet_top <= -100.0);
 
         let planet_cells = voxel_orbital_planet_cells();
-        assert!((40_000..=100_000).contains(&planet_cells.len()));
+        assert!((80_000..=250_000).contains(&planet_cells.len()));
         assert_eq!(
             planet_cells
                 .iter()
@@ -6600,13 +6397,15 @@ mod tests {
         assert!(planet_cells
             .iter()
             .all(|(cell, _)| { cell.abs().max_element() <= ORBITAL_PLANET_VOXEL_RADIUS }));
+        assert!(planet_cells.iter().all(|(cell, _)| {
+            cell.y >= 0 && cell.x * cell.x + cell.z * cell.z <= ORBITAL_PLANET_CAP_RADIUS.pow(2)
+        }));
         assert_eq!(VOXEL_SIZE, 0.25);
-        assert_eq!(
-            ORBITAL_PLANET_RADIUS,
-            (ORBITAL_PLANET_VOXEL_RADIUS as f32 + 0.5) * VOXEL_SIZE * 10.0
-        );
-        assert_eq!(ORBITAL_PLANET_LOD_SUBDIVISIONS, 10);
-        assert_eq!(PLANET_CLOUD_PUFF_COUNT, 64);
+        assert_eq!(ORBITAL_PLANET_RADIUS, 12.125 * 10.0);
+        assert_eq!(ORBITAL_PLANET_CAP_RADIUS, 128);
+        assert!(procedural_planet_material(IVec3::new(0, -1, 0)).is_none());
+        assert!(procedural_planet_material(IVec3::new(129, 470, 0)).is_none());
+        assert_eq!(PLANET_CLOUD_PUFF_COUNT, 48);
         assert!(PLANET_CLOUD_ALTITUDE > 0.0);
     }
 
@@ -6618,17 +6417,13 @@ mod tests {
             0,
         );
         let mut planet = VoxelOrbitalPlanet {
-            lod_cells: HashMap::new(),
-            refined_lod_cells: HashSet::new(),
             cells: HashMap::from([(surface, 3)]),
             removed: HashSet::new(),
-            lod_collider_entity: Entity::PLACEHOLDER,
             collider_entity: Entity::PLACEHOLDER,
             mesh_entities: Vec::new(),
             mesh_handles: Vec::new(),
             voxel_size: 1.0,
             dirty: false,
-            auto_refine_pending: false,
         };
 
         assert!(dig_planet_voxel(&mut planet, surface));
@@ -6646,17 +6441,13 @@ mod tests {
     #[test]
     fn planet_raycast_uses_centered_voxel_cells_in_planet_space() {
         let planet = VoxelOrbitalPlanet {
-            lod_cells: HashMap::new(),
-            refined_lod_cells: HashSet::new(),
             cells: HashMap::from([(IVec3::ZERO, 2)]),
             removed: HashSet::new(),
-            lod_collider_entity: Entity::PLACEHOLDER,
             collider_entity: Entity::PLACEHOLDER,
             mesh_entities: Vec::new(),
             mesh_handles: Vec::new(),
             voxel_size: 2.0,
             dirty: false,
-            auto_refine_pending: false,
         };
         let transform = GlobalTransform::from(Transform::from_xyz(0.0, -10.0, 0.0));
         let ray = Ray3d::new(Vec3::ZERO, Dir3::NEG_Y);
@@ -6667,49 +6458,16 @@ mod tests {
     }
 
     #[test]
-    fn planet_lod_refines_to_exact_canonical_cell_bounds() {
-        let mut planet = VoxelOrbitalPlanet {
-            lod_cells: HashMap::from([(IVec3::ZERO, 2)]),
-            refined_lod_cells: HashSet::new(),
-            cells: HashMap::new(),
-            removed: HashSet::new(),
-            lod_collider_entity: Entity::PLACEHOLDER,
-            collider_entity: Entity::PLACEHOLDER,
-            mesh_entities: Vec::new(),
-            mesh_handles: Vec::new(),
-            voxel_size: VOXEL_SIZE,
-            dirty: false,
-            auto_refine_pending: false,
-        };
-
-        assert!(refine_planet_lod_cell(
-            &mut planet,
-            IVec3::ZERO
-        ));
-        let min = planet.cells.keys().copied().reduce(IVec3::min).unwrap();
-        let max = planet.cells.keys().copied().reduce(IVec3::max).unwrap();
-
-        assert_eq!(min, IVec3::splat(-5));
-        assert_eq!(max, IVec3::splat(4));
-        assert_eq!(planet.voxel_size, VOXEL_SIZE);
-        assert!(!planet.lod_cells.contains_key(&IVec3::ZERO));
-    }
-
-    #[test]
     fn planet_explosion_extracts_canonical_voxels_and_reveals_buried_cells() {
         let surface = IVec3::new(0, ORBITAL_PLANET_VOXEL_RADIUS, 0);
         let mut planet = VoxelOrbitalPlanet {
-            lod_cells: HashMap::new(),
-            refined_lod_cells: HashSet::new(),
             cells: HashMap::from([(surface, 3)]),
             removed: HashSet::new(),
-            lod_collider_entity: Entity::PLACEHOLDER,
             collider_entity: Entity::PLACEHOLDER,
             mesh_entities: Vec::new(),
             mesh_handles: Vec::new(),
             voxel_size: VOXEL_SIZE,
             dirty: false,
-            auto_refine_pending: false,
         };
 
         let removed = explode_planet_voxels(
@@ -7613,17 +7371,13 @@ mod tests {
             .world_mut()
             .spawn((
                 VoxelOrbitalPlanet {
-                    lod_cells: HashMap::new(),
-                    refined_lod_cells: HashSet::new(),
                     cells: HashMap::from([(selected_cell, 1)]),
                     removed: HashSet::new(),
-                    lod_collider_entity: Entity::PLACEHOLDER,
                     collider_entity: Entity::PLACEHOLDER,
                     mesh_entities: Vec::new(),
                     mesh_handles: Vec::new(),
                     voxel_size: VOXEL_SIZE,
                     dirty: false,
-                    auto_refine_pending: false,
                 },
                 GlobalTransform::from_translation(Vec3::new(10.0, 20.0, 30.0)),
             ))
