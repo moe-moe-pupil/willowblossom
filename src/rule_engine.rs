@@ -3040,6 +3040,9 @@ fn parse_first_signed_number(text: &str) -> Option<(f32, bool)> {
 }
 
 fn action_clause(text: &str) -> &str {
+    if is_active_skill_rule(text) {
+        return text;
+    }
     if let Some(trigger_end) = trigger_end_index(text) {
         let tail = text[trigger_end..].trim_start_matches(['，', ',', '；', ';', '时']);
         if contains_action_word(tail) {
@@ -3651,6 +3654,23 @@ mod tests {
             ast.explain(),
             "触发：每当自己释放技能。\n动作：对周围3米内的目标造成4点物理伤害。"
         );
+    }
+
+    #[test]
+    fn parses_active_skill_actions_before_and_after_comma() {
+        let ast = parse_rule("主动使用对目标造成3点物理伤害，对目标回复2点生命值").unwrap();
+
+        assert_eq!(ast.actions, vec![
+            Action::Damage {
+                target: TargetSelector::single(ActorRef::Target),
+                amount: ValueExpr::Number(3.0),
+                damage_type: DamageType::Physical,
+            },
+            Action::Heal {
+                target: TargetSelector::single(ActorRef::Target),
+                amount: ValueExpr::Number(2.0),
+            },
+        ]);
     }
 
     #[test]

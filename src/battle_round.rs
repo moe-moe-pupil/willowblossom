@@ -2032,7 +2032,7 @@ impl BattleRoundStore {
             return false;
         };
         let basic_config = encounter_basic_config(encounter, manager, actor_id);
-        let Some(actor_snapshot) = encounter
+        let Some(mut actor_snapshot) = encounter
             .participants
             .iter()
             .find(|participant| participant.target_id == actor_id)
@@ -2096,328 +2096,354 @@ impl BattleRoundStore {
             actor.turn.saturating_add(1),
         );
 
-        match static_skill_effect(
+        let effects = static_skill_effects(
             &skill.note,
             &skill.arg_values,
             skill.skill_type.as_deref(),
             skill.legacy_buff_machine_json.as_deref(),
-        ) {
-            Some(SkillEffect::Damage {
-                amount,
-                target,
-                damage_type,
-            }) => {
-                let actor_damage_multiplier = participant_damage_multiplier(
-                    &actor_snapshot,
-                    actor_character,
-                    &basic_config,
-                    completed_participant_turns(encounter),
-                    damage_type,
-                );
-                let fallback_radius = battle_skill_damage_range_radius(
-                    skill.range,
-                    actor_character,
-                    damage_type,
-                    skill.skill_type.as_deref(),
-                );
-                let target_ids = resolve_skill_targets(
+        );
+        if effects.is_empty() {
+            let note = skill.note.trim();
+            if note.is_empty() {
+                encounter.action_log.push(format!(
+                    "{}对{}使用{}",
+                    actor_name, target_name, skill.name
+                ));
+            } else {
+                encounter.action_log.push(format!(
+                    "{}对{}使用{}（{}）",
+                    actor_name, target_name, skill.name, note
+                ));
+            }
+        }
+        for effect in effects {
+            if let Some(current_actor) = encounter
+                .participants
+                .iter()
+                .find(|participant| participant.target_id == actor_id)
+            {
+                actor_snapshot = current_actor.clone();
+            }
+            match effect {
+                SkillEffect::Damage {
+                    amount,
                     target,
-                    actor_id,
-                    target_id,
-                    encounter,
-                    scene_positions,
-                    fallback_radius,
-                    skill.target_class.as_deref(),
-                );
-                let target_ids = limit_skill_targets(
-                    target_ids,
-                    skill_target_limit(
-                        skill.target_count,
-                        skill.target_class.as_deref(),
-                    ),
-                );
-                let infinite_focus_target_id = infinite_focus_eligible_target_id(
-                    target,
-                    actor_id,
-                    &target_ids,
-                    skill.target_class.as_deref(),
-                );
-                if target_ids.is_empty() {
-                    encounter.action_log.push(format!(
-                        "{}使用{}，但范围内没有目标",
-                        actor_name, skill.name
-                    ));
-                }
-                let mut pending_actor_lifesteal = 0.0;
-                let mut pending_endless_pain_bonus_damage = endless_pain_bonus_damage(
-                    actor_snapshot.endless_pain_bonus_damage_per_stack,
-                    actor_snapshot.endless_pain_stacks,
-                );
-                let mut consumed_endless_pain_stacks = 0_u32;
-                let mut infinite_focus_hit_target_id = None::<String>;
-                let damage_target_selector = target;
-                let damage_target_class = skill.target_class.as_deref();
-                for resolved_target_id in target_ids {
-                    let Some(target) = encounter
-                        .participants
-                        .iter_mut()
-                        .find(|participant| participant.target_id == resolved_target_id)
-                    else {
-                        continue;
-                    };
-                    let target_character = character_for_participant(target, manager);
-                    let target_damage_multiplier = target.damage_taken_modifier
-                        * champion_damage_taken_multiplier(
-                            target.champion_damage_reduction_per_stack,
-                            target.champion_stacks,
-                        )
-                        * target_character
-                            .map(|character| {
-                                character_damage_taken_attribute_multiplier(
-                                    character,
-                                    trpg_damage_taken_kind(damage_type),
-                                )
-                            })
-                            .unwrap_or(1.0)
-                        * target_character
-                            .map(|character| {
-                                character_fighting_spirit_damage_taken_multiplier(
-                                    character,
-                                    target.turn,
-                                )
-                            })
-                            .unwrap_or(1.0);
-                    let infinite_focus_multiplier = if infinite_focus_target_id.as_deref()
-                        == Some(resolved_target_id.as_str())
-                    {
-                        participant_infinite_focus_damage_multiplier(
-                            &actor_snapshot,
-                            &resolved_target_id,
-                        )
-                    } else {
-                        1.0
-                    };
-                    let incoming_amount = (amount
-                        * actor_damage_multiplier
-                        * infinite_focus_multiplier
-                        * target_damage_multiplier)
-                        .max(0.0);
-                    let target_large_hit_modifier = target_character
-                        .map(character_large_hit_damage_taken_modifier)
-                        .unwrap_or(1.0);
-                    let typed_final_amount = (incoming_amount
-                        * large_hit_damage_taken_multiplier(
-                            target.max_hp,
-                            incoming_amount,
-                            target_large_hit_modifier,
-                        ))
-                    .max(0.0);
-                    let mut final_amount =
-                        if amount > f32::EPSILON && actor_minimum_damage_floor > f32::EPSILON {
-                            typed_final_amount.max(actor_minimum_damage_floor)
-                        } else {
-                            typed_final_amount
-                        };
-                    let evaded_by_keen_evasion = participant_keen_evasion_evades_damage(
-                        target,
-                        final_amount,
-                        damage_target_selector,
-                        damage_target_class,
+                    damage_type,
+                } => {
+                    let actor_damage_multiplier = participant_damage_multiplier(
+                        &actor_snapshot,
+                        actor_character,
+                        &basic_config,
+                        completed_participant_turns(encounter),
+                        damage_type,
                     );
-                    if evaded_by_keen_evasion {
-                        final_amount = 0.0;
+                    let fallback_radius = battle_skill_damage_range_radius(
+                        skill.range,
+                        actor_character,
+                        damage_type,
+                        skill.skill_type.as_deref(),
+                    );
+                    let target_ids = resolve_skill_targets(
+                        target,
+                        actor_id,
+                        target_id,
+                        encounter,
+                        scene_positions,
+                        fallback_radius,
+                        skill.target_class.as_deref(),
+                    );
+                    let target_ids = limit_skill_targets(
+                        target_ids,
+                        skill_target_limit(
+                            skill.target_count,
+                            skill.target_class.as_deref(),
+                        ),
+                    );
+                    let infinite_focus_target_id = infinite_focus_eligible_target_id(
+                        target,
+                        actor_id,
+                        &target_ids,
+                        skill.target_class.as_deref(),
+                    );
+                    if target_ids.is_empty() {
+                        encounter.action_log.push(format!(
+                            "{}使用{}，但范围内没有目标",
+                            actor_name, skill.name
+                        ));
                     }
-                    let endless_pain_bonus = if final_amount > f32::EPSILON
-                        && pending_endless_pain_bonus_damage > f32::EPSILON
-                    {
-                        let bonus = pending_endless_pain_bonus_damage;
-                        pending_endless_pain_bonus_damage = 0.0;
-                        consumed_endless_pain_stacks = actor_snapshot.endless_pain_stacks.min(2);
-                        bonus
-                    } else {
-                        0.0
-                    };
-                    let resolved_amount = final_amount + endless_pain_bonus;
-                    let (final_amount, delayed_liquid_body_damage) =
-                        participant_liquid_body_split_damage(target, resolved_amount);
-                    let target_display_name = target.display_name.clone();
-                    if delayed_liquid_body_damage > f32::EPSILON {
-                        schedule_participant_delayed_damage(
+                    let mut pending_actor_lifesteal = 0.0;
+                    let mut pending_endless_pain_bonus_damage = endless_pain_bonus_damage(
+                        actor_snapshot.endless_pain_bonus_damage_per_stack,
+                        actor_snapshot.endless_pain_stacks,
+                    );
+                    let mut consumed_endless_pain_stacks = 0_u32;
+                    let mut infinite_focus_hit_target_id = None::<String>;
+                    let damage_target_selector = target;
+                    let damage_target_class = skill.target_class.as_deref();
+                    for resolved_target_id in target_ids {
+                        let Some(target) = encounter
+                            .participants
+                            .iter_mut()
+                            .find(|participant| participant.target_id == resolved_target_id)
+                        else {
+                            continue;
+                        };
+                        let target_character = character_for_participant(target, manager);
+                        let target_damage_multiplier = target.damage_taken_modifier
+                            * champion_damage_taken_multiplier(
+                                target.champion_damage_reduction_per_stack,
+                                target.champion_stacks,
+                            )
+                            * target_character
+                                .map(|character| {
+                                    character_damage_taken_attribute_multiplier(
+                                        character,
+                                        trpg_damage_taken_kind(damage_type),
+                                    )
+                                })
+                                .unwrap_or(1.0)
+                            * target_character
+                                .map(|character| {
+                                    character_fighting_spirit_damage_taken_multiplier(
+                                        character,
+                                        target.turn,
+                                    )
+                                })
+                                .unwrap_or(1.0);
+                        let infinite_focus_multiplier = if infinite_focus_target_id.as_deref()
+                            == Some(resolved_target_id.as_str())
+                        {
+                            participant_infinite_focus_damage_multiplier(
+                                &actor_snapshot,
+                                &resolved_target_id,
+                            )
+                        } else {
+                            1.0
+                        };
+                        let incoming_amount = (amount
+                            * actor_damage_multiplier
+                            * infinite_focus_multiplier
+                            * target_damage_multiplier)
+                            .max(0.0);
+                        let target_large_hit_modifier = target_character
+                            .map(character_large_hit_damage_taken_modifier)
+                            .unwrap_or(1.0);
+                        let typed_final_amount = (incoming_amount
+                            * large_hit_damage_taken_multiplier(
+                                target.max_hp,
+                                incoming_amount,
+                                target_large_hit_modifier,
+                            ))
+                        .max(0.0);
+                        let mut final_amount =
+                            if amount > f32::EPSILON && actor_minimum_damage_floor > f32::EPSILON {
+                                typed_final_amount.max(actor_minimum_damage_floor)
+                            } else {
+                                typed_final_amount
+                            };
+                        let evaded_by_keen_evasion = participant_keen_evasion_evades_damage(
                             target,
-                            actor_id,
-                            &target_display_name,
-                            "液态躯体",
-                            delayed_liquid_body_damage,
-                            damage_type,
+                            final_amount,
+                            damage_target_selector,
+                            damage_target_class,
                         );
-                    }
-                    let defeat_outcome =
-                        apply_participant_damage_for_battle(target, final_amount, actor_id);
-                    if final_amount > f32::EPSILON
-                        && actor_damage_dealt_buffs
-                            .iter()
-                            .any(|buff| buff.name == "溃伤")
-                    {
-                        target.wound_healing_taken_turns = 1;
-                    }
-                    if final_amount > f32::EPSILON && damage_type == DamageType::Physical {
-                        pending_actor_lifesteal +=
-                            typed_final_amount * actor_physical_damage_lifesteal;
-                        if actor_physical_damage_followup_rate > f32::EPSILON {
+                        if evaded_by_keen_evasion {
+                            final_amount = 0.0;
+                        }
+                        let endless_pain_bonus = if final_amount > f32::EPSILON
+                            && pending_endless_pain_bonus_damage > f32::EPSILON
+                        {
+                            let bonus = pending_endless_pain_bonus_damage;
+                            pending_endless_pain_bonus_damage = 0.0;
+                            consumed_endless_pain_stacks =
+                                actor_snapshot.endless_pain_stacks.min(2);
+                            bonus
+                        } else {
+                            0.0
+                        };
+                        let resolved_amount = final_amount + endless_pain_bonus;
+                        let (final_amount, delayed_liquid_body_damage) =
+                            participant_liquid_body_split_damage(target, resolved_amount);
+                        let target_display_name = target.display_name.clone();
+                        if delayed_liquid_body_damage > f32::EPSILON {
                             schedule_participant_delayed_damage(
                                 target,
                                 actor_id,
-                                &actor_name,
-                                "苏萨斯之爪",
-                                final_amount * actor_physical_damage_followup_rate,
-                                DamageType::Magical,
+                                &target_display_name,
+                                "液态躯体",
+                                delayed_liquid_body_damage,
+                                damage_type,
                             );
                         }
-                    }
-                    encounter.action_log.push(format!(
-                        "{}对{}使用{}，造成{}点伤害",
-                        actor_name,
-                        target_display_name,
-                        skill.name,
-                        format_number(final_amount)
-                    ));
-                    if evaded_by_keen_evasion {
+                        let defeat_outcome =
+                            apply_participant_damage_for_battle(target, final_amount, actor_id);
+                        if final_amount > f32::EPSILON
+                            && actor_damage_dealt_buffs
+                                .iter()
+                                .any(|buff| buff.name == "溃伤")
+                        {
+                            target.wound_healing_taken_turns = 1;
+                        }
+                        if final_amount > f32::EPSILON && damage_type == DamageType::Physical {
+                            pending_actor_lifesteal +=
+                                typed_final_amount * actor_physical_damage_lifesteal;
+                            if actor_physical_damage_followup_rate > f32::EPSILON {
+                                schedule_participant_delayed_damage(
+                                    target,
+                                    actor_id,
+                                    &actor_name,
+                                    "苏萨斯之爪",
+                                    final_amount * actor_physical_damage_followup_rate,
+                                    DamageType::Magical,
+                                );
+                            }
+                        }
                         encounter.action_log.push(format!(
-                            "{}触发敏锐，闪避本次伤害",
-                            target_display_name
-                        ));
-                    }
-                    if delayed_liquid_body_damage > f32::EPSILON {
-                        encounter.action_log.push(format!(
-                            "{}触发液态躯体，延后{}点伤害",
-                            target_display_name,
-                            format_number(delayed_liquid_body_damage)
-                        ));
-                    }
-                    if endless_pain_bonus > f32::EPSILON {
-                        encounter.action_log.push(format!(
-                            "{}触发无尽痛楚，追加{}点无类型伤害",
+                            "{}对{}使用{}，造成{}点伤害",
                             actor_name,
-                            format_number(endless_pain_bonus)
+                            target_display_name,
+                            skill.name,
+                            format_number(final_amount)
                         ));
-                    }
-                    if final_amount > f32::EPSILON
-                        && infinite_focus_target_id.as_deref() == Some(resolved_target_id.as_str())
-                    {
-                        infinite_focus_hit_target_id = Some(resolved_target_id.clone());
-                        if infinite_focus_multiplier > 1.0 + f32::EPSILON {
+                        if evaded_by_keen_evasion {
                             encounter.action_log.push(format!(
-                                "{}触发无限专注，伤害提高{}%",
+                                "{}触发敏锐，闪避本次伤害",
+                                target_display_name
+                            ));
+                        }
+                        if delayed_liquid_body_damage > f32::EPSILON {
+                            encounter.action_log.push(format!(
+                                "{}触发液态躯体，延后{}点伤害",
+                                target_display_name,
+                                format_number(delayed_liquid_body_damage)
+                            ));
+                        }
+                        if endless_pain_bonus > f32::EPSILON {
+                            encounter.action_log.push(format!(
+                                "{}触发无尽痛楚，追加{}点无类型伤害",
                                 actor_name,
-                                format_number((infinite_focus_multiplier - 1.0) * 100.0)
+                                format_number(endless_pain_bonus)
+                            ));
+                        }
+                        if final_amount > f32::EPSILON
+                            && infinite_focus_target_id.as_deref()
+                                == Some(resolved_target_id.as_str())
+                        {
+                            infinite_focus_hit_target_id = Some(resolved_target_id.clone());
+                            if infinite_focus_multiplier > 1.0 + f32::EPSILON {
+                                encounter.action_log.push(format!(
+                                    "{}触发无限专注，伤害提高{}%",
+                                    actor_name,
+                                    format_number((infinite_focus_multiplier - 1.0) * 100.0)
+                                ));
+                            }
+                        }
+                        if let Some(outcome) = defeat_outcome {
+                            apply_battle_defeat_outcome(encounter, outcome);
+                        }
+                    }
+                    if let Some(hit_target_id) = infinite_focus_hit_target_id {
+                        if let Some(actor) = encounter
+                            .participants
+                            .iter_mut()
+                            .find(|participant| participant.target_id == actor_id)
+                        {
+                            record_participant_infinite_focus_hit(actor, &hit_target_id);
+                        }
+                    }
+                    if consumed_endless_pain_stacks > 0 {
+                        if let Some(actor) = encounter
+                            .participants
+                            .iter_mut()
+                            .find(|participant| participant.target_id == actor_id)
+                        {
+                            actor.endless_pain_stacks = actor
+                                .endless_pain_stacks
+                                .saturating_sub(consumed_endless_pain_stacks);
+                        }
+                    }
+                    if pending_actor_lifesteal > f32::EPSILON {
+                        if let Some(actor) = encounter
+                            .participants
+                            .iter_mut()
+                            .find(|participant| participant.target_id == actor_id)
+                        {
+                            record_participant_healing_taken(actor, pending_actor_lifesteal);
+                            actor.hp = (actor.hp + pending_actor_lifesteal).min(actor.max_hp);
+                            actor.alive = actor.hp > 0.0;
+                            encounter.action_log.push(format!(
+                                "{}触发禅宗古训，回复{}点生命值",
+                                actor_name,
+                                format_number(pending_actor_lifesteal)
                             ));
                         }
                     }
-                    if let Some(outcome) = defeat_outcome {
-                        apply_battle_defeat_outcome(encounter, outcome);
-                    }
-                }
-                if let Some(hit_target_id) = infinite_focus_hit_target_id {
-                    if let Some(actor) = encounter
-                        .participants
-                        .iter_mut()
-                        .find(|participant| participant.target_id == actor_id)
-                    {
-                        record_participant_infinite_focus_hit(actor, &hit_target_id);
-                    }
-                }
-                if consumed_endless_pain_stacks > 0 {
-                    if let Some(actor) = encounter
-                        .participants
-                        .iter_mut()
-                        .find(|participant| participant.target_id == actor_id)
-                    {
-                        actor.endless_pain_stacks = actor
-                            .endless_pain_stacks
-                            .saturating_sub(consumed_endless_pain_stacks);
-                    }
-                }
-                if pending_actor_lifesteal > f32::EPSILON {
-                    if let Some(actor) = encounter
-                        .participants
-                        .iter_mut()
-                        .find(|participant| participant.target_id == actor_id)
-                    {
-                        record_participant_healing_taken(actor, pending_actor_lifesteal);
-                        actor.hp = (actor.hp + pending_actor_lifesteal).min(actor.max_hp);
-                        actor.alive = actor.hp > 0.0;
-                        encounter.action_log.push(format!(
-                            "{}触发禅宗古训，回复{}点生命值",
-                            actor_name,
-                            format_number(pending_actor_lifesteal)
-                        ));
-                    }
-                }
-            },
-            Some(SkillEffect::Heal { amount, target }) => {
-                let actor_healing_multiplier = participant_healing_multiplier(
-                    &actor_snapshot,
-                    actor_character,
-                    &basic_config,
-                );
-                let actor_mutual_aid_healing_rate = actor_character
-                    .map(character_mutual_aid_healing_rate)
-                    .unwrap_or(0.0);
-                let actor_echoing_memory_healing_rates =
-                    actor_character.and_then(character_echoing_memory_healing_rates);
-                let target_ids = resolve_skill_targets(
-                    target,
-                    actor_id,
-                    target_id,
-                    encounter,
-                    scene_positions,
-                    skill_range_radius(skill.range),
-                    skill.target_class.as_deref(),
-                );
-                let target_ids = limit_skill_targets(
-                    target_ids,
-                    skill_target_limit(
-                        skill.target_count,
-                        skill.target_class.as_deref(),
-                    ),
-                );
-                let single_heal_target_id = one_heart_eligible_target_id(
-                    target,
-                    &target_ids,
-                    skill.target_class.as_deref(),
-                );
-                if target_ids.is_empty() {
-                    encounter.action_log.push(format!(
-                        "{}使用{}，但范围内没有目标",
-                        actor_name, skill.name
-                    ));
-                }
-                let mut pending_actor_mutual_aid_healing = 0.0;
-                let mut healed_one_heart_target_id = None::<String>;
-                for resolved_target_id in target_ids {
-                    let Some(target) = encounter
-                        .participants
-                        .iter_mut()
-                        .find(|participant| participant.target_id == resolved_target_id)
-                    else {
-                        continue;
-                    };
-                    let target_character = character_for_participant(target, manager);
-                    let target_dying_healing_modifier = target_character
-                        .map(character_dying_healing_taken_modifier)
-                        .unwrap_or(1.0);
-                    let target_mutual_aid_healing_rate = target_character
+                },
+                SkillEffect::Heal { amount, target } => {
+                    let actor_healing_multiplier = participant_healing_multiplier(
+                        &actor_snapshot,
+                        actor_character,
+                        &basic_config,
+                    );
+                    let actor_mutual_aid_healing_rate = actor_character
                         .map(character_mutual_aid_healing_rate)
                         .unwrap_or(0.0);
-                    let target_healing_multiplier = target.healing_taken_modifier
-                        * participant_wound_healing_multiplier(target)
-                        * dying_healing_taken_multiplier(
-                            target.hp,
-                            target.max_hp,
-                            target_dying_healing_modifier,
-                        );
-                    let one_heart_multiplier =
-                        if single_heal_target_id.as_deref() == Some(resolved_target_id.as_str()) {
+                    let actor_echoing_memory_healing_rates =
+                        actor_character.and_then(character_echoing_memory_healing_rates);
+                    let target_ids = resolve_skill_targets(
+                        target,
+                        actor_id,
+                        target_id,
+                        encounter,
+                        scene_positions,
+                        skill_range_radius(skill.range),
+                        skill.target_class.as_deref(),
+                    );
+                    let target_ids = limit_skill_targets(
+                        target_ids,
+                        skill_target_limit(
+                            skill.target_count,
+                            skill.target_class.as_deref(),
+                        ),
+                    );
+                    let single_heal_target_id = one_heart_eligible_target_id(
+                        target,
+                        &target_ids,
+                        skill.target_class.as_deref(),
+                    );
+                    if target_ids.is_empty() {
+                        encounter.action_log.push(format!(
+                            "{}使用{}，但范围内没有目标",
+                            actor_name, skill.name
+                        ));
+                    }
+                    let mut pending_actor_mutual_aid_healing = 0.0;
+                    let mut healed_one_heart_target_id = None::<String>;
+                    for resolved_target_id in target_ids {
+                        let Some(target) = encounter
+                            .participants
+                            .iter_mut()
+                            .find(|participant| participant.target_id == resolved_target_id)
+                        else {
+                            continue;
+                        };
+                        let target_character = character_for_participant(target, manager);
+                        let target_dying_healing_modifier = target_character
+                            .map(character_dying_healing_taken_modifier)
+                            .unwrap_or(1.0);
+                        let target_mutual_aid_healing_rate = target_character
+                            .map(character_mutual_aid_healing_rate)
+                            .unwrap_or(0.0);
+                        let target_healing_multiplier = target.healing_taken_modifier
+                            * participant_wound_healing_multiplier(target)
+                            * dying_healing_taken_multiplier(
+                                target.hp,
+                                target.max_hp,
+                                target_dying_healing_modifier,
+                            );
+                        let one_heart_multiplier = if single_heal_target_id.as_deref()
+                            == Some(resolved_target_id.as_str())
+                        {
                             participant_one_heart_healing_multiplier(
                                 &actor_snapshot,
                                 &resolved_target_id,
@@ -2425,102 +2451,93 @@ impl BattleRoundStore {
                         } else {
                             1.0
                         };
-                    let final_amount = (amount
-                        * actor_healing_multiplier
-                        * one_heart_multiplier
-                        * target_healing_multiplier)
-                        .max(0.0);
-                    record_participant_healing_taken(target, final_amount);
-                    target.hp = (target.hp + final_amount).min(target.max_hp);
-                    target.alive = target.hp > 0.0;
-                    if resolved_target_id != actor_id && final_amount > f32::EPSILON {
-                        pending_actor_mutual_aid_healing += final_amount
-                            * (actor_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
-                    }
-                    if final_amount > f32::EPSILON
-                        && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
-                    {
-                        healed_one_heart_target_id = Some(resolved_target_id.clone());
-                    }
-                    if final_amount > f32::EPSILON
-                        && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
-                    {
-                        if let Some((first_echo_rate, second_echo_rate)) =
-                            actor_echoing_memory_healing_rates
+                        let final_amount = (amount
+                            * actor_healing_multiplier
+                            * one_heart_multiplier
+                            * target_healing_multiplier)
+                            .max(0.0);
+                        record_participant_healing_taken(target, final_amount);
+                        target.hp = (target.hp + final_amount).min(target.max_hp);
+                        target.alive = target.hp > 0.0;
+                        if resolved_target_id != actor_id && final_amount > f32::EPSILON {
+                            pending_actor_mutual_aid_healing += final_amount
+                                * (actor_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
+                        }
+                        if final_amount > f32::EPSILON
+                            && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
                         {
-                            schedule_participant_delayed_healing(
-                                target,
-                                actor_id,
-                                &actor_name,
-                                "千万回忆",
-                                final_amount * first_echo_rate,
-                                1,
-                            );
-                            schedule_participant_delayed_healing(
-                                target,
-                                actor_id,
-                                &actor_name,
-                                "千万回忆",
-                                final_amount * second_echo_rate,
-                                2,
-                            );
+                            healed_one_heart_target_id = Some(resolved_target_id.clone());
+                        }
+                        if final_amount > f32::EPSILON
+                            && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
+                        {
+                            if let Some((first_echo_rate, second_echo_rate)) =
+                                actor_echoing_memory_healing_rates
+                            {
+                                schedule_participant_delayed_healing(
+                                    target,
+                                    actor_id,
+                                    &actor_name,
+                                    "千万回忆",
+                                    final_amount * first_echo_rate,
+                                    1,
+                                );
+                                schedule_participant_delayed_healing(
+                                    target,
+                                    actor_id,
+                                    &actor_name,
+                                    "千万回忆",
+                                    final_amount * second_echo_rate,
+                                    2,
+                                );
+                            }
+                        }
+                        encounter.action_log.push(format!(
+                            "{}对{}使用{}，回复{}点生命值",
+                            actor_name,
+                            target.display_name,
+                            skill.name,
+                            format_number(final_amount)
+                        ));
+                        if one_heart_multiplier > 1.0 + f32::EPSILON {
+                            encounter.action_log.push(format!(
+                                "{}触发一心，治疗效果提高{}%",
+                                actor_name,
+                                format_number((one_heart_multiplier - 1.0) * 100.0)
+                            ));
                         }
                     }
-                    encounter.action_log.push(format!(
-                        "{}对{}使用{}，回复{}点生命值",
-                        actor_name,
-                        target.display_name,
-                        skill.name,
-                        format_number(final_amount)
-                    ));
-                    if one_heart_multiplier > 1.0 + f32::EPSILON {
-                        encounter.action_log.push(format!(
-                            "{}触发一心，治疗效果提高{}%",
-                            actor_name,
-                            format_number((one_heart_multiplier - 1.0) * 100.0)
-                        ));
+                    if let Some(target_id) = healed_one_heart_target_id {
+                        if let Some(actor) = encounter
+                            .participants
+                            .iter_mut()
+                            .find(|participant| participant.target_id == actor_id)
+                        {
+                            record_participant_one_heart_heal(actor, &target_id);
+                        }
                     }
-                }
-                if let Some(target_id) = healed_one_heart_target_id {
-                    if let Some(actor) = encounter
-                        .participants
-                        .iter_mut()
-                        .find(|participant| participant.target_id == actor_id)
-                    {
-                        record_participant_one_heart_heal(actor, &target_id);
+                    if pending_actor_mutual_aid_healing > f32::EPSILON {
+                        if let Some(actor) = encounter
+                            .participants
+                            .iter_mut()
+                            .find(|participant| participant.target_id == actor_id)
+                        {
+                            record_participant_healing_taken(
+                                actor,
+                                pending_actor_mutual_aid_healing,
+                            );
+                            actor.hp =
+                                (actor.hp + pending_actor_mutual_aid_healing).min(actor.max_hp);
+                            actor.alive = actor.hp > 0.0;
+                            encounter.action_log.push(format!(
+                                "{}触发互帮互助，回复{}点生命值",
+                                actor_name,
+                                format_number(pending_actor_mutual_aid_healing)
+                            ));
+                        }
                     }
-                }
-                if pending_actor_mutual_aid_healing > f32::EPSILON {
-                    if let Some(actor) = encounter
-                        .participants
-                        .iter_mut()
-                        .find(|participant| participant.target_id == actor_id)
-                    {
-                        record_participant_healing_taken(actor, pending_actor_mutual_aid_healing);
-                        actor.hp = (actor.hp + pending_actor_mutual_aid_healing).min(actor.max_hp);
-                        actor.alive = actor.hp > 0.0;
-                        encounter.action_log.push(format!(
-                            "{}触发互帮互助，回复{}点生命值",
-                            actor_name,
-                            format_number(pending_actor_mutual_aid_healing)
-                        ));
-                    }
-                }
-            },
-            None => {
-                let note = skill.note.trim();
-                if note.is_empty() {
-                    encounter.action_log.push(format!(
-                        "{}对{}使用{}",
-                        actor_name, target_name, skill.name
-                    ));
-                } else {
-                    encounter.action_log.push(format!(
-                        "{}对{}使用{}（{}）",
-                        actor_name, target_name, skill.name, note
-                    ));
-                }
-            },
+                },
+            }
         }
         if mp_cost > 0.0 {
             encounter.action_log.push(format!(
@@ -3660,13 +3677,13 @@ enum SkillEffect {
     },
 }
 
-fn static_skill_effect(
+fn static_skill_effects(
     note: &str,
     arg_values: &SkillRuleArgs,
     skill_type: Option<&str>,
     legacy_buff_machine_json: Option<&str>,
-) -> Option<SkillEffect> {
-    let ast = parse_rule_with_named_args(
+) -> Vec<SkillEffect> {
+    let Some(ast) = parse_rule_with_named_args(
         note,
         &arg_values.numeric_values,
         &arg_values.text_values,
@@ -3681,27 +3698,32 @@ fn static_skill_effect(
                 skill_type,
             )
         })
-    })?;
-    ast.actions.into_iter().find_map(|action| match action {
-        Action::Damage {
-            target,
-            amount: ValueExpr::Number(amount),
-            damage_type,
-        } => Some(SkillEffect::Damage {
-            amount: amount.max(0.0),
-            target,
-            damage_type,
-        }),
-        Action::Heal {
-            target,
-            amount: ValueExpr::Number(amount),
-            ..
-        } => Some(SkillEffect::Heal {
-            amount: amount.max(0.0),
-            target,
-        }),
-        _ => None,
-    })
+    }) else {
+        return Vec::new();
+    };
+    ast.actions
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::Damage {
+                target,
+                amount: ValueExpr::Number(amount),
+                damage_type,
+            } => Some(SkillEffect::Damage {
+                amount: amount.max(0.0),
+                target,
+                damage_type,
+            }),
+            Action::Heal {
+                target,
+                amount: ValueExpr::Number(amount),
+                ..
+            } => Some(SkillEffect::Heal {
+                amount: amount.max(0.0),
+                target,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 fn resolve_skill_targets(
@@ -6889,6 +6911,54 @@ mod tests {
             .find(|participant| participant.target_id == "b")
             .unwrap();
         assert_eq!(target.hp, 17.0);
+    }
+
+    #[test]
+    fn battle_skill_executes_multiple_damage_and_healing_actions_in_order() {
+        let manager = empty_manager();
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0), target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "连段".to_owned(),
+            note: "主动使用对目标造成3点物理伤害，对目标回复2点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: Some(1),
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+
+        let encounter = &store.encounters["battle"];
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.hp, 9.0);
+        let effect_logs = encounter
+            .action_log
+            .iter()
+            .filter(|entry| entry.contains("使用连段"))
+            .collect::<Vec<_>>();
+        assert_eq!(effect_logs.len(), 2);
+        assert!(effect_logs[0].contains("造成3点伤害"));
+        assert!(effect_logs[1].contains("回复2点生命值"));
     }
 
     #[test]
