@@ -118,6 +118,9 @@ impl<T> Grid<T> {
 pub trait GridMut {
     type T;
     fn set(&mut self, idx: IVec3, val: Self::T);
+    /// Mutates cells without marking the ECS component changed. The caller
+    /// must call `set_changed` once when its batch is complete.
+    fn set_batched(&mut self, idx: IVec3, val: Self::T);
     fn get_mut(&mut self, idx: IVec3) -> Option<&mut Self::T>;
 }
 
@@ -135,6 +138,21 @@ impl<'w, T: Default> GridMut for Mut<'w, Grid<T>> {
         let changed = self.last_changed();
 
         self.chunks
+            .entry(major)
+            .or_insert_with(|| Entry {
+                chunk: Box::new(Chunk::default()),
+                changed,
+                child: None,
+            })
+            .chunk[minor] = val;
+    }
+
+    fn set_batched(&mut self, idx: IVec3, val: Self::T) {
+        let major = idx.div_euclid(DIMS);
+        let minor = idx.rem_euclid(DIMS);
+        let changed = self.last_changed();
+        self.bypass_change_detection()
+            .chunks
             .entry(major)
             .or_insert_with(|| Entry {
                 chunk: Box::new(Chunk::default()),

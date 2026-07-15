@@ -388,6 +388,14 @@ fn paint_voxel_creative_item_icon(
                 stroke,
             );
         },
+        VoxelCreativeItem::Mode(VoxelEditMode::Drag) => {
+            box_outline((-0.58, -0.58), (0.58, 0.58));
+            painter.arrow(
+                point(0.0, 0.0),
+                egui::vec2(0.72 * scale, 0.0),
+                stroke,
+            );
+        },
         VoxelCreativeItem::Mode(VoxelEditMode::Push) => {
             box_outline((-0.85, -0.48), (-0.15, 0.48));
             painter.arrow(
@@ -510,6 +518,10 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
             VoxelEditMode::Physics => (
                 "物理化工具",
                 egui::Color32::from_rgb(95, 112, 138),
+            ),
+            VoxelEditMode::Drag => (
+                "拖拽工具",
+                egui::Color32::from_rgb(54, 190, 174),
             ),
             VoxelEditMode::Push => (
                 "推开工具",
@@ -12001,6 +12013,11 @@ pub fn ui_system(
                             VoxelEditMode::Physics,
                             "物理选区",
                         );
+                        ui.selectable_value(
+                            &mut voxel_editor.mode,
+                            VoxelEditMode::Drag,
+                            "拖拽",
+                        );
                         ui.separator();
                         ui.selectable_value(
                             &mut voxel_editor.mode,
@@ -12063,6 +12080,12 @@ pub fn ui_system(
                         {
                             voxel_editor.first_person_enabled = !voxel_editor.first_person_enabled;
                         }
+                        ui.label("移动速度");
+                        ui.add(
+                            egui::DragValue::new(&mut voxel_editor.first_person_speed)
+                                .range(0.25..=50.0)
+                                .speed(0.25),
+                        );
                         if ui
                             .selectable_label(
                                 voxel_editor.creative_inventory_open,
@@ -12086,7 +12109,7 @@ pub fn ui_system(
                             "WASD 移动 · 空格跳跃 · 双击空格飞行"
                         };
                         let interaction_hint = if voxel_editor.is_tool_gun_equipped() {
-                            "左键发射 · R切换模式"
+                            "右键发射 · R切换模式"
                         } else {
                             "左键拆除 · 右键放置/使用"
                         };
@@ -12096,7 +12119,7 @@ pub fn ui_system(
                         ));
                     } else {
                         let interaction_hint = if voxel_editor.is_tool_gun_equipped() {
-                            "左键发射 · R切换模式"
+                            "右键发射 · R切换模式"
                         } else {
                             "左键拆除 · 右键放置/使用"
                         };
@@ -12226,11 +12249,7 @@ pub fn ui_system(
                                     .range(0.1..=200.0)
                                     .speed(0.25),
                             );
-                            ui.label(if voxel_editor.is_tool_gun_equipped() {
-                                "左键点击方块或物理体；静态方块会按笔刷大小自动物理化"
-                            } else {
-                                "右键点击方块或物理体；静态方块会按笔刷大小自动物理化"
-                            });
+                            ui.label("右键点击方块或物理体；静态方块会按笔刷大小自动物理化");
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
                             }
@@ -12250,11 +12269,7 @@ pub fn ui_system(
                                     .range(0.25..=100.0)
                                     .speed(0.25),
                             );
-                            ui.label(if voxel_editor.is_tool_gun_equipped() {
-                                "左键点击爆心；每次爆炸最多新建40个物理碎块，超额方块会合并"
-                            } else {
-                                "右键点击爆心；每次爆炸最多新建40个物理碎块，超额方块会合并"
-                            });
+                            ui.label("右键点击爆心；每次爆炸最多新建40个物理碎块，超额方块会合并");
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
                             }
@@ -12454,7 +12469,7 @@ pub fn ui_system(
                                         48.0,
                                         None,
                                     )
-                                    .on_hover_text("GMod风格工具枪：左键使用，R切换物理化、推开、拉近和爆炸模式")
+                                    .on_hover_text("GMod风格工具枪：右键使用，R切换物理化、拖拽、推开、拉近和爆炸模式")
                                     .clicked()
                                     {
                                         picked_item = Some(tool_gun);

@@ -138,6 +138,8 @@ const PLAYER_CAPTURE_WIDTH: u32 = 1024;
 const PLAYER_CAPTURE_HEIGHT: u32 = 768;
 const PLAYER_CAPTURE_PREPARE_FRAMES: u8 = 3;
 const PLAYER_STANDEE_HEIGHT: f32 = FIRST_PERSON_BODY_LENGTH + FIRST_PERSON_RADIUS * 2.0;
+const TOOL_GUN_DRAG_RESPONSE: f32 = 12.0;
+const TOOL_GUN_DRAG_MAX_SPEED: f32 = 24.0;
 
 pub struct TrpgVoxelPlugin;
 
@@ -244,6 +246,13 @@ struct VoxelPhysicsBodySnapshot {
     angular_velocity: AngularVelocity,
 }
 
+#[derive(Resource, Default)]
+struct VoxelToolGunDragState {
+    target: Option<Entity>,
+    distance: f32,
+    body_offset: Vec3,
+}
+
 #[derive(Clone)]
 struct VoxelSceneSnapshot {
     name: String,
@@ -264,8 +273,10 @@ struct VoxelOrbitalPlanet {
     dirty: bool,
 }
 
+#[derive(Clone, Copy)]
 struct VoxelPlanetRayHit {
     occupied: IVec3,
+    normal: IVec3,
     distance: f32,
     lod: bool,
 }
@@ -388,17 +399,19 @@ pub(crate) enum VoxelEditMode {
     Remove,
     Paint,
     Physics,
+    Drag,
     Push,
     Pull,
     Explode,
 }
 
 impl VoxelEditMode {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Add,
         Self::Remove,
         Self::Paint,
         Self::Physics,
+        Self::Drag,
         Self::Push,
         Self::Pull,
         Self::Explode,
@@ -410,6 +423,7 @@ impl VoxelEditMode {
             Self::Remove => "删除",
             Self::Paint => "涂色",
             Self::Physics => "物理选区",
+            Self::Drag => "拖拽",
             Self::Push => "推开",
             Self::Pull => "拉近",
             Self::Explode => "爆炸",
@@ -451,6 +465,7 @@ pub(crate) struct VoxelEditorState {
     pub view_reset_requested: bool,
     pub first_person_enabled: bool,
     pub first_person_flying: bool,
+    pub first_person_speed: f32,
     pub creative_inventory_open: bool,
     pub creative_hotbar: [Option<VoxelCreativeItem>; 10],
     pub selected_hotbar_slot: usize,
@@ -510,6 +525,7 @@ impl Default for VoxelEditorState {
             view_reset_requested: false,
             first_person_enabled: false,
             first_person_flying: false,
+            first_person_speed: FIRST_PERSON_SPEED,
             creative_inventory_open: false,
             creative_hotbar: std::array::from_fn(|index| {
                 Some(VoxelCreativeItem::Material(
@@ -569,19 +585,10 @@ impl VoxelEditorState {
     pub(crate) fn has_physics_selection(&self) -> bool { self.selection_bounds().is_some() }
 
     pub(crate) fn physics_selection_hint(&self) -> &str {
-        let primary = if self.is_tool_gun_equipped() { "左键" } else { "右键" };
         if self.selection_anchor.is_none() {
-            if primary == "左键" {
-                "依次左键点击两个方块，框选物理区域"
-            } else {
-                "依次右键点击两个方块，框选物理区域"
-            }
+            "依次右键点击两个方块，框选物理区域"
         } else if self.selection_end.is_none() {
-            if primary == "左键" {
-                "再左键点击一个方块，确定选区另一角"
-            } else {
-                "再右键点击一个方块，确定选区另一角"
-            }
+            "再右键点击一个方块，确定选区另一角"
         } else {
             "选区已确定；可重新选择起点或生成物理体"
         }
@@ -698,8 +705,9 @@ impl VoxelEditorState {
     }
 
     pub(crate) fn cycle_tool_gun_mode(&mut self) {
-        const MODES: [VoxelEditMode; 4] = [
+        const MODES: [VoxelEditMode; 5] = [
             VoxelEditMode::Physics,
+            VoxelEditMode::Drag,
             VoxelEditMode::Push,
             VoxelEditMode::Pull,
             VoxelEditMode::Explode,
@@ -806,6 +814,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPlayerCameraEditor>()
         .init_resource::<VoxelPlayerCaptureState>()
         .init_resource::<VoxelPlayerStandeeAssets>()
+        .init_resource::<VoxelToolGunDragState>()
         .insert_resource(player_camera_store)
         .add_systems(
             Startup,
@@ -825,26 +834,34 @@ impl Plugin for TrpgVoxelPlugin {
         .add_systems(
             Update,
             (
-                voxel_editor_shortcuts,
-                handle_editor_requests,
-                place_creative_light,
-                sync_selected_voxel_light,
-                edit_voxel_grid,
-                rebuild_voxel_orbital_planet,
-                make_selection_physical,
-                apply_voxel_physics_action,
-                process_voxel_scene_history,
-                animate_voxel_auto_doors,
-                rebuild_voxel_geometry,
-                sync_voxel_radiance_volume,
-                sync_voxel_lighting,
-                control_first_person_player,
-                control_voxel_camera,
-                sync_voxel_player_cameras,
-                sync_voxel_player_standees,
-                capture_voxel_player_view,
-                draw_voxel_target,
-                animate_voxel_materials,
+                (
+                    voxel_editor_shortcuts,
+                    handle_editor_requests,
+                    place_creative_light,
+                    sync_selected_voxel_light,
+                    refine_aimed_planet_voxel,
+                    edit_voxel_grid,
+                    drag_voxel_physics_body,
+                    rebuild_voxel_orbital_planet,
+                    make_selection_physical,
+                    apply_voxel_physics_action,
+                    process_voxel_scene_history,
+                )
+                    .chain(),
+                (
+                    animate_voxel_auto_doors,
+                    rebuild_voxel_geometry,
+                    sync_voxel_radiance_volume,
+                    sync_voxel_lighting,
+                    control_first_person_player,
+                    control_voxel_camera,
+                    sync_voxel_player_cameras,
+                    sync_voxel_player_standees,
+                    capture_voxel_player_view,
+                    draw_voxel_target,
+                    animate_voxel_materials,
+                )
+                    .chain(),
             )
                 .chain(),
         )
@@ -3423,6 +3440,16 @@ fn dig_planet_voxel(planet: &mut VoxelOrbitalPlanet, cell: IVec3) -> bool {
     true
 }
 
+fn set_planet_voxel(planet: &mut VoxelOrbitalPlanet, cell: IVec3, material: u8) -> bool {
+    if planet.cells.get(&cell).copied() == Some(material) {
+        return false;
+    }
+    planet.removed.remove(&cell);
+    planet.cells.insert(cell, material);
+    planet.dirty = true;
+    true
+}
+
 fn explode_planet_voxels(
     planet: &mut VoxelOrbitalPlanet,
     local_origin: Vec3,
@@ -3547,6 +3574,8 @@ fn spawn_voxel_orbital_planet(
 
 fn rebuild_voxel_orbital_planet(
     mut commands: Commands,
+    mouse: Res<ButtonInput<MouseButton>>,
+    editor: Res<VoxelEditorState>,
     mut planets: Query<(
         Entity,
         &mut VoxelOrbitalPlanet,
@@ -3555,8 +3584,14 @@ fn rebuild_voxel_orbital_planet(
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
+    let batching_edits = !editor.is_tool_gun_equipped()
+        && matches!(
+            editor.mode,
+            VoxelEditMode::Add | VoxelEditMode::Remove | VoxelEditMode::Paint
+        )
+        && (mouse.pressed(MouseButton::Left) || mouse.pressed(MouseButton::Right));
     for (entity, mut planet, mut collider) in &mut planets {
-        if !planet.dirty {
+        if !planet.dirty || batching_edits {
             continue;
         }
         for mesh_entity in planet.mesh_entities.drain(..) {
@@ -4592,6 +4627,121 @@ fn sync_selected_voxel_light(
     }
 }
 
+fn refine_aimed_planet_voxel(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
+    mut planets: Query<(
+        &mut VoxelOrbitalPlanet,
+        &GlobalTransform,
+    )>,
+    editor: Res<VoxelEditorState>,
+    egui_input: Res<EguiWantsInput>,
+) {
+    if editor.creative_inventory_open
+        || voxel_world_pointer_blocked(
+            egui_input.wants_any_pointer_input(),
+            editor.left_started_over_ui || editor.right_started_over_ui,
+        )
+    {
+        return;
+    }
+    let (Ok(window), Ok((camera, camera_transform)), Ok((mut planet, planet_transform))) = (
+        windows.single(),
+        cameras.single(),
+        planets.single_mut(),
+    ) else {
+        return;
+    };
+    let Some(ray) = viewport_ray(
+        window,
+        camera,
+        camera_transform,
+        &editor,
+    ) else {
+        return;
+    };
+    if let Some(hit) = raycast_voxel_planet(&planet, planet_transform, ray).filter(|hit| hit.lod) {
+        refine_planet_lod_cell(&mut planet, hit.occupied);
+    }
+}
+
+fn drag_voxel_physics_body(
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
+    mut bodies: Query<
+        (
+            &Transform,
+            &mut LinearVelocity,
+            &mut AngularVelocity,
+        ),
+        With<VoxelPhysicsBody>,
+    >,
+    body_entities: Query<(), With<VoxelPhysicsBody>>,
+    spatial_query: SpatialQuery,
+    editor: Res<VoxelEditorState>,
+    egui_input: Res<EguiWantsInput>,
+    mut drag: ResMut<VoxelToolGunDragState>,
+) {
+    let active = editor.is_tool_gun_equipped()
+        && editor.mode == VoxelEditMode::Drag
+        && !editor.creative_inventory_open
+        && !voxel_world_pointer_blocked(
+            egui_input.wants_any_pointer_input(),
+            editor.right_started_over_ui,
+        );
+    if !active || !mouse.pressed(MouseButton::Right) {
+        drag.target = None;
+        return;
+    }
+    let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single()) else {
+        drag.target = None;
+        return;
+    };
+    let Some(ray) = viewport_ray(
+        window,
+        camera,
+        camera_transform,
+        &editor,
+    ) else {
+        drag.target = None;
+        return;
+    };
+    if mouse.just_pressed(MouseButton::Right) {
+        let Some(hit) = spatial_query.cast_ray_predicate(
+            ray.origin,
+            ray.direction,
+            MAX_RAY_DISTANCE,
+            true,
+            &SpatialQueryFilter::default(),
+            &|entity| body_entities.contains(entity),
+        ) else {
+            return;
+        };
+        let Ok((transform, ..)) = bodies.get(hit.entity) else {
+            return;
+        };
+        let hit_point = ray.origin + *ray.direction * hit.distance;
+        drag.target = Some(hit.entity);
+        drag.distance = hit.distance.max(VOXEL_SIZE * 2.0);
+        drag.body_offset = transform.translation - hit_point;
+    }
+    let Some(target) = drag.target else {
+        return;
+    };
+    let desired = ray.origin + *ray.direction * drag.distance + drag.body_offset;
+    if let Ok((transform, mut velocity, mut angular_velocity)) = bodies.get_mut(target) {
+        velocity.0 = tool_gun_drag_velocity(transform.translation, desired);
+        angular_velocity.0 *= 0.8;
+    } else {
+        drag.target = None;
+    }
+}
+
+fn tool_gun_drag_velocity(current: Vec3, target: Vec3) -> Vec3 {
+    ((target - current) * TOOL_GUN_DRAG_RESPONSE).clamp_length_max(TOOL_GUN_DRAG_MAX_SPEED)
+}
+
 fn edit_voxel_grid(
     mut commands: Commands,
     time: Res<Time>,
@@ -4638,6 +4788,9 @@ fn edit_voxel_grid(
         editor.edit_hold_seconds = 0.0;
         editor.edit_repeat_seconds = 0.0;
         if !editor.active_stroke.is_empty() {
+            if let Ok(mut grid) = grids.single_mut() {
+                grid.set_changed();
+            }
             let stroke = std::mem::take(&mut editor.active_stroke);
             editor.undo.push(stroke);
             editor.redo.clear();
@@ -4938,28 +5091,51 @@ fn edit_voxel_grid(
         return;
     };
     let grid_hit = raycast_grid(&grid, ray);
-    if input_mode == VoxelEditMode::Remove {
-        let grid_distance = grid_hit
-            .as_ref()
-            .filter(|hit| hit.occupied.is_some())
-            .map(|hit| hit.distance);
-        if let Ok((mut planet, planet_transform)) = planets.single_mut() {
-            if let Some(planet_hit) = raycast_voxel_planet(&planet, planet_transform, ray)
-                .filter(|hit| grid_distance.is_none_or(|distance| hit.distance < distance))
-            {
-                let fine_cell = if planet_hit.lod {
-                    refine_planet_lod_cell(&mut planet, planet_hit.occupied);
-                    raycast_voxel_planet(&planet, planet_transform, ray)
-                        .filter(|hit| !hit.lod)
-                        .map(|hit| hit.occupied)
-                } else {
-                    Some(planet_hit.occupied)
-                };
-                if fine_cell.is_some_and(|cell| dig_planet_voxel(&mut planet, cell)) {
-                    editor.physics_status =
-                        Some("已挖掘行星体素；新的地下体素已按需生成".to_owned());
-                    return;
+    let grid_distance = grid_hit
+        .as_ref()
+        .filter(|hit| hit.occupied.is_some())
+        .map(|hit| hit.distance);
+    if let Ok((mut planet, planet_transform)) = planets.single_mut() {
+        let mut planet_hit = raycast_voxel_planet(&planet, planet_transform, ray)
+            .filter(|hit| grid_distance.is_none_or(|distance| hit.distance < distance));
+        if let Some(hit) = planet_hit.filter(|hit| hit.lod) {
+            refine_planet_lod_cell(&mut planet, hit.occupied);
+            planet_hit = raycast_voxel_planet(&planet, planet_transform, ray).filter(|hit| {
+                !hit.lod && grid_distance.is_none_or(|distance| hit.distance < distance)
+            });
+        }
+        if let Some(hit) = planet_hit.filter(|hit| !hit.lod) {
+            let center = if input_mode == VoxelEditMode::Add {
+                hit.occupied + hit.normal
+            } else {
+                hit.occupied
+            };
+            let mut changed = 0;
+            let brush_radius = editor.brush_radius;
+            for x in -brush_radius..=brush_radius {
+                for y in -brush_radius..=brush_radius {
+                    for z in -brush_radius..=brush_radius {
+                        let cell = center + IVec3::new(x, y, z);
+                        let did_change = match input_mode {
+                            VoxelEditMode::Add => {
+                                set_planet_voxel(&mut planet, cell, editor.material)
+                            },
+                            VoxelEditMode::Remove => dig_planet_voxel(&mut planet, cell),
+                            VoxelEditMode::Paint => {
+                                planet.cells.contains_key(&cell)
+                                    && set_planet_voxel(&mut planet, cell, editor.material)
+                            },
+                            _ => false,
+                        };
+                        changed += usize::from(did_change);
+                    }
                 }
+            }
+            if changed > 0 {
+                editor.physics_status = Some(format!(
+                    "已编辑 {changed} 个行星 0.25 体素"
+                ));
+                return;
             }
         }
     }
@@ -5002,6 +5178,7 @@ fn edit_voxel_grid(
         VoxelEditMode::Add => hit.add,
         VoxelEditMode::Remove | VoxelEditMode::Paint => hit.occupied,
         VoxelEditMode::Physics
+        | VoxelEditMode::Drag
         | VoxelEditMode::Push
         | VoxelEditMode::Pull
         | VoxelEditMode::Explode => unreachable!(),
@@ -5024,7 +5201,7 @@ fn edit_voxel_grid(
                     continue;
                 };
                 if before != after {
-                    grid.set(position, after);
+                    grid.set_batched(position, after);
                     stroke.push(VoxelChange {
                         position,
                         before,
@@ -5061,11 +5238,8 @@ fn voxel_edit_input_mode(
 }
 
 fn voxel_tool_fire_button(tool_gun_equipped: bool) -> MouseButton {
-    if tool_gun_equipped {
-        MouseButton::Left
-    } else {
-        MouseButton::Right
-    }
+    let _ = tool_gun_equipped;
+    MouseButton::Right
 }
 
 fn edited_voxel(mode: VoxelEditMode, before: u8, material: u8) -> Option<u8> {
@@ -5074,6 +5248,7 @@ fn edited_voxel(mode: VoxelEditMode, before: u8, material: u8) -> Option<u8> {
         VoxelEditMode::Remove => Some(0),
         VoxelEditMode::Paint => (before != 0).then_some(material),
         VoxelEditMode::Physics
+        | VoxelEditMode::Drag
         | VoxelEditMode::Push
         | VoxelEditMode::Pull
         | VoxelEditMode::Explode => None,
@@ -5172,6 +5347,7 @@ fn raycast_voxel_planet(
         if planet.cells.contains_key(&cell) {
             return Some(VoxelPlanetRayHit {
                 occupied: cell,
+                normal: voxel_face_normal_against_ray(local_direction),
                 distance,
                 lod: false,
             });
@@ -5182,6 +5358,7 @@ fn raycast_voxel_planet(
         if planet.lod_cells.contains_key(&lod_cell) {
             return Some(VoxelPlanetRayHit {
                 occupied: lod_cell,
+                normal: voxel_face_normal_against_ray(local_direction),
                 distance,
                 lod: true,
             });
@@ -5189,6 +5366,29 @@ fn raycast_voxel_planet(
         distance += step;
     }
     None
+}
+
+fn voxel_face_normal_against_ray(direction: Vec3) -> IVec3 {
+    let absolute = direction.abs();
+    if absolute.x >= absolute.y && absolute.x >= absolute.z {
+        IVec3::new(
+            if direction.x > 0.0 { -1 } else { 1 },
+            0,
+            0,
+        )
+    } else if absolute.y >= absolute.z {
+        IVec3::new(
+            0,
+            if direction.y > 0.0 { -1 } else { 1 },
+            0,
+        )
+    } else {
+        IVec3::new(
+            0,
+            0,
+            if direction.z > 0.0 { -1 } else { 1 },
+        )
+    }
 }
 
 fn control_first_person_player(
@@ -5254,8 +5454,9 @@ fn control_first_person_player(
     let right = yaw_rotation * Vec3::X;
     let movement =
         (forward * forward_input as f32 + right * right_input as f32).clamp_length_max(1.0);
-    velocity.x = movement.x * FIRST_PERSON_SPEED;
-    velocity.z = movement.z * FIRST_PERSON_SPEED;
+    let movement_speed = editor.first_person_speed.max(VOXEL_SIZE);
+    velocity.x = movement.x * movement_speed;
+    velocity.z = movement.z * movement_speed;
 
     if editor.first_person_flying {
         acceleration.0 = Vec3::ZERO;
@@ -5474,12 +5675,12 @@ fn draw_voxel_target(
     let Ok(grid) = grids.single() else {
         return;
     };
-    let (hit, explosion_origin) = if editor.creative_inventory_open
+    let (hit, explosion_origin, planet_target) = if editor.creative_inventory_open
         || voxel_world_pointer_blocked(
             egui_input.wants_any_pointer_input(),
             editor.left_started_over_ui || editor.right_started_over_ui,
         ) {
-        (None, None)
+        (None, None, None)
     } else {
         let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single())
         else {
@@ -5494,6 +5695,24 @@ fn draw_voxel_target(
             return;
         };
         let hit = raycast_grid(grid, ray);
+        let planet_hit_any = planets.iter().next().and_then(|(planet, transform)| {
+            raycast_voxel_planet(planet, transform, ray).map(|planet_hit| (planet_hit, transform))
+        });
+        let planet_hit = planet_hit_any.filter(|(planet_hit, _)| !planet_hit.lod);
+        let planet_target = planet_hit
+            .filter(|(planet_hit, _)| {
+                hit.as_ref()
+                    .is_none_or(|grid_hit| planet_hit.distance < grid_hit.distance)
+            })
+            .and_then(|(planet_hit, transform)| {
+                let cell = match editor.mode {
+                    VoxelEditMode::Add => planet_hit.occupied + planet_hit.normal,
+                    VoxelEditMode::Remove | VoxelEditMode::Paint => planet_hit.occupied,
+                    _ => return None,
+                };
+                Some(transform.transform_point(cell.as_vec3() * VOXEL_SIZE))
+            });
+        let hit = planet_target.is_none().then_some(hit).flatten();
         let explosion_origin = if editor.mode == VoxelEditMode::Explode {
             let body_hit = spatial_query.cast_ray_predicate(
                 ray.origin,
@@ -5507,11 +5726,7 @@ fn draw_voxel_target(
                 .as_ref()
                 .filter(|hit| hit.occupied.is_some())
                 .map(|hit| hit.distance);
-            let planet_distance = planets
-                .iter()
-                .next()
-                .and_then(|(planet, transform)| raycast_voxel_planet(planet, transform, ray))
-                .map(|hit| hit.distance);
+            let planet_distance = planet_hit_any.map(|(hit, _)| hit.distance);
             body_hit
                 .as_ref()
                 .map(|hit| hit.distance)
@@ -5523,7 +5738,7 @@ fn draw_voxel_target(
         } else {
             None
         };
-        (hit, explosion_origin)
+        (hit, explosion_origin, planet_target)
     };
     let target = match (editor.light_tool, editor.mode, hit) {
         (Some(VoxelLightTool::Remove), ..) => None,
@@ -5534,6 +5749,7 @@ fn draw_voxel_target(
             VoxelEditMode::Remove
             | VoxelEditMode::Paint
             | VoxelEditMode::Physics
+            | VoxelEditMode::Drag
             | VoxelEditMode::Push
             | VoxelEditMode::Pull
             | VoxelEditMode::Explode,
@@ -5590,6 +5806,13 @@ fn draw_voxel_target(
             Isometry3d::from_translation(origin),
             editor.physics_explosion_radius.max(VOXEL_SIZE),
             Color::srgb(1.0, 0.3, 0.08),
+        );
+    }
+    if let Some(center) = planet_target {
+        let size = (editor.brush_radius * 2 + 1) as f32 * VOXEL_SIZE;
+        gizmos.cube(
+            Transform::from_translation(center).with_scale(Vec3::splat(size)),
+            Color::srgb(1.0, 0.9, 0.2),
         );
     }
     // Keep the aimed voxel visible in both orbit and first-person views. In
@@ -6843,7 +7066,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_gun_uses_primary_fire_and_cycles_utility_modes() {
+    fn tool_gun_uses_secondary_fire_and_cycles_utility_modes() {
         let mut editor = VoxelEditorState::default();
 
         editor.equip_creative_item(VoxelCreativeItem::ToolGun);
@@ -6852,7 +7075,7 @@ mod tests {
         assert_eq!(editor.mode, VoxelEditMode::Physics);
         assert_eq!(
             voxel_tool_fire_button(true),
-            MouseButton::Left
+            MouseButton::Right
         );
         assert_eq!(
             voxel_tool_fire_button(false),
@@ -6865,10 +7088,50 @@ mod tests {
 
         editor.cycle_tool_gun_mode();
 
-        assert_eq!(editor.mode, VoxelEditMode::Push);
+        assert_eq!(editor.mode, VoxelEditMode::Drag);
         assert_eq!(
             editor.active_tool_label(),
-            "工具枪 · 推开"
+            "工具枪 · 拖拽"
+        );
+    }
+
+    #[test]
+    fn drag_velocity_points_at_target_and_is_clamped() {
+        let velocity = tool_gun_drag_velocity(Vec3::ZERO, Vec3::new(100.0, 0.0, 0.0));
+        assert!((velocity.length() - TOOL_GUN_DRAG_MAX_SPEED).abs() < 0.001);
+        assert!(velocity.x > 0.0);
+
+        assert_eq!(
+            tool_gun_drag_velocity(Vec3::ONE, Vec3::ONE),
+            Vec3::ZERO
+        );
+    }
+
+    #[test]
+    fn held_voxel_edits_defer_the_grid_change_signal_until_release() {
+        let mut world = World::new();
+        let entity = world.spawn(Grid::<u8>::new()).id();
+        world.clear_trackers();
+
+        let mut entity_mut = world.entity_mut(entity);
+        let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
+        assert!(!grid.is_changed());
+        grid.set_batched(IVec3::new(2, 3, 4), 7);
+        assert_eq!(grid.get(IVec3::new(2, 3, 4)), Some(&7));
+        assert!(!grid.is_changed());
+        grid.set_changed();
+        assert!(grid.is_changed());
+    }
+
+    #[test]
+    fn planet_face_normal_opposes_the_dominant_ray_axis() {
+        assert_eq!(
+            voxel_face_normal_against_ray(Vec3::new(0.1, -0.9, 0.2)),
+            IVec3::Y
+        );
+        assert_eq!(
+            voxel_face_normal_against_ray(Vec3::new(0.8, 0.1, 0.2)),
+            IVec3::NEG_X
         );
     }
 
