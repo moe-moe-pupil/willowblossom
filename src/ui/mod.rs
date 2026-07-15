@@ -64,6 +64,7 @@ use crate::voxel::{
     VoxelEditMode,
     VoxelEditorState,
     VoxelLightTool,
+    MAX_VOXEL_BRUSH_RADIUS,
 };
 
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
@@ -12054,7 +12055,10 @@ pub fn ui_system(
                         }
                         ui.separator();
                         ui.label("笔刷大小");
-                        ui.add(egui::DragValue::new(&mut voxel_editor.brush_radius).range(0..=3));
+                        ui.add(
+                            egui::DragValue::new(&mut voxel_editor.brush_radius)
+                                .range(0..=MAX_VOXEL_BRUSH_RADIUS),
+                        );
                         if ui.button("撤销").clicked() {
                             voxel_editor.undo_requested = true;
                         }

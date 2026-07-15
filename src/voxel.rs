@@ -89,6 +89,7 @@ use crate::{
 };
 
 const VOXEL_SIZE: f32 = 0.25;
+pub(crate) const MAX_VOXEL_BRUSH_RADIUS: i32 = 50;
 const MAX_RAY_DISTANCE: f32 = 200.0;
 const PLANET_MAX_RAY_DISTANCE: f32 = 600.0;
 const EDIT_REPEAT_DELAY: f32 = 0.32;
@@ -6058,6 +6059,11 @@ mod tests {
             .single(app.world())
             .unwrap();
         (app, entity)
+    }
+
+    #[test]
+    fn voxel_brush_radius_allows_fifty_cells() {
+        assert_eq!(MAX_VOXEL_BRUSH_RADIUS, 50);
     }
 
     #[test]
