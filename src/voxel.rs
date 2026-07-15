@@ -140,6 +140,7 @@ const PLAYER_CAPTURE_PREPARE_FRAMES: u8 = 3;
 const PLAYER_STANDEE_HEIGHT: f32 = FIRST_PERSON_BODY_LENGTH + FIRST_PERSON_RADIUS * 2.0;
 const TOOL_GUN_DRAG_RESPONSE: f32 = 12.0;
 const TOOL_GUN_DRAG_MAX_SPEED: f32 = 24.0;
+const PLANET_AUTO_REFINEMENTS_PER_FRAME: usize = 8;
 
 pub struct TrpgVoxelPlugin;
 
@@ -271,6 +272,7 @@ struct VoxelOrbitalPlanet {
     mesh_handles: Vec<Handle<Mesh>>,
     voxel_size: f32,
     dirty: bool,
+    auto_refine_pending: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -287,7 +289,7 @@ struct VoxelKeyLight;
 #[derive(Component)]
 struct VoxelFillLight;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum VoxelLightTool {
     Point,
     DarkPoint,
@@ -333,7 +335,7 @@ impl VoxelLightTool {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum VoxelCreativeItem {
     Material(u8),
     Light(VoxelLightTool),
@@ -392,7 +394,7 @@ impl VoxelRadianceVolume {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum VoxelEditMode {
     #[default]
     Add,
@@ -452,6 +454,31 @@ struct VoxelChange {
     after: u8,
 }
 
+#[derive(Resource, Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct VoxelInventoryStore {
+    hotbar: [Option<VoxelCreativeItem>; 10],
+    selected_hotbar_slot: usize,
+    tool_gun_mode: VoxelEditMode,
+}
+
+impl Default for VoxelInventoryStore {
+    fn default() -> Self {
+        Self {
+            hotbar: default_creative_hotbar(),
+            selected_hotbar_slot: 0,
+            tool_gun_mode: VoxelEditMode::Physics,
+        }
+    }
+}
+
+fn default_creative_hotbar() -> [Option<VoxelCreativeItem>; 10] {
+    std::array::from_fn(|index| {
+        Some(VoxelCreativeItem::Material(
+            index as u8 + 1,
+        ))
+    })
+}
+
 #[derive(Resource)]
 pub(crate) struct VoxelEditorState {
     pub mode: VoxelEditMode,
@@ -502,6 +529,7 @@ pub(crate) struct VoxelEditorState {
     right_started_over_ui: bool,
     selection_anchor: Option<IVec3>,
     selection_end: Option<IVec3>,
+    selection_is_planet: bool,
     physics_status: Option<String>,
     scene_snapshots: Vec<VoxelSceneSnapshot>,
     next_scene_snapshot_number: u64,
@@ -527,11 +555,7 @@ impl Default for VoxelEditorState {
             first_person_flying: false,
             first_person_speed: FIRST_PERSON_SPEED,
             creative_inventory_open: false,
-            creative_hotbar: std::array::from_fn(|index| {
-                Some(VoxelCreativeItem::Material(
-                    index as u8 + 1,
-                ))
-            }),
+            creative_hotbar: default_creative_hotbar(),
             selected_hotbar_slot: 0,
             equipped_item: Some(VoxelCreativeItem::Material(1)),
             tool_gun_mode: VoxelEditMode::Physics,
@@ -566,6 +590,7 @@ impl Default for VoxelEditorState {
             right_started_over_ui: false,
             selection_anchor: None,
             selection_end: None,
+            selection_is_planet: false,
             physics_status: None,
             scene_snapshots: Vec::new(),
             next_scene_snapshot_number: 1,
@@ -721,6 +746,7 @@ impl VoxelEditorState {
             self.mode = self.tool_gun_mode;
             self.selection_anchor = None;
             self.selection_end = None;
+            self.selection_is_planet = false;
             self.physics_status = Some(format!(
                 "工具枪模式：{}",
                 self.tool_gun_mode.label()
@@ -757,10 +783,14 @@ impl VoxelEditorState {
         Some((start.min(end), start.max(end)))
     }
 
-    fn select_physics_corner(&mut self, cell: IVec3) {
-        if self.selection_anchor.is_none() || self.selection_end.is_some() {
+    fn select_physics_corner(&mut self, cell: IVec3, is_planet: bool) {
+        if self.selection_anchor.is_none()
+            || self.selection_end.is_some()
+            || self.selection_is_planet != is_planet
+        {
             self.selection_anchor = Some(cell);
             self.selection_end = None;
+            self.selection_is_planet = is_planet;
         } else {
             self.selection_end = Some(cell);
         }
@@ -797,6 +827,19 @@ impl Plugin for TrpgVoxelPlugin {
             .default(VoxelPlayerCameraStore::default())
             .build()
             .expect("failed to initialize voxel player camera store");
+        let inventory_store = Persistent::<VoxelInventoryStore>::builder()
+            .name("voxel_creative_inventory")
+            .format(StorageFormat::Toml)
+            .path(
+                Path::new(".data")
+                    .join("willowblossom")
+                    .join("voxel_creative_inventory.toml"),
+            )
+            .default(VoxelInventoryStore::default())
+            .revertible(true)
+            .revert_to_default_on_deserialization_errors(true)
+            .build()
+            .expect("failed to initialize voxel creative inventory store");
         app.add_plugins((
             PhysicsPlugins::default(),
             VoxelPlugin::<u8>::default(),
@@ -816,9 +859,11 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPlayerStandeeAssets>()
         .init_resource::<VoxelToolGunDragState>()
         .insert_resource(player_camera_store)
+        .insert_resource(inventory_store)
         .add_systems(
             Startup,
             (
+                load_voxel_inventory,
                 setup_voxel_materials,
                 setup_voxel_grid,
                 populate_voxel_grid,
@@ -839,11 +884,11 @@ impl Plugin for TrpgVoxelPlugin {
                     handle_editor_requests,
                     place_creative_light,
                     sync_selected_voxel_light,
-                    refine_aimed_planet_voxel,
+                    refine_visible_planet_voxels,
                     edit_voxel_grid,
                     drag_voxel_physics_body,
-                    rebuild_voxel_orbital_planet,
                     make_selection_physical,
+                    rebuild_voxel_orbital_planet,
                     apply_voxel_physics_action,
                     process_voxel_scene_history,
                 )
@@ -860,12 +905,44 @@ impl Plugin for TrpgVoxelPlugin {
                     capture_voxel_player_view,
                     draw_voxel_target,
                     animate_voxel_materials,
+                    persist_voxel_inventory,
                 )
                     .chain(),
             )
                 .chain(),
         )
         .add_systems(EguiPrimaryContextPass, voxel_player_camera_panel);
+    }
+}
+
+fn load_voxel_inventory(
+    store: Res<Persistent<VoxelInventoryStore>>,
+    mut editor: ResMut<VoxelEditorState>,
+) {
+    editor.creative_hotbar = store.hotbar;
+    editor.selected_hotbar_slot = store
+        .selected_hotbar_slot
+        .min(editor.creative_hotbar.len() - 1);
+    editor.tool_gun_mode = store.tool_gun_mode;
+    let selected_hotbar_slot = editor.selected_hotbar_slot;
+    editor.select_hotbar_slot(selected_hotbar_slot);
+}
+
+fn persist_voxel_inventory(
+    editor: Res<VoxelEditorState>,
+    mut store: ResMut<Persistent<VoxelInventoryStore>>,
+) {
+    let snapshot = VoxelInventoryStore {
+        hotbar: editor.creative_hotbar,
+        selected_hotbar_slot: editor.selected_hotbar_slot,
+        tool_gun_mode: editor.tool_gun_mode,
+    };
+    if **store == snapshot {
+        return;
+    }
+    **store = snapshot;
+    if let Err(err) = store.persist() {
+        eprintln!("failed to persist voxel creative inventory: {err}");
     }
 }
 
@@ -3510,6 +3587,22 @@ fn sorted_planet_lod_cells(planet: &VoxelOrbitalPlanet) -> Vec<(IVec3, u8)> {
     cells
 }
 
+fn exposed_solid_voxel_cells(cells: &[(IVec3, u8)]) -> Vec<IVec3> {
+    let solids = cells
+        .iter()
+        .filter_map(|(cell, material)| TrpgVoxelConnector::solid(material).then_some(*cell))
+        .collect::<HashSet<_>>();
+    solids
+        .iter()
+        .copied()
+        .filter(|cell| {
+            VOXEL_FACES
+                .iter()
+                .any(|(normal, _)| !solids.contains(&(*cell + *normal)))
+        })
+        .collect()
+}
+
 fn planet_material_handle(materials: &VoxelMaterials, material_id: u8) -> Handle<StandardMaterial> {
     if material_id == 4 {
         materials.planet_ocean.clone()
@@ -3527,14 +3620,18 @@ fn spawn_voxel_orbital_planet(
     let (material_meshes, _) = build_voxel_meshes_from_cells(&lod_cells);
     let voxel_scale = ORBITAL_PLANET_LOD_VOXEL_SIZE / VOXEL_SIZE;
     let mesh_center_offset = Vec3::splat(-0.5 * ORBITAL_PLANET_LOD_VOXEL_SIZE);
-    let collider_cells = lod_cells.iter().map(|(cell, _)| *cell).collect::<Vec<_>>();
+    let collider_cells = exposed_solid_voxel_cells(&lod_cells);
     let entity = commands
         .spawn((
             RigidBody::Static,
-            Collider::voxels(
-                Vec3::splat(ORBITAL_PLANET_LOD_VOXEL_SIZE),
-                &collider_cells,
-            ),
+            Collider::compound(vec![(
+                Vec3::splat(-0.5 * ORBITAL_PLANET_LOD_VOXEL_SIZE),
+                Quat::IDENTITY,
+                Collider::voxels(
+                    Vec3::splat(ORBITAL_PLANET_LOD_VOXEL_SIZE),
+                    &collider_cells,
+                ),
+            )]),
             Transform::from_translation(ORBITAL_PLANET_CENTER),
         ))
         .id();
@@ -3568,6 +3665,7 @@ fn spawn_voxel_orbital_planet(
         mesh_handles,
         voxel_size: VOXEL_SIZE,
         dirty: false,
+        auto_refine_pending: false,
     });
     entity
 }
@@ -3591,7 +3689,7 @@ fn rebuild_voxel_orbital_planet(
         )
         && (mouse.pressed(MouseButton::Left) || mouse.pressed(MouseButton::Right));
     for (entity, mut planet, mut collider) in &mut planets {
-        if !planet.dirty || batching_edits {
+        if !planet.dirty || batching_edits || planet.auto_refine_pending {
             continue;
         }
         for mesh_entity in planet.mesh_entities.drain(..) {
@@ -3602,12 +3700,12 @@ fn rebuild_voxel_orbital_planet(
         }
         let cells = sorted_planet_cells(&planet);
         let lod_cells = sorted_planet_lod_cells(&planet);
-        let fine_collider_cells = cells.iter().map(|(cell, _)| *cell).collect::<Vec<_>>();
-        let lod_collider_cells = lod_cells.iter().map(|(cell, _)| *cell).collect::<Vec<_>>();
+        let fine_collider_cells = exposed_solid_voxel_cells(&cells);
+        let lod_collider_cells = exposed_solid_voxel_cells(&lod_cells);
         let mut collider_parts = Vec::new();
         if !lod_collider_cells.is_empty() {
             collider_parts.push((
-                Vec3::ZERO,
+                Vec3::splat(-0.5 * ORBITAL_PLANET_LOD_VOXEL_SIZE),
                 Quat::IDENTITY,
                 Collider::voxels(
                     Vec3::splat(ORBITAL_PLANET_LOD_VOXEL_SIZE),
@@ -3617,7 +3715,7 @@ fn rebuild_voxel_orbital_planet(
         }
         if !fine_collider_cells.is_empty() {
             collider_parts.push((
-                Vec3::ZERO,
+                Vec3::splat(-0.5 * VOXEL_SIZE),
                 Quat::IDENTITY,
                 Collider::voxels(
                     Vec3::splat(VOXEL_SIZE),
@@ -3757,23 +3855,30 @@ fn build_voxel_meshes(grid: &Grid<u8>) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
 fn build_voxel_meshes_from_cells(cells: &[(IVec3, u8)]) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
     let mut material_meshes = Vec::new();
     let occupied = cells.iter().copied().collect::<HashMap<_, _>>();
+    let mut cells_by_material = HashMap::<u8, Vec<IVec3>>::new();
+    for (cell, material) in cells {
+        if *material != 0 {
+            cells_by_material.entry(*material).or_default().push(*cell);
+        }
+    }
     let collider_voxels = cells
         .iter()
         .filter_map(|(cell, material)| TrpgVoxelConnector::solid(material).then_some(*cell))
         .collect::<Vec<_>>();
 
-    for material in 1..=VOXEL_MATERIAL_COUNT as u8 {
+    let mut material_ids = cells_by_material.keys().copied().collect::<Vec<_>>();
+    material_ids.sort_unstable();
+    for material in material_ids {
         let mut positions = Vec::<[f32; 3]>::new();
         let mut normals = Vec::<[f32; 3]>::new();
         let mut uvs = Vec::<[f32; 2]>::new();
         let mut indices = Vec::<u32>::new();
-        for &(cell, cell_material) in cells {
-            if cell_material != material {
-                continue;
-            }
-            append_voxel_faces(
+        for (normal, corners) in VOXEL_FACES {
+            append_greedy_voxel_faces(
                 &occupied,
-                cell,
+                &cells_by_material[&material],
+                normal,
+                corners,
                 &mut positions,
                 &mut normals,
                 &mut uvs,
@@ -3800,67 +3905,138 @@ fn build_voxel_meshes_from_cells(cells: &[(IVec3, u8)]) -> (Vec<(u8, Mesh)>, Vec
     (material_meshes, collider_voxels)
 }
 
-fn append_voxel_faces(
+const VOXEL_FACES: [(IVec3, [[f32; 3]; 4]); 6] = [
+    (IVec3::X, [
+        [1., 0., 0.],
+        [1., 1., 0.],
+        [1., 1., 1.],
+        [1., 0., 1.],
+    ]),
+    (IVec3::NEG_X, [
+        [0., 0., 1.],
+        [0., 1., 1.],
+        [0., 1., 0.],
+        [0., 0., 0.],
+    ]),
+    (IVec3::Y, [
+        [0., 1., 1.],
+        [1., 1., 1.],
+        [1., 1., 0.],
+        [0., 1., 0.],
+    ]),
+    (IVec3::NEG_Y, [
+        [0., 0., 0.],
+        [1., 0., 0.],
+        [1., 0., 1.],
+        [0., 0., 1.],
+    ]),
+    (IVec3::Z, [
+        [1., 0., 1.],
+        [1., 1., 1.],
+        [0., 1., 1.],
+        [0., 0., 1.],
+    ]),
+    (IVec3::NEG_Z, [
+        [0., 0., 0.],
+        [0., 1., 0.],
+        [1., 1., 0.],
+        [1., 0., 0.],
+    ]),
+];
+
+fn append_greedy_voxel_faces(
     occupied: &HashMap<IVec3, u8>,
-    cell: IVec3,
+    material_cells: &[IVec3],
+    normal: IVec3,
+    corners: [[f32; 3]; 4],
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
     uvs: &mut Vec<[f32; 2]>,
     indices: &mut Vec<u32>,
 ) {
-    const FACES: [(IVec3, [[f32; 3]; 4]); 6] = [
-        (IVec3::X, [
-            [1., 0., 0.],
-            [1., 1., 0.],
-            [1., 1., 1.],
-            [1., 0., 1.],
-        ]),
-        (IVec3::NEG_X, [
-            [0., 0., 1.],
-            [0., 1., 1.],
-            [0., 1., 0.],
-            [0., 0., 0.],
-        ]),
-        (IVec3::Y, [
-            [0., 1., 1.],
-            [1., 1., 1.],
-            [1., 1., 0.],
-            [0., 1., 0.],
-        ]),
-        (IVec3::NEG_Y, [
-            [0., 0., 0.],
-            [1., 0., 0.],
-            [1., 0., 1.],
-            [0., 0., 1.],
-        ]),
-        (IVec3::Z, [
-            [1., 0., 1.],
-            [1., 1., 1.],
-            [0., 1., 1.],
-            [0., 0., 1.],
-        ]),
-        (IVec3::NEG_Z, [
-            [0., 0., 0.],
-            [0., 1., 0.],
-            [1., 1., 0.],
-            [1., 0., 0.],
-        ]),
-    ];
-    for (normal, corners) in FACES {
-        if occupied.get(&(cell + normal)).copied().unwrap_or(0) != 0 {
+    let normal_axis = if normal.x != 0 {
+        0
+    } else if normal.y != 0 {
+        1
+    } else {
+        2
+    };
+    let (u_axis, v_axis) = match normal_axis {
+        0 => (2, 1),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    let mut faces = material_cells
+        .iter()
+        .filter_map(|cell| {
+            (occupied.get(&(*cell + normal)).copied().unwrap_or(0) == 0).then_some(*cell)
+        })
+        .collect::<Vec<_>>();
+    faces.sort_unstable_by_key(|cell| {
+        (
+            cell[normal_axis],
+            cell[v_axis],
+            cell[u_axis],
+        )
+    });
+    let face_set = faces.iter().copied().collect::<HashSet<_>>();
+    let mut consumed = HashSet::new();
+    for cell in faces {
+        if consumed.contains(&cell) {
             continue;
+        }
+        let mut width = 1;
+        while face_set.contains(&offset_axis(cell, u_axis, width))
+            && !consumed.contains(&offset_axis(cell, u_axis, width))
+        {
+            width += 1;
+        }
+        let mut height = 1;
+        'height: loop {
+            for u in 0..width {
+                let candidate = offset_axis(
+                    offset_axis(cell, v_axis, height),
+                    u_axis,
+                    u,
+                );
+                if !face_set.contains(&candidate) || consumed.contains(&candidate) {
+                    break 'height;
+                }
+            }
+            height += 1;
+        }
+        for v in 0..height {
+            for u in 0..width {
+                consumed.insert(offset_axis(
+                    offset_axis(cell, v_axis, v),
+                    u_axis,
+                    u,
+                ));
+            }
         }
         let base = positions.len() as u32;
         for (corner, uv) in corners
             .into_iter()
             .zip([[0., 1.], [0., 0.], [1., 0.], [1., 1.]])
         {
-            positions.push(((cell.as_vec3() + Vec3::from(corner)) * VOXEL_SIZE).to_array());
+            let mut corner = Vec3::from(corner);
+            if corner[u_axis] > 0.5 {
+                corner[u_axis] = width as f32;
+            }
+            if corner[v_axis] > 0.5 {
+                corner[v_axis] = height as f32;
+            }
+            positions.push(((cell.as_vec3() + corner) * VOXEL_SIZE).to_array());
             normals.push(normal.as_vec3().to_array());
-            uvs.push(uv);
+            uvs.push([uv[0] * width as f32, uv[1] * height as f32]);
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
+}
+
+fn offset_axis(mut cell: IVec3, axis: usize, amount: i32) -> IVec3 {
+    cell[axis] += amount;
+    cell
 }
 
 fn animate_voxel_materials(
@@ -3914,6 +4090,7 @@ fn handle_editor_requests(
         editor.redo.clear();
         editor.selection_anchor = None;
         editor.selection_end = None;
+        editor.selection_is_planet = false;
         editor.selected_light = None;
         editor.physics_status = None;
         editor.reset_requested = false;
@@ -3938,6 +4115,10 @@ fn make_selection_physical(
     mut commands: Commands,
     mut editor: ResMut<VoxelEditorState>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    mut planets: Query<(
+        &mut VoxelOrbitalPlanet,
+        &GlobalTransform,
+    )>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
@@ -3949,6 +4130,61 @@ fn make_selection_physical(
         editor.physics_status = Some("请先用两个角点框选区域".to_owned());
         return;
     };
+    if editor.selection_is_planet {
+        let Ok((mut planet, planet_transform)) = planets.single_mut() else {
+            return;
+        };
+        let mut selected_voxels = planet
+            .cells
+            .iter()
+            .filter_map(|(cell, material)| {
+                (cell.cmpge(min).all()
+                    && cell.cmple(max).all()
+                    && TrpgVoxelConnector::solid(material))
+                .then_some((*cell, *material))
+            })
+            .collect::<Vec<_>>();
+        selected_voxels.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
+        let voxel_count = selected_voxels.len();
+        if voxel_count == 0 {
+            editor.physics_status = Some("行星选区内没有可物理化的固体方块".to_owned());
+            return;
+        }
+        for (cell, _) in &selected_voxels {
+            dig_planet_voxel(&mut planet, *cell);
+        }
+        let origin = selected_voxels
+            .iter()
+            .map(|(cell, _)| *cell)
+            .reduce(IVec3::min)
+            .unwrap_or(IVec3::ZERO);
+        let local_cells = selected_voxels
+            .into_iter()
+            .map(|(cell, material)| (cell - origin, material))
+            .collect();
+        let transform = Transform::from_matrix(
+            planet_transform.to_matrix()
+                * Mat4::from_translation(
+                    origin.as_vec3() * VOXEL_SIZE - Vec3::splat(VOXEL_SIZE * 0.5),
+                ),
+        );
+        spawn_voxel_physics_body_at(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            local_cells,
+            transform,
+            LinearVelocity::ZERO,
+            AngularVelocity::ZERO,
+        );
+        editor.selection_anchor = None;
+        editor.selection_end = None;
+        editor.selection_is_planet = false;
+        editor.physics_status = Some(format!(
+            "已将 {voxel_count} 个行星方块生成 1 个物理体"
+        ));
+        return;
+    }
     let Ok(mut grid) = grids.single_mut() else {
         return;
     };
@@ -3972,6 +4208,7 @@ fn make_selection_physical(
 
     editor.selection_anchor = None;
     editor.selection_end = None;
+    editor.selection_is_planet = false;
     editor.physics_status = Some(format!(
         "已将 {voxel_count} 个方块生成 1 个物理体"
     ));
@@ -4250,6 +4487,7 @@ fn process_voxel_scene_history(
     editor.stroke_positions.clear();
     editor.selection_anchor = None;
     editor.selection_end = None;
+    editor.selection_is_planet = false;
     editor.selected_light = None;
     editor.physics_action_requested = None;
     editor.physics_status = Some(format!("已恢复 {}", snapshot.name));
@@ -4627,41 +4865,72 @@ fn sync_selected_voxel_light(
     }
 }
 
-fn refine_aimed_planet_voxel(
-    windows: Query<&Window, With<PrimaryWindow>>,
+fn refine_visible_planet_voxels(
     cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
     mut planets: Query<(
         &mut VoxelOrbitalPlanet,
         &GlobalTransform,
     )>,
     editor: Res<VoxelEditorState>,
-    egui_input: Res<EguiWantsInput>,
 ) {
-    if editor.creative_inventory_open
-        || voxel_world_pointer_blocked(
-            egui_input.wants_any_pointer_input(),
-            editor.left_started_over_ui || editor.right_started_over_ui,
-        )
-    {
+    let (Ok((camera, camera_transform)), Ok((mut planet, planet_transform))) =
+        (cameras.single(), planets.single_mut())
+    else {
         return;
+    };
+
+    // Refine the planet around the camera before the player aims or clicks.
+    // This keeps nearby terrain at the canonical 0.25 gameplay scale while
+    // retaining coarse sparse storage for the distant planet.
+    let local_camera = planet_transform
+        .affine()
+        .inverse()
+        .transform_point3(camera_transform.translation());
+    let camera_lod_cell = (local_camera / ORBITAL_PLANET_LOD_VOXEL_SIZE)
+        .round()
+        .as_ivec3();
+    let mut requested = prism(
+        camera_lod_cell - IVec3::splat(2),
+        camera_lod_cell + IVec3::splat(3),
+    )
+    .filter(|cell| planet.lod_cells.contains_key(cell))
+    .collect::<HashSet<_>>();
+
+    // Also refine the visible surface in orbit view, where the camera may be
+    // farther than the proximity radius. Sampling the viewport avoids making
+    // the entire planet resident at canonical resolution.
+    for sample_y in 0..3 {
+        for sample_x in 0..5 {
+            let fraction = Vec2::new(
+                sample_x as f32 / 4.0,
+                sample_y as f32 / 2.0,
+            );
+            let screen_position =
+                editor.viewport_min + (editor.viewport_max - editor.viewport_min) * fraction;
+            let Ok(ray) = camera.viewport_to_world(camera_transform, screen_position) else {
+                continue;
+            };
+            if let Some(hit) =
+                raycast_voxel_planet(&planet, planet_transform, ray).filter(|hit| hit.lod)
+            {
+                requested.insert(hit.occupied);
+            }
+        }
     }
-    let (Ok(window), Ok((camera, camera_transform)), Ok((mut planet, planet_transform))) = (
-        windows.single(),
-        cameras.single(),
-        planets.single_mut(),
-    ) else {
-        return;
-    };
-    let Some(ray) = viewport_ray(
-        window,
-        camera,
-        camera_transform,
-        &editor,
-    ) else {
-        return;
-    };
-    if let Some(hit) = raycast_voxel_planet(&planet, planet_transform, ray).filter(|hit| hit.lod) {
-        refine_planet_lod_cell(&mut planet, hit.occupied);
+    let mut requested = requested.into_iter().collect::<Vec<_>>();
+    requested.sort_unstable_by(|left, right| {
+        let left_distance = left.as_vec3() * ORBITAL_PLANET_LOD_VOXEL_SIZE - local_camera;
+        let right_distance = right.as_vec3() * ORBITAL_PLANET_LOD_VOXEL_SIZE - local_camera;
+        left_distance
+            .length_squared()
+            .total_cmp(&right_distance.length_squared())
+    });
+    planet.auto_refine_pending = requested.len() > PLANET_AUTO_REFINEMENTS_PER_FRAME;
+    for cell in requested
+        .into_iter()
+        .take(PLANET_AUTO_REFINEMENTS_PER_FRAME)
+    {
+        refine_planet_lod_cell(&mut planet, cell);
     }
 }
 
@@ -5050,8 +5319,27 @@ fn edit_voxel_grid(
         ) else {
             return;
         };
-        if let Some(cell) = raycast_grid(&grid, ray).and_then(|hit| hit.occupied) {
-            editor.select_physics_corner(cell);
+        let grid_hit = raycast_grid(&grid, ray);
+        let grid_distance = grid_hit
+            .as_ref()
+            .filter(|hit| hit.occupied.is_some())
+            .map(|hit| hit.distance);
+        if let Ok((mut planet, planet_transform)) = planets.single_mut() {
+            let mut planet_hit = raycast_voxel_planet(&planet, planet_transform, ray);
+            if let Some(hit) = planet_hit.filter(|hit| hit.lod) {
+                refine_planet_lod_cell(&mut planet, hit.occupied);
+                planet_hit =
+                    raycast_voxel_planet(&planet, planet_transform, ray).filter(|hit| !hit.lod);
+            }
+            if let Some(hit) = planet_hit.filter(|hit| {
+                !hit.lod && grid_distance.is_none_or(|distance| hit.distance < distance)
+            }) {
+                editor.select_physics_corner(hit.occupied, true);
+                return;
+            }
+        }
+        if let Some(cell) = grid_hit.and_then(|hit| hit.occupied) {
+            editor.select_physics_corner(cell, false);
         }
         return;
     }
@@ -5675,12 +5963,13 @@ fn draw_voxel_target(
     let Ok(grid) = grids.single() else {
         return;
     };
-    let (hit, explosion_origin, planet_target) = if editor.creative_inventory_open
+    let (hit, explosion_origin, planet_target, planet_cell_target) = if editor
+        .creative_inventory_open
         || voxel_world_pointer_blocked(
             egui_input.wants_any_pointer_input(),
             editor.left_started_over_ui || editor.right_started_over_ui,
         ) {
-        (None, None, None)
+        (None, None, None, None)
     } else {
         let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single())
         else {
@@ -5699,20 +5988,24 @@ fn draw_voxel_target(
             raycast_voxel_planet(planet, transform, ray).map(|planet_hit| (planet_hit, transform))
         });
         let planet_hit = planet_hit_any.filter(|(planet_hit, _)| !planet_hit.lod);
-        let planet_target = planet_hit
+        let planet_cell_target = planet_hit
             .filter(|(planet_hit, _)| {
                 hit.as_ref()
                     .is_none_or(|grid_hit| planet_hit.distance < grid_hit.distance)
             })
-            .and_then(|(planet_hit, transform)| {
-                let cell = match editor.mode {
+            .and_then(|(planet_hit, _)| {
+                Some(match editor.mode {
                     VoxelEditMode::Add => planet_hit.occupied + planet_hit.normal,
-                    VoxelEditMode::Remove | VoxelEditMode::Paint => planet_hit.occupied,
+                    VoxelEditMode::Remove | VoxelEditMode::Paint | VoxelEditMode::Physics => {
+                        planet_hit.occupied
+                    },
                     _ => return None,
-                };
-                Some(transform.transform_point(cell.as_vec3() * VOXEL_SIZE))
+                })
             });
-        let hit = planet_target.is_none().then_some(hit).flatten();
+        let planet_target = planet_cell_target.and_then(|cell| {
+            planet_hit.map(|(_, transform)| transform.transform_point(cell.as_vec3() * VOXEL_SIZE))
+        });
+        let hit = planet_cell_target.is_none().then_some(hit).flatten();
         let explosion_origin = if editor.mode == VoxelEditMode::Explode {
             let body_hit = spatial_query.cast_ray_predicate(
                 ray.origin,
@@ -5738,7 +6031,12 @@ fn draw_voxel_target(
         } else {
             None
         };
-        (hit, explosion_origin, planet_target)
+        (
+            hit,
+            explosion_origin,
+            planet_target,
+            planet_cell_target,
+        )
     };
     let target = match (editor.light_tool, editor.mode, hit) {
         (Some(VoxelLightTool::Remove), ..) => None,
@@ -5780,18 +6078,70 @@ fn draw_voxel_target(
         }
     }
     if editor.mode == VoxelEditMode::Physics {
-        let selection_end = editor.selection_end.or(target);
+        let selection_end = editor.selection_end.or(if editor.selection_is_planet {
+            planet_cell_target
+        } else {
+            target
+        });
         if let (Some(start), Some(end)) = (editor.selection_anchor, selection_end) {
             let (min, max) = (start.min(end), start.max(end));
             let size = (max - min + IVec3::ONE).as_vec3() * VOXEL_SIZE;
-            let center = (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE;
+            let local_center = if editor.selection_is_planet {
+                (min.as_vec3() + (max - min).as_vec3() * 0.5) * VOXEL_SIZE
+            } else {
+                (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE
+            };
+            let center = if editor.selection_is_planet {
+                planets
+                    .iter()
+                    .next()
+                    .map_or(local_center, |(_, transform)| {
+                        transform.transform_point(local_center)
+                    })
+            } else {
+                local_center
+            };
             gizmos.cube(
                 Transform::from_translation(center).with_scale(size),
                 Color::srgb(0.15, 0.9, 1.0),
             );
             if editor.selection_end.is_some() {
-                for (cell, _) in selected_solid_voxels(grid, min, max) {
-                    let center = (cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
+                let selected_cells = if editor.selection_is_planet {
+                    planets
+                        .iter()
+                        .next()
+                        .map(|(planet, _)| {
+                            planet
+                                .cells
+                                .iter()
+                                .filter_map(|(cell, material)| {
+                                    (cell.cmpge(min).all()
+                                        && cell.cmple(max).all()
+                                        && TrpgVoxelConnector::solid(material))
+                                    .then_some((*cell, *material))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    selected_solid_voxels(grid, min, max)
+                };
+                for (cell, _) in selected_cells {
+                    let local_center = if editor.selection_is_planet {
+                        cell.as_vec3() * VOXEL_SIZE
+                    } else {
+                        (cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE
+                    };
+                    let center = if editor.selection_is_planet {
+                        planets
+                            .iter()
+                            .next()
+                            .map_or(local_center, |(_, transform)| {
+                                transform.transform_point(local_center)
+                            })
+                    } else {
+                        local_center
+                    };
                     gizmos.cube(
                         Transform::from_translation(center)
                             .with_scale(Vec3::splat(VOXEL_SIZE * 0.88)),
@@ -5809,7 +6159,11 @@ fn draw_voxel_target(
         );
     }
     if let Some(center) = planet_target {
-        let size = (editor.brush_radius * 2 + 1) as f32 * VOXEL_SIZE;
+        let size = if editor.mode == VoxelEditMode::Physics {
+            VOXEL_SIZE
+        } else {
+            (editor.brush_radius * 2 + 1) as f32 * VOXEL_SIZE
+        };
         gizmos.cube(
             Transform::from_translation(center).with_scale(Vec3::splat(size)),
             Color::srgb(1.0, 0.9, 0.2),
@@ -6229,6 +6583,7 @@ mod tests {
             mesh_handles: Vec::new(),
             voxel_size: 1.0,
             dirty: false,
+            auto_refine_pending: false,
         };
 
         assert!(dig_planet_voxel(&mut planet, surface));
@@ -6254,6 +6609,7 @@ mod tests {
             mesh_handles: Vec::new(),
             voxel_size: 2.0,
             dirty: false,
+            auto_refine_pending: false,
         };
         let transform = GlobalTransform::from(Transform::from_xyz(0.0, -10.0, 0.0));
         let ray = Ray3d::new(Vec3::ZERO, Dir3::NEG_Y);
@@ -6275,6 +6631,7 @@ mod tests {
             mesh_handles: Vec::new(),
             voxel_size: VOXEL_SIZE,
             dirty: false,
+            auto_refine_pending: false,
         };
 
         let removed = explode_planet_voxels(
@@ -6595,6 +6952,34 @@ mod tests {
     }
 
     #[test]
+    fn greedy_meshing_collapses_a_solid_cuboid_to_six_quads() {
+        let cells = prism(IVec3::ZERO, IVec3::new(4, 3, 2))
+            .map(|cell| (cell, 1))
+            .collect::<Vec<_>>();
+
+        let (meshes, _) = build_voxel_meshes_from_cells(&cells);
+        assert_eq!(meshes.len(), 1);
+        let mesh = &meshes[0].1;
+        assert_eq!(
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().len(),
+            24
+        );
+        assert_eq!(mesh.indices().unwrap().len(), 36);
+    }
+
+    #[test]
+    fn planet_collider_keeps_only_exposed_solid_voxels() {
+        let cells = prism(IVec3::ZERO, IVec3::splat(3))
+            .map(|cell| (cell, 1))
+            .collect::<Vec<_>>();
+
+        let exposed = exposed_solid_voxel_cells(&cells);
+
+        assert_eq!(exposed.len(), 26);
+        assert!(!exposed.contains(&IVec3::ONE));
+    }
+
+    #[test]
     fn connector_treats_zero_as_air() {
         assert!(!TrpgVoxelConnector::solid(&0));
         assert!(TrpgVoxelConnector::solid(&1));
@@ -6635,8 +7020,8 @@ mod tests {
     #[test]
     fn physics_selection_normalizes_corners() {
         let mut editor = VoxelEditorState::default();
-        editor.select_physics_corner(IVec3::new(4, 1, -2));
-        editor.select_physics_corner(IVec3::new(-1, 3, 5));
+        editor.select_physics_corner(IVec3::new(4, 1, -2), false);
+        editor.select_physics_corner(IVec3::new(-1, 3, 5), false);
         assert_eq!(
             editor.selection_bounds(),
             Some((
@@ -7063,6 +7448,94 @@ mod tests {
         assert_eq!(editor.creative_hotbar[3], None);
         assert_eq!(editor.light_tool, None);
         assert_eq!(editor.active_tool_label(), "空手");
+    }
+
+    #[test]
+    fn creative_inventory_snapshot_persists_as_toml() {
+        let mut inventory = VoxelInventoryStore::default();
+        inventory.hotbar[2] = Some(VoxelCreativeItem::ToolGun);
+        inventory.hotbar[4] = Some(VoxelCreativeItem::Mode(
+            VoxelEditMode::Drag,
+        ));
+        inventory.selected_hotbar_slot = 4;
+        inventory.tool_gun_mode = VoxelEditMode::Pull;
+
+        let path = std::env::temp_dir().join(format!(
+            "willowblossom_voxel_inventory_{}.toml",
+            std::process::id()
+        ));
+        let mut store = Persistent::<VoxelInventoryStore>::builder()
+            .name("test_voxel_inventory")
+            .format(StorageFormat::Toml)
+            .path(&path)
+            .default(VoxelInventoryStore::default())
+            .build()
+            .unwrap();
+        *store = inventory.clone();
+        store.persist().unwrap();
+        let loaded = Persistent::<VoxelInventoryStore>::builder()
+            .name("test_voxel_inventory_reload")
+            .format(StorageFormat::Toml)
+            .path(&path)
+            .default(VoxelInventoryStore::default())
+            .build()
+            .unwrap();
+
+        assert_eq!(*loaded, inventory);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn planet_selection_becomes_a_canonical_dynamic_voxel_body() {
+        let selected_cell = IVec3::new(0, 0, 0);
+        let mut editor = VoxelEditorState::default();
+        editor.physics_requested = true;
+        editor.selection_anchor = Some(selected_cell);
+        editor.selection_end = Some(selected_cell);
+        editor.selection_is_planet = true;
+
+        let mut app = App::new();
+        app.insert_resource(editor)
+            .insert_resource(Assets::<Mesh>::default())
+            .insert_resource(VoxelMaterials {
+                handles: std::array::from_fn(|_| Handle::default()),
+                planet_ocean: Handle::default(),
+            })
+            .add_systems(Update, make_selection_physical);
+        let planet_entity = app
+            .world_mut()
+            .spawn((
+                VoxelOrbitalPlanet {
+                    lod_cells: HashMap::new(),
+                    refined_lod_cells: HashSet::new(),
+                    cells: HashMap::from([(selected_cell, 1)]),
+                    removed: HashSet::new(),
+                    mesh_entities: Vec::new(),
+                    mesh_handles: Vec::new(),
+                    voxel_size: VOXEL_SIZE,
+                    dirty: false,
+                    auto_refine_pending: false,
+                },
+                GlobalTransform::from_translation(Vec3::new(10.0, 20.0, 30.0)),
+            ))
+            .id();
+
+        app.update();
+
+        let planet = app
+            .world()
+            .entity(planet_entity)
+            .get::<VoxelOrbitalPlanet>()
+            .unwrap();
+        assert!(!planet.cells.contains_key(&selected_cell));
+        assert!(planet.removed.contains(&selected_cell));
+        let mut bodies = app.world_mut().query::<(&VoxelPhysicsBody, &Transform)>();
+        let (body, transform) = bodies.single(app.world()).unwrap();
+        assert_eq!(body.cells, vec![(IVec3::ZERO, 1)]);
+        assert_eq!(
+            transform.translation + Vec3::splat(VOXEL_SIZE * 0.5),
+            Vec3::new(10.0, 20.0, 30.0)
+        );
     }
 
     #[test]
