@@ -33,6 +33,8 @@ Additional 2026-06-26 update: `液态躯体` approved-talent parsed battle now s
 
 Additional 2026-06-26 update: `敏锐` approved-talent parsed battle now preserves a once-per-battle dodge charge and consumes it to fully evade the first positive range/non-targeted incoming skill damage, without spending the charge on normal single-target damage. Focused verification passes with `cargo test --lib -j 1 keen_evasion -- --nocapture`: 1 passed, 0 failed. Full-suite verification passes with `cargo test -j 1`: 317 passed, 1 ignored live DeepSeek API test, 0 failed.
 
+Additional 2026-07-16 update: `奥术护盾` approved-talent battle participants now enter each encounter with a persisted shield equal to 10% of maximum MP. The central battle damage path consumes the shield before HP for manual damage, parsed skills, and scheduled damage; fully absorbed hits do not count as HP damage or damage-source contributions. Focused verification passes with `cargo test --lib -j 1 arcane_shield -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 386 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -325,6 +327,8 @@ Additional implemented talent execution: `千万回忆` now records parsed-battl
 Additional implemented talent execution: `液态躯体` now records parsed-battle delayed damage and previous-turn damage healing, halving direct incoming skill damage into immediate and next-round portions.
 
 Additional implemented talent execution: `敏锐` now records a parsed-battle once-per-battle dodge charge and spends it on the first positive range/non-targeted incoming skill damage, leaving ordinary single-target damage untouched.
+
+Additional implemented talent execution: `奥术护盾` now grants battle entrants 10% of maximum MP as encounter-local shielding and consumes it before HP damage across the shared battle damage path.
 
 6. Import/export is partial.
 

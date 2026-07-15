@@ -6898,6 +6898,14 @@ pub fn character_keen_evasion_available(character: &PlayerCharacter) -> bool {
     character_has_approved_moonberry_talent(character, "敏锐")
 }
 
+pub fn character_arcane_shield_amount(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "奥术护盾") {
+        character.max_mp.max(0.0) * 0.10
+    } else {
+        0.0
+    }
+}
+
 pub fn upsert_character_active_buff(character: &mut PlayerCharacter, buff: BuffSpec) -> bool {
     if let Some(existing) = character
         .active_buffs

@@ -39,6 +39,7 @@ use crate::{
         arrogance_damage_dealt_multiplier,
         champion_damage_dealt_multiplier,
         champion_damage_taken_multiplier,
+        character_arcane_shield_amount,
         character_arrogance_damage_bonus_per_source,
         character_champion_damage_bonus_per_stack,
         character_champion_damage_reduction_per_stack,
@@ -272,6 +273,8 @@ pub struct BattleParticipantSnapshot {
     pub keen_evasion_enabled: bool,
     #[serde(default)]
     pub keen_evasion_available: bool,
+    #[serde(default)]
+    pub arcane_shield: f32,
     #[serde(default)]
     pub liquid_body_damage_delay_rate: f32,
     #[serde(default)]
@@ -628,7 +631,11 @@ fn apply_participant_damage_for_battle(
     amount: f32,
     source_id: &str,
 ) -> Option<BattleDefeatOutcome> {
-    let final_amount = amount.max(0.0);
+    let incoming_amount = amount.max(0.0);
+    let available_shield = participant.arcane_shield.max(0.0);
+    let absorbed = available_shield.min(incoming_amount);
+    participant.arcane_shield = available_shield - absorbed;
+    let final_amount = (incoming_amount - absorbed).max(0.0);
     if final_amount <= f32::EPSILON {
         return None;
     }
@@ -1071,6 +1078,7 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant.one_heart_stacks.hash(&mut hasher);
             participant.keen_evasion_enabled.hash(&mut hasher);
             participant.keen_evasion_available.hash(&mut hasher);
+            participant.arcane_shield.to_bits().hash(&mut hasher);
             participant
                 .liquid_body_damage_delay_rate
                 .to_bits()
@@ -1496,6 +1504,12 @@ fn encounter_roster_ui(
             }
             if participant.keen_evasion_enabled && participant.keen_evasion_available {
                 ui.small("敏锐待机");
+            }
+            if participant.arcane_shield > f32::EPSILON {
+                ui.small(format!(
+                    "奥术护盾{}",
+                    format_number(participant.arcane_shield)
+                ));
             }
             if participant.liquid_body_damage_delay_rate > f32::EPSILON
                 || participant.liquid_body_self_healing_rate > f32::EPSILON
@@ -3317,6 +3331,7 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant.one_heart_stacks.hash(&mut hasher);
         participant.keen_evasion_enabled.hash(&mut hasher);
         participant.keen_evasion_available.hash(&mut hasher);
+        participant.arcane_shield.to_bits().hash(&mut hasher);
         participant
             .liquid_body_damage_delay_rate
             .to_bits()
@@ -3449,6 +3464,7 @@ fn participant_from_character(
         one_heart_stacks: 0,
         keen_evasion_enabled: character_keen_evasion_available(character),
         keen_evasion_available: character_keen_evasion_available(character),
+        arcane_shield: character_arcane_shield_amount(character),
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
@@ -3526,6 +3542,7 @@ fn participant_from_unit_template(
         one_heart_stacks: 0,
         keen_evasion_enabled: character_keen_evasion_available(character),
         keen_evasion_available: character_keen_evasion_available(character),
+        arcane_shield: character_arcane_shield_amount(character),
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
@@ -3599,6 +3616,7 @@ fn participant_from_target(
         one_heart_stacks: 0,
         keen_evasion_enabled: false,
         keen_evasion_available: false,
+        arcane_shield: 0.0,
         liquid_body_damage_delay_rate: 0.0,
         liquid_body_self_healing_rate: 0.0,
         champion_damage_bonus_per_stack: 0.0,
@@ -4792,6 +4810,7 @@ mod area_tests {
             one_heart_stacks: 0,
             keen_evasion_enabled: false,
             keen_evasion_available: false,
+            arcane_shield: 0.0,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             champion_damage_bonus_per_stack: 0.0,
@@ -4880,6 +4899,7 @@ mod tests {
             one_heart_stacks: 0,
             keen_evasion_enabled: false,
             keen_evasion_available: false,
+            arcane_shield: 0.0,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             champion_damage_bonus_per_stack: 0.0,
@@ -6905,6 +6925,45 @@ mod tests {
             .unwrap();
         assert!((target.hp - 6.0).abs() < 0.0001);
         assert!(!target.keen_evasion_available);
+    }
+
+    #[test]
+    fn arcane_shield_absorbs_battle_damage_before_hp() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                mp: 30.0,
+                max_mp: 50.0,
+                skill_names: vec!["奥术护盾".to_owned()],
+                skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                    "support_talent",
+                    "辅助天赋",
+                )],
+                ..Default::default()
+            });
+        let mut participant = participant_from_target("target", &manager);
+
+        assert!((participant.arcane_shield - 5.0).abs() < 0.0001);
+        assert!(apply_participant_damage_for_battle(&mut participant, 3.0, "enemy").is_none());
+        assert!((participant.arcane_shield - 2.0).abs() < 0.0001);
+        assert!((participant.hp - 20.0).abs() < 0.0001);
+        assert!((participant.damage_taken_this_turn - 0.0).abs() < 0.0001);
+        assert!(participant.damage_contributors.is_empty());
+
+        assert!(apply_participant_damage_for_battle(&mut participant, 4.0, "enemy").is_none());
+        assert!((participant.arcane_shield - 0.0).abs() < 0.0001);
+        assert!((participant.hp - 18.0).abs() < 0.0001);
+        assert!((participant.damage_taken_this_turn - 2.0).abs() < 0.0001);
+        assert_eq!(participant.damage_contributors, vec![
+            "enemy".to_owned()
+        ]);
+
+        let persisted = serde_json::to_string(&participant).unwrap();
+        let restored: BattleParticipantSnapshot = serde_json::from_str(&persisted).unwrap();
+        assert!((restored.arcane_shield - participant.arcane_shield).abs() < 0.0001);
     }
 
     #[test]
