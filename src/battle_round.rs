@@ -1131,7 +1131,7 @@ fn battle_round_panel(
     mut contexts: EguiContexts,
     mut ui_state: ResMut<BattleRoundUiState>,
     mut store: Option<ResMut<Persistent<BattleRoundStore>>>,
-    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    mut manager: Option<ResMut<Persistent<NapcatMessageManager>>>,
     scene_positions: Option<Res<SceneCharacterPositions>>,
     encounters: Query<&BattleEncounterEntity>,
 ) {
@@ -1144,12 +1144,13 @@ fn battle_round_panel(
     let Some(store) = store.as_deref_mut() else {
         return;
     };
-    let Some(manager) = manager.as_deref() else {
+    let Some(manager) = manager.as_deref_mut() else {
         return;
     };
 
     let mut panel_open = ui_state.panel_open;
     let mut changed = false;
+    let mut manager_changed = false;
     let mut close_requested = false;
 
     egui::Window::new("战斗轮")
@@ -1173,7 +1174,7 @@ fn battle_round_panel(
                     }
 
                     for encounter_entity in encounter_rows {
-                        changed |= encounter_ui(
+                        let encounter_changed = encounter_ui(
                             ui,
                             &mut ui_state,
                             store,
@@ -1181,6 +1182,13 @@ fn battle_round_panel(
                             scene_positions.as_deref(),
                             encounter_entity,
                         );
+                        changed |= encounter_changed;
+                        if encounter_changed {
+                            manager_changed |= sync_encounter_to_manager(
+                                store.encounters.get(encounter_entity.id.as_str()),
+                                manager,
+                            );
+                        }
                         ui.add_space(6.0);
                     }
 
@@ -1194,6 +1202,9 @@ fn battle_round_panel(
     ui_state.panel_open = panel_open && !close_requested;
     if changed {
         store.persist().ok();
+    }
+    if manager_changed {
+        manager.persist().ok();
     }
 }
 
@@ -1272,7 +1283,6 @@ fn encounter_ui(
 
     ui.group(|ui| {
         ui.set_width(ui.available_width());
-        let mut prev_round_requested = false;
         let mut next_round_requested = false;
         {
             let encounter = store
@@ -1297,9 +1307,6 @@ fn encounter_ui(
                 if ui.button("刷新玩家").clicked() {
                     changed |= refresh_encounter_players(encounter, manager);
                 }
-                if ui.button("上一轮").clicked() {
-                    prev_round_requested = true;
-                }
                 if ui.button("下一轮").clicked() {
                     next_round_requested = true;
                 }
@@ -1307,10 +1314,6 @@ fn encounter_ui(
                     remove = true;
                 }
             });
-        }
-        if prev_round_requested {
-            changed |= store.previous_round(encounter_id);
-            ui_state.confirm_next_round.remove(encounter_id);
         }
         if next_round_requested {
             if store.encounter_has_pending_actions(encounter_id)
@@ -1587,9 +1590,13 @@ fn encounter_roster_ui(
                 }
             });
             if ui.button("添加").clicked() {
-                encounter.participants.push(participant_from_target(
-                    selected, manager,
-                ));
+                let mut participant = participant_from_target(selected, manager);
+                initialize_participant_clock(
+                    &mut participant,
+                    encounter.trpg_group.as_deref(),
+                    manager,
+                );
+                encounter.participants.push(participant);
                 changed = true;
             }
         });
@@ -1845,7 +1852,15 @@ impl BattleRoundStore {
         let participants = group
             .players
             .iter()
-            .map(|target_id| participant_from_target(target_id, manager))
+            .map(|target_id| {
+                let mut participant = participant_from_target(target_id, manager);
+                initialize_participant_clock(
+                    &mut participant,
+                    Some(&group_name),
+                    manager,
+                );
+                participant
+            })
             .collect::<Vec<_>>();
 
         self.encounters
@@ -1855,27 +1870,11 @@ impl BattleRoundStore {
                 active: true,
                 sort_by_turn: group.battle_sort_by_turn,
                 negative_enabled: group.battle_negative_enabled,
-                round: 0,
+                round: group.world_turn,
                 participants,
                 action_log: Vec::new(),
             });
         encounter_id
-    }
-
-    fn previous_round(&mut self, encounter_id: &str) -> bool {
-        let Some(encounter) = self.encounters.get_mut(encounter_id) else {
-            return false;
-        };
-        if encounter.round > 0 {
-            encounter.round -= 1;
-        }
-        for participant in &mut encounter.participants {
-            participant.action_done = false;
-        }
-        encounter
-            .action_log
-            .push(format!("GM回到第{}轮", encounter.round));
-        true
     }
 
     fn next_round(&mut self, encounter_id: &str) -> bool {
@@ -2637,12 +2636,110 @@ fn refresh_encounter_players(
         {
             sync_participant_from_manager(participant, manager);
         } else {
-            encounter.participants.push(participant_from_target(
-                target_id, manager,
-            ));
+            let mut participant = participant_from_target(target_id, manager);
+            initialize_participant_clock(
+                &mut participant,
+                Some(group_name),
+                manager,
+            );
+            encounter.participants.push(participant);
         }
     }
     before_signature != encounter_participants_signature(&encounter.participants)
+}
+
+fn initialize_participant_clock(
+    participant: &mut BattleParticipantSnapshot,
+    group_name: Option<&str>,
+    manager: &NapcatMessageManager,
+) {
+    let Some(character) = manager.player_characters.get(&participant.target_id) else {
+        return;
+    };
+    let group = group_name.and_then(|name| manager.trpg_groups.get(name));
+    participant.turn = group
+        .and_then(|group| group.player_turns.get(&participant.target_id))
+        .map(|turn| turn.turns_passed)
+        .or_else(|| group.map(|group| group.world_turn))
+        .unwrap_or_default();
+    participant.skill_last_used_turns = character.skill_last_cast_turns.clone();
+}
+
+fn sync_encounter_to_manager(
+    encounter: Option<&BattleEncounter>,
+    manager: &mut NapcatMessageManager,
+) -> bool {
+    let Some(encounter) = encounter else {
+        return false;
+    };
+    let mut changed = false;
+
+    for participant in &encounter.participants {
+        if participant.unit_template_id.is_some() || !participant.player_character {
+            continue;
+        }
+        let Some(character) = manager.player_characters.get_mut(&participant.target_id) else {
+            continue;
+        };
+        let hp = participant.hp.clamp(0.0, character.max_hp.max(0.0));
+        let mp = participant.mp.clamp(0.0, character.max_mp.max(0.0));
+        if (character.hp - hp).abs() > f32::EPSILON {
+            character.hp = hp;
+            changed = true;
+        }
+        if (character.mp - mp).abs() > f32::EPSILON {
+            character.mp = mp;
+            changed = true;
+        }
+        if (character.damage_taken_this_turn - participant.damage_taken_this_turn).abs()
+            > f32::EPSILON
+        {
+            character.damage_taken_this_turn = participant.damage_taken_this_turn.max(0.0);
+            changed = true;
+        }
+        if (character.healing_taken_this_turn - participant.healing_taken_this_turn).abs()
+            > f32::EPSILON
+        {
+            character.healing_taken_this_turn = participant.healing_taken_this_turn.max(0.0);
+            changed = true;
+        }
+        if character.skill_last_cast_turns != participant.skill_last_used_turns {
+            character.skill_last_cast_turns = participant.skill_last_used_turns.clone();
+            changed = true;
+        }
+    }
+
+    let Some(group_name) = encounter.trpg_group.as_deref() else {
+        return changed;
+    };
+    let Some(group) = manager.trpg_groups.get_mut(group_name) else {
+        return changed;
+    };
+    changed |= group.sync_turn_players();
+    if group.world_turn < encounter.round {
+        group.world_turn = encounter.round;
+        changed = true;
+    }
+    for participant in encounter
+        .participants
+        .iter()
+        .filter(|participant| participant.player_character)
+    {
+        let Some(turn) = group.player_turns.get_mut(&participant.target_id) else {
+            continue;
+        };
+        if turn.turns_passed < participant.turn {
+            turn.turns_passed = participant.turn;
+            changed = true;
+        }
+        if turn.acted != participant.action_done || turn.skipped {
+            turn.acted = participant.action_done;
+            turn.skipped = false;
+            changed = true;
+        }
+    }
+    changed |= group.refresh_legacy_negative_timers();
+    changed
 }
 
 fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) -> u64 {
@@ -4167,6 +4264,108 @@ mod tests {
             healing_taken_this_turn: 0.0,
             skill_last_used_turns: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn new_battle_inherits_group_and_character_turn_clocks() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("a".to_owned(), PlayerCharacter {
+                skill_last_cast_turns: HashMap::from([("0".to_owned(), 5)]),
+                ..Default::default()
+            });
+        let group = TrpgGroup {
+            players: vec!["a".to_owned()],
+            world_turn: 7,
+            player_turns: HashMap::from([(
+                "a".to_owned(),
+                crate::napcat::TrpgPlayerTurnState {
+                    turns_passed: 6,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        manager
+            .trpg_groups
+            .insert("party".to_owned(), group.clone());
+        let mut store = BattleRoundStore::default();
+
+        let encounter_id = store.create_encounter_from_group(
+            "test".to_owned(),
+            "party".to_owned(),
+            &group,
+            &manager,
+        );
+
+        let encounter = &store.encounters[&encounter_id];
+        assert_eq!(encounter.round, 7);
+        assert_eq!(encounter.participants[0].turn, 6);
+        assert_eq!(
+            encounter.participants[0].skill_last_used_turns,
+            HashMap::from([("0".to_owned(), 5)])
+        );
+    }
+
+    #[test]
+    fn battle_changes_sync_to_character_and_group_turn_state() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("a".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 8.0,
+                max_mp: 8.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["a".to_owned()],
+            world_turn: 3,
+            player_turns: HashMap::from([(
+                "a".to_owned(),
+                crate::napcat::TrpgPlayerTurnState {
+                    turns_passed: 3,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let mut player = participant("a", 4);
+        player.player_character = true;
+        player.action_done = true;
+        player.hp = 6.0;
+        player.mp = 2.0;
+        player.damage_taken_this_turn = 4.0;
+        player.healing_taken_this_turn = 1.0;
+        player.skill_last_used_turns = HashMap::from([("0".to_owned(), 4)]);
+        let encounter = BattleEncounter {
+            trpg_group: Some("party".to_owned()),
+            round: 4,
+            participants: vec![player],
+            ..Default::default()
+        };
+
+        assert!(sync_encounter_to_manager(
+            Some(&encounter),
+            &mut manager
+        ));
+
+        let character = &manager.player_characters["a"];
+        assert_eq!(character.hp, 6.0);
+        assert_eq!(character.mp, 2.0);
+        assert_eq!(character.damage_taken_this_turn, 4.0);
+        assert_eq!(character.healing_taken_this_turn, 1.0);
+        assert_eq!(
+            character.skill_last_cast_turns,
+            HashMap::from([("0".to_owned(), 4)])
+        );
+        let group = &manager.trpg_groups["party"];
+        assert_eq!(group.world_turn, 4);
+        assert_eq!(group.player_turns["a"].turns_passed, 4);
+        assert!(group.player_turns["a"].acted);
+        assert!(!group.player_turns["a"].skipped);
     }
 
     #[test]
