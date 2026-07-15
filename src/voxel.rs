@@ -2737,14 +2737,7 @@ fn sync_voxel_player_standees(
                 let entity = commands
                     .spawn((
                         Mesh3d(meshes.add(Plane3d::new(Vec3::Z, size * 0.5).mesh())),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: Color::WHITE,
-                            base_color_texture: Some(texture),
-                            alpha_mode: AlphaMode::Blend,
-                            cull_mode: None,
-                            unlit: true,
-                            ..default()
-                        })),
+                        MeshMaterial3d(materials.add(voxel_player_standee_material(texture))),
                         voxel_player_standee_transform(&camera_transform),
                         Visibility::Visible,
                         VoxelPlayerStandee {
@@ -2764,6 +2757,17 @@ fn sync_voxel_player_standees(
 }
 
 fn voxel_player_standee_transform(camera_transform: &Transform) -> Transform { *camera_transform }
+
+fn voxel_player_standee_material(texture: Handle<Image>) -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::WHITE,
+        base_color_texture: Some(texture),
+        alpha_mode: AlphaMode::Opaque,
+        cull_mode: None,
+        unlit: true,
+        ..default()
+    }
+}
 
 fn voxel_player_standee_size(image_size: Vec2) -> Vec2 {
     let width = (image_size.x / image_size.y.max(1.0) * PLAYER_STANDEE_HEIGHT)
@@ -2964,21 +2968,35 @@ fn capture_voxel_player_view(
         return;
     }
     let pending = state.pending.remove(0);
-    if let Ok(mut camera) = cameras.get_mut(pending.camera_entity) {
-        camera.is_active = false;
-    }
-    for (entity, visibility) in &pending.hidden_standees {
-        if let Ok((_, _, mut current_visibility)) = standees.get_mut(*entity) {
-            *current_visibility = visibility.clone();
-        }
-    }
     commands
         .spawn(Screenshot::image(
             pending.target.clone(),
         ))
         .observe(
             move |screenshot: On<ScreenshotCaptured>,
-                  napcat_sender: Option<Res<NapcatIOSender>>| {
+                  napcat_sender: Option<Res<NapcatIOSender>>,
+                  mut cameras: Query<
+                &mut Camera,
+                (
+                    With<VoxelPlayerCaptureCamera>,
+                    Without<VoxelPlayerStandee>,
+                ),
+            >,
+                  mut standees: Query<
+                &mut Visibility,
+                (
+                    With<VoxelPlayerStandee>,
+                    Without<VoxelPlayerCaptureCamera>,
+                ),
+            >| {
+                if let Ok(mut camera) = cameras.get_mut(pending.camera_entity) {
+                    camera.is_active = false;
+                }
+                for (entity, visibility) in &pending.hidden_standees {
+                    if let Ok(mut current_visibility) = standees.get_mut(*entity) {
+                        *current_visibility = visibility.clone();
+                    }
+                }
                 let save_result = screenshot
                     .image
                     .clone()
@@ -5570,6 +5588,16 @@ mod tests {
 
         assert_eq!(size.y, VOXEL_SIZE * 2.0);
         assert_eq!(size.x, VOXEL_SIZE);
+    }
+
+    #[test]
+    fn player_standee_material_is_opaque() {
+        let material = voxel_player_standee_material(Handle::<Image>::default());
+
+        assert!(matches!(
+            material.alpha_mode,
+            AlphaMode::Opaque
+        ));
     }
 
     #[test]
