@@ -357,6 +357,15 @@ fn paint_voxel_creative_item_icon(
             rays(0.58);
             cross(0.45, 0.45, 0.42);
         },
+        VoxelCreativeItem::ToolGun => {
+            box_outline((-0.82, -0.62), (0.42, 0.18));
+            line((0.42, -0.42), (0.92, -0.42));
+            line((-0.42, 0.18), (-0.12, 0.92));
+            line((-0.12, 0.92), (0.38, 0.92));
+            line((0.38, 0.92), (0.18, 0.18));
+            box_outline((-0.58, -0.42), (0.12, -0.04));
+            dot(-0.22, -0.23, 0.09);
+        },
         VoxelCreativeItem::Mode(VoxelEditMode::Add) => {
             box_outline((-0.75, -0.75), (0.35, 0.35));
             plus(0.48, 0.48, 0.4);
@@ -481,6 +490,10 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
                 egui::Color32::from_rgb(150, 42, 42),
             ),
         },
+        VoxelCreativeItem::ToolGun => (
+            "工具枪",
+            egui::Color32::from_rgb(238, 116, 30),
+        ),
         VoxelCreativeItem::Mode(mode) => match mode {
             VoxelEditMode::Add => (
                 "添加工具",
@@ -12072,14 +12085,24 @@ pub fn ui_system(
                         } else {
                             "WASD 移动 · 空格跳跃 · 双击空格飞行"
                         };
+                        let interaction_hint = if voxel_editor.is_tool_gun_equipped() {
+                            "左键发射 · R切换模式"
+                        } else {
+                            "左键拆除 · 右键放置/使用"
+                        };
                         ui.small(format!(
-                            "{movement_hint} · 当前工具：{} · 左键拆除 · 右键放置/使用 · 滚轮选择快捷栏 · Esc 退出",
+                            "{movement_hint} · 当前工具：{} · {interaction_hint} · 滚轮选择快捷栏 · Esc 退出",
                             voxel_editor.active_tool_label()
                         ));
                     } else {
+                        let interaction_hint = if voxel_editor.is_tool_gun_equipped() {
+                            "左键发射 · R切换模式"
+                        } else {
+                            "左键拆除 · 右键放置/使用"
+                        };
                         ui.small(format!(
-                            "当前工具：{} · 左键拆除 · 右键放置/使用 · 中键旋转 · Shift+中键平移",
-                            voxel_editor.active_tool_label()
+                            "当前工具：{} · {interaction_hint} · 中键旋转 · Shift+中键平移",
+                            voxel_editor.active_tool_label(),
                         ));
                     }
                     ui.collapsing("光照编辑器", |ui| {
@@ -12203,7 +12226,11 @@ pub fn ui_system(
                                     .range(0.1..=200.0)
                                     .speed(0.25),
                             );
-                            ui.label("右键点击方块或物理体；静态方块会按笔刷大小自动物理化");
+                            ui.label(if voxel_editor.is_tool_gun_equipped() {
+                                "左键点击方块或物理体；静态方块会按笔刷大小自动物理化"
+                            } else {
+                                "右键点击方块或物理体；静态方块会按笔刷大小自动物理化"
+                            });
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
                             }
@@ -12223,7 +12250,11 @@ pub fn ui_system(
                                     .range(0.25..=100.0)
                                     .speed(0.25),
                             );
-                            ui.label("右键点击爆心；每次爆炸最多新建40个物理碎块，超额方块会合并");
+                            ui.label(if voxel_editor.is_tool_gun_equipped() {
+                                "左键点击爆心；每次爆炸最多新建40个物理碎块，超额方块会合并"
+                            } else {
+                                "右键点击爆心；每次爆炸最多新建40个物理碎块，超额方块会合并"
+                            });
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
                             }
@@ -12409,6 +12440,27 @@ pub fn ui_system(
                             .num_columns(4)
                             .spacing(egui::vec2(10.0, 10.0))
                             .show(ui, |ui| {
+                                let tool_gun = VoxelCreativeItem::ToolGun;
+                                let (name, _) = voxel_creative_item_visual(tool_gun);
+                                ui.vertical_centered(|ui| {
+                                    if voxel_creative_drag_source(
+                                        ui,
+                                        egui::Id::new("voxel_catalog_tool_gun"),
+                                        VoxelCreativeDragPayload::Catalog(tool_gun),
+                                        tool_gun,
+                                        voxel_editor.creative_hotbar
+                                            [voxel_editor.selected_hotbar_slot]
+                                            == Some(tool_gun),
+                                        48.0,
+                                        None,
+                                    )
+                                    .on_hover_text("GMod风格工具枪：左键使用，R切换物理化、推开、拉近和爆炸模式")
+                                    .clicked()
+                                    {
+                                        picked_item = Some(tool_gun);
+                                    }
+                                    ui.small(name);
+                                });
                                 for (index, mode) in VoxelEditMode::ALL.into_iter().enumerate() {
                                     let item = VoxelCreativeItem::Mode(mode);
                                     let (name, _) = voxel_creative_item_visual(item);
@@ -12430,7 +12482,7 @@ pub fn ui_system(
                                         }
                                         ui.small(name);
                                     });
-                                    if (index + 1) % 4 == 0 {
+                                    if (index + 2) % 4 == 0 {
                                         ui.end_row();
                                     }
                                 }

@@ -327,6 +327,7 @@ pub(crate) enum VoxelCreativeItem {
     Material(u8),
     Light(VoxelLightTool),
     Mode(VoxelEditMode),
+    ToolGun,
 }
 
 #[derive(Component, Clone)]
@@ -454,6 +455,7 @@ pub(crate) struct VoxelEditorState {
     pub creative_hotbar: [Option<VoxelCreativeItem>; 10],
     pub selected_hotbar_slot: usize,
     equipped_item: Option<VoxelCreativeItem>,
+    tool_gun_mode: VoxelEditMode,
     pub light_tool: Option<VoxelLightTool>,
     pub placed_light_color: [f32; 3],
     pub placed_light_intensity: f32,
@@ -516,6 +518,7 @@ impl Default for VoxelEditorState {
             }),
             selected_hotbar_slot: 0,
             equipped_item: Some(VoxelCreativeItem::Material(1)),
+            tool_gun_mode: VoxelEditMode::Physics,
             light_tool: None,
             placed_light_color: [1.0, 0.78, 0.48],
             placed_light_intensity: 1_800.0,
@@ -566,12 +569,21 @@ impl VoxelEditorState {
     pub(crate) fn has_physics_selection(&self) -> bool { self.selection_bounds().is_some() }
 
     pub(crate) fn physics_selection_hint(&self) -> &str {
+        let primary = if self.is_tool_gun_equipped() { "左键" } else { "右键" };
         if self.selection_anchor.is_none() {
-            "依次右键点击两个方块，框选物理区域"
+            if primary == "左键" {
+                "依次左键点击两个方块，框选物理区域"
+            } else {
+                "依次右键点击两个方块，框选物理区域"
+            }
         } else if self.selection_end.is_none() {
-            "再右键点击一个方块，确定选区另一角"
+            if primary == "左键" {
+                "再左键点击一个方块，确定选区另一角"
+            } else {
+                "再右键点击一个方块，确定选区另一角"
+            }
         } else {
-            "选区已确定；可重新右键点击起点或生成物理体"
+            "选区已确定；可重新选择起点或生成物理体"
         }
     }
 
@@ -602,6 +614,11 @@ impl VoxelEditorState {
             },
             VoxelCreativeItem::Mode(mode) => {
                 self.mode = mode;
+                self.light_tool = None;
+                self.selected_light = None;
+            },
+            VoxelCreativeItem::ToolGun => {
+                self.mode = self.tool_gun_mode;
                 self.light_tool = None;
                 self.selected_light = None;
             },
@@ -658,14 +675,49 @@ impl VoxelEditorState {
         self.equip_creative_item(VoxelCreativeItem::Mode(mode));
     }
 
-    pub(crate) fn active_tool_label(&self) -> &'static str {
+    pub(crate) fn active_tool_label(&self) -> String {
         if self.equipped_item.is_none() {
-            return "空手";
+            return "空手".to_owned();
         }
-        self.light_tool.map_or_else(
-            || self.mode.label(),
-            VoxelLightTool::label,
-        )
+        if self.is_tool_gun_equipped() {
+            return format!(
+                "工具枪 · {}",
+                self.tool_gun_mode.label()
+            );
+        }
+        self.light_tool
+            .map_or_else(
+                || self.mode.label(),
+                VoxelLightTool::label,
+            )
+            .to_owned()
+    }
+
+    pub(crate) fn is_tool_gun_equipped(&self) -> bool {
+        self.equipped_item == Some(VoxelCreativeItem::ToolGun)
+    }
+
+    pub(crate) fn cycle_tool_gun_mode(&mut self) {
+        const MODES: [VoxelEditMode; 4] = [
+            VoxelEditMode::Physics,
+            VoxelEditMode::Push,
+            VoxelEditMode::Pull,
+            VoxelEditMode::Explode,
+        ];
+        let current = MODES
+            .iter()
+            .position(|mode| *mode == self.tool_gun_mode)
+            .unwrap_or(0);
+        self.tool_gun_mode = MODES[(current + 1) % MODES.len()];
+        if self.is_tool_gun_equipped() {
+            self.mode = self.tool_gun_mode;
+            self.selection_anchor = None;
+            self.selection_end = None;
+            self.physics_status = Some(format!(
+                "工具枪模式：{}",
+                self.tool_gun_mode.label()
+            ));
+        }
     }
 
     pub(crate) fn request_scene_snapshot(&mut self) { self.save_scene_requested = true; }
@@ -810,6 +862,12 @@ fn voxel_editor_shortcuts(
     }
     if keyboard.just_pressed(KeyCode::KeyE) {
         editor.creative_inventory_open = !editor.creative_inventory_open;
+    }
+    if keyboard.just_pressed(KeyCode::KeyR)
+        && !editor.creative_inventory_open
+        && editor.is_tool_gun_equipped()
+    {
+        editor.cycle_tool_gun_mode();
     }
     for (key, slot) in [
         (KeyCode::Digit1, 0),
@@ -2510,6 +2568,7 @@ fn voxel_player_camera_panel(
     mut images: ResMut<Assets<Image>>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
     mut editor: ResMut<VoxelPlayerCameraEditor>,
+    mut voxel_editor: ResMut<VoxelEditorState>,
     mut runtimes: ResMut<VoxelPlayerCameraRuntimes>,
     mut store: ResMut<Persistent<VoxelPlayerCameraStore>>,
     viewport_camera: Query<
@@ -2608,6 +2667,9 @@ fn voxel_player_camera_panel(
                     changed = true;
                 }
             }
+            if ui.button("使用当前PL视角").clicked() {
+                apply_voxel_player_view_to_editor(&mut voxel_editor, &transform);
+            }
             ui.label("位置");
             ui.horizontal(|ui| {
                 changed |= ui
@@ -2653,6 +2715,20 @@ fn voxel_player_camera_panel(
                 }
             }
         });
+}
+
+fn apply_voxel_player_view_to_editor(editor: &mut VoxelEditorState, transform: &Transform) {
+    let (yaw, pitch, _) = transform.rotation.to_euler(EulerRot::YXZ);
+    editor.first_person_enabled = false;
+    editor.first_person_flying = false;
+    editor.camera_yaw = yaw;
+    editor.camera_pitch = pitch;
+    editor.camera_focus = orbit_focus_preserving_camera_position(
+        transform.translation,
+        yaw,
+        pitch,
+        editor.camera_distance,
+    );
 }
 
 fn sync_voxel_player_standees(
@@ -4572,6 +4648,7 @@ fn edit_voxel_grid(
     }
     let left_pressed = mouse.pressed(MouseButton::Left);
     let right_pressed = mouse.pressed(MouseButton::Right);
+    let tool_gun_equipped = editor.is_tool_gun_equipped();
     if editor.equipped_item.is_none() && !left_pressed {
         return;
     }
@@ -4586,8 +4663,11 @@ fn edit_voxel_grid(
     if voxel_world_pointer_blocked(egui_owns_pointer, started_over_ui) {
         return;
     }
-    if let Some(action) = force_tool_action(editor.mode).filter(|_| !left_pressed) {
-        if !mouse.just_pressed(MouseButton::Right) {
+    if let Some(action) = force_tool_action(editor.mode) {
+        let fired = mouse.just_pressed(voxel_tool_fire_button(
+            tool_gun_equipped,
+        )) && (tool_gun_equipped || !left_pressed);
+        if !fired {
             return;
         }
         let (Ok(window), Ok((camera, camera_transform)), Ok(mut grid)) = (
@@ -4795,8 +4875,11 @@ fn edit_voxel_grid(
         });
         return;
     }
-    if editor.mode == VoxelEditMode::Physics && !left_pressed {
-        if !mouse.just_pressed(MouseButton::Right) {
+    if editor.mode == VoxelEditMode::Physics {
+        let fired = mouse.just_pressed(voxel_tool_fire_button(
+            tool_gun_equipped,
+        )) && (tool_gun_equipped || !left_pressed);
+        if !fired {
             return;
         }
         let (Ok(window), Ok((camera, camera_transform)), Ok(grid)) = (
@@ -4966,6 +5049,14 @@ fn voxel_edit_input_mode(
         Some(equipped_mode)
     } else {
         None
+    }
+}
+
+fn voxel_tool_fire_button(tool_gun_equipped: bool) -> MouseButton {
+    if tool_gun_equipped {
+        MouseButton::Left
+    } else {
+        MouseButton::Right
     }
 }
 
@@ -5493,9 +5584,9 @@ fn draw_voxel_target(
             Color::srgb(1.0, 0.3, 0.08),
         );
     }
-    // First person already has a centered crosshair. Drawing the world-space
-    // yellow selection cube there makes it look like a shader artifact.
-    if let Some(target) = target.filter(|_| !editor.first_person_enabled) {
+    // Keep the aimed voxel visible in both orbit and first-person views. In
+    // first person the ray originates at the centered crosshair.
+    if let Some(target) = target {
         let size = if matches!(
             editor.mode,
             VoxelEditMode::Physics | VoxelEditMode::Explode
@@ -5580,6 +5671,29 @@ mod tests {
 
         assert_eq!(standee.translation, camera.translation);
         assert_eq!(standee.rotation, camera.rotation);
+    }
+
+    #[test]
+    fn current_player_view_moves_the_gm_orbit_camera() {
+        let player_view = Transform::from_xyz(4.0, 5.0, 6.0).with_rotation(Quat::from_euler(
+            EulerRot::YXZ,
+            0.4,
+            -0.2,
+            0.0,
+        ));
+        let mut editor = VoxelEditorState {
+            first_person_enabled: true,
+            first_person_flying: true,
+            ..default()
+        };
+
+        apply_voxel_player_view_to_editor(&mut editor, &player_view);
+        let gm_view = editor_camera_transform(&editor);
+
+        assert!(!editor.first_person_enabled);
+        assert!(!editor.first_person_flying);
+        assert!(gm_view.translation.distance(player_view.translation) < 0.000_1);
+        assert!(gm_view.forward().dot(*player_view.forward()) > 0.999_9);
     }
 
     #[test]
@@ -6713,6 +6827,36 @@ mod tests {
         assert_eq!(editor.creative_hotbar[3], None);
         assert_eq!(editor.light_tool, None);
         assert_eq!(editor.active_tool_label(), "空手");
+    }
+
+    #[test]
+    fn tool_gun_uses_primary_fire_and_cycles_utility_modes() {
+        let mut editor = VoxelEditorState::default();
+
+        editor.equip_creative_item(VoxelCreativeItem::ToolGun);
+
+        assert!(editor.is_tool_gun_equipped());
+        assert_eq!(editor.mode, VoxelEditMode::Physics);
+        assert_eq!(
+            voxel_tool_fire_button(true),
+            MouseButton::Left
+        );
+        assert_eq!(
+            voxel_tool_fire_button(false),
+            MouseButton::Right
+        );
+        assert_eq!(
+            editor.active_tool_label(),
+            "工具枪 · 物理选区"
+        );
+
+        editor.cycle_tool_gun_mode();
+
+        assert_eq!(editor.mode, VoxelEditMode::Push);
+        assert_eq!(
+            editor.active_tool_label(),
+            "工具枪 · 推开"
+        );
     }
 
     #[test]
