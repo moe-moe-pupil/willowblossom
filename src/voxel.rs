@@ -3452,26 +3452,30 @@ fn explode_planet_voxels(
     planet: &mut VoxelOrbitalPlanet,
     local_origin: Vec3,
     radius: f32,
-) -> usize {
+) -> Vec<(IVec3, u8)> {
     let radius = radius.max(VOXEL_SIZE);
     let radius_squared = radius * radius;
-    let removed = planet
+    let mut selected = planet
         .cells
-        .keys()
-        .copied()
-        .filter(|cell| {
+        .iter()
+        .filter_map(|(cell, material)| {
             let center = cell.as_vec3() * VOXEL_SIZE;
-            center.distance_squared(local_origin) <= radius_squared
+            (center.distance_squared(local_origin) <= radius_squared).then_some((*cell, *material))
         })
         .collect::<Vec<_>>();
-    for cell in &removed {
-        planet.cells.remove(cell);
-        planet.removed.insert(*cell);
+    selected.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
+
+    // Use the exact same removal path as hand digging and physics extraction.
+    // Each removed surface cell reveals its buried neighbours. Those newly
+    // exposed cells stay in the planet instead of recursively joining this
+    // explosion, keeping a useful digging surface and a bounded edit cost.
+    let mut removed = Vec::with_capacity(selected.len());
+    for (cell, material) in selected {
+        if dig_planet_voxel(planet, cell) {
+            removed.push((cell, material));
+        }
     }
-    if !removed.is_empty() {
-        planet.dirty = true;
-    }
-    removed.len()
+    removed
 }
 
 fn sorted_planet_cells(planet: &VoxelOrbitalPlanet) -> Vec<(IVec3, u8)> {
@@ -4131,6 +4135,44 @@ fn spawn_voxel_physics_body_at(
             }
         })
         .id()
+}
+
+fn spawn_planet_explosion_fragments(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &VoxelMaterials,
+    planet_transform: &GlobalTransform,
+    removed: Vec<(IVec3, u8)>,
+) -> Vec<Entity> {
+    let part_count = removed.len().min(MAX_EXPLOSION_NEW_PHYSICS_BODIES);
+    let mut fragments = Vec::with_capacity(part_count);
+    for cells in split_voxel_cells(removed, part_count) {
+        let origin = cells
+            .iter()
+            .map(|(cell, _)| *cell)
+            .reduce(IVec3::min)
+            .unwrap_or(IVec3::ZERO);
+        let local_cells = cells
+            .into_iter()
+            .map(|(cell, material)| (cell - origin, material))
+            .collect::<Vec<_>>();
+        let transform = Transform::from_matrix(
+            planet_transform.to_matrix()
+                * Mat4::from_translation(
+                    origin.as_vec3() * VOXEL_SIZE - Vec3::splat(VOXEL_SIZE * 0.5),
+                ),
+        );
+        fragments.push(spawn_voxel_physics_body_at(
+            commands,
+            meshes,
+            materials,
+            local_cells,
+            transform,
+            LinearVelocity::ZERO,
+            AngularVelocity::ZERO,
+        ));
+    }
+    fragments
 }
 
 fn process_voxel_scene_history(
@@ -4829,8 +4871,24 @@ fn edit_voxel_grid(
                     local_origin,
                     editor.physics_explosion_radius,
                 );
+                let removed_count = removed.len();
+                let fragments = spawn_planet_explosion_fragments(
+                    &mut commands,
+                    &mut meshes,
+                    &materials,
+                    transform,
+                    removed,
+                );
+                let fragment_count = fragments.len();
+                if fragment_count > 0 {
+                    editor.physics_action_requested = Some(VoxelPhysicsRequest {
+                        action: VoxelPhysicsAction::Explode,
+                        target: fragments.first().copied(),
+                        origin: interaction_point,
+                    });
+                }
                 editor.physics_status = Some(format!(
-                    "行星爆炸已移除 {removed} 个 0.25 体素"
+                    "行星爆炸挖出 {removed_count} 个 0.25 体素并生成 {fragment_count} 个物理碎块"
                 ));
             }
             return;
@@ -6264,12 +6322,10 @@ mod tests {
     }
 
     #[test]
-    fn planet_explosion_carves_canonical_voxels_directly() {
-        let cells = prism(IVec3::splat(-2), IVec3::splat(3))
-            .map(|cell| (cell, 3))
-            .collect::<HashMap<_, _>>();
+    fn planet_explosion_extracts_canonical_voxels_and_reveals_buried_cells() {
+        let surface = IVec3::new(0, ORBITAL_PLANET_VOXEL_RADIUS, 0);
         let mut planet = VoxelOrbitalPlanet {
-            cells,
+            cells: HashMap::from([(surface, 3)]),
             removed: HashSet::new(),
             mesh_entities: Vec::new(),
             mesh_handles: Vec::new(),
@@ -6279,13 +6335,14 @@ mod tests {
 
         let removed = explode_planet_voxels(
             &mut planet,
-            Vec3::ZERO,
-            VOXEL_SIZE * 1.1,
+            surface.as_vec3() * VOXEL_SIZE,
+            VOXEL_SIZE,
         );
 
-        assert!(removed > 0);
+        assert_eq!(removed, vec![(surface, 3)]);
         assert_eq!(planet.voxel_size, VOXEL_SIZE);
-        assert_eq!(planet.removed.len(), removed);
+        assert_eq!(planet.removed.len(), removed.len());
+        assert!(planet.cells.contains_key(&(surface - IVec3::Y)));
         assert!(planet.dirty);
     }
 
@@ -7156,6 +7213,7 @@ mod tests {
             .unwrap();
         assert!(!planet.cells.contains_key(&selected_cell));
         assert!(planet.removed.contains(&selected_cell));
+        assert!(!planet.cells.is_empty());
         let mut bodies = app.world_mut().query::<(&VoxelPhysicsBody, &Transform)>();
         let (body, transform) = bodies.single(app.world()).unwrap();
         assert_eq!(body.cells, vec![(IVec3::ZERO, 1)]);
