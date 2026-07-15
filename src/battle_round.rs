@@ -26,6 +26,14 @@ use serde::{
     Serialize,
 };
 
+#[cfg(test)]
+use crate::rule_engine::{
+    BuffEffect,
+    BuffField,
+    BuffKind,
+    BuffSpec,
+    BuffValue,
+};
 use crate::{
     napcat::{
         arrogance_damage_dealt_multiplier,
@@ -35,6 +43,7 @@ use crate::{
         character_champion_damage_bonus_per_stack,
         character_champion_damage_reduction_per_stack,
         character_chaos_output_variance,
+        character_damage_attribute_multiplier,
         character_damage_dealt_talent_buffs,
         character_damage_taken_attribute_multiplier,
         character_dominion_max_hp_bonus_cap,
@@ -44,6 +53,7 @@ use crate::{
         character_endless_pain_bonus_damage_per_stack,
         character_fighting_spirit_damage_taken_multiplier,
         character_gale_force_battle_speeds,
+        character_healing_attribute_multiplier,
         character_infinite_focus_damage_bonus_per_stack,
         character_keen_evasion_available,
         character_large_hit_damage_taken_modifier,
@@ -94,6 +104,7 @@ use crate::{
         parse_rule_with_named_args,
         Action,
         ActorRef,
+        BuffTickAction,
         DamageType,
         RuleBuffTemplate,
         RuleEngineState,
@@ -188,6 +199,8 @@ pub struct BattleParticipantSnapshot {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit_template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_character: Option<PlayerCharacter>,
     #[serde(default)]
     pub player_character: bool,
     #[serde(default)]
@@ -1704,7 +1717,8 @@ fn encounter_action_ui(
         })
         .collect::<Vec<_>>();
     let skills = character_for_participant(&actor, manager)
-        .map(character_skills)
+        .as_ref()
+        .map(|character| character_skills(character))
         .unwrap_or_default();
 
     ui.label(format!(
@@ -2064,15 +2078,19 @@ impl BattleRoundStore {
         };
         let actor_character = character_for_participant(&actor_snapshot, manager);
         let actor_damage_dealt_buffs = actor_character
+            .as_ref()
             .map(|character| character_damage_dealt_talent_buffs(character, actor_id))
             .unwrap_or_default();
         let actor_physical_damage_lifesteal = actor_character
+            .as_ref()
             .map(character_physical_damage_lifesteal)
             .unwrap_or(0.0);
         let actor_physical_damage_followup_rate = actor_character
+            .as_ref()
             .map(character_physical_damage_followup_rate)
             .unwrap_or(0.0);
         let actor_minimum_damage_floor = actor_character
+            .as_ref()
             .map(character_minimum_damage_floor)
             .unwrap_or(0.0);
         let actor_name = actor_snapshot.display_name.clone();
@@ -2154,14 +2172,14 @@ impl BattleRoundStore {
                 } => {
                     let actor_damage_multiplier = participant_damage_multiplier(
                         &actor_snapshot,
-                        actor_character,
+                        actor_character.as_ref(),
                         &basic_config,
                         completed_participant_turns(encounter),
                         damage_type,
                     );
                     let fallback_radius = battle_skill_damage_range_radius(
                         skill.range,
-                        actor_character,
+                        actor_character.as_ref(),
                         damage_type,
                         skill.skill_type.as_deref(),
                     );
@@ -2217,6 +2235,7 @@ impl BattleRoundStore {
                                 target.champion_stacks,
                             )
                             * target_character
+                                .as_ref()
                                 .map(|character| {
                                     character_damage_taken_attribute_multiplier(
                                         character,
@@ -2225,6 +2244,7 @@ impl BattleRoundStore {
                                 })
                                 .unwrap_or(1.0)
                             * target_character
+                                .as_ref()
                                 .map(|character| {
                                     character_fighting_spirit_damage_taken_multiplier(
                                         character,
@@ -2248,6 +2268,7 @@ impl BattleRoundStore {
                             * target_damage_multiplier)
                             .max(0.0);
                         let target_large_hit_modifier = target_character
+                            .as_ref()
                             .map(character_large_hit_damage_taken_modifier)
                             .unwrap_or(1.0);
                         let typed_final_amount = (incoming_amount
@@ -2404,14 +2425,16 @@ impl BattleRoundStore {
                 SkillEffect::Heal { amount, target } => {
                     let actor_healing_multiplier = participant_healing_multiplier(
                         &actor_snapshot,
-                        actor_character,
+                        actor_character.as_ref(),
                         &basic_config,
                     );
                     let actor_mutual_aid_healing_rate = actor_character
+                        .as_ref()
                         .map(character_mutual_aid_healing_rate)
                         .unwrap_or(0.0);
-                    let actor_echoing_memory_healing_rates =
-                        actor_character.and_then(character_echoing_memory_healing_rates);
+                    let actor_echoing_memory_healing_rates = actor_character
+                        .as_ref()
+                        .and_then(|character| character_echoing_memory_healing_rates(character));
                     let target_ids = resolve_skill_targets(
                         target,
                         actor_id,
@@ -2451,9 +2474,11 @@ impl BattleRoundStore {
                         };
                         let target_character = character_for_participant(target, manager);
                         let target_dying_healing_modifier = target_character
+                            .as_ref()
                             .map(character_dying_healing_taken_modifier)
                             .unwrap_or(1.0);
                         let target_mutual_aid_healing_rate = target_character
+                            .as_ref()
                             .map(character_mutual_aid_healing_rate)
                             .unwrap_or(0.0);
                         let target_healing_multiplier = target.healing_taken_modifier
@@ -2689,19 +2714,24 @@ impl BattleRoundStore {
                     .and_then(|participant| participant.unit_template_id.clone());
                 let stat_config = manager.character_stat_config_for_target(&resolved_target_id);
                 let buff = buff.to_buff_spec(actor_id);
-                if let Some(unit_template_id) = unit_template_id {
-                    if let Some(encounter) = self.encounters.get_mut(encounter_id) {
-                        let target_name = encounter
-                            .participants
-                            .iter()
-                            .find(|participant| participant.target_id == resolved_target_id)
-                            .map(|participant| participant.display_name.clone())
-                            .unwrap_or(resolved_target_id.clone());
-                        encounter.action_log.push(format!(
-                            "{}是战斗单位；{}状态未写入共享单位模板{}",
-                            target_name, buff.name, unit_template_id
-                        ));
-                    }
+                if unit_template_id.is_some() {
+                    let Some(participant) =
+                        self.encounters.get_mut(encounter_id).and_then(|encounter| {
+                            encounter
+                                .participants
+                                .iter_mut()
+                                .find(|participant| participant.target_id == resolved_target_id)
+                        })
+                    else {
+                        continue;
+                    };
+                    let Some(mut character) = character_for_participant(participant, manager)
+                    else {
+                        continue;
+                    };
+                    character.active_buffs.push(buff);
+                    participant.unit_character = Some(character);
+                    sync_participant_from_manager_with_vitals(participant, manager);
                     continue;
                 } else {
                     let Some(character) = manager.player_characters.get_mut(&resolved_target_id)
@@ -2725,7 +2755,7 @@ impl BattleRoundStore {
                             .find(|participant| participant.target_id == resolved_target_id)
                     })
                 {
-                    sync_participant_from_manager(participant, manager);
+                    sync_participant_from_manager_with_vitals(participant, manager);
                 }
             }
         }
@@ -2826,7 +2856,7 @@ fn refresh_encounter_players(
         .iter_mut()
         .filter(|participant| participant.unit_template_id.is_some())
     {
-        sync_participant_from_manager(participant, manager);
+        refresh_unit_participant_from_template(participant, manager);
     }
     for target_id in &group.players {
         if let Some(participant) = encounter
@@ -2974,6 +3004,7 @@ fn sync_battle_round_buff_advancement(
     let mut changed = sync_encounter_to_manager(Some(encounter), manager);
     for _ in 0..rounds_to_advance {
         changed |= advance_buffs_for_players(manager, &player_ids, rule_engine_state);
+        changed |= advance_unit_participant_buffs(store, encounter_id, manager);
     }
     if rounds_to_advance == 0 {
         return changed;
@@ -2984,10 +3015,237 @@ fn sync_battle_round_buff_advancement(
             .iter_mut()
             .filter(|participant| participant.player_character)
         {
-            sync_participant_from_manager(participant, manager);
+            sync_participant_from_manager_with_vitals(participant, manager);
         }
     }
     true
+}
+
+#[derive(Clone)]
+struct BattleBuffTick {
+    source_id: String,
+    target_id: String,
+    action: BuffTickAction,
+}
+
+fn advance_unit_participant_buffs(
+    store: &mut BattleRoundStore,
+    encounter_id: &str,
+    manager: &NapcatMessageManager,
+) -> bool {
+    let Some(encounter) = store.encounters.get_mut(encounter_id) else {
+        return false;
+    };
+    let mut changed = false;
+    let mut ticks = Vec::new();
+    for participant in encounter
+        .participants
+        .iter_mut()
+        .filter(|participant| participant.unit_template_id.is_some())
+    {
+        let Some(mut character) = character_for_participant(participant, manager) else {
+            continue;
+        };
+        let before = character.active_buffs.clone();
+        character.active_buffs.retain_mut(|buff| {
+            if buff.turns_remaining == 0 {
+                return true;
+            }
+            if buff.turns_remaining < 0 {
+                return false;
+            }
+            buff.turns_remaining -= 1;
+            if buff.turns_remaining <= 0 {
+                return false;
+            }
+            ticks.extend(
+                buff.tick_actions
+                    .iter()
+                    .cloned()
+                    .map(|action| BattleBuffTick {
+                        source_id: buff.source_id.clone(),
+                        target_id: participant.target_id.clone(),
+                        action,
+                    }),
+            );
+            true
+        });
+        if character.active_buffs != before {
+            participant.unit_character = Some(character);
+            sync_participant_from_manager_with_vitals(participant, manager);
+            changed = true;
+        }
+    }
+    if !ticks.is_empty() {
+        apply_battle_buff_ticks(encounter, manager, &ticks);
+        changed = true;
+    }
+    changed
+}
+
+fn apply_battle_buff_ticks(
+    encounter: &mut BattleEncounter,
+    manager: &NapcatMessageManager,
+    ticks: &[BattleBuffTick],
+) {
+    for tick in ticks {
+        let source_character = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == tick.source_id)
+            .and_then(|participant| character_for_participant(participant, manager))
+            .or_else(|| manager.player_characters.get(&tick.source_id).cloned());
+        let source_name = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == tick.source_id)
+            .map(|participant| participant.display_name.clone())
+            .unwrap_or_else(|| tick.source_id.clone());
+        let Some(target_index) = encounter
+            .participants
+            .iter()
+            .position(|participant| participant.target_id == tick.target_id)
+        else {
+            continue;
+        };
+        let target_character = character_for_participant(
+            &encounter.participants[target_index],
+            manager,
+        );
+        let target_name = encounter.participants[target_index].display_name.clone();
+        match tick.action {
+            BuffTickAction::Damage {
+                amount,
+                damage_type,
+            } => {
+                let stat_config = manager.character_stat_config_for_target(&tick.source_id);
+                let source_multiplier = source_character
+                    .as_ref()
+                    .map(|source| {
+                        source.damage_dealt_modifier
+                            * low_hp_damage_multiplier(source.hp, source.max_hp)
+                            * character_damage_attribute_multiplier(
+                                source,
+                                &stat_config,
+                                trpg_damage_bonus_kind(damage_type),
+                            )
+                    })
+                    .unwrap_or(1.0);
+                let target_multiplier = encounter.participants[target_index].damage_taken_modifier
+                    * target_character
+                        .as_ref()
+                        .map(|target| {
+                            character_damage_taken_attribute_multiplier(
+                                target,
+                                trpg_damage_taken_kind(damage_type),
+                            )
+                        })
+                        .unwrap_or(1.0);
+                let final_amount =
+                    (amount.max(0.0) * source_multiplier * target_multiplier).max(0.0);
+                let outcome = apply_participant_damage_for_battle(
+                    &mut encounter.participants[target_index],
+                    final_amount,
+                    &tick.source_id,
+                );
+                encounter.action_log.push(format!(
+                    "状态触发：{}对{}造成{}点伤害",
+                    source_name,
+                    target_name,
+                    format_number(final_amount)
+                ));
+                if let Some(outcome) = outcome {
+                    apply_battle_defeat_outcome(encounter, outcome);
+                }
+            },
+            BuffTickAction::FixedDamage { amount, .. } => {
+                let final_amount = amount.max(0.0);
+                let outcome = apply_participant_damage_for_battle(
+                    &mut encounter.participants[target_index],
+                    final_amount,
+                    &tick.source_id,
+                );
+                encounter.action_log.push(format!(
+                    "状态触发：{}对{}造成{}点固定伤害",
+                    source_name,
+                    target_name,
+                    format_number(final_amount)
+                ));
+                if let Some(outcome) = outcome {
+                    apply_battle_defeat_outcome(encounter, outcome);
+                }
+            },
+            BuffTickAction::Heal { amount } => {
+                let stat_config = manager.character_stat_config_for_target(&tick.source_id);
+                let source_multiplier = source_character
+                    .as_ref()
+                    .map(|source| {
+                        source.healing_dealt_modifier
+                            * character_healing_attribute_multiplier(source, &stat_config)
+                            * wounded_healing_dealt_multiplier(
+                                source.hp,
+                                source.max_hp,
+                                character_wounded_healing_dealt_modifier(source),
+                            )
+                    })
+                    .unwrap_or(1.0);
+                let target_multiplier = encounter.participants[target_index].healing_taken_modifier
+                    * participant_wound_healing_multiplier(&encounter.participants[target_index])
+                    * target_character
+                        .as_ref()
+                        .map(|target| {
+                            dying_healing_taken_multiplier(
+                                target.hp,
+                                target.max_hp,
+                                character_dying_healing_taken_modifier(target),
+                            )
+                        })
+                        .unwrap_or(1.0);
+                let final_amount =
+                    (amount.max(0.0) * source_multiplier * target_multiplier).max(0.0);
+                let mutual_aid_healing =
+                    if tick.source_id != tick.target_id && final_amount > f32::EPSILON {
+                        final_amount
+                            * (source_character
+                                .as_ref()
+                                .map(character_mutual_aid_healing_rate)
+                                .unwrap_or(0.0)
+                                + target_character
+                                    .as_ref()
+                                    .map(character_mutual_aid_healing_rate)
+                                    .unwrap_or(0.0))
+                    } else {
+                        0.0
+                    };
+                let target = &mut encounter.participants[target_index];
+                record_participant_healing_taken(target, final_amount);
+                target.hp = (target.hp + final_amount).min(target.max_hp);
+                target.alive = target.hp > 0.0;
+                encounter.action_log.push(format!(
+                    "状态触发：{}为{}回复{}点生命值",
+                    source_name,
+                    target_name,
+                    format_number(final_amount)
+                ));
+                if mutual_aid_healing > f32::EPSILON {
+                    if let Some(source) = encounter
+                        .participants
+                        .iter_mut()
+                        .find(|participant| participant.target_id == tick.source_id)
+                    {
+                        record_participant_healing_taken(source, mutual_aid_healing);
+                        source.hp = (source.hp + mutual_aid_healing).min(source.max_hp);
+                        source.alive = source.hp > 0.0;
+                        encounter.action_log.push(format!(
+                            "{}触发互帮互助，回复{}点生命值",
+                            source_name,
+                            format_number(mutual_aid_healing)
+                        ));
+                    }
+                }
+            },
+        }
+    }
 }
 
 fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) -> u64 {
@@ -2996,6 +3254,11 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant.target_id.hash(&mut hasher);
         participant.display_name.hash(&mut hasher);
         participant.unit_template_id.hash(&mut hasher);
+        if let Some(character) = participant.unit_character.as_ref() {
+            if let Ok(active_buffs) = serde_json::to_string(&character.active_buffs) {
+                active_buffs.hash(&mut hasher);
+            }
+        }
         participant.player_character.hash(&mut hasher);
         participant.str_.hash(&mut hasher);
         participant.agi.hash(&mut hasher);
@@ -3146,6 +3409,7 @@ fn participant_from_character(
         target_id: target_id.to_owned(),
         display_name: character_display_name(target_id, character, manager),
         unit_template_id: None,
+        unit_character: None,
         player_character: true,
         turn: 0,
         str_: status.str_,
@@ -3222,6 +3486,7 @@ fn participant_from_unit_template(
         target_id: target_id.to_owned(),
         display_name: unit_participant_display_name(target_id, unit_id, unit),
         unit_template_id: Some(unit_id.to_owned()),
+        unit_character: Some(character.clone()),
         player_character: false,
         turn: 0,
         str_: status.str_,
@@ -3298,6 +3563,7 @@ fn participant_from_target(
         target_id: target_id.to_owned(),
         display_name: fallback_target_display_name(target_id, manager),
         unit_template_id: None,
+        unit_character: None,
         player_character: false,
         turn: 0,
         str_: 0,
@@ -3362,9 +3628,19 @@ fn sync_participant_from_manager(
 ) {
     if let Some(unit_id) = participant.unit_template_id.as_deref() {
         if let Some(unit) = manager.unit_pool.get(unit_id) {
-            let character = &unit.character;
+            let mut character = character_for_participant(participant, manager)
+                .unwrap_or_else(|| unit.character.clone());
+            let stat_config = manager.character_stat_config_for_target(&participant.target_id);
+            let mut rule_engine_state = RuleEngineState::default();
+            sync_character_buffs(
+                &participant.target_id,
+                &mut character,
+                &stat_config,
+                &mut rule_engine_state,
+                &manager.skill_pool,
+            );
             let status = character.status.combined(&character.extra_status);
-            let (speed, low_survivor_speed) = character_battle_speeds(character);
+            let (speed, low_survivor_speed) = character_battle_speeds(&character);
             participant.display_name =
                 unit_participant_display_name(&participant.target_id, unit_id, unit);
             participant.player_character = false;
@@ -3384,27 +3660,27 @@ fn sync_participant_from_manager(
             participant.healing_dealt_modifier = character.healing_dealt_modifier;
             participant.healing_taken_modifier = character.healing_taken_modifier;
             participant.arrogance_damage_bonus_per_source =
-                character_arrogance_damage_bonus_per_source(character);
+                character_arrogance_damage_bonus_per_source(&character);
             participant.endless_pain_bonus_damage_per_stack =
-                character_endless_pain_bonus_damage_per_stack(character);
+                character_endless_pain_bonus_damage_per_stack(&character);
             participant.infinite_focus_damage_bonus_per_stack =
-                character_infinite_focus_damage_bonus_per_stack(character);
+                character_infinite_focus_damage_bonus_per_stack(&character);
             participant.one_heart_healing_bonus_per_stack =
-                character_one_heart_healing_bonus_per_stack(character);
+                character_one_heart_healing_bonus_per_stack(&character);
             sync_participant_keen_evasion(
                 participant,
-                character_keen_evasion_available(character),
+                character_keen_evasion_available(&character),
             );
             participant.liquid_body_damage_delay_rate =
-                character_liquid_body_damage_delay_rate(character);
+                character_liquid_body_damage_delay_rate(&character);
             participant.liquid_body_self_healing_rate =
-                character_liquid_body_self_healing_rate(character);
+                character_liquid_body_self_healing_rate(&character);
             participant.champion_damage_bonus_per_stack =
-                character_champion_damage_bonus_per_stack(character);
+                character_champion_damage_bonus_per_stack(&character);
             participant.champion_damage_reduction_per_stack =
-                character_champion_damage_reduction_per_stack(character);
-            let dominion_gain_rate = character_dominion_max_hp_gain_rate(character);
-            let dominion_bonus_cap = character_dominion_max_hp_bonus_cap(character);
+                character_champion_damage_reduction_per_stack(&character);
+            let dominion_gain_rate = character_dominion_max_hp_gain_rate(&character);
+            let dominion_bonus_cap = character_dominion_max_hp_bonus_cap(&character);
             participant.dominion_max_hp_gain_rate = dominion_gain_rate;
             participant.dominion_max_hp_bonus_cap = dominion_bonus_cap;
             participant.dominion_max_hp_bonus = if dominion_gain_rate > f32::EPSILON {
@@ -3416,13 +3692,19 @@ fn sync_participant_from_manager(
             };
             participant.max_hp = character.max_hp + participant.dominion_max_hp_bonus;
             participant.sin_on_sin_exp_bonus_per_stack =
-                character_sin_on_sin_exp_bonus_per_stack(character);
-            participant.sin_on_sin_recovery_rate = character_sin_on_sin_recovery_rate(character);
+                character_sin_on_sin_exp_bonus_per_stack(&character);
+            participant.sin_on_sin_recovery_rate = character_sin_on_sin_recovery_rate(&character);
             participant.penance_healing_bonus_percent =
-                character_penance_healing_bonus_percent(character);
-            participant.hp = participant.hp.min(participant.max_hp);
-            participant.mp = participant.mp.min(participant.max_mp);
+                character_penance_healing_bonus_percent(&character);
+            participant.hp = character.hp.clamp(0.0, participant.max_hp.max(0.0));
+            participant.mp = character.mp.clamp(0.0, participant.max_mp.max(0.0));
             participant.alive = participant.hp > 0.0;
+            character.hp = participant.hp;
+            character.mp = participant.mp;
+            character.damage_taken_this_turn = participant.damage_taken_this_turn;
+            character.healing_taken_this_turn = participant.healing_taken_this_turn;
+            character.skill_last_cast_turns = participant.skill_last_used_turns.clone();
+            participant.unit_character = Some(character);
         }
         return;
     }
@@ -3511,6 +3793,62 @@ fn sync_participant_from_manager(
         participant.penance_healing_bonus_percent = 0.0;
         participant.display_name = participant_display_name(&participant.target_id, manager);
     }
+}
+
+fn sync_participant_from_manager_with_vitals(
+    participant: &mut BattleParticipantSnapshot,
+    manager: &NapcatMessageManager,
+) {
+    sync_participant_from_manager(participant, manager);
+    let vitals = if participant.unit_template_id.is_some() {
+        participant
+            .unit_character
+            .as_ref()
+            .map(|character| (character.hp, character.mp))
+    } else {
+        manager
+            .player_characters
+            .get(&participant.target_id)
+            .map(|character| (character.hp, character.mp))
+    };
+    if let Some((hp, mp)) = vitals {
+        participant.hp = hp.clamp(0.0, participant.max_hp.max(0.0));
+        participant.mp = mp.clamp(0.0, participant.max_mp.max(0.0));
+        participant.alive = participant.hp > 0.0;
+    }
+}
+
+fn refresh_unit_participant_from_template(
+    participant: &mut BattleParticipantSnapshot,
+    manager: &NapcatMessageManager,
+) {
+    let Some(unit_id) = participant.unit_template_id.as_deref() else {
+        return;
+    };
+    let Some(unit) = manager.unit_pool.get(unit_id) else {
+        return;
+    };
+    let current = character_for_participant(participant, manager);
+    let mut refreshed = unit.character.clone();
+    if let Some(current) = current {
+        refreshed.active_buffs = current.active_buffs;
+        refreshed.hp = current
+            .buff_base_stats
+            .as_ref()
+            .map(|base| base.hp)
+            .unwrap_or(participant.hp);
+        refreshed.mp = current
+            .buff_base_stats
+            .as_ref()
+            .map(|base| base.mp)
+            .unwrap_or(participant.mp);
+        refreshed.damage_taken_this_turn = participant.damage_taken_this_turn;
+        refreshed.healing_taken_this_turn = participant.healing_taken_this_turn;
+        refreshed.skill_last_cast_turns = participant.skill_last_used_turns.clone();
+    }
+    refreshed.buff_base_stats = None;
+    participant.unit_character = Some(refreshed);
+    sync_participant_from_manager(participant, manager);
 }
 
 fn living_player_participant_count(encounter: &BattleEncounter) -> usize {
@@ -3660,15 +3998,54 @@ fn next_unit_participant_id(encounter: &BattleEncounter, unit_id: &str) -> Strin
     unreachable!("unbounded unit participant id search should always return")
 }
 
-fn character_for_participant<'a>(
+fn character_for_participant(
     participant: &BattleParticipantSnapshot,
-    manager: &'a NapcatMessageManager,
-) -> Option<&'a PlayerCharacter> {
-    if let Some(unit_id) = participant.unit_template_id.as_deref() {
-        return manager.unit_pool.get(unit_id).map(|unit| &unit.character);
+    manager: &NapcatMessageManager,
+) -> Option<PlayerCharacter> {
+    let mut character = if let Some(unit_id) = participant.unit_template_id.as_deref() {
+        participant.unit_character.clone().or_else(|| {
+            manager
+                .unit_pool
+                .get(unit_id)
+                .map(|unit| unit.character.clone())
+        })?
+    } else {
+        manager
+            .player_characters
+            .get(&participant.target_id)?
+            .clone()
+    };
+    if let Some(base_stats) = character.buff_base_stats.as_mut() {
+        base_stats.hp = (base_stats.hp + participant.hp - character.hp).max(0.0);
+        base_stats.mp = (base_stats.mp + participant.mp - character.mp).max(0.0);
     }
-
-    manager.player_characters.get(&participant.target_id)
+    character.hp = participant.hp;
+    character.mp = participant.mp;
+    character.damage_taken_this_turn = participant.damage_taken_this_turn;
+    character.healing_taken_this_turn = participant.healing_taken_this_turn;
+    character.skill_last_cast_turns = participant.skill_last_used_turns.clone();
+    if participant.unit_template_id.is_none() {
+        character.max_hp = participant.max_hp;
+        character.max_mp = participant.max_mp;
+        character.hp_regen = participant.hp_regen;
+        character.mp_regen = participant.mp_regen;
+        character.speed = participant.speed;
+        character.damage_dealt_modifier = participant.damage_dealt_modifier;
+        character.damage_taken_modifier = participant.damage_taken_modifier;
+        character.healing_dealt_modifier = participant.healing_dealt_modifier;
+        character.healing_taken_modifier = participant.healing_taken_modifier;
+        character.status.str_ = participant.str_;
+        character.status.agi = participant.agi;
+        character.status.dex = participant.dex;
+        character.status.int_ = participant.int_;
+        character.status.wis = participant.wis;
+        character.extra_status.str_ = 0;
+        character.extra_status.agi = 0;
+        character.extra_status.dex = 0;
+        character.extra_status.int_ = 0;
+        character.extra_status.wis = 0;
+    }
+    Some(character)
 }
 
 fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
@@ -4379,6 +4756,7 @@ mod area_tests {
             target_id: target_id.to_owned(),
             display_name: target_id.to_owned(),
             unit_template_id: None,
+            unit_character: None,
             player_character: false,
             turn: 0,
             str_: 0,
@@ -4466,6 +4844,7 @@ mod tests {
             target_id: id.to_owned(),
             display_name: id.to_owned(),
             unit_template_id: None,
+            unit_character: None,
             player_character: false,
             turn,
             str_: 0,
@@ -4754,12 +5133,348 @@ mod tests {
         assert_eq!(participant.max_hp, 12.0);
 
         let skills = character_for_participant(&participant, &manager)
-            .map(character_skills)
+            .as_ref()
+            .map(|character| character_skills(character))
             .unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "黏液喷吐");
         assert_eq!(skills[0].mp_cost, 1.0);
         assert_eq!(skills[0].cooldown_turns, 2);
+    }
+
+    #[test]
+    fn battle_buffs_are_isolated_per_unit_instance_and_expire() {
+        let mut manager = empty_manager();
+        let caster = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("caster".to_owned(), caster.clone());
+        let unit = UnitPoolEntry {
+            label: "史莱姆".to_owned(),
+            note: String::new(),
+            legacy_member_id: None,
+            character: PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                ..Default::default()
+            },
+        };
+        manager.unit_pool.insert("slime".to_owned(), unit.clone());
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![
+                    participant_from_character("caster", &caster, &manager),
+                    participant_from_unit_template("unit:slime#1", "slime", &unit),
+                    participant_from_unit_template("unit:slime#2", "slime", &unit),
+                ],
+                ..Default::default()
+            });
+        let guard = CharacterSkill {
+            index: 0,
+            name: "守护术".to_owned(),
+            note: "主动使用给予目标2回合守护状态使承伤设为0.5".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let damage = CharacterSkill {
+            index: 1,
+            name: "打击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use_with_buffs(
+            "battle",
+            "caster",
+            "unit:slime#1",
+            &guard,
+            &mut manager,
+            None,
+        ));
+
+        assert!(manager.unit_pool["slime"].character.active_buffs.is_empty());
+        assert!((manager.unit_pool["slime"].character.damage_taken_modifier - 1.0).abs() < 0.0001);
+        let encounter = &store.encounters["battle"];
+        let guarded = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "unit:slime#1")
+            .unwrap();
+        let unguarded = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "unit:slime#2")
+            .unwrap();
+        assert!((guarded.damage_taken_modifier - 0.5).abs() < 0.0001);
+        assert_eq!(
+            guarded.unit_character.as_ref().unwrap().active_buffs.len(),
+            1
+        );
+        assert!((unguarded.damage_taken_modifier - 1.0).abs() < 0.0001);
+        assert!(unguarded
+            .unit_character
+            .as_ref()
+            .unwrap()
+            .active_buffs
+            .is_empty());
+        let serialized = serde_json::to_string(&store).unwrap();
+        let restored = serde_json::from_str::<BattleRoundStore>(&serialized).unwrap();
+        let restored_guarded = restored.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "unit:slime#1")
+            .unwrap();
+        assert_eq!(
+            restored_guarded
+                .unit_character
+                .as_ref()
+                .unwrap()
+                .active_buffs
+                .len(),
+            1
+        );
+
+        assert!(store.record_skill_use(
+            "battle",
+            "caster",
+            "unit:slime#1",
+            &damage,
+            &manager,
+            None,
+        ));
+        assert!(store.record_skill_use(
+            "battle",
+            "caster",
+            "unit:slime#2",
+            &damage,
+            &manager,
+            None,
+        ));
+        let encounter = &store.encounters["battle"];
+        assert!(
+            (encounter
+                .participants
+                .iter()
+                .find(|participant| participant.target_id == "unit:slime#1")
+                .unwrap()
+                .hp
+                - 15.0)
+                .abs()
+                < 0.0001
+        );
+        assert!(
+            (encounter
+                .participants
+                .iter()
+                .find(|participant| participant.target_id == "unit:slime#2")
+                .unwrap()
+                .hp
+                - 10.0)
+                .abs()
+                < 0.0001
+        );
+
+        let mut rule_engine_state = RuleEngineState::default();
+        assert!(store.next_round("battle"));
+        assert!(sync_battle_round_buff_advancement(
+            &mut store,
+            "battle",
+            0,
+            &mut manager,
+            &mut rule_engine_state,
+        ));
+        let guarded = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "unit:slime#1")
+            .unwrap();
+        assert_eq!(
+            guarded.unit_character.as_ref().unwrap().active_buffs[0].turns_remaining,
+            1
+        );
+
+        assert!(store.next_round("battle"));
+        assert!(sync_battle_round_buff_advancement(
+            &mut store,
+            "battle",
+            1,
+            &mut manager,
+            &mut rule_engine_state,
+        ));
+        let guarded = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "unit:slime#1")
+            .unwrap();
+        assert!(guarded
+            .unit_character
+            .as_ref()
+            .unwrap()
+            .active_buffs
+            .is_empty());
+        assert!((guarded.damage_taken_modifier - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn unit_instance_buff_ticks_damage_without_mutating_template() {
+        let mut manager = empty_manager();
+        let source = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("source".to_owned(), source.clone());
+        let unit = UnitPoolEntry {
+            label: "史莱姆".to_owned(),
+            note: String::new(),
+            legacy_member_id: None,
+            character: PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                ..Default::default()
+            },
+        };
+        manager.unit_pool.insert("slime".to_owned(), unit.clone());
+        let mut target = participant_from_unit_template("unit:slime", "slime", &unit);
+        target
+            .unit_character
+            .as_mut()
+            .unwrap()
+            .active_buffs
+            .push(BuffSpec {
+                name: "灼烧".to_owned(),
+                kind: BuffKind::Magic,
+                priority: 0,
+                turns_remaining: 2,
+                source_id: "source".to_owned(),
+                beneficial: false,
+                effects: vec![BuffEffect {
+                    field: BuffField::DamageTakenModifier,
+                    value: BuffValue::Set(1.0),
+                }],
+                tick_actions: vec![BuffTickAction::Damage {
+                    amount: 4.0,
+                    damage_type: DamageType::Magical,
+                }],
+            });
+        sync_participant_from_manager(&mut target, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![
+                    participant_from_character("source", &source, &manager),
+                    target,
+                ],
+                ..Default::default()
+            });
+
+        assert!(store.next_round("battle"));
+        assert!(sync_battle_round_buff_advancement(
+            &mut store,
+            "battle",
+            0,
+            &mut manager,
+            &mut RuleEngineState::default(),
+        ));
+
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "unit:slime")
+            .unwrap();
+        assert!((target.hp - 16.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 4.0).abs() < 0.0001);
+        assert_eq!(
+            target.unit_character.as_ref().unwrap().active_buffs[0].turns_remaining,
+            1
+        );
+        assert!(manager.unit_pool["slime"].character.active_buffs.is_empty());
+        assert_eq!(
+            manager.unit_pool["slime"].character.hp,
+            20.0
+        );
+    }
+
+    #[test]
+    fn unit_instance_hp_buff_recomputes_from_base_without_stacking() {
+        let mut manager = empty_manager();
+        let unit = UnitPoolEntry {
+            label: "史莱姆".to_owned(),
+            note: String::new(),
+            legacy_member_id: None,
+            character: PlayerCharacter {
+                hp: 10.0,
+                max_hp: 20.0,
+                ..Default::default()
+            },
+        };
+        manager.unit_pool.insert("slime".to_owned(), unit.clone());
+        let mut participant = participant_from_unit_template("unit:slime", "slime", &unit);
+        participant
+            .unit_character
+            .as_mut()
+            .unwrap()
+            .active_buffs
+            .push(BuffSpec {
+                name: "生命祝福".to_owned(),
+                kind: BuffKind::Magic,
+                priority: 0,
+                turns_remaining: 2,
+                source_id: "source".to_owned(),
+                beneficial: true,
+                effects: vec![BuffEffect {
+                    field: BuffField::Hp,
+                    value: BuffValue::Add(5.0),
+                }],
+                tick_actions: Vec::new(),
+            });
+
+        sync_participant_from_manager(&mut participant, &manager);
+        assert!((participant.hp - 15.0).abs() < 0.0001);
+        sync_participant_from_manager(&mut participant, &manager);
+        assert!((participant.hp - 15.0).abs() < 0.0001);
+
+        participant.hp = 12.0;
+        sync_participant_from_manager(&mut participant, &manager);
+        assert!((participant.hp - 12.0).abs() < 0.0001);
+        participant
+            .unit_character
+            .as_mut()
+            .unwrap()
+            .active_buffs
+            .clear();
+        sync_participant_from_manager(&mut participant, &manager);
+        assert!((participant.hp - 7.0).abs() < 0.0001);
+        assert_eq!(
+            manager.unit_pool["slime"].character.hp,
+            10.0
+        );
     }
 
     #[test]
@@ -5069,6 +5784,44 @@ mod tests {
             .find(|participant| participant.target_id == "b")
             .unwrap();
         assert!((target.damage_taken_modifier - 1.0).abs() < 0.0001);
+
+        let vitality = CharacterSkill {
+            index: 2,
+            name: "活力".to_owned(),
+            note: "旧规则".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: Some(
+                r#"{"buffMachine":{"技能释放":[{"name":"活力","life":2,"effect":["hp"],"from":"技能目标","benifit":true,"value":["5"]}]}}"#
+                    .to_owned(),
+            ),
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        assert!(store.record_skill_use_with_buffs(
+            "battle",
+            "a",
+            "b",
+            &vitality,
+            &mut manager,
+            None,
+        ));
+        assert!((manager.player_characters["b"].hp - 20.0).abs() < 0.0001);
+        assert!(
+            (store.encounters["battle"]
+                .participants
+                .iter()
+                .find(|participant| participant.target_id == "b")
+                .unwrap()
+                .hp
+                - 20.0)
+                .abs()
+                < 0.0001
+        );
     }
 
     #[test]
