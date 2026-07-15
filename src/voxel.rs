@@ -4902,7 +4902,12 @@ fn edit_voxel_grid(
         }
         return;
     }
-    let Some(input_mode) = voxel_edit_input_mode(editor.mode, left_pressed, right_pressed) else {
+    let Some(input_mode) = voxel_edit_input_mode(
+        editor.mode,
+        left_pressed,
+        right_pressed,
+        tool_gun_equipped,
+    ) else {
         return;
     };
     let just_pressed = if left_pressed {
@@ -5042,8 +5047,11 @@ fn voxel_edit_input_mode(
     equipped_mode: VoxelEditMode,
     left_pressed: bool,
     right_pressed: bool,
+    tool_gun_equipped: bool,
 ) -> Option<VoxelEditMode> {
-    if left_pressed {
+    if tool_gun_equipped {
+        None
+    } else if left_pressed {
         Some(VoxelEditMode::Remove)
     } else if right_pressed {
         Some(equipped_mode)
@@ -6680,20 +6688,25 @@ mod tests {
     #[test]
     fn minecraft_mouse_buttons_remove_with_left_and_use_equipped_mode_with_right() {
         assert_eq!(
-            voxel_edit_input_mode(VoxelEditMode::Add, true, false),
+            voxel_edit_input_mode(VoxelEditMode::Add, true, false, false),
             Some(VoxelEditMode::Remove)
         );
         assert_eq!(
-            voxel_edit_input_mode(VoxelEditMode::Paint, false, true),
+            voxel_edit_input_mode(VoxelEditMode::Paint, false, true, false),
             Some(VoxelEditMode::Paint)
         );
         assert_eq!(
-            voxel_edit_input_mode(VoxelEditMode::Add, true, true),
+            voxel_edit_input_mode(VoxelEditMode::Add, true, true, false),
             Some(VoxelEditMode::Remove)
         );
         assert_eq!(
-            voxel_edit_input_mode(VoxelEditMode::Add, false, false),
+            voxel_edit_input_mode(VoxelEditMode::Add, false, false, false),
             None
+        );
+        assert_eq!(
+            voxel_edit_input_mode(VoxelEditMode::Add, true, false, true),
+            None,
+            "tool gun primary fire must never fall through to block deletion"
         );
     }
 
