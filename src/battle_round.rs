@@ -3884,6 +3884,9 @@ fn apply_battle_buff_ticks(
         else {
             continue;
         };
+        if !encounter.participants[target_index].alive {
+            continue;
+        }
         let target_character = character_for_participant(
             &encounter.participants[target_index],
             manager,
@@ -3999,9 +4002,6 @@ fn apply_battle_buff_ticks(
                 }
             },
             BuffTickAction::Heal { amount } => {
-                if !encounter.participants[target_index].alive {
-                    continue;
-                }
                 let stat_config = manager.character_stat_config_for_target(&tick.source_id);
                 let source_multiplier = source_character
                     .as_ref()
@@ -9263,7 +9263,7 @@ mod tests {
     }
 
     #[test]
-    fn background_healing_does_not_revive_defeated_participants() {
+    fn background_effects_do_not_modify_defeated_participants() {
         let manager = empty_manager();
         let source = participant("source", 0);
         let mut target = participant("target", 0);
@@ -9301,15 +9301,42 @@ mod tests {
             .iter()
             .any(|entry| entry.contains("延迟治疗")));
 
+        store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "target")
+            .unwrap()
+            .overhealing_shield = 3.0;
         let log_count = store.encounters["battle"].action_log.len();
         apply_battle_buff_ticks(
             store.encounters.get_mut("battle").unwrap(),
             &manager,
-            &[BattleBuffTick {
-                source_id: "source".to_owned(),
-                target_id: "target".to_owned(),
-                action: BuffTickAction::Heal { amount: 5.0 },
-            }],
+            &[
+                BattleBuffTick {
+                    source_id: "source".to_owned(),
+                    target_id: "target".to_owned(),
+                    action: BuffTickAction::Heal { amount: 5.0 },
+                },
+                BattleBuffTick {
+                    source_id: "source".to_owned(),
+                    target_id: "target".to_owned(),
+                    action: BuffTickAction::Damage {
+                        amount: 2.0,
+                        damage_type: DamageType::Physical,
+                    },
+                },
+                BattleBuffTick {
+                    source_id: "source".to_owned(),
+                    target_id: "target".to_owned(),
+                    action: BuffTickAction::FixedDamage {
+                        amount: 2.0,
+                        damage_type: DamageType::None,
+                    },
+                },
+            ],
         );
         let target = store.encounters["battle"]
             .participants
@@ -9318,6 +9345,8 @@ mod tests {
             .unwrap();
         assert_eq!(target.hp, 0.0);
         assert!(!target.alive);
+        assert_eq!(target.overhealing_shield, 3.0);
+        assert_eq!(target.damage_taken_this_turn, 0.0);
         assert_eq!(
             store.encounters["battle"].action_log.len(),
             log_count
