@@ -57,6 +57,7 @@ use crate::{
         character_healing_attribute_multiplier,
         character_hope_avatar_available,
         character_infinite_focus_damage_bonus_per_stack,
+        character_inspiration_available,
         character_keen_evasion_available,
         character_large_hit_damage_taken_modifier,
         character_liquid_body_damage_delay_rate,
@@ -272,6 +273,12 @@ pub struct BattleParticipantSnapshot {
     pub one_heart_target_id: Option<String>,
     #[serde(default)]
     pub one_heart_stacks: u32,
+    #[serde(default)]
+    pub inspiration_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspiration_target_id: Option<String>,
+    #[serde(default)]
+    pub inspiration_sources: HashMap<String, u32>,
     #[serde(default)]
     pub keen_evasion_enabled: bool,
     #[serde(default)]
@@ -589,6 +596,82 @@ fn record_participant_one_heart_heal(participant: &mut BattleParticipantSnapshot
     } else {
         participant.one_heart_target_id = Some(target_id.to_owned());
         participant.one_heart_stacks = 1;
+    }
+}
+
+fn participant_inspiration_multiplier(participant: &BattleParticipantSnapshot) -> f32 {
+    if participant
+        .inspiration_sources
+        .values()
+        .any(|turns| *turns > 0)
+    {
+        1.10
+    } else {
+        1.0
+    }
+}
+
+fn apply_encounter_inspiration(
+    encounter: &mut BattleEncounter,
+    source_id: &str,
+    target_id: &str,
+) -> bool {
+    let enabled = encounter
+        .participants
+        .iter()
+        .find(|participant| participant.target_id == source_id)
+        .is_some_and(|participant| participant.inspiration_enabled);
+    let target_exists = encounter
+        .participants
+        .iter()
+        .any(|participant| participant.target_id == target_id);
+    if !enabled || !target_exists {
+        return false;
+    }
+    for participant in &mut encounter.participants {
+        participant.inspiration_sources.remove(source_id);
+    }
+    if let Some(source) = encounter
+        .participants
+        .iter_mut()
+        .find(|participant| participant.target_id == source_id)
+    {
+        source.inspiration_target_id = Some(target_id.to_owned());
+    }
+    if let Some(target) = encounter
+        .participants
+        .iter_mut()
+        .find(|participant| participant.target_id == target_id)
+    {
+        target.inspiration_sources.insert(source_id.to_owned(), 1);
+    }
+    true
+}
+
+fn advance_encounter_inspiration(encounter: &mut BattleEncounter) {
+    let mut expired = Vec::new();
+    for target in &mut encounter.participants {
+        let target_id = target.target_id.clone();
+        target.inspiration_sources.retain(|source_id, turns| {
+            *turns = turns.saturating_sub(1);
+            if *turns == 0 {
+                expired.push((source_id.clone(), target_id.clone()));
+                false
+            } else {
+                true
+            }
+        });
+    }
+    for (source_id, target_id) in expired {
+        if let Some(source) = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == source_id)
+        {
+            if source.inspiration_target_id.as_deref() == Some(target_id.as_str()) {
+                source.inspiration_target_id = None;
+            }
+        }
     }
 }
 
@@ -1283,6 +1366,15 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
                 .hash(&mut hasher);
             participant.one_heart_target_id.hash(&mut hasher);
             participant.one_heart_stacks.hash(&mut hasher);
+            participant.inspiration_enabled.hash(&mut hasher);
+            participant.inspiration_target_id.hash(&mut hasher);
+            let mut inspiration_sources =
+                participant.inspiration_sources.iter().collect::<Vec<_>>();
+            inspiration_sources.sort_by(|left, right| left.0.cmp(right.0));
+            for (source_id, turns) in inspiration_sources {
+                source_id.hash(&mut hasher);
+                turns.hash(&mut hasher);
+            }
             participant.keen_evasion_enabled.hash(&mut hasher);
             participant.keen_evasion_available.hash(&mut hasher);
             participant.arcane_shield.to_bits().hash(&mut hasher);
@@ -1723,6 +1815,9 @@ fn encounter_roster_ui(
                     "一心{}层",
                     participant.one_heart_stacks
                 ));
+            }
+            if participant_inspiration_multiplier(participant) > 1.0 + f32::EPSILON {
+                ui.small("振奋：速度与伤害+10%");
             }
             if participant.keen_evasion_enabled && participant.keen_evasion_available {
                 ui.small("敏锐待机");
@@ -2189,6 +2284,7 @@ impl BattleRoundStore {
             return false;
         };
         encounter.round += 1;
+        advance_encounter_inspiration(encounter);
         let mut delayed_logs = Vec::new();
         let mut defeat_outcomes = Vec::new();
         for participant in &mut encounter.participants {
@@ -2832,6 +2928,7 @@ impl BattleRoundStore {
                     }
                     let mut pending_actor_mutual_aid_healing = 0.0;
                     let mut healed_one_heart_target_id = None::<String>;
+                    let mut healed_inspiration_target_id = None::<String>;
                     for resolved_target_id in target_ids {
                         let Some(target) = encounter
                             .participants
@@ -2884,6 +2981,7 @@ impl BattleRoundStore {
                             && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
                         {
                             healed_one_heart_target_id = Some(resolved_target_id.clone());
+                            healed_inspiration_target_id = Some(resolved_target_id.clone());
                         }
                         if final_amount > f32::EPSILON
                             && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
@@ -2933,6 +3031,20 @@ impl BattleRoundStore {
                             .find(|participant| participant.target_id == actor_id)
                         {
                             record_participant_one_heart_heal(actor, &target_id);
+                        }
+                    }
+                    if let Some(target_id) = healed_inspiration_target_id {
+                        let target_name = encounter
+                            .participants
+                            .iter()
+                            .find(|participant| participant.target_id == target_id)
+                            .map(|participant| participant.display_name.clone())
+                            .unwrap_or_else(|| target_id.clone());
+                        if apply_encounter_inspiration(encounter, actor_id, &target_id) {
+                            encounter.action_log.push(format!(
+                                "{}触发振奋，使{}获得10%速度与伤害加成，持续1回合",
+                                actor_name, target_name
+                            ));
                         }
                     }
                     if pending_actor_mutual_aid_healing > f32::EPSILON {
@@ -3163,6 +3275,10 @@ impl BattleRoundStore {
         let mut delayed_logs = Vec::new();
         let (hope_log, hope_outcome) = advance_participant_hope_avatar(participant);
         let mut defeat_outcomes = hope_outcome.into_iter().collect::<Vec<_>>();
+        participant.inspiration_sources.retain(|_, turns| {
+            *turns = turns.saturating_sub(1);
+            *turns > 0
+        });
         if let Some(log) = hope_log {
             delayed_logs.push(log);
         } else {
@@ -3756,6 +3872,14 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
             .hash(&mut hasher);
         participant.one_heart_target_id.hash(&mut hasher);
         participant.one_heart_stacks.hash(&mut hasher);
+        participant.inspiration_enabled.hash(&mut hasher);
+        participant.inspiration_target_id.hash(&mut hasher);
+        let mut inspiration_sources = participant.inspiration_sources.iter().collect::<Vec<_>>();
+        inspiration_sources.sort_by(|left, right| left.0.cmp(right.0));
+        for (source_id, turns) in inspiration_sources {
+            source_id.hash(&mut hasher);
+            turns.hash(&mut hasher);
+        }
         participant.keen_evasion_enabled.hash(&mut hasher);
         participant.keen_evasion_available.hash(&mut hasher);
         participant.arcane_shield.to_bits().hash(&mut hasher);
@@ -3904,6 +4028,9 @@ fn participant_from_character(
         one_heart_healing_bonus_per_stack: character_one_heart_healing_bonus_per_stack(character),
         one_heart_target_id: None,
         one_heart_stacks: 0,
+        inspiration_enabled: character_inspiration_available(character),
+        inspiration_target_id: None,
+        inspiration_sources: HashMap::new(),
         keen_evasion_enabled: character_keen_evasion_available(character),
         keen_evasion_available: character_keen_evasion_available(character),
         arcane_shield: character_arcane_shield_amount(character),
@@ -3991,6 +4118,9 @@ fn participant_from_unit_template(
         one_heart_healing_bonus_per_stack: character_one_heart_healing_bonus_per_stack(character),
         one_heart_target_id: None,
         one_heart_stacks: 0,
+        inspiration_enabled: character_inspiration_available(character),
+        inspiration_target_id: None,
+        inspiration_sources: HashMap::new(),
         keen_evasion_enabled: character_keen_evasion_available(character),
         keen_evasion_available: character_keen_evasion_available(character),
         arcane_shield: character_arcane_shield_amount(character),
@@ -4074,6 +4204,9 @@ fn participant_from_target(
         one_heart_healing_bonus_per_stack: 0.0,
         one_heart_target_id: None,
         one_heart_stacks: 0,
+        inspiration_enabled: false,
+        inspiration_target_id: None,
+        inspiration_sources: HashMap::new(),
         keen_evasion_enabled: false,
         keen_evasion_available: false,
         arcane_shield: 0.0,
@@ -4154,6 +4287,7 @@ fn sync_participant_from_manager(
                 character_infinite_focus_damage_bonus_per_stack(&character);
             participant.one_heart_healing_bonus_per_stack =
                 character_one_heart_healing_bonus_per_stack(&character);
+            participant.inspiration_enabled = character_inspiration_available(&character);
             sync_participant_keen_evasion(
                 participant,
                 character_keen_evasion_available(&character),
@@ -4235,6 +4369,7 @@ fn sync_participant_from_manager(
             character_infinite_focus_damage_bonus_per_stack(character);
         participant.one_heart_healing_bonus_per_stack =
             character_one_heart_healing_bonus_per_stack(character);
+        participant.inspiration_enabled = character_inspiration_available(character);
         sync_participant_keen_evasion(
             participant,
             character_keen_evasion_available(character),
@@ -4280,6 +4415,7 @@ fn sync_participant_from_manager(
         participant.endless_pain_bonus_damage_per_stack = 0.0;
         participant.infinite_focus_damage_bonus_per_stack = 0.0;
         participant.one_heart_healing_bonus_per_stack = 0.0;
+        participant.inspiration_enabled = false;
         sync_participant_keen_evasion(participant, false);
         participant.overhealing_shield_cap_rate = 0.0;
         sync_participant_undying_rage(participant, false);
@@ -4367,12 +4503,15 @@ fn participant_order_speed(
     living_player_count: usize,
 ) -> f32 {
     let speed = participant.speed.max(0.0);
-    if living_player_count > 0 && living_player_count <= 3 && participant.low_survivor_speed > speed
+    let base_speed = if living_player_count > 0
+        && living_player_count <= 3
+        && participant.low_survivor_speed > speed
     {
         participant.low_survivor_speed
     } else {
         speed
-    }
+    };
+    base_speed * participant_inspiration_multiplier(participant)
 }
 
 fn ordered_participant_indices(encounter: &BattleEncounter) -> Vec<usize> {
@@ -4684,6 +4823,7 @@ fn participant_damage_multiplier(
         })
         .unwrap_or_default();
     participant.damage_dealt_modifier
+        * participant_inspiration_multiplier(participant)
         * participant_undying_rage_damage_multiplier(participant)
         * arrogance_damage_dealt_multiplier(
             participant.arrogance_damage_bonus_per_source,
@@ -5294,6 +5434,9 @@ mod area_tests {
             one_heart_healing_bonus_per_stack: 0.0,
             one_heart_target_id: None,
             one_heart_stacks: 0,
+            inspiration_enabled: false,
+            inspiration_target_id: None,
+            inspiration_sources: HashMap::new(),
             keen_evasion_enabled: false,
             keen_evasion_available: false,
             arcane_shield: 0.0,
@@ -5392,6 +5535,9 @@ mod tests {
             one_heart_healing_bonus_per_stack: 0.0,
             one_heart_target_id: None,
             one_heart_stacks: 0,
+            inspiration_enabled: false,
+            inspiration_target_id: None,
+            inspiration_sources: HashMap::new(),
             keen_evasion_enabled: false,
             keen_evasion_available: false,
             arcane_shield: 0.0,
@@ -9010,6 +9156,215 @@ mod tests {
             .action_log
             .iter()
             .any(|entry| entry.contains("触发一心")));
+    }
+
+    #[test]
+    fn parsed_battle_inspiration_transfers_single_target_bonus_and_expires() {
+        let mut manager = empty_manager();
+        let healer_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            damage_dealt_modifier: 1.0,
+            damage_taken_modifier: 1.0,
+            healing_dealt_modifier: 1.0,
+            healing_taken_modifier: 1.0,
+            skill_names: vec!["振奋".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), healer_character.clone());
+        let mut healer = participant_from_character("a", &healer_character, &manager);
+        healer.speed = 1.0;
+        let mut target_b = participant("b", 0);
+        target_b.hp = 10.0;
+        target_b.max_hp = 20.0;
+        target_b.speed = 10.0;
+        let mut target_c = participant("c", 0);
+        target_c.hp = 10.0;
+        target_c.max_hp = 20.0;
+        target_c.speed = 10.5;
+        let mut damage_target = participant("d", 0);
+        damage_target.hp = 100.0;
+        damage_target.max_hp = 100.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![healer, target_b, target_c, damage_target],
+                ..Default::default()
+            });
+        let heal = CharacterSkill {
+            index: 0,
+            name: "振奋治疗".to_owned(),
+            note: "主动使用对目标恢复10点生命值".to_owned(),
+            skill_type: Some("法术".to_owned()),
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let damage = CharacterSkill {
+            index: 0,
+            name: "测试攻击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &heal, &manager, None));
+        let encounter = &store.encounters["battle"];
+        let healer = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target_b = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(
+            healer.inspiration_target_id.as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            target_b.inspiration_sources.get("a"),
+            Some(&1)
+        );
+        assert!((participant_inspiration_multiplier(target_b) - 1.10).abs() < 0.0001);
+        let restored: BattleParticipantSnapshot =
+            serde_json::from_str(&serde_json::to_string(target_b).unwrap()).unwrap();
+        assert_eq!(
+            restored.inspiration_sources.get("a"),
+            Some(&1)
+        );
+        let order = ordered_participant_indices(encounter);
+        let b_index = encounter
+            .participants
+            .iter()
+            .position(|participant| participant.target_id == "b")
+            .unwrap();
+        let c_index = encounter
+            .participants
+            .iter()
+            .position(|participant| participant.target_id == "c")
+            .unwrap();
+        assert!(
+            order.iter().position(|index| *index == b_index).unwrap()
+                < order.iter().position(|index| *index == c_index).unwrap()
+        );
+        assert!(store.record_skill_use("battle", "b", "d", &damage, &manager, None));
+        assert!((store.encounters["battle"].participants[3].hp - 89.0).abs() < 0.0001);
+
+        assert!(store.record_skill_use("battle", "a", "c", &heal, &manager, None));
+        let encounter = &store.encounters["battle"];
+        let target_b = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        let target_c = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert!(target_b.inspiration_sources.is_empty());
+        assert_eq!(
+            target_c.inspiration_sources.get("a"),
+            Some(&1)
+        );
+        let mut multiply_inspired = target_c.clone();
+        multiply_inspired
+            .inspiration_sources
+            .insert("other-healer".to_owned(), 1);
+        assert!((participant_inspiration_multiplier(&multiply_inspired) - 1.10).abs() < 0.0001);
+        assert!(store.record_skill_use("battle", "b", "d", &damage, &manager, None));
+        assert!(store.record_skill_use("battle", "c", "d", &damage, &manager, None));
+        let damage_target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "d")
+            .unwrap();
+        assert!((damage_target.hp - 68.0).abs() < 0.0001);
+
+        let area_heal = CharacterSkill {
+            index: 1,
+            name: "范围治疗".to_owned(),
+            note: "主动使用对周围3米内的目标恢复1点生命值".to_owned(),
+            target_class: Some("范围".to_owned()),
+            ..heal.clone()
+        };
+        let positions = SceneCharacterPositions {
+            positions: HashMap::from([
+                ("a".to_owned(), Vec3::ZERO),
+                ("b".to_owned(), Vec3::new(1.0, 0.0, 0.0)),
+                ("c".to_owned(), Vec3::new(2.0, 0.0, 0.0)),
+                (
+                    "d".to_owned(),
+                    Vec3::new(10.0, 0.0, 0.0),
+                ),
+            ]),
+        };
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &area_heal,
+            &manager,
+            Some(&positions),
+        ));
+        let target_c = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert_eq!(
+            target_c.inspiration_sources.get("a"),
+            Some(&1)
+        );
+
+        assert!(store.next_round("battle"));
+        let encounter = &store.encounters["battle"];
+        let healer = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target_c = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert!(healer.inspiration_target_id.is_none());
+        assert!(target_c.inspiration_sources.is_empty());
+        assert!(store.record_skill_use("battle", "c", "d", &damage, &manager, None));
+        let damage_target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "d")
+            .unwrap();
+        assert!((damage_target.hp - 58.0).abs() < 0.0001);
+        assert!(store.encounters["battle"]
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("触发振奋")));
     }
 
     #[test]

@@ -6922,6 +6922,10 @@ pub fn character_hope_avatar_available(character: &PlayerCharacter) -> bool {
     character_has_approved_moonberry_talent(character, "希望化身")
 }
 
+pub fn character_inspiration_available(character: &PlayerCharacter) -> bool {
+    character_has_approved_moonberry_talent(character, "振奋")
+}
+
 pub fn upsert_character_active_buff(character: &mut PlayerCharacter, buff: BuffSpec) -> bool {
     if let Some(existing) = character
         .active_buffs

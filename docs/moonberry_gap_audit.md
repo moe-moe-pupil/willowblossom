@@ -45,6 +45,8 @@ Additional 2026-07-16 update: `希望化身` approved-talent battle participants
 
 Additional 2026-07-16 correction: `溃伤`'s one-round healing-received penalty now expires in the global `next_round` path used by the battle UI. Its regression now proves reduced healing during the hit round and normal healing after the next global round boundary instead of exercising only the unused per-participant advance helper. Focused verification passes with `cargo test --lib -j 1 wound_healing_taken_debuff -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 390 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 update: `振奋` approved-talent parsed-battle single-target healing now grants the healed target +10% effective battle-order speed and outgoing damage until the next global round boundary. Each healer can maintain the effect on only one target, changing targets transfers that healer's contribution, multiple healers do not stack the numeric bonus beyond 10%, area/multi-target healing does not trigger it, and the source/target ownership state persists safely. Focused verification passes with `cargo test --lib -j 1 inspiration -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 391 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -347,6 +349,8 @@ Additional implemented talent execution: `不死者之怒` now provides one enco
 Battle damage resolution now distinguishes attempted, absorbed, and applied damage so shields/evasion do not falsely trigger successful-hit talent effects or inflate combat logs.
 
 `希望化身` now executes as a persisted lethal transformation with two-round damage immunity, healing-only actions, and forced expiry death; channel interruption remains pending until battle channeling itself is represented.
+
+`振奋` now executes for positive single-target battle healing with one-target transfer, non-stacking +10% speed/damage, and global-round expiry.
 
 6. Import/export is partial.
 
