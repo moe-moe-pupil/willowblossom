@@ -54,6 +54,7 @@ use crate::{
         character_dying_healing_taken_modifier,
         character_echoing_memory_healing_rates,
         character_endless_pain_bonus_damage_per_stack,
+        character_fatigue_walker_available,
         character_fighting_spirit_damage_taken_multiplier,
         character_gale_force_battle_speeds,
         character_healing_attribute_multiplier,
@@ -64,6 +65,7 @@ use crate::{
         character_large_hit_damage_taken_modifier,
         character_liquid_body_damage_delay_rate,
         character_liquid_body_self_healing_rate,
+        character_low_hp_damage_multiplier,
         character_minimum_damage_floor,
         character_minimum_range_meters,
         character_moonberry_talent_damage_attribute_bonus,
@@ -85,7 +87,7 @@ use crate::{
         endless_pain_bonus_damage,
         infinite_focus_damage_dealt_multiplier,
         large_hit_damage_taken_multiplier,
-        low_hp_damage_multiplier,
+        low_hp_damage_multiplier_with_fatigue,
         moonberry_chaos_output_multiplier,
         moonberry_effective_skill_range_radius_with_multiplier,
         moonberry_skill_type_is_spell,
@@ -4161,7 +4163,7 @@ fn apply_battle_buff_ticks(
                     .as_ref()
                     .map(|source| {
                         source.damage_dealt_modifier
-                            * low_hp_damage_multiplier(source.hp, source.max_hp)
+                            * character_low_hp_damage_multiplier(source)
                             * character_damage_attribute_multiplier(
                                 source,
                                 &stat_config,
@@ -5472,7 +5474,13 @@ fn participant_damage_multiplier(
             participant.champion_damage_bonus_per_stack,
             participant.champion_stacks,
         )
-        * low_hp_damage_multiplier(participant.hp, participant.max_hp)
+        * low_hp_damage_multiplier_with_fatigue(
+            participant.hp,
+            participant.max_hp,
+            character
+                .map(character_fatigue_walker_available)
+                .unwrap_or(false),
+        )
         * (status_damage_attribute_multiplier(&status, config, bonus_kind) + talent_bonus)
         * character
             .map(character_chaos_output_variance)
@@ -11496,6 +11504,59 @@ mod tests {
             .find(|participant| participant.target_id == "b")
             .unwrap();
         assert_eq!(target.hp, 17.0);
+    }
+
+    #[test]
+    fn parsed_battle_fatigue_walker_mitigates_low_hp_damage_penalty() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 5.0,
+            max_hp: 10.0,
+            skill_names: vec!["疲惫行者".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let mut target = participant("b", 0);
+        target.hp = 20.0;
+        target.max_hp = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "疲惫攻击".to_owned(),
+            note: "主动使用对目标造成4点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 16.8).abs() < 0.0001);
     }
 
     #[test]

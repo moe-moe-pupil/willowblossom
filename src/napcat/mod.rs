@@ -5668,6 +5668,7 @@ fn moonberry_talent_effect_summary(talent: &MoonberryTalent) -> Option<&'static 
         "越战越勇" => Some("战斗轮中每经过任意目标一回合伤害+2%，上限+20%"),
         "斗志昂扬" => Some("战斗轮第1/2/3个自身回合承伤-50%/-10%/-2%"),
         "狂妄" => Some("战斗轮中每个新伤害来源令自身伤害+10%，上限+30%"),
+        "疲惫行者" => Some("生命值低下惩罚减轻20%，濒死最多按5%生命的重伤惩罚计算"),
         "无限专注" => Some("战斗轮中连续单体攻击同一目标时伤害逐次+10%，上限+20%"),
         "总冠军" => Some("战斗轮中每名玩家目标淘汰令自身伤害+2%、承伤-1%"),
         "罪上加罪" => Some("每次参与击杀获得2.5%经验加成并回复10%已损生命/魔法"),
@@ -7044,18 +7045,40 @@ pub fn status_damage_attribute_multiplier(
 }
 
 pub fn low_hp_damage_multiplier(hp: f32, max_hp: f32) -> f32 {
+    low_hp_damage_multiplier_with_fatigue(hp, max_hp, false)
+}
+
+pub fn character_fatigue_walker_available(character: &PlayerCharacter) -> bool {
+    character_has_approved_moonberry_talent(character, "疲惫行者")
+}
+
+pub fn character_low_hp_damage_multiplier(character: &PlayerCharacter) -> f32 {
+    low_hp_damage_multiplier_with_fatigue(
+        character.hp,
+        character.max_hp,
+        character_fatigue_walker_available(character),
+    )
+}
+
+pub fn low_hp_damage_multiplier_with_fatigue(hp: f32, max_hp: f32, fatigue_walker: bool) -> f32 {
     if max_hp <= 0.0 {
         return 0.0;
     }
-    let missing_ratio = ((max_hp - hp) / max_hp).clamp(0.0, 1.0);
-    if hp > max_hp * 0.8 {
+    let effective_hp = if fatigue_walker { hp.max(max_hp * 0.05) } else { hp };
+    let missing_ratio = ((max_hp - effective_hp) / max_hp).clamp(0.0, 1.0);
+    let multiplier = if effective_hp > max_hp * 0.8 {
         1.0
-    } else if hp > max_hp * 0.6 {
+    } else if effective_hp > max_hp * 0.6 {
         1.0 - 0.1 * missing_ratio
-    } else if hp > max_hp * 0.4 {
+    } else if effective_hp > max_hp * 0.4 {
         1.0 - 0.5 * missing_ratio
     } else {
         1.0 - missing_ratio
+    };
+    if fatigue_walker {
+        1.0 - (1.0 - multiplier) * 0.8
+    } else {
+        multiplier
     }
 }
 
@@ -10931,6 +10954,9 @@ mod tests {
         assert!((low_hp_damage_multiplier(2.0, 10.0) - 0.2).abs() < 0.0001);
         assert!((low_hp_damage_multiplier(0.5, 10.0) - 0.05).abs() < 0.0001);
         assert_eq!(low_hp_damage_multiplier(1.0, 0.0), 0.0);
+
+        assert!((low_hp_damage_multiplier_with_fatigue(5.0, 10.0, true) - 0.8).abs() < 0.0001);
+        assert!((low_hp_damage_multiplier_with_fatigue(0.1, 10.0, true) - 0.24).abs() < 0.0001);
     }
 
     #[test]

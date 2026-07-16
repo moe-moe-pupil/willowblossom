@@ -1253,6 +1253,7 @@ pub struct Character {
     pub physical_damage_followup_rate: f32,
     pub minimum_damage_floor: f32,
     pub chaos_output_variance: f32,
+    pub fatigue_walker: bool,
     pub damage_taken_modifier: f32,
     pub large_hit_damage_taken_modifier: f32,
     pub magical_damage_taken_modifier: f32,
@@ -1524,6 +1525,7 @@ impl RuleEngineState {
         physical_damage_followup_rate: f32,
         minimum_damage_floor: f32,
         chaos_output_variance: f32,
+        fatigue_walker: bool,
         damage_taken_modifier: f32,
         large_hit_damage_taken_modifier: f32,
         magical_damage_taken_modifier: f32,
@@ -1553,6 +1555,7 @@ impl RuleEngineState {
         character.physical_damage_followup_rate = physical_damage_followup_rate.max(0.0);
         character.minimum_damage_floor = minimum_damage_floor.max(0.0);
         character.chaos_output_variance = chaos_output_variance.clamp(0.0, 1.0);
+        character.fatigue_walker = fatigue_walker;
         character.damage_taken_modifier = damage_taken_modifier;
         character.large_hit_damage_taken_modifier = large_hit_damage_taken_modifier.max(0.0);
         character.magical_damage_taken_modifier = magical_damage_taken_modifier;
@@ -1606,6 +1609,7 @@ impl Character {
             physical_damage_followup_rate: 0.0,
             minimum_damage_floor: 0.0,
             chaos_output_variance: 0.0,
+            fatigue_walker: false,
             damage_taken_modifier: 1.0,
             large_hit_damage_taken_modifier: 1.0,
             magical_damage_taken_modifier: 1.0,
@@ -1657,19 +1661,11 @@ impl Character {
     }
 
     fn low_hp_damage_multiplier(&self) -> f32 {
-        if self.max_hp <= 0.0 {
-            return 0.0;
-        }
-        let missing_ratio = ((self.max_hp - self.hp) / self.max_hp).clamp(0.0, 1.0);
-        if self.hp > self.max_hp * 0.8 {
-            1.0
-        } else if self.hp > self.max_hp * 0.6 {
-            1.0 - 0.1 * missing_ratio
-        } else if self.hp > self.max_hp * 0.4 {
-            1.0 - 0.5 * missing_ratio
-        } else {
-            1.0 - missing_ratio
-        }
+        crate::napcat::low_hp_damage_multiplier_with_fatigue(
+            self.hp,
+            self.max_hp,
+            self.fatigue_walker,
+        )
     }
 
     fn dying_healing_taken_multiplier(&self) -> f32 {
@@ -4828,6 +4824,25 @@ mod tests {
             engine.characters.get("enemy").unwrap().hp,
             17.0
         );
+    }
+
+    #[test]
+    fn fatigue_walker_mitigates_and_caps_low_hp_damage_penalty() {
+        let mut engine = RuleEngine::default();
+        let mut alice = Character::new("alice", "自己", 10.0);
+        alice.hp = 0.1;
+        alice.fatigue_walker = true;
+        engine.add_character(alice);
+        engine.add_character(Character::new("enemy", "敌人", 20.0));
+
+        engine.attack(
+            "alice",
+            "enemy",
+            10.0,
+            DamageType::Physical,
+        );
+
+        assert!((engine.characters.get("enemy").unwrap().hp - 17.6).abs() < 0.0001);
     }
 
     #[test]

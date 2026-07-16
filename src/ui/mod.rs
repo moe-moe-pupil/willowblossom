@@ -625,8 +625,10 @@ use crate::{
         character_damage_dealt_talent_buffs,
         character_damage_taken_attribute_multiplier,
         character_dying_healing_taken_modifier,
+        character_fatigue_walker_available,
         character_healing_attribute_multiplier,
         character_large_hit_damage_taken_modifier,
+        character_low_hp_damage_multiplier,
         character_minimum_damage_floor,
         character_minimum_range_meters,
         character_mutual_aid_healing_rate,
@@ -639,7 +641,6 @@ use crate::{
         grant_character_experience,
         is_scene_capture_command_text,
         large_hit_damage_taken_multiplier,
-        low_hp_damage_multiplier,
         moonberry_chaos_output_multiplier,
         moonberry_effective_skill_range_radius_with_multiplier,
         moonberry_physical_damage_followup_buff,
@@ -5027,7 +5028,7 @@ fn apply_quick_cast_action_to_manager(
         let source_damage_multiplier = match effect {
             Some(QuickCastEffect::Damage { damage_type, .. }) => {
                 caster.damage_dealt_modifier
-                    * low_hp_damage_multiplier(caster.hp, caster.max_hp)
+                    * character_low_hp_damage_multiplier(caster)
                     * character_damage_attribute_multiplier(
                         caster,
                         &stat_config,
@@ -6299,6 +6300,7 @@ fn sync_character_skill_rules_with_stats(
         character_physical_damage_followup_rate(&base_character),
         character_minimum_damage_floor(&base_character),
         character_chaos_output_variance(&base_character),
+        character_fatigue_walker_available(&base_character),
         stats.damage_taken_modifier,
         character_large_hit_damage_taken_modifier(&base_character),
         character_damage_taken_attribute_multiplier(
@@ -7438,7 +7440,7 @@ fn apply_character_buff_ticks(
                     .get(&tick.source_id)
                     .map(|source| {
                         source.damage_dealt_modifier
-                            * low_hp_damage_multiplier(source.hp, source.max_hp)
+                            * character_low_hp_damage_multiplier(source)
                             * character_damage_attribute_multiplier(
                                 source,
                                 &stat_config,
@@ -16589,5 +16591,46 @@ mod tests {
             manager.player_characters["target"].hp,
             17.0
         );
+
+        manager.player_characters.get_mut("target").unwrap().hp = 20.0;
+        let caster = manager.player_characters.get_mut("caster").unwrap();
+        caster.skill_names.push("疲惫行者".to_owned());
+        caster.skill_metadata.push(CharacterSkillMetadata::talent(
+            "normal_talent",
+            "天赋",
+        ));
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "疲惫行者测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 4.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 1,
+                force: false,
+            },
+        ));
+        assert!((manager.player_characters["target"].hp - 16.8).abs() < 0.0001);
     }
 }
