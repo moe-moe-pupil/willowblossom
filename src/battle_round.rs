@@ -2570,12 +2570,7 @@ impl BattleRoundStore {
     fn encounter_has_pending_actions(&self, encounter_id: &str) -> bool {
         self.encounters
             .get(encounter_id)
-            .map(|encounter| {
-                encounter
-                    .participants
-                    .iter()
-                    .any(|participant| participant.alive && !participant.action_done)
-            })
+            .map(|encounter| encounter.participants.iter().any(participant_can_act))
             .unwrap_or(false)
     }
 
@@ -2613,6 +2608,9 @@ impl BattleRoundStore {
         else {
             return false;
         };
+        if !participant_can_act(participant) {
+            return false;
+        }
         participant.action_done = true;
         participant.turn += 1;
         if encounter.active {
@@ -2644,17 +2642,22 @@ impl BattleRoundStore {
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
-        let (actor_name, actor_hope_avatar_active) = encounter
+        let Some(actor) = encounter
             .participants
             .iter()
             .find(|participant| participant.target_id == actor_id)
-            .map(|participant| {
-                (
-                    participant.display_name.clone(),
-                    encounter.active && participant_hope_avatar_active(participant),
-                )
-            })
-            .unwrap_or_else(|| (actor_id.to_owned(), false));
+        else {
+            return false;
+        };
+        let actor_name = actor.display_name.clone();
+        if !participant_can_act(actor) {
+            encounter.action_log.push(format!(
+                "{}已经倒下或完成本轮行动，无法再次行动",
+                actor_name
+            ));
+            return false;
+        }
+        let actor_hope_avatar_active = encounter.active && participant_hope_avatar_active(actor);
         if actor_hope_avatar_active {
             encounter.action_log.push(format!(
                 "{}处于希望化身，只能释放治疗技能",
@@ -2733,6 +2736,13 @@ impl BattleRoundStore {
         else {
             return false;
         };
+        if !participant_can_act(&actor_snapshot) {
+            encounter.action_log.push(format!(
+                "{}已经倒下或完成本轮行动，无法使用技能",
+                actor_snapshot.display_name
+            ));
+            return false;
+        }
         let actor_character = character_for_participant(&actor_snapshot, manager);
         let effects = static_skill_effects(
             &skill.note,
@@ -3536,7 +3546,6 @@ impl BattleRoundStore {
         else {
             return false;
         };
-
         if resume {
             participant.hp = participant.max_hp;
             participant.mp = participant.max_mp;
@@ -3614,6 +3623,9 @@ impl BattleRoundStore {
         else {
             return false;
         };
+        if !participant_can_act(participant) {
+            return false;
+        }
         participant.negative_layers += 1;
         participant.pending_negative = false;
         let _ = participant;
@@ -4990,10 +5002,11 @@ fn ordered_participant_indices(encounter: &BattleEncounter) -> Vec<usize> {
 fn current_actor_index(encounter: &BattleEncounter) -> Option<usize> {
     ordered_participant_indices(encounter)
         .into_iter()
-        .find(|index| {
-            let participant = &encounter.participants[*index];
-            participant.alive && !participant.action_done
-        })
+        .find(|index| participant_can_act(&encounter.participants[*index]))
+}
+
+fn participant_can_act(participant: &BattleParticipantSnapshot) -> bool {
+    participant.alive && !participant.action_done
 }
 
 fn normalize_encounter_after_edit(encounter: &mut BattleEncounter) {
@@ -11927,5 +11940,87 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn ineligible_battle_actors_cannot_mutate_targets_resources_or_clocks() {
+        let manager = empty_manager();
+        let mut defeated = participant("defeated", 4);
+        defeated.hp = 0.0;
+        defeated.mp = 8.0;
+        defeated.alive = false;
+        defeated.pending_negative = true;
+        let mut finished = participant("finished", 7);
+        finished.action_done = true;
+        finished.pending_negative = true;
+        let mut target = participant("target", 0);
+        target.hp = 10.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                round: 3,
+                participants: vec![defeated, finished, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "违规攻击".to_owned(),
+            note: "主动使用对目标造成4点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 3.0,
+            cooldown_turns: 2,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(!store.apply_action(
+            "battle",
+            "missing",
+            "target",
+            "幽灵攻击",
+            4.0
+        ));
+        assert!(!store.record_skill_use("battle", "missing", "target", &skill, &manager, None));
+        assert!(!store.apply_action(
+            "battle",
+            "defeated",
+            "target",
+            "倒地攻击",
+            4.0
+        ));
+        assert!(!store.record_skill_use("battle", "defeated", "target", &skill, &manager, None,));
+        assert!(!store.finish_actor_action("battle", "defeated"));
+        assert!(!store.skip_negative_participant("battle", "defeated"));
+        assert!(!store.apply_action(
+            "battle",
+            "finished",
+            "target",
+            "重复攻击",
+            4.0
+        ));
+        assert!(!store.record_skill_use("battle", "finished", "target", &skill, &manager, None,));
+        assert!(!store.finish_actor_action("battle", "finished"));
+        assert!(!store.skip_negative_participant("battle", "finished"));
+
+        let encounter = &store.encounters["battle"];
+        let defeated = &encounter.participants[0];
+        let finished = &encounter.participants[1];
+        let target = &encounter.participants[2];
+        assert_eq!(encounter.round, 3);
+        assert_eq!(encounter.combat_completed_turns, 0);
+        assert_eq!(target.hp, 10.0);
+        assert_eq!(defeated.mp, 8.0);
+        assert_eq!(defeated.turn, 4);
+        assert_eq!(defeated.negative_layers, 0);
+        assert!(defeated.skill_last_used_turns.is_empty());
+        assert_eq!(finished.turn, 7);
+        assert_eq!(finished.negative_layers, 0);
+        assert!(finished.skill_last_used_turns.is_empty());
+        assert_eq!(encounter.action_log.len(), 4);
     }
 }
