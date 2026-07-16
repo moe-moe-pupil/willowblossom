@@ -2445,10 +2445,12 @@ impl BattleRoundStore {
                 }
                 continue;
             }
-            if let Some(log) =
-                apply_participant_liquid_body_healing(participant, previous_damage_taken)
-            {
-                delayed_logs.push(log);
+            if encounter.active {
+                if let Some(log) =
+                    apply_participant_liquid_body_healing(participant, previous_damage_taken)
+                {
+                    delayed_logs.push(log);
+                }
             }
             if participant.wound_healing_taken_turns > 0 {
                 participant.wound_healing_taken_turns -= 1;
@@ -2890,7 +2892,7 @@ impl BattleRoundStore {
                             0.0
                         };
                         let (final_amount, delayed_liquid_body_damage) =
-                            if participant_hope_avatar_active(target) {
+                            if !encounter.active || participant_hope_avatar_active(target) {
                                 (resolved_amount, 0.0)
                             } else {
                                 participant_liquid_body_split_damage(target, resolved_amount)
@@ -3450,10 +3452,12 @@ impl BattleRoundStore {
         if let Some(log) = hope_log {
             delayed_logs.push(log);
         } else {
-            if let Some(log) =
-                apply_participant_liquid_body_healing(participant, previous_damage_taken)
-            {
-                delayed_logs.push(log);
+            if encounter.active {
+                if let Some(log) =
+                    apply_participant_liquid_body_healing(participant, previous_damage_taken)
+                {
+                    delayed_logs.push(log);
+                }
             }
             if participant.wound_healing_taken_turns > 0 {
                 participant.wound_healing_taken_turns -= 1;
@@ -7789,6 +7793,91 @@ mod tests {
         assert!((target.hp - 10.5).abs() < 0.0001);
         assert!((target.healing_taken_this_turn - 0.25).abs() < 0.0001);
         assert_eq!(target.damage_taken_this_turn, 0.0);
+        assert!(target.delayed_damage_ticks.is_empty());
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            false
+        ));
+        let target = store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        target.hp = 20.0;
+        target.alive = true;
+        reset_participant_turn_totals(target);
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 10.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 10.0).abs() < 0.0001);
+        assert!(target.delayed_damage_ticks.is_empty());
+
+        assert!(store.next_round("battle"));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 10.0).abs() < 0.0001);
+        assert_eq!(target.healing_taken_this_turn, 0.0);
+        assert_eq!(target.damage_taken_this_turn, 0.0);
+        assert!(target.delayed_damage_ticks.is_empty());
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            true
+        ));
+        let target = store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        target.hp = 20.0;
+        target.alive = true;
+        reset_participant_turn_totals(target);
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 15.0).abs() < 0.0001);
+        assert_eq!(target.delayed_damage_ticks.len(), 1);
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            false
+        ));
+        assert!(store.next_round("battle"));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 10.0).abs() < 0.0001);
+        assert_eq!(target.healing_taken_this_turn, 0.0);
+        assert_eq!(target.delayed_damage_ticks.len(), 1);
+
+        assert!(store.advance_participant("battle", "b", false));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 10.0).abs() < 0.0001);
+        assert_eq!(target.healing_taken_this_turn, 0.0);
         assert!(target.delayed_damage_ticks.is_empty());
     }
 

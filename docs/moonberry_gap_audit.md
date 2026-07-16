@@ -67,6 +67,8 @@ Additional 2026-07-16 correction: `无限专注` is now fully scoped to active c
 
 Additional 2026-07-16 correction: `狂妄` and `无尽痛楚` are now fully scoped to active combat, matching their preserved “进入战斗轮” trigger. Resting damage cannot add unique-source or pain stacks, stale persisted state cannot boost resting attacks, combat exit and entry clear both states, and the roster hides them during rest. Their active-combat +10% per unique source (up to +30%) and next-hit `等级*1.5` untyped damage (up to two stacks) remain unchanged. Focused verification passes with `cargo test --lib -j 1 arrogance -- --nocapture` and `cargo test --lib -j 1 endless_pain -- --nocapture`: 1 passed in each command, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `液态躯体` now obeys its preserved active battle-round trigger. Resting skill damage applies fully and schedules no liquid-body delayed tick, while resting round or participant advancement cannot trigger the previous-round self-heal. Active-combat 50/50 damage splitting and 5% prior-round-damage healing remain unchanged; delayed damage already committed during combat is not erased merely by changing the encounter to resting. Focused verification passes with `cargo test --lib -j 1 liquid_body -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -288,7 +290,7 @@ These are present now, often as a Rust/Bevy redesign rather than a direct port:
 
    Additional update: `千万回忆` now executes in parsed battle for single-target healing, scheduling 15% and 5% delayed healing echoes over the next two rounds from the resolved immediate heal amount.
 
-   Additional update: `液态躯体` now executes in parsed battle when direct skill damage is resolved against the holder, applying half immediately, delaying half to the next battle round, and healing from previous-turn damage on later round advances.
+   Additional update: `液态躯体` now executes during active parsed battle when direct skill damage is resolved against the holder, applying half immediately, delaying half to the next battle round, and healing from previous-turn damage on later active round advances. Resting damage and advances do not activate either effect.
 
    Additional update: `敏锐` now executes in parsed battle as a once-per-battle charge that dodges the first positive range/non-targeted incoming skill damage without being consumed by ordinary single-target hits.
 
@@ -356,7 +358,7 @@ Additional implemented talent execution: `一心` now tracks active-combat repea
 
 Additional implemented talent execution: `千万回忆` now records parsed-battle delayed healing echoes from successful single-target heals, resolving 15% then 5% of the original heal on later round advances.
 
-Additional implemented talent execution: `液态躯体` now records parsed-battle delayed damage and previous-turn damage healing, halving direct incoming skill damage into immediate and next-round portions.
+Additional implemented talent execution: `液态躯体` now records active-combat delayed damage and previous-turn damage healing, halving direct incoming skill damage into immediate and next-round portions without modifying resting hits or healing during resting advances.
 
 Additional implemented talent execution: `敏锐` now records a parsed-battle once-per-battle dodge charge, spends it on the first positive range/non-targeted incoming skill damage, clears it during rest, and rearms it on battle re-entry while leaving ordinary single-target damage untouched.
 
