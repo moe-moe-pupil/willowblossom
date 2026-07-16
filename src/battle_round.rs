@@ -73,6 +73,7 @@ use crate::{
         character_sin_on_sin_exp_bonus_per_stack,
         character_sin_on_sin_recovery_rate,
         character_spell_range_multiplier,
+        character_undying_rage_available,
         character_valorous_battle_damage_multiplier,
         character_wounded_healing_dealt_modifier,
         dying_healing_taken_multiplier,
@@ -282,6 +283,12 @@ pub struct BattleParticipantSnapshot {
     pub overhealing_shield: f32,
     #[serde(default)]
     pub overhealing_shield_turns_remaining: u32,
+    #[serde(default)]
+    pub undying_rage_enabled: bool,
+    #[serde(default)]
+    pub undying_rage_used: bool,
+    #[serde(default)]
+    pub undying_rage_active: bool,
     #[serde(default)]
     pub liquid_body_damage_delay_rate: f32,
     #[serde(default)]
@@ -587,6 +594,21 @@ fn sync_participant_keen_evasion(participant: &mut BattleParticipantSnapshot, en
     participant.keen_evasion_enabled = enabled;
 }
 
+fn sync_participant_undying_rage(participant: &mut BattleParticipantSnapshot, enabled: bool) {
+    if !enabled {
+        participant.undying_rage_active = false;
+    }
+    participant.undying_rage_enabled = enabled;
+}
+
+fn participant_undying_rage_damage_multiplier(participant: &BattleParticipantSnapshot) -> f32 {
+    if participant.undying_rage_active {
+        1.10
+    } else {
+        1.0
+    }
+}
+
 fn skill_damage_triggers_keen_evasion(target: TargetSelector, target_class: Option<&str>) -> bool {
     target.area.is_some()
         || skill_target_class_is_area(target_class)
@@ -688,7 +710,21 @@ fn apply_participant_damage_for_battle(
     let available_shield = participant.arcane_shield.max(0.0);
     let absorbed = available_shield.min(after_overhealing_shield);
     participant.arcane_shield = available_shield - absorbed;
-    let final_amount = (after_overhealing_shield - absorbed).max(0.0);
+    let mut final_amount = (after_overhealing_shield - absorbed).max(0.0);
+    let within_undying_rage_limit =
+        participant.max_hp > f32::EPSILON && final_amount <= participant.max_hp + f32::EPSILON;
+    if participant.undying_rage_active && within_undying_rage_limit {
+        final_amount = 0.0;
+    } else if participant.undying_rage_enabled
+        && !participant.undying_rage_used
+        && participant.hp > f32::EPSILON
+        && final_amount + f32::EPSILON >= participant.hp
+        && within_undying_rage_limit
+    {
+        participant.undying_rage_used = true;
+        participant.undying_rage_active = true;
+        final_amount = 0.0;
+    }
     if final_amount <= f32::EPSILON {
         return None;
     }
@@ -1148,6 +1184,9 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant
                 .overhealing_shield_turns_remaining
                 .hash(&mut hasher);
+            participant.undying_rage_enabled.hash(&mut hasher);
+            participant.undying_rage_used.hash(&mut hasher);
+            participant.undying_rage_active.hash(&mut hasher);
             participant
                 .liquid_body_damage_delay_rate
                 .to_bits()
@@ -1587,6 +1626,11 @@ fn encounter_roster_ui(
                     format_number(participant.overhealing_shield)
                 ));
             }
+            if participant.undying_rage_active {
+                ui.small("不死者之怒生效");
+            } else if participant.undying_rage_enabled && participant.undying_rage_used {
+                ui.small("不死者之怒已触发");
+            }
             if participant.liquid_body_damage_delay_rate > f32::EPSILON
                 || participant.liquid_body_self_healing_rate > f32::EPSILON
             {
@@ -2012,6 +2056,7 @@ impl BattleRoundStore {
         let mut defeat_outcomes = Vec::new();
         for participant in &mut encounter.participants {
             participant.action_done = false;
+            participant.undying_rage_active = false;
             advance_participant_overhealing_shield(participant);
             let previous_damage_taken = participant.damage_taken_this_turn;
             reset_participant_turn_totals(participant);
@@ -2882,6 +2927,7 @@ impl BattleRoundStore {
         }
         let previous_damage_taken = participant.damage_taken_this_turn;
         reset_participant_turn_totals(participant);
+        participant.undying_rage_active = false;
         advance_participant_overhealing_shield(participant);
         let mut delayed_logs = Vec::new();
         if let Some(log) = apply_participant_liquid_body_healing(participant, previous_damage_taken)
@@ -3186,6 +3232,12 @@ fn apply_battle_buff_ticks(
     ticks: &[BattleBuffTick],
 ) {
     for tick in ticks {
+        let source_undying_rage_damage_multiplier = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == tick.source_id)
+            .map(participant_undying_rage_damage_multiplier)
+            .unwrap_or(1.0);
         let source_character = encounter
             .participants
             .iter()
@@ -3227,7 +3279,8 @@ fn apply_battle_buff_ticks(
                                 trpg_damage_bonus_kind(damage_type),
                             )
                     })
-                    .unwrap_or(1.0);
+                    .unwrap_or(1.0)
+                    * source_undying_rage_damage_multiplier;
                 let target_multiplier = encounter.participants[target_index].damage_taken_modifier
                     * target_character
                         .as_ref()
@@ -3432,6 +3485,9 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant
             .overhealing_shield_turns_remaining
             .hash(&mut hasher);
+        participant.undying_rage_enabled.hash(&mut hasher);
+        participant.undying_rage_used.hash(&mut hasher);
+        participant.undying_rage_active.hash(&mut hasher);
         participant
             .liquid_body_damage_delay_rate
             .to_bits()
@@ -3569,6 +3625,9 @@ fn participant_from_character(
         overhealing_shield_cap_rate: character_overhealing_shield_cap_rate(character),
         overhealing_shield: 0.0,
         overhealing_shield_turns_remaining: 0,
+        undying_rage_enabled: character_undying_rage_available(character),
+        undying_rage_used: false,
+        undying_rage_active: false,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
@@ -3650,6 +3709,9 @@ fn participant_from_unit_template(
         overhealing_shield_cap_rate: character_overhealing_shield_cap_rate(character),
         overhealing_shield: 0.0,
         overhealing_shield_turns_remaining: 0,
+        undying_rage_enabled: character_undying_rage_available(character),
+        undying_rage_used: false,
+        undying_rage_active: false,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
@@ -3727,6 +3789,9 @@ fn participant_from_target(
         overhealing_shield_cap_rate: 0.0,
         overhealing_shield: 0.0,
         overhealing_shield_turns_remaining: 0,
+        undying_rage_enabled: false,
+        undying_rage_used: false,
+        undying_rage_active: false,
         liquid_body_damage_delay_rate: 0.0,
         liquid_body_self_healing_rate: 0.0,
         champion_damage_bonus_per_stack: 0.0,
@@ -3801,6 +3866,10 @@ fn sync_participant_from_manager(
             );
             participant.overhealing_shield_cap_rate =
                 character_overhealing_shield_cap_rate(&character);
+            sync_participant_undying_rage(
+                participant,
+                character_undying_rage_available(&character),
+            );
             participant.liquid_body_damage_delay_rate =
                 character_liquid_body_damage_delay_rate(&character);
             participant.liquid_body_self_healing_rate =
@@ -3876,6 +3945,10 @@ fn sync_participant_from_manager(
             character_keen_evasion_available(character),
         );
         participant.overhealing_shield_cap_rate = character_overhealing_shield_cap_rate(character);
+        sync_participant_undying_rage(
+            participant,
+            character_undying_rage_available(character),
+        );
         participant.liquid_body_damage_delay_rate =
             character_liquid_body_damage_delay_rate(character);
         participant.liquid_body_self_healing_rate =
@@ -3913,6 +3986,7 @@ fn sync_participant_from_manager(
         participant.one_heart_healing_bonus_per_stack = 0.0;
         sync_participant_keen_evasion(participant, false);
         participant.overhealing_shield_cap_rate = 0.0;
+        sync_participant_undying_rage(participant, false);
         participant.liquid_body_damage_delay_rate = 0.0;
         participant.liquid_body_self_healing_rate = 0.0;
         participant.champion_damage_bonus_per_stack = 0.0;
@@ -4313,6 +4387,7 @@ fn participant_damage_multiplier(
         })
         .unwrap_or_default();
     participant.damage_dealt_modifier
+        * participant_undying_rage_damage_multiplier(participant)
         * arrogance_damage_dealt_multiplier(
             participant.arrogance_damage_bonus_per_source,
             participant.arrogance_damage_source_ids.len() as u32,
@@ -4928,6 +5003,9 @@ mod area_tests {
             overhealing_shield_cap_rate: 0.0,
             overhealing_shield: 0.0,
             overhealing_shield_turns_remaining: 0,
+            undying_rage_enabled: false,
+            undying_rage_used: false,
+            undying_rage_active: false,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             champion_damage_bonus_per_stack: 0.0,
@@ -5020,6 +5098,9 @@ mod tests {
             overhealing_shield_cap_rate: 0.0,
             overhealing_shield: 0.0,
             overhealing_shield_turns_remaining: 0,
+            undying_rage_enabled: false,
+            undying_rage_used: false,
+            undying_rage_active: false,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             champion_damage_bonus_per_stack: 0.0,
@@ -7084,6 +7165,107 @@ mod tests {
         let persisted = serde_json::to_string(&participant).unwrap();
         let restored: BattleParticipantSnapshot = serde_json::from_str(&persisted).unwrap();
         assert!((restored.arcane_shield - participant.arcane_shield).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parsed_battle_undying_rage_negates_one_lethal_round_and_boosts_damage() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            skill_names: vec!["不死者之怒".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let mut target = participant("b", 0);
+        target.hp = 100.0;
+        target.max_hp = 100.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+
+        let actor = store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!(apply_participant_damage_for_battle(actor, 20.0, "enemy").is_none());
+        assert!((actor.hp - 20.0).abs() < 0.0001);
+        assert!(actor.undying_rage_used);
+        assert!(actor.undying_rage_active);
+        assert!((actor.damage_taken_this_turn - 0.0).abs() < 0.0001);
+        assert!(actor.damage_contributors.is_empty());
+
+        let persisted = serde_json::to_string(actor).unwrap();
+        let restored: BattleParticipantSnapshot = serde_json::from_str(&persisted).unwrap();
+        assert!(restored.undying_rage_used);
+        assert!(restored.undying_rage_active);
+
+        let skill = CharacterSkill {
+            index: 0,
+            name: "怒击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 89.0).abs() < 0.0001);
+
+        let actor = store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!(apply_participant_damage_for_battle(actor, 20.0, "enemy").is_none());
+        assert!((actor.hp - 20.0).abs() < 0.0001);
+
+        assert!(store.next_round("battle"));
+        let actor = store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!(!actor.undying_rage_active);
+        assert!(apply_participant_damage_for_battle(actor, 20.0, "enemy").is_some());
+        assert!(!actor.alive);
+
+        let mut oversized = participant_from_character("a", &actor_character, &manager);
+        assert!(apply_participant_damage_for_battle(&mut oversized, 21.0, "enemy").is_some());
+        assert!(!oversized.alive);
+        assert!(!oversized.undying_rage_used);
     }
 
     #[test]

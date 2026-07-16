@@ -37,6 +37,8 @@ Additional 2026-07-16 update: `奥术护盾` approved-talent battle participants
 
 Additional 2026-07-16 update: `过度治疗` approved-talent battle healing now converts overheal into an encounter-local shield capped at 30% of the target's maximum HP. The shield is persisted, consumed before other HP damage, and remains through the following full battle round; parsed skills, delayed healing, buff ticks, lifesteal, mutual-aid feedback, liquid-body recovery, and kill recovery share the same healing path while passive regeneration remains excluded. Focused verification passes with `cargo test --lib -j 1 overhealing -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 387 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 update: `不死者之怒` approved-talent battle participants now negate their first lethal post-shield hit per encounter when the remaining damage does not exceed maximum HP. The resulting 100% damage reduction and +10% outgoing damage remain active until the next battle-round boundary; oversized hits bypass the effect, and negated hits do not create damage-taken stacks or contributor credit. The old Moonberry commit stored this talent as description-only data, so these runtime edge semantics follow its preserved wording explicitly. Focused verification passes with `cargo test --lib -j 1 undying_rage -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 388 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -333,6 +335,8 @@ Additional implemented talent execution: `敏锐` now records a parsed-battle on
 Additional implemented talent execution: `奥术护盾` now grants battle entrants 10% of maximum MP as encounter-local shielding and consumes it before HP damage across the shared battle damage path.
 
 Additional implemented talent execution: `过度治疗` now converts battle overheal into one-round encounter-local shielding capped at 30% of the healed target's maximum HP across immediate and delayed healing paths.
+
+Additional implemented talent execution: `不死者之怒` now provides one encounter-local lethal-hit negation, same-round damage immunity, and +10% outgoing damage, while hits above maximum HP bypass it.
 
 6. Import/export is partial.
 

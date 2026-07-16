@@ -6914,6 +6914,10 @@ pub fn character_overhealing_shield_cap_rate(character: &PlayerCharacter) -> f32
     }
 }
 
+pub fn character_undying_rage_available(character: &PlayerCharacter) -> bool {
+    character_has_approved_moonberry_talent(character, "不死者之怒")
+}
+
 pub fn upsert_character_active_buff(character: &mut PlayerCharacter, buff: BuffSpec) -> bool {
     if let Some(existing) = character
         .active_buffs
