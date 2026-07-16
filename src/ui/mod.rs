@@ -7459,6 +7459,9 @@ fn apply_character_buff_ticks(
                                 &stat_config,
                                 trpg_damage_bonus_kind(*damage_type),
                             )
+                            * moonberry_chaos_output_multiplier(character_chaos_output_variance(
+                                source,
+                            ))
                     })
                     .unwrap_or(1.0);
                 let Some(target) = manager.player_characters.get_mut(&tick.target_id) else {
@@ -7469,7 +7472,14 @@ fn apply_character_buff_ticks(
                         target,
                         trpg_damage_taken_kind(*damage_type),
                     );
-                let final_amount = (*amount * source_multiplier * target_multiplier).max(0.0);
+                let incoming_amount = (*amount * source_multiplier * target_multiplier).max(0.0);
+                let final_amount = (incoming_amount
+                    * large_hit_damage_taken_multiplier(
+                        target.max_hp,
+                        incoming_amount,
+                        character_large_hit_damage_taken_modifier(target),
+                    ))
+                .max(0.0);
                 changed |= apply_effective_character_damage(target, final_amount).0;
             },
             BuffTickAction::FixedDamage { amount, .. } => {
@@ -7481,7 +7491,11 @@ fn apply_character_buff_ticks(
             },
             BuffTickAction::Heal { amount } => {
                 let stat_config = manager.character_stat_config_for_target(&tick.source_id);
-                let (source_multiplier, source_mutual_aid_healing_rate) = manager
+                let (
+                    source_multiplier,
+                    source_mutual_aid_healing_rate,
+                    source_dying_target_healing_modifier,
+                ) = manager
                     .player_characters
                     .get(&tick.source_id)
                     .map(|source| {
@@ -7492,18 +7506,27 @@ fn apply_character_buff_ticks(
                                     source.hp,
                                     source.max_hp,
                                     character_wounded_healing_dealt_modifier(source),
+                                )
+                                * moonberry_chaos_output_multiplier(
+                                    character_chaos_output_variance(source),
                                 ),
                             character_mutual_aid_healing_rate(source),
+                            character_dying_target_healing_modifier(source),
                         )
                     })
-                    .unwrap_or((1.0, 0.0));
+                    .unwrap_or((1.0, 0.0, 1.0));
                 let mut mutual_aid_heal = 0.0;
                 {
                     let Some(target) = manager.player_characters.get_mut(&tick.target_id) else {
                         continue;
                     };
-                    let final_amount =
-                        (*amount * source_multiplier * target.healing_taken_modifier).max(0.0);
+                    let target_multiplier = target.healing_taken_modifier
+                        * dying_target_healing_multiplier(
+                            target.hp,
+                            target.max_hp,
+                            source_dying_target_healing_modifier,
+                        );
+                    let final_amount = (*amount * source_multiplier * target_multiplier).max(0.0);
                     let target_mutual_aid_healing_rate = character_mutual_aid_healing_rate(target);
                     let (healing_changed, effective_amount) =
                         apply_effective_character_healing(target, final_amount);
@@ -14645,6 +14668,67 @@ mod tests {
         let target = &manager.player_characters["fixed-target"];
         assert_eq!(target.hp, 0.0);
         assert_eq!(target.damage_taken_this_turn, 1.0);
+    }
+
+    #[test]
+    fn world_buff_ticks_apply_source_and_target_talent_modifiers() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("source".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                skill_names: vec!["生死时速".to_owned(), "混沌无序".to_owned()],
+                skill_metadata: vec![
+                    CharacterSkillMetadata::talent("support_talent", "辅助天赋"),
+                    CharacterSkillMetadata::talent("normal_talent", "天赋"),
+                ],
+                ..Default::default()
+            });
+        manager.player_characters.insert(
+            "damage-target".to_owned(),
+            PlayerCharacter {
+                hp: 20.0,
+                max_hp: 20.0,
+                skill_names: vec!["过度免疫".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("normal_talent", "天赋")],
+                ..Default::default()
+            },
+        );
+        manager.player_characters.insert(
+            "healing-target".to_owned(),
+            PlayerCharacter {
+                hp: 4.0,
+                max_hp: 20.0,
+                ..Default::default()
+            },
+        );
+
+        assert!(apply_character_buff_ticks(
+            &mut manager,
+            &[
+                CharacterBuffTick {
+                    source_id: "source".to_owned(),
+                    target_id: "damage-target".to_owned(),
+                    action: BuffTickAction::Damage {
+                        amount: 5.0,
+                        damage_type: DamageType::Physical,
+                    },
+                },
+                CharacterBuffTick {
+                    source_id: "source".to_owned(),
+                    target_id: "healing-target".to_owned(),
+                    action: BuffTickAction::Heal { amount: 4.0 },
+                },
+            ]
+        ));
+
+        let target = &manager.player_characters["damage-target"];
+        assert!((3.4..=4.6).contains(&target.damage_taken_this_turn));
+        assert!((15.4..=16.6).contains(&target.hp));
+        let target = &manager.player_characters["healing-target"];
+        assert!((5.1..=6.9).contains(&target.healing_taken_this_turn));
+        assert!((9.1..=10.9).contains(&target.hp));
     }
 
     #[test]
