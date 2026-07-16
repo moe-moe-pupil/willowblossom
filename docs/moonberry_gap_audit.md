@@ -59,6 +59,8 @@ Additional 2026-07-16 correction: `希望化身` now obeys the active encounter 
 
 Additional 2026-07-16 correction: battle damage contributors are now scoped to one active combat. Surviving targets clear contributor attribution when combat ends, battle entry defensively removes stale persisted attribution, and exit-forced defeats resolve their legitimate contributors before cleanup. This prevents attackers from an earlier combat receiving `忏悔` or `罪上加罪` kill/assist credit when another attacker defeats the target later. Focused verification passes with `cargo test --lib -j 1 battle_exit_prevents_cross_combat_kill_assist_credit -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `振奋` is now fully scoped to active combat. Resting healing cannot grant it, stale persisted links cannot modify resting order speed or damage, combat exit clears healer/target ownership, and combat entry defensively clears stale links before new healing can establish them. The existing active-combat transfer, non-stacking, round expiry, speed, and damage behavior remains unchanged. Focused verification passes with `cargo test --lib -j 1 inspiration -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -362,7 +364,7 @@ Battle damage resolution now distinguishes attempted, absorbed, and applied dama
 
 `希望化身` now executes as a persisted active-combat lethal transformation with two-round damage immunity, healing-only actions, forced expiry or battle-exit death, and fresh eligibility on later combat entry; channel interruption remains pending until battle channeling itself is represented.
 
-`振奋` now executes for positive single-target battle healing with one-target transfer, non-stacking +10% speed/damage, and global-round expiry.
+`振奋` now executes only during active combat for positive single-target healing, with one-target transfer, non-stacking +10% speed/damage, global-round expiry, and boundary cleanup of persisted ownership.
 
 `息心` now executes at the active-to-resting encounter transition, restoring 50% of persisted post-mitigation active-combat damage once without reviving defeated participants.
 

@@ -494,6 +494,8 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         for participant in &mut encounter.participants {
             participant.combat_damage_taken_total = 0.0;
             participant.damage_contributors.clear();
+            participant.inspiration_target_id = None;
+            participant.inspiration_sources.clear();
             participant.keen_evasion_available = participant.keen_evasion_enabled;
             participant.undying_rage_used = false;
             participant.undying_rage_active = false;
@@ -509,6 +511,8 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.keen_evasion_available = false;
             participant.undying_rage_active = false;
             participant.arcane_shield = 0.0;
+            participant.inspiration_target_id = None;
+            participant.inspiration_sources.clear();
             if participant_hope_avatar_active(participant) {
                 let was_alive = participant.alive;
                 participant.hp = 0.0;
@@ -1865,7 +1869,11 @@ fn encounter_roster_ui(
             changed |= ui
                 .add(egui::DragValue::new(&mut participant.speed).speed(0.5))
                 .changed();
-            let effective_speed = participant_order_speed(participant, living_player_count);
+            let effective_speed = participant_order_speed(
+                participant,
+                living_player_count,
+                encounter.active,
+            );
             if (effective_speed - participant.speed).abs() > f32::EPSILON {
                 ui.small(format!(
                     "实 {}",
@@ -1912,7 +1920,9 @@ fn encounter_roster_ui(
                     participant.one_heart_stacks
                 ));
             }
-            if participant_inspiration_multiplier(participant) > 1.0 + f32::EPSILON {
+            if encounter.active
+                && participant_inspiration_multiplier(participant) > 1.0 + f32::EPSILON
+            {
                 ui.small("振奋：速度与伤害+10%");
             }
             if encounter.active
@@ -2721,6 +2731,7 @@ impl BattleRoundStore {
                         &basic_config,
                         completed_participant_turns(encounter),
                         damage_type,
+                        encounter.active,
                     );
                     let fallback_radius = battle_skill_damage_range_radius(
                         skill.range,
@@ -3160,18 +3171,20 @@ impl BattleRoundStore {
                             record_participant_one_heart_heal(actor, &target_id);
                         }
                     }
-                    if let Some(target_id) = healed_inspiration_target_id {
-                        let target_name = encounter
-                            .participants
-                            .iter()
-                            .find(|participant| participant.target_id == target_id)
-                            .map(|participant| participant.display_name.clone())
-                            .unwrap_or_else(|| target_id.clone());
-                        if apply_encounter_inspiration(encounter, actor_id, &target_id) {
-                            encounter.action_log.push(format!(
-                                "{}触发振奋，使{}获得10%速度与伤害加成，持续1回合",
-                                actor_name, target_name
-                            ));
+                    if encounter.active {
+                        if let Some(target_id) = healed_inspiration_target_id {
+                            let target_name = encounter
+                                .participants
+                                .iter()
+                                .find(|participant| participant.target_id == target_id)
+                                .map(|participant| participant.display_name.clone())
+                                .unwrap_or_else(|| target_id.clone());
+                            if apply_encounter_inspiration(encounter, actor_id, &target_id) {
+                                encounter.action_log.push(format!(
+                                    "{}触发振奋，使{}获得10%速度与伤害加成，持续1回合",
+                                    actor_name, target_name
+                                ));
+                            }
                         }
                     }
                     if pending_actor_mutual_aid_healing > f32::EPSILON {
@@ -4654,6 +4667,7 @@ fn living_player_participant_count(encounter: &BattleEncounter) -> usize {
 fn participant_order_speed(
     participant: &BattleParticipantSnapshot,
     living_player_count: usize,
+    encounter_active: bool,
 ) -> f32 {
     let speed = participant.speed.max(0.0);
     let base_speed = if living_player_count > 0
@@ -4664,7 +4678,12 @@ fn participant_order_speed(
     } else {
         speed
     };
-    base_speed * participant_inspiration_multiplier(participant)
+    let inspiration_multiplier = if encounter_active {
+        participant_inspiration_multiplier(participant)
+    } else {
+        1.0
+    };
+    base_speed * inspiration_multiplier
 }
 
 fn ordered_participant_indices(encounter: &BattleEncounter) -> Vec<usize> {
@@ -4674,22 +4693,27 @@ fn ordered_participant_indices(encounter: &BattleEncounter) -> Vec<usize> {
         indices.sort_by(|left, right| {
             let left_participant = &encounter.participants[*left];
             let right_participant = &encounter.participants[*right];
-            participant_order_speed(right_participant, living_player_count)
-                .total_cmp(&participant_order_speed(
-                    left_participant,
-                    living_player_count,
-                ))
-                .then_with(|| right_participant.agi.cmp(&left_participant.agi))
-                .then_with(|| {
-                    left_participant
-                        .action_done
-                        .cmp(&right_participant.action_done)
-                })
-                .then_with(|| {
-                    left_participant
-                        .display_name
-                        .cmp(&right_participant.display_name)
-                })
+            participant_order_speed(
+                right_participant,
+                living_player_count,
+                encounter.active,
+            )
+            .total_cmp(&participant_order_speed(
+                left_participant,
+                living_player_count,
+                encounter.active,
+            ))
+            .then_with(|| right_participant.agi.cmp(&left_participant.agi))
+            .then_with(|| {
+                left_participant
+                    .action_done
+                    .cmp(&right_participant.action_done)
+            })
+            .then_with(|| {
+                left_participant
+                    .display_name
+                    .cmp(&right_participant.display_name)
+            })
         });
     } else {
         indices.sort_by(|left, right| {
@@ -4960,6 +4984,7 @@ fn participant_damage_multiplier(
     config: &TrpgBasicConfig,
     completed_turns: u32,
     damage_type: DamageType,
+    encounter_active: bool,
 ) -> f32 {
     let status = participant_status(participant);
     let bonus_kind = trpg_damage_bonus_kind(damage_type);
@@ -4975,8 +5000,13 @@ fn participant_damage_multiplier(
             }
         })
         .unwrap_or_default();
+    let inspiration_multiplier = if encounter_active {
+        participant_inspiration_multiplier(participant)
+    } else {
+        1.0
+    };
     participant.damage_dealt_modifier
-        * participant_inspiration_multiplier(participant)
+        * inspiration_multiplier
         * participant_undying_rage_damage_multiplier(participant)
         * arrogance_damage_dealt_multiplier(
             participant.arrogance_damage_bonus_per_source,
@@ -9839,6 +9869,45 @@ mod tests {
             .action_log
             .iter()
             .any(|entry| entry.contains("触发振奋")));
+
+        assert!(store.record_skill_use("battle", "a", "b", &heal, &manager, None));
+        assert_eq!(
+            store.encounters["battle"].participants[1]
+                .inspiration_sources
+                .get("a"),
+            Some(&1)
+        );
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, false
+        ));
+        assert!(encounter.participants[0].inspiration_target_id.is_none());
+        assert!(encounter.participants[1].inspiration_sources.is_empty());
+        encounter.participants[2]
+            .inspiration_sources
+            .insert("stale".to_owned(), 1);
+
+        assert!(store.record_skill_use("battle", "c", "d", &damage, &manager, None));
+        assert!((store.encounters["battle"].participants[3].hp - 48.0).abs() < 0.0001);
+        assert!(store.record_skill_use("battle", "a", "b", &heal, &manager, None));
+        let encounter = &store.encounters["battle"];
+        assert!(encounter.participants[0].inspiration_target_id.is_none());
+        assert!(encounter.participants[1].inspiration_sources.is_empty());
+        assert_eq!(
+            encounter.participants[2].inspiration_sources.get("stale"),
+            Some(&1)
+        );
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, true
+        ));
+        assert!(
+            encounter.participants.iter().all(|participant| participant
+                .inspiration_target_id
+                .is_none()
+                && participant.inspiration_sources.is_empty())
+        );
     }
 
     #[test]
