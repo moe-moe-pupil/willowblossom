@@ -4280,6 +4280,7 @@ fn quick_cast_ui(
     scene_positions: Option<&SceneCharacterPositions>,
     player_camera_positions: Option<&ScenePlayerCameraPositions>,
 ) -> Option<QuickCastAction> {
+    crate::napcat::materialize_imported_skill_cooldowns(character, cast_turn);
     let skills = quick_cast_skills(character);
     if skills.is_empty() {
         ui.small("没有可释放技能。");
@@ -4559,13 +4560,15 @@ fn quick_skill_cooldown_remaining(
     cooldown_left: Option<u32>,
     cast_turn: u32,
 ) -> u32 {
-    let Some(last_cast_turn) = character
-        .skill_last_cast_turns
-        .get(&skill_index.to_string())
-    else {
-        return cooldown_left.unwrap_or_default();
-    };
-    cooldown_turns.saturating_sub(cast_turn.saturating_sub(*last_cast_turn))
+    let skill_key = skill_index.to_string();
+    if let Some(last_cast_turn) = character.skill_last_cast_turns.get(&skill_key) {
+        return cooldown_turns.saturating_sub(cast_turn.saturating_sub(*last_cast_turn));
+    }
+    character
+        .skill_cooldown_ready_turns
+        .get(&skill_key)
+        .map(|ready_turn| ready_turn.saturating_sub(cast_turn))
+        .unwrap_or_else(|| cooldown_left.unwrap_or_default())
 }
 
 fn quick_cast_effect(
@@ -5007,6 +5010,7 @@ fn apply_quick_cast_action_to_manager(
         let Some(caster) = manager.player_characters.get_mut(&action.caster_id) else {
             return false;
         };
+        crate::napcat::materialize_imported_skill_cooldowns(caster, action.cast_turn);
         if !action.force && caster.mp + f32::EPSILON < action.skill.mp_cost {
             return false;
         }
@@ -5077,6 +5081,9 @@ fn apply_quick_cast_action_to_manager(
             action.skill.index.to_string(),
             action.cast_turn,
         );
+        caster
+            .skill_cooldown_ready_turns
+            .remove(&action.skill.index.to_string());
         (
             source_damage_multiplier,
             source_healing_multiplier,
@@ -14762,7 +14769,7 @@ mod tests {
             &mut manager,
             QuickCastAction {
                 caster_id: "caster".to_owned(),
-                skill,
+                skill: skill.clone(),
                 targets: vec!["target".to_owned()],
                 effect: Some(QuickCastEffect::Damage {
                     amount: 1.0,
@@ -14780,6 +14787,36 @@ mod tests {
             manager.player_characters["target"].hp,
             10.0
         );
+        assert_eq!(
+            manager.player_characters["caster"].skill_cooldown_ready_turns["0"],
+            2
+        );
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(QuickCastEffect::Damage {
+                    amount: 1.0,
+                    target: TargetSelector {
+                        actor: ActorRef::Target,
+                        area: None,
+                    },
+                    damage_type: DamageType::Physical,
+                }),
+                cast_turn: 2,
+                force: false,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["target"].hp,
+            9.0
+        );
+        assert!(!manager.player_characters["caster"]
+            .skill_cooldown_ready_turns
+            .contains_key("0"));
     }
 
     #[test]

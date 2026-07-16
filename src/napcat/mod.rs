@@ -922,6 +922,8 @@ pub struct PlayerCharacter {
     #[serde(default)]
     pub skill_last_cast_turns: HashMap<String, u32>,
     #[serde(default)]
+    pub skill_cooldown_ready_turns: HashMap<String, u32>,
+    #[serde(default)]
     pub active_buffs: Vec<BuffSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buff_base_stats: Option<CharacterBuffBaseStats>,
@@ -962,6 +964,7 @@ impl Default for PlayerCharacter {
             skill_cooldown_turns: Vec::new(),
             skill_metadata: Vec::new(),
             skill_last_cast_turns: HashMap::new(),
+            skill_cooldown_ready_turns: HashMap::new(),
             active_buffs: Vec::new(),
             buff_base_stats: None,
             inventory: CharacterInventory::default(),
@@ -5999,16 +6002,20 @@ fn character_skill_source_label(metadata: &CharacterSkillMetadata) -> Option<Str
     }
 }
 
-fn format_private_character_cooldowns(manager: &NapcatMessageManager, target_id: &str) -> String {
-    let Some(character) = manager.player_characters.get(target_id) else {
+fn format_private_character_cooldowns(
+    manager: &mut NapcatMessageManager,
+    target_id: &str,
+) -> String {
+    let current_turn = current_player_cooldown_turn(manager, target_id);
+    let Some(character) = manager.player_characters.get_mut(target_id) else {
         return "你还没有角色卡。输入【.兑换】开始建卡。".to_owned();
     };
+    materialize_imported_skill_cooldowns(character, current_turn);
     let skill_count = character_skill_count(character);
     if skill_count == 0 {
         return "还没有已兑换技能。".to_owned();
     }
 
-    let current_turn = current_player_cooldown_turn(manager, target_id);
     let mut lines = Vec::new();
     for index in 0..skill_count {
         let cooldown = character
@@ -6170,13 +6177,35 @@ fn skill_cooldown_remaining(
     cooldown_left: Option<u32>,
     current_turn: u32,
 ) -> u32 {
-    let Some(last_cast_turn) = character
-        .skill_last_cast_turns
-        .get(&skill_index.to_string())
-    else {
-        return cooldown_left.unwrap_or_default();
-    };
-    cooldown_turns.saturating_sub(current_turn.saturating_sub(*last_cast_turn))
+    let skill_key = skill_index.to_string();
+    if let Some(last_cast_turn) = character.skill_last_cast_turns.get(&skill_key) {
+        return cooldown_turns.saturating_sub(current_turn.saturating_sub(*last_cast_turn));
+    }
+    character
+        .skill_cooldown_ready_turns
+        .get(&skill_key)
+        .map(|ready_turn| ready_turn.saturating_sub(current_turn))
+        .unwrap_or_else(|| cooldown_left.unwrap_or_default())
+}
+
+pub fn materialize_imported_skill_cooldowns(character: &mut PlayerCharacter, current_turn: u32) {
+    for (index, metadata) in character.skill_metadata.iter().enumerate() {
+        let skill_key = index.to_string();
+        if character.skill_last_cast_turns.contains_key(&skill_key)
+            || character
+                .skill_cooldown_ready_turns
+                .contains_key(&skill_key)
+        {
+            continue;
+        }
+        let remaining = metadata.cooldown_left.unwrap_or_default();
+        if remaining > 0 {
+            character.skill_cooldown_ready_turns.insert(
+                skill_key,
+                current_turn.saturating_add(remaining),
+            );
+        }
+    }
 }
 
 fn format_character_number(value: f32) -> String {
@@ -9467,15 +9496,48 @@ mod tests {
                 }],
                 ..Default::default()
             });
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        });
 
-        let response = handle_character_creation_message(
+        let first_response = handle_character_creation_message(
             &mut manager,
             &test_message_with_text(NapcatMessageType::Private, ".冷却"),
             "2",
         )
         .unwrap();
+        assert!(first_response.contains("护盾：还剩2轮"));
+        assert_eq!(
+            manager.player_characters["2"].skill_cooldown_ready_turns["0"],
+            2
+        );
 
-        assert!(response.contains("护盾：还剩2轮"));
+        manager
+            .trpg_groups
+            .get_mut("table")
+            .unwrap()
+            .set_player_turns_passed("2", 1);
+        let second_response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".冷却"),
+            "2",
+        )
+        .unwrap();
+        assert!(second_response.contains("护盾：还剩1轮"));
+
+        manager
+            .trpg_groups
+            .get_mut("table")
+            .unwrap()
+            .set_player_turns_passed("2", 2);
+        let ready_response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".冷却"),
+            "2",
+        )
+        .unwrap();
+        assert!(ready_response.contains("护盾：可用"));
     }
 
     #[test]

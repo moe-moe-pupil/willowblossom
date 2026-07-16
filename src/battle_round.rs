@@ -361,6 +361,8 @@ pub struct BattleParticipantSnapshot {
     pub healing_taken_this_turn: f32,
     #[serde(default)]
     pub skill_last_used_turns: HashMap<String, u32>,
+    #[serde(default)]
+    pub skill_cooldown_ready_turns: HashMap<String, u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -2785,6 +2787,9 @@ impl BattleRoundStore {
             skill.index.to_string(),
             actor.turn.saturating_add(1),
         );
+        actor
+            .skill_cooldown_ready_turns
+            .remove(&skill.index.to_string());
 
         if effects.is_empty() {
             let note = skill.note.trim();
@@ -3641,6 +3646,12 @@ fn initialize_participant_clock(
         .or_else(|| group.map(|group| group.world_turn))
         .unwrap_or_default();
     participant.skill_last_used_turns = character.skill_last_cast_turns.clone();
+    let mut cooldown_character = character.clone();
+    crate::napcat::materialize_imported_skill_cooldowns(
+        &mut cooldown_character,
+        participant.turn,
+    );
+    participant.skill_cooldown_ready_turns = cooldown_character.skill_cooldown_ready_turns;
 }
 
 fn sync_encounter_to_manager(
@@ -3683,6 +3694,10 @@ fn sync_encounter_to_manager(
         }
         if character.skill_last_cast_turns != participant.skill_last_used_turns {
             character.skill_last_cast_turns = participant.skill_last_used_turns.clone();
+            changed = true;
+        }
+        if character.skill_cooldown_ready_turns != participant.skill_cooldown_ready_turns {
+            character.skill_cooldown_ready_turns = participant.skill_cooldown_ready_turns.clone();
             changed = true;
         }
     }
@@ -4342,6 +4357,7 @@ fn participant_from_character(
         damage_taken_this_turn: character.damage_taken_this_turn,
         healing_taken_this_turn: character.healing_taken_this_turn,
         skill_last_used_turns: HashMap::new(),
+        skill_cooldown_ready_turns: HashMap::new(),
     }
 }
 
@@ -4351,6 +4367,8 @@ fn participant_from_unit_template(
     unit: &UnitPoolEntry,
 ) -> BattleParticipantSnapshot {
     let character = &unit.character;
+    let mut cooldown_character = character.clone();
+    crate::napcat::materialize_imported_skill_cooldowns(&mut cooldown_character, 0);
     let status = character.status.combined(&character.extra_status);
     let (speed, low_survivor_speed) = character_battle_speeds(character);
     BattleParticipantSnapshot {
@@ -4438,6 +4456,7 @@ fn participant_from_unit_template(
         damage_taken_this_turn: character.damage_taken_this_turn,
         healing_taken_this_turn: character.healing_taken_this_turn,
         skill_last_used_turns: HashMap::new(),
+        skill_cooldown_ready_turns: cooldown_character.skill_cooldown_ready_turns,
     }
 }
 
@@ -4528,6 +4547,7 @@ fn participant_from_target(
         damage_taken_this_turn: 0.0,
         healing_taken_this_turn: 0.0,
         skill_last_used_turns: HashMap::new(),
+        skill_cooldown_ready_turns: HashMap::new(),
     }
 }
 
@@ -4628,6 +4648,7 @@ fn sync_participant_from_manager(
             character.damage_taken_this_turn = participant.damage_taken_this_turn;
             character.healing_taken_this_turn = participant.healing_taken_this_turn;
             character.skill_last_cast_turns = participant.skill_last_used_turns.clone();
+            character.skill_cooldown_ready_turns = participant.skill_cooldown_ready_turns.clone();
             participant.unit_character = Some(character);
         }
         return;
@@ -4791,6 +4812,7 @@ fn refresh_unit_participant_from_template(
         refreshed.damage_taken_this_turn = participant.damage_taken_this_turn;
         refreshed.healing_taken_this_turn = participant.healing_taken_this_turn;
         refreshed.skill_last_cast_turns = participant.skill_last_used_turns.clone();
+        refreshed.skill_cooldown_ready_turns = participant.skill_cooldown_ready_turns.clone();
     }
     refreshed.buff_base_stats = None;
     participant.unit_character = Some(refreshed);
@@ -4984,6 +5006,7 @@ fn character_for_participant(
     character.damage_taken_this_turn = participant.damage_taken_this_turn;
     character.healing_taken_this_turn = participant.healing_taken_this_turn;
     character.skill_last_cast_turns = participant.skill_last_used_turns.clone();
+    character.skill_cooldown_ready_turns = participant.skill_cooldown_ready_turns.clone();
     if participant.unit_template_id.is_none() {
         character.max_hp = participant.max_hp;
         character.max_mp = participant.max_mp;
@@ -5078,13 +5101,15 @@ fn skill_cooldown_remaining(
     cooldown_turns: u32,
     cooldown_left: Option<u32>,
 ) -> u32 {
-    let Some(last_used_turn) = participant
-        .skill_last_used_turns
-        .get(&skill_index.to_string())
-    else {
-        return cooldown_left.unwrap_or_default();
-    };
-    cooldown_turns.saturating_sub(participant.turn.saturating_sub(*last_used_turn))
+    let skill_key = skill_index.to_string();
+    if let Some(last_used_turn) = participant.skill_last_used_turns.get(&skill_key) {
+        return cooldown_turns.saturating_sub(participant.turn.saturating_sub(*last_used_turn));
+    }
+    participant
+        .skill_cooldown_ready_turns
+        .get(&skill_key)
+        .map(|ready_turn| ready_turn.saturating_sub(participant.turn))
+        .unwrap_or_else(|| cooldown_left.unwrap_or_default())
 }
 
 fn display_name_for_target(options: &[(String, String)], target_id: &str) -> String {
@@ -5813,6 +5838,7 @@ mod area_tests {
             damage_taken_this_turn: 0.0,
             healing_taken_this_turn: 0.0,
             skill_last_used_turns: HashMap::new(),
+            skill_cooldown_ready_turns: HashMap::new(),
         }
     }
 }
@@ -5920,6 +5946,7 @@ mod tests {
             damage_taken_this_turn: 0.0,
             healing_taken_this_turn: 0.0,
             skill_last_used_turns: HashMap::new(),
+            skill_cooldown_ready_turns: HashMap::new(),
         }
     }
 
@@ -11054,11 +11081,13 @@ mod tests {
     fn battle_skill_respects_imported_cooldown_left() {
         let mut store = BattleRoundStore::default();
         let manager = empty_manager();
+        let mut actor = participant("a", 0);
+        actor.skill_cooldown_ready_turns.insert("0".to_owned(), 2);
         store
             .encounters
             .insert("battle".to_owned(), BattleEncounter {
                 name: "battle".to_owned(),
-                participants: vec![participant("a", 0), participant("b", 0)],
+                participants: vec![actor, participant("b", 0)],
                 ..Default::default()
             });
         let skill = CharacterSkill {
@@ -11078,6 +11107,14 @@ mod tests {
 
         assert!(!store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
         assert!(store.encounters["battle"].action_log[0].contains("冷却还剩2轮"));
+
+        store.encounters.get_mut("battle").unwrap().participants[0].turn = 2;
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        assert!(
+            !store.encounters["battle"].participants[0]
+                .skill_cooldown_ready_turns
+                .contains_key("0")
+        );
     }
 
     #[test]
