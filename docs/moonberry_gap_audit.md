@@ -77,6 +77,8 @@ Additional 2026-07-16 correction: `奥术护盾` now checks the active encounter
 
 Additional 2026-07-16 update: `以逸待劳` approved-talent participants now persist one recovery charge whenever their natural turn advances during a resting encounter, capped at ten charges. Entering active combat consumes the charges once and restores 5% maximum HP per charge up to 50%; active turns do not accumulate charges, full-health entry still consumes them, and defeated participants are not revived. The recovery is direct HP restoration rather than overheal, so it cannot create an unintended `过度治疗` shield. Focused verification passes with `cargo test --lib -j 1 rest_then_fight -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 394 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: parsed-battle delayed damage now removes each scheduled tick immediately after its one intended execution. `苏萨斯之爪` and `液态躯体` still fire at the next round boundary, but no longer leave an already-applied amount displayed and persisted for another round. Compatibility is preserved for saved encounters: a pre-fire legacy tick at countdown `2` executes once and is removed, while an already-fired stale tick at countdown `1` expires without repeating its damage. Focused verification passes with `cargo test --lib -j 1 sousas -- --nocapture` and `cargo test --lib -j 1 liquid_body -- --nocapture`: 3 and 1 passed respectively, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 394 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -377,6 +379,8 @@ Additional implemented talent execution: `过度治疗` now converts battle over
 Additional implemented talent execution: `不死者之怒` now provides one active-encounter lethal-hit negation, same-round damage immunity, and +10% outgoing parsed-skill/buff-tick damage while hits above maximum HP bypass it; rest clears the active effect, stale resting flags cannot apply it, and battle re-entry rearms one charge.
 
 Battle damage resolution now distinguishes attempted, absorbed, and applied damage so shields/evasion do not falsely trigger successful-hit talent effects or inflate combat logs, and contributor attribution is cleared at combat boundaries so kill/assist rewards cannot leak across encounters.
+
+Parsed-battle delayed damage now has one-shot persisted execution semantics: next-round `苏萨斯之爪` and `液态躯体` ticks are removed as soon as they apply, and stale post-fire countdowns from older saves expire without duplicate damage.
 
 `希望化身` now executes as a persisted active-combat lethal transformation with two-round damage immunity, healing-only actions, forced expiry or battle-exit death, and fresh eligibility on later combat entry; channel interruption remains pending until battle channeling itself is represented.
 

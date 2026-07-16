@@ -1254,16 +1254,15 @@ fn advance_participant_delayed_damage_ticks(
     let display_name = participant.display_name.clone();
     let mut due = Vec::new();
     participant.delayed_damage_ticks.retain_mut(|tick| {
+        // Persisted ticks use 2 before their one execution; older builds left 1 behind after it.
         if tick.turns_remaining <= 0 {
             return false;
         }
         tick.turns_remaining -= 1;
         if tick.turns_remaining > 0 {
             due.push(tick.clone());
-            true
-        } else {
-            false
         }
+        false
     });
     if !participant.alive {
         return advance;
@@ -7272,6 +7271,9 @@ mod tests {
             "苏萨斯之爪"
         );
 
+        let serialized = serde_json::to_string(&store).unwrap();
+        let mut store = serde_json::from_str::<BattleRoundStore>(&serialized).unwrap();
+
         assert!(store.next_round("battle"));
         let target = store.encounters["battle"]
             .participants
@@ -7280,7 +7282,7 @@ mod tests {
             .unwrap();
         assert!((target.hp - 6.5).abs() < 0.0001);
         assert!((target.damage_taken_this_turn - 3.5).abs() < 0.0001);
-        assert_eq!(target.delayed_damage_ticks.len(), 1);
+        assert!(target.delayed_damage_ticks.is_empty());
 
         assert!(store.next_round("battle"));
         let target = store.encounters["battle"]
@@ -7290,6 +7292,31 @@ mod tests {
             .unwrap();
         assert!(target.delayed_damage_ticks.is_empty());
         assert!((target.hp - 6.5).abs() < 0.0001);
+
+        let mut stale_target = participant("stale", 0);
+        stale_target.hp = 20.0;
+        stale_target.max_hp = 20.0;
+        stale_target
+            .delayed_damage_ticks
+            .push(BattleDelayedDamageTick {
+                name: "旧存档已结算伤害".to_owned(),
+                source_id: "a".to_owned(),
+                source_name: "a".to_owned(),
+                amount: 5.0,
+                damage_type: DamageType::Magical,
+                turns_remaining: 1,
+            });
+        store
+            .encounters
+            .insert("stale".to_owned(), BattleEncounter {
+                name: "stale".to_owned(),
+                participants: vec![stale_target],
+                ..Default::default()
+            });
+        assert!(store.next_round("stale"));
+        let stale_target = &store.encounters["stale"].participants[0];
+        assert!((stale_target.hp - 20.0).abs() < 0.0001);
+        assert!(stale_target.delayed_damage_ticks.is_empty());
     }
 
     #[test]
@@ -7995,7 +8022,7 @@ mod tests {
         assert!((target.hp - 10.25).abs() < 0.0001);
         assert!((target.healing_taken_this_turn - 0.25).abs() < 0.0001);
         assert!((target.damage_taken_this_turn - 5.0).abs() < 0.0001);
-        assert_eq!(target.delayed_damage_ticks.len(), 1);
+        assert!(target.delayed_damage_ticks.is_empty());
 
         assert!(store.next_round("battle"));
         let target = store.encounters["battle"]
@@ -8081,7 +8108,7 @@ mod tests {
             .unwrap();
         assert!((target.hp - 10.0).abs() < 0.0001);
         assert_eq!(target.healing_taken_this_turn, 0.0);
-        assert_eq!(target.delayed_damage_ticks.len(), 1);
+        assert!(target.delayed_damage_ticks.is_empty());
 
         assert!(store.advance_participant("battle", "b", false));
         let target = store.encounters["battle"]
