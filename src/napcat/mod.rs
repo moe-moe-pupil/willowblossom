@@ -6902,6 +6902,14 @@ pub fn character_calm_heart_healing_rate(character: &PlayerCharacter) -> f32 {
     }
 }
 
+pub fn character_rest_then_fight_healing_rate(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "以逸待劳") {
+        0.05
+    } else {
+        0.0
+    }
+}
+
 pub fn character_keen_evasion_available(character: &PlayerCharacter) -> bool {
     character_has_approved_moonberry_talent(character, "敏锐")
 }

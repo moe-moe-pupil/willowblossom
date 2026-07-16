@@ -75,6 +75,8 @@ Additional 2026-07-16 correction: `不死者之怒`'s +10% outgoing damage now c
 
 Additional 2026-07-16 correction: `奥术护盾` now checks the active encounter at damage application as well as at normal combat exit. Resting damage ignores and clears stale or migrated arcane shield values, the roster hides inactive arcane shield state, and entering combat still replaces any stale value with a fresh 10% maximum-MP shield. Ordinary `过度治疗` shielding remains usable outside this combat-only rule. Focused verification passes with `cargo test --lib -j 1 arcane_shield -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 update: `以逸待劳` approved-talent participants now persist one recovery charge whenever their natural turn advances during a resting encounter, capped at ten charges. Entering active combat consumes the charges once and restores 5% maximum HP per charge up to 50%; active turns do not accumulate charges, full-health entry still consumes them, and defeated participants are not revived. The recovery is direct HP restoration rather than overheal, so it cannot create an unintended `过度治疗` shield. Focused verification passes with `cargo test --lib -j 1 rest_then_fight -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 394 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -381,6 +383,8 @@ Battle damage resolution now distinguishes attempted, absorbed, and applied dama
 `振奋` now executes only during active combat for positive single-target healing, with one-target transfer, non-stacking +10% speed/damage, global-round expiry, and boundary cleanup of persisted ownership.
 
 `息心` now executes at the active-to-resting encounter transition, restoring 50% of persisted post-mitigation active-combat damage once without reviving defeated participants.
+
+`以逸待劳` now accumulates up to ten persisted charges as the participant's natural turn advances during rest and consumes them on the next active-combat entry for 5% maximum-HP recovery per charge, capped at 50%, without reviving defeated participants or producing overheal shielding.
 
 6. Import/export is partial.
 
