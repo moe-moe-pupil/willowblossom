@@ -47,6 +47,8 @@ Additional 2026-07-16 correction: `溃伤`'s one-round healing-received penalty 
 
 Additional 2026-07-16 update: `振奋` approved-talent parsed-battle single-target healing now grants the healed target +10% effective battle-order speed and outgoing damage until the next global round boundary. Each healer can maintain the effect on only one target, changing targets transfers that healer's contribution, multiple healers do not stack the numeric bonus beyond 10%, area/multi-target healing does not trigger it, and the source/target ownership state persists safely. Focused verification passes with `cargo test --lib -j 1 inspiration -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 391 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 update: `息心` approved-talent battle participants now persist the post-mitigation damage they take while an encounter is active and recover 50% of that amount when the GM changes the encounter from active to resting. Prevented damage does not enter the tally, resting damage is excluded, re-entering battle starts a fresh tally, repeated resting-state writes cannot retrigger recovery, and defeated participants are not revived. The old Moonberry source stored this talent as description-only data, so the encounter's existing GM-controlled active/resting transition is the executable battle-exit boundary. Focused verification passes with `cargo test calm_heart_heals_active_combat_damage_once_on_battle_exit -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 392 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -352,6 +354,8 @@ Battle damage resolution now distinguishes attempted, absorbed, and applied dama
 
 `振奋` now executes for positive single-target battle healing with one-target transfer, non-stacking +10% speed/damage, and global-round expiry.
 
+`息心` now executes at the active-to-resting encounter transition, restoring 50% of persisted post-mitigation active-combat damage once without reviving defeated participants.
+
 6. Import/export is partial.
 
    Willowblossom now has a versioned JSON export/import wrapper for the persisted `NapcatMessageManager`, exposed in the TRPG settings UI. That covers messages, chat metadata, character cards, TRPG groups, skill pools, random pools, unit pools, and chat window state that live in that store. It also has targeted JSON export/import-merge for PC/character cards, reusable unit/NPC templates, chat-list metadata without message bodies, scoped DeepSeek summary blocks without raw source text, and voxel scene data. It can also merge old Moonberry root/config JSON exports for groups, basic group descriptions/guide/initial points, old `basicConfig` stat formula coefficients, PCs, chat-list metadata, chat messages, skill-pool metadata, per-character skill shape metadata, unit-pool templates, random-pool text/min-max items plus old id/group/tag/description/created-at metadata, old per-PC negative timers, old teams, old worlds/chat areas, and old send panes.
@@ -397,6 +401,8 @@ Battle damage resolution now distinguishes attempted, absorbed, and applied dama
    Additional update: parsed battle incoming damage now applies `液态躯体` as a target-side delayed-damage split and previous-turn self-heal, with pending delayed damage visible in the battle roster.
 
    Additional update: parsed battle incoming damage now applies `敏锐` as a target-side once-per-battle dodge of the first positive range/non-targeted skill hit, with the ready charge visible in the battle roster.
+
+   Additional update: parsed battle encounter exit now applies `息心` as a one-shot heal for 50% of post-mitigation damage recorded while the encounter was active, then clears the persisted tally before resting.
 
 8. Per-group rules/config are partial.
 
@@ -467,6 +473,7 @@ Battle damage resolution now distinguishes attempted, absorbed, and applied dama
    - use the new `千万回忆` delayed healing echo scheduler as a stepping stone for other delayed support-side talent triggers,
    - use the new `液态躯体` delayed-damage/self-heal hook as a stepping stone for other target-side timing talents,
    - use the new `敏锐` once-per-battle dodge hook as a stepping stone for other target-side avoidance or targeting-sensitive talents,
+   - use the new `息心` active-to-resting transition hook as a stepping stone for other battle-entry and battle-exit talent clauses,
    - conditional combat/timing talent triggers/effects beyond immediate knowledge-stat and always-on numeric passive talents,
    - richer talent choice/approval UX if old campaign operations need it,
    - executable typed talent effects from the preserved trigger/category metadata,

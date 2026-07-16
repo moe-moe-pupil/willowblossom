@@ -6894,6 +6894,14 @@ pub fn character_liquid_body_self_healing_rate(character: &PlayerCharacter) -> f
     }
 }
 
+pub fn character_calm_heart_healing_rate(character: &PlayerCharacter) -> f32 {
+    if character_has_approved_moonberry_talent(character, "息心") {
+        0.5
+    } else {
+        0.0
+    }
+}
+
 pub fn character_keen_evasion_available(character: &PlayerCharacter) -> bool {
     character_has_approved_moonberry_talent(character, "敏锐")
 }

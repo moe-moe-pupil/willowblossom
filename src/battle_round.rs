@@ -41,6 +41,7 @@ use crate::{
         champion_damage_taken_multiplier,
         character_arcane_shield_amount,
         character_arrogance_damage_bonus_per_source,
+        character_calm_heart_healing_rate,
         character_champion_damage_bonus_per_stack,
         character_champion_damage_reduction_per_stack,
         character_chaos_output_variance,
@@ -308,6 +309,10 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub liquid_body_self_healing_rate: f32,
     #[serde(default)]
+    pub calm_heart_healing_rate: f32,
+    #[serde(default)]
+    pub combat_damage_taken_total: f32,
+    #[serde(default)]
     pub champion_damage_bonus_per_stack: f32,
     #[serde(default)]
     pub champion_damage_reduction_per_stack: f32,
@@ -475,6 +480,38 @@ fn apply_participant_healing_for_battle(
             (participant.overhealing_shield.max(0.0) + overhealing).min(shield_cap);
         participant.overhealing_shield_turns_remaining = 2;
     }
+}
+
+fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> bool {
+    if encounter.active == active {
+        return false;
+    }
+
+    if active {
+        for participant in &mut encounter.participants {
+            participant.combat_damage_taken_total = 0.0;
+        }
+    } else {
+        let mut logs = Vec::new();
+        for participant in &mut encounter.participants {
+            let healing = participant.combat_damage_taken_total.max(0.0)
+                * participant.calm_heart_healing_rate.max(0.0);
+            participant.combat_damage_taken_total = 0.0;
+            if !participant.alive || healing <= f32::EPSILON {
+                continue;
+            }
+            let shield_cap_rate = participant.overhealing_shield_cap_rate;
+            apply_participant_healing_for_battle(participant, healing, shield_cap_rate);
+            logs.push(format!(
+                "{}触发息心，回复{}点生命值",
+                participant.display_name,
+                format_number(healing)
+            ));
+        }
+        encounter.action_log.extend(logs);
+    }
+    encounter.active = active;
+    true
 }
 
 fn advance_participant_overhealing_shield(participant: &mut BattleParticipantSnapshot) {
@@ -809,6 +846,7 @@ fn apply_participant_damage_for_battle(
     participant: &mut BattleParticipantSnapshot,
     amount: f32,
     source_id: &str,
+    encounter_active: bool,
 ) -> BattleDamageResolution {
     let incoming_amount = amount.max(0.0);
     if participant_hope_avatar_active(participant) {
@@ -862,6 +900,9 @@ fn apply_participant_damage_for_battle(
     }
     let was_alive = participant.alive;
     record_participant_damage_taken(participant, final_amount);
+    if encounter_active {
+        participant.combat_damage_taken_total += final_amount;
+    }
     if was_alive {
         record_participant_damage_contributor(participant, source_id);
         record_participant_arrogance_damage_source(participant, source_id);
@@ -1101,6 +1142,7 @@ struct BattleDelayedDamageAdvance {
 
 fn advance_participant_delayed_damage_ticks(
     participant: &mut BattleParticipantSnapshot,
+    encounter_active: bool,
 ) -> BattleDelayedDamageAdvance {
     if participant.delayed_damage_ticks.is_empty() {
         return BattleDelayedDamageAdvance::default();
@@ -1132,6 +1174,7 @@ fn advance_participant_delayed_damage_ticks(
             participant,
             final_amount,
             &tick.source_id,
+            encounter_active,
         );
         if let Some(outcome) = resolution.defeat_outcome {
             advance.defeat_outcomes.push(outcome);
@@ -1401,6 +1444,14 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
                 .to_bits()
                 .hash(&mut hasher);
             participant
+                .calm_heart_healing_rate
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .combat_damage_taken_total
+                .to_bits()
+                .hash(&mut hasher);
+            participant
                 .champion_damage_bonus_per_stack
                 .to_bits()
                 .hash(&mut hasher);
@@ -1645,7 +1696,10 @@ fn encounter_ui(
                 if encounter_entity.negative_enabled {
                     ui.small("消极已开");
                 }
-                changed |= ui.checkbox(&mut encounter.active, "进行中").changed();
+                let mut active = encounter.active;
+                if ui.checkbox(&mut active, "进行中").changed() {
+                    changed |= set_encounter_active_state(encounter, active);
+                }
                 changed |= ui
                     .checkbox(&mut encounter.negative_enabled, "消极")
                     .changed();
@@ -1851,6 +1905,16 @@ fn encounter_roster_ui(
                 || participant.liquid_body_self_healing_rate > f32::EPSILON
             {
                 ui.small("液态躯体");
+            }
+            if participant.calm_heart_healing_rate > f32::EPSILON {
+                if encounter.active && participant.combat_damage_taken_total > f32::EPSILON {
+                    ui.small(format!(
+                        "息心累计伤害{}",
+                        format_number(participant.combat_damage_taken_total)
+                    ));
+                } else {
+                    ui.small("息心");
+                }
             }
             let pending_delayed_damage = participant
                 .delayed_damage_ticks
@@ -2316,7 +2380,7 @@ impl BattleRoundStore {
                 }
                 participant.mp = (participant.mp + participant.mp_regen).min(participant.max_mp);
             }
-            let delayed = advance_participant_delayed_damage_ticks(participant);
+            let delayed = advance_participant_delayed_damage_ticks(participant, encounter.active);
             delayed_logs.extend(delayed.logs);
             defeat_outcomes.extend(delayed.defeat_outcomes);
             delayed_logs.extend(advance_participant_delayed_healing_ticks(participant));
@@ -2432,7 +2496,12 @@ impl BattleRoundStore {
             return false;
         };
         let final_damage = damage.max(0.0);
-        let resolution = apply_participant_damage_for_battle(target, final_damage, actor_id);
+        let resolution = apply_participant_damage_for_battle(
+            target,
+            final_damage,
+            actor_id,
+            encounter.active,
+        );
         let target_display_name = target.display_name.clone();
         encounter.action_log.push(format!(
             "{}对{}使用{}，造成{}点伤害",
@@ -2746,8 +2815,12 @@ impl BattleRoundStore {
                                 damage_type,
                             );
                         }
-                        let resolution =
-                            apply_participant_damage_for_battle(target, final_amount, actor_id);
+                        let resolution = apply_participant_damage_for_battle(
+                            target,
+                            final_amount,
+                            actor_id,
+                            encounter.active,
+                        );
                         let applied_physical_damage =
                             resolution.damage_applied * physical_damage_share;
                         let endless_pain_damage_committed = endless_pain_bonus > f32::EPSILON
@@ -3290,7 +3363,7 @@ impl BattleRoundStore {
             if participant.wound_healing_taken_turns > 0 {
                 participant.wound_healing_taken_turns -= 1;
             }
-            let delayed = advance_participant_delayed_damage_ticks(participant);
+            let delayed = advance_participant_delayed_damage_ticks(participant, encounter.active);
             delayed_logs.extend(delayed.logs);
             defeat_outcomes.extend(delayed.defeat_outcomes);
             delayed_logs.extend(advance_participant_delayed_healing_ticks(participant));
@@ -3651,6 +3724,7 @@ fn apply_battle_buff_ticks(
                     &mut encounter.participants[target_index],
                     final_amount,
                     &tick.source_id,
+                    encounter.active,
                 );
                 encounter.action_log.push(format!(
                     "状态触发：{}对{}造成{}点伤害",
@@ -3690,6 +3764,7 @@ fn apply_battle_buff_ticks(
                     &mut encounter.participants[target_index],
                     final_amount,
                     &tick.source_id,
+                    encounter.active,
                 );
                 encounter.action_log.push(format!(
                     "状态触发：{}对{}造成{}点固定伤害",
@@ -3906,6 +3981,14 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
             .to_bits()
             .hash(&mut hasher);
         participant
+            .calm_heart_healing_rate
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .combat_damage_taken_total
+            .to_bits()
+            .hash(&mut hasher);
+        participant
             .champion_damage_bonus_per_stack
             .to_bits()
             .hash(&mut hasher);
@@ -4045,6 +4128,8 @@ fn participant_from_character(
         hope_avatar_rounds_remaining: 0,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
+        calm_heart_healing_rate: character_calm_heart_healing_rate(character),
+        combat_damage_taken_total: 0.0,
         champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
         champion_damage_reduction_per_stack: character_champion_damage_reduction_per_stack(
             character,
@@ -4135,6 +4220,8 @@ fn participant_from_unit_template(
         hope_avatar_rounds_remaining: 0,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
+        calm_heart_healing_rate: character_calm_heart_healing_rate(character),
+        combat_damage_taken_total: 0.0,
         champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
         champion_damage_reduction_per_stack: character_champion_damage_reduction_per_stack(
             character,
@@ -4221,6 +4308,8 @@ fn participant_from_target(
         hope_avatar_rounds_remaining: 0,
         liquid_body_damage_delay_rate: 0.0,
         liquid_body_self_healing_rate: 0.0,
+        calm_heart_healing_rate: 0.0,
+        combat_damage_taken_total: 0.0,
         champion_damage_bonus_per_stack: 0.0,
         champion_damage_reduction_per_stack: 0.0,
         champion_stacks: 0,
@@ -4303,6 +4392,7 @@ fn sync_participant_from_manager(
                 character_liquid_body_damage_delay_rate(&character);
             participant.liquid_body_self_healing_rate =
                 character_liquid_body_self_healing_rate(&character);
+            participant.calm_heart_healing_rate = character_calm_heart_healing_rate(&character);
             participant.champion_damage_bonus_per_stack =
                 character_champion_damage_bonus_per_stack(&character);
             participant.champion_damage_reduction_per_stack =
@@ -4384,6 +4474,7 @@ fn sync_participant_from_manager(
             character_liquid_body_damage_delay_rate(character);
         participant.liquid_body_self_healing_rate =
             character_liquid_body_self_healing_rate(character);
+        participant.calm_heart_healing_rate = character_calm_heart_healing_rate(character);
         participant.champion_damage_bonus_per_stack =
             character_champion_damage_bonus_per_stack(character);
         participant.champion_damage_reduction_per_stack =
@@ -4422,6 +4513,7 @@ fn sync_participant_from_manager(
         participant.hope_avatar_enabled = false;
         participant.liquid_body_damage_delay_rate = 0.0;
         participant.liquid_body_self_healing_rate = 0.0;
+        participant.calm_heart_healing_rate = 0.0;
         participant.champion_damage_bonus_per_stack = 0.0;
         participant.champion_damage_reduction_per_stack = 0.0;
         participant.dominion_max_hp_gain_rate = 0.0;
@@ -5451,6 +5543,8 @@ mod area_tests {
             hope_avatar_rounds_remaining: 0,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
+            calm_heart_healing_rate: 0.0,
+            combat_damage_taken_total: 0.0,
             champion_damage_bonus_per_stack: 0.0,
             champion_damage_reduction_per_stack: 0.0,
             champion_stacks: 0,
@@ -5552,6 +5646,8 @@ mod tests {
             hope_avatar_rounds_remaining: 0,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
+            calm_heart_healing_rate: 0.0,
+            combat_damage_taken_total: 0.0,
             champion_damage_bonus_per_stack: 0.0,
             champion_damage_reduction_per_stack: 0.0,
             champion_stacks: 0,
@@ -7597,7 +7693,7 @@ mod tests {
         let mut participant = participant_from_target("target", &manager);
 
         assert!((participant.arcane_shield - 5.0).abs() < 0.0001);
-        let resolution = apply_participant_damage_for_battle(&mut participant, 3.0, "enemy");
+        let resolution = apply_participant_damage_for_battle(&mut participant, 3.0, "enemy", true);
         assert!(resolution.defeat_outcome.is_none());
         assert!((resolution.damage_applied - 0.0).abs() < 0.0001);
         assert!((participant.arcane_shield - 2.0).abs() < 0.0001);
@@ -7605,7 +7701,7 @@ mod tests {
         assert!((participant.damage_taken_this_turn - 0.0).abs() < 0.0001);
         assert!(participant.damage_contributors.is_empty());
 
-        let resolution = apply_participant_damage_for_battle(&mut participant, 4.0, "enemy");
+        let resolution = apply_participant_damage_for_battle(&mut participant, 4.0, "enemy", true);
         assert!(resolution.defeat_outcome.is_none());
         assert!((resolution.damage_applied - 2.0).abs() < 0.0001);
         assert!((participant.arcane_shield - 0.0).abs() < 0.0001);
@@ -7657,7 +7753,7 @@ mod tests {
             .iter_mut()
             .find(|participant| participant.target_id == "a")
             .unwrap();
-        let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy");
+        let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy", true);
         assert!(resolution.defeat_outcome.is_none());
         assert!(resolution.undying_rage_triggered);
         assert!((actor.hp - 20.0).abs() < 0.0001);
@@ -7701,7 +7797,7 @@ mod tests {
             .iter_mut()
             .find(|participant| participant.target_id == "a")
             .unwrap();
-        let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy");
+        let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy", true);
         assert!(resolution.defeat_outcome.is_none());
         assert!((resolution.damage_applied - 0.0).abs() < 0.0001);
         assert!((actor.hp - 20.0).abs() < 0.0001);
@@ -7716,15 +7812,104 @@ mod tests {
             .find(|participant| participant.target_id == "a")
             .unwrap();
         assert!(!actor.undying_rage_active);
-        let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy");
+        let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy", true);
         assert!(resolution.defeat_outcome.is_some());
         assert!(!actor.alive);
 
         let mut oversized = participant_from_character("a", &actor_character, &manager);
-        let resolution = apply_participant_damage_for_battle(&mut oversized, 21.0, "enemy");
+        let resolution = apply_participant_damage_for_battle(&mut oversized, 21.0, "enemy", true);
         assert!(resolution.defeat_outcome.is_some());
         assert!(!oversized.alive);
         assert!(!oversized.undying_rage_used);
+    }
+
+    #[test]
+    fn calm_heart_heals_active_combat_damage_once_on_battle_exit() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            damage_dealt_modifier: 1.0,
+            damage_taken_modifier: 1.0,
+            healing_dealt_modifier: 1.0,
+            healing_taken_modifier: 1.0,
+            skill_names: vec!["息心".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        assert!((actor.calm_heart_healing_rate - 0.5).abs() < 0.0001);
+
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, participant("enemy", 0)],
+                ..Default::default()
+            });
+
+        assert!(store.apply_action("battle", "enemy", "a", "攻击", 30.0));
+        let actor = &store.encounters["battle"].participants[0];
+        assert!((actor.hp - 70.0).abs() < 0.0001);
+        assert!((actor.combat_damage_taken_total - 30.0).abs() < 0.0001);
+        let restored: BattleParticipantSnapshot =
+            serde_json::from_str(&serde_json::to_string(actor).unwrap()).unwrap();
+        assert!((restored.calm_heart_healing_rate - 0.5).abs() < 0.0001);
+        assert!((restored.combat_damage_taken_total - 30.0).abs() < 0.0001);
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, false
+        ));
+        assert!((encounter.participants[0].hp - 85.0).abs() < 0.0001);
+        assert!((encounter.participants[0].combat_damage_taken_total - 0.0).abs() < 0.0001);
+        assert!(encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("触发息心，回复15点生命值")));
+        assert!(!set_encounter_active_state(
+            encounter, false
+        ));
+        assert!((encounter.participants[0].hp - 85.0).abs() < 0.0001);
+
+        assert!(store.apply_action("battle", "enemy", "a", "休整攻击", 10.0));
+        assert!((store.encounters["battle"].participants[0].hp - 75.0).abs() < 0.0001);
+        assert!(
+            (store.encounters["battle"].participants[0].combat_damage_taken_total - 0.0).abs()
+                < 0.0001
+        );
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, true
+        ));
+        assert!(store.apply_action("battle", "enemy", "a", "攻击", 10.0));
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!((encounter.participants[0].combat_damage_taken_total - 10.0).abs() < 0.0001);
+        assert!(set_encounter_active_state(
+            encounter, false
+        ));
+        assert!((encounter.participants[0].hp - 70.0).abs() < 0.0001);
+
+        assert!(set_encounter_active_state(
+            encounter, true
+        ));
+        encounter.participants[0].hp = 5.0;
+        assert!(store.apply_action("battle", "enemy", "a", "致命攻击", 10.0));
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(!encounter.participants[0].alive);
+        assert!(set_encounter_active_state(
+            encounter, false
+        ));
+        assert!((encounter.participants[0].hp - 0.0).abs() < 0.0001);
+        assert!((encounter.participants[0].combat_damage_taken_total - 0.0).abs() < 0.0001);
     }
 
     #[test]
@@ -8111,7 +8296,7 @@ mod tests {
             target.overhealing_shield_turns_remaining,
             2
         );
-        let resolution = apply_participant_damage_for_battle(target, 20.0, "enemy");
+        let resolution = apply_participant_damage_for_battle(target, 20.0, "enemy", true);
         assert!(resolution.defeat_outcome.is_none());
         assert!((resolution.damage_applied - 0.0).abs() < 0.0001);
         assert!((target.hp - 100.0).abs() < 0.0001);
