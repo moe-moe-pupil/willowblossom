@@ -51,6 +51,8 @@ Additional 2026-07-16 update: `息心` approved-talent battle participants now p
 
 Additional 2026-07-16 correction: `奥术护盾` now persists its 10% maximum-MP grant rate separately from remaining shield strength. Changing an encounter from active to resting removes any leftover arcane shield as the talent describes, and changing it back to active grants a fresh shield from the participant's current maximum MP even if the previous shield was depleted. Focused verification passes with `cargo test --lib -j 1 arcane_shield -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 392 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `敏锐`'s persisted dodge charge now follows the encounter lifecycle promised by its “进入战斗轮” trigger. Leaving combat clears the charge, resting encounters cannot consume stale or migrated charges, and entering combat rearms one dodge for approved holders even when their previous charge was spent. Focused verification passes with `cargo test --lib -j 1 keen_evasion -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 392 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -342,7 +344,7 @@ Additional implemented talent execution: `千万回忆` now records parsed-battl
 
 Additional implemented talent execution: `液态躯体` now records parsed-battle delayed damage and previous-turn damage healing, halving direct incoming skill damage into immediate and next-round portions.
 
-Additional implemented talent execution: `敏锐` now records a parsed-battle once-per-battle dodge charge and spends it on the first positive range/non-targeted incoming skill damage, leaving ordinary single-target damage untouched.
+Additional implemented talent execution: `敏锐` now records a parsed-battle once-per-battle dodge charge, spends it on the first positive range/non-targeted incoming skill damage, clears it during rest, and rearms it on battle re-entry while leaving ordinary single-target damage untouched.
 
 Additional implemented talent execution: `奥术护盾` now grants battle entrants 10% of maximum MP as encounter-local shielding, consumes it before HP damage across the shared battle damage path, clears it on battle exit, and replenishes it on battle re-entry.
 

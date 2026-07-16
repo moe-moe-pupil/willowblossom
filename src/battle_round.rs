@@ -493,12 +493,14 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
     if active {
         for participant in &mut encounter.participants {
             participant.combat_damage_taken_total = 0.0;
+            participant.keen_evasion_available = participant.keen_evasion_enabled;
             participant.arcane_shield =
                 participant.max_mp.max(0.0) * participant.arcane_shield_rate.max(0.0);
         }
     } else {
         let mut logs = Vec::new();
         for participant in &mut encounter.participants {
+            participant.keen_evasion_available = false;
             participant.arcane_shield = 0.0;
             let healing = participant.combat_damage_taken_total.max(0.0)
                 * participant.calm_heart_healing_rate.max(0.0);
@@ -770,8 +772,10 @@ fn participant_keen_evasion_evades_damage(
     amount: f32,
     target: TargetSelector,
     target_class: Option<&str>,
+    encounter_active: bool,
 ) -> bool {
     if amount <= f32::EPSILON
+        || !encounter_active
         || !participant.keen_evasion_enabled
         || !participant.keen_evasion_available
         || !skill_damage_triggers_keen_evasion(target, target_class)
@@ -1880,7 +1884,10 @@ fn encounter_roster_ui(
             if participant_inspiration_multiplier(participant) > 1.0 + f32::EPSILON {
                 ui.small("振奋：速度与伤害+10%");
             }
-            if participant.keen_evasion_enabled && participant.keen_evasion_available {
+            if encounter.active
+                && participant.keen_evasion_enabled
+                && participant.keen_evasion_available
+            {
                 ui.small("敏锐待机");
             }
             if participant.arcane_shield > f32::EPSILON {
@@ -2788,6 +2795,7 @@ impl BattleRoundStore {
                             final_amount,
                             damage_target_selector,
                             damage_target_class,
+                            encounter.active,
                         );
                         if evaded_by_keen_evasion {
                             final_amount = 0.0;
@@ -7686,6 +7694,47 @@ mod tests {
             .find(|participant| participant.target_id == "b")
             .unwrap();
         assert!((target.hp - 6.0).abs() < 0.0001);
+        assert!(!target.keen_evasion_available);
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, false
+        ));
+        assert!(!encounter.participants[1].keen_evasion_available);
+        encounter.participants[1].keen_evasion_available = true;
+        let resting_area_skill = CharacterSkill {
+            index: 2,
+            name: "休整范围测试".to_owned(),
+            note: "主动使用对范围内目标造成1点物理伤害".to_owned(),
+            ..area_skill.clone()
+        };
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &resting_area_skill,
+            &manager,
+            None
+        ));
+        let target = &store.encounters["battle"].participants[1];
+        assert!((target.hp - 5.0).abs() < 0.0001);
+        assert!(target.keen_evasion_available);
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, true
+        ));
+        assert!(encounter.participants[1].keen_evasion_available);
+        assert!(store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &area_skill,
+            &manager,
+            None
+        ));
+        let target = &store.encounters["battle"].participants[1];
+        assert!((target.hp - 5.0).abs() < 0.0001);
         assert!(!target.keen_evasion_available);
     }
 
