@@ -1064,18 +1064,20 @@ fn apply_participant_damage_for_battle(
         };
     }
     let was_alive = participant.alive;
-    record_participant_damage_taken(participant, final_amount);
+    let previous_hp = participant.hp.max(0.0);
+    let damage_applied = final_amount.min(previous_hp);
+    record_participant_damage_taken(participant, damage_applied);
     if encounter_active {
-        participant.combat_damage_taken_total += final_amount;
+        participant.combat_damage_taken_total += damage_applied;
     }
-    if was_alive {
+    if was_alive && damage_applied > f32::EPSILON {
         record_participant_damage_contributor(participant, source_id);
         if encounter_active {
             record_participant_arrogance_damage_source(participant, source_id);
             record_participant_endless_pain_stack(participant);
         }
     }
-    participant.hp = (participant.hp - final_amount).max(0.0);
+    participant.hp = (previous_hp - damage_applied).max(0.0);
     participant.alive = participant.hp > 0.0;
     if encounter_active
         && !participant.alive
@@ -1088,7 +1090,7 @@ fn apply_participant_damage_for_battle(
         hope_avatar_triggered = true;
     }
     BattleDamageResolution {
-        damage_applied: final_amount,
+        damage_applied,
         damage_absorbed: (incoming_amount - final_amount).max(0.0),
         undying_rage_triggered,
         hope_avatar_triggered,
@@ -9906,6 +9908,80 @@ mod tests {
             store.encounters["battle"].action_log.len(),
             log_count
         );
+    }
+
+    #[test]
+    fn parsed_battle_overkill_uses_actual_hp_loss_for_damage_rewards() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 90.0,
+            max_hp: 100.0,
+            damage_dealt_modifier: 1.0,
+            damage_taken_modifier: 1.0,
+            healing_dealt_modifier: 1.0,
+            healing_taken_modifier: 1.0,
+            skill_names: vec!["禅宗古训".to_owned(), "苏萨斯之爪".to_owned()],
+            skill_metadata: (0..2)
+                .map(|_| crate::napcat::CharacterSkillMetadata::talent("normal_talent", "天赋"))
+                .collect(),
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let mut target = participant("b", 0);
+        target.hp = 3.0;
+        target.max_hp = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                active: true,
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "过量斩击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: Some("物理".to_owned()),
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((actor.hp - 90.45).abs() < 0.0001);
+        assert!((actor.healing_taken_this_turn - 0.45).abs() < 0.0001);
+        assert_eq!(target.hp, 0.0);
+        assert!(!target.alive);
+        assert_eq!(target.damage_taken_this_turn, 3.0);
+        assert_eq!(target.combat_damage_taken_total, 3.0);
+        assert_eq!(target.delayed_damage_ticks.len(), 1);
+        assert!((target.delayed_damage_ticks[0].amount - 1.05).abs() < 0.0001);
+        assert!(encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("过量斩击") && entry.contains("造成3点伤害")));
     }
 
     #[test]
