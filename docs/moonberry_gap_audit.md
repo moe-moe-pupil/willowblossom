@@ -97,6 +97,8 @@ Additional 2026-07-16 update: `疲惫行者` is now executable anywhere Willowbl
 
 Additional 2026-07-16 correction: `生死时速` now belongs to the healer, matching its preserved “your healing” wording, rather than incorrectly granting the bonus when the dying target owns the talent. Rule-engine healing, quick casts, parsed battle skills, and continuing buff healing apply the healer's approved +50% modifier when the target is at or below 20% maximum HP; battle buff ticks use the encounter participant's current HP instead of a stale durable character snapshot. Focused verification passes with `cargo test --lib dying_target` and `cargo test --lib battle_buff_healing_uses_source_talent_and_encounter_target_vitals`: 3 and 1 passed respectively, 0 failed. Full library verification passes with `cargo test --lib --quiet`: 406 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: continuing battle buff damage and healing now use the shared encounter-participant source multiplier pipeline instead of a partial duplicate based mostly on the durable character. Damage ticks therefore honor active encounter state such as `振奋`, `狂妄`, `总冠军`, `越战越勇`, and `不死者之怒`; healing ticks honor encounter-local `忏悔` decay; and both use the encounter's campaign stat configuration and current source vitals while retaining talent metadata. Sources outside the encounter retain the prior character-based fallback. Focused verification passes with `cargo test --lib buff_tick`: 3 passed, 0 failed. Full library verification passes with `cargo test --lib --quiet`: 407 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:

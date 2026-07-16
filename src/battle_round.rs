@@ -4116,27 +4116,15 @@ fn apply_battle_buff_ticks(
     ticks: &[BattleBuffTick],
 ) {
     for tick in ticks {
-        let source_undying_rage_damage_multiplier = if encounter.active {
-            encounter
-                .participants
-                .iter()
-                .find(|participant| participant.target_id == tick.source_id)
-                .map(participant_undying_rage_damage_multiplier)
-                .unwrap_or(1.0)
-        } else {
-            1.0
-        };
-        let source_character = encounter
+        let source_index = encounter
             .participants
             .iter()
-            .find(|participant| participant.target_id == tick.source_id)
-            .and_then(|participant| character_for_participant(participant, manager))
+            .position(|participant| participant.target_id == tick.source_id);
+        let source_character = source_index
+            .and_then(|index| character_for_participant(&encounter.participants[index], manager))
             .or_else(|| manager.player_characters.get(&tick.source_id).cloned());
-        let source_name = encounter
-            .participants
-            .iter()
-            .find(|participant| participant.target_id == tick.source_id)
-            .map(|participant| participant.display_name.clone())
+        let source_name = source_index
+            .map(|index| encounter.participants[index].display_name.clone())
             .unwrap_or_else(|| tick.source_id.clone());
         let Some(target_index) = encounter
             .participants
@@ -4158,20 +4146,32 @@ fn apply_battle_buff_ticks(
                 amount,
                 damage_type,
             } => {
-                let stat_config = manager.character_stat_config_for_target(&tick.source_id);
-                let source_multiplier = source_character
-                    .as_ref()
-                    .map(|source| {
-                        source.damage_dealt_modifier
-                            * character_low_hp_damage_multiplier(source)
-                            * character_damage_attribute_multiplier(
-                                source,
-                                &stat_config,
-                                trpg_damage_bonus_kind(damage_type),
-                            )
+                let stat_config = encounter_basic_config(encounter, manager, &tick.source_id);
+                let source_multiplier = source_index
+                    .map(|index| {
+                        participant_damage_multiplier(
+                            &encounter.participants[index],
+                            source_character.as_ref(),
+                            &stat_config,
+                            encounter.combat_completed_turns,
+                            damage_type,
+                            encounter.active,
+                        )
                     })
-                    .unwrap_or(1.0)
-                    * source_undying_rage_damage_multiplier;
+                    .unwrap_or_else(|| {
+                        source_character
+                            .as_ref()
+                            .map(|source| {
+                                source.damage_dealt_modifier
+                                    * character_low_hp_damage_multiplier(source)
+                                    * character_damage_attribute_multiplier(
+                                        source,
+                                        &stat_config,
+                                        trpg_damage_bonus_kind(damage_type),
+                                    )
+                            })
+                            .unwrap_or(1.0)
+                    });
                 let target_multiplier = encounter.participants[target_index].damage_taken_modifier
                     * target_character
                         .as_ref()
@@ -4263,19 +4263,29 @@ fn apply_battle_buff_ticks(
                 }
             },
             BuffTickAction::Heal { amount } => {
-                let stat_config = manager.character_stat_config_for_target(&tick.source_id);
-                let source_multiplier = source_character
-                    .as_ref()
-                    .map(|source| {
-                        source.healing_dealt_modifier
-                            * character_healing_attribute_multiplier(source, &stat_config)
-                            * wounded_healing_dealt_multiplier(
-                                source.hp,
-                                source.max_hp,
-                                character_wounded_healing_dealt_modifier(source),
-                            )
+                let stat_config = encounter_basic_config(encounter, manager, &tick.source_id);
+                let source_multiplier = source_index
+                    .map(|index| {
+                        participant_healing_multiplier(
+                            &encounter.participants[index],
+                            source_character.as_ref(),
+                            &stat_config,
+                        )
                     })
-                    .unwrap_or(1.0);
+                    .unwrap_or_else(|| {
+                        source_character
+                            .as_ref()
+                            .map(|source| {
+                                source.healing_dealt_modifier
+                                    * character_healing_attribute_multiplier(source, &stat_config)
+                                    * wounded_healing_dealt_multiplier(
+                                        source.hp,
+                                        source.max_hp,
+                                        character_wounded_healing_dealt_modifier(source),
+                                    )
+                            })
+                            .unwrap_or(1.0)
+                    });
                 let target_multiplier = encounter.participants[target_index].healing_taken_modifier
                     * participant_wound_healing_multiplier(&encounter.participants[target_index])
                     * source_character
@@ -9665,6 +9675,69 @@ mod tests {
             .unwrap();
         assert!((target.hp - 10.0).abs() < 0.0001);
         assert!((target.healing_taken_this_turn - 6.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn battle_buff_ticks_use_shared_encounter_source_modifiers() {
+        let mut manager = empty_manager();
+        let source_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            healing_dealt_modifier: 1.25,
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "source".to_owned(),
+            source_character.clone(),
+        );
+        let mut source = participant_from_character("source", &source_character, &manager);
+        source.inspiration_sources.insert("healer".to_owned(), 1);
+        source.penance_healing_bonus_percent = 25.0;
+        source.penance_kill_assist_count = 1;
+        let mut damage_target = participant("damage-target", 0);
+        damage_target.hp = 100.0;
+        damage_target.max_hp = 100.0;
+        let mut healing_target = participant("healing-target", 0);
+        healing_target.hp = 0.0;
+        healing_target.max_hp = 100.0;
+        healing_target.alive = true;
+        let mut encounter = BattleEncounter {
+            name: "battle".to_owned(),
+            active: true,
+            participants: vec![source, damage_target, healing_target],
+            ..Default::default()
+        };
+
+        apply_battle_buff_ticks(&mut encounter, &manager, &[
+            BattleBuffTick {
+                source_id: "source".to_owned(),
+                target_id: "damage-target".to_owned(),
+                action: BuffTickAction::Damage {
+                    amount: 10.0,
+                    damage_type: DamageType::Physical,
+                },
+            },
+            BattleBuffTick {
+                source_id: "source".to_owned(),
+                target_id: "healing-target".to_owned(),
+                action: BuffTickAction::Heal { amount: 10.0 },
+            },
+        ]);
+
+        let damage_target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "damage-target")
+            .unwrap();
+        assert!((damage_target.hp - 89.0).abs() < 0.0001);
+        assert!((damage_target.damage_taken_this_turn - 11.0).abs() < 0.0001);
+        let healing_target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "healing-target")
+            .unwrap();
+        assert!((healing_target.hp - 11.5).abs() < 0.0001);
+        assert!((healing_target.healing_taken_this_turn - 11.5).abs() < 0.0001);
     }
 
     #[test]
