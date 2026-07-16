@@ -49,6 +49,8 @@ Additional 2026-07-16 update: `振奋` approved-talent parsed-battle single-targ
 
 Additional 2026-07-16 update: `息心` approved-talent battle participants now persist the post-mitigation damage they take while an encounter is active and recover 50% of that amount when the GM changes the encounter from active to resting. Prevented damage does not enter the tally, resting damage is excluded, re-entering battle starts a fresh tally, repeated resting-state writes cannot retrigger recovery, and defeated participants are not revived. The old Moonberry source stored this talent as description-only data, so the encounter's existing GM-controlled active/resting transition is the executable battle-exit boundary. Focused verification passes with `cargo test calm_heart_heals_active_combat_damage_once_on_battle_exit -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 392 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `奥术护盾` now persists its 10% maximum-MP grant rate separately from remaining shield strength. Changing an encounter from active to resting removes any leftover arcane shield as the talent describes, and changing it back to active grants a fresh shield from the participant's current maximum MP even if the previous shield was depleted. Focused verification passes with `cargo test --lib -j 1 arcane_shield -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 392 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -342,7 +344,7 @@ Additional implemented talent execution: `液态躯体` now records parsed-battl
 
 Additional implemented talent execution: `敏锐` now records a parsed-battle once-per-battle dodge charge and spends it on the first positive range/non-targeted incoming skill damage, leaving ordinary single-target damage untouched.
 
-Additional implemented talent execution: `奥术护盾` now grants battle entrants 10% of maximum MP as encounter-local shielding and consumes it before HP damage across the shared battle damage path.
+Additional implemented talent execution: `奥术护盾` now grants battle entrants 10% of maximum MP as encounter-local shielding, consumes it before HP damage across the shared battle damage path, clears it on battle exit, and replenishes it on battle re-entry.
 
 Additional implemented talent execution: `过度治疗` now converts battle overheal into one-round encounter-local shielding capped at 30% of the healed target's maximum HP across immediate and delayed healing paths.
 

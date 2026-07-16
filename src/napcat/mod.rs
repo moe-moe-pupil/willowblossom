@@ -6907,8 +6907,12 @@ pub fn character_keen_evasion_available(character: &PlayerCharacter) -> bool {
 }
 
 pub fn character_arcane_shield_amount(character: &PlayerCharacter) -> f32 {
+    character.max_mp.max(0.0) * character_arcane_shield_rate(character)
+}
+
+pub fn character_arcane_shield_rate(character: &PlayerCharacter) -> f32 {
     if character_has_approved_moonberry_talent(character, "奥术护盾") {
-        character.max_mp.max(0.0) * 0.10
+        0.10
     } else {
         0.0
     }

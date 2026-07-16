@@ -40,6 +40,7 @@ use crate::{
         champion_damage_dealt_multiplier,
         champion_damage_taken_multiplier,
         character_arcane_shield_amount,
+        character_arcane_shield_rate,
         character_arrogance_damage_bonus_per_source,
         character_calm_heart_healing_rate,
         character_champion_damage_bonus_per_stack,
@@ -287,6 +288,8 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub arcane_shield: f32,
     #[serde(default)]
+    pub arcane_shield_rate: f32,
+    #[serde(default)]
     pub overhealing_shield_cap_rate: f32,
     #[serde(default)]
     pub overhealing_shield: f32,
@@ -490,10 +493,13 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
     if active {
         for participant in &mut encounter.participants {
             participant.combat_damage_taken_total = 0.0;
+            participant.arcane_shield =
+                participant.max_mp.max(0.0) * participant.arcane_shield_rate.max(0.0);
         }
     } else {
         let mut logs = Vec::new();
         for participant in &mut encounter.participants {
+            participant.arcane_shield = 0.0;
             let healing = participant.combat_damage_taken_total.max(0.0)
                 * participant.calm_heart_healing_rate.max(0.0);
             participant.combat_damage_taken_total = 0.0;
@@ -1421,6 +1427,7 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant.keen_evasion_enabled.hash(&mut hasher);
             participant.keen_evasion_available.hash(&mut hasher);
             participant.arcane_shield.to_bits().hash(&mut hasher);
+            participant.arcane_shield_rate.to_bits().hash(&mut hasher);
             participant
                 .overhealing_shield_cap_rate
                 .to_bits()
@@ -3958,6 +3965,7 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant.keen_evasion_enabled.hash(&mut hasher);
         participant.keen_evasion_available.hash(&mut hasher);
         participant.arcane_shield.to_bits().hash(&mut hasher);
+        participant.arcane_shield_rate.to_bits().hash(&mut hasher);
         participant
             .overhealing_shield_cap_rate
             .to_bits()
@@ -4117,6 +4125,7 @@ fn participant_from_character(
         keen_evasion_enabled: character_keen_evasion_available(character),
         keen_evasion_available: character_keen_evasion_available(character),
         arcane_shield: character_arcane_shield_amount(character),
+        arcane_shield_rate: character_arcane_shield_rate(character),
         overhealing_shield_cap_rate: character_overhealing_shield_cap_rate(character),
         overhealing_shield: 0.0,
         overhealing_shield_turns_remaining: 0,
@@ -4209,6 +4218,7 @@ fn participant_from_unit_template(
         keen_evasion_enabled: character_keen_evasion_available(character),
         keen_evasion_available: character_keen_evasion_available(character),
         arcane_shield: character_arcane_shield_amount(character),
+        arcane_shield_rate: character_arcane_shield_rate(character),
         overhealing_shield_cap_rate: character_overhealing_shield_cap_rate(character),
         overhealing_shield: 0.0,
         overhealing_shield_turns_remaining: 0,
@@ -4297,6 +4307,7 @@ fn participant_from_target(
         keen_evasion_enabled: false,
         keen_evasion_available: false,
         arcane_shield: 0.0,
+        arcane_shield_rate: 0.0,
         overhealing_shield_cap_rate: 0.0,
         overhealing_shield: 0.0,
         overhealing_shield_turns_remaining: 0,
@@ -4381,6 +4392,7 @@ fn sync_participant_from_manager(
                 participant,
                 character_keen_evasion_available(&character),
             );
+            participant.arcane_shield_rate = character_arcane_shield_rate(&character);
             participant.overhealing_shield_cap_rate =
                 character_overhealing_shield_cap_rate(&character);
             sync_participant_undying_rage(
@@ -4464,6 +4476,7 @@ fn sync_participant_from_manager(
             participant,
             character_keen_evasion_available(character),
         );
+        participant.arcane_shield_rate = character_arcane_shield_rate(character);
         participant.overhealing_shield_cap_rate = character_overhealing_shield_cap_rate(character);
         sync_participant_undying_rage(
             participant,
@@ -4508,6 +4521,7 @@ fn sync_participant_from_manager(
         participant.one_heart_healing_bonus_per_stack = 0.0;
         participant.inspiration_enabled = false;
         sync_participant_keen_evasion(participant, false);
+        participant.arcane_shield_rate = 0.0;
         participant.overhealing_shield_cap_rate = 0.0;
         sync_participant_undying_rage(participant, false);
         participant.hope_avatar_enabled = false;
@@ -5532,6 +5546,7 @@ mod area_tests {
             keen_evasion_enabled: false,
             keen_evasion_available: false,
             arcane_shield: 0.0,
+            arcane_shield_rate: 0.0,
             overhealing_shield_cap_rate: 0.0,
             overhealing_shield: 0.0,
             overhealing_shield_turns_remaining: 0,
@@ -5635,6 +5650,7 @@ mod tests {
             keen_evasion_enabled: false,
             keen_evasion_available: false,
             arcane_shield: 0.0,
+            arcane_shield_rate: 0.0,
             overhealing_shield_cap_rate: 0.0,
             overhealing_shield: 0.0,
             overhealing_shield_turns_remaining: 0,
@@ -7714,6 +7730,29 @@ mod tests {
         let persisted = serde_json::to_string(&participant).unwrap();
         let restored: BattleParticipantSnapshot = serde_json::from_str(&persisted).unwrap();
         assert!((restored.arcane_shield - participant.arcane_shield).abs() < 0.0001);
+        assert!((restored.arcane_shield_rate - 0.10).abs() < 0.0001);
+
+        let mut encounter = BattleEncounter {
+            active: true,
+            participants: vec![restored],
+            ..Default::default()
+        };
+        encounter.participants[0].arcane_shield = 2.0;
+        assert!(set_encounter_active_state(
+            &mut encounter,
+            false
+        ));
+        assert!((encounter.participants[0].arcane_shield - 0.0).abs() < 0.0001);
+        assert!(!set_encounter_active_state(
+            &mut encounter,
+            false
+        ));
+        encounter.participants[0].max_mp = 80.0;
+        assert!(set_encounter_active_state(
+            &mut encounter,
+            true
+        ));
+        assert!((encounter.participants[0].arcane_shield - 8.0).abs() < 0.0001);
     }
 
     #[test]
