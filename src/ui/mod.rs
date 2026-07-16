@@ -5141,16 +5141,10 @@ fn apply_quick_cast_action_to_manager(
                     } else {
                         typed_final_amount
                     };
-                changed |= record_character_damage_taken(target, final_amount);
-                let next_hp = (target.hp - final_amount).max(0.0);
-                if (target.hp - next_hp).abs() > f32::EPSILON {
-                    target.hp = next_hp;
-                    if let Some(base_stats) = target.buff_base_stats.as_mut() {
-                        base_stats.hp = (base_stats.hp - final_amount).max(0.0);
-                    }
-                    changed = true;
-                }
-                if final_amount > f32::EPSILON {
+                let (damage_changed, effective_amount) =
+                    apply_effective_character_damage(target, final_amount);
+                changed |= damage_changed;
+                if effective_amount > f32::EPSILON {
                     for buff in damage_dealt_buffs.iter().cloned() {
                         if upsert_character_active_buff(target, buff) {
                             changed = true;
@@ -5158,13 +5152,13 @@ fn apply_quick_cast_action_to_manager(
                     }
                     if damage_type == DamageType::Physical {
                         pending_source_lifesteal +=
-                            typed_final_amount * source_physical_damage_lifesteal;
+                            effective_amount * source_physical_damage_lifesteal;
                         if source_physical_damage_followup_rate > f32::EPSILON {
                             target
                                 .active_buffs
                                 .push(moonberry_physical_damage_followup_buff(
                                     &action.caster_id,
-                                    final_amount * source_physical_damage_followup_rate,
+                                    effective_amount * source_physical_damage_followup_rate,
                                 ));
                             changed = true;
                         }
@@ -5219,6 +5213,21 @@ fn apply_effective_character_healing(character: &mut PlayerCharacter, amount: f3
         base_stats.hp = (base_stats.hp + effective_amount).min(base_stats.max_hp);
     }
     record_character_healing_taken(character, effective_amount);
+    (true, effective_amount)
+}
+
+fn apply_effective_character_damage(character: &mut PlayerCharacter, amount: f32) -> (bool, f32) {
+    let previous_hp = character.hp;
+    let next_hp = (character.hp - amount.max(0.0)).max(0.0);
+    let effective_amount = (previous_hp - next_hp).max(0.0);
+    if effective_amount <= f32::EPSILON {
+        return (false, 0.0);
+    }
+    character.hp = next_hp;
+    if let Some(base_stats) = character.buff_base_stats.as_mut() {
+        base_stats.hp = (base_stats.hp - effective_amount).max(0.0);
+    }
+    record_character_damage_taken(character, effective_amount);
     (true, effective_amount)
 }
 
@@ -7461,30 +7470,14 @@ fn apply_character_buff_ticks(
                         trpg_damage_taken_kind(*damage_type),
                     );
                 let final_amount = (*amount * source_multiplier * target_multiplier).max(0.0);
-                changed |= record_character_damage_taken(target, final_amount);
-                let next_hp = (target.hp - final_amount).max(0.0);
-                if (target.hp - next_hp).abs() > f32::EPSILON {
-                    target.hp = next_hp;
-                    if let Some(base_stats) = target.buff_base_stats.as_mut() {
-                        base_stats.hp = (base_stats.hp - final_amount).max(0.0);
-                    }
-                    changed = true;
-                }
+                changed |= apply_effective_character_damage(target, final_amount).0;
             },
             BuffTickAction::FixedDamage { amount, .. } => {
                 let Some(target) = manager.player_characters.get_mut(&tick.target_id) else {
                     continue;
                 };
                 let final_amount = amount.max(0.0);
-                changed |= record_character_damage_taken(target, final_amount);
-                let next_hp = (target.hp - final_amount).max(0.0);
-                if (target.hp - next_hp).abs() > f32::EPSILON {
-                    target.hp = next_hp;
-                    if let Some(base_stats) = target.buff_base_stats.as_mut() {
-                        base_stats.hp = (base_stats.hp - final_amount).max(0.0);
-                    }
-                    changed = true;
-                }
+                changed |= apply_effective_character_damage(target, final_amount).0;
             },
             BuffTickAction::Heal { amount } => {
                 let stat_config = manager.character_stat_config_for_target(&tick.source_id);
@@ -14598,6 +14591,63 @@ mod tests {
     }
 
     #[test]
+    fn damage_buff_ticks_record_effective_overkill() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("source".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager.player_characters.insert(
+            "normal-target".to_owned(),
+            PlayerCharacter {
+                hp: 2.0,
+                max_hp: 20.0,
+                ..Default::default()
+            },
+        );
+        manager.player_characters.insert(
+            "fixed-target".to_owned(),
+            PlayerCharacter {
+                hp: 1.0,
+                max_hp: 20.0,
+                ..Default::default()
+            },
+        );
+
+        assert!(apply_character_buff_ticks(
+            &mut manager,
+            &[
+                CharacterBuffTick {
+                    source_id: "source".to_owned(),
+                    target_id: "normal-target".to_owned(),
+                    action: BuffTickAction::Damage {
+                        amount: 4.0,
+                        damage_type: DamageType::Physical,
+                    },
+                },
+                CharacterBuffTick {
+                    source_id: "source".to_owned(),
+                    target_id: "fixed-target".to_owned(),
+                    action: BuffTickAction::FixedDamage {
+                        amount: 4.0,
+                        damage_type: DamageType::None,
+                    },
+                },
+            ]
+        ));
+
+        let target = &manager.player_characters["normal-target"];
+        assert_eq!(target.hp, 0.0);
+        assert_eq!(target.damage_taken_this_turn, 2.0);
+        let target = &manager.player_characters["fixed-target"];
+        assert_eq!(target.hp, 0.0);
+        assert_eq!(target.damage_taken_this_turn, 1.0);
+    }
+
+    #[test]
     fn quick_cast_skills_exclude_unapproved_entries() {
         let mut character = PlayerCharacter {
             skill_names: vec!["已批准".to_owned(), "待批准".to_owned()],
@@ -15869,21 +15919,24 @@ mod tests {
     }
 
     #[test]
-    fn quick_cast_physical_damage_applies_lifesteal_talent() {
+    fn quick_cast_physical_overkill_scales_lifesteal_and_followup() {
         let mut manager = empty_manager();
         manager
             .player_characters
             .insert("caster".to_owned(), PlayerCharacter {
                 hp: 9.0,
                 max_hp: 10.0,
-                skill_names: vec!["禅宗古训".to_owned()],
-                skill_metadata: vec![CharacterSkillMetadata::talent("normal_talent", "天赋")],
+                skill_names: vec!["禅宗古训".to_owned(), "苏萨斯之爪".to_owned()],
+                skill_metadata: vec![
+                    CharacterSkillMetadata::talent("normal_talent", "天赋"),
+                    CharacterSkillMetadata::talent("normal_talent", "天赋"),
+                ],
                 ..Default::default()
             });
         manager
             .player_characters
             .insert("target".to_owned(), PlayerCharacter {
-                hp: 20.0,
+                hp: 2.0,
                 max_hp: 20.0,
                 ..Default::default()
             });
@@ -15922,11 +15975,16 @@ mod tests {
         ));
 
         let caster = &manager.player_characters["caster"];
-        assert!((caster.hp - 9.6).abs() < 0.0001);
-        assert!((caster.healing_taken_this_turn - 0.6).abs() < 0.0001);
+        assert!((caster.hp - 9.3).abs() < 0.0001);
+        assert!((caster.healing_taken_this_turn - 0.3).abs() < 0.0001);
         let target = &manager.player_characters["target"];
-        assert!((target.hp - 16.0).abs() < 0.0001);
-        assert!((target.damage_taken_this_turn - 4.0).abs() < 0.0001);
+        assert_eq!(target.hp, 0.0);
+        assert!((target.damage_taken_this_turn - 2.0).abs() < 0.0001);
+        assert!(matches!(
+            target.active_buffs[0].tick_actions.as_slice(),
+            [BuffTickAction::FixedDamage { amount, damage_type: DamageType::Magical }]
+                if (*amount - 0.7).abs() < 0.0001
+        ));
     }
 
     #[test]

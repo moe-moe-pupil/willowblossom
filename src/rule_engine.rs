@@ -2172,15 +2172,18 @@ impl RuleEngine {
             0.0
         };
 
+        let mut effective_damage = 0.0;
         let mut hp_update = None;
         if let Some(target) = self.characters.get_mut(target_id) {
-            target.damage_taken_this_turn += final_damage;
+            let previous_hp = target.hp;
             target.hp = (target.hp - final_damage).max(0.0);
+            effective_damage = (previous_hp - target.hp).max(0.0);
+            target.damage_taken_this_turn += effective_damage;
             hp_update = Some((target.hp, target.max_hp));
             self.log.push(format!(
                 "{}受到{}点伤害，生命值变为 {}/{}",
                 target.name,
-                format_number(final_damage),
+                format_number(effective_damage),
                 format_number(target.hp),
                 format_number(target.max_hp)
             ));
@@ -2188,7 +2191,7 @@ impl RuleEngine {
         if let Some((hp, max_hp)) = hp_update {
             self.sync_character_hp_to_ecs(target_id, hp, max_hp);
         }
-        if final_damage > f32::EPSILON {
+        if effective_damage > f32::EPSILON {
             for buff in damage_dealt_buffs {
                 self.give_or_replace_named_buff(target_id, buff);
             }
@@ -2197,44 +2200,50 @@ impl RuleEngine {
                     target_id,
                     sousas_claw_followup_buff(
                         source_id,
-                        final_damage * source_physical_damage_followup_rate,
+                        effective_damage * source_physical_damage_followup_rate,
                     ),
                 );
             }
         }
-        if typed_final_damage > f32::EPSILON && source_physical_damage_lifesteal > f32::EPSILON {
-            let lifesteal_amount = typed_final_damage * source_physical_damage_lifesteal;
+        if effective_damage > f32::EPSILON && source_physical_damage_lifesteal > f32::EPSILON {
+            let lifesteal_amount = effective_damage * source_physical_damage_lifesteal;
             let mut hp_update = None;
             if let Some(source) = self.characters.get_mut(source_id) {
-                source.healing_taken_this_turn += lifesteal_amount;
+                let previous_hp = source.hp;
                 source.hp = (source.hp + lifesteal_amount).min(source.max_hp);
+                let effective_lifesteal = (source.hp - previous_hp).max(0.0);
+                source.healing_taken_this_turn += effective_lifesteal;
                 hp_update = Some((source.hp, source.max_hp));
-                self.log.push(format!(
-                    "{}吸血回复{}点生命值，生命值变为 {}/{}",
-                    source.name,
-                    format_number(lifesteal_amount),
-                    format_number(source.hp),
-                    format_number(source.max_hp)
-                ));
+                if effective_lifesteal > f32::EPSILON {
+                    self.log.push(format!(
+                        "{}吸血回复{}点生命值，生命值变为 {}/{}",
+                        source.name,
+                        format_number(effective_lifesteal),
+                        format_number(source.hp),
+                        format_number(source.max_hp)
+                    ));
+                }
             }
             if let Some((hp, max_hp)) = hp_update {
                 self.sync_character_hp_to_ecs(source_id, hp, max_hp);
             }
         }
 
-        self.queue_event(RuleEvent::DamageTaken {
-            source_id: source_id.to_owned(),
-            target_id: target_id.to_owned(),
-            amount: final_damage,
-            damage_type,
-        });
-        self.queue_event(RuleEvent::DamageDealt {
-            source_id: source_id.to_owned(),
-            target_id: target_id.to_owned(),
-            amount: final_damage,
-            damage_type,
-        });
-        self.resolve_queued_events();
+        if effective_damage > f32::EPSILON {
+            self.queue_event(RuleEvent::DamageTaken {
+                source_id: source_id.to_owned(),
+                target_id: target_id.to_owned(),
+                amount: effective_damage,
+                damage_type,
+            });
+            self.queue_event(RuleEvent::DamageDealt {
+                source_id: source_id.to_owned(),
+                target_id: target_id.to_owned(),
+                amount: effective_damage,
+                damage_type,
+            });
+            self.resolve_queued_events();
+        }
     }
 
     fn fixed_damage(
@@ -2245,15 +2254,18 @@ impl RuleEngine {
         damage_type: DamageType,
     ) {
         let final_damage = amount.max(0.0);
+        let mut effective_damage = 0.0;
         let mut hp_update = None;
         if let Some(target) = self.characters.get_mut(target_id) {
-            target.damage_taken_this_turn += final_damage;
+            let previous_hp = target.hp;
             target.hp = (target.hp - final_damage).max(0.0);
+            effective_damage = (previous_hp - target.hp).max(0.0);
+            target.damage_taken_this_turn += effective_damage;
             hp_update = Some((target.hp, target.max_hp));
             self.log.push(format!(
                 "{}受到{}点{}伤害，生命值变为 {}/{}",
                 target.name,
-                format_number(final_damage),
+                format_number(effective_damage),
                 damage_type.explain(),
                 format_number(target.hp),
                 format_number(target.max_hp)
@@ -2262,19 +2274,21 @@ impl RuleEngine {
         if let Some((hp, max_hp)) = hp_update {
             self.sync_character_hp_to_ecs(target_id, hp, max_hp);
         }
-        self.queue_event(RuleEvent::DamageTaken {
-            source_id: source_id.to_owned(),
-            target_id: target_id.to_owned(),
-            amount: final_damage,
-            damage_type,
-        });
-        self.queue_event(RuleEvent::DamageDealt {
-            source_id: source_id.to_owned(),
-            target_id: target_id.to_owned(),
-            amount: final_damage,
-            damage_type,
-        });
-        self.resolve_queued_events();
+        if effective_damage > f32::EPSILON {
+            self.queue_event(RuleEvent::DamageTaken {
+                source_id: source_id.to_owned(),
+                target_id: target_id.to_owned(),
+                amount: effective_damage,
+                damage_type,
+            });
+            self.queue_event(RuleEvent::DamageDealt {
+                source_id: source_id.to_owned(),
+                target_id: target_id.to_owned(),
+                amount: effective_damage,
+                damage_type,
+            });
+            self.resolve_queued_events();
+        }
     }
 
     pub fn heal(&mut self, source_id: &str, target_id: &str, amount: f32) {
@@ -4330,7 +4344,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_resolution_stops_recursive_damage_rules() {
+    fn queued_recursive_damage_stops_when_target_has_no_hp_left() {
         let mut engine = RuleEngine::default();
         engine.add_character(Character::new("alice", "自己", 10.0));
         engine.add_character(Character::new("enemy", "敌人", 10.0));
@@ -4346,7 +4360,10 @@ mod tests {
             DamageType::Physical,
         );
 
-        assert!(engine.log.iter().any(|line| line.contains("触发次数过多")));
+        let target = engine.characters.get("enemy").unwrap();
+        assert_eq!(target.hp, 0.0);
+        assert_eq!(target.damage_taken_this_turn, 10.0);
+        assert!(!engine.log.iter().any(|line| line.contains("触发次数过多")));
     }
 
     #[test]
@@ -4663,13 +4680,16 @@ mod tests {
     }
 
     #[test]
-    fn physical_damage_lifesteals_to_source() {
+    fn physical_overkill_scales_lifesteal_and_followup_to_effective_damage() {
         let mut engine = RuleEngine::default();
         let mut source = Character::new("source", "来源", 20.0);
         source.hp = 19.8;
         source.physical_damage_lifesteal = 0.15;
+        source.physical_damage_followup_rate = 0.35;
         engine.add_character(source);
-        engine.add_character(Character::new("target", "目标", 20.0));
+        let mut target = Character::new("target", "目标", 20.0);
+        target.hp = 2.0;
+        engine.add_character(target);
 
         engine.attack(
             "source",
@@ -4679,8 +4699,10 @@ mod tests {
         );
         let source = engine.characters.get("source").unwrap();
         assert!((source.hp - 20.0).abs() < 0.0001);
-        assert!((source.healing_taken_this_turn - 0.6).abs() < 0.0001);
-        assert!((engine.characters.get("target").unwrap().hp - 16.0).abs() < 0.0001);
+        assert!((source.healing_taken_this_turn - 0.2).abs() < 0.0001);
+        let target = engine.characters.get("target").unwrap();
+        assert_eq!(target.hp, 0.0);
+        assert!((target.damage_taken_this_turn - 2.0).abs() < 0.0001);
 
         engine.attack(
             "source",
@@ -4695,11 +4717,13 @@ mod tests {
                 .get("source")
                 .unwrap()
                 .healing_taken_this_turn
-                - 0.6)
+                - 0.2)
                 .abs()
                 < 0.0001
         );
-        assert!((engine.characters.get("target").unwrap().hp - 12.0).abs() < 0.0001);
+        let target = engine.characters.get("target").unwrap();
+        assert_eq!(target.hp, 0.0);
+        assert!((target.damage_taken_this_turn - 2.0).abs() < 0.0001);
     }
 
     #[test]

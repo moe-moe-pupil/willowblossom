@@ -103,6 +103,8 @@ Additional 2026-07-16 correction: continuing typed battle damage now uses the sa
 
 Additional 2026-07-16 correction: rule-engine healing, quick casts, and non-encounter world-turn healing ticks now record HP actually restored rather than the pre-cap healing request. `互帮互助` feedback is calculated from that effective amount, so partial or fully wasted healing can no longer create phantom feedback or inflate per-turn healing totals; capped feedback likewise records only restored HP and no longer emits a zero-healing trigger log. Parsed battle healing already used effective resolution and remains unchanged. Focused verification passes with `cargo test --lib mutual_aid`: 4 passed, 0 failed. Full library verification passes with `cargo test --lib --quiet`: 408 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: rule-engine attacks/fixed damage, quick casts, and non-encounter world-turn damage ticks now record actual HP loss rather than pre-cap overkill. Damage-derived buffs, `禅宗古训` lifesteal, `苏萨斯之爪` follow-up, and rule-engine damage events use effective damage; lifesteal counters also use HP actually restored. Zero/post-defeat damage no longer emits rule events, so recursive damage rules terminate naturally when the target reaches zero HP instead of continuing through phantom hits until the recursion guard. Focused verification passes with `cargo test --lib overkill`: 3 passed, 0 failed. Full library verification passes with `cargo test --lib --quiet`: 409 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
