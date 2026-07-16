@@ -862,6 +862,34 @@ fn skill_effects_are_hope_avatar_healing(effects: &[SkillEffect]) -> bool {
             .any(|effect| matches!(effect, SkillEffect::Damage { .. }))
 }
 
+fn skill_effects_allow_selected_target(
+    effects: &[SkillEffect],
+    target_class: Option<&str>,
+    selected_target_alive: Option<bool>,
+) -> bool {
+    if effects.is_empty()
+        || matches!(
+            target_class.map(str::trim),
+            Some("无目标" | "范围")
+        )
+    {
+        return true;
+    }
+
+    effects.iter().all(|effect| {
+        let (target, healing) = match effect {
+            SkillEffect::Damage { target, .. } => (*target, false),
+            SkillEffect::Heal { target, .. } => (*target, true),
+            SkillEffect::GrantBuff { target, .. } => (*target, false),
+        };
+        matches!(target.actor, ActorRef::SelfActor)
+            || target.area.is_some()
+            || selected_target_alive
+                .map(|alive| alive || healing)
+                .unwrap_or(false)
+    })
+}
+
 fn skill_damage_triggers_keen_evasion(target: TargetSelector, target_class: Option<&str>) -> bool {
     target.area.is_some()
         || skill_target_class_is_area(target_class)
@@ -2286,14 +2314,23 @@ fn encounter_action_ui(
     let target_options = encounter
         .participants
         .iter()
-        .filter(|participant| participant.alive)
         .map(|participant| {
             (
                 participant.target_id.clone(),
-                participant.display_name.clone(),
+                if participant.alive {
+                    participant.display_name.clone()
+                } else {
+                    format!("{}（倒下）", participant.display_name)
+                },
             )
         })
         .collect::<Vec<_>>();
+    let living_target_ids = encounter
+        .participants
+        .iter()
+        .filter(|participant| participant.alive)
+        .map(|participant| participant.target_id.clone())
+        .collect::<HashSet<_>>();
     let skills = character_for_participant(&actor, manager)
         .as_ref()
         .map(|character| character_skills(character))
@@ -2309,7 +2346,14 @@ fn encounter_action_ui(
         .or_insert_with(|| {
             target_options
                 .iter()
-                .find(|(target_id, _)| target_id != &actor.target_id)
+                .find(|(target_id, _)| {
+                    target_id != &actor.target_id && living_target_ids.contains(target_id)
+                })
+                .or_else(|| {
+                    target_options
+                        .iter()
+                        .find(|(target_id, _)| target_id != &actor.target_id)
+                })
                 .or_else(|| target_options.first())
                 .map(|(target_id, _)| target_id.clone())
                 .unwrap_or_default()
@@ -2344,9 +2388,10 @@ fn encounter_action_ui(
         });
         ui.label("伤害");
         ui.add(egui::DragValue::new(amount).speed(1.0).range(0.0..=9999.0));
+        let target_alive = living_target_ids.contains(target.as_str());
         if ui
             .add_enabled(
-                !encounter_active || !participant_hope_avatar_active(&actor),
+                target_alive && (!encounter_active || !participant_hope_avatar_active(&actor)),
                 egui::Button::new("普通攻击"),
             )
             .clicked()
@@ -2423,7 +2468,13 @@ fn encounter_action_ui(
             let hope_avatar_allows = !encounter_active
                 || !participant_hope_avatar_active(&actor)
                 || skill_effects_are_hope_avatar_healing(&effects);
-            let can_use = cooldown_remaining == 0 && can_pay && hope_avatar_allows;
+            let target_alive = living_target_ids.contains(target.as_str());
+            let target_allows = skill_effects_allow_selected_target(
+                &effects,
+                skill.target_class.as_deref(),
+                Some(target_alive),
+            );
+            let can_use = cooldown_remaining == 0 && can_pay && hope_avatar_allows && target_allows;
             let response = ui.add_enabled(can_use, egui::Button::new("使用技能"));
             if response.clicked() {
                 changed |= store.record_skill_use_with_buffs_and_finish(
@@ -2437,6 +2488,8 @@ fn encounter_action_ui(
             }
             if !hope_avatar_allows {
                 ui.small("希望化身期间只能释放治疗技能");
+            } else if !target_allows {
+                ui.small("倒下目标只能接受单目标治疗");
             } else if !can_pay {
                 ui.small(format!(
                     "需要{} MP",
@@ -2703,6 +2756,14 @@ impl BattleRoundStore {
         else {
             return false;
         };
+        if !target.alive {
+            let target_name = target.display_name.clone();
+            encounter.action_log.push(format!(
+                "{}已经倒下，不能成为普通攻击目标",
+                target_name
+            ));
+            return false;
+        }
         let final_damage = damage.max(0.0);
         let resolution = apply_participant_damage_for_battle(
             target,
@@ -2781,6 +2842,22 @@ impl BattleRoundStore {
             skill.skill_type.as_deref(),
             skill.legacy_buff_machine_json.as_deref(),
         );
+        let selected_target_alive = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == target_id)
+            .map(|participant| participant.alive);
+        if !skill_effects_allow_selected_target(
+            &effects,
+            skill.target_class.as_deref(),
+            selected_target_alive,
+        ) {
+            encounter.action_log.push(format!(
+                "{}不能对所选目标使用{}；倒下目标只能接受单目标治疗",
+                actor_snapshot.display_name, skill.name
+            ));
+            return false;
+        }
         let actor_damage_dealt_buffs = actor_character
             .as_ref()
             .map(|character| character_damage_dealt_talent_buffs(character, actor_id))
@@ -2903,6 +2980,7 @@ impl BattleRoundStore {
                         scene_positions,
                         fallback_radius,
                         skill.target_class.as_deref(),
+                        DefeatedTargetPolicy::Exclude,
                     );
                     let target_ids = limit_skill_targets(
                         target_ids,
@@ -3213,6 +3291,7 @@ impl BattleRoundStore {
                         scene_positions,
                         skill_range_radius(skill.range),
                         skill.target_class.as_deref(),
+                        DefeatedTargetPolicy::AllowSingleTarget,
                     );
                     let target_ids = limit_skill_targets(
                         target_ids,
@@ -3386,6 +3465,7 @@ impl BattleRoundStore {
                         scene_positions,
                         skill_range_radius(skill.range),
                         skill.target_class.as_deref(),
+                        DefeatedTargetPolicy::Exclude,
                     );
                     let target_ids = limit_skill_targets(
                         target_ids,
@@ -3469,6 +3549,7 @@ impl BattleRoundStore {
                         scene_positions,
                         skill_range_radius(skill.range),
                         skill.target_class.as_deref(),
+                        DefeatedTargetPolicy::Exclude,
                     );
                     Some((
                         limit_skill_targets(
@@ -5524,6 +5605,12 @@ fn static_skill_effects(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefeatedTargetPolicy {
+    Exclude,
+    AllowSingleTarget,
+}
+
 fn resolve_skill_targets(
     target: TargetSelector,
     actor_id: &str,
@@ -5532,6 +5619,7 @@ fn resolve_skill_targets(
     scene_positions: Option<&SceneCharacterPositions>,
     fallback_radius: Option<f32>,
     target_class: Option<&str>,
+    defeated_target_policy: DefeatedTargetPolicy,
 ) -> Vec<String> {
     let force_area =
         skill_target_class_is_area(target_class) && !matches!(target.actor, ActorRef::SelfActor);
@@ -5576,6 +5664,16 @@ fn resolve_skill_targets(
     if matches!(target.actor, ActorRef::SelfActor) {
         targets
     } else {
+        let Some(selected_target) = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == selected_target_id)
+        else {
+            return Vec::new();
+        };
+        if !selected_target.alive && defeated_target_policy == DefeatedTargetPolicy::Exclude {
+            return Vec::new();
+        }
         filter_battle_targets_by_range(
             actor_id,
             targets,
@@ -5891,6 +5989,7 @@ mod area_tests {
             Some(&positions),
             None,
             None,
+            DefeatedTargetPolicy::Exclude,
         );
 
         assert_eq!(targets, vec!["near".to_owned()]);
@@ -5931,6 +6030,7 @@ mod area_tests {
             Some(&positions),
             Some(3.0),
             Some("范围"),
+            DefeatedTargetPolicy::Exclude,
         );
 
         assert_eq!(targets, vec!["near".to_owned()]);
@@ -12149,5 +12249,105 @@ mod tests {
         assert!(!actor.action_done);
         assert_eq!(encounter.round, 1);
         assert_eq!(encounter.combat_completed_turns, 1);
+    }
+
+    #[test]
+    fn direct_healing_can_revive_defeated_targets_but_attacks_and_buffs_cannot() {
+        let mut manager = empty_manager();
+        let mut actor = participant("actor", 0);
+        actor.mp = 10.0;
+        let mut defeated = participant("defeated", 0);
+        defeated.hp = 0.0;
+        defeated.alive = false;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                participants: vec![actor, defeated],
+                ..Default::default()
+            });
+        let damage = CharacterSkill {
+            index: 0,
+            name: "补刀".to_owned(),
+            note: "主动使用对目标造成4点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 2.0,
+            cooldown_turns: 2,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let guard = CharacterSkill {
+            index: 1,
+            name: "守护术".to_owned(),
+            note: "主动使用给予目标2回合守护状态使承伤设为0.5".to_owned(),
+            ..damage.clone()
+        };
+        let healing = CharacterSkill {
+            index: 2,
+            name: "急救".to_owned(),
+            note: "主动使用对目标回复4点生命值".to_owned(),
+            ..damage.clone()
+        };
+
+        assert!(!store.apply_action_and_finish(
+            "battle",
+            "actor",
+            "defeated",
+            "普通攻击",
+            4.0,
+        ));
+        assert!(
+            !store.record_skill_use_with_buffs_and_finish(
+                "battle",
+                "actor",
+                "defeated",
+                &damage,
+                &mut manager,
+                None,
+            )
+        );
+        assert!(
+            !store.record_skill_use_with_buffs_and_finish(
+                "battle",
+                "actor",
+                "defeated",
+                &guard,
+                &mut manager,
+                None,
+            )
+        );
+        let actor_before_healing = &store.encounters["battle"].participants[0];
+        assert_eq!(actor_before_healing.mp, 10.0);
+        assert_eq!(actor_before_healing.turn, 0);
+        assert!(!actor_before_healing.action_done);
+        assert!(actor_before_healing.skill_last_used_turns.is_empty());
+        assert_eq!(
+            store.encounters["battle"].participants[1].hp,
+            0.0
+        );
+
+        assert!(
+            store.record_skill_use_with_buffs_and_finish(
+                "battle",
+                "actor",
+                "defeated",
+                &healing,
+                &mut manager,
+                None,
+            )
+        );
+        let encounter = &store.encounters["battle"];
+        let actor = &encounter.participants[0];
+        let revived = &encounter.participants[1];
+        assert_eq!(actor.mp, 8.0);
+        assert_eq!(actor.turn, 1);
+        assert!(actor.action_done);
+        assert_eq!(revived.hp, 4.0);
+        assert!(revived.alive);
+        assert_eq!(encounter.round, 0);
     }
 }
