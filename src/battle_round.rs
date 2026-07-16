@@ -180,6 +180,8 @@ pub struct BattleEncounter {
     #[serde(default)]
     pub round: u32,
     #[serde(default)]
+    pub combat_completed_turns: u32,
+    #[serde(default)]
     pub participants: Vec<BattleParticipantSnapshot>,
     #[serde(default)]
     pub action_log: Vec<String>,
@@ -194,6 +196,7 @@ impl Default for BattleEncounter {
             sort_by_turn: true,
             negative_enabled: false,
             round: 0,
+            combat_completed_turns: 0,
             participants: Vec::new(),
             action_log: Vec::new(),
         }
@@ -212,6 +215,8 @@ pub struct BattleParticipantSnapshot {
     pub player_character: bool,
     #[serde(default)]
     pub turn: u32,
+    #[serde(default)]
+    pub combat_turns_completed: u32,
     #[serde(default)]
     #[serde(rename = "str")]
     pub str_: i32,
@@ -491,7 +496,9 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
     }
 
     if active {
+        encounter.combat_completed_turns = 0;
         for participant in &mut encounter.participants {
+            participant.combat_turns_completed = 0;
             participant.combat_damage_taken_total = 0.0;
             participant.damage_contributors.clear();
             participant.arrogance_damage_source_ids.clear();
@@ -511,9 +518,11 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
                 participant.max_mp.max(0.0) * participant.arcane_shield_rate.max(0.0);
         }
     } else {
+        encounter.combat_completed_turns = 0;
         let mut logs = Vec::new();
         let mut defeat_outcomes = Vec::new();
         for participant in &mut encounter.participants {
+            participant.combat_turns_completed = 0;
             participant.keen_evasion_available = false;
             participant.undying_rage_active = false;
             participant.arcane_shield = 0.0;
@@ -1144,13 +1153,7 @@ fn reset_participant_turn_totals(participant: &mut BattleParticipantSnapshot) ->
     changed
 }
 
-fn completed_participant_turns(encounter: &BattleEncounter) -> u32 {
-    encounter
-        .participants
-        .iter()
-        .map(|participant| participant.turn)
-        .fold(0_u32, u32::saturating_add)
-}
+fn completed_combat_turns(encounter: &BattleEncounter) -> u32 { encounter.combat_completed_turns }
 
 fn schedule_participant_delayed_damage(
     participant: &mut BattleParticipantSnapshot,
@@ -1402,6 +1405,7 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
         encounter.sort_by_turn.hash(&mut hasher);
         encounter.negative_enabled.hash(&mut hasher);
         encounter.round.hash(&mut hasher);
+        encounter.combat_completed_turns.hash(&mut hasher);
         for entry in &encounter.action_log {
             entry.hash(&mut hasher);
         }
@@ -1411,6 +1415,7 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant.unit_template_id.hash(&mut hasher);
             participant.player_character.hash(&mut hasher);
             participant.turn.hash(&mut hasher);
+            participant.combat_turns_completed.hash(&mut hasher);
             participant.str_.hash(&mut hasher);
             participant.agi.hash(&mut hasher);
             participant.dex.hash(&mut hasher);
@@ -2417,6 +2422,7 @@ impl BattleRoundStore {
                 sort_by_turn: group.battle_sort_by_turn,
                 negative_enabled: group.battle_negative_enabled,
                 round: group.world_turn,
+                combat_completed_turns: 0,
                 participants,
                 action_log: Vec::new(),
             });
@@ -2528,6 +2534,11 @@ impl BattleRoundStore {
         };
         participant.action_done = true;
         participant.turn += 1;
+        if encounter.active {
+            participant.combat_turns_completed =
+                participant.combat_turns_completed.saturating_add(1);
+            encounter.combat_completed_turns = encounter.combat_completed_turns.saturating_add(1);
+        }
         participant.pending_negative = false;
         if encounter
             .participants
@@ -2749,7 +2760,7 @@ impl BattleRoundStore {
                         &actor_snapshot,
                         actor_character.as_ref(),
                         &basic_config,
-                        completed_participant_turns(encounter),
+                        completed_combat_turns(encounter),
                         damage_type,
                         encounter.active,
                     );
@@ -2827,15 +2838,19 @@ impl BattleRoundStore {
                                     )
                                 })
                                 .unwrap_or(1.0)
-                            * target_character
-                                .as_ref()
-                                .map(|character| {
-                                    character_fighting_spirit_damage_taken_multiplier(
-                                        character,
-                                        target.turn,
-                                    )
-                                })
-                                .unwrap_or(1.0);
+                            * if encounter.active {
+                                target_character
+                                    .as_ref()
+                                    .map(|character| {
+                                        character_fighting_spirit_damage_taken_multiplier(
+                                            character,
+                                            target.combat_turns_completed,
+                                        )
+                                    })
+                                    .unwrap_or(1.0)
+                            } else {
+                                1.0
+                            };
                         let infinite_focus_multiplier = if infinite_focus_target_id.as_deref()
                             == Some(resolved_target_id.as_str())
                         {
@@ -3468,6 +3483,11 @@ impl BattleRoundStore {
             delayed_logs.extend(advance_participant_delayed_healing_ticks(participant));
         }
         participant.turn += 1;
+        if encounter.active {
+            participant.combat_turns_completed =
+                participant.combat_turns_completed.saturating_add(1);
+            encounter.combat_completed_turns = encounter.combat_completed_turns.saturating_add(1);
+        }
         participant.pending_negative = false;
         encounter.round = encounter
             .participants
@@ -4176,6 +4196,7 @@ fn participant_from_character(
         unit_character: None,
         player_character: true,
         turn: 0,
+        combat_turns_completed: 0,
         str_: status.str_,
         agi: status.agi,
         dex: status.dex,
@@ -4269,6 +4290,7 @@ fn participant_from_unit_template(
         unit_character: Some(character.clone()),
         player_character: false,
         turn: 0,
+        combat_turns_completed: 0,
         str_: status.str_,
         agi: status.agi,
         dex: status.dex,
@@ -4362,6 +4384,7 @@ fn participant_from_target(
         unit_character: None,
         player_character: false,
         turn: 0,
+        combat_turns_completed: 0,
         str_: 0,
         agi: 0,
         dex: 0,
@@ -5059,11 +5082,15 @@ fn participant_damage_multiplier(
             .map(character_chaos_output_variance)
             .map(moonberry_chaos_output_multiplier)
             .unwrap_or(1.0)
-        * character
-            .map(|character| {
-                character_valorous_battle_damage_multiplier(character, completed_turns)
-            })
-            .unwrap_or(1.0)
+        * if encounter_active {
+            character
+                .map(|character| {
+                    character_valorous_battle_damage_multiplier(character, completed_turns)
+                })
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        }
 }
 
 fn participant_healing_multiplier(
@@ -5623,6 +5650,7 @@ mod area_tests {
             unit_character: None,
             player_character: false,
             turn: 0,
+            combat_turns_completed: 0,
             str_: 0,
             agi: 0,
             dex: 0,
@@ -5727,6 +5755,7 @@ mod tests {
             unit_character: None,
             player_character: false,
             turn,
+            combat_turns_completed: 0,
             str_: 0,
             agi: 0,
             dex: 0,
@@ -6504,6 +6533,11 @@ mod tests {
 
         let participant = &store.encounters["battle"].participants[0];
         assert_eq!(participant.turn, 1);
+        assert_eq!(participant.combat_turns_completed, 1);
+        assert_eq!(
+            store.encounters["battle"].combat_completed_turns,
+            1
+        );
         assert_eq!(participant.hp, 5.0);
         assert_eq!(participant.mp, 1.0);
     }
@@ -7273,7 +7307,8 @@ mod tests {
                     .iter_mut()
                     .find(|participant| participant.target_id == "b")
                     .unwrap();
-                target.turn = turn;
+                target.turn = 99;
+                target.combat_turns_completed = turn;
                 target.hp = 100.0;
                 target.damage_taken_this_turn = 0.0;
             }
@@ -7287,6 +7322,33 @@ mod tests {
             assert!((target.damage_taken_this_turn - expected_damage).abs() < 0.0001);
             assert!((target.hp - (100.0 - expected_damage)).abs() < 0.0001);
         }
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            false
+        ));
+        assert_eq!(
+            store.encounters["battle"].combat_completed_turns,
+            0
+        );
+        let target = store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert_eq!(target.combat_turns_completed, 0);
+        target.hp = 100.0;
+        target.damage_taken_this_turn = 0.0;
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 90.0).abs() < 0.0001);
     }
 
     #[test]
@@ -7406,16 +7468,11 @@ mod tests {
             .iter()
             .find(|participant| participant.target_id == "b")
             .unwrap();
-        assert!((target.hp - 89.0).abs() < 0.0001);
+        assert!((target.hp - 90.0).abs() < 0.0001);
 
         {
             let encounter = store.encounters.get_mut("battle").unwrap();
-            encounter
-                .participants
-                .iter_mut()
-                .find(|participant| participant.target_id == "a")
-                .unwrap()
-                .turn = 10;
+            encounter.combat_completed_turns = 5;
             let target = encounter
                 .participants
                 .iter_mut()
@@ -7431,8 +7488,61 @@ mod tests {
             .iter()
             .find(|participant| participant.target_id == "b")
             .unwrap();
+        assert!((target.hp - 89.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 11.0).abs() < 0.0001);
+
+        {
+            let encounter = store.encounters.get_mut("battle").unwrap();
+            encounter.combat_completed_turns = 10;
+            let target = encounter
+                .participants
+                .iter_mut()
+                .find(|participant| participant.target_id == "b")
+                .unwrap();
+            target.hp = 100.0;
+            target.damage_taken_this_turn = 0.0;
+        }
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
         assert!((target.hp - 88.0).abs() < 0.0001);
-        assert!((target.damage_taken_this_turn - 12.0).abs() < 0.0001);
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            false
+        ));
+        assert_eq!(
+            store.encounters["battle"].combat_completed_turns,
+            0
+        );
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        encounter.combat_completed_turns = 10;
+        let target = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        target.hp = 100.0;
+        target.damage_taken_this_turn = 0.0;
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None,));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 90.0).abs() < 0.0001);
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            true
+        ));
+        assert_eq!(
+            store.encounters["battle"].combat_completed_turns,
+            0
+        );
     }
 
     #[test]
@@ -11041,6 +11151,11 @@ mod tests {
             .find(|participant| participant.target_id == "a")
             .unwrap();
         assert_eq!(actor.turn, 1);
+        assert_eq!(actor.combat_turns_completed, 1);
+        assert_eq!(
+            store.encounters["battle"].combat_completed_turns,
+            1
+        );
         assert_eq!(
             skill_cooldown_remaining(
                 actor,

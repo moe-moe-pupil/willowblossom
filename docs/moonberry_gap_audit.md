@@ -69,6 +69,8 @@ Additional 2026-07-16 correction: `狂妄` and `无尽痛楚` are now fully scop
 
 Additional 2026-07-16 correction: `液态躯体` now obeys its preserved active battle-round trigger. Resting skill damage applies fully and schedules no liquid-body delayed tick, while resting round or participant advancement cannot trigger the previous-round self-heal. Active-combat 50/50 damage splitting and 5% prior-round-damage healing remain unchanged; delayed damage already committed during combat is not erased merely by changing the encounter to resting. Focused verification passes with `cargo test --lib -j 1 liquid_body -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `越战越勇` and `斗志昂扬` now use dedicated persisted combat-turn counters instead of the participants' inherited world/cooldown clocks. A newly created or re-entered combat therefore starts at +0% valorous damage and the defender's 50% first-turn reduction even when the campaign clock is already advanced; completed active actions then advance the shared/per-participant counters, combat boundaries reset them, and neither modifier applies during rest. Existing world turns and skill cooldown timing remain unchanged. Focused verification passes with `cargo test --lib -j 1 valorous -- --nocapture`, `cargo test --lib -j 1 fighting_spirit -- --nocapture`, `cargo test --lib -j 1 active_battle_turn_suppresses -- --nocapture`, and `cargo test --lib -j 1 skill_cooldown_starts -- --nocapture`: 1 passed in each command, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -336,9 +338,9 @@ These are present now, often as a Rust/Bevy redesign rather than a direct port:
 
    Additional implemented talent execution: 狂风恶浪 now raises parsed battle order speed from the normal +20% talent speed to +35% while live player-character participants are <=3.
 
-   Additional implemented talent execution: `越战越勇` now raises parsed-battle skill damage by 2% for each completed participant turn, capped at 20%.
+   Additional implemented talent execution: `越战越勇` now raises active parsed-battle skill damage by 2% for each action completed in the current combat, capped at 20%; inherited world turns, resting actions, and prior combats do not preload the bonus.
 
-   Additional implemented talent execution: `斗志昂扬` now reduces parsed-battle incoming skill damage by 50%, 10%, and 2% on the target's first, second, and third own turns.
+   Additional implemented talent execution: `斗志昂扬` now reduces active parsed-battle incoming skill damage by 50%, 10%, and 2% before the target completes its first, second, and third actions in the current combat; inherited world turns and rest do not consume or apply the sequence.
 
 Additional implemented talent execution: `狂妄` now records unique active-combat damage sources and raises the actor's skill damage by 10% per source, capped at 30%; resting damage and combat boundaries cannot retain or apply those sources.
 
@@ -402,9 +404,9 @@ Battle damage resolution now distinguishes attempted, absorbed, and applied dama
 
    Additional update: parsed battle order now carries participant speed plus a 狂风恶浪 low-survivor speed override, so the talent's +20% speed becomes +35% while live player-character participants are <=3.
 
-   Additional update: parsed battle skill damage now applies `越战越勇` as +2% damage per completed participant turn, capped at +20%.
+   Additional update: active parsed battle skill damage now applies `越战越勇` as +2% damage per action completed in the current combat, capped at +20%, using a dedicated encounter-local counter.
 
-   Additional update: parsed battle skill damage now applies `斗志昂扬` as incoming damage reduction on the target's first three own turns: 50%, then 10%, then 2%.
+   Additional update: active parsed battle skill damage now applies `斗志昂扬` from a dedicated per-combat action counter: 50% before the target's first completed action, then 10%, then 2%.
 
    Additional update: parsed battle now records unique damage sources for `狂妄`; each unique source raises the damaged actor's later skill damage by 10%, capped at 30%.
 
