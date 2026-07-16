@@ -51,7 +51,7 @@ use crate::{
         character_damage_taken_attribute_multiplier,
         character_dominion_max_hp_bonus_cap,
         character_dominion_max_hp_gain_rate,
-        character_dying_healing_taken_modifier,
+        character_dying_target_healing_modifier,
         character_echoing_memory_healing_rates,
         character_endless_pain_bonus_damage_per_stack,
         character_fatigue_walker_available,
@@ -83,7 +83,7 @@ use crate::{
         character_undying_rage_available,
         character_valorous_battle_damage_multiplier,
         character_wounded_healing_dealt_modifier,
-        dying_healing_taken_multiplier,
+        dying_target_healing_multiplier,
         endless_pain_bonus_damage,
         infinite_focus_damage_dealt_multiplier,
         large_hit_damage_taken_multiplier,
@@ -3304,6 +3304,10 @@ impl BattleRoundStore {
                     let actor_echoing_memory_healing_rates = actor_character
                         .as_ref()
                         .and_then(|character| character_echoing_memory_healing_rates(character));
+                    let actor_dying_target_healing_modifier = actor_character
+                        .as_ref()
+                        .map(character_dying_target_healing_modifier)
+                        .unwrap_or(1.0);
                     let target_ids = resolve_skill_targets(
                         target,
                         actor_id,
@@ -3344,20 +3348,16 @@ impl BattleRoundStore {
                             continue;
                         };
                         let target_character = character_for_participant(target, manager);
-                        let target_dying_healing_modifier = target_character
-                            .as_ref()
-                            .map(character_dying_healing_taken_modifier)
-                            .unwrap_or(1.0);
                         let target_mutual_aid_healing_rate = target_character
                             .as_ref()
                             .map(character_mutual_aid_healing_rate)
                             .unwrap_or(0.0);
                         let target_healing_multiplier = target.healing_taken_modifier
                             * participant_wound_healing_multiplier(target)
-                            * dying_healing_taken_multiplier(
+                            * dying_target_healing_multiplier(
                                 target.hp,
                                 target.max_hp,
-                                target_dying_healing_modifier,
+                                actor_dying_target_healing_modifier,
                             );
                         let one_heart_multiplier = if encounter.active
                             && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
@@ -4278,13 +4278,13 @@ fn apply_battle_buff_ticks(
                     .unwrap_or(1.0);
                 let target_multiplier = encounter.participants[target_index].healing_taken_modifier
                     * participant_wound_healing_multiplier(&encounter.participants[target_index])
-                    * target_character
+                    * source_character
                         .as_ref()
-                        .map(|target| {
-                            dying_healing_taken_multiplier(
-                                target.hp,
-                                target.max_hp,
-                                character_dying_healing_taken_modifier(target),
+                        .map(|source| {
+                            dying_target_healing_multiplier(
+                                encounter.participants[target_index].hp,
+                                encounter.participants[target_index].max_hp,
+                                character_dying_target_healing_modifier(source),
                             )
                         })
                         .unwrap_or(1.0);
@@ -9615,6 +9615,59 @@ mod tests {
     }
 
     #[test]
+    fn battle_buff_healing_uses_source_talent_and_encounter_target_vitals() {
+        let mut manager = empty_manager();
+        let source_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            skill_names: vec!["生死时速".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "source".to_owned(),
+            source_character.clone(),
+        );
+        manager.player_characters.insert(
+            "target".to_owned(),
+            target_character.clone(),
+        );
+        let source = participant_from_character("source", &source_character, &manager);
+        let mut target = participant_from_character("target", &target_character, &manager);
+        target.hp = 4.0;
+        let mut encounter = BattleEncounter {
+            name: "battle".to_owned(),
+            active: true,
+            participants: vec![source, target],
+            ..Default::default()
+        };
+
+        apply_battle_buff_ticks(&mut encounter, &manager, &[
+            BattleBuffTick {
+                source_id: "source".to_owned(),
+                target_id: "target".to_owned(),
+                action: BuffTickAction::Heal { amount: 4.0 },
+            },
+        ]);
+
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        assert!((target.hp - 10.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 6.0).abs() < 0.0001);
+    }
+
+    #[test]
     fn background_effects_do_not_modify_defeated_participants() {
         let manager = empty_manager();
         let source = participant("source", 0);
@@ -10590,16 +10643,16 @@ mod tests {
         let actor_character = PlayerCharacter {
             hp: 10.0,
             max_hp: 10.0,
-            ..Default::default()
-        };
-        let target_character = PlayerCharacter {
-            hp: 4.0,
-            max_hp: 20.0,
             skill_names: vec!["生死时速".to_owned()],
             skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
                 "support_talent",
                 "辅助天赋",
             )],
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 4.0,
+            max_hp: 20.0,
             ..Default::default()
         };
         manager

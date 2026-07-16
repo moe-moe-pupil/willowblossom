@@ -624,7 +624,7 @@ use crate::{
         character_damage_attribute_multiplier,
         character_damage_dealt_talent_buffs,
         character_damage_taken_attribute_multiplier,
-        character_dying_healing_taken_modifier,
+        character_dying_target_healing_modifier,
         character_fatigue_walker_available,
         character_healing_attribute_multiplier,
         character_large_hit_damage_taken_modifier,
@@ -637,7 +637,7 @@ use crate::{
         character_physical_damage_lifesteal,
         character_spell_range_multiplier,
         character_wounded_healing_dealt_modifier,
-        dying_healing_taken_multiplier,
+        dying_target_healing_multiplier,
         grant_character_experience,
         is_scene_capture_command_text,
         large_hit_damage_taken_multiplier,
@@ -5006,6 +5006,7 @@ fn apply_quick_cast_action_to_manager(
         source_physical_damage_followup_rate,
         source_minimum_damage_floor,
         source_mutual_aid_healing_rate,
+        source_dying_target_healing_modifier,
         damage_dealt_buffs,
     ) = {
         let Some(caster) = manager.player_characters.get_mut(&action.caster_id) else {
@@ -5074,6 +5075,7 @@ fn apply_quick_cast_action_to_manager(
             Some(QuickCastEffect::Heal { .. }) => character_mutual_aid_healing_rate(caster),
             _ => 0.0,
         };
+        let source_dying_target_healing_modifier = character_dying_target_healing_modifier(caster);
         let damage_dealt_buffs = character_damage_dealt_talent_buffs(caster, &action.caster_id);
         if !action.force {
             caster.mp = (caster.mp - action.skill.mp_cost).max(0.0);
@@ -5092,6 +5094,7 @@ fn apply_quick_cast_action_to_manager(
             source_physical_damage_followup_rate,
             source_minimum_damage_floor,
             source_mutual_aid_healing_rate,
+            source_dying_target_healing_modifier,
             damage_dealt_buffs,
         )
     };
@@ -5170,10 +5173,10 @@ fn apply_quick_cast_action_to_manager(
             },
             QuickCastEffect::Heal { amount, .. } => {
                 let target_healing_multiplier = target.healing_taken_modifier
-                    * dying_healing_taken_multiplier(
+                    * dying_target_healing_multiplier(
                         target.hp,
                         target.max_hp,
-                        character_dying_healing_taken_modifier(target),
+                        source_dying_target_healing_modifier,
                     );
                 let final_amount =
                     (amount * source_healing_multiplier * target_healing_multiplier).max(0.0);
@@ -6320,7 +6323,7 @@ fn sync_character_skill_rules_with_stats(
         character_wounded_healing_dealt_modifier(&base_character),
         character_mutual_aid_healing_rate(&base_character),
         stats.healing_taken_modifier,
-        character_dying_healing_taken_modifier(&base_character),
+        character_dying_target_healing_modifier(&base_character),
         character_damage_dealt_talent_buffs(&base_character, target_id),
         rules,
     );
@@ -16340,6 +16343,8 @@ mod tests {
             .insert("caster".to_owned(), PlayerCharacter {
                 hp: 10.0,
                 max_hp: 10.0,
+                skill_names: vec!["生死时速".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
                 ..Default::default()
             });
         manager
@@ -16347,8 +16352,6 @@ mod tests {
             .insert("target".to_owned(), PlayerCharacter {
                 hp: 4.0,
                 max_hp: 20.0,
-                skill_names: vec!["生死时速".to_owned()],
-                skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
                 ..Default::default()
             });
         let skill = QuickCastSkill {

@@ -6839,7 +6839,7 @@ pub fn large_hit_damage_taken_multiplier(
     }
 }
 
-pub fn character_dying_healing_taken_modifier(character: &PlayerCharacter) -> f32 {
+pub fn character_dying_target_healing_modifier(character: &PlayerCharacter) -> f32 {
     if character_has_approved_moonberry_talent(character, "生死时速") {
         1.5
     } else {
@@ -6847,9 +6847,13 @@ pub fn character_dying_healing_taken_modifier(character: &PlayerCharacter) -> f3
     }
 }
 
-pub fn dying_healing_taken_multiplier(hp: f32, max_hp: f32, dying_healing_modifier: f32) -> f32 {
+pub fn dying_target_healing_multiplier(
+    hp: f32,
+    max_hp: f32,
+    dying_target_healing_modifier: f32,
+) -> f32 {
     if max_hp > 0.0 && hp <= max_hp * 0.2 {
-        dying_healing_modifier.max(0.0)
+        dying_target_healing_modifier.max(0.0)
     } else {
         1.0
     }
@@ -10789,37 +10793,37 @@ mod tests {
             character_large_hit_damage_taken_modifier(&large_hit_target),
             1.0
         );
-        let mut dying_target = character.clone();
-        dying_target.hp = 4.0;
-        dying_target.max_hp = 20.0;
-        dying_target.skill_names.push("生死时速".to_owned());
-        dying_target
+        let mut dying_target_healer = character.clone();
+        dying_target_healer.skill_names.push("生死时速".to_owned());
+        dying_target_healer
             .skill_metadata
             .push(CharacterSkillMetadata::talent(
                 "support_talent",
                 "辅助天赋",
             ));
-        assert!((character_dying_healing_taken_modifier(&dying_target) - 1.5).abs() < f32::EPSILON);
+        assert!(
+            (character_dying_target_healing_modifier(&dying_target_healer) - 1.5).abs()
+                < f32::EPSILON
+        );
         assert_eq!(
-            dying_healing_taken_multiplier(
-                dying_target.hp,
-                dying_target.max_hp,
-                character_dying_healing_taken_modifier(&dying_target),
+            dying_target_healing_multiplier(
+                4.0,
+                20.0,
+                character_dying_target_healing_modifier(&dying_target_healer),
             ),
             1.5
         );
-        dying_target.hp = 5.0;
         assert_eq!(
-            dying_healing_taken_multiplier(
-                dying_target.hp,
-                dying_target.max_hp,
-                character_dying_healing_taken_modifier(&dying_target),
+            dying_target_healing_multiplier(
+                5.0,
+                20.0,
+                character_dying_target_healing_modifier(&dying_target_healer),
             ),
             1.0
         );
-        dying_target.skill_metadata[0].st_approved = false;
+        dying_target_healer.skill_metadata[0].st_approved = false;
         assert_eq!(
-            character_dying_healing_taken_modifier(&dying_target),
+            character_dying_target_healing_modifier(&dying_target_healer),
             1.0
         );
         let mut wounded_healer = character.clone();

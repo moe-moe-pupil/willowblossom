@@ -1263,7 +1263,7 @@ pub struct Character {
     pub wounded_healing_dealt_modifier: f32,
     pub mutual_aid_healing_rate: f32,
     pub healing_taken_modifier: f32,
-    pub dying_healing_taken_modifier: f32,
+    pub dying_target_healing_modifier: f32,
     pub damage_taken_this_turn: f32,
     pub healing_taken_this_turn: f32,
     pub damage_dealt_buffs: Vec<BuffSpec>,
@@ -1535,7 +1535,7 @@ impl RuleEngineState {
         wounded_healing_dealt_modifier: f32,
         mutual_aid_healing_rate: f32,
         healing_taken_modifier: f32,
-        dying_healing_taken_modifier: f32,
+        dying_target_healing_modifier: f32,
         damage_dealt_buffs: Vec<BuffSpec>,
         rules: Vec<RuleAst>,
     ) {
@@ -1565,7 +1565,7 @@ impl RuleEngineState {
         character.wounded_healing_dealt_modifier = wounded_healing_dealt_modifier.max(0.0);
         character.mutual_aid_healing_rate = mutual_aid_healing_rate.max(0.0);
         character.healing_taken_modifier = healing_taken_modifier;
-        character.dying_healing_taken_modifier = dying_healing_taken_modifier.max(0.0);
+        character.dying_target_healing_modifier = dying_target_healing_modifier.max(0.0);
         character.damage_dealt_buffs = damage_dealt_buffs;
         self.engine.add_character(character);
         self.engine.replace_rules_for_owner(owner_id, rules);
@@ -1619,7 +1619,7 @@ impl Character {
             wounded_healing_dealt_modifier: 1.0,
             mutual_aid_healing_rate: 0.0,
             healing_taken_modifier: 1.0,
-            dying_healing_taken_modifier: 1.0,
+            dying_target_healing_modifier: 1.0,
             damage_taken_this_turn: 0.0,
             healing_taken_this_turn: 0.0,
             damage_dealt_buffs: Vec::new(),
@@ -1668,12 +1668,12 @@ impl Character {
         )
     }
 
-    fn dying_healing_taken_multiplier(&self) -> f32 {
-        if self.max_hp > 0.0 && self.hp <= self.max_hp * 0.2 {
-            self.dying_healing_taken_modifier
-        } else {
-            1.0
-        }
+    fn dying_target_healing_multiplier(&self, target_hp: f32, target_max_hp: f32) -> f32 {
+        crate::napcat::dying_target_healing_multiplier(
+            target_hp,
+            target_max_hp,
+            self.dying_target_healing_modifier,
+        )
     }
 
     fn wounded_healing_dealt_multiplier(&self) -> f32 {
@@ -2278,21 +2278,25 @@ impl RuleEngine {
     }
 
     pub fn heal(&mut self, source_id: &str, target_id: &str, amount: f32) {
+        let (target_hp, target_max_hp) = self
+            .characters
+            .get(target_id)
+            .map(|character| (character.hp, character.max_hp))
+            .unwrap_or_default();
         let source_modifier = self
             .characters
             .get(source_id)
             .map(|character| {
                 character.healing_dealt_modifier
                     * character.wounded_healing_dealt_multiplier()
+                    * character.dying_target_healing_multiplier(target_hp, target_max_hp)
                     * chaos_output_multiplier(character.chaos_output_variance)
             })
             .unwrap_or(1.0);
         let target_modifier = self
             .characters
             .get(target_id)
-            .map(|character| {
-                character.healing_taken_modifier * character.dying_healing_taken_multiplier()
-            })
+            .map(|character| character.healing_taken_modifier)
             .unwrap_or(1.0);
         let final_heal = (amount * source_modifier * target_modifier).max(0.0);
         let mutual_aid_heal = if source_id != target_id && final_heal > f32::EPSILON {
@@ -4351,12 +4355,13 @@ mod tests {
     }
 
     #[test]
-    fn healing_dying_target_uses_dying_healing_modifier() {
+    fn healing_dying_target_uses_source_talent_modifier() {
         let mut engine = RuleEngine::default();
-        engine.add_character(Character::new("source", "来源", 10.0));
+        let mut source = Character::new("source", "来源", 10.0);
+        source.dying_target_healing_modifier = 1.5;
+        engine.add_character(source);
         let mut target = Character::new("target", "目标", 20.0);
         target.hp = 4.0;
-        target.dying_healing_taken_modifier = 1.5;
         engine.add_character(target);
 
         engine.heal("source", "target", 4.0);
@@ -4372,15 +4377,22 @@ mod tests {
                 < 0.0001
         );
 
+        let source = engine.characters.get_mut("source").unwrap();
+        source.dying_target_healing_modifier = 1.0;
+        let target = engine.characters.get_mut("target").unwrap();
+        target.hp = 4.0;
+        target.healing_taken_this_turn = 0.0;
+        target.dying_target_healing_modifier = 1.5;
+
         engine.heal("source", "target", 4.0);
-        assert!((engine.characters.get("target").unwrap().hp - 14.0).abs() < 0.0001);
+        assert!((engine.characters.get("target").unwrap().hp - 8.0).abs() < 0.0001);
         assert!(
             (engine
                 .characters
                 .get("target")
                 .unwrap()
                 .healing_taken_this_turn
-                - 10.0)
+                - 4.0)
                 .abs()
                 < 0.0001
         );
