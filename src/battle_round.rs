@@ -494,6 +494,8 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         for participant in &mut encounter.participants {
             participant.combat_damage_taken_total = 0.0;
             participant.damage_contributors.clear();
+            participant.one_heart_target_id = None;
+            participant.one_heart_stacks = 0;
             participant.inspiration_target_id = None;
             participant.inspiration_sources.clear();
             participant.keen_evasion_available = participant.keen_evasion_enabled;
@@ -511,6 +513,8 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.keen_evasion_available = false;
             participant.undying_rage_active = false;
             participant.arcane_shield = 0.0;
+            participant.one_heart_target_id = None;
+            participant.one_heart_stacks = 0;
             participant.inspiration_target_id = None;
             participant.inspiration_sources.clear();
             if participant_hope_avatar_active(participant) {
@@ -1912,7 +1916,8 @@ fn encounter_roster_ui(
                     participant.infinite_focus_stacks
                 ));
             }
-            if participant.one_heart_healing_bonus_per_stack > f32::EPSILON
+            if encounter.active
+                && participant.one_heart_healing_bonus_per_stack > f32::EPSILON
                 && participant.one_heart_stacks > 0
             {
                 ui.small(format!(
@@ -3091,8 +3096,8 @@ impl BattleRoundStore {
                                 target.max_hp,
                                 target_dying_healing_modifier,
                             );
-                        let one_heart_multiplier = if single_heal_target_id.as_deref()
-                            == Some(resolved_target_id.as_str())
+                        let one_heart_multiplier = if encounter.active
+                            && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
                         {
                             participant_one_heart_healing_multiplier(
                                 &actor_snapshot,
@@ -3162,13 +3167,15 @@ impl BattleRoundStore {
                             ));
                         }
                     }
-                    if let Some(target_id) = healed_one_heart_target_id {
-                        if let Some(actor) = encounter
-                            .participants
-                            .iter_mut()
-                            .find(|participant| participant.target_id == actor_id)
-                        {
-                            record_participant_one_heart_heal(actor, &target_id);
+                    if encounter.active {
+                        if let Some(target_id) = healed_one_heart_target_id {
+                            if let Some(actor) = encounter
+                                .participants
+                                .iter_mut()
+                                .find(|participant| participant.target_id == actor_id)
+                            {
+                                record_participant_one_heart_heal(actor, &target_id);
+                            }
                         }
                     }
                     if encounter.active {
@@ -9660,6 +9667,40 @@ mod tests {
             .action_log
             .iter()
             .any(|entry| entry.contains("触发一心")));
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, false
+        ));
+        assert!(encounter.participants[0].one_heart_target_id.is_none());
+        assert_eq!(
+            encounter.participants[0].one_heart_stacks,
+            0
+        );
+        encounter.participants[0].one_heart_target_id = Some("c".to_owned());
+        encounter.participants[0].one_heart_stacks = 5;
+
+        assert!(store.record_skill_use("battle", "a", "c", &skill, &manager, None));
+        let encounter = &store.encounters["battle"];
+        assert!((encounter.participants[2].hp - 20.0).abs() < 0.0001);
+        assert_eq!(
+            encounter.participants[0].one_heart_target_id.as_deref(),
+            Some("c")
+        );
+        assert_eq!(
+            encounter.participants[0].one_heart_stacks,
+            5
+        );
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, true
+        ));
+        assert!(encounter.participants[0].one_heart_target_id.is_none());
+        assert_eq!(
+            encounter.participants[0].one_heart_stacks,
+            0
+        );
     }
 
     #[test]

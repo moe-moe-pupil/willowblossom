@@ -61,6 +61,8 @@ Additional 2026-07-16 correction: battle damage contributors are now scoped to o
 
 Additional 2026-07-16 correction: `振奋` is now fully scoped to active combat. Resting healing cannot grant it, stale persisted links cannot modify resting order speed or damage, combat exit clears healer/target ownership, and combat entry defensively clears stale links before new healing can establish them. The existing active-combat transfer, non-stacking, round expiry, speed, and damage behavior remains unchanged. Focused verification passes with `cargo test --lib -j 1 inspiration -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `一心` is now fully scoped to active combat. Resting healing neither gains stacks nor receives a stale persisted focus bonus, combat exit clears the healer's target/stacks, and combat entry defensively clears migrated stale focus. Active-combat same-target stacking, the +25% cap, and target-switch reset remain unchanged. Focused verification passes with `cargo test --lib -j 1 one_heart -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -346,7 +348,7 @@ Additional implemented talent execution: `罪上加罪` now tracks parsed-battle
 
 Additional implemented talent execution: `忏悔` now tracks parsed-battle damage contributors and decays the talent's healing bonus by 10% for each kill/assist credit, bottoming at 0%.
 
-Additional implemented talent execution: `一心` now tracks parsed-battle repeated single-target healing against the same target and raises healing by +5% per existing stack up to +25%, resetting when the healer switches targets.
+Additional implemented talent execution: `一心` now tracks active-combat repeated single-target healing against the same target and raises healing by +5% per existing stack up to +25%, resetting when the healer switches targets or crosses a combat boundary.
 
 Additional implemented talent execution: `千万回忆` now records parsed-battle delayed healing echoes from successful single-target heals, resolving 15% then 5% of the original heal on later round advances.
 
