@@ -473,16 +473,25 @@ fn record_participant_healing_taken(
     true
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BattleHealingResolution {
+    hp_restored: f32,
+    shield_gained: f32,
+}
+
+impl BattleHealingResolution {
+    fn effective_amount(self) -> f32 { self.hp_restored + self.shield_gained }
+}
+
 fn apply_participant_healing_for_battle(
     participant: &mut BattleParticipantSnapshot,
     amount: f32,
     overhealing_shield_cap_rate: f32,
-) {
+) -> BattleHealingResolution {
     let amount = amount.max(0.0);
     if amount <= f32::EPSILON {
-        return;
+        return BattleHealingResolution::default();
     }
-    record_participant_healing_taken(participant, amount);
     let missing_hp = (participant.max_hp - participant.hp).max(0.0);
     let applied_healing = amount.min(missing_hp);
     participant.hp = (participant.hp + applied_healing).min(participant.max_hp);
@@ -490,11 +499,20 @@ fn apply_participant_healing_for_battle(
 
     let overhealing = (amount - applied_healing).max(0.0);
     let shield_cap = participant.max_hp.max(0.0) * overhealing_shield_cap_rate.max(0.0);
+    let previous_shield = participant.overhealing_shield.max(0.0);
     if overhealing > f32::EPSILON && shield_cap > f32::EPSILON {
-        participant.overhealing_shield =
-            (participant.overhealing_shield.max(0.0) + overhealing).min(shield_cap);
+        participant.overhealing_shield = (previous_shield + overhealing).min(shield_cap);
         participant.overhealing_shield_turns_remaining = 2;
     }
+    let resolution = BattleHealingResolution {
+        hp_restored: applied_healing,
+        shield_gained: (participant.overhealing_shield - previous_shield).max(0.0),
+    };
+    record_participant_healing_taken(
+        participant,
+        resolution.effective_amount(),
+    );
+    resolution
 }
 
 fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> bool {
@@ -568,11 +586,12 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
                 continue;
             }
             let shield_cap_rate = participant.overhealing_shield_cap_rate;
-            apply_participant_healing_for_battle(participant, healing, shield_cap_rate);
+            let resolution =
+                apply_participant_healing_for_battle(participant, healing, shield_cap_rate);
             logs.push(format!(
                 "{}触发息心，回复{}点生命值",
                 participant.display_name,
-                format_number(healing)
+                format_number(resolution.effective_amount())
             ));
         }
         encounter.action_log.extend(logs);
@@ -947,11 +966,11 @@ fn apply_participant_liquid_body_healing(
         return None;
     }
     let shield_cap_rate = participant.overhealing_shield_cap_rate;
-    apply_participant_healing_for_battle(participant, healing, shield_cap_rate);
+    let resolution = apply_participant_healing_for_battle(participant, healing, shield_cap_rate);
     Some(format!(
         "{}触发液态躯体，回复{}点生命值",
         participant.display_name,
-        format_number(healing)
+        format_number(resolution.effective_amount())
     ))
 }
 
@@ -1384,7 +1403,7 @@ fn advance_participant_delayed_healing_ticks(
         if final_amount <= f32::EPSILON {
             continue;
         }
-        apply_participant_healing_for_battle(
+        let resolution = apply_participant_healing_for_battle(
             participant,
             final_amount,
             tick.overhealing_shield_cap_rate,
@@ -1394,7 +1413,7 @@ fn advance_participant_delayed_healing_ticks(
             tick.source_name,
             tick.name,
             display_name,
-            format_number(final_amount)
+            format_number(resolution.effective_amount())
         ));
     }
     logs
@@ -3257,7 +3276,7 @@ impl BattleRoundStore {
                             .iter_mut()
                             .find(|participant| participant.target_id == actor_id)
                         {
-                            apply_participant_healing_for_battle(
+                            let resolution = apply_participant_healing_for_battle(
                                 actor,
                                 pending_actor_lifesteal,
                                 actor_snapshot.overhealing_shield_cap_rate,
@@ -3265,7 +3284,7 @@ impl BattleRoundStore {
                             encounter.action_log.push(format!(
                                 "{}触发禅宗古训，回复{}点生命值",
                                 actor_name,
-                                format_number(pending_actor_lifesteal)
+                                format_number(resolution.effective_amount())
                             ));
                         }
                     }
@@ -3353,22 +3372,23 @@ impl BattleRoundStore {
                             * one_heart_multiplier
                             * target_healing_multiplier)
                             .max(0.0);
-                        apply_participant_healing_for_battle(
+                        let healing_resolution = apply_participant_healing_for_battle(
                             target,
                             final_amount,
                             actor_snapshot.overhealing_shield_cap_rate,
                         );
-                        if resolved_target_id != actor_id && final_amount > f32::EPSILON {
-                            pending_actor_mutual_aid_healing += final_amount
+                        let effective_amount = healing_resolution.effective_amount();
+                        if resolved_target_id != actor_id && effective_amount > f32::EPSILON {
+                            pending_actor_mutual_aid_healing += effective_amount
                                 * (actor_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
                         }
-                        if final_amount > f32::EPSILON
+                        if effective_amount > f32::EPSILON
                             && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
                         {
                             healed_one_heart_target_id = Some(resolved_target_id.clone());
                             healed_inspiration_target_id = Some(resolved_target_id.clone());
                         }
-                        if final_amount > f32::EPSILON
+                        if effective_amount > f32::EPSILON
                             && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
                         {
                             if let Some((first_echo_rate, second_echo_rate)) =
@@ -3379,7 +3399,7 @@ impl BattleRoundStore {
                                     actor_id,
                                     &actor_name,
                                     "千万回忆",
-                                    final_amount * first_echo_rate,
+                                    effective_amount * first_echo_rate,
                                     actor_snapshot.overhealing_shield_cap_rate,
                                     1,
                                 );
@@ -3388,7 +3408,7 @@ impl BattleRoundStore {
                                     actor_id,
                                     &actor_name,
                                     "千万回忆",
-                                    final_amount * second_echo_rate,
+                                    effective_amount * second_echo_rate,
                                     actor_snapshot.overhealing_shield_cap_rate,
                                     2,
                                 );
@@ -3399,7 +3419,7 @@ impl BattleRoundStore {
                             actor_name,
                             target.display_name,
                             skill.name,
-                            format_number(final_amount)
+                            format_number(effective_amount)
                         ));
                         if one_heart_multiplier > 1.0 + f32::EPSILON {
                             encounter.action_log.push(format!(
@@ -3443,7 +3463,7 @@ impl BattleRoundStore {
                             .find(|participant| participant.target_id == actor_id)
                         {
                             let shield_cap_rate = actor.overhealing_shield_cap_rate;
-                            apply_participant_healing_for_battle(
+                            let resolution = apply_participant_healing_for_battle(
                                 actor,
                                 pending_actor_mutual_aid_healing,
                                 shield_cap_rate,
@@ -3451,7 +3471,7 @@ impl BattleRoundStore {
                             encounter.action_log.push(format!(
                                 "{}触发互帮互助，回复{}点生命值",
                                 actor_name,
-                                format_number(pending_actor_mutual_aid_healing)
+                                format_number(resolution.effective_amount())
                             ));
                         }
                     }
@@ -4272,9 +4292,16 @@ fn apply_battle_buff_ticks(
                     .as_ref()
                     .map(character_overhealing_shield_cap_rate)
                     .unwrap_or(0.0);
+                let target = &mut encounter.participants[target_index];
+                let resolution = apply_participant_healing_for_battle(
+                    target,
+                    final_amount,
+                    source_overhealing_shield_cap_rate,
+                );
+                let effective_amount = resolution.effective_amount();
                 let mutual_aid_healing =
-                    if tick.source_id != tick.target_id && final_amount > f32::EPSILON {
-                        final_amount
+                    if tick.source_id != tick.target_id && effective_amount > f32::EPSILON {
+                        effective_amount
                             * (source_character
                                 .as_ref()
                                 .map(character_mutual_aid_healing_rate)
@@ -4286,17 +4313,11 @@ fn apply_battle_buff_ticks(
                     } else {
                         0.0
                     };
-                let target = &mut encounter.participants[target_index];
-                apply_participant_healing_for_battle(
-                    target,
-                    final_amount,
-                    source_overhealing_shield_cap_rate,
-                );
                 encounter.action_log.push(format!(
                     "状态触发：{}为{}回复{}点生命值",
                     source_name,
                     target_name,
-                    format_number(final_amount)
+                    format_number(effective_amount)
                 ));
                 if mutual_aid_healing > f32::EPSILON {
                     if let Some(source) = encounter
@@ -4305,7 +4326,7 @@ fn apply_battle_buff_ticks(
                         .find(|participant| participant.target_id == tick.source_id)
                     {
                         let shield_cap_rate = source.overhealing_shield_cap_rate;
-                        apply_participant_healing_for_battle(
+                        let resolution = apply_participant_healing_for_battle(
                             source,
                             mutual_aid_healing,
                             shield_cap_rate,
@@ -4313,7 +4334,7 @@ fn apply_battle_buff_ticks(
                         encounter.action_log.push(format!(
                             "{}触发互帮互助，回复{}点生命值",
                             source_name,
-                            format_number(mutual_aid_healing)
+                            format_number(resolution.effective_amount())
                         ));
                     }
                 }
@@ -9506,6 +9527,7 @@ mod tests {
             .unwrap();
         assert!((target.hp - 100.0).abs() < 0.0001);
         assert!((target.overhealing_shield - 30.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 35.0).abs() < 0.0001);
         assert_eq!(
             target.overhealing_shield_turns_remaining,
             2
@@ -10873,6 +10895,78 @@ mod tests {
     }
 
     #[test]
+    fn parsed_battle_wasted_healing_does_not_trigger_follow_up_talents() {
+        let mut manager = empty_manager();
+        let healer_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 20.0,
+            skill_names: vec![
+                "互帮互助".to_owned(),
+                "一心".to_owned(),
+                "振奋".to_owned(),
+                "千万回忆".to_owned(),
+            ],
+            skill_metadata: (0..4)
+                .map(|_| {
+                    crate::napcat::CharacterSkillMetadata::talent("support_talent", "辅助天赋")
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), healer_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let healer = participant_from_character("a", &healer_character, &manager);
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                active: true,
+                participants: vec![healer, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "无效治疗".to_owned(),
+            note: "主动使用对目标治疗10点生命值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let encounter = &store.encounters["battle"];
+        let healer = &encounter.participants[0];
+        let target = &encounter.participants[1];
+        assert!((healer.hp - 10.0).abs() < 0.0001);
+        assert!(healer.one_heart_target_id.is_none());
+        assert!(healer.inspiration_target_id.is_none());
+        assert!((target.healing_taken_this_turn - 0.0).abs() < 0.0001);
+        assert!(target.inspiration_sources.is_empty());
+        assert!(target.delayed_healing_ticks.is_empty());
+        assert!(encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("无效治疗，回复0点生命值")));
+    }
+
+    #[test]
     fn parsed_battle_one_heart_talent_stacks_same_target_healing_and_resets_on_switch() {
         let mut manager = empty_manager();
         let healer_character = PlayerCharacter {
@@ -11218,6 +11312,7 @@ mod tests {
             .iter()
             .any(|entry| entry.contains("触发振奋")));
 
+        store.encounters.get_mut("battle").unwrap().participants[1].hp = 10.0;
         assert!(store.record_skill_use("battle", "a", "b", &heal, &manager, None));
         assert_eq!(
             store.encounters["battle"].participants[1]
