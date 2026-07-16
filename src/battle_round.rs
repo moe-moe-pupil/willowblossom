@@ -928,7 +928,7 @@ fn apply_participant_damage_for_battle(
         participant.overhealing_shield_turns_remaining = 0;
     }
     let after_overhealing_shield = (incoming_amount - overhealing_absorbed).max(0.0);
-    let available_shield = participant.arcane_shield.max(0.0);
+    let available_shield = if encounter_active { participant.arcane_shield.max(0.0) } else { 0.0 };
     let absorbed = available_shield.min(after_overhealing_shield);
     participant.arcane_shield = available_shield - absorbed;
     let mut final_amount = (after_overhealing_shield - absorbed).max(0.0);
@@ -1954,7 +1954,7 @@ fn encounter_roster_ui(
             {
                 ui.small("敏锐待机");
             }
-            if participant.arcane_shield > f32::EPSILON {
+            if encounter.active && participant.arcane_shield > f32::EPSILON {
                 ui.small(format!(
                     "奥术护盾{}",
                     format_number(participant.arcane_shield)
@@ -8224,6 +8224,18 @@ mod tests {
             &mut encounter,
             false
         ));
+        let participant = &mut encounter.participants[0];
+        participant.hp = 20.0;
+        participant.alive = true;
+        participant.arcane_shield = 5.0;
+        participant.damage_taken_this_turn = 0.0;
+        participant.damage_contributors.clear();
+        let resolution = apply_participant_damage_for_battle(participant, 3.0, "enemy", false);
+        assert!((resolution.damage_applied - 3.0).abs() < 0.0001);
+        assert!((resolution.damage_absorbed - 0.0).abs() < 0.0001);
+        assert!((participant.hp - 17.0).abs() < 0.0001);
+        assert!((participant.arcane_shield - 0.0).abs() < 0.0001);
+
         encounter.participants[0].max_mp = 80.0;
         assert!(set_encounter_active_state(
             &mut encounter,

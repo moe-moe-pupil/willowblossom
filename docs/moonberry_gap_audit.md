@@ -73,6 +73,8 @@ Additional 2026-07-16 correction: `越战越勇` and `斗志昂扬` now use dedi
 
 Additional 2026-07-16 correction: `不死者之怒`'s +10% outgoing damage now checks the active encounter at every application point, not only through normal exit cleanup. A stale or migrated `undying_rage_active` flag in a resting encounter therefore cannot boost parsed skill damage or continuing buff-tick damage, while the same-round active-combat bonus remains unchanged. Focused verification passes with `cargo test --lib -j 1 undying_rage -- --nocapture` and `cargo test --lib -j 1 unit_instance_buff_ticks_damage_without_mutating_template -- --nocapture`: 1 passed in each command, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `奥术护盾` now checks the active encounter at damage application as well as at normal combat exit. Resting damage ignores and clears stale or migrated arcane shield values, the roster hides inactive arcane shield state, and entering combat still replaces any stale value with a fresh 10% maximum-MP shield. Ordinary `过度治疗` shielding remains usable outside this combat-only rule. Focused verification passes with `cargo test --lib -j 1 arcane_shield -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -366,7 +368,7 @@ Additional implemented talent execution: `液态躯体` now records active-comba
 
 Additional implemented talent execution: `敏锐` now records a parsed-battle once-per-battle dodge charge, spends it on the first positive range/non-targeted incoming skill damage, clears it during rest, and rearms it on battle re-entry while leaving ordinary single-target damage untouched.
 
-Additional implemented talent execution: `奥术护盾` now grants battle entrants 10% of maximum MP as encounter-local shielding, consumes it before HP damage across the shared battle damage path, clears it on battle exit, and replenishes it on battle re-entry.
+Additional implemented talent execution: `奥术护盾` now grants battle entrants 10% of maximum MP as encounter-local shielding, consumes it before HP damage across the shared active-battle damage path, clears it on battle exit, ignores/normalizes stale resting values, and replenishes it on battle re-entry.
 
 Additional implemented talent execution: `过度治疗` now converts battle overheal into one-round encounter-local shielding capped at 30% of the healed target's maximum HP across immediate and delayed healing paths.
 
