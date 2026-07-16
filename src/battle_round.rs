@@ -494,6 +494,8 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         for participant in &mut encounter.participants {
             participant.combat_damage_taken_total = 0.0;
             participant.damage_contributors.clear();
+            participant.arrogance_damage_source_ids.clear();
+            participant.endless_pain_stacks = 0;
             participant.infinite_focus_target_id = None;
             participant.infinite_focus_stacks = 0;
             participant.one_heart_target_id = None;
@@ -515,6 +517,8 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.keen_evasion_available = false;
             participant.undying_rage_active = false;
             participant.arcane_shield = 0.0;
+            participant.arrogance_damage_source_ids.clear();
+            participant.endless_pain_stacks = 0;
             participant.infinite_focus_target_id = None;
             participant.infinite_focus_stacks = 0;
             participant.one_heart_target_id = None;
@@ -954,8 +958,10 @@ fn apply_participant_damage_for_battle(
     }
     if was_alive {
         record_participant_damage_contributor(participant, source_id);
-        record_participant_arrogance_damage_source(participant, source_id);
-        record_participant_endless_pain_stack(participant);
+        if encounter_active {
+            record_participant_arrogance_damage_source(participant, source_id);
+            record_participant_endless_pain_stack(participant);
+        }
     }
     participant.hp = (participant.hp - final_amount).max(0.0);
     participant.alive = participant.hp > 0.0;
@@ -1896,7 +1902,8 @@ fn encounter_roster_ui(
                     participant.penance_kill_assist_count
                 ));
             }
-            if participant.arrogance_damage_bonus_per_source > f32::EPSILON
+            if encounter.active
+                && participant.arrogance_damage_bonus_per_source > f32::EPSILON
                 && !participant.arrogance_damage_source_ids.is_empty()
             {
                 ui.small(format!(
@@ -1904,7 +1911,8 @@ fn encounter_roster_ui(
                     participant.arrogance_damage_source_ids.len()
                 ));
             }
-            if participant.endless_pain_bonus_damage_per_stack > f32::EPSILON
+            if encounter.active
+                && participant.endless_pain_bonus_damage_per_stack > f32::EPSILON
                 && participant.endless_pain_stacks > 0
             {
                 ui.small(format!(
@@ -2782,10 +2790,14 @@ impl BattleRoundStore {
                         ));
                     }
                     let mut pending_actor_lifesteal = 0.0;
-                    let mut pending_endless_pain_bonus_damage = endless_pain_bonus_damage(
-                        actor_snapshot.endless_pain_bonus_damage_per_stack,
-                        actor_snapshot.endless_pain_stacks,
-                    );
+                    let mut pending_endless_pain_bonus_damage = if encounter.active {
+                        endless_pain_bonus_damage(
+                            actor_snapshot.endless_pain_bonus_damage_per_stack,
+                            actor_snapshot.endless_pain_stacks,
+                        )
+                    } else {
+                        0.0
+                    };
                     let mut consumed_endless_pain_stacks = 0_u32;
                     let mut infinite_focus_hit_target_id = None::<String>;
                     let damage_target_selector = target;
@@ -5021,13 +5033,18 @@ fn participant_damage_multiplier(
     } else {
         1.0
     };
-    participant.damage_dealt_modifier
-        * inspiration_multiplier
-        * participant_undying_rage_damage_multiplier(participant)
-        * arrogance_damage_dealt_multiplier(
+    let arrogance_multiplier = if encounter_active {
+        arrogance_damage_dealt_multiplier(
             participant.arrogance_damage_bonus_per_source,
             participant.arrogance_damage_source_ids.len() as u32,
         )
+    } else {
+        1.0
+    };
+    participant.damage_dealt_modifier
+        * inspiration_multiplier
+        * participant_undying_rage_damage_multiplier(participant)
+        * arrogance_multiplier
         * champion_damage_dealt_multiplier(
             participant.champion_damage_bonus_per_stack,
             participant.champion_stacks,
@@ -7488,6 +7505,63 @@ mod tests {
             .unwrap();
         assert!((target.hp - 87.0).abs() < 0.0001);
         assert!((target.damage_taken_this_turn - 13.0).abs() < 0.0001);
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            false
+        ));
+        let arrogant = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!(arrogant.arrogance_damage_source_ids.is_empty());
+
+        assert!(store.apply_action("battle", "e", "a", "休整试探", 1.0));
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        let arrogant = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!(arrogant.arrogance_damage_source_ids.is_empty());
+        arrogant.arrogance_damage_source_ids = vec!["b".to_owned(), "c".to_owned(), "d".to_owned()];
+        let target = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        target.hp = 100.0;
+        target.damage_taken_this_turn = 0.0;
+
+        assert!(store.record_skill_use("battle", "a", "target", &skill, &manager, None,));
+        let encounter = &store.encounters["battle"];
+        let arrogant = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        assert_eq!(
+            arrogant.arrogance_damage_source_ids.len(),
+            3
+        );
+        assert!((target.hp - 90.0).abs() < 0.0001);
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            true
+        ));
+        let arrogant = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!(arrogant.arrogance_damage_source_ids.is_empty());
     }
 
     #[test]
@@ -7574,6 +7648,60 @@ mod tests {
             .unwrap();
         assert!((target.hp - 68.0).abs() < 0.0001);
         assert!((target.damage_taken_this_turn - 32.0).abs() < 0.0001);
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            false
+        ));
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert_eq!(actor.endless_pain_stacks, 0);
+
+        assert!(store.apply_action("battle", "b", "a", "休整试探", 1.0));
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        let actor = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert_eq!(actor.endless_pain_stacks, 0);
+        actor.endless_pain_stacks = 2;
+        let target = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        target.hp = 100.0;
+        target.damage_taken_this_turn = 0.0;
+
+        assert!(store.record_skill_use("battle", "a", "target", &skill, &manager, None,));
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        assert_eq!(actor.endless_pain_stacks, 2);
+        assert!((target.hp - 90.0).abs() < 0.0001);
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            true
+        ));
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert_eq!(actor.endless_pain_stacks, 0);
     }
 
     #[test]

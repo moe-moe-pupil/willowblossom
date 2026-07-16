@@ -65,6 +65,8 @@ Additional 2026-07-16 correction: `一心` is now fully scoped to active combat.
 
 Additional 2026-07-16 correction: `无限专注` is now fully scoped to active combat. Resting attacks neither gain stacks nor receive a stale persisted focus bonus, combat exit clears the attacker's target/stacks, combat entry defensively clears migrated stale focus, and the roster hides inactive focus state. Active-combat same-target +10%/+20% escalation and target-switch reset remain unchanged. Focused verification passes with `cargo test --lib -j 1 infinite_focus -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `狂妄` and `无尽痛楚` are now fully scoped to active combat, matching their preserved “进入战斗轮” trigger. Resting damage cannot add unique-source or pain stacks, stale persisted state cannot boost resting attacks, combat exit and entry clear both states, and the roster hides them during rest. Their active-combat +10% per unique source (up to +30%) and next-hit `等级*1.5` untyped damage (up to two stacks) remain unchanged. Focused verification passes with `cargo test --lib -j 1 arrogance -- --nocapture` and `cargo test --lib -j 1 endless_pain -- --nocapture`: 1 passed in each command, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -336,9 +338,9 @@ These are present now, often as a Rust/Bevy redesign rather than a direct port:
 
    Additional implemented talent execution: `斗志昂扬` now reduces parsed-battle incoming skill damage by 50%, 10%, and 2% on the target's first, second, and third own turns.
 
-Additional implemented talent execution: `狂妄` now records unique parsed-battle damage sources and raises the actor's skill damage by 10% per source, capped at 30%.
+Additional implemented talent execution: `狂妄` now records unique active-combat damage sources and raises the actor's skill damage by 10% per source, capped at 30%; resting damage and combat boundaries cannot retain or apply those sources.
 
-Additional implemented talent execution: `无尽痛楚` now records parsed-battle successful damage-taken stacks and consumes up to two stacks on the actor's next positive skill hit, adding `等级*1.5` untyped damage per stack.
+Additional implemented talent execution: `无尽痛楚` now records active-combat successful damage-taken stacks and consumes up to two stacks on the actor's next positive active-combat skill hit, adding `等级*1.5` untyped damage per stack; resting damage and combat boundaries cannot retain or apply those stacks.
 
 Additional implemented talent execution: `无限专注` now tracks active-combat repeated single-target attacks against the same target and raises damage by 10% then 20%, resetting when the actor successfully hits a different single target or crosses a combat boundary. Resting attacks neither gain stacks nor receive a stale focus bonus.
 
