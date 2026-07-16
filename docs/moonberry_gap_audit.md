@@ -41,6 +41,8 @@ Additional 2026-07-16 update: `不死者之怒` approved-talent battle participa
 
 Additional 2026-07-16 update: battle damage now returns a shared typed resolution containing applied damage, absorbed damage, lethal outcome, and `不死者之怒` activation. Manual actions, parsed skills, delayed damage, and buff ticks log post-absorption damage. Parsed-skill `溃伤`, `禅宗古训`, `苏萨斯之爪`, and `无限专注` now require positive applied damage; `无尽痛楚` stacks remain when a shield absorbs the entire effect, but are consumed when `液态躯体` commits part of that bonus to delayed damage. Lifesteal and delayed physical follow-up scale from the applied physical share instead of the pre-shield amount. Focused verification passes with `cargo test --lib -j 1 shield_absorption_gates -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 389 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 update: `希望化身` approved-talent battle participants now transform on their first lethal post-shield hit, remain actionable at 0 HP, become immune to subsequent damage, and may use healing effects but not normal attacks or damaging skills. The encounter-local state persists across saves and expires at the second battle-round boundary after activation, forcing death and resolving the original damage contributors normally. The old Moonberry source stored this as description-only data; Willowblossom does not yet model channeled casts, so the described channel interruption has no executable state to cancel. Focused verification passes with `cargo test --lib -j 1 hope_avatar -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 390 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -341,6 +343,8 @@ Additional implemented talent execution: `过度治疗` now converts battle over
 Additional implemented talent execution: `不死者之怒` now provides one encounter-local lethal-hit negation, same-round damage immunity, and +10% outgoing damage, while hits above maximum HP bypass it.
 
 Battle damage resolution now distinguishes attempted, absorbed, and applied damage so shields/evasion do not falsely trigger successful-hit talent effects or inflate combat logs.
+
+`希望化身` now executes as a persisted lethal transformation with two-round damage immunity, healing-only actions, and forced expiry death; channel interruption remains pending until battle channeling itself is represented.
 
 6. Import/export is partial.
 

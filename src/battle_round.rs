@@ -55,6 +55,7 @@ use crate::{
         character_fighting_spirit_damage_taken_multiplier,
         character_gale_force_battle_speeds,
         character_healing_attribute_multiplier,
+        character_hope_avatar_available,
         character_infinite_focus_damage_bonus_per_stack,
         character_keen_evasion_available,
         character_large_hit_damage_taken_modifier,
@@ -289,6 +290,12 @@ pub struct BattleParticipantSnapshot {
     pub undying_rage_used: bool,
     #[serde(default)]
     pub undying_rage_active: bool,
+    #[serde(default)]
+    pub hope_avatar_enabled: bool,
+    #[serde(default)]
+    pub hope_avatar_used: bool,
+    #[serde(default)]
+    pub hope_avatar_rounds_remaining: u32,
     #[serde(default)]
     pub liquid_body_damage_delay_rate: f32,
     #[serde(default)]
@@ -609,6 +616,19 @@ fn participant_undying_rage_damage_multiplier(participant: &BattleParticipantSna
     }
 }
 
+fn participant_hope_avatar_active(participant: &BattleParticipantSnapshot) -> bool {
+    participant.hope_avatar_used && participant.hope_avatar_rounds_remaining > 0
+}
+
+fn skill_effects_are_hope_avatar_healing(effects: &[SkillEffect]) -> bool {
+    effects
+        .iter()
+        .any(|effect| matches!(effect, SkillEffect::Heal { .. }))
+        && !effects
+            .iter()
+            .any(|effect| matches!(effect, SkillEffect::Damage { .. }))
+}
+
 fn skill_damage_triggers_keen_evasion(target: TargetSelector, target_class: Option<&str>) -> bool {
     target.area.is_some()
         || skill_target_class_is_area(target_class)
@@ -682,6 +702,8 @@ struct BattleDamageResolution {
     damage_applied: f32,
     damage_absorbed: f32,
     undying_rage_triggered: bool,
+    hope_avatar_triggered: bool,
+    hope_avatar_immune: bool,
     defeat_outcome: Option<BattleDefeatOutcome>,
 }
 
@@ -706,6 +728,16 @@ fn apply_participant_damage_for_battle(
     source_id: &str,
 ) -> BattleDamageResolution {
     let incoming_amount = amount.max(0.0);
+    if participant_hope_avatar_active(participant) {
+        return BattleDamageResolution {
+            damage_applied: 0.0,
+            damage_absorbed: incoming_amount,
+            undying_rage_triggered: false,
+            hope_avatar_triggered: false,
+            hope_avatar_immune: true,
+            defeat_outcome: None,
+        };
+    }
     let available_overhealing_shield = participant.overhealing_shield.max(0.0);
     let overhealing_absorbed = available_overhealing_shield.min(incoming_amount);
     participant.overhealing_shield = available_overhealing_shield - overhealing_absorbed;
@@ -719,6 +751,7 @@ fn apply_participant_damage_for_battle(
     participant.arcane_shield = available_shield - absorbed;
     let mut final_amount = (after_overhealing_shield - absorbed).max(0.0);
     let mut undying_rage_triggered = false;
+    let mut hope_avatar_triggered = false;
     let within_undying_rage_limit =
         participant.max_hp > f32::EPSILON && final_amount <= participant.max_hp + f32::EPSILON;
     if participant.undying_rage_active && within_undying_rage_limit {
@@ -739,6 +772,8 @@ fn apply_participant_damage_for_battle(
             damage_applied: 0.0,
             damage_absorbed: incoming_amount,
             undying_rage_triggered,
+            hope_avatar_triggered,
+            hope_avatar_immune: false,
             defeat_outcome: None,
         };
     }
@@ -751,12 +786,45 @@ fn apply_participant_damage_for_battle(
     }
     participant.hp = (participant.hp - final_amount).max(0.0);
     participant.alive = participant.hp > 0.0;
+    if !participant.alive && participant.hope_avatar_enabled && !participant.hope_avatar_used {
+        participant.alive = true;
+        participant.hope_avatar_used = true;
+        participant.hope_avatar_rounds_remaining = 2;
+        hope_avatar_triggered = true;
+    }
     BattleDamageResolution {
         damage_applied: final_amount,
         damage_absorbed: (incoming_amount - final_amount).max(0.0),
         undying_rage_triggered,
+        hope_avatar_triggered,
+        hope_avatar_immune: false,
         defeat_outcome: participant_defeat_outcome(participant, was_alive),
     }
+}
+
+fn advance_participant_hope_avatar(
+    participant: &mut BattleParticipantSnapshot,
+) -> (
+    Option<String>,
+    Option<BattleDefeatOutcome>,
+) {
+    if !participant_hope_avatar_active(participant) {
+        return (None, None);
+    }
+    participant.hope_avatar_rounds_remaining -= 1;
+    if participant.hope_avatar_rounds_remaining > 0 {
+        return (None, None);
+    }
+    let was_alive = participant.alive;
+    participant.hp = 0.0;
+    participant.alive = false;
+    (
+        Some(format!(
+            "{}的希望化身结束，角色死亡",
+            participant.display_name
+        )),
+        participant_defeat_outcome(participant, was_alive),
+    )
 }
 
 fn apply_penance_kill_assists(
@@ -993,7 +1061,17 @@ fn advance_participant_delayed_damage_ticks(
             format_number(resolution.damage_applied),
             battle_damage_type_label(tick.damage_type)
         ));
-        if resolution.undying_rage_triggered {
+        if resolution.hope_avatar_triggered {
+            advance.logs.push(format!(
+                "{}触发希望化身，进入持续2回合的无敌天使形态",
+                display_name
+            ));
+        } else if resolution.hope_avatar_immune {
+            advance.logs.push(format!(
+                "{}处于希望化身，免疫本次伤害",
+                display_name
+            ));
+        } else if resolution.undying_rage_triggered {
             advance.logs.push(format!(
                 "{}触发不死者之怒，免疫本次致命伤害",
                 display_name
@@ -1219,6 +1297,9 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant.undying_rage_enabled.hash(&mut hasher);
             participant.undying_rage_used.hash(&mut hasher);
             participant.undying_rage_active.hash(&mut hasher);
+            participant.hope_avatar_enabled.hash(&mut hasher);
+            participant.hope_avatar_used.hash(&mut hasher);
+            participant.hope_avatar_rounds_remaining.hash(&mut hasher);
             participant
                 .liquid_body_damage_delay_rate
                 .to_bits()
@@ -1663,6 +1744,14 @@ fn encounter_roster_ui(
             } else if participant.undying_rage_enabled && participant.undying_rage_used {
                 ui.small("不死者之怒已触发");
             }
+            if participant_hope_avatar_active(participant) {
+                ui.small(format!(
+                    "希望化身：剩余{}回合",
+                    participant.hope_avatar_rounds_remaining
+                ));
+            } else if participant.hope_avatar_enabled && participant.hope_avatar_used {
+                ui.small("希望化身已结束");
+            }
             if participant.liquid_body_damage_delay_rate > f32::EPSILON
                 || participant.liquid_body_self_healing_rate > f32::EPSILON
             {
@@ -1932,7 +2021,13 @@ fn encounter_action_ui(
         });
         ui.label("伤害");
         ui.add(egui::DragValue::new(amount).speed(1.0).range(0.0..=9999.0));
-        if ui.button("普通攻击").clicked() {
+        if ui
+            .add_enabled(
+                !participant_hope_avatar_active(&actor),
+                egui::Button::new("普通攻击"),
+            )
+            .clicked()
+        {
             changed |= store.apply_action(
                 encounter_id,
                 &actor.target_id,
@@ -1997,7 +2092,15 @@ fn encounter_action_ui(
                 skill.cooldown_left,
             );
             let can_pay = actor.mp + f32::EPSILON >= skill.mp_cost.max(0.0);
-            let can_use = cooldown_remaining == 0 && can_pay;
+            let effects = static_skill_effects(
+                &skill.note,
+                &skill.arg_values,
+                skill.skill_type.as_deref(),
+                skill.legacy_buff_machine_json.as_deref(),
+            );
+            let hope_avatar_allows = !participant_hope_avatar_active(&actor)
+                || skill_effects_are_hope_avatar_healing(&effects);
+            let can_use = cooldown_remaining == 0 && can_pay && hope_avatar_allows;
             let response = ui.add_enabled(can_use, egui::Button::new("使用技能"));
             if response.clicked() {
                 changed |= store.record_skill_use_with_buffs(
@@ -2010,7 +2113,9 @@ fn encounter_action_ui(
                 );
                 changed |= store.finish_actor_action(encounter_id, &actor.target_id);
             }
-            if !can_pay {
+            if !hope_avatar_allows {
+                ui.small("希望化身期间只能释放治疗技能");
+            } else if !can_pay {
                 ui.small(format!(
                     "需要{} MP",
                     format_number(skill.mp_cost.max(0.0))
@@ -2092,6 +2197,14 @@ impl BattleRoundStore {
             advance_participant_overhealing_shield(participant);
             let previous_damage_taken = participant.damage_taken_this_turn;
             reset_participant_turn_totals(participant);
+            let (hope_log, hope_outcome) = advance_participant_hope_avatar(participant);
+            if let Some(log) = hope_log {
+                delayed_logs.push(log);
+                if let Some(outcome) = hope_outcome {
+                    defeat_outcomes.push(outcome);
+                }
+                continue;
+            }
             if let Some(log) =
                 apply_participant_liquid_body_healing(participant, previous_damage_taken)
             {
@@ -2194,12 +2307,24 @@ impl BattleRoundStore {
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
-        let actor_name = encounter
+        let (actor_name, actor_hope_avatar_active) = encounter
             .participants
             .iter()
             .find(|participant| participant.target_id == actor_id)
-            .map(|participant| participant.display_name.clone())
-            .unwrap_or_else(|| actor_id.to_owned());
+            .map(|participant| {
+                (
+                    participant.display_name.clone(),
+                    participant_hope_avatar_active(participant),
+                )
+            })
+            .unwrap_or_else(|| (actor_id.to_owned(), false));
+        if actor_hope_avatar_active {
+            encounter.action_log.push(format!(
+                "{}处于希望化身，只能释放治疗技能",
+                actor_name
+            ));
+            return false;
+        }
         let Some(target) = encounter
             .participants
             .iter_mut()
@@ -2217,7 +2342,17 @@ impl BattleRoundStore {
             action_name,
             format_number(resolution.damage_applied)
         ));
-        if resolution.undying_rage_triggered {
+        if resolution.hope_avatar_triggered {
+            encounter.action_log.push(format!(
+                "{}触发希望化身，进入持续2回合的无敌天使形态",
+                target_display_name
+            ));
+        } else if resolution.hope_avatar_immune {
+            encounter.action_log.push(format!(
+                "{}处于希望化身，免疫本次伤害",
+                target_display_name
+            ));
+        } else if resolution.undying_rage_triggered {
             encounter.action_log.push(format!(
                 "{}触发不死者之怒，免疫本次致命伤害",
                 target_display_name
@@ -2257,6 +2392,12 @@ impl BattleRoundStore {
             return false;
         };
         let actor_character = character_for_participant(&actor_snapshot, manager);
+        let effects = static_skill_effects(
+            &skill.note,
+            &skill.arg_values,
+            skill.skill_type.as_deref(),
+            skill.legacy_buff_machine_json.as_deref(),
+        );
         let actor_damage_dealt_buffs = actor_character
             .as_ref()
             .map(|character| character_damage_dealt_talent_buffs(character, actor_id))
@@ -2280,6 +2421,15 @@ impl BattleRoundStore {
             .find(|participant| participant.target_id == target_id)
             .map(|participant| participant.display_name.clone())
             .unwrap_or_else(|| target_id.to_owned());
+        if participant_hope_avatar_active(&actor_snapshot)
+            && !skill_effects_are_hope_avatar_healing(&effects)
+        {
+            encounter.action_log.push(format!(
+                "{}处于希望化身，只能释放治疗技能",
+                actor_name
+            ));
+            return false;
+        }
         let Some(actor) = encounter
             .participants
             .iter_mut()
@@ -2316,12 +2466,6 @@ impl BattleRoundStore {
             actor.turn.saturating_add(1),
         );
 
-        let effects = static_skill_effects(
-            &skill.note,
-            &skill.arg_values,
-            skill.skill_type.as_deref(),
-            skill.legacy_buff_machine_json.as_deref(),
-        );
         if effects.is_empty() {
             let note = skill.note.trim();
             if note.is_empty() {
@@ -2487,7 +2631,11 @@ impl BattleRoundStore {
                             0.0
                         };
                         let (final_amount, delayed_liquid_body_damage) =
-                            participant_liquid_body_split_damage(target, resolved_amount);
+                            if participant_hope_avatar_active(target) {
+                                (resolved_amount, 0.0)
+                            } else {
+                                participant_liquid_body_split_damage(target, resolved_amount)
+                            };
                         let target_display_name = target.display_name.clone();
                         if delayed_liquid_body_damage > f32::EPSILON {
                             schedule_participant_delayed_damage(
@@ -2554,7 +2702,17 @@ impl BattleRoundStore {
                                 format_number(delayed_liquid_body_damage)
                             ));
                         }
-                        if resolution.undying_rage_triggered {
+                        if resolution.hope_avatar_triggered {
+                            encounter.action_log.push(format!(
+                                "{}触发希望化身，进入持续2回合的无敌天使形态",
+                                target_display_name
+                            ));
+                        } else if resolution.hope_avatar_immune {
+                            encounter.action_log.push(format!(
+                                "{}处于希望化身，免疫本次伤害",
+                                target_display_name
+                            ));
+                        } else if resolution.undying_rage_triggered {
                             encounter.action_log.push(format!(
                                 "{}触发不死者之怒，免疫本次致命伤害",
                                 target_display_name
@@ -2988,6 +3146,7 @@ impl BattleRoundStore {
             participant.hp = participant.max_hp;
             participant.mp = participant.max_mp;
             participant.alive = true;
+            participant.hope_avatar_rounds_remaining = 0;
         } else if participant.alive {
             if !encounter.active {
                 participant.hp = (participant.hp + participant.hp_regen).min(participant.max_hp);
@@ -2999,17 +3158,24 @@ impl BattleRoundStore {
         participant.undying_rage_active = false;
         advance_participant_overhealing_shield(participant);
         let mut delayed_logs = Vec::new();
-        if let Some(log) = apply_participant_liquid_body_healing(participant, previous_damage_taken)
-        {
+        let (hope_log, hope_outcome) = advance_participant_hope_avatar(participant);
+        let mut defeat_outcomes = hope_outcome.into_iter().collect::<Vec<_>>();
+        if let Some(log) = hope_log {
             delayed_logs.push(log);
+        } else {
+            if let Some(log) =
+                apply_participant_liquid_body_healing(participant, previous_damage_taken)
+            {
+                delayed_logs.push(log);
+            }
+            if participant.wound_healing_taken_turns > 0 {
+                participant.wound_healing_taken_turns -= 1;
+            }
+            let delayed = advance_participant_delayed_damage_ticks(participant);
+            delayed_logs.extend(delayed.logs);
+            defeat_outcomes.extend(delayed.defeat_outcomes);
+            delayed_logs.extend(advance_participant_delayed_healing_ticks(participant));
         }
-        if participant.wound_healing_taken_turns > 0 {
-            participant.wound_healing_taken_turns -= 1;
-        }
-        let delayed = advance_participant_delayed_damage_ticks(participant);
-        delayed_logs.extend(delayed.logs);
-        let defeat_outcomes = delayed.defeat_outcomes;
-        delayed_logs.extend(advance_participant_delayed_healing_ticks(participant));
         participant.turn += 1;
         participant.pending_negative = false;
         encounter.round = encounter
@@ -3373,7 +3539,17 @@ fn apply_battle_buff_ticks(
                     target_name,
                     format_number(resolution.damage_applied)
                 ));
-                if resolution.undying_rage_triggered {
+                if resolution.hope_avatar_triggered {
+                    encounter.action_log.push(format!(
+                        "{}触发希望化身，进入持续2回合的无敌天使形态",
+                        target_name
+                    ));
+                } else if resolution.hope_avatar_immune {
+                    encounter.action_log.push(format!(
+                        "{}处于希望化身，免疫本次伤害",
+                        target_name
+                    ));
+                } else if resolution.undying_rage_triggered {
                     encounter.action_log.push(format!(
                         "{}触发不死者之怒，免疫本次致命伤害",
                         target_name
@@ -3402,7 +3578,17 @@ fn apply_battle_buff_ticks(
                     target_name,
                     format_number(resolution.damage_applied)
                 ));
-                if resolution.undying_rage_triggered {
+                if resolution.hope_avatar_triggered {
+                    encounter.action_log.push(format!(
+                        "{}触发希望化身，进入持续2回合的无敌天使形态",
+                        target_name
+                    ));
+                } else if resolution.hope_avatar_immune {
+                    encounter.action_log.push(format!(
+                        "{}处于希望化身，免疫本次伤害",
+                        target_name
+                    ));
+                } else if resolution.undying_rage_triggered {
                     encounter.action_log.push(format!(
                         "{}触发不死者之怒，免疫本次致命伤害",
                         target_name
@@ -3581,6 +3767,9 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant.undying_rage_enabled.hash(&mut hasher);
         participant.undying_rage_used.hash(&mut hasher);
         participant.undying_rage_active.hash(&mut hasher);
+        participant.hope_avatar_enabled.hash(&mut hasher);
+        participant.hope_avatar_used.hash(&mut hasher);
+        participant.hope_avatar_rounds_remaining.hash(&mut hasher);
         participant
             .liquid_body_damage_delay_rate
             .to_bits()
@@ -3721,6 +3910,9 @@ fn participant_from_character(
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
+        hope_avatar_enabled: character_hope_avatar_available(character),
+        hope_avatar_used: false,
+        hope_avatar_rounds_remaining: 0,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
@@ -3805,6 +3997,9 @@ fn participant_from_unit_template(
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
+        hope_avatar_enabled: character_hope_avatar_available(character),
+        hope_avatar_used: false,
+        hope_avatar_rounds_remaining: 0,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         champion_damage_bonus_per_stack: character_champion_damage_bonus_per_stack(character),
@@ -3885,6 +4080,9 @@ fn participant_from_target(
         undying_rage_enabled: false,
         undying_rage_used: false,
         undying_rage_active: false,
+        hope_avatar_enabled: false,
+        hope_avatar_used: false,
+        hope_avatar_rounds_remaining: 0,
         liquid_body_damage_delay_rate: 0.0,
         liquid_body_self_healing_rate: 0.0,
         champion_damage_bonus_per_stack: 0.0,
@@ -3963,6 +4161,7 @@ fn sync_participant_from_manager(
                 participant,
                 character_undying_rage_available(&character),
             );
+            participant.hope_avatar_enabled = character_hope_avatar_available(&character);
             participant.liquid_body_damage_delay_rate =
                 character_liquid_body_damage_delay_rate(&character);
             participant.liquid_body_self_healing_rate =
@@ -3990,7 +4189,7 @@ fn sync_participant_from_manager(
                 character_penance_healing_bonus_percent(&character);
             participant.hp = character.hp.clamp(0.0, participant.max_hp.max(0.0));
             participant.mp = character.mp.clamp(0.0, participant.max_mp.max(0.0));
-            participant.alive = participant.hp > 0.0;
+            participant.alive = participant.hp > 0.0 || participant_hope_avatar_active(participant);
             character.hp = participant.hp;
             character.mp = participant.mp;
             character.damage_taken_this_turn = participant.damage_taken_this_turn;
@@ -4042,6 +4241,7 @@ fn sync_participant_from_manager(
             participant,
             character_undying_rage_available(character),
         );
+        participant.hope_avatar_enabled = character_hope_avatar_available(character);
         participant.liquid_body_damage_delay_rate =
             character_liquid_body_damage_delay_rate(character);
         participant.liquid_body_self_healing_rate =
@@ -4069,7 +4269,7 @@ fn sync_participant_from_manager(
             character_penance_healing_bonus_percent(character);
         participant.hp = participant.hp.min(participant.max_hp);
         participant.mp = participant.mp.min(participant.max_mp);
-        participant.alive = participant.hp > 0.0;
+        participant.alive = participant.hp > 0.0 || participant_hope_avatar_active(participant);
     } else {
         participant.player_character = false;
         participant.low_survivor_speed = participant.speed.max(0.0);
@@ -4080,6 +4280,7 @@ fn sync_participant_from_manager(
         sync_participant_keen_evasion(participant, false);
         participant.overhealing_shield_cap_rate = 0.0;
         sync_participant_undying_rage(participant, false);
+        participant.hope_avatar_enabled = false;
         participant.liquid_body_damage_delay_rate = 0.0;
         participant.liquid_body_self_healing_rate = 0.0;
         participant.champion_damage_bonus_per_stack = 0.0;
@@ -4113,7 +4314,7 @@ fn sync_participant_from_manager_with_vitals(
     if let Some((hp, mp)) = vitals {
         participant.hp = hp.clamp(0.0, participant.max_hp.max(0.0));
         participant.mp = mp.clamp(0.0, participant.max_mp.max(0.0));
-        participant.alive = participant.hp > 0.0;
+        participant.alive = participant.hp > 0.0 || participant_hope_avatar_active(participant);
     }
 }
 
@@ -4222,7 +4423,7 @@ fn normalize_encounter_after_edit(encounter: &mut BattleEncounter) {
         participant.mp = participant.mp.clamp(0.0, participant.max_mp);
         participant.damage_taken_this_turn = participant.damage_taken_this_turn.max(0.0);
         participant.healing_taken_this_turn = participant.healing_taken_this_turn.max(0.0);
-        if participant.hp <= 0.0 {
+        if participant.hp <= 0.0 && !participant_hope_avatar_active(participant) {
             participant.alive = false;
         }
     }
@@ -5099,6 +5300,9 @@ mod area_tests {
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,
+            hope_avatar_enabled: false,
+            hope_avatar_used: false,
+            hope_avatar_rounds_remaining: 0,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             champion_damage_bonus_per_stack: 0.0,
@@ -5194,6 +5398,9 @@ mod tests {
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,
+            hope_avatar_enabled: false,
+            hope_avatar_used: false,
+            hope_avatar_rounds_remaining: 0,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             champion_damage_bonus_per_stack: 0.0,
@@ -7369,6 +7576,166 @@ mod tests {
         assert!(resolution.defeat_outcome.is_some());
         assert!(!oversized.alive);
         assert!(!oversized.undying_rage_used);
+    }
+
+    #[test]
+    fn parsed_battle_hope_avatar_survives_two_rounds_for_healing_then_dies() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            mp: 20.0,
+            max_mp: 20.0,
+            damage_dealt_modifier: 1.0,
+            damage_taken_modifier: 1.0,
+            healing_dealt_modifier: 1.0,
+            healing_taken_modifier: 1.0,
+            skill_names: vec!["希望化身".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        let actor = participant_from_character("a", &actor_character, &manager);
+        let mut target = participant("b", 0);
+        target.hp = 5.0;
+        target.max_hp = 20.0;
+        let enemy = participant("enemy", 0);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, target, enemy],
+                ..Default::default()
+            });
+
+        assert!(store.apply_action("battle", "enemy", "a", "致命攻击", 10.0));
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!((actor.hp - 0.0).abs() < 0.0001);
+        assert!(actor.alive);
+        assert!(actor.hope_avatar_used);
+        assert_eq!(actor.hope_avatar_rounds_remaining, 2);
+        assert!(store.encounters["battle"]
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("触发希望化身")));
+        let restored: BattleParticipantSnapshot =
+            serde_json::from_str(&serde_json::to_string(actor).unwrap()).unwrap();
+        assert!(restored.hope_avatar_used);
+        assert_eq!(restored.hope_avatar_rounds_remaining, 2);
+
+        assert!(!store.apply_action("battle", "a", "enemy", "普通攻击", 5.0));
+        let damage = CharacterSkill {
+            index: 0,
+            name: "天使之怒".to_owned(),
+            note: "主动使用对目标造成5点魔法伤害".to_owned(),
+            skill_type: Some("法术".to_owned()),
+            legacy_buff_machine_json: None,
+            mp_cost: 5.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        assert!(!store.record_skill_use("battle", "a", "enemy", &damage, &manager, None));
+        let heal = CharacterSkill {
+            index: 1,
+            name: "希望治愈".to_owned(),
+            note: "主动使用对目标恢复10点生命值".to_owned(),
+            skill_type: Some("法术".to_owned()),
+            legacy_buff_machine_json: None,
+            mp_cost: 5.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        assert!(store.record_skill_use("battle", "a", "b", &heal, &manager, None));
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((actor.mp - 15.0).abs() < 0.0001);
+        assert!((target.hp - 15.0).abs() < 0.0001);
+
+        store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap()
+            .liquid_body_damage_delay_rate = 0.5;
+        let immune_damage = CharacterSkill {
+            name: "追击".to_owned(),
+            note: "主动使用对目标造成999点物理伤害".to_owned(),
+            mp_cost: 0.0,
+            ..damage.clone()
+        };
+        assert!(store.record_skill_use(
+            "battle",
+            "enemy",
+            "a",
+            &immune_damage,
+            &manager,
+            None,
+        ));
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!((actor.hp - 0.0).abs() < 0.0001);
+        assert!(actor.alive);
+        assert!(actor.delayed_damage_ticks.is_empty());
+        assert!(store.encounters["battle"]
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("处于希望化身，免疫本次伤害")));
+
+        assert!(store.next_round("battle"));
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!(actor.alive);
+        assert_eq!(actor.hope_avatar_rounds_remaining, 1);
+
+        assert!(store.next_round("battle"));
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!(!actor.alive);
+        assert!((actor.hp - 0.0).abs() < 0.0001);
+        assert_eq!(actor.hope_avatar_rounds_remaining, 0);
+        assert!(store.encounters["battle"]
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("希望化身结束，角色死亡")));
     }
 
     #[test]
