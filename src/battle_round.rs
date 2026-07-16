@@ -1334,6 +1334,9 @@ fn advance_participant_delayed_healing_ticks(
             true
         }
     });
+    if !participant.alive {
+        return Vec::new();
+    }
     let mut logs = Vec::new();
     for tick in due {
         let final_amount = tick.amount.max(0.0);
@@ -3996,6 +3999,9 @@ fn apply_battle_buff_ticks(
                 }
             },
             BuffTickAction::Heal { amount } => {
+                if !encounter.participants[target_index].alive {
+                    continue;
+                }
                 let stat_config = manager.character_stat_config_for_target(&tick.source_id);
                 let source_multiplier = source_character
                     .as_ref()
@@ -9253,6 +9259,68 @@ mod tests {
         assert_eq!(
             target.overhealing_shield_turns_remaining,
             2
+        );
+    }
+
+    #[test]
+    fn background_healing_does_not_revive_defeated_participants() {
+        let manager = empty_manager();
+        let source = participant("source", 0);
+        let mut target = participant("target", 0);
+        target.hp = 0.0;
+        target.alive = false;
+        schedule_participant_delayed_healing(
+            &mut target,
+            "source",
+            "healer",
+            "延迟治疗",
+            10.0,
+            0.0,
+            1,
+        );
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![source, target],
+                ..Default::default()
+            });
+
+        assert!(store.next_round("battle"));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        assert_eq!(target.hp, 0.0);
+        assert!(!target.alive);
+        assert!(target.delayed_healing_ticks.is_empty());
+        assert!(!store.encounters["battle"]
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("延迟治疗")));
+
+        let log_count = store.encounters["battle"].action_log.len();
+        apply_battle_buff_ticks(
+            store.encounters.get_mut("battle").unwrap(),
+            &manager,
+            &[BattleBuffTick {
+                source_id: "source".to_owned(),
+                target_id: "target".to_owned(),
+                action: BuffTickAction::Heal { amount: 5.0 },
+            }],
+        );
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        assert_eq!(target.hp, 0.0);
+        assert!(!target.alive);
+        assert_eq!(
+            store.encounters["battle"].action_log.len(),
+            log_count
         );
     }
 
