@@ -494,6 +494,8 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         for participant in &mut encounter.participants {
             participant.combat_damage_taken_total = 0.0;
             participant.damage_contributors.clear();
+            participant.infinite_focus_target_id = None;
+            participant.infinite_focus_stacks = 0;
             participant.one_heart_target_id = None;
             participant.one_heart_stacks = 0;
             participant.inspiration_target_id = None;
@@ -513,6 +515,8 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.keen_evasion_available = false;
             participant.undying_rage_active = false;
             participant.arcane_shield = 0.0;
+            participant.infinite_focus_target_id = None;
+            participant.infinite_focus_stacks = 0;
             participant.one_heart_target_id = None;
             participant.one_heart_stacks = 0;
             participant.inspiration_target_id = None;
@@ -1908,7 +1912,8 @@ fn encounter_roster_ui(
                     participant.endless_pain_stacks
                 ));
             }
-            if participant.infinite_focus_damage_bonus_per_stack > f32::EPSILON
+            if encounter.active
+                && participant.infinite_focus_damage_bonus_per_stack > f32::EPSILON
                 && participant.infinite_focus_stacks > 0
             {
                 ui.small(format!(
@@ -2760,12 +2765,16 @@ impl BattleRoundStore {
                             skill.target_class.as_deref(),
                         ),
                     );
-                    let infinite_focus_target_id = infinite_focus_eligible_target_id(
-                        target,
-                        actor_id,
-                        &target_ids,
-                        skill.target_class.as_deref(),
-                    );
+                    let infinite_focus_target_id = if encounter.active {
+                        infinite_focus_eligible_target_id(
+                            target,
+                            actor_id,
+                            &target_ids,
+                            skill.target_class.as_deref(),
+                        )
+                    } else {
+                        None
+                    };
                     if target_ids.is_empty() {
                         encounter.action_log.push(format!(
                             "{}使用{}，但范围内没有目标",
@@ -8736,6 +8745,59 @@ mod tests {
         );
         assert_eq!(actor.infinite_focus_stacks, 1);
         assert!((target_c.hp - 90.0).abs() < 0.0001);
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            false
+        ));
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert_eq!(actor.infinite_focus_target_id, None);
+        assert_eq!(actor.infinite_focus_stacks, 0);
+
+        let actor = store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        actor.infinite_focus_target_id = Some("c".to_owned());
+        actor.infinite_focus_stacks = 2;
+        assert!(store.record_skill_use("battle", "a", "c", &skill, &manager, None,));
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target_c = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert_eq!(
+            actor.infinite_focus_target_id.as_deref(),
+            Some("c")
+        );
+        assert_eq!(actor.infinite_focus_stacks, 2);
+        assert!((target_c.hp - 80.0).abs() < 0.0001);
+
+        assert!(set_encounter_active_state(
+            store.encounters.get_mut("battle").unwrap(),
+            true
+        ));
+        let actor = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert_eq!(actor.infinite_focus_target_id, None);
+        assert_eq!(actor.infinite_focus_stacks, 0);
     }
 
     #[test]

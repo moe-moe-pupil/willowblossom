@@ -63,6 +63,8 @@ Additional 2026-07-16 correction: `振奋` is now fully scoped to active combat.
 
 Additional 2026-07-16 correction: `一心` is now fully scoped to active combat. Resting healing neither gains stacks nor receives a stale persisted focus bonus, combat exit clears the healer's target/stacks, and combat entry defensively clears migrated stale focus. Active-combat same-target stacking, the +25% cap, and target-switch reset remain unchanged. Focused verification passes with `cargo test --lib -j 1 one_heart -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `无限专注` is now fully scoped to active combat. Resting attacks neither gain stacks nor receive a stale persisted focus bonus, combat exit clears the attacker's target/stacks, combat entry defensively clears migrated stale focus, and the roster hides inactive focus state. Active-combat same-target +10%/+20% escalation and target-switch reset remain unchanged. Focused verification passes with `cargo test --lib -j 1 infinite_focus -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -338,7 +340,7 @@ Additional implemented talent execution: `狂妄` now records unique parsed-batt
 
 Additional implemented talent execution: `无尽痛楚` now records parsed-battle successful damage-taken stacks and consumes up to two stacks on the actor's next positive skill hit, adding `等级*1.5` untyped damage per stack.
 
-Additional implemented talent execution: `无限专注` now tracks parsed-battle repeated single-target attacks against the same target and raises damage by 10% then 20%, resetting when the actor successfully hits a different single target.
+Additional implemented talent execution: `无限专注` now tracks active-combat repeated single-target attacks against the same target and raises damage by 10% then 20%, resetting when the actor successfully hits a different single target or crosses a combat boundary. Resting attacks neither gain stacks nor receive a stale focus bonus.
 
 Additional implemented talent execution: `总冠军` now tracks parsed-battle player-character eliminations and grants the talent holder +2% damage dealt and -1% incoming damage per stack.
 
