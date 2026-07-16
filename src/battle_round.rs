@@ -496,15 +496,31 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.keen_evasion_available = participant.keen_evasion_enabled;
             participant.undying_rage_used = false;
             participant.undying_rage_active = false;
+            participant.hope_avatar_used = false;
+            participant.hope_avatar_rounds_remaining = 0;
             participant.arcane_shield =
                 participant.max_mp.max(0.0) * participant.arcane_shield_rate.max(0.0);
         }
     } else {
         let mut logs = Vec::new();
+        let mut defeat_outcomes = Vec::new();
         for participant in &mut encounter.participants {
             participant.keen_evasion_available = false;
             participant.undying_rage_active = false;
             participant.arcane_shield = 0.0;
+            if participant_hope_avatar_active(participant) {
+                let was_alive = participant.alive;
+                participant.hp = 0.0;
+                participant.alive = false;
+                participant.hope_avatar_rounds_remaining = 0;
+                logs.push(format!(
+                    "{}的希望化身随战斗结束，角色死亡",
+                    participant.display_name
+                ));
+                if let Some(outcome) = participant_defeat_outcome(participant, was_alive) {
+                    defeat_outcomes.push(outcome);
+                }
+            }
             let healing = participant.combat_damage_taken_total.max(0.0)
                 * participant.calm_heart_healing_rate.max(0.0);
             participant.combat_damage_taken_total = 0.0;
@@ -520,6 +536,9 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             ));
         }
         encounter.action_log.extend(logs);
+        for outcome in defeat_outcomes {
+            apply_battle_defeat_outcome(encounter, outcome);
+        }
     }
     encounter.active = active;
     true
@@ -862,7 +881,7 @@ fn apply_participant_damage_for_battle(
     encounter_active: bool,
 ) -> BattleDamageResolution {
     let incoming_amount = amount.max(0.0);
-    if participant_hope_avatar_active(participant) {
+    if encounter_active && participant_hope_avatar_active(participant) {
         return BattleDamageResolution {
             damage_applied: 0.0,
             damage_absorbed: incoming_amount,
@@ -924,7 +943,11 @@ fn apply_participant_damage_for_battle(
     }
     participant.hp = (participant.hp - final_amount).max(0.0);
     participant.alive = participant.hp > 0.0;
-    if !participant.alive && participant.hope_avatar_enabled && !participant.hope_avatar_used {
+    if encounter_active
+        && !participant.alive
+        && participant.hope_avatar_enabled
+        && !participant.hope_avatar_used
+    {
         participant.alive = true;
         participant.hope_avatar_used = true;
         participant.hope_avatar_rounds_remaining = 2;
@@ -1913,12 +1936,15 @@ fn encounter_roster_ui(
                     ui.small("不死者之怒已触发");
                 }
             }
-            if participant_hope_avatar_active(participant) {
+            if encounter.active && participant_hope_avatar_active(participant) {
                 ui.small(format!(
                     "希望化身：剩余{}回合",
                     participant.hope_avatar_rounds_remaining
                 ));
-            } else if participant.hope_avatar_enabled && participant.hope_avatar_used {
+            } else if encounter.active
+                && participant.hope_avatar_enabled
+                && participant.hope_avatar_used
+            {
                 ui.small("希望化身已结束");
             }
             if participant.liquid_body_damage_delay_rate > f32::EPSILON
@@ -2139,6 +2165,7 @@ fn encounter_action_ui(
         return changed;
     };
     let actor = encounter.participants[actor_index].clone();
+    let encounter_active = encounter.active;
     let target_options = encounter
         .participants
         .iter()
@@ -2202,7 +2229,7 @@ fn encounter_action_ui(
         ui.add(egui::DragValue::new(amount).speed(1.0).range(0.0..=9999.0));
         if ui
             .add_enabled(
-                !participant_hope_avatar_active(&actor),
+                !encounter_active || !participant_hope_avatar_active(&actor),
                 egui::Button::new("普通攻击"),
             )
             .clicked()
@@ -2277,7 +2304,8 @@ fn encounter_action_ui(
                 skill.skill_type.as_deref(),
                 skill.legacy_buff_machine_json.as_deref(),
             );
-            let hope_avatar_allows = !participant_hope_avatar_active(&actor)
+            let hope_avatar_allows = !encounter_active
+                || !participant_hope_avatar_active(&actor)
                 || skill_effects_are_hope_avatar_healing(&effects);
             let can_use = cooldown_remaining == 0 && can_pay && hope_avatar_allows;
             let response = ui.add_enabled(can_use, egui::Button::new("使用技能"));
@@ -2497,7 +2525,7 @@ impl BattleRoundStore {
             .map(|participant| {
                 (
                     participant.display_name.clone(),
-                    participant_hope_avatar_active(participant),
+                    encounter.active && participant_hope_avatar_active(participant),
                 )
             })
             .unwrap_or_else(|| (actor_id.to_owned(), false));
@@ -2609,7 +2637,8 @@ impl BattleRoundStore {
             .find(|participant| participant.target_id == target_id)
             .map(|participant| participant.display_name.clone())
             .unwrap_or_else(|| target_id.to_owned());
-        if participant_hope_avatar_active(&actor_snapshot)
+        if encounter.active
+            && participant_hope_avatar_active(&actor_snapshot)
             && !skill_effects_are_hope_avatar_healing(&effects)
         {
             encounter.action_log.push(format!(
@@ -8202,6 +8231,64 @@ mod tests {
             .action_log
             .iter()
             .any(|entry| entry.contains("希望化身结束，角色死亡")));
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, false
+        ));
+        let actor = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        actor.hp = 10.0;
+        actor.alive = true;
+        actor.hope_avatar_used = false;
+        assert!(store.apply_action(
+            "battle",
+            "enemy",
+            "a",
+            "休整致命攻击",
+            10.0
+        ));
+        let actor = &store.encounters["battle"].participants[0];
+        assert!(!actor.alive);
+        assert!(!actor.hope_avatar_used);
+        assert_eq!(actor.hope_avatar_rounds_remaining, 0);
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        let actor = &mut encounter.participants[0];
+        actor.hp = 10.0;
+        actor.alive = true;
+        actor.hope_avatar_used = true;
+        assert!(set_encounter_active_state(
+            encounter, true
+        ));
+        assert!(!encounter.participants[0].hope_avatar_used);
+        assert!(store.apply_action(
+            "battle",
+            "enemy",
+            "a",
+            "新战斗致命攻击",
+            10.0
+        ));
+        let actor = &store.encounters["battle"].participants[0];
+        assert!(actor.alive);
+        assert!(actor.hope_avatar_used);
+        assert_eq!(actor.hope_avatar_rounds_remaining, 2);
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, false
+        ));
+        let actor = &encounter.participants[0];
+        assert!(!actor.alive);
+        assert!((actor.hp - 0.0).abs() < 0.0001);
+        assert_eq!(actor.hope_avatar_rounds_remaining, 0);
+        assert!(encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("希望化身随战斗结束，角色死亡")));
     }
 
     #[test]

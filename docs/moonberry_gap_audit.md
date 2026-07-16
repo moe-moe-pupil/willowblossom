@@ -55,6 +55,8 @@ Additional 2026-07-16 correction: `敏锐`'s persisted dodge charge now follows 
 
 Additional 2026-07-16 correction: `不死者之怒` now obeys its documented encounter-local lifecycle. Resting encounters cannot trigger or preserve the lethal-hit immunity, leaving combat clears the same-round damage bonus, and entering a later combat resets the consumed flag so the holder receives one fresh charge. Repeated lethal hits within the same combat remain limited to the original single activation. Focused verification passes with `cargo test --lib -j 1 undying_rage -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 392 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `希望化身` now obeys the active encounter boundary. Lethal damage during rest cannot activate the avatar, its immunity and healing-only action restriction apply only during active combat, entering a later combat resets prior consumption, and ending combat while the avatar is active immediately performs its promised death and normal defeat-contributor handling rather than leaving an immortal 0-HP resting participant. Focused verification passes with `cargo test --lib -j 1 hope_avatar -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 392 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -356,7 +358,7 @@ Additional implemented talent execution: `不死者之怒` now provides one acti
 
 Battle damage resolution now distinguishes attempted, absorbed, and applied damage so shields/evasion do not falsely trigger successful-hit talent effects or inflate combat logs.
 
-`希望化身` now executes as a persisted lethal transformation with two-round damage immunity, healing-only actions, and forced expiry death; channel interruption remains pending until battle channeling itself is represented.
+`希望化身` now executes as a persisted active-combat lethal transformation with two-round damage immunity, healing-only actions, forced expiry or battle-exit death, and fresh eligibility on later combat entry; channel interruption remains pending until battle channeling itself is represented.
 
 `振奋` now executes for positive single-target battle healing with one-target transfer, non-stacking +10% speed/damage, and global-round expiry.
 
