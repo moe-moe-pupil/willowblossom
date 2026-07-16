@@ -506,6 +506,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         encounter.combat_completed_turns = 0;
         let mut logs = Vec::new();
         for participant in &mut encounter.participants {
+            clear_participant_dominion_bonus(participant);
             participant.combat_turns_completed = 0;
             participant.combat_damage_taken_total = 0.0;
             participant.damage_contributors.clear();
@@ -534,6 +535,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         let mut logs = Vec::new();
         let mut defeat_outcomes = Vec::new();
         for participant in &mut encounter.participants {
+            clear_participant_dominion_bonus(participant);
             participant.combat_turns_completed = 0;
             participant.keen_evasion_available = false;
             participant.undying_rage_active = false;
@@ -574,6 +576,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             ));
         }
         encounter.action_log.extend(logs);
+        encounter.active = false;
         for outcome in defeat_outcomes {
             apply_battle_defeat_outcome(encounter, outcome);
         }
@@ -583,6 +586,16 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
     }
     encounter.active = active;
     true
+}
+
+fn clear_participant_dominion_bonus(participant: &mut BattleParticipantSnapshot) {
+    let bonus = participant.dominion_max_hp_bonus.max(0.0);
+    if bonus <= f32::EPSILON {
+        return;
+    }
+    participant.max_hp = (participant.max_hp - bonus).max(0.0);
+    participant.hp = participant.hp.min(participant.max_hp);
+    participant.dominion_max_hp_bonus = 0.0;
 }
 
 fn advance_participant_rest_then_fight(participant: &mut BattleParticipantSnapshot) {
@@ -2092,7 +2105,8 @@ fn encounter_roster_ui(
                     participant.champion_stacks
                 ));
             }
-            if participant.dominion_max_hp_gain_rate > f32::EPSILON
+            if encounter.active
+                && participant.dominion_max_hp_gain_rate > f32::EPSILON
                 && participant.dominion_max_hp_bonus > f32::EPSILON
             {
                 ui.small(format!(
@@ -3432,12 +3446,18 @@ impl BattleRoundStore {
             return true;
         }
 
+        let max_hp_adjustments = self
+            .encounters
+            .get(encounter_id)
+            .map(|encounter| apply_battle_manager_max_hp_adjustments(encounter, manager))
+            .unwrap_or_default();
         let _ = sync_encounter_to_manager(
             self.encounters.get(encounter_id),
             manager,
         );
         let skill_pool = manager.skill_pool.clone();
         let mut rule_engine_state = RuleEngineState::default();
+        let mut refreshed_player_ids = HashSet::new();
         for (target_ids, buff) in granted_buffs {
             for resolved_target_id in target_ids {
                 let unit_template_id = self
@@ -3484,19 +3504,24 @@ impl BattleRoundStore {
                         &mut rule_engine_state,
                         &skill_pool,
                     );
-                }
-                if let Some(participant) =
-                    self.encounters.get_mut(encounter_id).and_then(|encounter| {
-                        encounter
-                            .participants
-                            .iter_mut()
-                            .find(|participant| participant.target_id == resolved_target_id)
-                    })
-                {
-                    sync_participant_from_manager_with_vitals(participant, manager);
+                    refreshed_player_ids.insert(resolved_target_id.clone());
                 }
             }
         }
+        restore_battle_manager_max_hp_adjustments(&max_hp_adjustments, manager);
+        if let Some(encounter) = self.encounters.get_mut(encounter_id) {
+            for participant in encounter
+                .participants
+                .iter_mut()
+                .filter(|participant| refreshed_player_ids.contains(&participant.target_id))
+            {
+                sync_participant_from_manager_with_vitals(participant, manager);
+            }
+        }
+        let _ = sync_encounter_to_manager(
+            self.encounters.get(encounter_id),
+            manager,
+        );
         true
     }
 
@@ -3680,10 +3705,16 @@ fn sync_encounter_to_manager(
         let hp = participant.hp.clamp(0.0, character.max_hp.max(0.0));
         let mp = participant.mp.clamp(0.0, character.max_mp.max(0.0));
         if (character.hp - hp).abs() > f32::EPSILON {
+            if let Some(base_stats) = character.buff_base_stats.as_mut() {
+                base_stats.hp = (base_stats.hp + hp - character.hp).max(0.0);
+            }
             character.hp = hp;
             changed = true;
         }
         if (character.mp - mp).abs() > f32::EPSILON {
+            if let Some(base_stats) = character.buff_base_stats.as_mut() {
+                base_stats.mp = (base_stats.mp + mp - character.mp).max(0.0);
+            }
             character.mp = mp;
             changed = true;
         }
@@ -3742,6 +3773,58 @@ fn sync_encounter_to_manager(
     changed
 }
 
+#[derive(Debug)]
+struct BattleManagerMaxHpAdjustment {
+    target_id: String,
+    bonus: f32,
+}
+
+fn apply_battle_manager_max_hp_adjustments(
+    encounter: &BattleEncounter,
+    manager: &mut NapcatMessageManager,
+) -> Vec<BattleManagerMaxHpAdjustment> {
+    if !encounter.active {
+        return Vec::new();
+    }
+    let mut adjustments = Vec::new();
+    for participant in &encounter.participants {
+        let bonus = participant.dominion_max_hp_bonus.max(0.0);
+        if !participant.player_character
+            || participant.unit_template_id.is_some()
+            || bonus <= f32::EPSILON
+        {
+            continue;
+        }
+        let Some(character) = manager.player_characters.get_mut(&participant.target_id) else {
+            continue;
+        };
+        character.max_hp += bonus;
+        if let Some(base_stats) = character.buff_base_stats.as_mut() {
+            base_stats.max_hp += bonus;
+        }
+        adjustments.push(BattleManagerMaxHpAdjustment {
+            target_id: participant.target_id.clone(),
+            bonus,
+        });
+    }
+    adjustments
+}
+
+fn restore_battle_manager_max_hp_adjustments(
+    adjustments: &[BattleManagerMaxHpAdjustment],
+    manager: &mut NapcatMessageManager,
+) {
+    for adjustment in adjustments {
+        let Some(character) = manager.player_characters.get_mut(&adjustment.target_id) else {
+            continue;
+        };
+        character.max_hp = (character.max_hp - adjustment.bonus).max(0.0);
+        if let Some(base_stats) = character.buff_base_stats.as_mut() {
+            base_stats.max_hp = (base_stats.max_hp - adjustment.bonus).max(0.0);
+        }
+    }
+}
+
 fn sync_battle_round_buff_advancement(
     store: &mut BattleRoundStore,
     encounter_id: &str,
@@ -3771,14 +3854,16 @@ fn sync_battle_round_buff_advancement(
         .map(|participant| participant.target_id.clone())
         .collect::<Vec<_>>();
 
-    let mut changed = sync_encounter_to_manager(Some(encounter), manager);
-    for _ in 0..rounds_to_advance {
-        changed |= advance_buffs_for_players(manager, &player_ids, rule_engine_state);
-        changed |= advance_unit_participant_buffs(store, encounter_id, manager);
-    }
     if rounds_to_advance == 0 {
-        return changed;
+        return sync_encounter_to_manager(Some(encounter), manager);
     }
+    let max_hp_adjustments = apply_battle_manager_max_hp_adjustments(encounter, manager);
+    let _ = sync_encounter_to_manager(Some(encounter), manager);
+    for _ in 0..rounds_to_advance {
+        let _ = advance_buffs_for_players(manager, &player_ids, rule_engine_state);
+        let _ = advance_unit_participant_buffs(store, encounter_id, manager);
+    }
+    restore_battle_manager_max_hp_adjustments(&max_hp_adjustments, manager);
     if let Some(encounter) = store.encounters.get_mut(encounter_id) {
         for participant in encounter
             .participants
@@ -3788,6 +3873,10 @@ fn sync_battle_round_buff_advancement(
             sync_participant_from_manager_with_vitals(participant, manager);
         }
     }
+    let _ = sync_encounter_to_manager(
+        store.encounters.get(encounter_id),
+        manager,
+    );
     true
 }
 
@@ -6914,6 +7003,8 @@ mod tests {
             .find(|participant| participant.target_id == "b")
             .unwrap();
         assert!((target.damage_taken_modifier - 1.0).abs() < 0.0001);
+        assert!((target.hp - 15.0).abs() < 0.0001);
+        assert!((manager.player_characters["b"].hp - 15.0).abs() < 0.0001);
 
         let vitality = CharacterSkill {
             index: 2,
@@ -9802,6 +9893,190 @@ mod tests {
             .action_log
             .iter()
             .any(|entry| entry.contains("触发役于我手")));
+    }
+
+    #[test]
+    fn dominion_bonus_is_cleared_at_combat_boundaries() {
+        let mut holder = participant("holder", 0);
+        holder.hp = 115.0;
+        holder.max_hp = 120.0;
+        holder.dominion_max_hp_gain_rate = 0.05;
+        holder.dominion_max_hp_bonus_cap = 20.0;
+        holder.dominion_max_hp_bonus = 20.0;
+        let mut avatar = participant("avatar", 0);
+        avatar.hp = 0.0;
+        avatar.max_hp = 50.0;
+        avatar.hope_avatar_enabled = true;
+        avatar.hope_avatar_used = true;
+        avatar.hope_avatar_rounds_remaining = 1;
+        let mut encounter = BattleEncounter {
+            active: true,
+            participants: vec![holder, avatar],
+            ..Default::default()
+        };
+
+        assert!(set_encounter_active_state(
+            &mut encounter,
+            false
+        ));
+        let holder = &encounter.participants[0];
+        assert_eq!(holder.hp, 100.0);
+        assert_eq!(holder.max_hp, 100.0);
+        assert_eq!(holder.dominion_max_hp_bonus, 0.0);
+        assert_eq!(encounter.participants[1].hp, 0.0);
+        assert!(!encounter.participants[1].alive);
+        assert!(!encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("触发役于我手")));
+
+        encounter.participants[0].hp = 105.0;
+        encounter.participants[0].max_hp = 110.0;
+        encounter.participants[0].dominion_max_hp_bonus = 10.0;
+        assert!(set_encounter_active_state(
+            &mut encounter,
+            true
+        ));
+        let holder = &encounter.participants[0];
+        assert_eq!(holder.hp, 100.0);
+        assert_eq!(holder.max_hp, 100.0);
+        assert_eq!(holder.dominion_max_hp_bonus, 0.0);
+    }
+
+    #[test]
+    fn dominion_overflow_hp_uses_battle_cap_during_round_buff_healing() {
+        let mut manager = empty_manager();
+        let dominion_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["役于我手".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            active_buffs: vec![BuffSpec {
+                name: "再生".to_owned(),
+                kind: BuffKind::Magic,
+                priority: 0,
+                turns_remaining: 2,
+                source_id: "holder".to_owned(),
+                beneficial: true,
+                effects: Vec::new(),
+                tick_actions: vec![BuffTickAction::Heal { amount: 20.0 }],
+            }],
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "holder".to_owned(),
+            dominion_character.clone(),
+        );
+        let mut holder = participant_from_character("holder", &dominion_character, &manager);
+        holder.hp = 105.0;
+        holder.max_hp = 120.0;
+        holder.dominion_max_hp_bonus = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                participants: vec![holder],
+                ..Default::default()
+            });
+
+        assert!(store.next_round("battle"));
+        assert!(sync_battle_round_buff_advancement(
+            &mut store,
+            "battle",
+            0,
+            &mut manager,
+            &mut RuleEngineState::default(),
+        ));
+
+        let holder = &store.encounters["battle"].participants[0];
+        assert_eq!(holder.hp, 120.0);
+        assert_eq!(holder.max_hp, 120.0);
+        assert_eq!(holder.dominion_max_hp_bonus, 20.0);
+        let character = &manager.player_characters["holder"];
+        assert_eq!(character.hp, 100.0);
+        assert_eq!(character.max_hp, 100.0);
+        assert_eq!(
+            character.active_buffs[0].turns_remaining,
+            1
+        );
+    }
+
+    #[test]
+    fn dominion_overflow_hp_survives_grant_buff_refresh() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            ..Default::default()
+        };
+        let dominion_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["役于我手".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "actor".to_owned(),
+            actor_character.clone(),
+        );
+        manager.player_characters.insert(
+            "holder".to_owned(),
+            dominion_character.clone(),
+        );
+        let mut holder = participant_from_character("holder", &dominion_character, &manager);
+        holder.hp = 115.0;
+        holder.max_hp = 120.0;
+        holder.dominion_max_hp_bonus = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                participants: vec![
+                    participant_from_character("actor", &actor_character, &manager),
+                    holder,
+                ],
+                ..Default::default()
+            });
+        let guard = CharacterSkill {
+            index: 0,
+            name: "守护术".to_owned(),
+            note: "主动使用给予目标2回合守护状态使承伤设为0.5".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use_with_buffs(
+            "battle",
+            "actor",
+            "holder",
+            &guard,
+            &mut manager,
+            None,
+        ));
+
+        let holder = &store.encounters["battle"].participants[1];
+        assert_eq!(holder.hp, 115.0);
+        assert_eq!(holder.max_hp, 120.0);
+        assert_eq!(holder.dominion_max_hp_bonus, 20.0);
+        assert!((holder.damage_taken_modifier - 0.5).abs() < 0.0001);
+        let character = &manager.player_characters["holder"];
+        assert_eq!(character.hp, 100.0);
+        assert_eq!(character.max_hp, 100.0);
+        assert_eq!(character.active_buffs.len(), 1);
     }
 
     #[test]
