@@ -2351,14 +2351,13 @@ fn encounter_action_ui(
             )
             .clicked()
         {
-            changed |= store.apply_action(
+            changed |= store.apply_action_and_finish(
                 encounter_id,
                 &actor.target_id,
                 target,
                 "普通攻击",
                 *amount,
             );
-            changed |= store.finish_actor_action(encounter_id, &actor.target_id);
         }
         if ui.button("标记完成").clicked() {
             changed |= store.finish_actor_action(encounter_id, &actor.target_id);
@@ -2427,7 +2426,7 @@ fn encounter_action_ui(
             let can_use = cooldown_remaining == 0 && can_pay && hope_avatar_allows;
             let response = ui.add_enabled(can_use, egui::Button::new("使用技能"));
             if response.clicked() {
-                changed |= store.record_skill_use_with_buffs(
+                changed |= store.record_skill_use_with_buffs_and_finish(
                     encounter_id,
                     &actor.target_id,
                     target,
@@ -2435,7 +2434,6 @@ fn encounter_action_ui(
                     manager,
                     scene_positions,
                 );
-                changed |= store.finish_actor_action(encounter_id, &actor.target_id);
             }
             if !hope_avatar_allows {
                 ui.small("希望化身期间只能释放治疗技能");
@@ -2598,6 +2596,19 @@ impl BattleRoundStore {
     }
 
     fn finish_actor_action(&mut self, encounter_id: &str, target_id: &str) -> bool {
+        self.finish_actor_action_internal(encounter_id, target_id, false)
+    }
+
+    fn finish_resolved_actor_action(&mut self, encounter_id: &str, target_id: &str) -> bool {
+        self.finish_actor_action_internal(encounter_id, target_id, true)
+    }
+
+    fn finish_actor_action_internal(
+        &mut self,
+        encounter_id: &str,
+        target_id: &str,
+        allow_defeated: bool,
+    ) -> bool {
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
@@ -2608,7 +2619,7 @@ impl BattleRoundStore {
         else {
             return false;
         };
-        if !participant_can_act(participant) {
+        if participant.action_done || (!allow_defeated && !participant.alive) {
             return false;
         }
         participant.action_done = true;
@@ -2629,6 +2640,26 @@ impl BattleRoundStore {
             mark_negative_candidates(encounter);
         }
         true
+    }
+
+    fn apply_action_and_finish(
+        &mut self,
+        encounter_id: &str,
+        actor_id: &str,
+        target_id: &str,
+        action_name: &str,
+        damage: f32,
+    ) -> bool {
+        if !self.apply_action(
+            encounter_id,
+            actor_id,
+            target_id,
+            action_name,
+            damage,
+        ) {
+            return false;
+        }
+        self.finish_resolved_actor_action(encounter_id, actor_id)
     }
 
     fn apply_action(
@@ -3533,6 +3564,28 @@ impl BattleRoundStore {
             manager,
         );
         true
+    }
+
+    fn record_skill_use_with_buffs_and_finish(
+        &mut self,
+        encounter_id: &str,
+        actor_id: &str,
+        target_id: &str,
+        skill: &CharacterSkill,
+        manager: &mut NapcatMessageManager,
+        scene_positions: Option<&SceneCharacterPositions>,
+    ) -> bool {
+        if !self.record_skill_use_with_buffs(
+            encounter_id,
+            actor_id,
+            target_id,
+            skill,
+            manager,
+            scene_positions,
+        ) {
+            return false;
+        }
+        self.finish_resolved_actor_action(encounter_id, actor_id)
     }
 
     fn advance_participant(&mut self, encounter_id: &str, target_id: &str, resume: bool) -> bool {
@@ -12022,5 +12075,79 @@ mod tests {
         assert_eq!(finished.negative_layers, 0);
         assert!(finished.skill_last_used_turns.is_empty());
         assert_eq!(encounter.action_log.len(), 4);
+    }
+
+    #[test]
+    fn battle_resolution_and_action_completion_are_one_transaction() {
+        let mut manager = empty_manager();
+        let mut actor = participant("actor", 0);
+        actor.mp = 0.0;
+        let target = participant("target", 0);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("failed".to_owned(), BattleEncounter {
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let unaffordable_skill = CharacterSkill {
+            index: 0,
+            name: "昂贵法术".to_owned(),
+            note: "主动使用对目标造成4点魔法伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 5.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(!store.apply_action_and_finish(
+            "failed",
+            "actor",
+            "missing",
+            "无效攻击",
+            4.0,
+        ));
+        assert!(
+            !store.record_skill_use_with_buffs_and_finish(
+                "failed",
+                "actor",
+                "target",
+                &unaffordable_skill,
+                &mut manager,
+                None,
+            )
+        );
+        let failed_actor = &store.encounters["failed"].participants[0];
+        assert_eq!(failed_actor.turn, 0);
+        assert_eq!(failed_actor.mp, 0.0);
+        assert!(!failed_actor.action_done);
+        assert_eq!(store.encounters["failed"].round, 0);
+        assert_eq!(
+            store.encounters["failed"].participants[1].hp,
+            10.0
+        );
+
+        let mut self_defeating_actor = participant("self", 0);
+        self_defeating_actor.hp = 5.0;
+        store.encounters.insert("self".to_owned(), BattleEncounter {
+            participants: vec![self_defeating_actor],
+            ..Default::default()
+        });
+
+        assert!(store.apply_action_and_finish("self", "self", "self", "自我牺牲", 10.0,));
+        let encounter = &store.encounters["self"];
+        let actor = &encounter.participants[0];
+        assert_eq!(actor.hp, 0.0);
+        assert!(!actor.alive);
+        assert_eq!(actor.turn, 1);
+        assert_eq!(actor.combat_turns_completed, 1);
+        assert!(!actor.action_done);
+        assert_eq!(encounter.round, 1);
+        assert_eq!(encounter.combat_completed_turns, 1);
     }
 }
