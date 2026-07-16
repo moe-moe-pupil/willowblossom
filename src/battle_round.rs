@@ -3778,12 +3778,16 @@ fn apply_battle_buff_ticks(
     ticks: &[BattleBuffTick],
 ) {
     for tick in ticks {
-        let source_undying_rage_damage_multiplier = encounter
-            .participants
-            .iter()
-            .find(|participant| participant.target_id == tick.source_id)
-            .map(participant_undying_rage_damage_multiplier)
-            .unwrap_or(1.0);
+        let source_undying_rage_damage_multiplier = if encounter.active {
+            encounter
+                .participants
+                .iter()
+                .find(|participant| participant.target_id == tick.source_id)
+                .map(participant_undying_rage_damage_multiplier)
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
         let source_character = encounter
             .participants
             .iter()
@@ -5068,9 +5072,14 @@ fn participant_damage_multiplier(
     } else {
         1.0
     };
+    let undying_rage_multiplier = if encounter_active {
+        participant_undying_rage_damage_multiplier(participant)
+    } else {
+        1.0
+    };
     participant.damage_dealt_modifier
         * inspiration_multiplier
-        * participant_undying_rage_damage_multiplier(participant)
+        * undying_rage_multiplier
         * arrogance_multiplier
         * champion_damage_dealt_multiplier(
             participant.champion_damage_bonus_per_stack,
@@ -6268,6 +6277,11 @@ mod tests {
         let source = PlayerCharacter {
             hp: 20.0,
             max_hp: 20.0,
+            skill_names: vec!["不死者之怒".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
             ..Default::default()
         };
         manager
@@ -6312,12 +6326,14 @@ mod tests {
             .encounters
             .insert("battle".to_owned(), BattleEncounter {
                 name: "battle".to_owned(),
+                active: false,
                 participants: vec![
                     participant_from_character("source", &source, &manager),
                     target,
                 ],
                 ..Default::default()
             });
+        store.encounters.get_mut("battle").unwrap().participants[0].undying_rage_active = true;
 
         assert!(store.next_round("battle"));
         assert!(sync_battle_round_buff_advancement(
@@ -8353,6 +8369,35 @@ mod tests {
         assert!(actor.alive);
         assert!(actor.undying_rage_used);
         assert!(actor.undying_rage_active);
+
+        let mut stale_actor = participant_from_character("a", &actor_character, &manager);
+        stale_actor.undying_rage_active = true;
+        let mut resting_target = participant("rest-target", 0);
+        resting_target.hp = 100.0;
+        resting_target.max_hp = 100.0;
+        let mut resting_store = BattleRoundStore::default();
+        resting_store
+            .encounters
+            .insert("rest".to_owned(), BattleEncounter {
+                name: "rest".to_owned(),
+                active: false,
+                participants: vec![stale_actor, resting_target],
+                ..Default::default()
+            });
+        assert!(resting_store.record_skill_use(
+            "rest",
+            "a",
+            "rest-target",
+            &skill,
+            &manager,
+            None,
+        ));
+        let resting_target = resting_store.encounters["rest"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "rest-target")
+            .unwrap();
+        assert!((resting_target.hp - 90.0).abs() < 0.0001);
 
         let mut oversized = participant_from_character("a", &actor_character, &manager);
         let resolution = apply_participant_damage_for_battle(&mut oversized, 21.0, "enemy", true);

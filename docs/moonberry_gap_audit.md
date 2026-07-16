@@ -71,6 +71,8 @@ Additional 2026-07-16 correction: `液态躯体` now obeys its preserved active 
 
 Additional 2026-07-16 correction: `越战越勇` and `斗志昂扬` now use dedicated persisted combat-turn counters instead of the participants' inherited world/cooldown clocks. A newly created or re-entered combat therefore starts at +0% valorous damage and the defender's 50% first-turn reduction even when the campaign clock is already advanced; completed active actions then advance the shared/per-participant counters, combat boundaries reset them, and neither modifier applies during rest. Existing world turns and skill cooldown timing remain unchanged. Focused verification passes with `cargo test --lib -j 1 valorous -- --nocapture`, `cargo test --lib -j 1 fighting_spirit -- --nocapture`, `cargo test --lib -j 1 active_battle_turn_suppresses -- --nocapture`, and `cargo test --lib -j 1 skill_cooldown_starts -- --nocapture`: 1 passed in each command, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `不死者之怒`'s +10% outgoing damage now checks the active encounter at every application point, not only through normal exit cleanup. A stale or migrated `undying_rage_active` flag in a resting encounter therefore cannot boost parsed skill damage or continuing buff-tick damage, while the same-round active-combat bonus remains unchanged. Focused verification passes with `cargo test --lib -j 1 undying_rage -- --nocapture` and `cargo test --lib -j 1 unit_instance_buff_ticks_damage_without_mutating_template -- --nocapture`: 1 passed in each command, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -368,7 +370,7 @@ Additional implemented talent execution: `奥术护盾` now grants battle entran
 
 Additional implemented talent execution: `过度治疗` now converts battle overheal into one-round encounter-local shielding capped at 30% of the healed target's maximum HP across immediate and delayed healing paths.
 
-Additional implemented talent execution: `不死者之怒` now provides one active-encounter lethal-hit negation, same-round damage immunity, and +10% outgoing damage while hits above maximum HP bypass it; rest clears the active effect and battle re-entry rearms one charge.
+Additional implemented talent execution: `不死者之怒` now provides one active-encounter lethal-hit negation, same-round damage immunity, and +10% outgoing parsed-skill/buff-tick damage while hits above maximum HP bypass it; rest clears the active effect, stale resting flags cannot apply it, and battle re-entry rearms one charge.
 
 Battle damage resolution now distinguishes attempted, absorbed, and applied damage so shields/evasion do not falsely trigger successful-hit talent effects or inflate combat logs, and contributor attribution is cleared at combat boundaries so kill/assist rewards cannot leak across encounters.
 
