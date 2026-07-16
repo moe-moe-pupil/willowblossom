@@ -53,6 +53,8 @@ Additional 2026-07-16 correction: `奥术护盾` now persists its 10% maximum-MP
 
 Additional 2026-07-16 correction: `敏锐`'s persisted dodge charge now follows the encounter lifecycle promised by its “进入战斗轮” trigger. Leaving combat clears the charge, resting encounters cannot consume stale or migrated charges, and entering combat rearms one dodge for approved holders even when their previous charge was spent. Focused verification passes with `cargo test --lib -j 1 keen_evasion -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 392 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `不死者之怒` now obeys its documented encounter-local lifecycle. Resting encounters cannot trigger or preserve the lethal-hit immunity, leaving combat clears the same-round damage bonus, and entering a later combat resets the consumed flag so the holder receives one fresh charge. Repeated lethal hits within the same combat remain limited to the original single activation. Focused verification passes with `cargo test --lib -j 1 undying_rage -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 392 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -350,7 +352,7 @@ Additional implemented talent execution: `奥术护盾` now grants battle entran
 
 Additional implemented talent execution: `过度治疗` now converts battle overheal into one-round encounter-local shielding capped at 30% of the healed target's maximum HP across immediate and delayed healing paths.
 
-Additional implemented talent execution: `不死者之怒` now provides one encounter-local lethal-hit negation, same-round damage immunity, and +10% outgoing damage, while hits above maximum HP bypass it.
+Additional implemented talent execution: `不死者之怒` now provides one active-encounter lethal-hit negation, same-round damage immunity, and +10% outgoing damage while hits above maximum HP bypass it; rest clears the active effect and battle re-entry rearms one charge.
 
 Battle damage resolution now distinguishes attempted, absorbed, and applied damage so shields/evasion do not falsely trigger successful-hit talent effects or inflate combat logs.
 

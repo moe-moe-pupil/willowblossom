@@ -494,6 +494,8 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         for participant in &mut encounter.participants {
             participant.combat_damage_taken_total = 0.0;
             participant.keen_evasion_available = participant.keen_evasion_enabled;
+            participant.undying_rage_used = false;
+            participant.undying_rage_active = false;
             participant.arcane_shield =
                 participant.max_mp.max(0.0) * participant.arcane_shield_rate.max(0.0);
         }
@@ -501,6 +503,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         let mut logs = Vec::new();
         for participant in &mut encounter.participants {
             participant.keen_evasion_available = false;
+            participant.undying_rage_active = false;
             participant.arcane_shield = 0.0;
             let healing = participant.combat_damage_taken_total.max(0.0)
                 * participant.calm_heart_healing_rate.max(0.0);
@@ -885,9 +888,10 @@ fn apply_participant_damage_for_battle(
     let mut hope_avatar_triggered = false;
     let within_undying_rage_limit =
         participant.max_hp > f32::EPSILON && final_amount <= participant.max_hp + f32::EPSILON;
-    if participant.undying_rage_active && within_undying_rage_limit {
+    if encounter_active && participant.undying_rage_active && within_undying_rage_limit {
         final_amount = 0.0;
-    } else if participant.undying_rage_enabled
+    } else if encounter_active
+        && participant.undying_rage_enabled
         && !participant.undying_rage_used
         && participant.hp > f32::EPSILON
         && final_amount + f32::EPSILON >= participant.hp
@@ -1902,10 +1906,12 @@ fn encounter_roster_ui(
                     format_number(participant.overhealing_shield)
                 ));
             }
-            if participant.undying_rage_active {
-                ui.small("不死者之怒生效");
-            } else if participant.undying_rage_enabled && participant.undying_rage_used {
-                ui.small("不死者之怒已触发");
+            if encounter.active {
+                if participant.undying_rage_active {
+                    ui.small("不死者之怒生效");
+                } else if participant.undying_rage_enabled && participant.undying_rage_used {
+                    ui.small("不死者之怒已触发");
+                }
             }
             if participant_hope_avatar_active(participant) {
                 ui.small(format!(
@@ -7903,6 +7909,44 @@ mod tests {
         let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy", true);
         assert!(resolution.defeat_outcome.is_some());
         assert!(!actor.alive);
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, false
+        ));
+        let actor = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        actor.hp = 20.0;
+        actor.alive = true;
+        actor.undying_rage_used = false;
+        actor.undying_rage_active = true;
+        let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy", false);
+        assert!(resolution.defeat_outcome.is_some());
+        assert!(!resolution.undying_rage_triggered);
+        assert!(!actor.alive);
+        assert!(!actor.undying_rage_used);
+
+        actor.hp = 20.0;
+        actor.alive = true;
+        assert!(set_encounter_active_state(
+            encounter, true
+        ));
+        let actor = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!(!actor.undying_rage_used);
+        assert!(!actor.undying_rage_active);
+        let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy", true);
+        assert!(resolution.defeat_outcome.is_none());
+        assert!(resolution.undying_rage_triggered);
+        assert!(actor.alive);
+        assert!(actor.undying_rage_used);
+        assert!(actor.undying_rage_active);
 
         let mut oversized = participant_from_character("a", &actor_character, &manager);
         let resolution = apply_participant_damage_for_battle(&mut oversized, 21.0, "enemy", true);
