@@ -493,6 +493,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
     if active {
         for participant in &mut encounter.participants {
             participant.combat_damage_taken_total = 0.0;
+            participant.damage_contributors.clear();
             participant.keen_evasion_available = participant.keen_evasion_enabled;
             participant.undying_rage_used = false;
             participant.undying_rage_active = false;
@@ -538,6 +539,9 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         encounter.action_log.extend(logs);
         for outcome in defeat_outcomes {
             apply_battle_defeat_outcome(encounter, outcome);
+        }
+        for participant in &mut encounter.participants {
+            participant.damage_contributors.clear();
         }
     }
     encounter.active = active;
@@ -9045,6 +9049,72 @@ mod tests {
             .action_log
             .iter()
             .any(|entry| entry.contains("触发罪上加罪") && entry.contains("经验加成10%")));
+    }
+
+    #[test]
+    fn battle_exit_prevents_cross_combat_kill_assist_credit() {
+        let mut old_attacker = participant("old", 0);
+        old_attacker.sin_on_sin_exp_bonus_per_stack = 0.025;
+        old_attacker.sin_on_sin_recovery_rate = 0.10;
+        let mut new_attacker = participant("new", 0);
+        new_attacker.sin_on_sin_exp_bonus_per_stack = 0.025;
+        new_attacker.sin_on_sin_recovery_rate = 0.10;
+        let mut victim = participant("victim", 0);
+        victim.hp = 10.0;
+        victim.max_hp = 10.0;
+
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![old_attacker, new_attacker, victim],
+                ..Default::default()
+            });
+
+        assert!(store.apply_action(
+            "battle",
+            "old",
+            "victim",
+            "旧战斗攻击",
+            4.0
+        ));
+        assert_eq!(
+            store.encounters["battle"].participants[2].damage_contributors,
+            vec!["old".to_owned()]
+        );
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        assert!(set_encounter_active_state(
+            encounter, false
+        ));
+        assert!(encounter.participants[2].damage_contributors.is_empty());
+        encounter.participants[2]
+            .damage_contributors
+            .push("old".to_owned());
+        assert!(set_encounter_active_state(
+            encounter, true
+        ));
+        assert!(encounter.participants[2].damage_contributors.is_empty());
+
+        assert!(store.apply_action(
+            "battle",
+            "new",
+            "victim",
+            "新战斗终击",
+            6.0
+        ));
+        let encounter = &store.encounters["battle"];
+        assert_eq!(
+            encounter.participants[0].sin_on_sin_stacks,
+            0
+        );
+        assert_eq!(
+            encounter.participants[1].sin_on_sin_stacks,
+            1
+        );
+        assert!(!encounter.participants[2].alive);
+        assert!(encounter.participants[2].damage_contributors.is_empty());
     }
 
     #[test]

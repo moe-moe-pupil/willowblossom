@@ -57,6 +57,8 @@ Additional 2026-07-16 correction: `不死者之怒` now obeys its documented enc
 
 Additional 2026-07-16 correction: `希望化身` now obeys the active encounter boundary. Lethal damage during rest cannot activate the avatar, its immunity and healing-only action restriction apply only during active combat, entering a later combat resets prior consumption, and ending combat while the avatar is active immediately performs its promised death and normal defeat-contributor handling rather than leaving an immortal 0-HP resting participant. Focused verification passes with `cargo test --lib -j 1 hope_avatar -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 392 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: battle damage contributors are now scoped to one active combat. Surviving targets clear contributor attribution when combat ends, battle entry defensively removes stale persisted attribution, and exit-forced defeats resolve their legitimate contributors before cleanup. This prevents attackers from an earlier combat receiving `忏悔` or `罪上加罪` kill/assist credit when another attacker defeats the target later. Focused verification passes with `cargo test --lib -j 1 battle_exit_prevents_cross_combat_kill_assist_credit -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 393 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -356,7 +358,7 @@ Additional implemented talent execution: `过度治疗` now converts battle over
 
 Additional implemented talent execution: `不死者之怒` now provides one active-encounter lethal-hit negation, same-round damage immunity, and +10% outgoing damage while hits above maximum HP bypass it; rest clears the active effect and battle re-entry rearms one charge.
 
-Battle damage resolution now distinguishes attempted, absorbed, and applied damage so shields/evasion do not falsely trigger successful-hit talent effects or inflate combat logs.
+Battle damage resolution now distinguishes attempted, absorbed, and applied damage so shields/evasion do not falsely trigger successful-hit talent effects or inflate combat logs, and contributor attribution is cleared at combat boundaries so kill/assist rewards cannot leak across encounters.
 
 `希望化身` now executes as a persisted active-combat lethal transformation with two-round damage immunity, healing-only actions, forced expiry or battle-exit death, and fresh eligibility on later combat entry; channel interruption remains pending until battle channeling itself is represented.
 
