@@ -1134,7 +1134,9 @@ fn apply_sin_on_sin_kill_participation(
 }
 
 fn apply_battle_defeat_outcome(encounter: &mut BattleEncounter, outcome: BattleDefeatOutcome) {
-    apply_dominion_target_death(encounter, outcome.defeated_max_hp);
+    if encounter.active {
+        apply_dominion_target_death(encounter, outcome.defeated_max_hp);
+    }
     let contributors = outcome.contributors.into_iter().collect::<HashSet<_>>();
     if !contributors.is_empty() {
         apply_penance_kill_assists(encounter, contributors.iter().cloned());
@@ -9379,6 +9381,31 @@ mod tests {
         assert!(!defeated.alive);
         assert!(defeated.damage_contributors.is_empty());
         assert!(encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("触发役于我手")));
+
+        let resting_holder = participant_from_character("a", &dominion_character, &manager);
+        let resting_attacker = participant_from_character("killer", &attacker_character, &manager);
+        let resting_victim = participant_from_character("victim", &victim_character, &manager);
+        store.encounters.insert("rest".to_owned(), BattleEncounter {
+            name: "rest".to_owned(),
+            active: false,
+            participants: vec![resting_holder, resting_attacker, resting_victim],
+            ..Default::default()
+        });
+
+        assert!(store.record_skill_use("rest", "killer", "victim", &skill, &manager, None,));
+
+        let resting_encounter = &store.encounters["rest"];
+        let resting_holder = resting_encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!((resting_holder.dominion_max_hp_bonus - 0.0).abs() < 0.0001);
+        assert!((resting_holder.max_hp - 100.0).abs() < 0.0001);
+        assert!(!resting_encounter
             .action_log
             .iter()
             .any(|entry| entry.contains("触发役于我手")));

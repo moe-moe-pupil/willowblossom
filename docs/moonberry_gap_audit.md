@@ -23,7 +23,7 @@ Additional 2026-06-25 to 2026-06-26 update: `菜鸡猛啄` approved-talent minim
 
 Additional 2026-06-26 update: `罪上加罪` approved-talent parsed battle now grants kill/assist contributors one stack, recovers 10% of missing HP/MP, and tracks the capped 2.5% per-stack experience-bonus metadata up to 10%. Focused verification passes with `cargo test --lib -j 1 sin_on_sin -- --nocapture`: 1 passed, 0 failed. Full-suite verification passes with `cargo test -j 1`: 312 passed, 1 ignored live DeepSeek API test, 0 failed.
 
-Additional 2026-06-26 update: `役于我手` approved-talent parsed battle now grants alive encounter participants 5% of a defeated target's maximum HP as max-HP bonus, capped by a fixed 20% cap from the holder's battle-entry max HP. Focused verification passes with `cargo test --lib -j 1 dominion -- --nocapture`: 1 passed, 0 failed. Full-suite verification passes with `cargo test -j 1`: 313 passed, 1 ignored live DeepSeek API test, 0 failed.
+Additional 2026-06-26 update: `役于我手` approved-talent parsed battle now grants alive participants in an active encounter 5% of a defeated target's maximum HP as max-HP bonus, capped by a fixed 20% cap from the holder's battle-entry max HP. Defeats while the encounter is resting do not trigger the talent. Focused verification passes with `cargo test --lib -j 1 dominion -- --nocapture`: 1 passed, 0 failed. Full-suite verification passes with `cargo test -j 1`: 313 passed, 1 ignored live DeepSeek API test, 0 failed.
 
 Additional 2026-06-26 update: `一心` approved-talent parsed battle now tracks single-target healing on the same target, applies +5% healing per existing stack up to +25%, and resets to one stack when switching targets. Focused verification passes with `cargo test --lib -j 1 one_heart -- --nocapture`: 1 passed, 0 failed. Full-suite verification passes with `cargo test -j 1`: 314 passed, 1 ignored live DeepSeek API test, 0 failed.
 
@@ -290,7 +290,7 @@ These are present now, often as a Rust/Bevy redesign rather than a direct port:
 
    Additional update: `罪上加罪` now executes in parsed battle when a damage contributor participates in a kill, including assist credit. It increments the talent stack, restores 10% of missing HP and MP, and reports the capped experience-bonus metadata.
 
-   Additional update: `役于我手` now executes in parsed battle when any target dies in the encounter. Alive holders gain 5% of the defeated target's maximum HP as battle max HP, capped at 20% of the holder's battle-entry max HP.
+   Additional update: `役于我手` now executes when any target dies during an active encounter. Alive holders gain 5% of the defeated target's maximum HP as battle max HP, capped at 20% of the holder's battle-entry max HP; defeats while resting do not trigger it.
 
    Additional update: `一心` now executes in parsed battle for single-target healing, tracking the currently focused target and increasing same-target healing by +5% per stack up to +25%; switching targets resets the stack.
 
