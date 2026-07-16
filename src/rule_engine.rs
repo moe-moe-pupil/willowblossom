@@ -2299,7 +2299,27 @@ impl RuleEngine {
             .map(|character| character.healing_taken_modifier)
             .unwrap_or(1.0);
         let final_heal = (amount * source_modifier * target_modifier).max(0.0);
-        let mutual_aid_heal = if source_id != target_id && final_heal > f32::EPSILON {
+        let mut effective_heal = 0.0;
+        let mut hp_update = None;
+        if let Some(target) = self.characters.get_mut(target_id) {
+            let previous_hp = target.hp;
+            target.hp = (target.hp + final_heal).min(target.max_hp);
+            effective_heal = (target.hp - previous_hp).max(0.0);
+            target.healing_taken_this_turn += effective_heal;
+            hp_update = Some((target.hp, target.max_hp));
+            self.log.push(format!(
+                "{}回复{}点生命值，生命值变为 {}/{}",
+                target.name,
+                format_number(effective_heal),
+                format_number(target.hp),
+                format_number(target.max_hp)
+            ));
+        }
+        if let Some((hp, max_hp)) = hp_update {
+            self.sync_character_hp_to_ecs(target_id, hp, max_hp);
+        }
+
+        let mutual_aid_heal = if source_id != target_id && effective_heal > f32::EPSILON {
             let source_rate = self
                 .characters
                 .get(source_id)
@@ -2312,40 +2332,27 @@ impl RuleEngine {
                 .map(|character| character.mutual_aid_healing_rate)
                 .unwrap_or(0.0)
                 .max(0.0);
-            final_heal * (source_rate + target_rate)
+            effective_heal * (source_rate + target_rate)
         } else {
             0.0
         };
-
-        let mut hp_update = None;
-        if let Some(target) = self.characters.get_mut(target_id) {
-            target.healing_taken_this_turn += final_heal;
-            target.hp = (target.hp + final_heal).min(target.max_hp);
-            hp_update = Some((target.hp, target.max_hp));
-            self.log.push(format!(
-                "{}回复{}点生命值，生命值变为 {}/{}",
-                target.name,
-                format_number(final_heal),
-                format_number(target.hp),
-                format_number(target.max_hp)
-            ));
-        }
-        if let Some((hp, max_hp)) = hp_update {
-            self.sync_character_hp_to_ecs(target_id, hp, max_hp);
-        }
         if mutual_aid_heal > f32::EPSILON {
             let mut hp_update = None;
             if let Some(source) = self.characters.get_mut(source_id) {
-                source.healing_taken_this_turn += mutual_aid_heal;
+                let previous_hp = source.hp;
                 source.hp = (source.hp + mutual_aid_heal).min(source.max_hp);
+                let effective_mutual_aid_heal = (source.hp - previous_hp).max(0.0);
+                source.healing_taken_this_turn += effective_mutual_aid_heal;
                 hp_update = Some((source.hp, source.max_hp));
-                self.log.push(format!(
-                    "{}触发互帮互助，回复{}点生命值，生命值变为 {}/{}",
-                    source.name,
-                    format_number(mutual_aid_heal),
-                    format_number(source.hp),
-                    format_number(source.max_hp)
-                ));
+                if effective_mutual_aid_heal > f32::EPSILON {
+                    self.log.push(format!(
+                        "{}触发互帮互助，回复{}点生命值，生命值变为 {}/{}",
+                        source.name,
+                        format_number(effective_mutual_aid_heal),
+                        format_number(source.hp),
+                        format_number(source.max_hp)
+                    ));
+                }
             }
             if let Some((hp, max_hp)) = hp_update {
                 self.sync_character_hp_to_ecs(source_id, hp, max_hp);
@@ -4431,23 +4438,23 @@ mod tests {
         source.mutual_aid_healing_rate = 0.5;
         engine.add_character(source);
         let mut target = Character::new("target", "目标", 20.0);
-        target.hp = 0.0;
+        target.hp = 18.0;
         target.mutual_aid_healing_rate = 0.5;
         engine.add_character(target);
 
         engine.heal("source", "target", 4.0);
 
         let source = engine.characters.get("source").unwrap();
-        assert!((source.hp - 14.0).abs() < 0.0001);
-        assert!((source.healing_taken_this_turn - 4.0).abs() < 0.0001);
+        assert!((source.hp - 12.0).abs() < 0.0001);
+        assert!((source.healing_taken_this_turn - 2.0).abs() < 0.0001);
         let target = engine.characters.get("target").unwrap();
-        assert!((target.hp - 4.0).abs() < 0.0001);
-        assert!((target.healing_taken_this_turn - 4.0).abs() < 0.0001);
+        assert!((target.hp - 20.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 2.0).abs() < 0.0001);
 
         engine.heal("source", "source", 4.0);
         let source = engine.characters.get("source").unwrap();
-        assert!((source.hp - 18.0).abs() < 0.0001);
-        assert!((source.healing_taken_this_turn - 8.0).abs() < 0.0001);
+        assert!((source.hp - 16.0).abs() < 0.0001);
+        assert!((source.healing_taken_this_turn - 6.0).abs() < 0.0001);
     }
 
     #[test]

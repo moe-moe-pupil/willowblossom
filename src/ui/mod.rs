@@ -5181,17 +5181,11 @@ fn apply_quick_cast_action_to_manager(
                 let final_amount =
                     (amount * source_healing_multiplier * target_healing_multiplier).max(0.0);
                 let target_mutual_aid_healing_rate = character_mutual_aid_healing_rate(target);
-                changed |= record_character_healing_taken(target, final_amount);
-                let next_hp = (target.hp + final_amount).min(target.max_hp);
-                if (target.hp - next_hp).abs() > f32::EPSILON {
-                    target.hp = next_hp;
-                    if let Some(base_stats) = target.buff_base_stats.as_mut() {
-                        base_stats.hp = (base_stats.hp + final_amount).min(base_stats.max_hp);
-                    }
-                    changed = true;
-                }
-                if target_id != action.caster_id && final_amount > f32::EPSILON {
-                    pending_source_mutual_aid_healing += final_amount
+                let (healing_changed, effective_amount) =
+                    apply_effective_character_healing(target, final_amount);
+                changed |= healing_changed;
+                if target_id != action.caster_id && effective_amount > f32::EPSILON {
+                    pending_source_mutual_aid_healing += effective_amount
                         * (source_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
                 }
             },
@@ -5207,18 +5201,25 @@ fn apply_quick_cast_action_to_manager(
     let pending_source_healing = pending_source_lifesteal + pending_source_mutual_aid_healing;
     if pending_source_healing > f32::EPSILON {
         if let Some(caster) = manager.player_characters.get_mut(&action.caster_id) {
-            changed |= record_character_healing_taken(caster, pending_source_healing);
-            let next_hp = (caster.hp + pending_source_healing).min(caster.max_hp);
-            if (caster.hp - next_hp).abs() > f32::EPSILON {
-                caster.hp = next_hp;
-                if let Some(base_stats) = caster.buff_base_stats.as_mut() {
-                    base_stats.hp = (base_stats.hp + pending_source_healing).min(base_stats.max_hp);
-                }
-                changed = true;
-            }
+            changed |= apply_effective_character_healing(caster, pending_source_healing).0;
         }
     }
     changed
+}
+
+fn apply_effective_character_healing(character: &mut PlayerCharacter, amount: f32) -> (bool, f32) {
+    let previous_hp = character.hp;
+    let next_hp = (character.hp + amount.max(0.0)).min(character.max_hp);
+    let effective_amount = (next_hp - previous_hp).max(0.0);
+    if effective_amount <= f32::EPSILON {
+        return (false, 0.0);
+    }
+    character.hp = next_hp;
+    if let Some(base_stats) = character.buff_base_stats.as_mut() {
+        base_stats.hp = (base_stats.hp + effective_amount).min(base_stats.max_hp);
+    }
+    record_character_healing_taken(character, effective_amount);
+    (true, effective_amount)
 }
 
 fn status_summary_value_ui(ui: &mut Ui, label: &str, base: i32, extra: i32) {
@@ -7511,32 +7512,17 @@ fn apply_character_buff_ticks(
                     let final_amount =
                         (*amount * source_multiplier * target.healing_taken_modifier).max(0.0);
                     let target_mutual_aid_healing_rate = character_mutual_aid_healing_rate(target);
-                    changed |= record_character_healing_taken(target, final_amount);
-                    let next_hp = (target.hp + final_amount).min(target.max_hp);
-                    if (target.hp - next_hp).abs() > f32::EPSILON {
-                        target.hp = next_hp;
-                        if let Some(base_stats) = target.buff_base_stats.as_mut() {
-                            base_stats.hp = (base_stats.hp + final_amount).min(base_stats.max_hp);
-                        }
-                        changed = true;
-                    }
-                    if tick.source_id != tick.target_id && final_amount > f32::EPSILON {
-                        mutual_aid_heal = final_amount
+                    let (healing_changed, effective_amount) =
+                        apply_effective_character_healing(target, final_amount);
+                    changed |= healing_changed;
+                    if tick.source_id != tick.target_id && effective_amount > f32::EPSILON {
+                        mutual_aid_heal = effective_amount
                             * (source_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
                     }
                 };
                 if mutual_aid_heal > f32::EPSILON {
                     if let Some(source) = manager.player_characters.get_mut(&tick.source_id) {
-                        changed |= record_character_healing_taken(source, mutual_aid_heal);
-                        let next_hp = (source.hp + mutual_aid_heal).min(source.max_hp);
-                        if (source.hp - next_hp).abs() > f32::EPSILON {
-                            source.hp = next_hp;
-                            if let Some(base_stats) = source.buff_base_stats.as_mut() {
-                                base_stats.hp =
-                                    (base_stats.hp + mutual_aid_heal).min(base_stats.max_hp);
-                            }
-                            changed = true;
-                        }
+                        changed |= apply_effective_character_healing(source, mutual_aid_heal).0;
                     }
                 }
             },
@@ -14587,7 +14573,7 @@ mod tests {
         manager
             .player_characters
             .insert("target".to_owned(), PlayerCharacter {
-                hp: 0.0,
+                hp: 18.0,
                 max_hp: 20.0,
                 skill_names: vec!["互帮互助".to_owned()],
                 skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
@@ -14604,11 +14590,11 @@ mod tests {
         ));
 
         let caster = &manager.player_characters["caster"];
-        assert!((caster.hp - 14.0).abs() < 0.0001);
-        assert!((caster.healing_taken_this_turn - 4.0).abs() < 0.0001);
+        assert!((caster.hp - 12.0).abs() < 0.0001);
+        assert!((caster.healing_taken_this_turn - 2.0).abs() < 0.0001);
         let target = &manager.player_characters["target"];
-        assert!((target.hp - 4.0).abs() < 0.0001);
-        assert!((target.healing_taken_this_turn - 4.0).abs() < 0.0001);
+        assert!((target.hp - 20.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 2.0).abs() < 0.0001);
     }
 
     #[test]
@@ -16464,7 +16450,7 @@ mod tests {
         manager
             .player_characters
             .insert("target".to_owned(), PlayerCharacter {
-                hp: 0.0,
+                hp: 18.0,
                 max_hp: 20.0,
                 skill_names: vec!["互帮互助".to_owned()],
                 skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
@@ -16504,11 +16490,11 @@ mod tests {
         ));
 
         let caster = &manager.player_characters["caster"];
-        assert!((caster.hp - 14.0).abs() < 0.0001);
-        assert!((caster.healing_taken_this_turn - 4.0).abs() < 0.0001);
+        assert!((caster.hp - 12.0).abs() < 0.0001);
+        assert!((caster.healing_taken_this_turn - 2.0).abs() < 0.0001);
         let target = &manager.player_characters["target"];
-        assert!((target.hp - 4.0).abs() < 0.0001);
-        assert!((target.healing_taken_this_turn - 4.0).abs() < 0.0001);
+        assert!((target.hp - 20.0).abs() < 0.0001);
+        assert!((target.healing_taken_this_turn - 2.0).abs() < 0.0001);
     }
 
     #[test]
