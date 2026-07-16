@@ -678,6 +678,13 @@ struct BattleDefeatOutcome {
     defeated_max_hp: f32,
 }
 
+struct BattleDamageResolution {
+    damage_applied: f32,
+    damage_absorbed: f32,
+    undying_rage_triggered: bool,
+    defeat_outcome: Option<BattleDefeatOutcome>,
+}
+
 fn participant_defeat_outcome(
     participant: &mut BattleParticipantSnapshot,
     was_alive: bool,
@@ -697,7 +704,7 @@ fn apply_participant_damage_for_battle(
     participant: &mut BattleParticipantSnapshot,
     amount: f32,
     source_id: &str,
-) -> Option<BattleDefeatOutcome> {
+) -> BattleDamageResolution {
     let incoming_amount = amount.max(0.0);
     let available_overhealing_shield = participant.overhealing_shield.max(0.0);
     let overhealing_absorbed = available_overhealing_shield.min(incoming_amount);
@@ -711,6 +718,7 @@ fn apply_participant_damage_for_battle(
     let absorbed = available_shield.min(after_overhealing_shield);
     participant.arcane_shield = available_shield - absorbed;
     let mut final_amount = (after_overhealing_shield - absorbed).max(0.0);
+    let mut undying_rage_triggered = false;
     let within_undying_rage_limit =
         participant.max_hp > f32::EPSILON && final_amount <= participant.max_hp + f32::EPSILON;
     if participant.undying_rage_active && within_undying_rage_limit {
@@ -723,10 +731,16 @@ fn apply_participant_damage_for_battle(
     {
         participant.undying_rage_used = true;
         participant.undying_rage_active = true;
+        undying_rage_triggered = true;
         final_amount = 0.0;
     }
     if final_amount <= f32::EPSILON {
-        return None;
+        return BattleDamageResolution {
+            damage_applied: 0.0,
+            damage_absorbed: incoming_amount,
+            undying_rage_triggered,
+            defeat_outcome: None,
+        };
     }
     let was_alive = participant.alive;
     record_participant_damage_taken(participant, final_amount);
@@ -737,7 +751,12 @@ fn apply_participant_damage_for_battle(
     }
     participant.hp = (participant.hp - final_amount).max(0.0);
     participant.alive = participant.hp > 0.0;
-    participant_defeat_outcome(participant, was_alive)
+    BattleDamageResolution {
+        damage_applied: final_amount,
+        damage_absorbed: (incoming_amount - final_amount).max(0.0),
+        undying_rage_triggered,
+        defeat_outcome: participant_defeat_outcome(participant, was_alive),
+    }
 }
 
 fn apply_penance_kill_assists(
@@ -958,11 +977,12 @@ fn advance_participant_delayed_damage_ticks(
         if final_amount <= f32::EPSILON {
             continue;
         }
-        if let Some(outcome) = apply_participant_damage_for_battle(
+        let resolution = apply_participant_damage_for_battle(
             participant,
             final_amount,
             &tick.source_id,
-        ) {
+        );
+        if let Some(outcome) = resolution.defeat_outcome {
             advance.defeat_outcomes.push(outcome);
         }
         advance.logs.push(format!(
@@ -970,9 +990,21 @@ fn advance_participant_delayed_damage_ticks(
             tick.source_name,
             tick.name,
             display_name,
-            format_number(final_amount),
+            format_number(resolution.damage_applied),
             battle_damage_type_label(tick.damage_type)
         ));
+        if resolution.undying_rage_triggered {
+            advance.logs.push(format!(
+                "{}触发不死者之怒，免疫本次致命伤害",
+                display_name
+            ));
+        } else if resolution.damage_absorbed > f32::EPSILON {
+            advance.logs.push(format!(
+                "{}吸收{}点伤害",
+                display_name,
+                format_number(resolution.damage_absorbed)
+            ));
+        }
     }
     advance
 }
@@ -2176,16 +2208,28 @@ impl BattleRoundStore {
             return false;
         };
         let final_damage = damage.max(0.0);
-        let defeat_outcome = apply_participant_damage_for_battle(target, final_damage, actor_id);
+        let resolution = apply_participant_damage_for_battle(target, final_damage, actor_id);
         let target_display_name = target.display_name.clone();
         encounter.action_log.push(format!(
             "{}对{}使用{}，造成{}点伤害",
             actor_name,
             target_display_name,
             action_name,
-            format_number(final_damage)
+            format_number(resolution.damage_applied)
         ));
-        if let Some(outcome) = defeat_outcome {
+        if resolution.undying_rage_triggered {
+            encounter.action_log.push(format!(
+                "{}触发不死者之怒，免疫本次致命伤害",
+                target_display_name
+            ));
+        } else if resolution.damage_absorbed > f32::EPSILON {
+            encounter.action_log.push(format!(
+                "{}吸收{}点伤害",
+                target_display_name,
+                format_number(resolution.damage_absorbed)
+            ));
+        }
+        if let Some(outcome) = resolution.defeat_outcome {
             apply_battle_defeat_outcome(encounter, outcome);
         }
         true
@@ -2432,15 +2476,16 @@ impl BattleRoundStore {
                         let endless_pain_bonus = if final_amount > f32::EPSILON
                             && pending_endless_pain_bonus_damage > f32::EPSILON
                         {
-                            let bonus = pending_endless_pain_bonus_damage;
-                            pending_endless_pain_bonus_damage = 0.0;
-                            consumed_endless_pain_stacks =
-                                actor_snapshot.endless_pain_stacks.min(2);
-                            bonus
+                            pending_endless_pain_bonus_damage
                         } else {
                             0.0
                         };
                         let resolved_amount = final_amount + endless_pain_bonus;
+                        let physical_damage_share = if resolved_amount > f32::EPSILON {
+                            (final_amount / resolved_amount).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
                         let (final_amount, delayed_liquid_body_damage) =
                             participant_liquid_body_split_damage(target, resolved_amount);
                         let target_display_name = target.display_name.clone();
@@ -2454,25 +2499,37 @@ impl BattleRoundStore {
                                 damage_type,
                             );
                         }
-                        let defeat_outcome =
+                        let resolution =
                             apply_participant_damage_for_battle(target, final_amount, actor_id);
-                        if final_amount > f32::EPSILON
+                        let applied_physical_damage =
+                            resolution.damage_applied * physical_damage_share;
+                        let endless_pain_damage_committed = endless_pain_bonus > f32::EPSILON
+                            && (resolution.damage_applied > f32::EPSILON
+                                || delayed_liquid_body_damage > f32::EPSILON);
+                        if endless_pain_damage_committed {
+                            pending_endless_pain_bonus_damage = 0.0;
+                            consumed_endless_pain_stacks =
+                                actor_snapshot.endless_pain_stacks.min(2);
+                        }
+                        if resolution.damage_applied > f32::EPSILON
                             && actor_damage_dealt_buffs
                                 .iter()
                                 .any(|buff| buff.name == "溃伤")
                         {
                             target.wound_healing_taken_turns = 1;
                         }
-                        if final_amount > f32::EPSILON && damage_type == DamageType::Physical {
+                        if applied_physical_damage > f32::EPSILON
+                            && damage_type == DamageType::Physical
+                        {
                             pending_actor_lifesteal +=
-                                typed_final_amount * actor_physical_damage_lifesteal;
+                                applied_physical_damage * actor_physical_damage_lifesteal;
                             if actor_physical_damage_followup_rate > f32::EPSILON {
                                 schedule_participant_delayed_damage(
                                     target,
                                     actor_id,
                                     &actor_name,
                                     "苏萨斯之爪",
-                                    final_amount * actor_physical_damage_followup_rate,
+                                    applied_physical_damage * actor_physical_damage_followup_rate,
                                     DamageType::Magical,
                                 );
                             }
@@ -2482,7 +2539,7 @@ impl BattleRoundStore {
                             actor_name,
                             target_display_name,
                             skill.name,
-                            format_number(final_amount)
+                            format_number(resolution.damage_applied)
                         ));
                         if evaded_by_keen_evasion {
                             encounter.action_log.push(format!(
@@ -2497,14 +2554,26 @@ impl BattleRoundStore {
                                 format_number(delayed_liquid_body_damage)
                             ));
                         }
-                        if endless_pain_bonus > f32::EPSILON {
+                        if resolution.undying_rage_triggered {
+                            encounter.action_log.push(format!(
+                                "{}触发不死者之怒，免疫本次致命伤害",
+                                target_display_name
+                            ));
+                        } else if resolution.damage_absorbed > f32::EPSILON {
+                            encounter.action_log.push(format!(
+                                "{}吸收{}点伤害",
+                                target_display_name,
+                                format_number(resolution.damage_absorbed)
+                            ));
+                        }
+                        if endless_pain_damage_committed {
                             encounter.action_log.push(format!(
                                 "{}触发无尽痛楚，追加{}点无类型伤害",
                                 actor_name,
                                 format_number(endless_pain_bonus)
                             ));
                         }
-                        if final_amount > f32::EPSILON
+                        if resolution.damage_applied > f32::EPSILON
                             && infinite_focus_target_id.as_deref()
                                 == Some(resolved_target_id.as_str())
                         {
@@ -2517,7 +2586,7 @@ impl BattleRoundStore {
                                 ));
                             }
                         }
-                        if let Some(outcome) = defeat_outcome {
+                        if let Some(outcome) = resolution.defeat_outcome {
                             apply_battle_defeat_outcome(encounter, outcome);
                         }
                     }
@@ -3293,7 +3362,7 @@ fn apply_battle_buff_ticks(
                         .unwrap_or(1.0);
                 let final_amount =
                     (amount.max(0.0) * source_multiplier * target_multiplier).max(0.0);
-                let outcome = apply_participant_damage_for_battle(
+                let resolution = apply_participant_damage_for_battle(
                     &mut encounter.participants[target_index],
                     final_amount,
                     &tick.source_id,
@@ -3302,15 +3371,27 @@ fn apply_battle_buff_ticks(
                     "状态触发：{}对{}造成{}点伤害",
                     source_name,
                     target_name,
-                    format_number(final_amount)
+                    format_number(resolution.damage_applied)
                 ));
-                if let Some(outcome) = outcome {
+                if resolution.undying_rage_triggered {
+                    encounter.action_log.push(format!(
+                        "{}触发不死者之怒，免疫本次致命伤害",
+                        target_name
+                    ));
+                } else if resolution.damage_absorbed > f32::EPSILON {
+                    encounter.action_log.push(format!(
+                        "{}吸收{}点伤害",
+                        target_name,
+                        format_number(resolution.damage_absorbed)
+                    ));
+                }
+                if let Some(outcome) = resolution.defeat_outcome {
                     apply_battle_defeat_outcome(encounter, outcome);
                 }
             },
             BuffTickAction::FixedDamage { amount, .. } => {
                 let final_amount = amount.max(0.0);
-                let outcome = apply_participant_damage_for_battle(
+                let resolution = apply_participant_damage_for_battle(
                     &mut encounter.participants[target_index],
                     final_amount,
                     &tick.source_id,
@@ -3319,9 +3400,21 @@ fn apply_battle_buff_ticks(
                     "状态触发：{}对{}造成{}点固定伤害",
                     source_name,
                     target_name,
-                    format_number(final_amount)
+                    format_number(resolution.damage_applied)
                 ));
-                if let Some(outcome) = outcome {
+                if resolution.undying_rage_triggered {
+                    encounter.action_log.push(format!(
+                        "{}触发不死者之怒，免疫本次致命伤害",
+                        target_name
+                    ));
+                } else if resolution.damage_absorbed > f32::EPSILON {
+                    encounter.action_log.push(format!(
+                        "{}吸收{}点伤害",
+                        target_name,
+                        format_number(resolution.damage_absorbed)
+                    ));
+                }
+                if let Some(outcome) = resolution.defeat_outcome {
                     apply_battle_defeat_outcome(encounter, outcome);
                 }
             },
@@ -7148,13 +7241,17 @@ mod tests {
         let mut participant = participant_from_target("target", &manager);
 
         assert!((participant.arcane_shield - 5.0).abs() < 0.0001);
-        assert!(apply_participant_damage_for_battle(&mut participant, 3.0, "enemy").is_none());
+        let resolution = apply_participant_damage_for_battle(&mut participant, 3.0, "enemy");
+        assert!(resolution.defeat_outcome.is_none());
+        assert!((resolution.damage_applied - 0.0).abs() < 0.0001);
         assert!((participant.arcane_shield - 2.0).abs() < 0.0001);
         assert!((participant.hp - 20.0).abs() < 0.0001);
         assert!((participant.damage_taken_this_turn - 0.0).abs() < 0.0001);
         assert!(participant.damage_contributors.is_empty());
 
-        assert!(apply_participant_damage_for_battle(&mut participant, 4.0, "enemy").is_none());
+        let resolution = apply_participant_damage_for_battle(&mut participant, 4.0, "enemy");
+        assert!(resolution.defeat_outcome.is_none());
+        assert!((resolution.damage_applied - 2.0).abs() < 0.0001);
         assert!((participant.arcane_shield - 0.0).abs() < 0.0001);
         assert!((participant.hp - 18.0).abs() < 0.0001);
         assert!((participant.damage_taken_this_turn - 2.0).abs() < 0.0001);
@@ -7204,7 +7301,9 @@ mod tests {
             .iter_mut()
             .find(|participant| participant.target_id == "a")
             .unwrap();
-        assert!(apply_participant_damage_for_battle(actor, 20.0, "enemy").is_none());
+        let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy");
+        assert!(resolution.defeat_outcome.is_none());
+        assert!(resolution.undying_rage_triggered);
         assert!((actor.hp - 20.0).abs() < 0.0001);
         assert!(actor.undying_rage_used);
         assert!(actor.undying_rage_active);
@@ -7246,7 +7345,9 @@ mod tests {
             .iter_mut()
             .find(|participant| participant.target_id == "a")
             .unwrap();
-        assert!(apply_participant_damage_for_battle(actor, 20.0, "enemy").is_none());
+        let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy");
+        assert!(resolution.defeat_outcome.is_none());
+        assert!((resolution.damage_applied - 0.0).abs() < 0.0001);
         assert!((actor.hp - 20.0).abs() < 0.0001);
 
         assert!(store.next_round("battle"));
@@ -7259,13 +7360,174 @@ mod tests {
             .find(|participant| participant.target_id == "a")
             .unwrap();
         assert!(!actor.undying_rage_active);
-        assert!(apply_participant_damage_for_battle(actor, 20.0, "enemy").is_some());
+        let resolution = apply_participant_damage_for_battle(actor, 20.0, "enemy");
+        assert!(resolution.defeat_outcome.is_some());
         assert!(!actor.alive);
 
         let mut oversized = participant_from_character("a", &actor_character, &manager);
-        assert!(apply_participant_damage_for_battle(&mut oversized, 21.0, "enemy").is_some());
+        let resolution = apply_participant_damage_for_battle(&mut oversized, 21.0, "enemy");
+        assert!(resolution.defeat_outcome.is_some());
         assert!(!oversized.alive);
         assert!(!oversized.undying_rage_used);
+    }
+
+    #[test]
+    fn shield_absorption_gates_post_hit_talents_and_logs_applied_damage() {
+        let mut manager = empty_manager();
+        let actor_character = PlayerCharacter {
+            hp: 90.0,
+            max_hp: 100.0,
+            level: 4,
+            skill_names: vec![
+                "溃伤".to_owned(),
+                "禅宗古训".to_owned(),
+                "苏萨斯之爪".to_owned(),
+                "无限专注".to_owned(),
+                "无尽痛楚".to_owned(),
+            ],
+            skill_metadata: (0..5)
+                .map(|_| crate::napcat::CharacterSkillMetadata::talent("normal_talent", "天赋"))
+                .collect(),
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), actor_character.clone());
+        let mut actor = participant_from_character("a", &actor_character, &manager);
+        actor.endless_pain_stacks = 2;
+        let mut fully_shielded = participant("b", 0);
+        fully_shielded.hp = 100.0;
+        fully_shielded.max_hp = 100.0;
+        fully_shielded.arcane_shield = 50.0;
+        let mut partly_shielded = participant("c", 0);
+        partly_shielded.hp = 100.0;
+        partly_shielded.max_hp = 100.0;
+        partly_shielded.arcane_shield = 5.0;
+        let mut liquid_body_shielded = participant("d", 0);
+        liquid_body_shielded.hp = 100.0;
+        liquid_body_shielded.max_hp = 100.0;
+        liquid_body_shielded.arcane_shield = 11.0;
+        liquid_body_shielded.liquid_body_damage_delay_rate = 0.5;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![actor, fully_shielded, partly_shielded, liquid_body_shielded],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "护盾测试击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((actor.hp - 90.0).abs() < 0.0001);
+        assert_eq!(actor.endless_pain_stacks, 2);
+        assert_eq!(actor.infinite_focus_stacks, 0);
+        assert!((target.hp - 100.0).abs() < 0.0001);
+        assert_eq!(target.wound_healing_taken_turns, 0);
+        assert!(target.delayed_damage_ticks.is_empty());
+        assert!(
+            encounter.action_log.iter().any(|entry| {
+                entry.contains("护盾测试击") && entry.contains("造成0点伤害")
+            })
+        );
+        assert!(encounter
+            .action_log
+            .iter()
+            .any(|entry| entry.contains("吸收22点伤害")));
+
+        store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap()
+            .endless_pain_stacks = 0;
+        assert!(store.record_skill_use("battle", "a", "c", &skill, &manager, None));
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "c")
+            .unwrap();
+        assert!((actor.hp - 90.75).abs() < 0.0001);
+        assert_eq!(
+            actor.infinite_focus_target_id.as_deref(),
+            Some("c")
+        );
+        assert_eq!(actor.infinite_focus_stacks, 1);
+        assert!((target.hp - 95.0).abs() < 0.0001);
+        assert_eq!(target.wound_healing_taken_turns, 1);
+        assert_eq!(target.delayed_damage_ticks.len(), 1);
+        assert!((target.delayed_damage_ticks[0].amount - 1.75).abs() < 0.0001);
+        assert!(
+            encounter.action_log.iter().any(|entry| {
+                entry.contains("护盾测试击") && entry.contains("造成5点伤害")
+            })
+        );
+
+        store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap()
+            .endless_pain_stacks = 2;
+        assert!(store.record_skill_use("battle", "a", "d", &skill, &manager, None));
+        let encounter = &store.encounters["battle"];
+        let actor = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "d")
+            .unwrap();
+        assert!((actor.hp - 90.75).abs() < 0.0001);
+        assert_eq!(actor.endless_pain_stacks, 0);
+        assert_eq!(
+            actor.infinite_focus_target_id.as_deref(),
+            Some("c")
+        );
+        assert_eq!(actor.infinite_focus_stacks, 1);
+        assert!((target.hp - 100.0).abs() < 0.0001);
+        assert_eq!(target.wound_healing_taken_turns, 0);
+        assert_eq!(target.delayed_damage_ticks.len(), 1);
+        assert!((target.delayed_damage_ticks[0].amount - 11.0).abs() < 0.0001);
     }
 
     #[test]
@@ -7333,7 +7595,9 @@ mod tests {
             target.overhealing_shield_turns_remaining,
             2
         );
-        assert!(apply_participant_damage_for_battle(target, 20.0, "enemy").is_none());
+        let resolution = apply_participant_damage_for_battle(target, 20.0, "enemy");
+        assert!(resolution.defeat_outcome.is_none());
+        assert!((resolution.damage_applied - 0.0).abs() < 0.0001);
         assert!((target.hp - 100.0).abs() < 0.0001);
         assert!((target.overhealing_shield - 10.0).abs() < 0.0001);
         assert!((target.damage_taken_this_turn - 0.0).abs() < 0.0001);

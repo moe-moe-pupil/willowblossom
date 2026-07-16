@@ -39,6 +39,8 @@ Additional 2026-07-16 update: `过度治疗` approved-talent battle healing now 
 
 Additional 2026-07-16 update: `不死者之怒` approved-talent battle participants now negate their first lethal post-shield hit per encounter when the remaining damage does not exceed maximum HP. The resulting 100% damage reduction and +10% outgoing damage remain active until the next battle-round boundary; oversized hits bypass the effect, and negated hits do not create damage-taken stacks or contributor credit. The old Moonberry commit stored this talent as description-only data, so these runtime edge semantics follow its preserved wording explicitly. Focused verification passes with `cargo test --lib -j 1 undying_rage -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 388 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 update: battle damage now returns a shared typed resolution containing applied damage, absorbed damage, lethal outcome, and `不死者之怒` activation. Manual actions, parsed skills, delayed damage, and buff ticks log post-absorption damage. Parsed-skill `溃伤`, `禅宗古训`, `苏萨斯之爪`, and `无限专注` now require positive applied damage; `无尽痛楚` stacks remain when a shield absorbs the entire effect, but are consumed when `液态躯体` commits part of that bonus to delayed damage. Lifesteal and delayed physical follow-up scale from the applied physical share instead of the pre-shield amount. Focused verification passes with `cargo test --lib -j 1 shield_absorption_gates -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 389 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
@@ -337,6 +339,8 @@ Additional implemented talent execution: `奥术护盾` now grants battle entran
 Additional implemented talent execution: `过度治疗` now converts battle overheal into one-round encounter-local shielding capped at 30% of the healed target's maximum HP across immediate and delayed healing paths.
 
 Additional implemented talent execution: `不死者之怒` now provides one encounter-local lethal-hit negation, same-round damage immunity, and +10% outgoing damage, while hits above maximum HP bypass it.
+
+Battle damage resolution now distinguishes attempted, absorbed, and applied damage so shields/evasion do not falsely trigger successful-hit talent effects or inflate combat logs.
 
 6. Import/export is partial.
 
