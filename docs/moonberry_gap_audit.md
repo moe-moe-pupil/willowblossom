@@ -83,6 +83,8 @@ Additional 2026-07-16 update: `以逸待劳` approved-talent participants now pe
 
 Additional 2026-07-16 correction: parsed-battle delayed damage now removes each scheduled tick immediately after its one intended execution. `苏萨斯之爪` and `液态躯体` still fire at the next round boundary, but no longer leave an already-applied amount displayed and persisted for another round. Compatibility is preserved for saved encounters: a pre-fire legacy tick at countdown `2` executes once and is removed, while an already-fired stale tick at countdown `1` expires without repeating its damage. Focused verification passes with `cargo test --lib -j 1 sousas -- --nocapture` and `cargo test --lib -j 1 liquid_body -- --nocapture`: 3 and 1 passed respectively, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 394 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: manual battle-roster `存活` edits now preserve the combat HP/alive invariant across character synchronization. Marking a participant defeated sets HP to zero and ends any active `希望化身`; marking a valid zero-HP participant alive restores one HP. A later manager refresh therefore no longer silently revives a manually defeated positive-HP snapshot or immediately defeats a manually revived zero-HP snapshot. Focused verification passes with `cargo test --lib -j 1 manual_alive_edits_keep_hp_and_refresh_state_consistent -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 396 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:

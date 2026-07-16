@@ -2134,7 +2134,11 @@ fn encounter_roster_ui(
             changed |= ui
                 .add(egui::DragValue::new(&mut participant.max_mp).speed(1.0))
                 .changed();
-            changed |= ui.checkbox(&mut participant.alive, "存活").changed();
+            let mut alive = participant.alive;
+            if ui.checkbox(&mut alive, "存活").changed() {
+                set_participant_alive_after_manual_edit(participant, alive);
+                changed = true;
+            }
             ui.small(format!(
                 "本轮承伤 {} / 受疗 {}",
                 format_number(participant.damage_taken_this_turn),
@@ -4911,10 +4915,23 @@ fn normalize_encounter_after_edit(encounter: &mut BattleEncounter) {
         participant.mp = participant.mp.clamp(0.0, participant.max_mp);
         participant.damage_taken_this_turn = participant.damage_taken_this_turn.max(0.0);
         participant.healing_taken_this_turn = participant.healing_taken_this_turn.max(0.0);
-        if participant.hp <= 0.0 && !participant_hope_avatar_active(participant) {
-            participant.alive = false;
-        }
+        participant.alive = participant.hp > 0.0 || participant_hope_avatar_active(participant);
     }
+}
+
+fn set_participant_alive_after_manual_edit(
+    participant: &mut BattleParticipantSnapshot,
+    alive: bool,
+) {
+    if alive {
+        participant.hp = participant.hp.max(1.0).min(participant.max_hp.max(0.0));
+        participant.alive = participant.hp > 0.0;
+        return;
+    }
+
+    participant.hp = 0.0;
+    participant.alive = false;
+    participant.hope_avatar_rounds_remaining = 0;
 }
 
 fn available_group_players(
@@ -6056,6 +6073,54 @@ mod tests {
         assert_eq!(group.player_turns["a"].turns_passed, 4);
         assert!(group.player_turns["a"].acted);
         assert!(!group.player_turns["a"].skipped);
+    }
+
+    #[test]
+    fn manual_alive_edits_keep_hp_and_refresh_state_consistent() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("a".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        let mut player = participant("a", 0);
+        player.player_character = true;
+        player.hope_avatar_rounds_remaining = 2;
+
+        set_participant_alive_after_manual_edit(&mut player, false);
+        assert_eq!(player.hp, 0.0);
+        assert!(!player.alive);
+        assert_eq!(player.hope_avatar_rounds_remaining, 0);
+
+        let mut encounter = BattleEncounter {
+            participants: vec![player],
+            ..Default::default()
+        };
+        assert!(sync_encounter_to_manager(
+            Some(&encounter),
+            &mut manager
+        ));
+        sync_participant_from_manager_with_vitals(&mut encounter.participants[0], &manager);
+        assert_eq!(encounter.participants[0].hp, 0.0);
+        assert!(!encounter.participants[0].alive);
+
+        encounter.participants[0].hp = 5.0;
+        normalize_encounter_after_edit(&mut encounter);
+        assert!(encounter.participants[0].alive);
+        set_participant_alive_after_manual_edit(&mut encounter.participants[0], false);
+
+        set_participant_alive_after_manual_edit(&mut encounter.participants[0], true);
+        assert_eq!(encounter.participants[0].hp, 1.0);
+        assert!(encounter.participants[0].alive);
+        assert!(sync_encounter_to_manager(
+            Some(&encounter),
+            &mut manager
+        ));
+        sync_participant_from_manager_with_vitals(&mut encounter.participants[0], &manager);
+        assert_eq!(encounter.participants[0].hp, 1.0);
+        assert!(encounter.participants[0].alive);
     }
 
     #[test]
