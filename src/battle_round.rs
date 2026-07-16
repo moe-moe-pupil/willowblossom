@@ -2210,6 +2210,9 @@ impl BattleRoundStore {
             {
                 delayed_logs.push(log);
             }
+            if participant.wound_healing_taken_turns > 0 {
+                participant.wound_healing_taken_turns -= 1;
+            }
             if participant.alive {
                 if !encounter.active {
                     participant.hp =
@@ -6627,7 +6630,7 @@ mod tests {
             .unwrap();
         assert!((target.hp - 13.0).abs() < 0.0001);
 
-        assert!(store.advance_participant("battle", "b", false));
+        assert!(store.next_round("battle"));
         let target = store.encounters["battle"]
             .participants
             .iter()

@@ -43,6 +43,8 @@ Additional 2026-07-16 update: battle damage now returns a shared typed resolutio
 
 Additional 2026-07-16 update: `希望化身` approved-talent battle participants now transform on their first lethal post-shield hit, remain actionable at 0 HP, become immune to subsequent damage, and may use healing effects but not normal attacks or damaging skills. The encounter-local state persists across saves and expires at the second battle-round boundary after activation, forcing death and resolving the original damage contributors normally. The old Moonberry source stored this as description-only data; Willowblossom does not yet model channeled casts, so the described channel interruption has no executable state to cancel. Focused verification passes with `cargo test --lib -j 1 hope_avatar -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 390 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: `溃伤`'s one-round healing-received penalty now expires in the global `next_round` path used by the battle UI. Its regression now proves reduced healing during the hit round and normal healing after the next global round boundary instead of exercising only the unused per-participant advance helper. Focused verification passes with `cargo test --lib -j 1 wound_healing_taken_debuff -- --nocapture`: 1 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 390 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
