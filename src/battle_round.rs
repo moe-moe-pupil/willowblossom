@@ -3048,33 +3048,12 @@ impl BattleRoundStore {
                             continue;
                         };
                         let target_character = character_for_participant(target, manager);
-                        let target_damage_multiplier = target.damage_taken_modifier
-                            * champion_damage_taken_multiplier(
-                                target.champion_damage_reduction_per_stack,
-                                target.champion_stacks,
-                            )
-                            * target_character
-                                .as_ref()
-                                .map(|character| {
-                                    character_damage_taken_attribute_multiplier(
-                                        character,
-                                        trpg_damage_taken_kind(damage_type),
-                                    )
-                                })
-                                .unwrap_or(1.0)
-                            * if encounter.active {
-                                target_character
-                                    .as_ref()
-                                    .map(|character| {
-                                        character_fighting_spirit_damage_taken_multiplier(
-                                            character,
-                                            target.combat_turns_completed,
-                                        )
-                                    })
-                                    .unwrap_or(1.0)
-                            } else {
-                                1.0
-                            };
+                        let target_damage_multiplier = participant_damage_taken_multiplier(
+                            target,
+                            target_character.as_ref(),
+                            damage_type,
+                            encounter.active,
+                        );
                         let infinite_focus_multiplier = if infinite_focus_target_id.as_deref()
                             == Some(resolved_target_id.as_str())
                         {
@@ -4172,18 +4151,26 @@ fn apply_battle_buff_ticks(
                             })
                             .unwrap_or(1.0)
                     });
-                let target_multiplier = encounter.participants[target_index].damage_taken_modifier
-                    * target_character
-                        .as_ref()
-                        .map(|target| {
-                            character_damage_taken_attribute_multiplier(
-                                target,
-                                trpg_damage_taken_kind(damage_type),
-                            )
-                        })
-                        .unwrap_or(1.0);
-                let final_amount =
+                let target = &encounter.participants[target_index];
+                let target_multiplier = participant_damage_taken_multiplier(
+                    target,
+                    target_character.as_ref(),
+                    damage_type,
+                    encounter.active,
+                );
+                let incoming_amount =
                     (amount.max(0.0) * source_multiplier * target_multiplier).max(0.0);
+                let target_large_hit_modifier = target_character
+                    .as_ref()
+                    .map(character_large_hit_damage_taken_modifier)
+                    .unwrap_or(1.0);
+                let final_amount = (incoming_amount
+                    * large_hit_damage_taken_multiplier(
+                        target.max_hp,
+                        incoming_amount,
+                        target_large_hit_modifier,
+                    ))
+                .max(0.0);
                 let resolution = apply_participant_damage_for_battle(
                     &mut encounter.participants[target_index],
                     final_amount,
@@ -5500,6 +5487,39 @@ fn participant_damage_multiplier(
             character
                 .map(|character| {
                     character_valorous_battle_damage_multiplier(character, completed_turns)
+                })
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        }
+}
+
+fn participant_damage_taken_multiplier(
+    participant: &BattleParticipantSnapshot,
+    character: Option<&PlayerCharacter>,
+    damage_type: DamageType,
+    encounter_active: bool,
+) -> f32 {
+    participant.damage_taken_modifier
+        * champion_damage_taken_multiplier(
+            participant.champion_damage_reduction_per_stack,
+            participant.champion_stacks,
+        )
+        * character
+            .map(|character| {
+                character_damage_taken_attribute_multiplier(
+                    character,
+                    trpg_damage_taken_kind(damage_type),
+                )
+            })
+            .unwrap_or(1.0)
+        * if encounter_active {
+            character
+                .map(|character| {
+                    character_fighting_spirit_damage_taken_multiplier(
+                        character,
+                        participant.combat_turns_completed,
+                    )
                 })
                 .unwrap_or(1.0)
         } else {
@@ -9738,6 +9758,63 @@ mod tests {
             .unwrap();
         assert!((healing_target.hp - 11.5).abs() < 0.0001);
         assert!((healing_target.healing_taken_this_turn - 11.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn battle_buff_damage_uses_shared_encounter_target_mitigation() {
+        let mut manager = empty_manager();
+        let source_character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 10.0,
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["斗志昂扬".to_owned(), "过度免疫".to_owned()],
+            skill_metadata: vec![
+                crate::napcat::CharacterSkillMetadata::talent("normal_talent", "天赋"),
+                crate::napcat::CharacterSkillMetadata::talent("normal_talent", "天赋"),
+            ],
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "source".to_owned(),
+            source_character.clone(),
+        );
+        manager.player_characters.insert(
+            "target".to_owned(),
+            target_character.clone(),
+        );
+        let source = participant_from_character("source", &source_character, &manager);
+        let mut target = participant_from_character("target", &target_character, &manager);
+        target.champion_damage_reduction_per_stack = 0.10;
+        target.champion_stacks = 1;
+        let mut encounter = BattleEncounter {
+            name: "battle".to_owned(),
+            active: true,
+            participants: vec![source, target],
+            ..Default::default()
+        };
+
+        apply_battle_buff_ticks(&mut encounter, &manager, &[
+            BattleBuffTick {
+                source_id: "source".to_owned(),
+                target_id: "target".to_owned(),
+                action: BuffTickAction::Damage {
+                    amount: 50.0,
+                    damage_type: DamageType::Physical,
+                },
+            },
+        ]);
+
+        let target = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        assert!((target.hp - 82.0).abs() < 0.0001);
+        assert!((target.damage_taken_this_turn - 18.0).abs() < 0.0001);
     }
 
     #[test]

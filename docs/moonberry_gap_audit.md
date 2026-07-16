@@ -99,6 +99,8 @@ Additional 2026-07-16 correction: `生死时速` now belongs to the healer, matc
 
 Additional 2026-07-16 correction: continuing battle buff damage and healing now use the shared encounter-participant source multiplier pipeline instead of a partial duplicate based mostly on the durable character. Damage ticks therefore honor active encounter state such as `振奋`, `狂妄`, `总冠军`, `越战越勇`, and `不死者之怒`; healing ticks honor encounter-local `忏悔` decay; and both use the encounter's campaign stat configuration and current source vitals while retaining talent metadata. Sources outside the encounter retain the prior character-based fallback. Focused verification passes with `cargo test --lib buff_tick`: 3 passed, 0 failed. Full library verification passes with `cargo test --lib --quiet`: 407 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-16 correction: continuing typed battle damage now uses the same target mitigation pipeline as parsed skills. Buff damage ticks honor encounter-local `总冠军` reduction, active-turn `斗志昂扬` reduction, typed talent defenses, and the post-multiplier large-hit threshold for `过度免疫`; fixed damage remains intentionally unmodified. The direct-skill path now calls the same shared target helper, preventing the two delivery paths from drifting again. Focused verification passes for the combined buff-damage regression plus the existing parsed `斗志昂扬` and `过度免疫` regressions. Full library verification passes with `cargo test --lib --quiet`: 408 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
