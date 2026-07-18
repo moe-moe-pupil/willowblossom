@@ -3531,6 +3531,19 @@ impl NapcatMessageManager {
             .filter(|group| group.players.iter().any(|player_id| player_id == target_id))
     }
 
+    pub fn group_for_player_target(&self, target_id: &str) -> Option<&TrpgGroup> {
+        if let Some(group) = self.current_group_for_player(target_id) {
+            return Some(group);
+        }
+
+        let mut groups = self
+            .trpg_groups
+            .values()
+            .filter(|group| group.players.iter().any(|player_id| player_id == target_id));
+        let group = groups.next()?;
+        groups.next().is_none().then_some(group)
+    }
+
     fn group_for_message_target(
         &self,
         target_id: &str,
@@ -3582,7 +3595,7 @@ impl NapcatMessageManager {
     }
 
     pub fn character_creation_config_for_target(&self, target_id: &str) -> (i32, i32) {
-        self.current_group_for_player(target_id)
+        self.group_for_player_target(target_id)
             .map(|group| {
                 (
                     group.initial_status_points.max(0),
@@ -3598,7 +3611,7 @@ impl NapcatMessageManager {
     }
 
     pub fn character_stat_config_for_target(&self, target_id: &str) -> TrpgBasicConfig {
-        self.current_group_for_player(target_id)
+        self.group_for_player_target(target_id)
             .map(|group| group.basic_config)
             .unwrap_or_default()
     }
@@ -6146,12 +6159,13 @@ fn format_private_character_cooldowns(
 }
 
 fn format_private_channel_members(manager: &NapcatMessageManager, target_id: &str) -> String {
-    let Some(group) = manager.current_group() else {
-        return "当前没有TRPG组。".to_owned();
+    let Some(group) = manager.group_for_player_target(target_id) else {
+        return if manager.trpg_groups.is_empty() {
+            "当前没有TRPG组。".to_owned()
+        } else {
+            "你还没有加入当前TRPG组。".to_owned()
+        };
     };
-    if !group.players.iter().any(|player_id| player_id == target_id) {
-        return "你还没有加入当前TRPG组。".to_owned();
-    }
 
     let access = target_id
         .parse::<u64>()
@@ -6179,12 +6193,13 @@ fn format_private_channel_members(manager: &NapcatMessageManager, target_id: &st
 }
 
 fn format_private_group_guide(manager: &NapcatMessageManager, target_id: &str) -> String {
-    let Some(group) = manager.current_group() else {
-        return "当前没有TRPG组。".to_owned();
+    let Some(group) = manager.group_for_player_target(target_id) else {
+        return if manager.trpg_groups.is_empty() {
+            "当前没有TRPG组。".to_owned()
+        } else {
+            "你还没有加入当前TRPG组。".to_owned()
+        };
     };
-    if !group.players.iter().any(|player_id| player_id == target_id) {
-        return "你还没有加入当前TRPG组。".to_owned();
-    }
 
     let guide = group.guide.trim();
     if guide.is_empty() {
@@ -6245,9 +6260,7 @@ fn character_skill_display_name(character: &PlayerCharacter, index: usize) -> St
 
 fn current_player_cooldown_turn(manager: &NapcatMessageManager, target_id: &str) -> u32 {
     manager
-        .trpg_groups
-        .values()
-        .filter(|group| group.players.iter().any(|player_id| player_id == target_id))
+        .group_for_player_target(target_id)
         .map(|group| {
             group
                 .player_turns
@@ -6255,7 +6268,6 @@ fn current_player_cooldown_turn(manager: &NapcatMessageManager, target_id: &str)
                 .map(|turn| turn.turns_passed)
                 .unwrap_or(group.world_turn)
         })
-        .max()
         .unwrap_or_default()
 }
 
@@ -7243,6 +7255,14 @@ fn auto_forward_request(
 
     let text = quoted_auto_forward_text(message)?;
     let sender_access = auto_forward_sender_access(manager, target_id);
+    if sender_access.is_none()
+        && manager
+            .trpg_groups
+            .values()
+            .any(|group| group.players.iter().any(|player_id| player_id == target_id))
+    {
+        return None;
+    }
     let recipients = manager
         .groups
         .values()
@@ -7286,9 +7306,7 @@ fn auto_forward_sender_access<'a>(
     manager: &'a NapcatMessageManager,
     target_id: &str,
 ) -> Option<(&'a TrpgGroup, PlayerAccess)> {
-    let group = manager
-        .current_group()
-        .filter(|group| group.players.iter().any(|player_id| player_id == target_id))?;
+    let group = manager.group_for_player_target(target_id)?;
     let player_id = target_id.parse::<u64>().ok()?;
     Some((group, group.player_access(player_id)))
 }
@@ -9517,6 +9535,53 @@ mod tests {
     }
 
     #[test]
+    fn private_group_commands_use_unique_noncurrent_player_group() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            players: vec!["9".to_owned()],
+            guide: "alpha secret".to_owned(),
+            ..Default::default()
+        });
+        let mut beta = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
+            guide: "beta guide".to_owned(),
+            ..Default::default()
+        };
+        beta.ensure_party("red");
+        beta.ensure_party("blue");
+        beta.set_player_party("2", Some("red"));
+        beta.set_player_party("3", Some("red"));
+        beta.set_player_party("4", Some("blue"));
+        manager.trpg_groups.insert("beta".to_owned(), beta);
+        manager.current_trpg_group = Some("alpha".to_owned());
+        for (target_id, nickname) in [("2", "晨星"), ("3", "白露"), ("4", "夜航")] {
+            manager.player_characters.insert(
+                target_id.to_owned(),
+                completed_character(nickname),
+            );
+        }
+
+        let guide = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".指南"),
+            "2",
+        )
+        .unwrap();
+        let members = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".频道人员"),
+            "2",
+        )
+        .unwrap();
+
+        assert!(guide.contains("beta guide"));
+        assert!(!guide.contains("alpha secret"));
+        assert!(members.contains("晨星"));
+        assert!(members.contains("白露"));
+        assert!(!members.contains("夜航"));
+    }
+
+    #[test]
     fn private_talent_draw_commands_add_exchanged_skills() {
         let mut manager = empty_manager();
         manager.player_characters.insert(
@@ -10163,6 +10228,74 @@ mod tests {
     }
 
     #[test]
+    fn auto_forward_from_noncurrent_party_member_excludes_other_parties() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3, 4] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message_from(user_id, "hello"),
+            ]);
+        }
+        manager.groups.insert("讨论组".to_owned(), ChatGroup {
+            members: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
+        });
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            players: vec!["9".to_owned()],
+            ..Default::default()
+        });
+        let mut beta = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
+            ..Default::default()
+        };
+        beta.ensure_party("red");
+        beta.ensure_party("blue");
+        beta.set_player_party("2", Some("red"));
+        beta.set_player_party("3", Some("red"));
+        beta.set_player_party("4", Some("blue"));
+        manager.trpg_groups.insert("beta".to_owned(), beta);
+        manager.current_trpg_group = Some("alpha".to_owned());
+
+        let request = auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "\"red-only clue\""),
+            "2",
+        )
+        .expect("same-party recipient should be available");
+
+        assert_eq!(request.recipients, vec![3]);
+    }
+
+    #[test]
+    fn auto_forward_refuses_ambiguous_noncurrent_player_group() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3, 4] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message_from(user_id, "hello"),
+            ]);
+        }
+        manager.groups.insert("讨论组".to_owned(), ChatGroup {
+            members: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
+        });
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            players: vec!["9".to_owned()],
+            ..Default::default()
+        });
+        for name in ["beta", "gamma"] {
+            manager.trpg_groups.insert(name.to_owned(), TrpgGroup {
+                players: vec!["2".to_owned(), "3".to_owned()],
+                ..Default::default()
+            });
+        }
+        manager.current_trpg_group = Some("alpha".to_owned());
+
+        assert!(auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "\"ambiguous clue\""),
+            "2",
+        )
+        .is_none());
+    }
+
+    #[test]
     fn new_incoming_target_waits_for_chat_window_approval() {
         let mut manager = empty_manager();
 
@@ -10536,6 +10669,41 @@ mod tests {
         assert_eq!(character.status_points, 7);
         assert_eq!(character.status.str_, 0);
         assert_eq!(character.status.agi, 0);
+    }
+
+    #[test]
+    fn private_exchange_command_uses_unique_noncurrent_group_config() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            players: vec!["9".to_owned()],
+            initial_status_points: 3,
+            initial_exchange_points: 4,
+            ..Default::default()
+        });
+        manager.trpg_groups.insert("beta".to_owned(), TrpgGroup {
+            players: vec!["2".to_owned()],
+            initial_status_points: 7,
+            initial_exchange_points: 9,
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("alpha".to_owned());
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            "2",
+        )
+        .unwrap();
+
+        assert!(response.contains("你拥有7点属性点"));
+        assert_eq!(
+            manager.player_characters["2"].status_points,
+            7
+        );
+        assert_eq!(
+            manager.player_characters["2"].exchange_points,
+            9
+        );
     }
 
     #[test]
