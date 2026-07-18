@@ -144,6 +144,119 @@ mod tests {
             }
         ]);
         assert!(ime.send_states["broadcast"].error.is_some());
+
+        ime.queue_text_send(
+            "broadcast",
+            "party update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+        let retry = receiver.try_recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert!(retry.message.to_string().contains("\"user_id\":43"));
+    }
+
+    #[test]
+    fn retry_after_partial_batch_sends_only_to_unacknowledged_targets() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+
+        ime.queue_text_send(
+            "broadcast",
+            "party update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+        let first = receiver.try_recv().unwrap();
+        let second = receiver.try_recv().unwrap();
+        let completed = ime.apply_send_results([
+            NapcatSendResult {
+                request_id: first.request_id,
+                target_id: "broadcast".to_owned(),
+                error: None,
+            },
+            NapcatSendResult {
+                request_id: second.request_id,
+                target_id: "broadcast".to_owned(),
+                error: Some("recipient rejected message".to_owned()),
+            },
+        ]);
+        assert_eq!(completed[0].successful_targets, vec![
+            NapcatSendTarget::Private(42)
+        ]);
+        assert!(!completed[0].clear_input);
+
+        ime.queue_text_send(
+            "broadcast",
+            "party update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+
+        let retry = receiver.try_recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert!(retry.message.to_string().contains("\"user_id\":43"));
+
+        let completed = ime.apply_send_results([NapcatSendResult {
+            request_id: retry.request_id,
+            target_id: "broadcast".to_owned(),
+            error: None,
+        }]);
+        assert_eq!(completed, vec![
+            ChatInputSendCompletion {
+                input_id: "broadcast".to_owned(),
+                text: "party update".to_owned(),
+                successful_targets: vec![NapcatSendTarget::Private(43)],
+                clear_input: true,
+            }
+        ]);
+    }
+
+    #[test]
+    fn changing_partial_batch_draft_starts_a_fresh_send_to_all_targets() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+
+        ime.queue_text_send(
+            "broadcast",
+            "first update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+        let first = receiver.try_recv().unwrap();
+        let second = receiver.try_recv().unwrap();
+        ime.apply_send_results([
+            NapcatSendResult {
+                request_id: first.request_id,
+                target_id: "broadcast".to_owned(),
+                error: None,
+            },
+            NapcatSendResult {
+                request_id: second.request_id,
+                target_id: "broadcast".to_owned(),
+                error: Some("recipient rejected message".to_owned()),
+            },
+        ]);
+
+        ime.queue_text_send(
+            "broadcast",
+            "corrected update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+
+        let first_retry = receiver.try_recv().unwrap();
+        let second_retry = receiver.try_recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert!(first_retry.message.to_string().contains("\"user_id\":42"));
+        assert!(second_retry.message.to_string().contains("\"user_id\":43"));
     }
 }
 
@@ -177,6 +290,8 @@ pub struct ImeManager {
 struct ChatInputSendState {
     pending_requests: Vec<(u64, NapcatSendTarget)>,
     successful_targets: Vec<NapcatSendTarget>,
+    delivered_text: Option<String>,
+    delivered_targets: Vec<NapcatSendTarget>,
     pending_text: Option<String>,
     error: Option<String>,
 }
@@ -287,6 +402,28 @@ impl ImeManager {
             return Err("上一条NapCat消息仍在发送中".to_owned());
         }
 
+        let mut targets = targets;
+        {
+            let send_state = self.send_states.entry(target_id.to_owned()).or_default();
+            let is_retry = send_state.error.is_some()
+                && send_state.delivered_text.as_deref() == Some(message_text.as_str());
+            if is_retry {
+                targets.retain(|target| !send_state.delivered_targets.contains(target));
+            } else {
+                send_state.delivered_text = None;
+                send_state.delivered_targets.clear();
+            }
+            send_state.successful_targets.clear();
+        }
+        if targets.is_empty() {
+            let error = "当前目标均已确认送达；如需再次发送，请修改消息内容".to_owned();
+            self.send_states
+                .entry(target_id.to_owned())
+                .or_default()
+                .error = Some(error.clone());
+            return Err(error);
+        }
+
         let mut pending_requests = Vec::new();
         let mut error = None;
         for target in targets {
@@ -329,7 +466,6 @@ impl ImeManager {
         }
 
         let send_state = self.send_states.entry(target_id.to_owned()).or_default();
-        send_state.successful_targets.clear();
         if !pending_requests.is_empty() {
             send_state.pending_requests = pending_requests;
             send_state.pending_text = Some(message_text);
@@ -376,12 +512,23 @@ impl ImeManager {
                 let Some(text) = state.pending_text.take() else {
                     continue;
                 };
+                state.delivered_text = Some(text.clone());
+                for target in &state.successful_targets {
+                    if !state.delivered_targets.contains(target) {
+                        state.delivered_targets.push(target.clone());
+                    }
+                }
+                let clear_input = state.error.is_none();
                 completions.push(ChatInputSendCompletion {
                     input_id: result.target_id.clone(),
                     text,
                     successful_targets: std::mem::take(&mut state.successful_targets),
-                    clear_input: state.error.is_none(),
+                    clear_input,
                 });
+                if clear_input {
+                    state.delivered_text = None;
+                    state.delivered_targets.clear();
+                }
             }
         }
         completions
