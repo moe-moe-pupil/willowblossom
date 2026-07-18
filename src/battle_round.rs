@@ -2614,7 +2614,16 @@ impl BattleRoundStore {
         advance_encounter_inspiration(encounter);
         let mut delayed_logs = Vec::new();
         let mut defeat_outcomes = Vec::new();
+        let mut skipped_combat_turns = 0_u32;
         for participant in &mut encounter.participants {
+            if participant.alive && !participant.action_done {
+                participant.turn = participant.turn.saturating_add(1);
+                if encounter.active {
+                    participant.combat_turns_completed =
+                        participant.combat_turns_completed.saturating_add(1);
+                    skipped_combat_turns = skipped_combat_turns.saturating_add(1);
+                }
+            }
             participant.action_done = false;
             participant.undying_rage_active = false;
             advance_participant_overhealing_shield(participant);
@@ -2651,6 +2660,9 @@ impl BattleRoundStore {
             defeat_outcomes.extend(delayed.defeat_outcomes);
             delayed_logs.extend(advance_participant_delayed_healing_ticks(participant));
         }
+        encounter.combat_completed_turns = encounter
+            .combat_completed_turns
+            .saturating_add(skipped_combat_turns);
         for outcome in defeat_outcomes {
             apply_battle_defeat_outcome(encounter, outcome);
         }
@@ -12589,6 +12601,67 @@ mod tests {
             .participants
             .iter()
             .all(|participant| participant.turn == 1 && !participant.action_done));
+    }
+
+    #[test]
+    fn forced_next_round_advances_only_unfinished_living_actor_clocks() {
+        let mut finished = participant("finished", 4);
+        finished.action_done = true;
+        finished.combat_turns_completed = 2;
+        let mut unfinished = participant("unfinished", 3);
+        unfinished.combat_turns_completed = 1;
+        unfinished.skill_last_used_turns.insert("0".to_owned(), 3);
+        let mut defeated = participant("defeated", 2);
+        defeated.alive = false;
+        defeated.combat_turns_completed = 1;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                round: 3,
+                combat_completed_turns: 3,
+                participants: vec![finished, unfinished, defeated],
+                ..Default::default()
+            });
+
+        assert!(store.next_round("battle"));
+
+        let encounter = &store.encounters["battle"];
+        let finished = &encounter.participants[0];
+        let unfinished = &encounter.participants[1];
+        let defeated = &encounter.participants[2];
+        assert_eq!(encounter.round, 4);
+        assert_eq!(encounter.combat_completed_turns, 4);
+        assert_eq!(
+            (
+                finished.turn,
+                finished.combat_turns_completed
+            ),
+            (4, 2)
+        );
+        assert_eq!(
+            (
+                unfinished.turn,
+                unfinished.combat_turns_completed
+            ),
+            (4, 2)
+        );
+        assert_eq!(
+            skill_cooldown_remaining(unfinished, 0, 2, None),
+            1
+        );
+        assert_eq!(
+            (
+                defeated.turn,
+                defeated.combat_turns_completed
+            ),
+            (2, 1)
+        );
+        assert!(encounter
+            .participants
+            .iter()
+            .all(|participant| !participant.action_done));
     }
 
     #[test]
