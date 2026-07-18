@@ -3931,7 +3931,9 @@ fn sync_encounter_to_manager(
         return changed;
     };
     changed |= group.sync_turn_players();
-    if group.world_turn < encounter.round {
+    let manager_round_ahead = group.world_turn > encounter.round;
+    let encounter_round_ahead = group.world_turn < encounter.round;
+    if encounter_round_ahead {
         group.world_turn = encounter.round;
         changed = true;
     }
@@ -3943,11 +3945,47 @@ fn sync_encounter_to_manager(
         let Some(turn) = group.player_turns.get_mut(&participant.target_id) else {
             continue;
         };
-        if turn.turns_passed < participant.turn {
-            turn.turns_passed = participant.turn;
-            changed = true;
+
+        // The group clock stores completed rounds plus a current-round flag,
+        // while a battle participant increments `turn` as soon as they act.
+        // Do not write both the incremented turn and `acted`, which would count
+        // the same action twice. An explicitly newer group clock/skip also wins
+        // over a stale open encounter until that encounter catches up.
+        if manager_round_ahead {
+            continue;
         }
-        if turn.acted != participant.action_done || turn.skipped {
+        if encounter_round_ahead {
+            let completed_turns = participant
+                .turn
+                .saturating_sub(u32::from(participant.action_done));
+            if turn.turns_passed <= completed_turns {
+                if turn.turns_passed != completed_turns
+                    || turn.acted != participant.action_done
+                    || turn.skipped
+                {
+                    turn.turns_passed = completed_turns;
+                    turn.acted = participant.action_done;
+                    turn.skipped = false;
+                    changed = true;
+                }
+            }
+            continue;
+        }
+
+        let group_effective_turn = turn
+            .turns_passed
+            .saturating_add(u32::from(turn.acted || turn.skipped));
+        if group_effective_turn >= participant.turn {
+            continue;
+        }
+        let completed_turns = participant
+            .turn
+            .saturating_sub(u32::from(participant.action_done));
+        if turn.turns_passed != completed_turns
+            || turn.acted != participant.action_done
+            || turn.skipped
+        {
+            turn.turns_passed = completed_turns;
             turn.acted = participant.action_done;
             turn.skipped = false;
             changed = true;
@@ -6400,7 +6438,7 @@ mod tests {
         player.skill_last_used_turns = HashMap::from([("0".to_owned(), 4)]);
         let encounter = BattleEncounter {
             trpg_group: Some("party".to_owned()),
-            round: 4,
+            round: 3,
             participants: vec![player],
             ..Default::default()
         };
@@ -6420,9 +6458,125 @@ mod tests {
             HashMap::from([("0".to_owned(), 4)])
         );
         let group = &manager.trpg_groups["party"];
+        assert_eq!(group.world_turn, 3);
+        assert_eq!(group.player_turns["a"].turns_passed, 3);
+        assert!(group.player_turns["a"].acted);
+        assert!(!group.player_turns["a"].skipped);
+    }
+
+    #[test]
+    fn battle_sync_preserves_a_group_skip_that_is_already_ahead() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "a".to_owned(),
+            PlayerCharacter::default(),
+        );
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["a".to_owned()],
+            world_turn: 3,
+            player_turns: HashMap::from([(
+                "a".to_owned(),
+                crate::napcat::TrpgPlayerTurnState {
+                    turns_passed: 3,
+                    skipped: true,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let mut player = participant("a", 3);
+        player.player_character = true;
+        let encounter = BattleEncounter {
+            trpg_group: Some("party".to_owned()),
+            round: 3,
+            participants: vec![player],
+            ..Default::default()
+        };
+
+        sync_encounter_to_manager(Some(&encounter), &mut manager);
+
+        let turn = &manager.trpg_groups["party"].player_turns["a"];
+        assert_eq!(turn.turns_passed, 3);
+        assert!(!turn.acted);
+        assert!(turn.skipped);
+    }
+
+    #[test]
+    fn newer_battle_round_clears_previous_group_completion_flags() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "a".to_owned(),
+            PlayerCharacter::default(),
+        );
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["a".to_owned()],
+            world_turn: 3,
+            player_turns: HashMap::from([(
+                "a".to_owned(),
+                crate::napcat::TrpgPlayerTurnState {
+                    turns_passed: 3,
+                    acted: true,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let mut player = participant("a", 4);
+        player.player_character = true;
+        let encounter = BattleEncounter {
+            trpg_group: Some("party".to_owned()),
+            round: 4,
+            participants: vec![player],
+            ..Default::default()
+        };
+
+        assert!(sync_encounter_to_manager(
+            Some(&encounter),
+            &mut manager
+        ));
+
+        let group = &manager.trpg_groups["party"];
         assert_eq!(group.world_turn, 4);
         assert_eq!(group.player_turns["a"].turns_passed, 4);
-        assert!(group.player_turns["a"].acted);
+        assert!(!group.player_turns["a"].acted);
+        assert!(!group.player_turns["a"].skipped);
+    }
+
+    #[test]
+    fn newer_group_round_is_not_rolled_back_by_a_stale_battle() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "a".to_owned(),
+            PlayerCharacter::default(),
+        );
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["a".to_owned()],
+            world_turn: 4,
+            player_turns: HashMap::from([(
+                "a".to_owned(),
+                crate::napcat::TrpgPlayerTurnState {
+                    turns_passed: 4,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let mut player = participant("a", 3);
+        player.player_character = true;
+        player.action_done = true;
+        let encounter = BattleEncounter {
+            trpg_group: Some("party".to_owned()),
+            round: 3,
+            participants: vec![player],
+            ..Default::default()
+        };
+
+        sync_encounter_to_manager(Some(&encounter), &mut manager);
+
+        let group = &manager.trpg_groups["party"];
+        assert_eq!(group.world_turn, 4);
+        assert_eq!(group.player_turns["a"].turns_passed, 4);
+        assert!(!group.player_turns["a"].acted);
         assert!(!group.player_turns["a"].skipped);
     }
 
