@@ -3414,7 +3414,7 @@ impl NapcatMessageManager {
         target_ids
             .into_iter()
             .map(|target_id| ChatTargetExportEntry {
-                kind: self.chat_target_export_kind(&target_id),
+                kind: self.chat_target_kind(&target_id),
                 metadata: self
                     .chat_targets
                     .get(&target_id)
@@ -3451,7 +3451,8 @@ impl NapcatMessageManager {
         groups
     }
 
-    fn chat_target_export_kind(&self, target_id: &str) -> ChatTargetExportKind {
+    /// Uses real message history when available and durable import metadata otherwise.
+    pub fn chat_target_kind(&self, target_id: &str) -> ChatTargetExportKind {
         match self
             .messages
             .get(target_id)
@@ -3469,7 +3470,7 @@ impl NapcatMessageManager {
     }
 
     fn is_private_chat_target(&self, target_id: &str) -> bool {
-        self.chat_target_export_kind(target_id) == ChatTargetExportKind::Private
+        self.chat_target_kind(target_id) == ChatTargetExportKind::Private
     }
 
     fn apply_imported_chat_window_state(
@@ -3561,9 +3562,7 @@ impl NapcatMessageManager {
         let group_targets = self
             .chat_targets
             .keys()
-            .filter(|target_id| {
-                self.chat_target_export_kind(target_id) == ChatTargetExportKind::Group
-            })
+            .filter(|target_id| self.chat_target_kind(target_id) == ChatTargetExportKind::Group)
             .cloned()
             .collect::<HashSet<_>>();
         let persisted_message_targets = self.messages.keys().cloned().collect::<HashSet<_>>();
@@ -5493,20 +5492,18 @@ fn request_missing_group_info_system(
         return;
     };
 
-    for (target_id, messages) in &manager.messages {
-        if !matches!(
-            messages.first().map(|message| &message.data.message_type),
-            Some(NapcatMessageType::Group)
-        ) {
+    for entry in manager.chat_target_export_entries() {
+        if entry.kind != ChatTargetExportKind::Group {
             continue;
         }
+        let target_id = entry.target_id;
 
         let has_name = manager
             .chat_targets
-            .get(target_id)
+            .get(&target_id)
             .map(|metadata| !metadata.automatic_name.trim().is_empty())
             .unwrap_or_default();
-        if has_name || group_info_requests.pending_group_ids.contains(target_id) {
+        if has_name || group_info_requests.pending_group_ids.contains(&target_id) {
             continue;
         }
 
@@ -5827,14 +5824,18 @@ fn append_local_private_text_response(
     recipient_id: u64,
     text: &str,
 ) -> bool {
-    let Some(self_id) = manager
+    let self_id = manager
         .messages
         .get(target_id)
         .and_then(|messages| messages.first())
         .map(|message| message.data.self_id)
-    else {
-        return false;
-    };
+        .or_else(|| {
+            manager
+                .messages
+                .values()
+                .find_map(|messages| messages.first().map(|message| message.data.self_id))
+        })
+        .unwrap_or_default();
 
     let time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7743,14 +7744,8 @@ fn auto_forward_request(
         .iter()
         .filter(|member_id| member_id.as_str() != target_id)
         .filter_map(|member_id| {
-            let is_private_member = matches!(
-                manager
-                    .messages
-                    .get(member_id)
-                    .and_then(|messages| messages.first())
-                    .map(|message| &message.data.message_type),
-                Some(NapcatMessageType::Private)
-            );
+            let is_private_member =
+                manager.chat_target_kind(member_id) == ChatTargetExportKind::Private;
             if !is_private_member {
                 return None;
             }
@@ -9269,7 +9264,7 @@ mod tests {
         assert!(manager.messages.is_empty());
         assert!(manager.is_private_chat_target("2"));
         assert_eq!(
-            manager.chat_target_export_kind("99"),
+            manager.chat_target_kind("99"),
             ChatTargetExportKind::Group
         );
 
@@ -9319,7 +9314,7 @@ mod tests {
             Ok(1)
         );
         assert_eq!(
-            manager.chat_target_export_kind("99"),
+            manager.chat_target_kind("99"),
             ChatTargetExportKind::Group
         );
         assert!(manager.sync_chat_targets());
@@ -12562,6 +12557,32 @@ mod tests {
         assert_eq!(response.data.target_id, Some(2));
         assert_eq!(response.data.sender.nickname, "GM");
         assert_eq!(message_text(response), "兑换回复");
+    }
+
+    #[test]
+    fn local_private_text_response_creates_history_for_imported_private_target() {
+        let mut manager = empty_manager();
+        manager.chat_targets.insert(
+            "2".to_owned(),
+            ChatTargetMetadata::default(),
+        );
+        manager.chat_target_kinds.insert(
+            "2".to_owned(),
+            ChatTargetExportKind::Private,
+        );
+
+        assert!(append_local_private_text_response(
+            &mut manager,
+            "2",
+            2,
+            "欢迎加入",
+        ));
+
+        let response = manager.messages["2"].first().unwrap();
+        assert_eq!(response.data.self_id, 0);
+        assert_eq!(response.data.user_id, 0);
+        assert_eq!(response.data.target_id, Some(2));
+        assert_eq!(message_text(response), "欢迎加入");
     }
 
     #[test]

@@ -662,6 +662,7 @@ use crate::{
         CharacterSkillSourceKind,
         CharacterStatus,
         ChatGroup,
+        ChatTargetExportKind,
         EquipmentSlot,
         ImageData,
         InventoryItem,
@@ -1662,13 +1663,13 @@ fn player_visible_preview_options(
     target_id: &str,
     messages: &[NapcatMessage],
 ) -> Vec<String> {
-    match messages.first().map(|message| &message.data.message_type) {
-        Some(NapcatMessageType::Private) => target_id
+    match target_kind_with_messages(manager, target_id, messages) {
+        ChatTargetExportKind::Private => target_id
             .parse::<u64>()
             .ok()
             .map(|_| vec![target_id.to_owned()])
             .unwrap_or_default(),
-        Some(NapcatMessageType::Group) => manager
+        ChatTargetExportKind::Group => manager
             .current_group()
             .filter(|group| {
                 group
@@ -1688,7 +1689,7 @@ fn player_visible_preview_options(
                 players
             })
             .unwrap_or_default(),
-        None => Vec::new(),
+        ChatTargetExportKind::Unknown => Vec::new(),
     }
 }
 
@@ -2047,14 +2048,7 @@ fn private_broadcast_target(
     manager: &NapcatMessageManager,
     member_id: &str,
 ) -> Option<NapcatSendTarget> {
-    if !matches!(
-        manager
-            .messages
-            .get(member_id)
-            .and_then(|messages| messages.first())
-            .map(|message| &message.data.message_type),
-        Some(NapcatMessageType::Private)
-    ) {
+    if manager.chat_target_kind(member_id) != ChatTargetExportKind::Private {
         return None;
     }
 
@@ -3310,10 +3304,7 @@ fn summary_scopes_for_target(
     let Some(campaign_id) = manager.active_campaign_id() else {
         return Vec::new();
     };
-    if !matches!(
-        messages.first().map(|message| &message.data.message_type),
-        Some(NapcatMessageType::Group)
-    ) {
+    if target_kind_with_messages(manager, target_id, messages) != ChatTargetExportKind::Group {
         return vec![SummaryScope::Private];
     }
     let mut party_ids = BTreeSet::new();
@@ -3417,12 +3408,7 @@ fn summary_display_parts<'a>(
     let (target_id, mut scope) = parse_group_summary_key(scope_key)
         .map(|(target_id, scope)| (target_id, scope.label()))
         .unwrap_or_else(|| {
-            let scope = if manager.messages.get(scope_key).is_some_and(|messages| {
-                matches!(
-                    messages.first().map(|message| &message.data.message_type),
-                    Some(NapcatMessageType::Group)
-                )
-            }) {
+            let scope = if manager.chat_target_kind(scope_key) == ChatTargetExportKind::Group {
                 "全部（旧）".to_owned()
             } else {
                 "私聊".to_owned()
@@ -3578,14 +3564,7 @@ fn pending_chat_requests_window(
 }
 
 fn approval_onboarding_text(manager: &NapcatMessageManager, target_id: &str) -> Option<String> {
-    if !matches!(
-        manager
-            .messages
-            .get(target_id)
-            .and_then(|messages| messages.first())
-            .map(|message| &message.data.message_type),
-        Some(NapcatMessageType::Private)
-    ) {
+    if manager.chat_target_kind(target_id) != ChatTargetExportKind::Private {
         return None;
     }
 
@@ -3670,38 +3649,36 @@ fn waiting_turn_manager_window(
     }
 }
 
-fn chat_target_kind(messages: Option<&Vec<NapcatMessage>>) -> &'static str {
-    match messages.and_then(|messages| messages.first()) {
-        Some(message)
-            if matches!(
-                message.data.message_type,
-                NapcatMessageType::Group
-            ) =>
-        {
-            "群"
-        },
-        Some(_) => "私聊",
-        None => "聊天",
+fn chat_target_kind_label(manager: &NapcatMessageManager, target_id: &str) -> &'static str {
+    match manager.chat_target_kind(target_id) {
+        ChatTargetExportKind::Group => "群",
+        ChatTargetExportKind::Private => "私聊",
+        ChatTargetExportKind::Unknown => "聊天",
+    }
+}
+
+fn target_kind_with_messages(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    messages: &[NapcatMessage],
+) -> ChatTargetExportKind {
+    match messages.first().map(|message| &message.data.message_type) {
+        Some(NapcatMessageType::Private) => ChatTargetExportKind::Private,
+        Some(NapcatMessageType::Group) => ChatTargetExportKind::Group,
+        None => manager.chat_target_kind(target_id),
     }
 }
 
 fn is_group_chat_target(manager: &NapcatMessageManager, target_id: &str) -> bool {
-    matches!(
-        manager
-            .messages
-            .get(target_id)
-            .and_then(|messages| messages.first())
-            .map(|message| &message.data.message_type),
-        Some(NapcatMessageType::Group)
-    )
+    manager.chat_target_kind(target_id) == ChatTargetExportKind::Group
 }
 
 fn sorted_pool_targets(manager: &NapcatMessageManager, group_chats: bool) -> Vec<String> {
     let mut targets = manager
-        .messages
-        .keys()
+        .chat_target_export_entries()
+        .into_iter()
+        .map(|entry| entry.target_id)
         .filter(|target_id| is_group_chat_target(manager, target_id) == group_chats)
-        .cloned()
         .collect::<Vec<_>>();
     targets.sort_by(|a, b| target_display_name(manager, a).cmp(&target_display_name(manager, b)));
     targets
@@ -3728,15 +3705,12 @@ fn chat_list_player_filter_options(manager: &NapcatMessageManager) -> Vec<String
 
     if players.is_empty() {
         players = manager
-            .messages
-            .iter()
-            .filter_map(|(target_id, messages)| {
-                matches!(
-                    messages.first().map(|message| &message.data.message_type),
-                    Some(NapcatMessageType::Private)
-                )
-                .then(|| target_id.parse::<u64>().ok().map(|_| target_id.clone()))
-                .flatten()
+            .chat_target_export_entries()
+            .into_iter()
+            .filter_map(|entry| {
+                (entry.kind == ChatTargetExportKind::Private)
+                    .then(|| entry.target_id.parse::<u64>().ok().map(|_| entry.target_id))
+                    .flatten()
             })
             .collect();
     }
@@ -3756,12 +3730,17 @@ fn chat_list_target_views(
     player_filter: Option<u64>,
 ) -> Vec<ChatListTargetView> {
     let mut targets = manager
-        .messages
-        .iter()
-        .filter_map(|(target_id, messages)| {
+        .chat_target_export_entries()
+        .into_iter()
+        .filter_map(|entry| {
+            let messages = manager
+                .messages
+                .get(&entry.target_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             chat_list_target_view(
                 manager,
-                target_id,
+                &entry.target_id,
                 messages,
                 player_filter,
             )
@@ -3992,8 +3971,8 @@ fn chat_list_panel(
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.small(chat_target_kind(
-                            manager.messages.get(&target_id),
+                        ui.small(chat_target_kind_label(
+                            manager, &target_id,
                         ));
                         ui.small(&target_id);
                         if player_filter_id.is_some() {
@@ -12877,9 +12856,11 @@ pub fn ui_system(
             }
 
             for target_id in visible_targets {
-                let Some(messages) = manager.messages.get(&target_id).cloned() else {
-                    continue;
-                };
+                let messages = manager
+                    .messages
+                    .get(&target_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let id = egui::Id::new(&target_id);
                 let mut default_rect: Rect = Rect::from_pos(Pos2::new(0.0, 0.0));
                 if !**has_run_once {
@@ -12911,7 +12892,7 @@ pub fn ui_system(
                 };
                 let (_nickname, heights) = get_nickname_lens(target_id.clone(), &messages);
                 let window_title = target_display_name(&manager, &target_id);
-                let targets = targets_for_messages(&target_id, &messages);
+                let targets = targets_for_target(&manager, &target_id);
                 let unread_count = target_unread_count(&manager, &target_id);
                 let summary_request_changed = queue_summaries_if_needed(
                     &manager,
@@ -12980,15 +12961,18 @@ pub fn ui_system(
     }
 }
 
-fn targets_for_messages(target_id: &str, messages: &[NapcatMessage]) -> Vec<NapcatSendTarget> {
+fn targets_for_target(manager: &NapcatMessageManager, target_id: &str) -> Vec<NapcatSendTarget> {
+    let kind = manager.chat_target_kind(target_id);
     let Ok(target_id) = target_id.parse::<u64>() else {
         eprintln!("invalid NapCat target id: {target_id}");
         return Vec::new();
     };
 
-    match messages.first().map(|message| &message.data.message_type) {
-        Some(NapcatMessageType::Group) => vec![NapcatSendTarget::Group(target_id)],
-        _ => vec![NapcatSendTarget::Private(target_id)],
+    match kind {
+        ChatTargetExportKind::Group => vec![NapcatSendTarget::Group(target_id)],
+        ChatTargetExportKind::Private | ChatTargetExportKind::Unknown => {
+            vec![NapcatSendTarget::Private(target_id)]
+        },
     }
 }
 
@@ -13012,14 +12996,18 @@ fn append_local_sent_message(
         ),
     };
 
-    let Some(existing_messages) = manager.messages.get(&target_id) else {
-        return false;
-    };
-    let Some(existing_message) = existing_messages.first() else {
-        return false;
-    };
-
-    let self_id = existing_message.data.self_id;
+    let self_id = manager
+        .messages
+        .get(&target_id)
+        .and_then(|messages| messages.first())
+        .or_else(|| {
+            manager
+                .messages
+                .values()
+                .find_map(|messages| messages.first())
+        })
+        .map(|message| message.data.self_id)
+        .unwrap_or_default();
     let time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -13243,6 +13231,74 @@ mod tests {
     }
 
     #[test]
+    fn history_free_imported_targets_are_listed_and_routed_by_persisted_kind() {
+        let mut manager = empty_manager();
+        for (target_id, kind) in [
+            ("2", ChatTargetExportKind::Private),
+            ("99", ChatTargetExportKind::Group),
+        ] {
+            manager
+                .chat_targets
+                .insert(target_id.to_owned(), Default::default());
+            manager.chat_target_kinds.insert(target_id.to_owned(), kind);
+        }
+
+        let views = chat_list_target_views(&manager, None);
+        assert_eq!(
+            views
+                .iter()
+                .map(|view| (
+                    view.target_id.as_str(),
+                    view.message_count
+                ))
+                .collect::<Vec<_>>(),
+            vec![("2", 0), ("99", 0)]
+        );
+        assert_eq!(targets_for_target(&manager, "2"), vec![
+            NapcatSendTarget::Private(2)
+        ]);
+        assert_eq!(
+            targets_for_target(&manager, "99"),
+            vec![NapcatSendTarget::Group(99)]
+        );
+        assert_eq!(
+            sorted_pool_targets(&manager, false),
+            vec!["2".to_owned()]
+        );
+        assert_eq!(
+            sorted_pool_targets(&manager, true),
+            vec!["99".to_owned()]
+        );
+    }
+
+    #[test]
+    fn acknowledged_send_creates_history_for_history_free_imported_target() {
+        let mut manager = empty_manager();
+        manager
+            .chat_targets
+            .insert("2".to_owned(), Default::default());
+        manager.chat_target_kinds.insert(
+            "2".to_owned(),
+            ChatTargetExportKind::Private,
+        );
+
+        assert!(append_local_sent_message(
+            &mut manager,
+            NapcatSendTarget::Private(2),
+            "first message",
+        ));
+
+        let message = manager.messages["2"].first().unwrap();
+        assert_eq!(message.data.self_id, 0);
+        assert_eq!(message.data.user_id, 0);
+        assert_eq!(message.data.target_id, Some(2));
+        assert_eq!(
+            manager.chat_target_kind("2"),
+            ChatTargetExportKind::Private
+        );
+    }
+
+    #[test]
     fn chat_list_player_filter_hides_inaccessible_targets_and_unread_activity() {
         let mut manager = split_party_summary_manager();
         manager
@@ -13362,6 +13418,29 @@ mod tests {
         assert_eq!(
             approval_onboarding_text(&manager, "2"),
             Some("团内引导：\n请先完成角色设定。".to_owned())
+        );
+    }
+
+    #[test]
+    fn approval_onboarding_text_supports_history_free_imported_private_target() {
+        let mut manager = empty_manager();
+        manager
+            .chat_targets
+            .insert("2".to_owned(), Default::default());
+        manager.chat_target_kinds.insert(
+            "2".to_owned(),
+            ChatTargetExportKind::Private,
+        );
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            guide: "导入后引导".to_owned(),
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
+
+        assert!(manager.approve_chat_target("2"));
+        assert_eq!(
+            approval_onboarding_text(&manager, "2"),
+            Some("团内引导：\n导入后引导".to_owned())
         );
     }
 
