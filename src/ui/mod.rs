@@ -13048,6 +13048,7 @@ fn append_local_sent_message(
             character_id: None,
             party_id: None,
             visibility: Visibility::Public,
+            access_scope_resolved: false,
         },
     };
     manager.annotate_message_access(&target_id, &mut message);
@@ -13116,6 +13117,7 @@ mod tests {
                 character_id: None,
                 party_id: None,
                 visibility: Visibility::Public,
+                access_scope_resolved: false,
             },
         }
     }
@@ -13145,6 +13147,7 @@ mod tests {
                 character_id: None,
                 party_id: None,
                 visibility: Visibility::Public,
+                access_scope_resolved: false,
             },
         }
     }

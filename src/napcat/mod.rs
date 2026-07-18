@@ -317,6 +317,9 @@ pub struct NapcatMessageData {
     pub party_id: Option<String>,
     #[serde(default)]
     pub visibility: Visibility,
+    /// False only for legacy or not-yet-annotated records whose scope must be derived.
+    #[serde(default)]
+    pub access_scope_resolved: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -3764,6 +3767,7 @@ impl NapcatMessageManager {
         message.data.character_id = campaign_message.character_id;
         message.data.party_id = campaign_message.party_id;
         message.data.visibility = campaign_message.visibility;
+        message.data.access_scope_resolved = true;
     }
 
     pub fn annotate_incoming_message_access(&self, target_id: &str, message: &mut NapcatMessage) {
@@ -3771,6 +3775,7 @@ impl NapcatMessageManager {
         message.data.character_id = None;
         message.data.party_id = None;
         message.data.visibility = Visibility::Public;
+        message.data.access_scope_resolved = false;
         self.annotate_message_access(target_id, message);
     }
 
@@ -3873,7 +3878,8 @@ impl NapcatMessageManager {
                     .group_id
                     .or_else(|| target_id.parse::<u64>().ok())
                     .unwrap_or_default();
-                let has_persisted_access = message.data.character_id.is_some()
+                let has_persisted_access = message.data.access_scope_resolved
+                    || message.data.character_id.is_some()
                     || message.data.party_id.is_some()
                     || !matches!(
                         message.data.visibility,
@@ -4864,6 +4870,7 @@ fn moonberry_chat_to_napcat_message(
             character_id: (chat_type != "GroupMessage").then(|| sender_id.to_string()),
             party_id: None,
             visibility,
+            access_scope_resolved: true,
         },
     }))
 }
@@ -5788,6 +5795,7 @@ fn append_local_private_text_response(
             character_id: None,
             party_id: None,
             visibility: Visibility::Public,
+            access_scope_resolved: false,
         },
     };
     manager.annotate_message_access(target_id, &mut message);
@@ -7801,6 +7809,7 @@ mod tests {
                 character_id: None,
                 party_id: None,
                 visibility: Visibility::Public,
+                access_scope_resolved: false,
             },
         }
     }
@@ -7835,6 +7844,7 @@ mod tests {
                 character_id: None,
                 party_id: None,
                 visibility: Visibility::Public,
+                access_scope_resolved: false,
             },
         }
     }
@@ -8605,6 +8615,7 @@ mod tests {
         message.data.character_id = Some("spoofed-character".to_owned());
         message.data.party_id = Some("blue".to_owned());
         message.data.visibility = Visibility::Player(9);
+        message.data.access_scope_resolved = true;
 
         manager.annotate_incoming_message_access("99", &mut message);
 
@@ -8621,6 +8632,7 @@ mod tests {
             message.data.visibility,
             Visibility::Party("red".to_owned())
         );
+        assert!(message.data.access_scope_resolved);
     }
 
     #[test]
@@ -8692,6 +8704,62 @@ mod tests {
         assert_eq!(blue_view, vec![
             "public history".to_owned()
         ]);
+    }
+
+    #[test]
+    fn resolved_public_group_history_stays_public_after_sender_joins_a_party() {
+        let mut manager = empty_manager();
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned()],
+            group_chats: vec!["99".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("blue"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        let mut public_message = test_message_with_text(
+            NapcatMessageType::Group,
+            "public before joining",
+        );
+        public_message.data.group_id = Some(99);
+        public_message.data.user_id = 5;
+        public_message.data.sender.user_id = 5;
+        manager.annotate_incoming_message_access("99", &mut public_message);
+
+        assert!(public_message.data.access_scope_resolved);
+        assert_eq!(public_message.data.character_id, None);
+        assert_eq!(
+            public_message.data.visibility,
+            Visibility::Public
+        );
+        let public_message: NapcatMessage =
+            serde_json::from_str(&serde_json::to_string(&public_message).unwrap()).unwrap();
+
+        let group = manager.trpg_groups.get_mut("table").unwrap();
+        group.players.push("5".to_owned());
+        group.sync_turn_players();
+        group.set_player_party("5", Some("blue"));
+
+        let messages = vec![public_message];
+        let history = manager.campaign_message_for_target("99", &messages[0]);
+        assert_eq!(history.party_id, None);
+        assert_eq!(history.visibility, Visibility::Public);
+        assert_eq!(
+            manager
+                .visible_messages_for_player("99", &messages, 2)
+                .len(),
+            1
+        );
+        assert_eq!(
+            manager
+                .visible_messages_for_player("99", &messages, 3)
+                .len(),
+            1
+        );
     }
 
     #[test]
