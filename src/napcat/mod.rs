@@ -3631,6 +3631,24 @@ impl NapcatMessageManager {
             .to_owned()
     }
 
+    pub fn scene_capture_campaign_for_user(&self, user_id: u64) -> Option<String> {
+        let group = self.current_group()?;
+        let target_id = user_id.to_string();
+        let is_player = group
+            .players
+            .iter()
+            .any(|player_id| player_id == &target_id);
+        if !is_player && !group.gm_users.contains(&user_id) {
+            return None;
+        }
+
+        Some(self.current_campaign_id())
+    }
+
+    pub fn can_serve_scene_capture(&self, user_id: u64, campaign_id: &str) -> bool {
+        self.scene_capture_campaign_for_user(user_id).as_deref() == Some(campaign_id)
+    }
+
     pub fn player_access_for_user(&self, player_id: u64) -> PlayerAccess {
         self.current_group()
             .map(|group| group.player_access(player_id))
@@ -5239,12 +5257,11 @@ fn message_system(
             } else {
                 None
             };
-            if is_scene_capture_command(&json) && json.data.user_id != json.data.self_id {
-                if let Some(scene_capture_requests) = scene_capture_requests.as_deref_mut() {
-                    scene_capture_requests.requests.push(SceneCaptureRequest {
-                        user_id: json.data.user_id,
-                    });
-                }
+            if let (Some(scene_capture_requests), Some(request)) = (
+                scene_capture_requests.as_deref_mut(),
+                scene_capture_request(&manager, &json),
+            ) {
+                scene_capture_requests.requests.push(request);
             }
 
             manager
@@ -5468,6 +5485,22 @@ fn append_local_private_text_response(
 
 fn is_scene_capture_command(message: &NapcatMessage) -> bool {
     is_scene_capture_command_text(&message_text(message))
+}
+
+fn scene_capture_request(
+    manager: &NapcatMessageManager,
+    message: &NapcatMessage,
+) -> Option<SceneCaptureRequest> {
+    if message.data.user_id == message.data.self_id || !is_scene_capture_command(message) {
+        return None;
+    }
+
+    let user_id = message.data.user_id;
+    let campaign_id = manager.scene_capture_campaign_for_user(user_id)?;
+    Some(SceneCaptureRequest {
+        user_id,
+        campaign_id,
+    })
 }
 
 pub(crate) fn is_scene_capture_command_text(text: &str) -> bool {
@@ -10080,6 +10113,59 @@ mod tests {
                 "{command} should trigger capture"
             );
         }
+    }
+
+    #[test]
+    fn scene_capture_request_requires_active_campaign_membership() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            campaign_id: "campaign-a".to_owned(),
+            players: vec!["2".to_owned()],
+            gm_users: HashSet::from([9]),
+            ..Default::default()
+        });
+        manager.trpg_groups.insert("beta".to_owned(), TrpgGroup {
+            campaign_id: "campaign-b".to_owned(),
+            players: vec!["3".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("alpha".to_owned());
+
+        let player_request = scene_capture_request(
+            &manager,
+            &test_private_message_from(2, ".观察"),
+        )
+        .unwrap();
+        let gm_request = scene_capture_request(
+            &manager,
+            &test_private_message_from(9, ".观察"),
+        )
+        .unwrap();
+
+        assert_eq!(player_request.user_id, 2);
+        assert_eq!(player_request.campaign_id, "campaign-a");
+        assert_eq!(gm_request.user_id, 9);
+        assert_eq!(gm_request.campaign_id, "campaign-a");
+        assert!(manager.can_serve_scene_capture(
+            player_request.user_id,
+            &player_request.campaign_id,
+        ));
+        assert!(scene_capture_request(
+            &manager,
+            &test_private_message_from(3, ".观察"),
+        )
+        .is_none());
+        assert!(scene_capture_request(
+            &manager,
+            &test_private_message_from(4, ".观察"),
+        )
+        .is_none());
+
+        manager.current_trpg_group = Some("beta".to_owned());
+        assert!(!manager.can_serve_scene_capture(
+            player_request.user_id,
+            &player_request.campaign_id,
+        ));
     }
 
     #[test]

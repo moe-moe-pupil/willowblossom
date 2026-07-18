@@ -534,6 +534,7 @@ impl ScenePlayerViewRequest {
 
 pub struct SceneCaptureRequest {
     pub user_id: u64,
+    pub campaign_id: String,
 }
 
 #[derive(Resource, Default)]
@@ -7233,6 +7234,16 @@ fn scene_capture_request_system(
 ) {
     let capture_requests = requests.requests.drain(..).collect::<Vec<_>>();
     for request in capture_requests {
+        let request_is_current = manager.as_deref().is_some_and(|manager| {
+            manager.can_serve_scene_capture(request.user_id, &request.campaign_id)
+        });
+        if !request_is_current {
+            eprintln!(
+                "ignored scene capture request from {} outside the active campaign {}",
+                request.user_id, request.campaign_id
+            );
+            continue;
+        }
         let Some(player_camera) = player_cameras.cameras.get(&request.user_id) else {
             eprintln!(
                 "ignored scene capture request from {} without a configured capture camera",
