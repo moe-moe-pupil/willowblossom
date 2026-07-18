@@ -3584,10 +3584,7 @@ fn approval_onboarding_text(manager: &NapcatMessageManager, target_id: &str) -> 
         return None;
     }
 
-    let group = manager.current_group()?;
-    if !group.players.iter().any(|player_id| player_id == target_id) {
-        return None;
-    }
+    let group = manager.group_for_player_target(target_id)?;
 
     let guide = group.guide.trim();
     if guide.is_empty() {
@@ -13341,6 +13338,35 @@ mod tests {
             approval_onboarding_text(&manager, "2"),
             Some("团内引导：\n请先完成角色设定。".to_owned())
         );
+    }
+
+    #[test]
+    fn approval_onboarding_text_uses_known_noncurrent_group_guide() {
+        let mut manager = empty_manager();
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message(2),
+        ]);
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            guide: "alpha secret".to_owned(),
+            players: vec!["9".to_owned()],
+            ..Default::default()
+        });
+        manager.trpg_groups.insert("beta".to_owned(), TrpgGroup {
+            guide: "beta guide".to_owned(),
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("alpha".to_owned());
+
+        assert!(manager.approve_chat_target("2"));
+
+        assert_eq!(
+            approval_onboarding_text(&manager, "2"),
+            Some("团内引导：\nbeta guide".to_owned())
+        );
+        assert!(!manager.trpg_groups["alpha"]
+            .players
+            .contains(&"2".to_owned()));
     }
 
     #[test]

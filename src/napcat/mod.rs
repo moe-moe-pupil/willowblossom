@@ -3526,22 +3526,29 @@ impl NapcatMessageManager {
             .and_then(|group_name| self.trpg_groups.get(group_name))
     }
 
-    pub fn current_group_for_player(&self, target_id: &str) -> Option<&TrpgGroup> {
-        self.current_group()
-            .filter(|group| group.players.iter().any(|player_id| player_id == target_id))
+    pub fn group_name_for_player_target(&self, target_id: &str) -> Option<&str> {
+        if let Some(group_name) = self.current_trpg_group.as_deref().filter(|group_name| {
+            self.trpg_groups
+                .get(*group_name)
+                .is_some_and(|group| group.players.iter().any(|player_id| player_id == target_id))
+        }) {
+            return Some(group_name);
+        }
+
+        let mut group_names = self.trpg_groups.iter().filter_map(|(group_name, group)| {
+            group
+                .players
+                .iter()
+                .any(|player_id| player_id == target_id)
+                .then_some(group_name.as_str())
+        });
+        let group_name = group_names.next()?;
+        group_names.next().is_none().then_some(group_name)
     }
 
     pub fn group_for_player_target(&self, target_id: &str) -> Option<&TrpgGroup> {
-        if let Some(group) = self.current_group_for_player(target_id) {
-            return Some(group);
-        }
-
-        let mut groups = self
-            .trpg_groups
-            .values()
-            .filter(|group| group.players.iter().any(|player_id| player_id == target_id));
-        let group = groups.next()?;
-        groups.next().is_none().then_some(group)
+        self.group_name_for_player_target(target_id)
+            .and_then(|group_name| self.trpg_groups.get(group_name))
     }
 
     fn group_for_message_target(
@@ -3850,6 +3857,17 @@ impl NapcatMessageManager {
             return;
         }
 
+        let is_private_target = is_private_message_target(self.messages.get(target_id));
+        let has_existing_membership = is_private_target
+            && self
+                .trpg_groups
+                .values()
+                .any(|group| group.players.iter().any(|player_id| player_id == target_id));
+        if has_existing_membership && self.group_for_player_target(target_id).is_none() {
+            self.pending_chat_targets.insert(target_id.to_owned());
+            return;
+        }
+
         if !self.join_requests_allowed_for_target(target_id) {
             self.rejected_chat_targets.insert(target_id.to_owned());
             return;
@@ -3863,9 +3881,20 @@ impl NapcatMessageManager {
             return true;
         }
 
+        if let Some(group) = self.group_for_player_target(target_id) {
+            return group.allow_join_requests;
+        }
+
+        let has_existing_membership = self
+            .trpg_groups
+            .values()
+            .any(|group| group.players.iter().any(|player_id| player_id == target_id));
+        if has_existing_membership {
+            return false;
+        }
+
         self.current_group()
-            .map(|group| group.allow_join_requests)
-            .unwrap_or(true)
+            .map_or(true, |group| group.allow_join_requests)
     }
 
     pub fn approve_chat_target(&mut self, target_id: &str) -> bool {
@@ -3873,7 +3902,19 @@ impl NapcatMessageManager {
         changed |= self.pending_chat_targets.remove(target_id);
         changed |= self.rejected_chat_targets.remove(target_id);
         if is_private_message_target(self.messages.get(target_id)) {
-            if let Some(group_name) = self.current_trpg_group.clone() {
+            let has_existing_membership = self
+                .trpg_groups
+                .values()
+                .any(|group| group.players.iter().any(|player_id| player_id == target_id));
+            let group_name = self
+                .group_name_for_player_target(target_id)
+                .map(str::to_owned)
+                .or_else(|| {
+                    (!has_existing_membership)
+                        .then(|| self.current_trpg_group.clone())
+                        .flatten()
+                });
+            if let Some(group_name) = group_name {
                 if let Some(group) = self.trpg_groups.get_mut(&group_name) {
                     if !group.players.iter().any(|player_id| player_id == target_id) {
                         group.players.push(target_id.to_owned());
@@ -10324,6 +10365,93 @@ mod tests {
         assert!(manager.rejected_chat_targets.contains("12345"));
         assert!(!manager.pending_chat_targets.contains("12345"));
         assert!(!manager.open_chat_targets.contains("12345"));
+    }
+
+    #[test]
+    fn known_noncurrent_private_target_uses_mapped_join_policy_and_membership() {
+        let mut manager = empty_manager();
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message_from(2, "hello"),
+        ]);
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            allow_join_requests: false,
+            players: vec!["9".to_owned()],
+            ..Default::default()
+        });
+        manager.trpg_groups.insert("beta".to_owned(), TrpgGroup {
+            allow_join_requests: true,
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("alpha".to_owned());
+
+        manager.register_incoming_target("2", true);
+
+        assert!(manager.pending_chat_targets.contains("2"));
+        assert!(!manager.rejected_chat_targets.contains("2"));
+        assert!(manager.approve_chat_target("2"));
+        assert!(!manager.trpg_groups["alpha"]
+            .players
+            .contains(&"2".to_owned()));
+        assert!(manager.trpg_groups["beta"]
+            .players
+            .contains(&"2".to_owned()));
+    }
+
+    #[test]
+    fn known_noncurrent_private_target_honors_mapped_closed_join_policy() {
+        let mut manager = empty_manager();
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message_from(2, "hello"),
+        ]);
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            allow_join_requests: true,
+            players: vec!["9".to_owned()],
+            ..Default::default()
+        });
+        manager.trpg_groups.insert("beta".to_owned(), TrpgGroup {
+            allow_join_requests: false,
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("alpha".to_owned());
+
+        manager.register_incoming_target("2", true);
+
+        assert!(manager.rejected_chat_targets.contains("2"));
+        assert!(!manager.pending_chat_targets.contains("2"));
+    }
+
+    #[test]
+    fn ambiguous_noncurrent_private_target_stays_pending_without_cross_assignment() {
+        let mut manager = empty_manager();
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message_from(2, "hello"),
+        ]);
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            players: vec!["9".to_owned()],
+            ..Default::default()
+        });
+        for group_name in ["beta", "gamma"] {
+            manager
+                .trpg_groups
+                .insert(group_name.to_owned(), TrpgGroup {
+                    allow_join_requests: true,
+                    players: vec!["2".to_owned()],
+                    ..Default::default()
+                });
+        }
+        manager.current_trpg_group = Some("alpha".to_owned());
+
+        manager.register_incoming_target("2", true);
+
+        assert!(manager.pending_chat_targets.contains("2"));
+        assert!(!manager.rejected_chat_targets.contains("2"));
+        manager.current_trpg_group = Some("beta".to_owned());
+        assert!(manager.approve_chat_target("2"));
+        assert!(!manager.trpg_groups["alpha"]
+            .players
+            .contains(&"2".to_owned()));
     }
 
     #[test]
