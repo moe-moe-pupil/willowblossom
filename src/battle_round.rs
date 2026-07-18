@@ -128,6 +128,8 @@ use crate::{
     },
 };
 
+const MAX_GROUP_CLOCK_CATCH_UP_ROUNDS_PER_FRAME: u32 = 64;
+
 pub struct BattleRoundPlugin;
 
 impl Plugin for BattleRoundPlugin {
@@ -1860,9 +1862,27 @@ fn encounter_ui(
         return false;
     }
     changed |= sync_encounter_from_group_clock(store, encounter_id, manager);
+    let group_rounds_remaining = group_rounds_ahead_of_encounter(store, encounter_id, manager);
 
     ui.group(|ui| {
         ui.set_width(ui.available_width());
+        if group_rounds_remaining > 0 {
+            let encounter = store
+                .encounters
+                .get(encounter_id)
+                .expect("encounter existence checked");
+            ui.horizontal_wrapped(|ui| {
+                ui.heading(&encounter_entity.name);
+                ui.small(format!("第{}轮", encounter.round));
+            });
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!(
+                    "正在同步TRPG组轮次，还差{group_rounds_remaining}轮；完成前不会开放战斗操作。"
+                ),
+            );
+            return;
+        }
         let mut next_round_requested = false;
         {
             let encounter = store
@@ -3885,10 +3905,21 @@ fn sync_encounter_from_group_clock(
                 sync_participant_from_manager_with_vitals(participant, manager);
             }
         }
-        for _ in encounter_round..group_round {
+        let rounds_to_advance = group_round
+            .saturating_sub(encounter_round)
+            .min(MAX_GROUP_CLOCK_CATCH_UP_ROUNDS_PER_FRAME);
+        for _ in 0..rounds_to_advance {
             changed |= store.next_round(encounter_id);
             changed |= advance_unit_participant_buffs(store, encounter_id, manager);
         }
+    }
+
+    if store
+        .encounters
+        .get(encounter_id)
+        .is_some_and(|encounter| encounter.round < group_round)
+    {
+        return changed;
     }
 
     let Some(encounter) = store.encounters.get_mut(encounter_id) else {
@@ -3931,6 +3962,24 @@ fn sync_encounter_from_group_clock(
         mark_negative_candidates(encounter);
     }
     changed
+}
+
+fn group_rounds_ahead_of_encounter(
+    store: &BattleRoundStore,
+    encounter_id: &str,
+    manager: &NapcatMessageManager,
+) -> u32 {
+    let Some(encounter) = store.encounters.get(encounter_id) else {
+        return 0;
+    };
+    let Some(group) = encounter
+        .trpg_group
+        .as_deref()
+        .and_then(|group_name| manager.trpg_groups.get(group_name))
+    else {
+        return 0;
+    };
+    group.world_turn.saturating_sub(encounter.round)
 }
 
 fn initialize_participant_clock(
@@ -6718,6 +6767,69 @@ mod tests {
         assert_eq!(player.combat_turns_completed, 2);
         assert_eq!(encounter.combat_completed_turns, 2);
         assert!(!player.action_done);
+    }
+
+    #[test]
+    fn extreme_group_round_gap_is_bounded_and_keeps_actions_closed() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("a".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 0.0,
+                max_mp: 10.0,
+                mp_regen: 1.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["a".to_owned()],
+            world_turn: u32::MAX,
+            player_turns: HashMap::from([(
+                "a".to_owned(),
+                crate::napcat::TrpgPlayerTurnState {
+                    turns_passed: u32::MAX,
+                    acted: true,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let mut player = participant("a", 0);
+        player.player_character = true;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                trpg_group: Some("party".to_owned()),
+                active: true,
+                participants: vec![player],
+                ..Default::default()
+            });
+
+        assert!(sync_encounter_from_group_clock(
+            &mut store, "battle", &manager
+        ));
+
+        let encounter = &store.encounters["battle"];
+        let player = &encounter.participants[0];
+        assert_eq!(
+            encounter.round,
+            MAX_GROUP_CLOCK_CATCH_UP_ROUNDS_PER_FRAME
+        );
+        assert_eq!(
+            player.turn,
+            MAX_GROUP_CLOCK_CATCH_UP_ROUNDS_PER_FRAME
+        );
+        assert_eq!(
+            player.combat_turns_completed,
+            MAX_GROUP_CLOCK_CATCH_UP_ROUNDS_PER_FRAME
+        );
+        assert!(!player.action_done);
+        assert_eq!(
+            group_rounds_ahead_of_encounter(&store, "battle", &manager),
+            u32::MAX - MAX_GROUP_CLOCK_CATCH_UP_ROUNDS_PER_FRAME
+        );
     }
 
     #[test]
