@@ -1981,6 +1981,7 @@ fn encounter_roster_ui(
     _scene_positions: Option<&SceneCharacterPositions>,
 ) -> bool {
     let mut changed = false;
+    let mut completion_target = None;
     let Some(encounter) = store.encounters.get_mut(encounter_id) else {
         return false;
     };
@@ -1993,7 +1994,17 @@ fn encounter_roster_ui(
         let participant = &mut encounter.participants[participant_index];
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{}.", order_index + 1));
-            changed |= ui.checkbox(&mut participant.action_done, "").changed();
+            let mut requested_done = participant.action_done;
+            if ui
+                .add_enabled(
+                    participant_can_act(participant),
+                    egui::Checkbox::new(&mut requested_done, ""),
+                )
+                .changed()
+                && requested_done
+            {
+                completion_target = Some(participant.target_id.clone());
+            }
             changed |= ui
                 .text_edit_singleline(&mut participant.display_name)
                 .changed();
@@ -2310,7 +2321,19 @@ fn encounter_roster_ui(
     if changed {
         normalize_encounter_after_edit(encounter);
     }
+    if let Some(target_id) = completion_target {
+        changed |= set_roster_action_done(store, encounter_id, &target_id, true);
+    }
     changed
+}
+
+fn set_roster_action_done(
+    store: &mut BattleRoundStore,
+    encounter_id: &str,
+    target_id: &str,
+    done: bool,
+) -> bool {
+    done && store.finish_actor_action(encounter_id, target_id)
 }
 
 fn encounter_action_ui(
@@ -12528,6 +12551,44 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn roster_action_completion_advances_turn_clocks_and_round() {
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![participant("a", 0), participant("b", 0)],
+                ..Default::default()
+            });
+
+        assert!(!set_roster_action_done(
+            &mut store, "battle", "a", false,
+        ));
+        assert!(set_roster_action_done(
+            &mut store, "battle", "a", true,
+        ));
+        let first = &store.encounters["battle"].participants[0];
+        assert!(first.action_done);
+        assert_eq!(first.turn, 1);
+        assert_eq!(first.combat_turns_completed, 1);
+        assert_eq!(
+            store.encounters["battle"].combat_completed_turns,
+            1
+        );
+
+        assert!(set_roster_action_done(
+            &mut store, "battle", "b", true,
+        ));
+        let encounter = &store.encounters["battle"];
+        assert_eq!(encounter.round, 1);
+        assert_eq!(encounter.combat_completed_turns, 2);
+        assert!(encounter
+            .participants
+            .iter()
+            .all(|participant| participant.turn == 1 && !participant.action_done));
     }
 
     #[test]
