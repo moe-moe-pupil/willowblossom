@@ -3515,15 +3515,23 @@ impl NapcatMessageManager {
             }
         }
         let character_len = self.player_characters.len();
-        self.player_characters
-            .retain(|target_id, _| is_private_message_target(self.messages.get(target_id)));
+        self.player_characters.retain(|target_id, _| {
+            self.messages
+                .get(target_id)
+                .is_none_or(|messages| !is_group_message_target(messages))
+        });
         changed |= character_len != self.player_characters.len();
 
+        let player_characters = &self.player_characters;
         for group in self.trpg_groups.values_mut() {
             let player_len = group.players.len();
-            group
-                .players
-                .retain(|target_id| self.messages.contains_key(target_id));
+            group.players.retain(|target_id| {
+                player_characters.contains_key(target_id)
+                    || self
+                        .messages
+                        .get(target_id)
+                        .is_some_and(|messages| !is_group_message_target(messages))
+            });
             changed |= player_len != group.players.len();
 
             let group_chat_len = group.group_chats.len();
@@ -9014,6 +9022,11 @@ mod tests {
             manager.chat_targets["2"].display_name,
             "保留聊天名"
         );
+        manager.sync_chat_targets();
+        assert_eq!(
+            manager.player_characters["9"].nickname,
+            "后到"
+        );
     }
 
     #[test]
@@ -10021,6 +10034,40 @@ mod tests {
             "旅人QQ"
         );
         assert_eq!(manager.messages["42"].len(), 1);
+    }
+
+    #[test]
+    fn moonberry_group_pc_without_chat_history_survives_target_sync() {
+        let legacy = serde_json::json!({
+            "discriminator": "Root",
+            "groups": [{
+                "name": "静默团",
+                "pc": [{
+                    "Id": 42,
+                    "inited": true,
+                    "nickname": "离线旅人",
+                    "hp": 6,
+                    "maxHP": 9
+                }]
+            }]
+        })
+        .to_string();
+        let mut manager = empty_manager();
+
+        let summary = manager.merge_moonberry_legacy_json(&legacy).unwrap();
+        assert_eq!(summary.players, 1);
+        assert!(!manager.messages.contains_key("42"));
+
+        manager.sync_chat_targets();
+
+        assert_eq!(
+            manager.player_characters["42"].nickname,
+            "离线旅人"
+        );
+        assert_eq!(
+            manager.trpg_groups["静默团"].players,
+            vec!["42"]
+        );
     }
 
     #[test]
@@ -11359,6 +11406,39 @@ mod tests {
         assert!(manager.sync_chat_targets());
         assert!(manager.player_characters.contains_key("player-1"));
         assert!(!manager.player_characters.contains_key("group-1"));
+        assert!(!manager.sync_chat_targets());
+    }
+
+    #[test]
+    fn chat_target_sync_preserves_offline_pcs_and_their_group_membership() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "offline".to_owned(),
+            completed_character("离线角色"),
+        );
+        manager.player_characters.insert(
+            "group-target".to_owned(),
+            completed_character("错误群角色"),
+        );
+        manager.messages.insert("group-target".to_owned(), vec![
+            test_message(NapcatMessageType::Group),
+        ]);
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec![
+                "offline".to_owned(),
+                "group-target".to_owned(),
+                "missing".to_owned(),
+            ],
+            ..Default::default()
+        });
+
+        assert!(manager.sync_chat_targets());
+        assert!(manager.player_characters.contains_key("offline"));
+        assert!(!manager.player_characters.contains_key("group-target"));
+        assert_eq!(
+            manager.trpg_groups["table"].players,
+            vec!["offline"]
+        );
         assert!(!manager.sync_chat_targets());
     }
 
