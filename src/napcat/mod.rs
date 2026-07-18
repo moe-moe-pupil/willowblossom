@@ -50,7 +50,12 @@ use tokio::{
         Receiver,
         Sender,
     },
-    time::sleep,
+    time::{
+        interval,
+        sleep,
+        Instant,
+        MissedTickBehavior,
+    },
 };
 use tokio_tungstenite::{
     connect_async,
@@ -99,6 +104,16 @@ pub struct NapcatOutboundMessage {
     pub request_id: u64,
     pub target_id: String,
     pub message: Message,
+}
+
+const NAPCAT_RESPONSE_ECHO_PREFIX: &str = "willowblossom:";
+const NAPCAT_ACTION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug)]
+struct PendingNapcatRequest {
+    request_id: u64,
+    target_id: String,
+    sent_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -5025,6 +5040,9 @@ async fn run_napcat_connection(
 
         eprintln!("connected to NapCat websocket at {NAPCAT_WS_URL}");
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+        let mut pending_requests = HashMap::<String, PendingNapcatRequest>::new();
+        let mut timeout_check = interval(Duration::from_secs(1));
+        timeout_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -5032,7 +5050,18 @@ async fn run_napcat_connection(
                     match msg {
                         Some(Ok(msg)) => {
                             if msg.is_text() || msg.is_binary() {
+                                if let Some(result) = correlated_action_result(
+                                    &msg,
+                                    &mut pending_requests,
+                                ) {
+                                    let _ = send_result_sender.send(result);
+                                }
                                 if client_to_game_sender.send(msg).is_err() {
+                                    fail_pending_napcat_requests(
+                                        &mut pending_requests,
+                                        &send_result_sender,
+                                        "NapCat响应接收端已关闭",
+                                    );
                                     return;
                                 }
                             } else if msg.is_close() {
@@ -5048,29 +5077,180 @@ async fn run_napcat_connection(
                 }
                 outbound = game_to_client_receiver.recv() => {
                     let Some(outbound) = outbound else {
+                        fail_pending_napcat_requests(
+                            &mut pending_requests,
+                            &send_result_sender,
+                            "NapCat发送端已关闭",
+                        );
                         return;
                     };
-                    if let Err(err) = ws_sender.send(outbound.message.clone()).await {
+                    let (message, echo) = match correlated_outbound_message(&outbound) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            let _ = send_result_sender.send(NapcatSendResult {
+                                request_id: outbound.request_id,
+                                target_id: outbound.target_id,
+                                error: Some(error),
+                            });
+                            continue;
+                        },
+                    };
+                    if pending_requests.contains_key(&echo) {
+                        let _ = send_result_sender.send(NapcatSendResult {
+                            request_id: outbound.request_id,
+                            target_id: outbound.target_id,
+                            error: Some(format!("NapCat请求echo重复：{echo}")),
+                        });
+                        continue;
+                    }
+                    if let Err(err) = ws_sender.send(message).await {
                         let error = format!("NapCat websocket send error: {err}");
                         eprintln!("{error}");
                         let _ = send_result_sender.send(NapcatSendResult {
                             request_id: outbound.request_id,
                             target_id: outbound.target_id,
-                            error: Some(error),
+                            error: Some(error.clone()),
                         });
+                        fail_pending_napcat_requests(
+                            &mut pending_requests,
+                            &send_result_sender,
+                            &error,
+                        );
                         break;
                     }
-                    let _ = send_result_sender.send(NapcatSendResult {
+                    pending_requests.insert(echo, PendingNapcatRequest {
                         request_id: outbound.request_id,
                         target_id: outbound.target_id,
-                        error: None,
+                        sent_at: Instant::now(),
                     });
                     eprintln!("sent NapCat websocket message");
+                }
+                _ = timeout_check.tick() => {
+                    expire_pending_napcat_requests(
+                        &mut pending_requests,
+                        &send_result_sender,
+                        Instant::now(),
+                    );
                 }
             }
         }
 
+        fail_pending_napcat_requests(
+            &mut pending_requests,
+            &send_result_sender,
+            "NapCat websocket连接在响应前断开",
+        );
+
         sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn correlated_outbound_message(
+    outbound: &NapcatOutboundMessage,
+) -> Result<(Message, String), String> {
+    let text = outbound
+        .message
+        .to_text()
+        .map_err(|err| format!("NapCat请求不是UTF-8文本：{err}"))?;
+    let mut payload = serde_json::from_str::<Value>(text)
+        .map_err(|err| format!("NapCat请求不是有效JSON：{err}"))?;
+    let Some(object) = payload.as_object_mut() else {
+        return Err("NapCat请求必须是JSON对象".to_owned());
+    };
+    let echo = match object.get("echo") {
+        Some(Value::String(echo)) if !echo.trim().is_empty() => echo.clone(),
+        Some(_) => return Err("NapCat请求echo必须是非空字符串".to_owned()),
+        None => {
+            let echo = format!(
+                "{NAPCAT_RESPONSE_ECHO_PREFIX}{}",
+                outbound.request_id
+            );
+            object.insert(
+                "echo".to_owned(),
+                Value::String(echo.clone()),
+            );
+            echo
+        },
+    };
+    Ok((
+        Message::Text(payload.to_string().into()),
+        echo,
+    ))
+}
+
+fn correlated_action_result(
+    message: &Message,
+    pending_requests: &mut HashMap<String, PendingNapcatRequest>,
+) -> Option<NapcatSendResult> {
+    let response = serde_json::from_str::<NapcatActionResponse>(message.to_text().ok()?).ok()?;
+    let echo = response.echo.as_deref()?;
+    let pending = pending_requests.remove(echo)?;
+    Some(NapcatSendResult {
+        request_id: pending.request_id,
+        target_id: pending.target_id,
+        error: napcat_action_response_error(&response),
+    })
+}
+
+fn napcat_action_response_error(response: &NapcatActionResponse) -> Option<String> {
+    if response.status.as_deref() == Some("ok") && response.retcode == Some(0) {
+        return None;
+    }
+    let status = response.status.as_deref().unwrap_or("missing");
+    let retcode = response
+        .retcode
+        .map(|retcode| retcode.to_string())
+        .unwrap_or_else(|| "missing".to_owned());
+    let detail = response
+        .message
+        .as_deref()
+        .or(response.wording.as_deref())
+        .filter(|detail| !detail.trim().is_empty())
+        .map(|detail| format!("：{detail}"))
+        .unwrap_or_default();
+    Some(format!(
+        "NapCat请求失败（status={status}, retcode={retcode}）{detail}"
+    ))
+}
+
+fn expire_pending_napcat_requests(
+    pending_requests: &mut HashMap<String, PendingNapcatRequest>,
+    send_result_sender: &CBSender<NapcatSendResult>,
+    now: Instant,
+) {
+    let expired = pending_requests
+        .iter()
+        .filter(|(_, pending)| {
+            now.saturating_duration_since(pending.sent_at) >= NAPCAT_ACTION_RESPONSE_TIMEOUT
+        })
+        .map(|(echo, _)| echo.clone())
+        .collect::<Vec<_>>();
+    for echo in expired {
+        let Some(pending) = pending_requests.remove(&echo) else {
+            continue;
+        };
+        let _ = send_result_sender.send(NapcatSendResult {
+            request_id: pending.request_id,
+            target_id: pending.target_id,
+            error: Some(format!(
+                "NapCat响应超时（{}秒）",
+                NAPCAT_ACTION_RESPONSE_TIMEOUT.as_secs()
+            )),
+        });
+    }
+}
+
+fn fail_pending_napcat_requests(
+    pending_requests: &mut HashMap<String, PendingNapcatRequest>,
+    send_result_sender: &CBSender<NapcatSendResult>,
+    error: &str,
+) {
+    for (_, pending) in pending_requests.drain() {
+        let _ = send_result_sender.send(NapcatSendResult {
+            request_id: pending.request_id,
+            target_id: pending.target_id,
+            error: Some(error.to_owned()),
+        });
     }
 }
 
@@ -5085,6 +5265,14 @@ fn send_result_system(
 
 #[derive(Debug, Deserialize)]
 struct NapcatActionResponse {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    retcode: Option<i64>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    wording: Option<String>,
     #[serde(default)]
     data: Option<NapcatActionResponseData>,
     #[serde(default)]
@@ -10669,6 +10857,131 @@ mod tests {
         assert!(manager.sync_chat_targets());
         assert!(manager.chat_targets.contains_key("12345"));
         assert!(!manager.sync_chat_targets());
+    }
+
+    #[test]
+    fn outbound_requests_receive_a_unique_correlation_echo() {
+        let outbound = NapcatOutboundMessage {
+            request_id: 42,
+            target_id: "10002".to_owned(),
+            message: Message::Text(
+                json!({
+                    "action": "send_private_msg",
+                    "params": { "user_id": 10002, "message": "hello" }
+                })
+                .to_string()
+                .into(),
+            ),
+        };
+
+        let (message, echo) = correlated_outbound_message(&outbound).unwrap();
+        let payload = serde_json::from_str::<Value>(message.to_text().unwrap()).unwrap();
+
+        assert_eq!(echo, "willowblossom:42");
+        assert_eq!(payload["echo"], "willowblossom:42");
+
+        let semantic_echo = NapcatOutboundMessage {
+            request_id: 2_000_000,
+            target_id: "99".to_owned(),
+            message: Message::Text(
+                json!({
+                    "action": "get_group_info",
+                    "params": { "group_id": 99 },
+                    "echo": "group-info:99"
+                })
+                .to_string()
+                .into(),
+            ),
+        };
+        let (message, echo) = correlated_outbound_message(&semantic_echo).unwrap();
+        let payload = serde_json::from_str::<Value>(message.to_text().unwrap()).unwrap();
+        assert_eq!(echo, "group-info:99");
+        assert_eq!(payload["echo"], "group-info:99");
+    }
+
+    #[test]
+    fn action_response_completes_only_its_echoed_pending_request() {
+        let now = Instant::now();
+        let mut pending = HashMap::from([
+            (
+                "willowblossom:42".to_owned(),
+                PendingNapcatRequest {
+                    request_id: 42,
+                    target_id: "10002".to_owned(),
+                    sent_at: now,
+                },
+            ),
+            (
+                "willowblossom:43".to_owned(),
+                PendingNapcatRequest {
+                    request_id: 43,
+                    target_id: "10003".to_owned(),
+                    sent_at: now,
+                },
+            ),
+        ]);
+        let response = Message::Text(
+            json!({
+                "status": "ok",
+                "retcode": 0,
+                "data": { "message_id": 7 },
+                "echo": "willowblossom:43"
+            })
+            .to_string()
+            .into(),
+        );
+
+        let result = correlated_action_result(&response, &mut pending).unwrap();
+
+        assert_eq!(result.request_id, 43);
+        assert_eq!(result.target_id, "10003");
+        assert!(result.error.is_none());
+        assert!(pending.contains_key("willowblossom:42"));
+        assert!(!pending.contains_key("willowblossom:43"));
+    }
+
+    #[test]
+    fn action_rejection_and_timeout_return_delivery_errors() {
+        let now = Instant::now();
+        let mut rejected_pending = HashMap::from([(
+            "willowblossom:42".to_owned(),
+            PendingNapcatRequest {
+                request_id: 42,
+                target_id: "10002".to_owned(),
+                sent_at: now,
+            },
+        )]);
+        let rejection = Message::Text(
+            json!({
+                "status": "failed",
+                "retcode": 1200,
+                "message": "recipient unavailable",
+                "echo": "willowblossom:42"
+            })
+            .to_string()
+            .into(),
+        );
+
+        let rejected = correlated_action_result(&rejection, &mut rejected_pending).unwrap();
+        let rejection_error = rejected.error.unwrap();
+        assert!(rejection_error.contains("retcode=1200"));
+        assert!(rejection_error.contains("recipient unavailable"));
+
+        let mut timed_out_pending = HashMap::from([(
+            "willowblossom:43".to_owned(),
+            PendingNapcatRequest {
+                request_id: 43,
+                target_id: "10003".to_owned(),
+                sent_at: now - NAPCAT_ACTION_RESPONSE_TIMEOUT - Duration::from_secs(1),
+            },
+        )]);
+        let (sender, receiver) = unbounded();
+        expire_pending_napcat_requests(&mut timed_out_pending, &sender, now);
+        let timed_out = receiver.try_recv().unwrap();
+        assert_eq!(timed_out.request_id, 43);
+        assert_eq!(timed_out.target_id, "10003");
+        assert!(timed_out.error.unwrap().contains("响应超时"));
+        assert!(timed_out_pending.is_empty());
     }
 
     #[test]
