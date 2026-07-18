@@ -1852,15 +1852,51 @@ fn encounter_ui(
 ) -> bool {
     let mut changed = false;
     let encounter_id = encounter_entity.id.as_str();
+    if !store.encounters.contains_key(encounter_id) {
+        return false;
+    }
+    let canonical_encounter_id = store
+        .encounters
+        .get(encounter_id)
+        .and_then(|encounter| encounter.trpg_group.as_deref())
+        .and_then(|group_name| store.canonical_encounter_id_for_group(group_name))
+        .filter(|canonical_id| *canonical_id != encounter_id)
+        .map(str::to_owned);
+    if let Some(canonical_encounter_id) = canonical_encounter_id {
+        let canonical_name = store
+            .encounters
+            .get(&canonical_encounter_id)
+            .map(|encounter| encounter.name.as_str())
+            .unwrap_or(canonical_encounter_id.as_str());
+        let mut remove = false;
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.heading(&encounter_entity.name);
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!(
+                    "此战斗轮与“{canonical_name}”绑定到同一TRPG组，已锁定以防重复结算或覆盖角色状态。"
+                ),
+            );
+            if ui.button("删除重复战斗轮").clicked() {
+                remove = true;
+            }
+        });
+        if remove {
+            store.encounters.remove(encounter_id);
+            if store.active_encounter_id.as_deref() == Some(encounter_id) {
+                store.active_encounter_id = None;
+            }
+            return true;
+        }
+        return false;
+    }
     let initial_round = store
         .encounters
         .get(encounter_id)
         .map(|encounter| encounter.round)
         .unwrap_or_default();
     let mut remove = false;
-    if !store.encounters.contains_key(encounter_id) {
-        return false;
-    }
     changed |= sync_encounter_from_group_clock(store, encounter_id, manager);
     let group_rounds_remaining = group_rounds_ahead_of_encounter(store, encounter_id, manager);
 
@@ -2596,6 +2632,9 @@ impl BattleRoundStore {
         group: &TrpgGroup,
         manager: &NapcatMessageManager,
     ) -> String {
+        if let Some(encounter_id) = self.canonical_encounter_id_for_group(&group_name) {
+            return encounter_id.to_owned();
+        }
         let encounter_id = self.allocate_encounter_id();
         let participants = group
             .players
@@ -2626,6 +2665,41 @@ impl BattleRoundStore {
         encounter_id
     }
 
+    fn canonical_encounter_id_for_group<'a>(&'a self, group_name: &str) -> Option<&'a str> {
+        let max_round = self
+            .encounters
+            .values()
+            .filter(|encounter| encounter.trpg_group.as_deref() == Some(group_name))
+            .map(|encounter| encounter.round)
+            .max()?;
+
+        if let Some(active_id) = self.active_encounter_id.as_deref() {
+            if self.encounters.get(active_id).is_some_and(|encounter| {
+                encounter.trpg_group.as_deref() == Some(group_name) && encounter.round == max_round
+            }) {
+                return Some(active_id);
+            }
+        }
+
+        self.encounters
+            .iter()
+            .filter(|(_, encounter)| {
+                encounter.trpg_group.as_deref() == Some(group_name) && encounter.round == max_round
+            })
+            .map(|(encounter_id, _)| encounter_id.as_str())
+            .max()
+    }
+
+    fn encounter_is_canonical(&self, encounter_id: &str) -> bool {
+        let Some(encounter) = self.encounters.get(encounter_id) else {
+            return false;
+        };
+        let Some(group_name) = encounter.trpg_group.as_deref() else {
+            return true;
+        };
+        self.canonical_encounter_id_for_group(group_name) == Some(encounter_id)
+    }
+
     fn allocate_encounter_id(&mut self) -> String {
         let first_index = self.next_encounter_index.max(1);
         let mut index = first_index;
@@ -2644,6 +2718,9 @@ impl BattleRoundStore {
     }
 
     fn next_round(&mut self, encounter_id: &str) -> bool {
+        if !self.encounter_is_canonical(encounter_id) {
+            return false;
+        }
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
@@ -2760,6 +2837,9 @@ impl BattleRoundStore {
         target_id: &str,
         allow_defeated: bool,
     ) -> bool {
+        if !self.encounter_is_canonical(encounter_id) {
+            return false;
+        }
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
@@ -2821,6 +2901,9 @@ impl BattleRoundStore {
         action_name: &str,
         damage: f32,
     ) -> bool {
+        if !self.encounter_is_canonical(encounter_id) {
+            return false;
+        }
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
@@ -2914,6 +2997,9 @@ impl BattleRoundStore {
         manager: &NapcatMessageManager,
         scene_positions: Option<&SceneCharacterPositions>,
     ) -> bool {
+        if !self.encounter_is_canonical(encounter_id) {
+            return false;
+        }
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
@@ -3748,6 +3834,9 @@ impl BattleRoundStore {
     }
 
     fn advance_participant(&mut self, encounter_id: &str, target_id: &str, resume: bool) -> bool {
+        if !self.encounter_is_canonical(encounter_id) {
+            return false;
+        }
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
@@ -3825,6 +3914,9 @@ impl BattleRoundStore {
     }
 
     fn skip_negative_participant(&mut self, encounter_id: &str, target_id: &str) -> bool {
+        if !self.encounter_is_canonical(encounter_id) {
+            return false;
+        }
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
@@ -3892,6 +3984,9 @@ fn sync_encounter_from_group_clock(
     encounter_id: &str,
     manager: &NapcatMessageManager,
 ) -> bool {
+    if !store.encounter_is_canonical(encounter_id) {
+        return false;
+    }
     let Some(group_name) = store
         .encounters
         .get(encounter_id)
@@ -4205,6 +4300,9 @@ fn sync_battle_round_buff_advancement(
     manager: &mut NapcatMessageManager,
     rule_engine_state: &mut RuleEngineState,
 ) -> bool {
+    if !store.encounter_is_canonical(encounter_id) {
+        return false;
+    }
     let Some(encounter) = store.encounters.get(encounter_id) else {
         return false;
     };
@@ -6595,6 +6693,136 @@ mod tests {
             "first"
         );
         assert_eq!(store.encounters["battle-2"].name, "new");
+    }
+
+    #[test]
+    fn new_battle_reuses_the_canonical_encounter_for_its_group() {
+        let manager = empty_manager();
+        let group = TrpgGroup::default();
+        let mut store = BattleRoundStore {
+            active_encounter_id: Some("battle-old".to_owned()),
+            encounters: HashMap::from([
+                (
+                    "battle-old".to_owned(),
+                    BattleEncounter {
+                        name: "stale".to_owned(),
+                        trpg_group: Some("party".to_owned()),
+                        round: 2,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "battle-current".to_owned(),
+                    BattleEncounter {
+                        name: "current".to_owned(),
+                        trpg_group: Some("party".to_owned()),
+                        round: 3,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            store.canonical_encounter_id_for_group("party"),
+            Some("battle-current")
+        );
+        let encounter_id = store.create_encounter_from_group(
+            "replacement".to_owned(),
+            "party".to_owned(),
+            &group,
+            &manager,
+        );
+
+        assert_eq!(encounter_id, "battle-current");
+        assert_eq!(store.encounters.len(), 2);
+        assert_eq!(
+            store.encounters["battle-current"].name,
+            "current"
+        );
+        assert_eq!(
+            store.encounters["battle-old"].name,
+            "stale"
+        );
+    }
+
+    #[test]
+    fn active_encounter_breaks_equal_round_group_ties() {
+        let store = BattleRoundStore {
+            active_encounter_id: Some("battle-selected".to_owned()),
+            encounters: HashMap::from([
+                (
+                    "battle-selected".to_owned(),
+                    BattleEncounter {
+                        trpg_group: Some("party".to_owned()),
+                        round: 3,
+                        ..Default::default()
+                    },
+                ),
+                ("battle-z".to_owned(), BattleEncounter {
+                    trpg_group: Some("party".to_owned()),
+                    round: 3,
+                    ..Default::default()
+                }),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            store.canonical_encounter_id_for_group("party"),
+            Some("battle-selected")
+        );
+    }
+
+    #[test]
+    fn duplicate_group_encounter_cannot_advance_or_apply_actions() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            world_turn: 4,
+            ..Default::default()
+        });
+        let mut store = BattleRoundStore {
+            encounters: HashMap::from([
+                (
+                    "battle-stale".to_owned(),
+                    BattleEncounter {
+                        trpg_group: Some("party".to_owned()),
+                        round: 2,
+                        participants: vec![participant("actor", 2), participant("target", 2)],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "battle-current".to_owned(),
+                    BattleEncounter {
+                        trpg_group: Some("party".to_owned()),
+                        round: 3,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        assert!(!sync_encounter_from_group_clock(
+            &mut store,
+            "battle-stale",
+            &manager
+        ));
+        assert!(!store.next_round("battle-stale"));
+        assert!(!store.apply_action(
+            "battle-stale",
+            "actor",
+            "target",
+            "攻击",
+            3.0
+        ));
+
+        let stale = &store.encounters["battle-stale"];
+        assert_eq!(stale.round, 2);
+        assert_eq!(stale.participants[1].hp, 10.0);
+        assert!(stale.action_log.is_empty());
     }
 
     #[test]
