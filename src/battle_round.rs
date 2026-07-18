@@ -1454,13 +1454,18 @@ fn setup_battle_round_store(mut commands: Commands) {
 
 fn sync_battle_round_entities(
     mut commands: Commands,
-    store: Option<Res<Persistent<BattleRoundStore>>>,
+    store: Option<ResMut<Persistent<BattleRoundStore>>>,
     existing: Query<Entity, With<BattleRoundRuntime>>,
     mut last_signature: Local<u64>,
 ) {
-    let Some(store) = store else {
+    let Some(mut store) = store else {
         return;
     };
+    if store.repair_duplicate_participants() {
+        if let Err(error) = store.persist() {
+            eprintln!("failed to persist repaired battle participant identities: {error}");
+        }
+    }
     let signature = battle_store_signature(&store);
     if *last_signature == signature {
         return;
@@ -2696,6 +2701,14 @@ fn encounter_log_ui(ui: &mut egui::Ui, store: &BattleRoundStore, encounter_id: &
 }
 
 impl BattleRoundStore {
+    fn repair_duplicate_participants(&mut self) -> bool {
+        let mut changed = false;
+        for encounter in self.encounters.values_mut() {
+            changed |= deduplicate_encounter_participants(encounter);
+        }
+        changed
+    }
+
     fn create_encounter_from_group(
         &mut self,
         name: String,
@@ -2710,9 +2723,11 @@ impl BattleRoundStore {
             return encounter_id.to_owned();
         }
         let encounter_id = self.allocate_encounter_id();
+        let mut seen_player_ids = HashSet::new();
         let participants = group
             .players
             .iter()
+            .filter(|target_id| seen_player_ids.insert((*target_id).clone()))
             .map(|target_id| {
                 let mut participant = participant_from_target(target_id, manager);
                 initialize_participant_clock(
@@ -4074,14 +4089,15 @@ fn refresh_encounter_players(
     encounter: &mut BattleEncounter,
     manager: &NapcatMessageManager,
 ) -> bool {
-    let Some(group_name) = encounter.trpg_group.as_deref() else {
+    let Some(group_name) = encounter.trpg_group.clone() else {
         return false;
     };
-    let Some(group) = manager.trpg_groups.get(group_name) else {
+    let Some(group) = manager.trpg_groups.get(&group_name) else {
         return false;
     };
 
     let before_signature = encounter_participants_signature(&encounter.participants);
+    deduplicate_encounter_participants(encounter);
     encounter.participants.retain(|participant| {
         participant.unit_template_id.is_some() || group.players.contains(&participant.target_id)
     });
@@ -4103,13 +4119,22 @@ fn refresh_encounter_players(
             let mut participant = participant_from_target(target_id, manager);
             initialize_participant_clock(
                 &mut participant,
-                Some(group_name),
+                Some(&group_name),
                 manager,
             );
             encounter.participants.push(participant);
         }
     }
     before_signature != encounter_participants_signature(&encounter.participants)
+}
+
+fn deduplicate_encounter_participants(encounter: &mut BattleEncounter) -> bool {
+    let before_len = encounter.participants.len();
+    let mut seen_target_ids = HashSet::new();
+    encounter
+        .participants
+        .retain(|participant| seen_target_ids.insert(participant.target_id.clone()));
+    before_len != encounter.participants.len()
 }
 
 fn sync_encounter_from_group_clock(
@@ -6809,6 +6834,37 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_group_players_create_one_actionable_battle_participant() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "a".to_owned(),
+            PlayerCharacter::default(),
+        );
+        let group = TrpgGroup {
+            players: vec!["a".to_owned(), "a".to_owned()],
+            ..Default::default()
+        };
+        manager
+            .trpg_groups
+            .insert("party".to_owned(), group.clone());
+        let mut store = BattleRoundStore::default();
+
+        let encounter_id = store.create_encounter_from_group(
+            "test".to_owned(),
+            "party".to_owned(),
+            &group,
+            &manager,
+        );
+
+        assert_eq!(
+            store.encounters[&encounter_id].participants.len(),
+            1
+        );
+        assert!(store.finish_actor_action(&encounter_id, "a"));
+        assert_eq!(store.encounters[&encounter_id].round, 1);
+    }
+
+    #[test]
     fn new_battle_id_wraps_and_skips_existing_imported_encounters() {
         let manager = empty_manager();
         let group = TrpgGroup::default();
@@ -8080,6 +8136,81 @@ mod tests {
         );
         assert_eq!(unit_participant.max_hp, 9.0);
         assert_eq!(unit_participant.agi, 2);
+    }
+
+    #[test]
+    fn refresh_encounter_players_repairs_duplicate_persisted_participants() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec!["pc".to_owned()],
+            ..Default::default()
+        });
+        manager
+            .player_characters
+            .insert("pc".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        let mut encounter = BattleEncounter {
+            name: "battle".to_owned(),
+            trpg_group: Some("table".to_owned()),
+            participants: vec![participant("pc", 0), participant("pc", 0)],
+            ..Default::default()
+        };
+
+        assert!(refresh_encounter_players(
+            &mut encounter,
+            &manager
+        ));
+        assert_eq!(encounter.participants.len(), 1);
+        assert_eq!(
+            encounter.participants[0].target_id,
+            "pc"
+        );
+    }
+
+    #[test]
+    fn battle_store_repairs_duplicate_participants_in_every_loaded_encounter() {
+        let duplicate_encounter = |target_id: &str| {
+            let mut first = participant(target_id, 0);
+            first.hp = 3.0;
+            let mut duplicate = participant(target_id, 0);
+            duplicate.hp = 9.0;
+            BattleEncounter {
+                name: target_id.to_owned(),
+                participants: vec![first, duplicate],
+                ..Default::default()
+            }
+        };
+        let mut store = BattleRoundStore {
+            encounters: HashMap::from([
+                (
+                    "battle-a".to_owned(),
+                    duplicate_encounter("a"),
+                ),
+                (
+                    "battle-b".to_owned(),
+                    duplicate_encounter("b"),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        assert!(store.repair_duplicate_participants());
+        assert_eq!(
+            store.encounters["battle-a"].participants.len(),
+            1
+        );
+        assert_eq!(
+            store.encounters["battle-b"].participants.len(),
+            1
+        );
+        assert_eq!(
+            store.encounters["battle-a"].participants[0].hp,
+            3.0
+        );
+        assert!(!store.repair_duplicate_participants());
     }
 
     #[test]

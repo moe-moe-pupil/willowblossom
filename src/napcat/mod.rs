@@ -1576,10 +1576,14 @@ impl TrpgLegacyNegativeTimer {
 
 impl TrpgGroup {
     pub fn sync_turn_players(&mut self) -> bool {
+        let player_len = self.players.len();
+        let mut seen = HashSet::new();
+        self.players
+            .retain(|target_id| seen.insert(target_id.clone()));
         let before_len = self.player_turns.len();
         self.player_turns
             .retain(|target_id, _| self.players.contains(target_id));
-        let mut changed = before_len != self.player_turns.len();
+        let mut changed = player_len != self.players.len() || before_len != self.player_turns.len();
 
         for target_id in &self.players {
             if !self.player_turns.contains_key(target_id) {
@@ -12511,6 +12515,33 @@ mod tests {
         assert!(group.group_chats.is_empty());
         assert!(group.player_turns.contains_key("player-1"));
         assert!(!group.player_turns.contains_key("missing-player"));
+    }
+
+    #[test]
+    fn turn_player_sync_deduplicates_group_members_without_resetting_clocks() {
+        let mut group = TrpgGroup {
+            players: vec!["a".to_owned(), "a".to_owned(), "b".to_owned()],
+            player_turns: HashMap::from([
+                ("a".to_owned(), TrpgPlayerTurnState {
+                    turns_passed: 7,
+                    acted: true,
+                    skipped: false,
+                }),
+                (
+                    "stale".to_owned(),
+                    TrpgPlayerTurnState::default(),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        assert!(group.sync_turn_players());
+        assert_eq!(group.players, vec!["a", "b"]);
+        assert_eq!(group.player_turns["a"].turns_passed, 7);
+        assert!(group.player_turns["a"].acted);
+        assert!(group.player_turns.contains_key("b"));
+        assert!(!group.player_turns.contains_key("stale"));
+        assert!(!group.sync_turn_players());
     }
 
     #[test]
