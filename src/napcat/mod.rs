@@ -6860,9 +6860,9 @@ pub fn update_character_from_status_with_config(
 }
 
 pub fn character_next_level_exp(level: i32) -> i32 {
-    let level = level.max(1) as i64;
+    let level = level.max(1) as i128;
     let required = level * (level - 1) * 25 / 2 + 100;
-    required.min(i32::MAX as i64) as i32
+    required.min(i32::MAX as i128) as i32
 }
 
 pub fn grant_character_experience(character: &mut PlayerCharacter, amount: i32) -> i32 {
@@ -11358,6 +11358,11 @@ mod tests {
         assert_eq!(character_next_level_exp(2), 125);
         assert_eq!(character_next_level_exp(3), 175);
         assert_eq!(character_next_level_exp(0), 100);
+        assert_eq!(character_next_level_exp(i32::MIN), 100);
+        assert_eq!(
+            character_next_level_exp(i32::MAX),
+            i32::MAX
+        );
 
         let mut character = PlayerCharacter {
             level: 1,
