@@ -13028,18 +13028,7 @@ fn append_local_sent_message(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
-    let campaign_id = manager.current_campaign_id();
-    let (character_id, party_id, visibility) = if let Some(recipient_id) = recipient_id {
-        let access = manager.player_access_for_user(recipient_id);
-        (
-            access.character_id,
-            access.party_id,
-            Visibility::Player(recipient_id),
-        )
-    } else {
-        (None, None, Visibility::Public)
-    };
-    let message = NapcatMessage {
+    let mut message = NapcatMessage {
         data: NapcatMessageData {
             time,
             message_type,
@@ -13059,12 +13048,13 @@ fn append_local_sent_message(
                 user_id: self_id,
                 nickname: "GM".to_owned(),
             },
-            campaign_id,
-            character_id,
-            party_id,
-            visibility,
+            campaign_id: String::new(),
+            character_id: None,
+            party_id: None,
+            visibility: Visibility::Public,
         },
     };
+    manager.annotate_message_access(&target_id, &mut message);
 
     manager.messages.entry(target_id).or_default().push(message);
     true
@@ -13177,6 +13167,79 @@ mod tests {
         manager.trpg_groups.insert("table".to_owned(), group);
         manager.current_trpg_group = Some("table".to_owned());
         manager
+    }
+
+    fn manager_with_noncurrent_beta_targets() -> NapcatMessageManager {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            campaign_id: "campaign-a".to_owned(),
+            players: vec!["9".to_owned()],
+            group_chats: vec!["88".to_owned()],
+            ..Default::default()
+        });
+        let mut beta = TrpgGroup {
+            campaign_id: "campaign-b".to_owned(),
+            players: vec!["2".to_owned()],
+            group_chats: vec!["99".to_owned()],
+            ..Default::default()
+        };
+        beta.ensure_party("red");
+        beta.set_player_party("2", Some("red"));
+        manager.trpg_groups.insert("beta".to_owned(), beta);
+        manager.current_trpg_group = Some("alpha".to_owned());
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message(2),
+        ]);
+        manager.messages.insert("99".to_owned(), vec![
+            test_group_message(2, "hello group"),
+        ]);
+        manager
+    }
+
+    #[test]
+    fn local_private_send_uses_noncurrent_target_campaign() {
+        let mut manager = manager_with_noncurrent_beta_targets();
+
+        assert!(append_local_sent_message(
+            &mut manager,
+            NapcatSendTarget::Private(2),
+            "private answer",
+        ));
+
+        let response = manager.messages["2"].last().unwrap();
+        assert_eq!(response.data.campaign_id, "campaign-b");
+        assert_eq!(
+            response.data.character_id.as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            response.data.party_id.as_deref(),
+            Some("red")
+        );
+        assert_eq!(
+            response.data.visibility,
+            Visibility::Player(2)
+        );
+    }
+
+    #[test]
+    fn local_group_send_uses_noncurrent_target_campaign() {
+        let mut manager = manager_with_noncurrent_beta_targets();
+
+        assert!(append_local_sent_message(
+            &mut manager,
+            NapcatSendTarget::Group(99),
+            "group answer",
+        ));
+
+        let response = manager.messages["99"].last().unwrap();
+        assert_eq!(response.data.campaign_id, "campaign-b");
+        assert_eq!(response.data.character_id, None);
+        assert_eq!(response.data.party_id, None);
+        assert_eq!(
+            response.data.visibility,
+            Visibility::Public
+        );
     }
 
     #[test]

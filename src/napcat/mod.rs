@@ -5377,8 +5377,7 @@ fn append_local_private_text_response(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
-    let access = manager.player_access_for_user(recipient_id);
-    let message = NapcatMessage {
+    let mut message = NapcatMessage {
         data: NapcatMessageData {
             time,
             message_type: NapcatMessageType::Private,
@@ -5398,12 +5397,13 @@ fn append_local_private_text_response(
                 user_id: self_id,
                 nickname: "GM".to_owned(),
             },
-            campaign_id: manager.current_campaign_id(),
-            character_id: access.character_id,
-            party_id: access.party_id,
-            visibility: Visibility::Player(recipient_id),
+            campaign_id: String::new(),
+            character_id: None,
+            party_id: None,
+            visibility: Visibility::Public,
         },
     };
+    manager.annotate_message_access(target_id, &mut message);
 
     manager
         .messages
@@ -11223,6 +11223,45 @@ mod tests {
         assert_eq!(response.data.target_id, Some(2));
         assert_eq!(response.data.sender.nickname, "GM");
         assert_eq!(message_text(response), "兑换回复");
+    }
+
+    #[test]
+    fn local_private_text_response_uses_noncurrent_target_campaign() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            campaign_id: "campaign-a".to_owned(),
+            players: vec!["9".to_owned()],
+            ..Default::default()
+        });
+        let mut beta = TrpgGroup {
+            campaign_id: "campaign-b".to_owned(),
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        };
+        beta.ensure_party("red");
+        beta.set_player_party("2", Some("red"));
+        manager.trpg_groups.insert("beta".to_owned(), beta);
+        manager.current_trpg_group = Some("alpha".to_owned());
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message_from(2, "player asks"),
+        ]);
+
+        append_local_private_text_response(&mut manager, "2", 2, "private answer");
+
+        let response = manager.messages["2"].last().unwrap();
+        assert_eq!(response.data.campaign_id, "campaign-b");
+        assert_eq!(
+            response.data.character_id.as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            response.data.party_id.as_deref(),
+            Some("red")
+        );
+        assert_eq!(
+            response.data.visibility,
+            Visibility::Player(2)
+        );
     }
 
     #[test]
