@@ -1855,6 +1855,21 @@ fn encounter_ui(
     if !store.encounters.contains_key(encounter_id) {
         return false;
     }
+    let missing_group_name = store
+        .encounters
+        .get(encounter_id)
+        .and_then(|encounter| encounter.trpg_group.as_deref())
+        .filter(|group_name| !manager.trpg_groups.contains_key(*group_name))
+        .map(str::to_owned);
+    if let Some(group_name) = missing_group_name {
+        return locked_encounter_ui(
+            ui,
+            store,
+            encounter_id,
+            &encounter_entity.name,
+            &format!("绑定的TRPG组“{group_name}”已不存在；此战斗轮已锁定，不会再覆盖角色状态。"),
+        );
+    }
     let canonical_encounter_id = store
         .encounters
         .get(encounter_id)
@@ -1868,28 +1883,15 @@ fn encounter_ui(
             .get(&canonical_encounter_id)
             .map(|encounter| encounter.name.as_str())
             .unwrap_or(canonical_encounter_id.as_str());
-        let mut remove = false;
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
-            ui.heading(&encounter_entity.name);
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                format!(
-                    "此战斗轮与“{canonical_name}”绑定到同一TRPG组，已锁定以防重复结算或覆盖角色状态。"
-                ),
-            );
-            if ui.button("删除重复战斗轮").clicked() {
-                remove = true;
-            }
-        });
-        if remove {
-            store.encounters.remove(encounter_id);
-            if store.active_encounter_id.as_deref() == Some(encounter_id) {
-                store.active_encounter_id = None;
-            }
-            return true;
-        }
-        return false;
+        return locked_encounter_ui(
+            ui,
+            store,
+            encounter_id,
+            &encounter_entity.name,
+            &format!(
+                "此战斗轮与“{canonical_name}”绑定到同一TRPG组，已锁定以防重复结算或覆盖角色状态。"
+            ),
+        );
     }
     let initial_round = store
         .encounters
@@ -2027,6 +2029,32 @@ fn encounter_ui(
     }
 
     changed
+}
+
+fn locked_encounter_ui(
+    ui: &mut egui::Ui,
+    store: &mut BattleRoundStore,
+    encounter_id: &str,
+    encounter_name: &str,
+    reason: &str,
+) -> bool {
+    let mut remove = false;
+    ui.group(|ui| {
+        ui.set_width(ui.available_width());
+        ui.heading(encounter_name);
+        ui.colored_label(egui::Color32::YELLOW, reason);
+        if ui.button("删除此战斗轮").clicked() {
+            remove = true;
+        }
+    });
+    if !remove {
+        return false;
+    }
+    store.encounters.remove(encounter_id);
+    if store.active_encounter_id.as_deref() == Some(encounter_id) {
+        store.active_encounter_id = None;
+    }
+    true
 }
 
 fn encounter_roster_ui(
@@ -2700,6 +2728,16 @@ impl BattleRoundStore {
         self.canonical_encounter_id_for_group(group_name) == Some(encounter_id)
     }
 
+    fn encounter_group_exists(&self, encounter_id: &str, manager: &NapcatMessageManager) -> bool {
+        let Some(encounter) = self.encounters.get(encounter_id) else {
+            return false;
+        };
+        encounter
+            .trpg_group
+            .as_deref()
+            .is_none_or(|group_name| manager.trpg_groups.contains_key(group_name))
+    }
+
     fn allocate_encounter_id(&mut self) -> String {
         let first_index = self.next_encounter_index.max(1);
         let mut index = first_index;
@@ -2997,7 +3035,9 @@ impl BattleRoundStore {
         manager: &NapcatMessageManager,
         scene_positions: Option<&SceneCharacterPositions>,
     ) -> bool {
-        if !self.encounter_is_canonical(encounter_id) {
+        if !self.encounter_is_canonical(encounter_id)
+            || !self.encounter_group_exists(encounter_id, manager)
+        {
             return false;
         }
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
@@ -4123,6 +4163,11 @@ fn sync_encounter_to_manager(
     let Some(encounter) = encounter else {
         return false;
     };
+    if let Some(group_name) = encounter.trpg_group.as_deref() {
+        if !manager.trpg_groups.contains_key(group_name) {
+            return false;
+        }
+    }
     let mut changed = false;
 
     for participant in &encounter.participants {
@@ -4309,12 +4354,14 @@ fn sync_battle_round_buff_advancement(
     if encounter.round <= previous_round {
         return false;
     }
-    let canonical_round = encounter
-        .trpg_group
-        .as_deref()
-        .and_then(|group_name| manager.trpg_groups.get(group_name))
-        .map(|group| group.world_turn)
-        .unwrap_or(previous_round);
+    let canonical_round = if let Some(group_name) = encounter.trpg_group.as_deref() {
+        let Some(group) = manager.trpg_groups.get(group_name) else {
+            return false;
+        };
+        group.world_turn
+    } else {
+        previous_round
+    };
     let rounds_to_advance = encounter
         .round
         .saturating_sub(canonical_round.max(previous_round));
@@ -6883,6 +6930,42 @@ mod tests {
         assert_eq!(group.player_turns["a"].turns_passed, 3);
         assert!(group.player_turns["a"].acted);
         assert!(!group.player_turns["a"].skipped);
+    }
+
+    #[test]
+    fn deleted_group_battle_cannot_write_character_state() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("a".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 8.0,
+                max_mp: 8.0,
+                damage_taken_this_turn: 1.0,
+                ..Default::default()
+            });
+        let mut player = participant("a", 4);
+        player.player_character = true;
+        player.hp = 2.0;
+        player.mp = 1.0;
+        player.damage_taken_this_turn = 8.0;
+        let encounter = BattleEncounter {
+            trpg_group: Some("deleted-party".to_owned()),
+            round: 4,
+            participants: vec![player],
+            ..Default::default()
+        };
+
+        assert!(!sync_encounter_to_manager(
+            Some(&encounter),
+            &mut manager
+        ));
+
+        let character = &manager.player_characters["a"];
+        assert_eq!(character.hp, 10.0);
+        assert_eq!(character.mp, 8.0);
+        assert_eq!(character.damage_taken_this_turn, 1.0);
     }
 
     #[test]
