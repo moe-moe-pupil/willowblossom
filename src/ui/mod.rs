@@ -100,6 +100,8 @@ const NAPCAT_MOONBERRY_LEGACY_IMPORT_DEFAULT_PATH: &str =
 const DEEPSEEK_SUMMARY_EXPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/exports/deepseek_summaries_export.json";
 const VOXEL_SCENE_EXPORT_DEFAULT_PATH: &str = ".data/willowblossom/exports/voxel_scene_export.json";
+const BATTLE_ROUND_EXPORT_DEFAULT_PATH: &str =
+    ".data/willowblossom/exports/battle_rounds_export.json";
 
 fn voxel_material_choices() -> [(u8, &'static str, egui::Color32); 10] {
     [
@@ -610,7 +612,11 @@ const MOONBERRY_SKILL_TYPES: &[&str] = &[
 const MOONBERRY_TARGET_CLASSES: &[&str] = &["无目标", "单目标", "多目标", "范围"];
 
 use crate::{
-    battle_round::BattleRoundUiState,
+    battle_round::{
+        BattleRoundStore,
+        BattleRoundUiState,
+        BATTLE_ROUND_EXPORT_VERSION,
+    },
     deepseek::{
         DeepseekIOSender,
         DeepseekManager,
@@ -797,6 +803,7 @@ pub(crate) struct TrpgGroupSettingsState {
     moonberry_legacy_import_path: String,
     deepseek_summary_export_path: String,
     voxel_scene_export_path: String,
+    battle_round_export_path: String,
     import_path: String,
     import_export_status: String,
 }
@@ -866,6 +873,7 @@ pub struct UiSystemLocals<'w, 's> {
     chat_player_visible_previews: Local<'s, HashMap<String, String>>,
     chat_list_player_visible_filter: Local<'s, Option<String>>,
     voxel_editor: ResMut<'w, VoxelEditorState>,
+    battle_store: Option<ResMut<'w, Persistent<BattleRoundStore>>>,
 }
 
 pub struct CircleImageButton {
@@ -9538,6 +9546,9 @@ fn ensure_import_export_paths(state: &mut TrpgGroupSettingsState) {
     if state.voxel_scene_export_path.trim().is_empty() {
         state.voxel_scene_export_path = VOXEL_SCENE_EXPORT_DEFAULT_PATH.to_owned();
     }
+    if state.battle_round_export_path.trim().is_empty() {
+        state.battle_round_export_path = BATTLE_ROUND_EXPORT_DEFAULT_PATH.to_owned();
+    }
     if state.import_path.trim().is_empty() {
         state.import_path = state.export_path.clone();
     }
@@ -9549,6 +9560,7 @@ fn napcat_import_export_ui(
     deepseek_manager: &mut ResMut<Persistent<DeepseekManager>>,
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
     mut scene_runtime: Option<&mut VoxelMapRuntimeState>,
+    mut battle_store: Option<&mut Persistent<BattleRoundStore>>,
     state: &mut TrpgGroupSettingsState,
 ) {
     ensure_import_export_paths(state);
@@ -9556,10 +9568,11 @@ fn napcat_import_export_ui(
     ui.collapsing("导入/导出", |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(format!(
-                "NapCat格式版本 {} / DeepSeek总结版本 {} / 场景版本 {}",
+                "NapCat格式版本 {} / DeepSeek总结版本 {} / 场景版本 {} / 战斗轮版本 {}",
                 NAPCAT_MANAGER_EXPORT_VERSION,
                 DEEPSEEK_SUMMARY_EXPORT_VERSION,
-                VOXEL_SCENE_EXPORT_VERSION
+                VOXEL_SCENE_EXPORT_VERSION,
+                BATTLE_ROUND_EXPORT_VERSION
             ));
             if !state.import_export_status.trim().is_empty() {
                 ui.small(state.import_export_status.as_str());
@@ -9809,6 +9822,53 @@ fn napcat_import_export_ui(
                     },
                     Err(err) => {
                         state.import_export_status = format!("体素场景导入失败：{err}");
+                    },
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("战斗轮文件");
+            ui.text_edit_singleline(&mut state.battle_round_export_path);
+            if ui.button("导出战斗轮").clicked() {
+                let result = battle_store
+                    .as_deref()
+                    .ok_or_else(|| "战斗轮存储未就绪".to_owned())
+                    .and_then(|store| {
+                        write_text_export(
+                            &state.battle_round_export_path,
+                            store.to_export_json(),
+                        )
+                    });
+                match result {
+                    Ok(()) => {
+                        state.import_export_status = format!(
+                            "已导出战斗轮到 {}",
+                            state.battle_round_export_path
+                        );
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("战斗轮导出失败：{err}");
+                    },
+                }
+            }
+            if ui.button("导入战斗轮（替换）").clicked() {
+                let result = battle_store
+                    .as_deref_mut()
+                    .ok_or_else(|| "战斗轮存储未就绪".to_owned())
+                    .and_then(|store| {
+                        let text = read_text_import(&state.battle_round_export_path)?;
+                        let imported = BattleRoundStore::from_export_json(&text)?;
+                        let count = imported.encounters.len();
+                        store.set(imported).map_err(|err| err.to_string())?;
+                        Ok(count)
+                    });
+                match result {
+                    Ok(count) => {
+                        state.import_export_status = format!("已替换导入{count}个战斗轮");
+                    },
+                    Err(err) => {
+                        state.import_export_status = format!("战斗轮导入失败：{err}");
                     },
                 }
             }
@@ -11100,6 +11160,7 @@ fn trpg_group_settings_window(
     deepseek_manager: &mut ResMut<Persistent<DeepseekManager>>,
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
     scene_runtime: Option<&mut VoxelMapRuntimeState>,
+    battle_store: Option<&mut Persistent<BattleRoundStore>>,
     napcat_sender: Option<&NapcatIOSender>,
     ime: &mut ImeManager,
     chat_input_msgs: &mut Local<HashMap<String, String>>,
@@ -11150,6 +11211,7 @@ fn trpg_group_settings_window(
                 deepseek_manager,
                 scene_store.as_deref_mut(),
                 scene_runtime,
+                battle_store,
                 state,
             );
             ui.separator();
@@ -11978,6 +12040,7 @@ pub fn ui_system(
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
     let voxel_editor: &mut VoxelEditorState = &mut locals.voxel_editor;
+    let battle_store = &mut locals.battle_store;
 
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -12057,6 +12120,7 @@ pub fn ui_system(
         &mut deepseek_manager,
         scene_store.as_deref_mut(),
         scene_runtime.as_deref_mut(),
+        battle_store.as_deref_mut(),
         napcat_sender,
         &mut *ime,
         chat_input_msgs,

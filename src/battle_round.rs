@@ -171,6 +171,22 @@ pub struct BattleRoundStore {
     next_encounter_index: u64,
 }
 
+pub const BATTLE_ROUND_EXPORT_VERSION: u32 = 1;
+
+#[derive(Serialize)]
+struct BattleRoundStoreExportRef<'a> {
+    version: u32,
+    export_type: &'static str,
+    store: &'a BattleRoundStore,
+}
+
+#[derive(Deserialize)]
+struct BattleRoundStoreExportOwned {
+    version: u32,
+    export_type: String,
+    store: BattleRoundStore,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BattleEncounter {
     pub name: String,
@@ -2704,6 +2720,60 @@ fn encounter_log_ui(ui: &mut egui::Ui, store: &BattleRoundStore, encounter_id: &
 }
 
 impl BattleRoundStore {
+    pub fn to_export_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(&BattleRoundStoreExportRef {
+            version: BATTLE_ROUND_EXPORT_VERSION,
+            export_type: "battle_rounds",
+            store: self,
+        })
+        .map_err(|err| err.to_string())
+    }
+
+    pub fn from_export_json(text: &str) -> Result<Self, String> {
+        let export: BattleRoundStoreExportOwned =
+            serde_json::from_str(text).map_err(|err| err.to_string())?;
+        if export.version != BATTLE_ROUND_EXPORT_VERSION {
+            return Err(format!(
+                "unsupported battle round export version {}; expected {}",
+                export.version, BATTLE_ROUND_EXPORT_VERSION
+            ));
+        }
+        if export.export_type != "battle_rounds" {
+            return Err(format!(
+                "unsupported battle round export type {}",
+                export.export_type
+            ));
+        }
+
+        let mut store = export.store;
+        for (encounter_id, encounter) in &store.encounters {
+            if encounter_id.trim().is_empty() {
+                return Err("battle round export contains an empty encounter id".to_owned());
+            }
+            if encounter
+                .participants
+                .iter()
+                .any(|participant| participant.target_id.trim().is_empty())
+            {
+                return Err(format!(
+                    "battle round export encounter {encounter_id} contains an empty participant id"
+                ));
+            }
+        }
+        store.repair_duplicate_participants();
+        for encounter in store.encounters.values_mut() {
+            normalize_encounter_after_edit(encounter);
+        }
+        if store
+            .active_encounter_id
+            .as_ref()
+            .is_some_and(|encounter_id| !store.encounters.contains_key(encounter_id))
+        {
+            store.active_encounter_id = None;
+        }
+        Ok(store)
+    }
+
     fn repair_duplicate_participants(&mut self) -> bool {
         let mut changed = false;
         for encounter in self.encounters.values_mut() {
@@ -6820,6 +6890,130 @@ mod tests {
             skill_last_used_turns: HashMap::new(),
             skill_cooldown_ready_turns: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn battle_round_export_round_trips_active_combat_state() {
+        let mut actor = participant("a", 7);
+        actor.action_done = true;
+        actor.hp = 6.0;
+        actor.arcane_shield = 4.5;
+        actor.damage_contributors = vec!["enemy".to_owned()];
+        actor.skill_cooldown_ready_turns = HashMap::from([("0".to_owned(), 12)]);
+        let store = BattleRoundStore {
+            encounters: HashMap::from(
+                [("battle-4".to_owned(), BattleEncounter {
+                    name: "首领战".to_owned(),
+                    trpg_group: Some("table".to_owned()),
+                    trpg_campaign_id: Some("campaign-a".to_owned()),
+                    active: true,
+                    round: 7,
+                    combat_completed_turns: 13,
+                    participants: vec![actor],
+                    action_log: vec!["a使用技能".to_owned()],
+                    ..Default::default()
+                })],
+            ),
+            active_encounter_id: Some("battle-4".to_owned()),
+            next_encounter_index: 9,
+        };
+        let json = store.to_export_json().unwrap();
+        let restored = BattleRoundStore::from_export_json(&json).unwrap();
+        let encounter = &restored.encounters["battle-4"];
+        let actor = &encounter.participants[0];
+
+        assert_eq!(
+            restored.active_encounter_id.as_deref(),
+            Some("battle-4")
+        );
+        assert_eq!(restored.next_encounter_index, 9);
+        assert_eq!(
+            encounter.trpg_campaign_id.as_deref(),
+            Some("campaign-a")
+        );
+        assert_eq!(encounter.round, 7);
+        assert_eq!(encounter.combat_completed_turns, 13);
+        assert_eq!(encounter.action_log, vec![
+            "a使用技能".to_owned()
+        ]);
+        assert_eq!(actor.hp, 6.0);
+        assert_eq!(actor.arcane_shield, 4.5);
+        assert_eq!(actor.damage_contributors, vec![
+            "enemy".to_owned()
+        ]);
+        assert_eq!(
+            actor.skill_cooldown_ready_turns["0"],
+            12
+        );
+        assert!(json.contains("\"export_type\": \"battle_rounds\""));
+    }
+
+    #[test]
+    fn battle_round_import_repairs_duplicate_participants_and_stale_active_id() {
+        let store = BattleRoundStore {
+            encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
+                participants: vec![participant("a", 1), participant("a", 2)],
+                ..Default::default()
+            })]),
+            active_encounter_id: Some("missing".to_owned()),
+            next_encounter_index: 2,
+        };
+
+        let restored =
+            BattleRoundStore::from_export_json(&store.to_export_json().unwrap()).unwrap();
+
+        assert_eq!(
+            restored.encounters["battle"].participants.len(),
+            1
+        );
+        assert_eq!(
+            restored.encounters["battle"].participants[0].turn,
+            1
+        );
+        assert_eq!(restored.active_encounter_id, None);
+    }
+
+    #[test]
+    fn battle_round_import_rejects_wrong_type_and_empty_participant_id() {
+        let wrong_version = serde_json::json!({
+            "version": BATTLE_ROUND_EXPORT_VERSION + 1,
+            "export_type": "battle_rounds",
+            "store": {},
+        })
+        .to_string();
+        assert!(
+            BattleRoundStore::from_export_json(&wrong_version)
+                .err()
+                .expect("wrong export version should fail")
+                .contains("unsupported battle round export version")
+        );
+
+        let wrong_type = serde_json::json!({
+            "version": BATTLE_ROUND_EXPORT_VERSION,
+            "export_type": "voxel_scene",
+            "store": {},
+        })
+        .to_string();
+        assert!(
+            BattleRoundStore::from_export_json(&wrong_type)
+                .err()
+                .expect("wrong export type should fail")
+                .contains("unsupported battle round export type")
+        );
+
+        let invalid = BattleRoundStore {
+            encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
+                participants: vec![participant(" ", 0)],
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+        assert!(
+            BattleRoundStore::from_export_json(&invalid.to_export_json().unwrap())
+                .err()
+                .expect("empty participant id should fail")
+                .contains("empty participant id")
+        );
     }
 
     #[test]
