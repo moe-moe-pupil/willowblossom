@@ -2611,7 +2611,10 @@ impl BattleRoundStore {
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
-        encounter.round += 1;
+        if encounter.round == u32::MAX {
+            return false;
+        }
+        encounter.round = encounter.round.saturating_add(1);
         advance_encounter_inspiration(encounter);
         let mut delayed_logs = Vec::new();
         let mut defeat_outcomes = Vec::new();
@@ -2735,7 +2738,7 @@ impl BattleRoundStore {
             return false;
         }
         participant.action_done = true;
-        participant.turn += 1;
+        participant.turn = participant.turn.saturating_add(1);
         if encounter.active {
             participant.combat_turns_completed =
                 participant.combat_turns_completed.saturating_add(1);
@@ -3760,7 +3763,7 @@ impl BattleRoundStore {
             defeat_outcomes.extend(delayed.defeat_outcomes);
             delayed_logs.extend(advance_participant_delayed_healing_ticks(participant));
         }
-        participant.turn += 1;
+        participant.turn = participant.turn.saturating_add(1);
         if encounter.active {
             participant.combat_turns_completed =
                 participant.combat_turns_completed.saturating_add(1);
@@ -3799,7 +3802,7 @@ impl BattleRoundStore {
         if !participant_can_act(participant) {
             return false;
         }
-        participant.negative_layers += 1;
+        participant.negative_layers = participant.negative_layers.saturating_add(1);
         participant.pending_negative = false;
         let _ = participant;
         self.finish_actor_action(encounter_id, target_id)
@@ -13041,6 +13044,57 @@ mod tests {
             .participants
             .iter()
             .all(|participant| !participant.action_done));
+    }
+
+    #[test]
+    fn maximum_battle_round_rejects_partial_round_effects() {
+        let mut actor = participant("a", u32::MAX);
+        actor.mp = 0.0;
+        actor.max_mp = 10.0;
+        actor.mp_regen = 1.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                round: u32::MAX,
+                participants: vec![actor],
+                action_log: vec!["before".to_owned()],
+                ..Default::default()
+            });
+
+        assert!(!store.next_round("battle"));
+
+        let encounter = &store.encounters["battle"];
+        assert_eq!(encounter.round, u32::MAX);
+        assert_eq!(encounter.participants[0].turn, u32::MAX);
+        assert_eq!(encounter.participants[0].mp, 0.0);
+        assert!(!encounter.participants[0].action_done);
+        assert_eq!(encounter.action_log, vec!["before"]);
+    }
+
+    #[test]
+    fn maximum_participant_counters_saturate_when_action_finishes() {
+        let mut actor = participant("a", u32::MAX);
+        actor.negative_layers = u32::MAX;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                round: u32::MAX,
+                participants: vec![actor],
+                ..Default::default()
+            });
+
+        assert!(store.skip_negative_participant("battle", "a"));
+
+        let encounter = &store.encounters["battle"];
+        let actor = &encounter.participants[0];
+        assert_eq!(encounter.round, u32::MAX);
+        assert_eq!(actor.turn, u32::MAX);
+        assert_eq!(actor.negative_layers, u32::MAX);
+        assert!(actor.action_done);
     }
 
     #[test]

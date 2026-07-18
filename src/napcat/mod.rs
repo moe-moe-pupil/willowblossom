@@ -2418,10 +2418,13 @@ impl TrpgGroup {
     }
 
     pub fn advance_world_turn(&mut self) -> bool {
+        if self.world_turn == u32::MAX {
+            return false;
+        }
         self.sync_turn_players();
-        self.world_turn += 1;
+        self.world_turn = self.world_turn.saturating_add(1);
         for turn in self.player_turns.values_mut() {
-            turn.turns_passed += 1;
+            turn.turns_passed = turn.turns_passed.saturating_add(1);
             turn.acted = false;
             turn.skipped = false;
         }
@@ -12342,6 +12345,29 @@ mod tests {
         assert_eq!(group.world_turn, 1);
         assert_eq!(group.player_turns["a"].turns_passed, 1);
         assert_eq!(group.player_turns["b"].turns_passed, 1);
+    }
+
+    #[test]
+    fn trpg_group_max_world_turn_rejects_partial_advance() {
+        let mut group = TrpgGroup {
+            players: vec!["a".to_owned()],
+            world_turn: u32::MAX,
+            player_turns: HashMap::from([("a".to_owned(), TrpgPlayerTurnState {
+                turns_passed: u32::MAX,
+                acted: true,
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+
+        assert!(!group.advance_world_turn());
+
+        assert_eq!(group.world_turn, u32::MAX);
+        assert_eq!(
+            group.player_turns["a"].turns_passed,
+            u32::MAX
+        );
+        assert!(group.player_turns["a"].acted);
     }
 
     #[test]
