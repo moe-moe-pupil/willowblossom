@@ -9881,7 +9881,27 @@ fn napcat_import_export_ui(
                 match read_napcat_manager_export(&state.import_path) {
                     Ok(imported) => match manager.set(imported) {
                         Ok(()) => {
-                            state.import_export_status = format!("已从 {} 导入", state.import_path);
+                            let quarantine_result = battle_store.as_deref_mut().map(|store| {
+                                let total = store.encounters.len();
+                                store.quarantine_manager_sync();
+                                store
+                                    .persist()
+                                    .map(|()| total)
+                                    .map_err(|err| err.to_string())
+                            });
+                            state.import_export_status = match quarantine_result {
+                                Some(Ok(count)) if count > 0 => format!(
+                                    "已从 {} 导入；已隔离{count}个旧战斗轮，需在战斗面板确认连接或导入配套战斗备份",
+                                    state.import_path
+                                ),
+                                Some(Ok(_)) | None => {
+                                    format!("已从 {} 导入", state.import_path)
+                                },
+                                Some(Err(err)) => format!(
+                                    "已从 {} 导入；旧战斗轮已在本次运行中隔离，但隔离状态保存失败：{err}",
+                                    state.import_path
+                                ),
+                            };
                         },
                         Err(err) => {
                             state.import_export_status = format!("导入保存失败：{err}");

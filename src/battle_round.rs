@@ -194,6 +194,8 @@ pub struct BattleEncounter {
     pub trpg_group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trpg_campaign_id: Option<String>,
+    #[serde(default)]
+    pub manager_sync_quarantined: bool,
     #[serde(default = "default_true")]
     pub active: bool,
     #[serde(default = "default_true")]
@@ -216,6 +218,7 @@ impl Default for BattleEncounter {
             name: String::new(),
             trpg_group: None,
             trpg_campaign_id: None,
+            manager_sync_quarantined: false,
             active: true,
             sort_by_turn: true,
             negative_enabled: false,
@@ -1546,6 +1549,7 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
         encounter.name.hash(&mut hasher);
         encounter.trpg_group.hash(&mut hasher);
         encounter.trpg_campaign_id.hash(&mut hasher);
+        encounter.manager_sync_quarantined.hash(&mut hasher);
         encounter.active.hash(&mut hasher);
         encounter.sort_by_turn.hash(&mut hasher);
         encounter.negative_enabled.hash(&mut hasher);
@@ -1889,6 +1893,19 @@ fn encounter_ui(
     if !store.encounters.contains_key(encounter_id) {
         return false;
     }
+    if store
+        .encounters
+        .get(encounter_id)
+        .is_some_and(|encounter| encounter.manager_sync_quarantined)
+    {
+        return quarantined_encounter_ui(
+            ui,
+            store,
+            manager,
+            encounter_id,
+            &encounter_entity.name,
+        );
+    }
     let linked_group_name = store
         .encounters
         .get(encounter_id)
@@ -2122,6 +2139,81 @@ fn locked_encounter_ui(
         store.active_encounter_id = None;
     }
     true
+}
+
+fn quarantined_encounter_ui(
+    ui: &mut egui::Ui,
+    store: &mut BattleRoundStore,
+    manager: &NapcatMessageManager,
+    encounter_id: &str,
+    encounter_name: &str,
+) -> bool {
+    let can_reconnect = store
+        .encounters
+        .get(encounter_id)
+        .is_some_and(|encounter| encounter_can_reconnect_to_manager(encounter, manager));
+    let mut reconnect = false;
+    let mut remove = false;
+    ui.group(|ui| {
+        ui.set_width(ui.available_width());
+        ui.heading(encounter_name);
+        ui.colored_label(
+            egui::Color32::YELLOW,
+            "主TRPG数据已被完整替换；此战斗轮已隔离，不会覆盖新导入角色的HP、MP、回合、计数或冷却。",
+        );
+        if can_reconnect {
+            ui.small("仅在确认此战斗轮与当前主数据属于同一份备份时重新连接；连接会立即以战斗状态更新角色。");
+            if ui
+                .button("确认连接当前主数据（会覆盖角色战斗状态）")
+                .clicked()
+            {
+                reconnect = true;
+            }
+        } else {
+            ui.small("当前TRPG组或活动身份不匹配。请导入配套战斗备份，或删除此旧战斗轮。");
+        }
+        if ui.button("删除此战斗轮").clicked() {
+            remove = true;
+        }
+    });
+
+    if reconnect {
+        if let Some(encounter) = store.encounters.get_mut(encounter_id) {
+            if encounter.trpg_campaign_id.is_none() {
+                encounter.trpg_campaign_id = encounter
+                    .trpg_group
+                    .as_deref()
+                    .and_then(|group_name| manager.trpg_groups.get(group_name))
+                    .map(|group| trpg_group_campaign_id(group).to_owned());
+            }
+            encounter.manager_sync_quarantined = false;
+            return true;
+        }
+    }
+    if remove {
+        store.encounters.remove(encounter_id);
+        if store.active_encounter_id.as_deref() == Some(encounter_id) {
+            store.active_encounter_id = None;
+        }
+        return true;
+    }
+    false
+}
+
+fn encounter_can_reconnect_to_manager(
+    encounter: &BattleEncounter,
+    manager: &NapcatMessageManager,
+) -> bool {
+    let Some(group_name) = encounter.trpg_group.as_deref() else {
+        return true;
+    };
+    let Some(group) = manager.trpg_groups.get(group_name) else {
+        return false;
+    };
+    encounter
+        .trpg_campaign_id
+        .as_deref()
+        .is_none_or(|campaign_id| campaign_id == trpg_group_campaign_id(group))
 }
 
 fn encounter_roster_ui(
@@ -2774,6 +2866,17 @@ impl BattleRoundStore {
         Ok(store)
     }
 
+    pub fn quarantine_manager_sync(&mut self) -> usize {
+        let mut changed = 0;
+        for encounter in self.encounters.values_mut() {
+            if !encounter.manager_sync_quarantined {
+                encounter.manager_sync_quarantined = true;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
     fn repair_duplicate_participants(&mut self) -> bool {
         let mut changed = false;
         for encounter in self.encounters.values_mut() {
@@ -2817,6 +2920,7 @@ impl BattleRoundStore {
                 name,
                 trpg_group: Some(group_name),
                 trpg_campaign_id: Some(campaign_id.to_owned()),
+                manager_sync_quarantined: false,
                 active: true,
                 sort_by_turn: group.battle_sort_by_turn,
                 negative_enabled: group.battle_negative_enabled,
@@ -4374,6 +4478,9 @@ fn sync_encounter_to_manager(
     let Some(encounter) = encounter else {
         return false;
     };
+    if encounter.manager_sync_quarantined {
+        return false;
+    }
     let linked_player_ids = if let Some(group_name) = encounter.trpg_group.as_deref() {
         let Some(group) = manager.trpg_groups.get(group_name) else {
             return false;
@@ -6906,6 +7013,7 @@ mod tests {
                     name: "首领战".to_owned(),
                     trpg_group: Some("table".to_owned()),
                     trpg_campaign_id: Some("campaign-a".to_owned()),
+                    manager_sync_quarantined: true,
                     active: true,
                     round: 7,
                     combat_completed_turns: 13,
@@ -6931,6 +7039,7 @@ mod tests {
             encounter.trpg_campaign_id.as_deref(),
             Some("campaign-a")
         );
+        assert!(encounter.manager_sync_quarantined);
         assert_eq!(encounter.round, 7);
         assert_eq!(encounter.combat_completed_turns, 13);
         assert_eq!(encounter.action_log, vec![
@@ -6946,6 +7055,53 @@ mod tests {
             12
         );
         assert!(json.contains("\"export_type\": \"battle_rounds\""));
+    }
+
+    #[test]
+    fn manager_sync_quarantine_marks_each_battle_once_and_survives_backup() {
+        let mut store = BattleRoundStore {
+            encounters: HashMap::from([
+                (
+                    "first".to_owned(),
+                    BattleEncounter::default(),
+                ),
+                (
+                    "second".to_owned(),
+                    BattleEncounter::default(),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(store.quarantine_manager_sync(), 2);
+        assert_eq!(store.quarantine_manager_sync(), 0);
+
+        let restored =
+            BattleRoundStore::from_export_json(&store.to_export_json().unwrap()).unwrap();
+        assert!(restored
+            .encounters
+            .values()
+            .all(|encounter| encounter.manager_sync_quarantined));
+    }
+
+    #[test]
+    fn legacy_battle_backup_defaults_to_manager_sync_enabled() {
+        let store = BattleRoundStore {
+            encounters: HashMap::from([(
+                "battle".to_owned(),
+                BattleEncounter::default(),
+            )]),
+            ..Default::default()
+        };
+        let mut export: serde_json::Value =
+            serde_json::from_str(&store.to_export_json().unwrap()).unwrap();
+        export["store"]["encounters"]["battle"]
+            .as_object_mut()
+            .unwrap()
+            .remove("manager_sync_quarantined");
+
+        let restored = BattleRoundStore::from_export_json(&export.to_string()).unwrap();
+        assert!(!restored.encounters["battle"].manager_sync_quarantined);
     }
 
     #[test]
@@ -7432,6 +7588,107 @@ mod tests {
             manager.player_characters["outsider"].hp,
             10.0
         );
+    }
+
+    #[test]
+    fn quarantined_battle_cannot_write_character_or_group_state() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("a".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 8.0,
+                max_mp: 8.0,
+                damage_taken_this_turn: 1.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            campaign_id: "campaign-a".to_owned(),
+            players: vec!["a".to_owned()],
+            world_turn: 2,
+            player_turns: HashMap::from([(
+                "a".to_owned(),
+                crate::napcat::TrpgPlayerTurnState {
+                    turns_passed: 2,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let mut player = participant("a", 7);
+        player.player_character = true;
+        player.action_done = true;
+        player.hp = 2.0;
+        player.mp = 1.0;
+        player.damage_taken_this_turn = 8.0;
+        let encounter = BattleEncounter {
+            trpg_group: Some("party".to_owned()),
+            trpg_campaign_id: Some("campaign-a".to_owned()),
+            manager_sync_quarantined: true,
+            round: 7,
+            participants: vec![player],
+            ..Default::default()
+        };
+
+        assert!(!sync_encounter_to_manager(
+            Some(&encounter),
+            &mut manager
+        ));
+
+        let character = &manager.player_characters["a"];
+        assert_eq!(character.hp, 10.0);
+        assert_eq!(character.mp, 8.0);
+        assert_eq!(character.damage_taken_this_turn, 1.0);
+        let group = &manager.trpg_groups["party"];
+        assert_eq!(group.world_turn, 2);
+        assert_eq!(group.player_turns["a"].turns_passed, 2);
+        assert!(!group.player_turns["a"].acted);
+    }
+
+    #[test]
+    fn quarantined_battle_reconnect_requires_matching_group_and_campaign() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            campaign_id: "campaign-new".to_owned(),
+            ..Default::default()
+        });
+        let standalone = BattleEncounter::default();
+        let legacy = BattleEncounter {
+            trpg_group: Some("party".to_owned()),
+            ..Default::default()
+        };
+        let matching = BattleEncounter {
+            trpg_group: Some("party".to_owned()),
+            trpg_campaign_id: Some("campaign-new".to_owned()),
+            ..Default::default()
+        };
+        let stale = BattleEncounter {
+            trpg_group: Some("party".to_owned()),
+            trpg_campaign_id: Some("campaign-old".to_owned()),
+            ..Default::default()
+        };
+        let missing = BattleEncounter {
+            trpg_group: Some("missing".to_owned()),
+            ..Default::default()
+        };
+
+        assert!(encounter_can_reconnect_to_manager(
+            &standalone,
+            &manager
+        ));
+        assert!(encounter_can_reconnect_to_manager(
+            &legacy, &manager
+        ));
+        assert!(encounter_can_reconnect_to_manager(
+            &matching, &manager
+        ));
+        assert!(!encounter_can_reconnect_to_manager(
+            &stale, &manager
+        ));
+        assert!(!encounter_can_reconnect_to_manager(
+            &missing, &manager
+        ));
     }
 
     #[test]
