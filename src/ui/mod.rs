@@ -11148,8 +11148,7 @@ fn trpg_group_settings_window(
                 ui.text_edit_singleline(&mut state.new_group_name);
                 if ui.button("创建").clicked() {
                     let name = state.new_group_name.trim();
-                    if !name.is_empty() {
-                        manager.trpg_groups.entry(name.to_owned()).or_default();
+                    if manager.create_trpg_group(name) {
                         if manager.current_trpg_group.is_none() {
                             manager.current_trpg_group = Some(name.to_owned());
                         }

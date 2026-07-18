@@ -2921,7 +2921,7 @@ impl NapcatMessageManager {
         if has_bundle_pcs || has_bundle_chatlists || has_bundle_messages {
             recognized_shape = true;
             let group_name = "月莓导入".to_owned();
-            self.trpg_groups.entry(group_name.clone()).or_default();
+            self.create_trpg_group(&group_name);
             if self.current_trpg_group.is_none() {
                 self.current_trpg_group = Some(group_name.clone());
             }
@@ -3543,6 +3543,41 @@ impl NapcatMessageManager {
             }
         }
         changed
+    }
+
+    pub fn create_trpg_group(&mut self, group_name: &str) -> bool {
+        let group_name = group_name.trim();
+        if group_name.is_empty() || self.trpg_groups.contains_key(group_name) {
+            return false;
+        }
+        let campaign_id = self.available_campaign_id(group_name);
+        self.trpg_groups.insert(group_name.to_owned(), TrpgGroup {
+            campaign_id,
+            ..Default::default()
+        });
+        true
+    }
+
+    fn available_campaign_id(&self, preferred_id: &str) -> String {
+        let used_ids = self
+            .trpg_groups
+            .values()
+            .map(|group| group.campaign_id.trim())
+            .chain(
+                self.messages
+                    .values()
+                    .flatten()
+                    .map(|message| message.data.campaign_id.trim()),
+            )
+            .filter(|campaign_id| !campaign_id.is_empty())
+            .collect::<HashSet<_>>();
+        if !used_ids.contains(preferred_id) {
+            return preferred_id.to_owned();
+        }
+        (2..=u64::MAX)
+            .map(|suffix| format!("{preferred_id}-{suffix}"))
+            .find(|candidate| !used_ids.contains(candidate.as_str()))
+            .expect("all campaign identifier suffixes are occupied")
     }
 
     pub fn current_group(&self) -> Option<&TrpgGroup> {
@@ -8329,6 +8364,49 @@ mod tests {
         assert!(legacy_group.legacy_worlds.is_empty());
         assert!(legacy_group.legacy_send_panes.is_empty());
         assert!(legacy_group.allow_join_requests);
+    }
+
+    #[test]
+    fn newly_created_trpg_groups_receive_distinct_campaign_ids() {
+        let mut manager = empty_manager();
+
+        assert!(manager.create_trpg_group("alpha"));
+        assert!(manager.create_trpg_group("beta"));
+        assert!(!manager.create_trpg_group("alpha"));
+
+        assert_eq!(
+            manager.trpg_groups["alpha"].campaign_id,
+            "alpha"
+        );
+        assert_eq!(
+            manager.trpg_groups["beta"].campaign_id,
+            "beta"
+        );
+        assert_ne!(
+            manager.trpg_groups["alpha"].campaign_id,
+            manager.trpg_groups["beta"].campaign_id
+        );
+    }
+
+    #[test]
+    fn recreating_deleted_group_does_not_reuse_historical_campaign_id() {
+        let mut manager = empty_manager();
+        assert!(manager.create_trpg_group("table"));
+        let mut old_message = test_private_message_from(2, "old secret");
+        old_message.data.campaign_id = "table".to_owned();
+        manager.messages.insert("2".to_owned(), vec![old_message]);
+        manager.trpg_groups.remove("table");
+
+        assert!(manager.create_trpg_group("table"));
+        manager.current_trpg_group = Some("table".to_owned());
+
+        assert_eq!(
+            manager.trpg_groups["table"].campaign_id,
+            "table-2"
+        );
+        assert!(manager
+            .visible_messages_for_player("2", &manager.messages["2"], 2)
+            .is_empty());
     }
 
     #[test]
