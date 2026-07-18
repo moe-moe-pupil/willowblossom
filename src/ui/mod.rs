@@ -3826,6 +3826,7 @@ fn target_unread_count_for_player(
         .get(target_id)
         .copied()
         .unwrap_or_default();
+    let campaign_id = manager.current_campaign_id();
     let access = manager.player_access_for_user(player_id);
 
     messages
@@ -3834,7 +3835,8 @@ fn target_unread_count_for_player(
         .filter(|message| message.data.user_id != message.data.self_id)
         .filter(|message| {
             let campaign_message = manager.campaign_message_for_target(target_id, message);
-            access.can_read(&campaign_message.visibility)
+            campaign_message.campaign_id == campaign_id
+                && access.can_read(&campaign_message.visibility)
         })
         .count()
 }
@@ -13302,6 +13304,28 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(raw_target_ids.contains(&"3"));
         assert!(raw_target_ids.contains(&"98"));
+    }
+
+    #[test]
+    fn chat_list_player_filter_excludes_other_campaign_unread_activity() {
+        let mut manager = split_party_summary_manager();
+        let current_message = test_group_message(2, "current campaign");
+        let mut other_campaign_message = test_group_message(2, "hidden campaign");
+        other_campaign_message.data.campaign_id = "other".to_owned();
+        manager.messages.insert("99".to_owned(), vec![
+            current_message,
+            other_campaign_message,
+        ]);
+        manager.read_message_counts.insert("99".to_owned(), 1);
+
+        let group_view = chat_list_target_views(&manager, Some(2))
+            .into_iter()
+            .find(|view| view.target_id == "99")
+            .unwrap();
+
+        assert_eq!(group_view.message_count, 1);
+        assert_eq!(group_view.total_message_count, 2);
+        assert_eq!(group_view.unread_count, 0);
     }
 
     fn buff(name: &str, turns_remaining: i32) -> BuffSpec {

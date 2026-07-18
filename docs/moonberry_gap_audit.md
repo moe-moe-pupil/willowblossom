@@ -127,6 +127,8 @@ Additional 2026-07-18 battle-turn correction: the roster action checkbox now com
 
 Additional 2026-07-18 forced-round correction: confirming a round advance while living actors still have pending actions now consumes those skipped turns before resetting the roster. Each unfinished living actor advances its participant clock and, during active combat, its per-actor and encounter combat counters, so cooldowns and later persisted group-turn synchronization cannot remain one turn behind or grant a free replacement action. Actors that already finished are not advanced twice, defeated actors remain unchanged, and normal automatic rollover keeps its existing single-advance behavior. Focused forced/automatic rollover verification passes: 2 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 428 passed, 1 ignored live API test, 0 failed.
 
+Additional 2026-07-18 unread-privacy correction: the player-visible chat-list filter now applies the active campaign boundary to unread badges as well as target inclusion, message counts, and timestamps. A public or otherwise readable message persisted for another campaign can no longer reveal background activity through an unread count while its content remains hidden. Party/player visibility filtering and the GM's unfiltered operational view remain unchanged. Focused player-filter verification passes: 2 passed, 0 failed. Full library verification passes with `cargo test --lib -j 1 --quiet`: 429 passed, 1 ignored live API test, 0 failed.
+
 ## What Moonberry Had
 
 Moonberry was a React/Umi/MobX GM/ST tool backed by `mirai-api-http`. Its useful behavior surface was much larger than just chat:
