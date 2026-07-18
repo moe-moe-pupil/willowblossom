@@ -8634,6 +8634,7 @@ mod tests {
         NapcatMessageManager {
             messages: HashMap::default(),
             chat_targets: HashMap::default(),
+            chat_target_kinds: HashMap::default(),
             player_characters: HashMap::default(),
             trpg_groups: HashMap::default(),
             current_trpg_group: None,

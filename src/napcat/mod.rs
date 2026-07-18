@@ -2520,6 +2520,8 @@ pub struct NapcatMessageManager {
     #[serde(default)]
     pub chat_targets: HashMap<String, ChatTargetMetadata>,
     #[serde(default)]
+    pub chat_target_kinds: HashMap<String, ChatTargetExportKind>,
+    #[serde(default)]
     pub player_characters: HashMap<String, PlayerCharacter>,
     #[serde(default)]
     pub trpg_groups: HashMap<String, TrpgGroup>,
@@ -2750,6 +2752,9 @@ impl NapcatMessageManager {
                 return Err("chat list export contains an empty target id".to_owned());
             }
             let target_id = target_id.to_owned();
+            if entry.kind != ChatTargetExportKind::Unknown {
+                self.chat_target_kinds.insert(target_id.clone(), entry.kind);
+            }
             self.chat_targets.insert(target_id.clone(), entry.metadata);
             merge_max_usize(
                 &mut self.read_message_counts,
@@ -3076,6 +3081,10 @@ impl NapcatMessageManager {
             let character = moonberry_pc_to_character(pc);
             let display_name = moonberry_character_display_name(&target_id, &character);
             self.player_characters.insert(target_id.clone(), character);
+            self.chat_target_kinds.insert(
+                target_id.clone(),
+                ChatTargetExportKind::Private,
+            );
             self.chat_targets
                 .entry(target_id.clone())
                 .or_default()
@@ -3121,6 +3130,10 @@ impl NapcatMessageManager {
                 .entry(target_id.clone())
                 .or_default()
                 .display_name = display_name;
+            self.chat_target_kinds.insert(
+                target_id.clone(),
+                ChatTargetExportKind::Private,
+            );
             self.open_chat_targets.insert(target_id.clone());
             if let Some(count) = moonberry_usize_field(item, "notReadCount") {
                 merge_max_usize(
@@ -3164,6 +3177,9 @@ impl NapcatMessageManager {
                 .entry(target_id.clone())
                 .or_default()
                 .automatic_name = napcat_message.data.sender.nickname.clone();
+            if let Some(kind) = message_target_kind(std::slice::from_ref(&napcat_message)) {
+                self.chat_target_kinds.insert(target_id.clone(), kind);
+            }
             self.open_chat_targets.insert(target_id.clone());
             self.messages
                 .entry(target_id)
@@ -3444,8 +3460,16 @@ impl NapcatMessageManager {
         {
             Some(NapcatMessageType::Private) => ChatTargetExportKind::Private,
             Some(NapcatMessageType::Group) => ChatTargetExportKind::Group,
-            None => ChatTargetExportKind::Unknown,
+            None => self
+                .chat_target_kinds
+                .get(target_id)
+                .copied()
+                .unwrap_or(ChatTargetExportKind::Unknown),
         }
+    }
+
+    fn is_private_chat_target(&self, target_id: &str) -> bool {
+        self.chat_target_export_kind(target_id) == ChatTargetExportKind::Private
     }
 
     fn apply_imported_chat_window_state(
@@ -3496,30 +3520,56 @@ impl NapcatMessageManager {
     pub fn sync_chat_targets(&mut self) -> bool {
         let mut changed = false;
         changed |= self.repair_ambiguous_campaign_ids();
-        for target_id in self.messages.keys() {
-            if !self.chat_targets.contains_key(target_id) {
+        let message_target_kinds = self
+            .messages
+            .iter()
+            .map(|(target_id, messages)| {
+                (
+                    target_id.clone(),
+                    message_target_kind(messages),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (target_id, kind) in message_target_kinds {
+            if !self.chat_targets.contains_key(&target_id) {
                 self.chat_targets.insert(
                     target_id.clone(),
                     ChatTargetMetadata::default(),
                 );
                 changed = true;
             }
-            if is_private_message_target(self.messages.get(target_id))
-                && !self.player_characters.contains_key(target_id)
-            {
-                self.player_characters.insert(
-                    target_id.clone(),
-                    PlayerCharacter::default(),
-                );
+            if let Some(kind) = kind {
+                if self.chat_target_kinds.get(&target_id) != Some(&kind) {
+                    self.chat_target_kinds.insert(target_id, kind);
+                    changed = true;
+                }
+            }
+        }
+        let private_targets = self
+            .chat_targets
+            .keys()
+            .filter(|target_id| self.is_private_chat_target(target_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for target_id in private_targets {
+            if !self.player_characters.contains_key(&target_id) {
+                self.player_characters
+                    .insert(target_id, PlayerCharacter::default());
                 changed = true;
             }
         }
+        let group_targets = self
+            .chat_targets
+            .keys()
+            .filter(|target_id| {
+                self.chat_target_export_kind(target_id) == ChatTargetExportKind::Group
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+        let persisted_message_targets = self.messages.keys().cloned().collect::<HashSet<_>>();
         let character_len = self.player_characters.len();
-        self.player_characters.retain(|target_id, _| {
-            self.messages
-                .get(target_id)
-                .is_none_or(|messages| !is_group_message_target(messages))
-        });
+        self.player_characters
+            .retain(|target_id, _| !group_targets.contains(target_id));
         changed |= character_len != self.player_characters.len();
 
         let player_characters = &self.player_characters;
@@ -3535,9 +3585,9 @@ impl NapcatMessageManager {
             changed |= player_len != group.players.len();
 
             let group_chat_len = group.group_chats.len();
-            group
-                .group_chats
-                .retain(|target_id| self.messages.contains_key(target_id));
+            group.group_chats.retain(|target_id| {
+                persisted_message_targets.contains(target_id) || group_targets.contains(target_id)
+            });
             changed |= group_chat_len != group.group_chats.len();
 
             changed |= group.sync_turn_players();
@@ -3990,7 +4040,7 @@ impl NapcatMessageManager {
             return;
         }
 
-        let is_private_target = is_private_message_target(self.messages.get(target_id));
+        let is_private_target = self.is_private_chat_target(target_id);
         let has_existing_membership = is_private_target
             && self
                 .trpg_groups
@@ -4010,7 +4060,7 @@ impl NapcatMessageManager {
     }
 
     fn join_requests_allowed_for_target(&self, target_id: &str) -> bool {
-        if !is_private_message_target(self.messages.get(target_id)) {
+        if !self.is_private_chat_target(target_id) {
             return true;
         }
 
@@ -4034,7 +4084,7 @@ impl NapcatMessageManager {
         let mut changed = self.open_chat_targets.insert(target_id.to_owned());
         changed |= self.pending_chat_targets.remove(target_id);
         changed |= self.rejected_chat_targets.remove(target_id);
-        if is_private_message_target(self.messages.get(target_id)) {
+        if self.is_private_chat_target(target_id) {
             let has_existing_membership = self
                 .trpg_groups
                 .values()
@@ -5021,13 +5071,12 @@ fn character_display_name(character: &PlayerCharacter, fallback: &str) -> String
     }
 }
 
-fn is_private_message_target(messages: Option<&Vec<NapcatMessage>>) -> bool {
-    matches!(
-        messages
-            .and_then(|messages| messages.first())
-            .map(|message| &message.data.message_type),
-        Some(NapcatMessageType::Private)
-    )
+fn message_target_kind(messages: &[NapcatMessage]) -> Option<ChatTargetExportKind> {
+    match messages.first().map(|message| &message.data.message_type) {
+        Some(NapcatMessageType::Private) => Some(ChatTargetExportKind::Private),
+        Some(NapcatMessageType::Group) => Some(ChatTargetExportKind::Group),
+        None => None,
+    }
 }
 
 fn is_group_message_target(messages: &[NapcatMessage]) -> bool {
@@ -5077,6 +5126,7 @@ fn setup(mut commands: Commands) {
     let message_manager = NapcatMessageManager {
         messages: HashMap::default(),
         chat_targets: HashMap::default(),
+        chat_target_kinds: HashMap::default(),
         player_characters: HashMap::default(),
         trpg_groups: HashMap::default(),
         current_trpg_group: None,
@@ -5605,6 +5655,13 @@ fn message_system(
                 .or_default()
                 .push(json);
             manager.chat_targets.entry(target_id.clone()).or_default();
+            if let Some(kind) = manager
+                .messages
+                .get(&target_id)
+                .and_then(|messages| message_target_kind(messages))
+            {
+                manager.chat_target_kinds.insert(target_id.clone(), kind);
+            }
             let group_name = manager
                 .messages
                 .get(&target_id)
@@ -5817,6 +5874,10 @@ fn append_local_private_text_response(
         .entry(target_id.to_owned())
         .or_default()
         .push(message);
+    manager.chat_target_kinds.insert(
+        target_id.to_owned(),
+        ChatTargetExportKind::Private,
+    );
     true
 }
 
@@ -7769,6 +7830,7 @@ mod tests {
         NapcatMessageManager {
             messages: HashMap::default(),
             chat_targets: HashMap::default(),
+            chat_target_kinds: HashMap::default(),
             player_characters: HashMap::default(),
             trpg_groups: HashMap::default(),
             current_trpg_group: None,
@@ -9181,6 +9243,91 @@ mod tests {
             "2".to_owned(),
             "99".to_owned(),
         ]);
+    }
+
+    #[test]
+    fn chat_list_import_preserves_history_free_target_kinds_for_sync_and_approval() {
+        let mut source = empty_manager();
+        source.messages.insert("2".to_owned(), vec![test_message(
+            NapcatMessageType::Private,
+        )]);
+        source.messages.insert("99".to_owned(), vec![test_message(
+            NapcatMessageType::Group,
+        )]);
+        let json = source.to_chat_list_export_json().unwrap();
+
+        let mut manager = empty_manager();
+        manager
+            .trpg_groups
+            .insert("table".to_owned(), TrpgGroup::default());
+        manager.current_trpg_group = Some("table".to_owned());
+
+        assert_eq!(
+            manager.merge_chat_list_export_json(&json),
+            Ok(2)
+        );
+        assert!(manager.messages.is_empty());
+        assert!(manager.is_private_chat_target("2"));
+        assert_eq!(
+            manager.chat_target_export_kind("99"),
+            ChatTargetExportKind::Group
+        );
+
+        assert!(manager.sync_chat_targets());
+        assert!(manager.player_characters.contains_key("2"));
+        assert!(!manager.player_characters.contains_key("99"));
+        assert!(manager.approve_chat_target("2"));
+        assert!(manager.approve_chat_target("99"));
+        assert_eq!(
+            manager.trpg_groups["table"].players,
+            vec!["2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn real_message_kind_overrides_stale_imported_target_kind() {
+        let json = serde_json::json!({
+            "version": NAPCAT_MANAGER_EXPORT_VERSION,
+            "export_type": "chat_list",
+            "targets": [{
+                "target_id": "99",
+                "kind": "private",
+                "metadata": {
+                    "display_name": "群聊",
+                    "automatic_name": "stale"
+                },
+                "read_message_count": 0,
+                "summarized_message_count": 0,
+                "open": true,
+                "pending": false,
+                "rejected": false
+            }],
+            "groups": [],
+        })
+        .to_string();
+        let mut manager = empty_manager();
+        manager.messages.insert("99".to_owned(), vec![test_message(
+            NapcatMessageType::Group,
+        )]);
+        manager.player_characters.insert(
+            "99".to_owned(),
+            completed_character("不应保留"),
+        );
+
+        assert_eq!(
+            manager.merge_chat_list_export_json(&json),
+            Ok(1)
+        );
+        assert_eq!(
+            manager.chat_target_export_kind("99"),
+            ChatTargetExportKind::Group
+        );
+        assert!(manager.sync_chat_targets());
+        assert_eq!(
+            manager.chat_target_kinds.get("99"),
+            Some(&ChatTargetExportKind::Group)
+        );
+        assert!(!manager.player_characters.contains_key("99"));
     }
 
     #[test]
