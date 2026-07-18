@@ -3531,6 +3531,41 @@ impl NapcatMessageManager {
             .filter(|group| group.players.iter().any(|player_id| player_id == target_id))
     }
 
+    fn group_for_message_target(
+        &self,
+        target_id: &str,
+        message: &NapcatMessage,
+    ) -> Option<&TrpgGroup> {
+        let peer_id = if message.data.user_id == message.data.self_id {
+            message
+                .data
+                .target_id
+                .or_else(|| target_id.parse::<u64>().ok())
+                .unwrap_or(message.data.user_id)
+        } else {
+            message.data.user_id
+        };
+        let peer_target_id = peer_id.to_string();
+        let matches_target = |group: &&TrpgGroup| match message.data.message_type {
+            NapcatMessageType::Private => group
+                .players
+                .iter()
+                .any(|player_id| player_id == &peer_target_id),
+            NapcatMessageType::Group => group
+                .group_chats
+                .iter()
+                .any(|group_id| group_id == target_id),
+        };
+
+        if let Some(group) = self.current_group().filter(matches_target) {
+            return Some(group);
+        }
+
+        let mut groups = self.trpg_groups.values().filter(matches_target);
+        let group = groups.next()?;
+        groups.next().is_none().then_some(group)
+    }
+
     pub fn register_legacy_negative_reply(&mut self, target_id: &str) -> bool {
         let mut changed = false;
         for group in self.trpg_groups.values_mut() {
@@ -3600,6 +3635,14 @@ impl NapcatMessageManager {
         message.data.visibility = campaign_message.visibility;
     }
 
+    pub fn annotate_incoming_message_access(&self, target_id: &str, message: &mut NapcatMessage) {
+        message.data.campaign_id.clear();
+        message.data.character_id = None;
+        message.data.party_id = None;
+        message.data.visibility = Visibility::Public;
+        self.annotate_message_access(target_id, message);
+    }
+
     pub fn visible_campaign_messages_for_summary(
         &self,
         target_id: &str,
@@ -3649,8 +3692,13 @@ impl NapcatMessageManager {
         message: &NapcatMessage,
     ) -> CampaignMessage {
         let text = message_text(message);
+        let message_group = self.group_for_message_target(target_id, message);
         let campaign_id = if message.data.campaign_id.trim().is_empty() {
-            self.current_campaign_id()
+            message_group
+                .map(|group| group.campaign_id.trim())
+                .filter(|campaign_id| !campaign_id.is_empty())
+                .unwrap_or("default")
+                .to_owned()
         } else {
             message.data.campaign_id.clone()
         };
@@ -3666,7 +3714,12 @@ impl NapcatMessageManager {
                 } else {
                     message.data.user_id
                 };
-                let access = self.player_access_for_user(peer_id);
+                let access = message_group
+                    .map(|group| group.player_access(peer_id))
+                    .unwrap_or(PlayerAccess {
+                        player_id: peer_id,
+                        ..Default::default()
+                    });
                 CampaignMessage {
                     campaign_id,
                     sender_id: message.data.user_id,
@@ -3703,9 +3756,14 @@ impl NapcatMessageManager {
                         visibility,
                     )
                 } else {
-                    // Legacy messages predate persisted access metadata, so retain the existing
-                    // current-membership fallback. New messages are annotated before save.
-                    let access = self.player_access_for_user(message.data.user_id);
+                    // Legacy messages predate persisted access metadata, so derive from the same
+                    // configured target mapping used at ingest. New messages are saved annotated.
+                    let access = message_group
+                        .map(|group| group.player_access(message.data.user_id))
+                        .unwrap_or(PlayerAccess {
+                            player_id: message.data.user_id,
+                            ..Default::default()
+                        });
                     let visibility = access
                         .party_id
                         .as_ref()
@@ -5115,7 +5173,7 @@ fn message_system(
             let is_new_target = !manager.messages.contains_key(&target_id);
             let is_incoming_message = json.data.user_id != json.data.self_id;
             let incoming_user_id = json.data.user_id;
-            manager.annotate_message_access(&target_id, &mut json);
+            manager.annotate_incoming_message_access(&target_id, &mut json);
 
             let auto_forward = auto_forward_request(&manager, &json, &target_id);
             let character_creation_response = if is_incoming_message
@@ -7987,6 +8045,49 @@ mod tests {
         assert_eq!(
             message.data.party_id.as_deref(),
             Some("red")
+        );
+    }
+
+    #[test]
+    fn incoming_message_scope_uses_trusted_noncurrent_target_mapping() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            campaign_id: "campaign-a".to_owned(),
+            players: vec!["9".to_owned()],
+            group_chats: vec!["88".to_owned()],
+            ..Default::default()
+        });
+        let mut beta = TrpgGroup {
+            campaign_id: "campaign-b".to_owned(),
+            players: vec!["2".to_owned()],
+            group_chats: vec!["99".to_owned()],
+            ..Default::default()
+        };
+        beta.ensure_party("red");
+        beta.set_player_party("2", Some("red"));
+        manager.trpg_groups.insert("beta".to_owned(), beta);
+        manager.current_trpg_group = Some("alpha".to_owned());
+        let mut message = test_message_with_text(NapcatMessageType::Group, "beta secret");
+        message.data.group_id = Some(99);
+        message.data.campaign_id = "spoofed-campaign".to_owned();
+        message.data.character_id = Some("spoofed-character".to_owned());
+        message.data.party_id = Some("blue".to_owned());
+        message.data.visibility = Visibility::Player(9);
+
+        manager.annotate_incoming_message_access("99", &mut message);
+
+        assert_eq!(message.data.campaign_id, "campaign-b");
+        assert_eq!(
+            message.data.character_id.as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            message.data.party_id.as_deref(),
+            Some("red")
+        );
+        assert_eq!(
+            message.data.visibility,
+            Visibility::Party("red".to_owned())
         );
     }
 
