@@ -12009,23 +12009,17 @@ pub fn ui_system(
     let napcat_sender = napcat_sender.as_deref();
     let deepseek_sender = deepseek_sender.as_deref();
     let mut sent_message_added = false;
-    for (target_id, pending_text, sent_targets) in
-        ime.apply_send_results(send_manager.results.drain(..))
-    {
-        if let Some(text) = chat_input_msgs.get_mut(&target_id) {
-            let should_clear = match pending_text.as_deref() {
-                Some(pending_text) => text.trim() == pending_text,
-                None => true,
-            };
-            if should_clear {
-                text.clear();
+    for completion in ime.apply_send_results(send_manager.results.drain(..)) {
+        if completion.clear_input {
+            if let Some(text) = chat_input_msgs.get_mut(&completion.input_id) {
+                if text.trim() == completion.text {
+                    text.clear();
+                }
             }
         }
-        if let Some(pending_text) = pending_text {
-            for target in sent_targets {
-                if append_local_sent_message(&mut manager, target, &pending_text) {
-                    sent_message_added = true;
-                }
+        for target in completion.successful_targets {
+            if append_local_sent_message(&mut manager, target, &completion.text) {
+                sent_message_added = true;
             }
         }
     }
@@ -13657,14 +13651,15 @@ mod tests {
             },
         ]);
 
-        assert_eq!(sent, vec![(
+        assert_eq!(sent, vec![ChatInputSendCompletion {
             input_id,
-            Some("秘密提示".to_owned()),
-            vec![
+            text: "秘密提示".to_owned(),
+            successful_targets: vec![
                 NapcatSendTarget::Private(10002),
                 NapcatSendTarget::Private(10003),
             ],
-        )]);
+            clear_input: true,
+        }]);
     }
 
     #[test]
@@ -13734,14 +13729,15 @@ mod tests {
             },
         ]);
 
-        assert_eq!(sent, vec![(
+        assert_eq!(sent, vec![ChatInputSendCompletion {
             input_id,
-            Some("红队提示".to_owned()),
-            vec![
+            text: "红队提示".to_owned(),
+            successful_targets: vec![
                 NapcatSendTarget::Private(10003),
                 NapcatSendTarget::Private(10002),
             ],
-        )]);
+            clear_input: true,
+        }]);
     }
 
     #[test]
@@ -14267,11 +14263,12 @@ mod tests {
             error: None,
         }]);
 
-        assert_eq!(sent, vec![(
-            random_pool_checked_send_input_id("遭遇随机", 0),
-            Some("你发现了线索".to_owned()),
-            vec![NapcatSendTarget::Private(10002)],
-        )]);
+        assert_eq!(sent, vec![ChatInputSendCompletion {
+            input_id: random_pool_checked_send_input_id("遭遇随机", 0),
+            text: "你发现了线索".to_owned(),
+            successful_targets: vec![NapcatSendTarget::Private(10002)],
+            clear_input: true,
+        }]);
     }
 
     #[test]

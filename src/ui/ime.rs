@@ -61,11 +61,89 @@ mod tests {
             error: None,
         }]);
 
-        assert_eq!(sent, vec![(
-            "42".to_owned(),
-            Some("欢迎加入".to_owned()),
-            vec![NapcatSendTarget::Private(42)],
-        )]);
+        assert_eq!(sent, vec![ChatInputSendCompletion {
+            input_id: "42".to_owned(),
+            text: "欢迎加入".to_owned(),
+            successful_targets: vec![NapcatSendTarget::Private(42)],
+            clear_input: true,
+        }]);
+    }
+
+    #[test]
+    fn batch_send_preserves_partial_success_and_error_after_out_of_order_failure() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+
+        ime.queue_text_send(
+            "broadcast",
+            "party update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+
+        let first = receiver.try_recv().unwrap();
+        let second = receiver.try_recv().unwrap();
+        assert!(ime
+            .apply_send_results([NapcatSendResult {
+                request_id: first.request_id,
+                target_id: "broadcast".to_owned(),
+                error: Some("recipient rejected message".to_owned()),
+            }])
+            .is_empty());
+
+        let completed = ime.apply_send_results([NapcatSendResult {
+            request_id: second.request_id,
+            target_id: "broadcast".to_owned(),
+            error: None,
+        }]);
+
+        assert_eq!(completed, vec![
+            ChatInputSendCompletion {
+                input_id: "broadcast".to_owned(),
+                text: "party update".to_owned(),
+                successful_targets: vec![NapcatSendTarget::Private(43)],
+                clear_input: false,
+            }
+        ]);
+        assert_eq!(
+            ime.send_states["broadcast"].error.as_deref(),
+            Some("recipient rejected message")
+        );
+    }
+
+    #[test]
+    fn partially_queued_batch_keeps_draft_and_records_queued_successes() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+
+        assert!(ime
+            .queue_text_send(
+                "broadcast",
+                "party update",
+                &sender,
+                vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43),]
+            )
+            .is_err());
+
+        let queued = receiver.try_recv().unwrap();
+        let completed = ime.apply_send_results([NapcatSendResult {
+            request_id: queued.request_id,
+            target_id: "broadcast".to_owned(),
+            error: None,
+        }]);
+
+        assert_eq!(completed, vec![
+            ChatInputSendCompletion {
+                input_id: "broadcast".to_owned(),
+                text: "party update".to_owned(),
+                successful_targets: vec![NapcatSendTarget::Private(42)],
+                clear_input: false,
+            }
+        ]);
+        assert!(ime.send_states["broadcast"].error.is_some());
     }
 }
 
@@ -97,10 +175,18 @@ pub struct ImeManager {
 
 #[derive(Debug, Default)]
 struct ChatInputSendState {
-    pending_request_ids: Vec<u64>,
-    pending_targets: Vec<NapcatSendTarget>,
+    pending_requests: Vec<(u64, NapcatSendTarget)>,
+    successful_targets: Vec<NapcatSendTarget>,
     pending_text: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChatInputSendCompletion {
+    pub input_id: String,
+    pub text: String,
+    pub successful_targets: Vec<NapcatSendTarget>,
+    pub clear_input: bool,
 }
 
 impl Default for ImeManager {
@@ -141,7 +227,7 @@ impl ImeManager {
         }
 
         let send_state = self.send_states.entry(target_id.to_owned()).or_default();
-        if send_state.pending_request_ids.is_empty() {
+        if send_state.pending_requests.is_empty() {
             if let Some(error) = &send_state.error {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
@@ -153,7 +239,7 @@ impl ImeManager {
             if self
                 .send_states
                 .get(target_id)
-                .map(|state| !state.pending_request_ids.is_empty())
+                .map(|state| !state.pending_requests.is_empty())
                 .unwrap_or(false)
             {
                 return teo;
@@ -195,14 +281,13 @@ impl ImeManager {
         if self
             .send_states
             .get(target_id)
-            .map(|state| !state.pending_request_ids.is_empty())
+            .map(|state| !state.pending_requests.is_empty())
             .unwrap_or(false)
         {
             return Err("上一条NapCat消息仍在发送中".to_owned());
         }
 
-        let mut pending_request_ids = Vec::new();
-        let mut pending_targets = Vec::new();
+        let mut pending_requests = Vec::new();
         let mut error = None;
         for target in targets {
             let (action, id_key, id) = match &target {
@@ -240,15 +325,17 @@ impl ImeManager {
                 ));
                 break;
             }
-            pending_request_ids.push(request_id);
-            pending_targets.push(target);
+            pending_requests.push((request_id, target));
         }
 
         let send_state = self.send_states.entry(target_id.to_owned()).or_default();
-        if !pending_request_ids.is_empty() {
-            send_state.pending_request_ids = pending_request_ids;
-            send_state.pending_targets = pending_targets;
+        send_state.successful_targets.clear();
+        if !pending_requests.is_empty() {
+            send_state.pending_requests = pending_requests;
             send_state.pending_text = Some(message_text);
+        } else {
+            send_state.pending_requests.clear();
+            send_state.pending_text = None;
         }
 
         match error {
@@ -266,34 +353,37 @@ impl ImeManager {
     pub fn apply_send_results(
         &mut self,
         results: impl IntoIterator<Item = NapcatSendResult>,
-    ) -> Vec<(
-        String,
-        Option<String>,
-        Vec<NapcatSendTarget>,
-    )> {
-        let mut sent_targets = Vec::new();
+    ) -> Vec<ChatInputSendCompletion> {
+        let mut completions = Vec::new();
         for result in results {
             let Some(state) = self.send_states.get_mut(&result.target_id) else {
                 continue;
             };
-            state
-                .pending_request_ids
-                .retain(|request_id| *request_id != result.request_id);
+            let Some(request_index) = state
+                .pending_requests
+                .iter()
+                .position(|(request_id, _)| *request_id == result.request_id)
+            else {
+                continue;
+            };
+            let (_, target) = state.pending_requests.remove(request_index);
             if let Some(error) = result.error {
                 state.error = Some(error);
-                state.pending_targets.clear();
-                state.pending_text = None;
-            } else if state.pending_request_ids.is_empty() {
-                state.error = None;
-                let pending_text = state.pending_text.take();
-                let pending_targets = std::mem::take(&mut state.pending_targets);
-                sent_targets.push((
-                    result.target_id.clone(),
-                    pending_text.clone(),
-                    pending_targets,
-                ));
+            } else {
+                state.successful_targets.push(target);
+            }
+            if state.pending_requests.is_empty() {
+                let Some(text) = state.pending_text.take() else {
+                    continue;
+                };
+                completions.push(ChatInputSendCompletion {
+                    input_id: result.target_id.clone(),
+                    text,
+                    successful_targets: std::mem::take(&mut state.successful_targets),
+                    clear_input: state.error.is_none(),
+                });
             }
         }
-        sent_targets
+        completions
     }
 }
