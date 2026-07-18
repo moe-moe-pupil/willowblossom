@@ -3183,7 +3183,9 @@ fn queue_summaries_if_needed(
     deepseek_manager: &mut DeepseekManager,
 ) -> bool {
     let mut changed = false;
-    let campaign_id = manager.current_campaign_id();
+    let Some(campaign_id) = manager.active_campaign_id() else {
+        return false;
+    };
     for scope in summary_scopes_for_target(manager, target_id, messages) {
         let summary_key = scope.summary_key(&campaign_id, target_id);
         let summarized_message_count = summarized_message_counts
@@ -3305,14 +3307,15 @@ fn summary_scopes_for_target(
     target_id: &str,
     messages: &[NapcatMessage],
 ) -> Vec<SummaryScope> {
+    let Some(campaign_id) = manager.active_campaign_id() else {
+        return Vec::new();
+    };
     if !matches!(
         messages.first().map(|message| &message.data.message_type),
         Some(NapcatMessageType::Group)
     ) {
         return vec![SummaryScope::Private];
     }
-
-    let campaign_id = manager.current_campaign_id();
     let mut party_ids = BTreeSet::new();
     if let Some(group) = manager.current_group().filter(|group| {
         group
@@ -3347,7 +3350,9 @@ fn campaign_messages_for_summary_scope(
     messages: &[NapcatMessage],
     scope: &SummaryScope,
 ) -> Vec<CampaignMessage> {
-    let campaign_id = manager.current_campaign_id();
+    let Some(campaign_id) = manager.active_campaign_id() else {
+        return Vec::new();
+    };
     match scope {
         SummaryScope::Private => manager.visible_campaign_messages_for_summary(target_id, messages),
         SummaryScope::GroupPublic => messages
@@ -3826,7 +3831,9 @@ fn target_unread_count_for_player(
         .get(target_id)
         .copied()
         .unwrap_or_default();
-    let campaign_id = manager.current_campaign_id();
+    let Some(campaign_id) = manager.active_campaign_id() else {
+        return 0;
+    };
     let access = manager.player_access_for_user(player_id);
 
     messages
@@ -13829,6 +13836,35 @@ mod tests {
             .collect::<Vec<_>>();
         pane_keys.sort();
         assert_eq!(pane_keys, vec!["closable", "fixed"]);
+    }
+
+    #[test]
+    fn no_active_campaign_disables_player_unread_and_summary_surfaces() {
+        let manager = empty_manager();
+        let messages = vec![test_private_message(2)];
+        let mut deepseek_manager = DeepseekManager::default();
+
+        assert!(summary_scopes_for_target(&manager, "2", &messages).is_empty());
+        assert!(campaign_messages_for_summary_scope(
+            &manager,
+            "2",
+            &messages,
+            &SummaryScope::Private,
+        )
+        .is_empty());
+        assert_eq!(
+            target_unread_count_for_player(&manager, "2", &messages, 2),
+            0
+        );
+        assert!(!queue_summaries_if_needed(
+            &manager,
+            "2",
+            &messages,
+            &HashMap::default(),
+            None,
+            &mut deepseek_manager,
+        ));
+        assert!(deepseek_manager.summaries.is_empty());
     }
 
     #[test]

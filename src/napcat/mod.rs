@@ -3717,12 +3717,11 @@ impl NapcatMessageManager {
             .unwrap_or_default()
     }
 
-    pub fn current_campaign_id(&self) -> String {
+    pub fn active_campaign_id(&self) -> Option<String> {
         self.current_group()
             .map(|group| group.campaign_id.trim())
             .filter(|campaign_id| !campaign_id.is_empty())
-            .unwrap_or("default")
-            .to_owned()
+            .map(str::to_owned)
     }
 
     pub fn scene_capture_campaign_for_user(&self, user_id: u64) -> Option<String> {
@@ -3736,7 +3735,7 @@ impl NapcatMessageManager {
             return None;
         }
 
-        Some(self.current_campaign_id())
+        self.active_campaign_id()
     }
 
     pub fn can_serve_scene_capture(&self, user_id: u64, campaign_id: &str) -> bool {
@@ -3780,7 +3779,9 @@ impl NapcatMessageManager {
         target_id: &str,
         messages: &[NapcatMessage],
     ) -> Vec<CampaignMessage> {
-        let campaign_id = self.current_campaign_id();
+        let Some(campaign_id) = self.active_campaign_id() else {
+            return Vec::new();
+        };
         let access = if is_group_message_target(messages) {
             self.gm_access()
         } else {
@@ -3805,7 +3806,9 @@ impl NapcatMessageManager {
         messages: &[NapcatMessage],
         player_id: u64,
     ) -> Vec<NapcatMessage> {
-        let campaign_id = self.current_campaign_id();
+        let Some(campaign_id) = self.active_campaign_id() else {
+            return Vec::new();
+        };
         let access = self.player_access_for_user(player_id);
         messages
             .iter()
@@ -8504,6 +8507,26 @@ mod tests {
     }
 
     #[test]
+    fn no_active_campaign_hides_default_history_from_players_and_summaries() {
+        let manager = empty_manager();
+        let mut old_message = test_private_message_from(2, "legacy secret");
+        old_message.data.campaign_id = "default".to_owned();
+        let messages = vec![old_message];
+
+        assert_eq!(manager.active_campaign_id(), None);
+        assert!(manager
+            .visible_messages_for_player("2", &messages, 2)
+            .is_empty());
+        assert!(manager
+            .visible_campaign_messages_for_summary("2", &messages)
+            .is_empty());
+        assert_eq!(
+            manager.scene_capture_campaign_for_user(2),
+            None
+        );
+    }
+
+    #[test]
     fn annotates_private_message_with_player_visibility() {
         let mut manager = empty_manager();
         manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
@@ -8726,6 +8749,12 @@ mod tests {
     #[test]
     fn visible_messages_for_player_keeps_private_local_replies_for_recipient() {
         let mut manager = empty_manager();
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            campaign_id: "default".to_owned(),
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
         manager.messages.insert("2".to_owned(), vec![
             test_private_message_from(2, "player asks"),
         ]);
