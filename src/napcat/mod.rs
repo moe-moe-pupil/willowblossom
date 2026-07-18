@@ -3488,6 +3488,7 @@ impl NapcatMessageManager {
 
     pub fn sync_chat_targets(&mut self) -> bool {
         let mut changed = false;
+        changed |= self.repair_ambiguous_campaign_ids();
         for target_id in self.messages.keys() {
             if !self.chat_targets.contains_key(target_id) {
                 self.chat_targets.insert(
@@ -3578,6 +3579,39 @@ impl NapcatMessageManager {
             .map(|suffix| format!("{preferred_id}-{suffix}"))
             .find(|candidate| !used_ids.contains(candidate.as_str()))
             .expect("all campaign identifier suffixes are occupied")
+    }
+
+    fn repair_ambiguous_campaign_ids(&mut self) -> bool {
+        let mut counts = HashMap::<String, usize>::new();
+        for group in self.trpg_groups.values() {
+            let campaign_id = group.campaign_id.trim();
+            let campaign_id = if campaign_id.is_empty() { "default" } else { campaign_id };
+            *counts.entry(campaign_id.to_owned()).or_default() += 1;
+        }
+        let mut ambiguous_groups = self
+            .trpg_groups
+            .iter()
+            .filter(|(_, group)| {
+                let campaign_id = group.campaign_id.trim();
+                let campaign_id = if campaign_id.is_empty() { "default" } else { campaign_id };
+                counts.get(campaign_id).copied().unwrap_or_default() > 1
+            })
+            .map(|(group_name, _)| group_name.clone())
+            .collect::<Vec<_>>();
+        ambiguous_groups.sort();
+
+        let mut changed = false;
+        for group_name in ambiguous_groups {
+            let preferred_id =
+                if group_name.trim().is_empty() { "campaign" } else { group_name.trim() };
+            let campaign_id = self.available_campaign_id(preferred_id);
+            let Some(group) = self.trpg_groups.get_mut(&group_name) else {
+                continue;
+            };
+            group.campaign_id = campaign_id;
+            changed = true;
+        }
+        changed
     }
 
     pub fn current_group(&self) -> Option<&TrpgGroup> {
@@ -8407,6 +8441,66 @@ mod tests {
         assert!(manager
             .visible_messages_for_player("2", &manager.messages["2"], 2)
             .is_empty());
+    }
+
+    #[test]
+    fn ambiguous_legacy_campaign_ids_are_rekeyed_fail_closed() {
+        let mut manager = empty_manager();
+        let mut old_message = test_private_message_from(2, "ambiguous secret");
+        old_message.data.campaign_id = "default".to_owned();
+        manager.messages.insert("2".to_owned(), vec![old_message]);
+        for group_name in ["alpha", "beta"] {
+            manager
+                .trpg_groups
+                .insert(group_name.to_owned(), TrpgGroup {
+                    campaign_id: "default".to_owned(),
+                    players: vec!["2".to_owned()],
+                    ..Default::default()
+                });
+        }
+        manager.current_trpg_group = Some("alpha".to_owned());
+
+        assert!(manager.sync_chat_targets());
+
+        let alpha_id = manager.trpg_groups["alpha"].campaign_id.clone();
+        let beta_id = manager.trpg_groups["beta"].campaign_id.clone();
+        assert_ne!(alpha_id, "default");
+        assert_ne!(beta_id, "default");
+        assert_ne!(alpha_id, beta_id);
+        assert!(manager
+            .visible_messages_for_player("2", &manager.messages["2"], 2)
+            .is_empty());
+        manager.current_trpg_group = Some("beta".to_owned());
+        assert!(manager
+            .visible_messages_for_player("2", &manager.messages["2"], 2)
+            .is_empty());
+    }
+
+    #[test]
+    fn unique_legacy_default_campaign_keeps_its_history() {
+        let mut manager = empty_manager();
+        let mut old_message = test_private_message_from(2, "legacy secret");
+        old_message.data.campaign_id = "default".to_owned();
+        manager.messages.insert("2".to_owned(), vec![old_message]);
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            campaign_id: "default".to_owned(),
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
+
+        assert!(manager.sync_chat_targets());
+
+        assert_eq!(
+            manager.trpg_groups["table"].campaign_id,
+            "default"
+        );
+        assert_eq!(
+            manager
+                .visible_messages_for_player("2", &manager.messages["2"], 2)
+                .len(),
+            1
+        );
     }
 
     #[test]

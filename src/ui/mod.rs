@@ -11319,12 +11319,9 @@ fn trpg_group_settings_window(
                                 if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
                                     ui.horizontal(|ui| {
                                         ui.label("活动ID");
-                                        changed |= ui
-                                            .add(
-                                                egui::TextEdit::singleline(&mut group.campaign_id)
-                                                    .desired_width(180.0),
-                                            )
-                                            .changed();
+                                        ui.monospace(&group.campaign_id).on_hover_text(
+                                            "活动ID用于隔离私聊、队伍消息、摘要和战斗记录，创建后不可直接修改。",
+                                        );
                                         ui.label("初始属性点");
                                         changed |= ui
                                             .add(
