@@ -2596,8 +2596,7 @@ impl BattleRoundStore {
         group: &TrpgGroup,
         manager: &NapcatMessageManager,
     ) -> String {
-        let encounter_id = format!("battle-{}", self.next_encounter_index);
-        self.next_encounter_index += 1;
+        let encounter_id = self.allocate_encounter_id();
         let participants = group
             .players
             .iter()
@@ -2625,6 +2624,23 @@ impl BattleRoundStore {
                 action_log: Vec::new(),
             });
         encounter_id
+    }
+
+    fn allocate_encounter_id(&mut self) -> String {
+        let first_index = self.next_encounter_index.max(1);
+        let mut index = first_index;
+        loop {
+            let encounter_id = format!("battle-{index}");
+            if !self.encounters.contains_key(&encounter_id) {
+                self.next_encounter_index = index.checked_add(1).unwrap_or(1);
+                return encounter_id;
+            }
+            index = index.checked_add(1).unwrap_or(1);
+            assert_ne!(
+                index, first_index,
+                "all battle encounter identifiers are occupied"
+            );
+        }
     }
 
     fn next_round(&mut self, encounter_id: &str) -> bool {
@@ -6537,6 +6553,48 @@ mod tests {
             encounter.participants[0].skill_last_used_turns,
             HashMap::from([("0".to_owned(), 5)])
         );
+    }
+
+    #[test]
+    fn new_battle_id_wraps_and_skips_existing_imported_encounters() {
+        let manager = empty_manager();
+        let group = TrpgGroup::default();
+        let mut store = BattleRoundStore {
+            next_encounter_index: u64::MAX,
+            encounters: HashMap::from([
+                (
+                    format!("battle-{}", u64::MAX),
+                    BattleEncounter {
+                        name: "maximum".to_owned(),
+                        ..Default::default()
+                    },
+                ),
+                ("battle-1".to_owned(), BattleEncounter {
+                    name: "first".to_owned(),
+                    ..Default::default()
+                }),
+            ]),
+            ..Default::default()
+        };
+
+        let encounter_id = store.create_encounter_from_group(
+            "new".to_owned(),
+            "party".to_owned(),
+            &group,
+            &manager,
+        );
+
+        assert_eq!(encounter_id, "battle-2");
+        assert_eq!(store.next_encounter_index, 3);
+        assert_eq!(
+            store.encounters[&format!("battle-{}", u64::MAX)].name,
+            "maximum"
+        );
+        assert_eq!(
+            store.encounters["battle-1"].name,
+            "first"
+        );
+        assert_eq!(store.encounters["battle-2"].name, "new");
     }
 
     #[test]
