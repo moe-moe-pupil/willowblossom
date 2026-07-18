@@ -1941,6 +1941,9 @@ fn encounter_ui(
             ),
         );
     }
+    if let Some(encounter) = store.encounters.get_mut(encounter_id) {
+        changed |= prune_unbound_group_participants(encounter, manager);
+    }
     let initial_round = store
         .encounters
         .get(encounter_id)
@@ -4137,6 +4140,24 @@ fn deduplicate_encounter_participants(encounter: &mut BattleEncounter) -> bool {
     before_len != encounter.participants.len()
 }
 
+fn prune_unbound_group_participants(
+    encounter: &mut BattleEncounter,
+    manager: &NapcatMessageManager,
+) -> bool {
+    let Some(group) = encounter
+        .trpg_group
+        .as_deref()
+        .and_then(|group_name| manager.trpg_groups.get(group_name))
+    else {
+        return false;
+    };
+    let before_len = encounter.participants.len();
+    encounter.participants.retain(|participant| {
+        participant.unit_template_id.is_some() || group.players.contains(&participant.target_id)
+    });
+    before_len != encounter.participants.len()
+}
+
 fn sync_encounter_from_group_clock(
     store: &mut BattleRoundStore,
     encounter_id: &str,
@@ -4283,7 +4304,7 @@ fn sync_encounter_to_manager(
     let Some(encounter) = encounter else {
         return false;
     };
-    if let Some(group_name) = encounter.trpg_group.as_deref() {
+    let linked_player_ids = if let Some(group_name) = encounter.trpg_group.as_deref() {
         let Some(group) = manager.trpg_groups.get(group_name) else {
             return false;
         };
@@ -4294,11 +4315,20 @@ fn sync_encounter_to_manager(
         {
             return false;
         }
-    }
+        Some(group.players.iter().cloned().collect::<HashSet<_>>())
+    } else {
+        None
+    };
     let mut changed = false;
 
     for participant in &encounter.participants {
         if participant.unit_template_id.is_some() || !participant.player_character {
+            continue;
+        }
+        if linked_player_ids
+            .as_ref()
+            .is_some_and(|player_ids| !player_ids.contains(&participant.target_id))
+        {
             continue;
         }
         let Some(character) = manager.player_characters.get_mut(&participant.target_id) else {
@@ -5701,13 +5731,17 @@ fn available_group_players(
         .collect::<HashSet<_>>();
     let mut candidate_ids = HashSet::new();
 
-    if let Some(group_name) = encounter.trpg_group.as_deref() {
-        if let Some(group) = manager.trpg_groups.get(group_name) {
-            candidate_ids.extend(group.players.iter().cloned());
-        }
+    match encounter.trpg_group.as_deref() {
+        Some(group_name) => {
+            if let Some(group) = manager.trpg_groups.get(group_name) {
+                candidate_ids.extend(group.players.iter().cloned());
+            }
+        },
+        None => {
+            candidate_ids.extend(manager.player_characters.keys().cloned());
+            candidate_ids.extend(manager.chat_targets.keys().cloned());
+        },
     }
-    candidate_ids.extend(manager.player_characters.keys().cloned());
-    candidate_ids.extend(manager.chat_targets.keys().cloned());
 
     let mut candidates = candidate_ids
         .into_iter()
@@ -7155,6 +7189,57 @@ mod tests {
     }
 
     #[test]
+    fn linked_battle_sync_ignores_player_characters_outside_its_group() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("member".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("outsider".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["member".to_owned()],
+            player_turns: HashMap::from([(
+                "member".to_owned(),
+                crate::napcat::TrpgPlayerTurnState::default(),
+            )]),
+            ..Default::default()
+        });
+        let mut member = participant("member", 0);
+        member.player_character = true;
+        member.hp = 6.0;
+        let mut outsider = participant("outsider", 0);
+        outsider.player_character = true;
+        outsider.hp = 1.0;
+        let encounter = BattleEncounter {
+            trpg_group: Some("party".to_owned()),
+            participants: vec![member, outsider],
+            ..Default::default()
+        };
+
+        assert!(sync_encounter_to_manager(
+            Some(&encounter),
+            &mut manager
+        ));
+        assert_eq!(
+            manager.player_characters["member"].hp,
+            6.0
+        );
+        assert_eq!(
+            manager.player_characters["outsider"].hp,
+            10.0
+        );
+    }
+
+    #[test]
     fn deleted_group_battle_cannot_write_character_state() {
         let mut manager = empty_manager();
         manager
@@ -8211,6 +8296,90 @@ mod tests {
             3.0
         );
         assert!(!store.repair_duplicate_participants());
+    }
+
+    #[test]
+    fn linked_battle_roster_prunes_outsiders_but_keeps_units() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec!["member".to_owned()],
+            ..Default::default()
+        });
+        let mut unit = participant("unit:slime", 0);
+        unit.player_character = false;
+        unit.unit_template_id = Some("slime".to_owned());
+        let mut encounter = BattleEncounter {
+            trpg_group: Some("table".to_owned()),
+            participants: vec![participant("member", 0), participant("outsider", 0), unit],
+            ..Default::default()
+        };
+
+        assert!(prune_unbound_group_participants(
+            &mut encounter,
+            &manager
+        ));
+        assert_eq!(
+            encounter
+                .participants
+                .iter()
+                .map(|participant| participant.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["member", "unit:slime"]
+        );
+        assert!(!prune_unbound_group_participants(
+            &mut encounter,
+            &manager
+        ));
+    }
+
+    #[test]
+    fn linked_battle_player_candidates_exclude_other_groups() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "member".to_owned(),
+            PlayerCharacter::default(),
+        );
+        manager.player_characters.insert(
+            "outsider".to_owned(),
+            PlayerCharacter::default(),
+        );
+        manager
+            .chat_targets
+            .insert("unbound".to_owned(), Default::default());
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec!["member".to_owned()],
+            ..Default::default()
+        });
+        let linked = BattleEncounter {
+            trpg_group: Some("table".to_owned()),
+            ..Default::default()
+        };
+        let missing_link = BattleEncounter {
+            trpg_group: Some("missing".to_owned()),
+            ..Default::default()
+        };
+        let standalone = BattleEncounter::default();
+
+        assert_eq!(
+            available_group_players(&linked, &manager)
+                .into_iter()
+                .map(|(target_id, _)| target_id)
+                .collect::<Vec<_>>(),
+            vec!["member"]
+        );
+        assert!(available_group_players(&missing_link, &manager).is_empty());
+        let standalone_candidates = available_group_players(&standalone, &manager)
+            .into_iter()
+            .map(|(target_id, _)| target_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            standalone_candidates,
+            HashSet::from([
+                "member".to_owned(),
+                "outsider".to_owned(),
+                "unbound".to_owned(),
+            ])
+        );
     }
 
     #[test]
