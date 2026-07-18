@@ -3681,12 +3681,38 @@ impl NapcatMessageManager {
                     .group_id
                     .or_else(|| target_id.parse::<u64>().ok())
                     .unwrap_or_default();
-                let access = self.player_access_for_user(message.data.user_id);
-                let visibility = access
-                    .party_id
-                    .as_ref()
-                    .map(|party_id| Visibility::Party(party_id.clone()))
-                    .unwrap_or(Visibility::Public);
+                let has_persisted_access = message.data.character_id.is_some()
+                    || message.data.party_id.is_some()
+                    || !matches!(
+                        message.data.visibility,
+                        Visibility::Public
+                    );
+                let (character_id, party_id, visibility) = if has_persisted_access {
+                    let party_id = message.data.party_id.clone();
+                    let visibility = match (&message.data.visibility, &party_id) {
+                        (Visibility::Public, Some(party_id)) => Visibility::Party(party_id.clone()),
+                        (visibility, _) => visibility.clone(),
+                    };
+                    (
+                        message.data.character_id.clone(),
+                        party_id,
+                        visibility,
+                    )
+                } else {
+                    // Legacy messages predate persisted access metadata, so retain the existing
+                    // current-membership fallback. New messages are annotated before save.
+                    let access = self.player_access_for_user(message.data.user_id);
+                    let visibility = access
+                        .party_id
+                        .as_ref()
+                        .map(|party_id| Visibility::Party(party_id.clone()))
+                        .unwrap_or(Visibility::Public);
+                    (
+                        access.character_id,
+                        access.party_id,
+                        visibility,
+                    )
+                };
                 CampaignMessage {
                     campaign_id,
                     sender_id: message.data.user_id,
@@ -3695,8 +3721,8 @@ impl NapcatMessageManager {
                         group_id,
                         user_id: message.data.user_id,
                     },
-                    character_id: access.character_id,
-                    party_id: access.party_id,
+                    character_id,
+                    party_id,
                     visibility,
                     text,
                     time: message.data.time,
@@ -7958,6 +7984,77 @@ mod tests {
             message.data.party_id.as_deref(),
             Some("red")
         );
+    }
+
+    #[test]
+    fn persisted_group_message_visibility_survives_party_moves() {
+        let mut manager = empty_manager();
+        let mut group = TrpgGroup {
+            players: vec![
+                "2".to_owned(),
+                "3".to_owned(),
+                "4".to_owned(),
+                "5".to_owned(),
+            ],
+            group_chats: vec!["99".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("blue"));
+        group.set_player_party("4", Some("red"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        let mut red_message = test_message_with_text(NapcatMessageType::Group, "red history");
+        red_message.data.group_id = Some(99);
+        manager.annotate_message_access("99", &mut red_message);
+        let mut public_message = test_message_with_text(
+            NapcatMessageType::Group,
+            "public history",
+        );
+        public_message.data.group_id = Some(99);
+        public_message.data.user_id = 5;
+        public_message.data.sender.user_id = 5;
+        manager.annotate_message_access("99", &mut public_message);
+        let red_message: NapcatMessage =
+            serde_json::from_str(&serde_json::to_string(&red_message).unwrap()).unwrap();
+        let public_message: NapcatMessage =
+            serde_json::from_str(&serde_json::to_string(&public_message).unwrap()).unwrap();
+
+        let group = manager.trpg_groups.get_mut("table").unwrap();
+        group.set_player_party("2", Some("blue"));
+        group.set_player_party("5", Some("blue"));
+
+        let messages = vec![red_message, public_message];
+        let red_history = manager.campaign_message_for_target("99", &messages[0]);
+        assert_eq!(
+            red_history.party_id.as_deref(),
+            Some("red")
+        );
+        assert_eq!(
+            red_history.visibility,
+            Visibility::Party("red".to_owned())
+        );
+        let red_view = manager
+            .visible_messages_for_player("99", &messages, 4)
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>();
+        let blue_view = manager
+            .visible_messages_for_player("99", &messages, 3)
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(red_view, vec![
+            "red history".to_owned(),
+            "public history".to_owned()
+        ]);
+        assert_eq!(blue_view, vec![
+            "public history".to_owned()
+        ]);
     }
 
     #[test]
