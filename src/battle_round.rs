@@ -1859,6 +1859,7 @@ fn encounter_ui(
     if !store.encounters.contains_key(encounter_id) {
         return false;
     }
+    changed |= sync_encounter_from_group_clock(store, encounter_id, manager);
 
     ui.group(|ui| {
         ui.set_width(ui.available_width());
@@ -3845,6 +3846,88 @@ fn refresh_encounter_players(
         }
     }
     before_signature != encounter_participants_signature(&encounter.participants)
+}
+
+fn sync_encounter_from_group_clock(
+    store: &mut BattleRoundStore,
+    encounter_id: &str,
+    manager: &NapcatMessageManager,
+) -> bool {
+    let Some(group_name) = store
+        .encounters
+        .get(encounter_id)
+        .and_then(|encounter| encounter.trpg_group.as_deref())
+    else {
+        return false;
+    };
+    let Some(group) = manager.trpg_groups.get(group_name) else {
+        return false;
+    };
+    let group_round = group.world_turn;
+    let group_turns = group.player_turns.clone();
+    let mut changed = false;
+
+    let encounter_round = store
+        .encounters
+        .get(encounter_id)
+        .map(|encounter| encounter.round)
+        .unwrap_or_default();
+    if group_round > encounter_round {
+        if let Some(encounter) = store.encounters.get_mut(encounter_id) {
+            for participant in encounter
+                .participants
+                .iter_mut()
+                .filter(|participant| participant.player_character)
+            {
+                sync_participant_from_manager_with_vitals(participant, manager);
+            }
+        }
+        for _ in encounter_round..group_round {
+            changed |= store.next_round(encounter_id);
+            changed |= advance_unit_participant_buffs(store, encounter_id, manager);
+        }
+    }
+
+    let Some(encounter) = store.encounters.get_mut(encounter_id) else {
+        return changed;
+    };
+    let encounter_active = encounter.active;
+    let mut completed_combat_turns = 0_u32;
+    for participant in encounter
+        .participants
+        .iter_mut()
+        .filter(|participant| participant.player_character && participant.alive)
+    {
+        let Some(turn) = group_turns.get(&participant.target_id) else {
+            continue;
+        };
+        let finished = turn.acted || turn.skipped;
+        let effective_turn = turn.turns_passed.saturating_add(u32::from(finished));
+        if effective_turn > participant.turn {
+            let advanced = effective_turn - participant.turn;
+            participant.turn = effective_turn;
+            if encounter_active {
+                participant.combat_turns_completed =
+                    participant.combat_turns_completed.saturating_add(advanced);
+                completed_combat_turns = completed_combat_turns.saturating_add(advanced);
+            }
+            changed = true;
+        }
+        if finished && effective_turn >= participant.turn && !participant.action_done {
+            participant.action_done = true;
+            participant.pending_negative = false;
+            changed = true;
+        }
+    }
+    if completed_combat_turns > 0 {
+        encounter.combat_completed_turns = encounter
+            .combat_completed_turns
+            .saturating_add(completed_combat_turns);
+    }
+    if changed && encounter.negative_enabled {
+        mark_negative_candidates(encounter);
+    }
+    changed
 }
 
 fn initialize_participant_clock(
@@ -6578,6 +6661,148 @@ mod tests {
         assert_eq!(group.player_turns["a"].turns_passed, 4);
         assert!(!group.player_turns["a"].acted);
         assert!(!group.player_turns["a"].skipped);
+    }
+
+    #[test]
+    fn newer_group_round_catches_battle_up_from_manager_vitals() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("a".to_owned(), PlayerCharacter {
+                hp: 8.0,
+                max_hp: 10.0,
+                mp: 4.0,
+                max_mp: 10.0,
+                mp_regen: 1.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["a".to_owned()],
+            world_turn: 2,
+            player_turns: HashMap::from([(
+                "a".to_owned(),
+                crate::napcat::TrpgPlayerTurnState {
+                    turns_passed: 2,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let mut player = participant("a", 0);
+        player.player_character = true;
+        player.hp = 1.0;
+        player.mp = 0.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                trpg_group: Some("party".to_owned()),
+                active: true,
+                participants: vec![player],
+                ..Default::default()
+            });
+
+        assert!(sync_encounter_from_group_clock(
+            &mut store, "battle", &manager
+        ));
+
+        let encounter = &store.encounters["battle"];
+        let player = &encounter.participants[0];
+        assert_eq!(encounter.round, 2);
+        assert_eq!(player.turn, 2);
+        assert_eq!(player.hp, 8.0);
+        assert_eq!(player.mp, 6.0);
+        assert_eq!(player.combat_turns_completed, 2);
+        assert_eq!(encounter.combat_completed_turns, 2);
+        assert!(!player.action_done);
+    }
+
+    #[test]
+    fn current_group_skip_finishes_the_matching_battle_action() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "a".to_owned(),
+            PlayerCharacter::default(),
+        );
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["a".to_owned()],
+            world_turn: 3,
+            player_turns: HashMap::from([(
+                "a".to_owned(),
+                crate::napcat::TrpgPlayerTurnState {
+                    turns_passed: 3,
+                    skipped: true,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let mut player = participant("a", 3);
+        player.player_character = true;
+        player.pending_negative = true;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                trpg_group: Some("party".to_owned()),
+                round: 3,
+                active: true,
+                participants: vec![player],
+                ..Default::default()
+            });
+
+        assert!(sync_encounter_from_group_clock(
+            &mut store, "battle", &manager
+        ));
+
+        let encounter = &store.encounters["battle"];
+        let player = &encounter.participants[0];
+        assert_eq!(player.turn, 4);
+        assert!(player.action_done);
+        assert!(!player.pending_negative);
+        assert_eq!(player.combat_turns_completed, 1);
+        assert_eq!(encounter.combat_completed_turns, 1);
+    }
+
+    #[test]
+    fn stale_group_completion_does_not_finish_a_newer_battle_action() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "a".to_owned(),
+            PlayerCharacter::default(),
+        );
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["a".to_owned()],
+            world_turn: 3,
+            player_turns: HashMap::from([(
+                "a".to_owned(),
+                crate::napcat::TrpgPlayerTurnState {
+                    turns_passed: 3,
+                    acted: true,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let mut player = participant("a", 5);
+        player.player_character = true;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                trpg_group: Some("party".to_owned()),
+                round: 3,
+                participants: vec![player],
+                ..Default::default()
+            });
+
+        assert!(!sync_encounter_from_group_clock(
+            &mut store, "battle", &manager
+        ));
+
+        let player = &store.encounters["battle"].participants[0];
+        assert_eq!(player.turn, 5);
+        assert!(!player.action_done);
     }
 
     #[test]
