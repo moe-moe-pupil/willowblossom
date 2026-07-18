@@ -129,8 +129,15 @@ pub struct NapcatSendManager {
 }
 
 #[derive(Resource)]
-struct NapcatAutoForwardRequestIds {
+struct NapcatAutomaticReplyRequests {
     next_request_id: u64,
+    pending: HashMap<u64, PendingAutomaticPrivateReply>,
+}
+
+#[derive(Debug)]
+struct PendingAutomaticPrivateReply {
+    recipient_id: u64,
+    text: String,
 }
 
 #[derive(Resource)]
@@ -4964,8 +4971,9 @@ fn setup(mut commands: Commands) {
     commands.insert_resource(napcat_send_results);
     commands.insert_resource(NapcatIOSender(game_to_client_sender));
     commands.insert_resource(NapcatSendManager::default());
-    commands.insert_resource(NapcatAutoForwardRequestIds {
+    commands.insert_resource(NapcatAutomaticReplyRequests {
         next_request_id: 1_000_000,
+        pending: HashMap::default(),
     });
     commands.insert_resource(NapcatGroupInfoRequests {
         next_request_id: 2_000_000,
@@ -5257,10 +5265,55 @@ fn fail_pending_napcat_requests(
 fn send_result_system(
     receiver: Res<NapcatSendResultReceiver>,
     mut send_manager: ResMut<NapcatSendManager>,
+    mut automatic_replies: ResMut<NapcatAutomaticReplyRequests>,
+    mut manager: ResMut<Persistent<NapcatMessageManager>>,
 ) {
+    let mut manager_changed = false;
     while let Ok(result) = receiver.0.try_recv() {
-        send_manager.results.push(result);
+        if let Some(changed) = apply_automatic_private_reply_result(
+            &result,
+            &mut automatic_replies,
+            &mut manager,
+        ) {
+            manager_changed |= changed;
+        } else {
+            send_manager.results.push(result);
+        }
     }
+    if manager_changed {
+        if let Err(err) = manager.persist() {
+            eprintln!("failed to persist acknowledged automatic NapCat reply: {err}");
+        }
+    }
+}
+
+fn apply_automatic_private_reply_result(
+    result: &NapcatSendResult,
+    automatic_replies: &mut NapcatAutomaticReplyRequests,
+    manager: &mut NapcatMessageManager,
+) -> Option<bool> {
+    let pending = automatic_replies.pending.remove(&result.request_id)?;
+    let expected_target_id = pending.recipient_id.to_string();
+    if result.target_id != expected_target_id {
+        eprintln!(
+            "ignored mismatched automatic NapCat reply result: expected target {}, got {}",
+            expected_target_id, result.target_id
+        );
+        return Some(false);
+    }
+    if let Some(error) = result.error.as_deref() {
+        eprintln!(
+            "automatic NapCat reply to {} failed: {}",
+            pending.recipient_id, error
+        );
+        return Some(false);
+    }
+    Some(append_local_private_text_response(
+        manager,
+        &expected_target_id,
+        pending.recipient_id,
+        &pending.text,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5409,7 +5462,7 @@ fn value_to_target_id(value: &Value) -> Option<String> {
 fn message_system(
     receiver: Res<NapcatIOReceiver>,
     sender: Option<Res<NapcatIOSender>>,
-    mut auto_forward_ids: ResMut<NapcatAutoForwardRequestIds>,
+    mut automatic_replies: ResMut<NapcatAutomaticReplyRequests>,
     mut group_info_requests: ResMut<NapcatGroupInfoRequests>,
     mut scene_capture_requests: Option<ResMut<SceneCaptureRequests>>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
@@ -5476,19 +5529,12 @@ fn message_system(
                 sender.as_deref(),
                 character_creation_response.as_deref(),
             ) {
-                if queue_private_text_response(
+                queue_private_text_response(
                     sender,
-                    &mut auto_forward_ids,
+                    &mut automatic_replies,
                     incoming_user_id,
                     response.to_owned(),
-                ) {
-                    append_local_private_text_response(
-                        &mut manager,
-                        &target_id,
-                        incoming_user_id,
-                        response,
-                    );
-                }
+                );
             }
 
             if let Err(err) = manager.persist() {
@@ -5499,7 +5545,7 @@ fn message_system(
                 for user_id in auto_forward.recipients {
                     queue_private_text_response(
                         sender,
-                        &mut auto_forward_ids,
+                        &mut automatic_replies,
                         user_id,
                         auto_forward.text.clone(),
                     );
@@ -5580,12 +5626,12 @@ fn cache_remote_image(url: &str) -> Result<PathBuf, String> {
 
 fn queue_private_text_response(
     sender: &NapcatIOSender,
-    auto_forward_ids: &mut NapcatAutoForwardRequestIds,
+    automatic_replies: &mut NapcatAutomaticReplyRequests,
     user_id: u64,
     text: String,
 ) -> bool {
-    let request_id = auto_forward_ids.next_request_id;
-    auto_forward_ids.next_request_id += 1;
+    let request_id = automatic_replies.next_request_id;
+    automatic_replies.next_request_id += 1;
     let message = Message::Text(
         json!({
             "action": "send_private_msg",
@@ -5595,7 +5641,7 @@ fn queue_private_text_response(
                     {
                         "type": "text",
                         "data": {
-                            "text": text
+                            "text": &text
                         }
                     }
                 ]
@@ -5613,6 +5659,13 @@ fn queue_private_text_response(
         eprintln!("failed to queue NapCat private text response: {err}");
         false
     } else {
+        automatic_replies.pending.insert(
+            request_id,
+            PendingAutomaticPrivateReply {
+                recipient_id: user_id,
+                text,
+            },
+        );
         true
     }
 }
@@ -5622,14 +5675,14 @@ fn append_local_private_text_response(
     target_id: &str,
     recipient_id: u64,
     text: &str,
-) {
+) -> bool {
     let Some(self_id) = manager
         .messages
         .get(target_id)
         .and_then(|messages| messages.first())
         .map(|message| message.data.self_id)
     else {
-        return;
+        return false;
     };
 
     let time = SystemTime::now()
@@ -5669,6 +5722,7 @@ fn append_local_private_text_response(
         .entry(target_id.to_owned())
         .or_default()
         .push(message);
+    true
 }
 
 fn is_scene_capture_command(message: &NapcatMessage) -> bool {
@@ -11892,6 +11946,88 @@ mod tests {
 
         assert!((low_hp_damage_multiplier_with_fatigue(5.0, 10.0, true) - 0.8).abs() < 0.0001);
         assert!((low_hp_damage_multiplier_with_fatigue(0.1, 10.0, true) - 0.24).abs() < 0.0001);
+    }
+
+    #[test]
+    fn automatic_private_reply_is_persisted_only_after_acknowledgement() {
+        let mut manager = empty_manager();
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message_from(2, "player asks"),
+        ]);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let sender = NapcatIOSender(sender);
+        let mut automatic_replies = NapcatAutomaticReplyRequests {
+            next_request_id: 1_000_000,
+            pending: HashMap::default(),
+        };
+
+        assert!(queue_private_text_response(
+            &sender,
+            &mut automatic_replies,
+            2,
+            "private answer".to_owned(),
+        ));
+        assert_eq!(manager.messages["2"].len(), 1);
+        let outbound = receiver.try_recv().unwrap();
+        assert!(automatic_replies.pending.contains_key(&outbound.request_id));
+
+        assert_eq!(
+            apply_automatic_private_reply_result(
+                &NapcatSendResult {
+                    request_id: outbound.request_id,
+                    target_id: "2".to_owned(),
+                    error: None,
+                },
+                &mut automatic_replies,
+                &mut manager,
+            ),
+            Some(true)
+        );
+
+        assert!(automatic_replies.pending.is_empty());
+        assert_eq!(manager.messages["2"].len(), 2);
+        assert_eq!(
+            message_text(manager.messages["2"].last().unwrap()),
+            "private answer"
+        );
+    }
+
+    #[test]
+    fn rejected_automatic_private_reply_does_not_create_local_history() {
+        let mut manager = empty_manager();
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message_from(2, "player asks"),
+        ]);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let sender = NapcatIOSender(sender);
+        let mut automatic_replies = NapcatAutomaticReplyRequests {
+            next_request_id: 1_000_000,
+            pending: HashMap::default(),
+        };
+
+        assert!(queue_private_text_response(
+            &sender,
+            &mut automatic_replies,
+            2,
+            "private answer".to_owned(),
+        ));
+        let outbound = receiver.try_recv().unwrap();
+
+        assert_eq!(
+            apply_automatic_private_reply_result(
+                &NapcatSendResult {
+                    request_id: outbound.request_id,
+                    target_id: "2".to_owned(),
+                    error: Some("NapCat rejected reply".to_owned()),
+                },
+                &mut automatic_replies,
+                &mut manager,
+            ),
+            Some(false)
+        );
+
+        assert!(automatic_replies.pending.is_empty());
+        assert_eq!(manager.messages["2"].len(), 1);
     }
 
     #[test]
