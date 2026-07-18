@@ -3605,6 +3605,7 @@ impl NapcatMessageManager {
         target_id: &str,
         messages: &[NapcatMessage],
     ) -> Vec<CampaignMessage> {
+        let campaign_id = self.current_campaign_id();
         let access = if is_group_message_target(messages) {
             self.gm_access()
         } else {
@@ -3618,6 +3619,7 @@ impl NapcatMessageManager {
             .iter()
             .filter(|message| message.data.user_id != message.data.self_id)
             .map(|message| self.campaign_message_for_target(target_id, message))
+            .filter(|message| message.campaign_id == campaign_id)
             .filter(|message| access.can_read(&message.visibility))
             .collect()
     }
@@ -3628,12 +3630,14 @@ impl NapcatMessageManager {
         messages: &[NapcatMessage],
         player_id: u64,
     ) -> Vec<NapcatMessage> {
+        let campaign_id = self.current_campaign_id();
         let access = self.player_access_for_user(player_id);
         messages
             .iter()
             .filter(|message| {
                 let campaign_message = self.campaign_message_for_target(target_id, message);
-                access.can_read(&campaign_message.visibility)
+                campaign_message.campaign_id == campaign_id
+                    && access.can_read(&campaign_message.visibility)
             })
             .cloned()
             .collect()
@@ -8134,6 +8138,40 @@ mod tests {
             "private answer".to_owned()
         ]);
         assert!(player_three_text.is_empty());
+    }
+
+    #[test]
+    fn player_history_and_summary_inputs_exclude_other_campaigns() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            campaign_id: "campaign-a".to_owned(),
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
+        let mut current = test_private_message_from(2, "current campaign");
+        current.data.campaign_id = "campaign-a".to_owned();
+        let mut other = test_private_message_from(2, "other campaign secret");
+        other.data.campaign_id = "campaign-b".to_owned();
+        let messages = vec![current, other];
+
+        let player_text = manager
+            .visible_messages_for_player("2", &messages, 2)
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>();
+        let summary_text = manager
+            .visible_campaign_messages_for_summary("2", &messages)
+            .into_iter()
+            .map(|message| message.text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(player_text, vec![
+            "current campaign".to_owned()
+        ]);
+        assert_eq!(summary_text, vec![
+            "current campaign".to_owned()
+        ]);
     }
 
     #[test]

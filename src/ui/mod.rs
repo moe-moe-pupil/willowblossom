@@ -3103,12 +3103,16 @@ enum SummaryScope {
 }
 
 impl SummaryScope {
-    fn summary_key(&self, target_id: &str) -> String {
-        match self {
+    fn summary_key(&self, campaign_id: &str, target_id: &str) -> String {
+        let scope_key = match self {
             SummaryScope::Private => target_id.to_owned(),
             SummaryScope::GroupPublic => format!("group:{target_id}:public"),
             SummaryScope::GroupParty(party_id) => format!("group:{target_id}:party:{party_id}"),
-        }
+        };
+        format!(
+            "campaign:{}:{scope_key}",
+            encode_summary_key_component(campaign_id)
+        )
     }
 
     fn label(&self) -> String {
@@ -3118,6 +3122,34 @@ impl SummaryScope {
             SummaryScope::GroupParty(party_id) => format!("小队：{party_id}"),
         }
     }
+}
+
+fn encode_summary_key_component(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn decode_summary_key_component(value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn parse_campaign_summary_key(summary_key: &str) -> Option<(String, &str)> {
+    let rest = summary_key.strip_prefix("campaign:")?;
+    let (encoded_campaign_id, scope_key) = rest.split_once(':')?;
+    Some((
+        decode_summary_key_component(encoded_campaign_id)?,
+        scope_key,
+    ))
 }
 
 fn player_text_lines(messages: &[CampaignMessage]) -> Vec<PlayerTextLine> {
@@ -3151,8 +3183,9 @@ fn queue_summaries_if_needed(
     deepseek_manager: &mut DeepseekManager,
 ) -> bool {
     let mut changed = false;
+    let campaign_id = manager.current_campaign_id();
     for scope in summary_scopes_for_target(manager, target_id, messages) {
-        let summary_key = scope.summary_key(target_id);
+        let summary_key = scope.summary_key(&campaign_id, target_id);
         let summarized_message_count = summarized_message_counts
             .get(&summary_key)
             .copied()
@@ -3279,6 +3312,7 @@ fn summary_scopes_for_target(
         return vec![SummaryScope::Private];
     }
 
+    let campaign_id = manager.current_campaign_id();
     let mut party_ids = BTreeSet::new();
     if let Some(group) = manager.current_group().filter(|group| {
         group
@@ -3293,10 +3327,11 @@ fn summary_scopes_for_target(
         if message.data.user_id == message.data.self_id {
             continue;
         }
-        if let Visibility::Party(party_id) = manager
-            .campaign_message_for_target(target_id, message)
-            .visibility
-        {
+        let campaign_message = manager.campaign_message_for_target(target_id, message);
+        if campaign_message.campaign_id != campaign_id {
+            continue;
+        }
+        if let Visibility::Party(party_id) = campaign_message.visibility {
             party_ids.insert(party_id);
         }
     }
@@ -3312,18 +3347,21 @@ fn campaign_messages_for_summary_scope(
     messages: &[NapcatMessage],
     scope: &SummaryScope,
 ) -> Vec<CampaignMessage> {
+    let campaign_id = manager.current_campaign_id();
     match scope {
         SummaryScope::Private => manager.visible_campaign_messages_for_summary(target_id, messages),
         SummaryScope::GroupPublic => messages
             .iter()
             .filter(|message| message.data.user_id != message.data.self_id)
             .map(|message| manager.campaign_message_for_target(target_id, message))
+            .filter(|message| message.campaign_id == campaign_id)
             .filter(|message| matches!(message.visibility, Visibility::Public))
             .collect(),
         SummaryScope::GroupParty(party_id) => messages
             .iter()
             .filter(|message| message.data.user_id != message.data.self_id)
             .map(|message| manager.campaign_message_for_target(target_id, message))
+            .filter(|message| message.campaign_id == campaign_id)
             .filter(|message| {
                 matches!(message.visibility, Visibility::Public)
                     || matches!(&message.visibility, Visibility::Party(message_party) if message_party == party_id)
@@ -3368,10 +3406,13 @@ fn summary_display_parts<'a>(
     manager: &NapcatMessageManager,
     summary_key: &'a str,
 ) -> (String, String) {
-    let (target_id, scope) = parse_group_summary_key(summary_key)
+    let (campaign_id, scope_key) = parse_campaign_summary_key(summary_key)
+        .map(|(campaign_id, scope_key)| (Some(campaign_id), scope_key))
+        .unwrap_or((None, summary_key));
+    let (target_id, mut scope) = parse_group_summary_key(scope_key)
         .map(|(target_id, scope)| (target_id, scope.label()))
         .unwrap_or_else(|| {
-            let scope = if manager.messages.get(summary_key).is_some_and(|messages| {
+            let scope = if manager.messages.get(scope_key).is_some_and(|messages| {
                 matches!(
                     messages.first().map(|message| &message.data.message_type),
                     Some(NapcatMessageType::Group)
@@ -3381,8 +3422,11 @@ fn summary_display_parts<'a>(
             } else {
                 "私聊".to_owned()
             };
-            (summary_key, scope)
+            (scope_key, scope)
         });
+    if let Some(campaign_id) = campaign_id {
+        scope = format!("{scope} · 战役：{campaign_id}");
+    }
     let display_name = manager
         .messages
         .get(target_id)
@@ -13685,10 +13729,13 @@ mod tests {
     #[test]
     fn group_summary_scope_filters_public_and_party_messages() {
         let manager = split_party_summary_manager();
+        let mut other_campaign = test_group_message(2, "other campaign secret");
+        other_campaign.data.campaign_id = "other".to_owned();
         let messages = vec![
             test_group_message(4, "public clue"),
             test_group_message(2, "red clue"),
             test_group_message(3, "blue clue"),
+            other_campaign,
         ];
 
         let public_lines = player_text_lines(&campaign_messages_for_summary_scope(
@@ -13721,6 +13768,8 @@ mod tests {
         assert!(red_text.contains("public clue"));
         assert!(red_text.contains("red clue"));
         assert!(!red_text.contains("blue clue"));
+        assert!(!public_text.contains("other campaign secret"));
+        assert!(!red_text.contains("other campaign secret"));
     }
 
     #[test]
@@ -13754,14 +13803,17 @@ mod tests {
             &mut deepseek_manager,
         ));
 
-        assert!(deepseek_manager.summaries.contains_key("group:99:public"));
-        assert!(deepseek_manager
-            .summaries
-            .contains_key("group:99:party:red"));
-        assert!(deepseek_manager
-            .summaries
-            .contains_key("group:99:party:blue"));
+        let public_key = SummaryScope::GroupPublic.summary_key("default", "99");
+        let red_key = SummaryScope::GroupParty("red".to_owned()).summary_key("default", "99");
+        let blue_key = SummaryScope::GroupParty("blue".to_owned()).summary_key("default", "99");
+        assert!(deepseek_manager.summaries.contains_key(&public_key));
+        assert!(deepseek_manager.summaries.contains_key(&red_key));
+        assert!(deepseek_manager.summaries.contains_key(&blue_key));
         assert!(!deepseek_manager.summaries.contains_key("99"));
+        assert_ne!(
+            red_key,
+            SummaryScope::GroupParty("red".to_owned()).summary_key("other", "99")
+        );
 
         let mut request_texts = HashMap::new();
         while let Ok(message) = receiver.try_recv() {
@@ -13775,9 +13827,9 @@ mod tests {
             request_texts.insert(target_id, text);
         }
 
-        let public_text = &request_texts["group:99:public"];
-        let red_text = &request_texts["group:99:party:red"];
-        let blue_text = &request_texts["group:99:party:blue"];
+        let public_text = &request_texts[&public_key];
+        let red_text = &request_texts[&red_key];
+        let blue_text = &request_texts[&blue_key];
         assert!(public_text.contains("public clue 0"));
         assert!(!public_text.contains("red clue 0"));
         assert!(!public_text.contains("blue clue 0"));
