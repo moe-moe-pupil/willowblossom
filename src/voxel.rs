@@ -3716,7 +3716,7 @@ fn load_voxel_player_standee_texture(
     ))
 }
 
-fn cached_or_local_voxel_standee_path(source: &str) -> Result<PathBuf, String> {
+pub(crate) fn cached_or_local_voxel_standee_path(source: &str) -> Result<PathBuf, String> {
     let source = source.trim();
     if source.is_empty() {
         return Err("empty image source".to_owned());

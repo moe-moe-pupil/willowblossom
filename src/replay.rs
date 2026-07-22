@@ -43,11 +43,19 @@ use serde::{
     Serialize,
 };
 use tempfile::TempDir;
+use tokio_tungstenite::tungstenite::protocol::Message;
 use voxxelmaxx::prelude::*;
 
 use crate::{
+    deepseek::{
+        DeepseekIOSender,
+        DeepseekManager,
+        DeepseekRequest,
+        DeepseekSummaryBlock,
+    },
     napcat::{
         CampaignMessage,
+        NapcatMessageChainType,
         NapcatMessageManager,
         PlayerAccess,
         PlayerCharacter,
@@ -55,6 +63,7 @@ use crate::{
     },
     ui,
     voxel::{
+        cached_or_local_voxel_standee_path,
         TrpgVoxelGrid,
         VoxelViewportCamera,
     },
@@ -64,8 +73,7 @@ const REPLAY_FORMAT_VERSION: u32 = 1;
 const CAMERA_SAMPLE_SECONDS: f32 = 0.1;
 const MIN_DIALOGUE_MS: u64 = 2_400;
 const MAX_DIALOGUE_MS: u64 = 10_000;
-const MIN_HISTORY_DIALOGUE_GAP_MS: u64 = 1_200;
-const MAX_HISTORY_DIALOGUE_GAP_MS: u64 = 8_000;
+const HISTORY_DIALOGUE_GAP_MS: u64 = 280;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
@@ -541,6 +549,8 @@ fn apply_replay_camera(
 fn replay_studio_ui(
     mut contexts: EguiContexts,
     manager: Res<Persistent<NapcatMessageManager>>,
+    deepseek_sender: Option<Res<DeepseekIOSender>>,
+    mut deepseek_manager: ResMut<Persistent<DeepseekManager>>,
     mut studio: ResMut<ReplayStudio>,
     camera: Query<&Transform, With<VoxelViewportCamera>>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
@@ -573,6 +583,8 @@ fn replay_studio_ui(
                 replay_controls(
                     ui,
                     &manager,
+                    deepseek_sender.as_deref(),
+                    &mut deepseek_manager,
                     &mut studio,
                     &camera,
                     &mut grids,
@@ -601,6 +613,8 @@ fn replay_studio_ui(
 fn replay_controls(
     ui: &mut egui::Ui,
     manager: &NapcatMessageManager,
+    deepseek_sender: Option<&DeepseekIOSender>,
+    deepseek_manager: &mut Persistent<DeepseekManager>,
     studio: &mut ReplayStudio,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
@@ -735,6 +749,60 @@ fn replay_controls(
             }
         });
     }
+
+    ui.separator();
+    ui.heading("DeepSeek 制作提要");
+    ui.small("只整理当前发布范围内已经说过的内容，供 DM 审核；不会续写剧情、改写玩家台词或读取其他队伍的隐藏内容。");
+    if ui
+        .add_enabled(
+            studio
+                .replay
+                .as_ref()
+                .is_some_and(|replay| !replay.dialogue.is_empty()),
+            egui::Button::new("整理现有台词"),
+        )
+        .clicked()
+    {
+        studio.status = match studio
+            .replay
+            .as_ref()
+            .ok_or_else(|| "请先从现有聊天生成回放".to_owned())
+            .and_then(|replay| {
+                queue_replay_summary(
+                    replay,
+                    deepseek_sender,
+                    deepseek_manager,
+                )
+            }) {
+            Ok(()) => {
+                if let Err(err) = deepseek_manager.persist() {
+                    format!("DeepSeek 请求已发送，但保存请求状态失败：{err}")
+                } else {
+                    "DeepSeek 正在整理可见台词；完成后会在这里显示制作提要".to_owned()
+                }
+            },
+            Err(err) => format!("DeepSeek 整理失败：{err}"),
+        };
+    }
+    if let Some(replay) = studio.replay.as_ref() {
+        if let Some(block) = replay_summary_block(replay, deepseek_manager) {
+            if block.pending {
+                ui.spinner();
+                ui.small("正在整理……");
+            } else if let Some(error) = &block.error {
+                ui.colored_label(
+                    egui::Color32::from_rgb(210, 90, 70),
+                    error,
+                );
+            } else if !block.latest.trim().is_empty() {
+                ui.group(|ui| {
+                    ui.label("DM 制作提要（不会自动写入台词）");
+                    ui.label(&block.latest);
+                });
+            }
+        }
+    }
+    ui.small("镜头使用 DM 录制的自由镜头轨迹；从聊天生成时使用当前镜头。台词显示时长和切换间隔由本地确定性排版器控制。");
 
     ui.separator();
     ui.heading("导出 MP4 视频");
@@ -905,17 +973,13 @@ fn build_from_history(
         .filter(|message| !message.text.trim().is_empty())
         .collect::<Vec<_>>();
     visible.sort_by_key(|message| message.time);
-    let mut timeline_ms: u64 = 0;
-    let mut previous_message_time = None;
+    let mut timeline_ms: u64 = 350;
     for message in &visible {
-        if let Some(previous_time) = previous_message_time {
-            timeline_ms = timeline_ms.saturating_add(history_dialogue_gap_ms(
-                previous_time,
-                message.time,
-            ));
-        }
-        previous_message_time = Some(message.time);
         if let Some(dialogue) = dialogue_from_message(message, manager, timeline_ms) {
+            timeline_ms = dialogue
+                .time_ms
+                .saturating_add(dialogue.duration_ms)
+                .saturating_add(HISTORY_DIALOGUE_GAP_MS);
             replay.dialogue.push(dialogue);
         }
     }
@@ -935,19 +999,78 @@ fn build_from_history(
     studio.playback_ms = 0;
     studio.replay = Some(replay);
     studio.status = format!(
-        "已从现有聊天生成 {0} 条对话",
+        "已从现有聊天生成 {0} 条连续对话；切换间隔约 0.28 秒",
         visible.len()
     );
 }
 
-fn history_dialogue_gap_ms(previous_time: u64, current_time: u64) -> u64 {
-    current_time
-        .saturating_sub(previous_time)
-        .saturating_mul(1_000)
-        .clamp(
-            MIN_HISTORY_DIALOGUE_GAP_MS,
-            MAX_HISTORY_DIALOGUE_GAP_MS,
-        )
+fn replay_summary_key(replay: &ReplayFile) -> String {
+    let audience = match &replay.audience {
+        ReplayAudience::Public => "public".to_owned(),
+        ReplayAudience::Party(id) => format!("party:{id}"),
+        ReplayAudience::Player(id) => format!("player:{id}"),
+        ReplayAudience::Gm => "gm".to_owned(),
+    };
+    format!(
+        "replay:{}:{audience}",
+        replay.campaign_id
+    )
+}
+
+fn replay_summary_block<'a>(
+    replay: &ReplayFile,
+    manager: &'a DeepseekManager,
+) -> Option<&'a DeepseekSummaryBlock> {
+    let message_count = replay.dialogue.len();
+    manager
+        .summaries
+        .get(&replay_summary_key(replay))?
+        .blocks
+        .iter()
+        .find(|block| block.message_count == message_count)
+}
+
+fn queue_replay_summary(
+    replay: &ReplayFile,
+    sender: Option<&DeepseekIOSender>,
+    manager: &mut DeepseekManager,
+) -> Result<(), String> {
+    if replay.dialogue.is_empty() {
+        return Err("回放中没有可整理的台词".to_owned());
+    }
+    let sender = sender.ok_or_else(|| "DeepSeek 连接尚未就绪，请稍后重试".to_owned())?;
+    let summary_key = replay_summary_key(replay);
+    let message_count = replay.dialogue.len();
+    if let Some(block) = replay_summary_block(replay, manager) {
+        if block.pending || !block.latest.trim().is_empty() {
+            return Err("这版台词已经整理过；新增台词后可以再次整理".to_owned());
+        }
+    }
+    let text = replay
+        .dialogue
+        .iter()
+        .map(|line| format!("{}：{}", line.name, line.text.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let request = serde_json::to_string(&DeepseekRequest::Summary {
+        target_id: summary_key.clone(),
+        message_count,
+        text,
+    })
+    .map(Message::text)
+    .map_err(|err| err.to_string())?;
+    sender.0.try_send(request).map_err(|err| err.to_string())?;
+    manager
+        .summaries
+        .entry(summary_key)
+        .or_default()
+        .upsert_block(DeepseekSummaryBlock {
+            latest: String::new(),
+            message_count,
+            pending: true,
+            error: None,
+        });
+    Ok(())
 }
 
 fn new_replay(
@@ -1305,15 +1428,25 @@ fn dialogue_from_message(
     if text.is_empty() {
         return None;
     }
+    let is_gm = manager
+        .current_group()
+        .is_some_and(|group| group.gm_users.contains(&message.sender_id));
     let character = manager
         .player_characters
-        .get(&message.sender_id.to_string());
+        .get(&message.sender_id.to_string())
+        .or_else(|| {
+            if is_gm {
+                None
+            } else {
+                message
+                    .character_id
+                    .as_ref()
+                    .and_then(|character_id| manager.player_characters.get(character_id))
+            }
+        });
     let (name, role, avatar) = dialogue_identity(message, character);
-    let side = speaker_side(
-        manager
-            .current_group()
-            .is_some_and(|group| group.gm_users.contains(&message.sender_id)),
-    );
+    let avatar = resolve_character_image_source(manager, &avatar);
+    let side = speaker_side(is_gm);
     Some(ReplayDialogue {
         time_ms,
         duration_ms: dialogue_duration_ms(text),
@@ -1326,6 +1459,35 @@ fn dialogue_from_message(
         visibility: message.visibility.clone(),
         side,
     })
+}
+
+fn resolve_character_image_source(manager: &NapcatMessageManager, source: &str) -> String {
+    let source = source.trim();
+    if source.is_empty() {
+        return String::new();
+    }
+    if Path::new(source).exists() {
+        return source.to_owned();
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        if let Some(local_path) = manager
+            .messages
+            .values()
+            .flatten()
+            .flat_map(|message| &message.data.message)
+            .find_map(|segment| match &segment.variant {
+                NapcatMessageChainType::Image { data }
+                    if data.url.trim() == source && Path::new(data.local_path.trim()).exists() =>
+                {
+                    Some(data.local_path.trim().to_owned())
+                },
+                _ => None,
+            })
+        {
+            return local_path;
+        }
+    }
+    source.to_owned()
 }
 
 fn speaker_side(is_gm: bool) -> DialogueSide {
@@ -1365,7 +1527,27 @@ fn dialogue_identity(
 }
 
 fn dialogue_duration_ms(text: &str) -> u64 {
-    (text.chars().count() as u64 * 90 + 1_800).clamp(MIN_DIALOGUE_MS, MAX_DIALOGUE_MS)
+    let reading_ms = text.chars().fold(1_150_u64, |total, character| {
+        let character_ms = match character {
+            '。' | '！' | '？' | '!' | '?' | '；' | ';' => 300,
+            '，' | ',' | '、' | '：' | ':' => 170,
+            character if character.is_whitespace() => 25,
+            character if is_cjk_character(character) => 165,
+            _ => 70,
+        };
+        total.saturating_add(character_ms)
+    });
+    reading_ms.clamp(MIN_DIALOGUE_MS, MAX_DIALOGUE_MS)
+}
+
+fn is_cjk_character(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2FA1F
+    )
 }
 
 fn active_dialogue(dialogue: &[ReplayDialogue], time_ms: u64) -> Option<&ReplayDialogue> {
@@ -1410,16 +1592,22 @@ fn dialogue_overlay(
         egui::StrokeKind::Inside,
     );
 
-    let avatar_width = (screen.width() * 0.30).clamp(230.0, 520.0);
-    let avatar_left = match dialogue.side {
-        DialogueSide::Left => dialogue_rect.left() + 15.0,
-        DialogueSide::Right => dialogue_rect.right() - avatar_width,
+    let name_width = 225.0;
+    let name_left = match dialogue.side {
+        DialogueSide::Left => dialogue_rect.left() + 40.0,
+        DialogueSide::Right => dialogue_rect.right() - name_width - 40.0,
     };
+    let name_rect = egui::Rect::from_min_size(
+        egui::pos2(name_left, dialogue_rect.top() - 102.0),
+        egui::vec2(name_width, 66.0),
+    );
+    let avatar_width = (screen.width() * 0.24).clamp(200.0, 430.0);
+    let avatar_left = name_rect.center().x - avatar_width * 0.5;
     let avatar_rect = egui::Rect::from_min_max(
-        egui::pos2(avatar_left, screen.top() + 70.0),
+        egui::pos2(avatar_left, screen.top() + 20.0),
         egui::pos2(
-            avatar_left + avatar_width - 15.0,
-            dialogue_rect.top() + 28.0,
+            avatar_left + avatar_width,
+            name_rect.top() - 8.0,
         ),
     );
     if let Some(texture) = replay_avatar_texture(ctx, dialogue, textures) {
@@ -1442,11 +1630,14 @@ fn dialogue_overlay(
             egui::Color32::WHITE,
         );
     } else {
+        let radius = 72.0_f32
+            .min(avatar_rect.width() * 0.30)
+            .min(avatar_rect.height().max(1.0) * 0.45);
         let center = egui::pos2(
             avatar_rect.center().x,
-            avatar_rect.bottom() - 82.0,
+            avatar_rect.bottom() - radius,
         );
-        painter.circle_filled(center, 72.0, match dialogue.side {
+        painter.circle_filled(center, radius, match dialogue.side {
             DialogueSide::Left => egui::Color32::from_rgb(72, 121, 170),
             DialogueSide::Right => egui::Color32::from_rgb(214, 116, 154),
         });
@@ -1459,15 +1650,6 @@ fn dialogue_overlay(
         );
     }
 
-    let name_width = 225.0;
-    let name_left = match dialogue.side {
-        DialogueSide::Left => dialogue_rect.left() + 40.0,
-        DialogueSide::Right => dialogue_rect.right() - name_width - 40.0,
-    };
-    let name_rect = egui::Rect::from_min_size(
-        egui::pos2(name_left, dialogue_rect.top() - 102.0),
-        egui::vec2(name_width, 66.0),
-    );
     painter.rect_filled(
         name_rect,
         0.0,
@@ -1549,7 +1731,8 @@ fn replay_avatar_texture(
     let bytes = if let Some((_, encoded)) = key.split_once(";base64,") {
         BASE64.decode(encoded).ok()?
     } else {
-        fs::read(key).ok()?
+        let path = cached_or_local_voxel_standee_path(key).ok()?;
+        fs::read(path).ok()?
     };
     let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
@@ -1595,12 +1778,13 @@ fn import_replay(path: &str) -> Result<ReplayFile, String> {
 }
 
 fn avatar_data_url(source: &str) -> Option<String> {
-    let path = source.trim();
-    if path.is_empty() || path.starts_with("http://") || path.starts_with("https://") {
+    let source = source.trim();
+    if source.is_empty() {
         return None;
     }
-    let bytes = fs::read(path).ok()?;
-    let mime = match Path::new(path)
+    let path = cached_or_local_voxel_standee_path(source).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let mime = match path
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase)
@@ -1724,6 +1908,10 @@ mod tests {
             dialogue_duration_ms(&"长".repeat(1_000)),
             MAX_DIALOGUE_MS
         );
+        assert!(dialogue_duration_ms("这是需要认真阅读的一句中文。") > MIN_DIALOGUE_MS);
+        assert!(
+            dialogue_duration_ms("等等！发生什么了？") > dialogue_duration_ms("等等发生什么了")
+        );
     }
 
     #[test]
@@ -1741,16 +1929,8 @@ mod tests {
     }
 
     #[test]
-    fn historical_chat_gaps_are_bounded_for_video() {
-        assert_eq!(
-            history_dialogue_gap_ms(10, 10),
-            MIN_HISTORY_DIALOGUE_GAP_MS
-        );
-        assert_eq!(history_dialogue_gap_ms(10, 13), 3_000);
-        assert_eq!(
-            history_dialogue_gap_ms(10, 10_000),
-            MAX_HISTORY_DIALOGUE_GAP_MS
-        );
+    fn historical_dialogue_transition_is_brief() {
+        assert!(HISTORY_DIALOGUE_GAP_MS < 500);
     }
 
     #[test]
