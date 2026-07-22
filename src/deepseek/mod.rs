@@ -4,6 +4,7 @@ use std::{
     fs,
     io::Read,
     path::Path,
+    time::Duration,
 };
 
 use async_compat::Compat;
@@ -235,7 +236,7 @@ impl DeepseekManager {
         max_tokens: u32,
     ) -> Result<String, String> {
         let payload = json!({
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-v4-pro",
             "messages": [
                 {
                     "role": "system",
@@ -247,14 +248,12 @@ impl DeepseekManager {
                 },
             ],
             "thinking": {
-                "type": "disabled",
+                "type": "enabled",
             },
-            "frequency_penalty": 0,
+            "reasoning_effort": "high",
             "max_tokens": max_tokens,
-            "presence_penalty": 0,
             "stream": false,
             "temperature": 0.2,
-            "top_p": 1
         })
         .to_string();
 
@@ -262,6 +261,10 @@ impl DeepseekManager {
 
         let mut easy = Easy::new();
         easy.url("https://api.deepseek.com/chat/completions")
+            .map_err(|err| err.to_string())?;
+        easy.connect_timeout(Duration::from_secs(10))
+            .map_err(|err| err.to_string())?;
+        easy.timeout(Duration::from_secs(180))
             .map_err(|err| err.to_string())?;
 
         let mut list = List::new();
@@ -291,23 +294,13 @@ impl DeepseekManager {
                 .map_err(|err| err.to_string())?;
             transfer.perform().map_err(|err| err.to_string())?;
         }
-
-        let json_response = String::from_utf8(dst).map_err(|err| err.to_string())?;
-        let response: ChatApiResponse =
-            serde_json::from_str(&json_response).map_err(|err| err.to_string())?;
-
-        response
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.as_deref())
-            .map(|text| text.trim().to_owned())
-            .filter(|text| !text.is_empty())
-            .ok_or_else(|| "DeepSeek response did not include message content".to_owned())
+        let status = easy.response_code().map_err(|err| err.to_string())?;
+        parse_chat_completion_response(status, &dst)
     }
 
     fn post_summary(text: &str) -> Result<String, String> {
         let user_text = format!("请整理最近这些玩家发言：\n{}", text);
-        Self::post_chat_completion(SUMMARY_SYSTEM_PROMPT, &user_text, 120)
+        Self::post_chat_completion(SUMMARY_SYSTEM_PROMPT, &user_text, 800)
     }
 }
 
@@ -355,11 +348,52 @@ struct ChatApiResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ChatMessage {
     content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChatApiErrorResponse {
+    error: ChatApiError,
+}
+
+#[derive(Deserialize)]
+struct ChatApiError {
+    message: String,
+}
+
+fn parse_chat_completion_response(status: u32, body: &[u8]) -> Result<String, String> {
+    let body = String::from_utf8(body.to_vec()).map_err(|err| err.to_string())?;
+    if !(200..300).contains(&status) {
+        let detail = serde_json::from_str::<ChatApiErrorResponse>(&body)
+            .map(|response| response.error.message)
+            .unwrap_or_else(|_| body.trim().to_owned());
+        return Err(format!(
+            "DeepSeek API HTTP {status}: {detail}"
+        ));
+    }
+    let response: ChatApiResponse = serde_json::from_str(&body)
+        .map_err(|err| format!("invalid DeepSeek API response: {err}"))?;
+    let choice = response
+        .choices
+        .first()
+        .ok_or_else(|| "DeepSeek response did not include a choice".to_owned())?;
+    if choice.finish_reason.as_deref() == Some("length") {
+        return Err("DeepSeek summary was truncated; reduce the selected chat range".to_owned());
+    }
+    choice
+        .message
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "DeepSeek response did not include message content".to_owned())
 }
 
 pub fn setup(mut commands: Commands) {
@@ -520,6 +554,38 @@ fn invalid_deepseek_response_does_not_mutate_manager() {
     ));
 
     assert!(manager.summaries.is_empty());
+}
+
+#[test]
+fn chat_completion_response_surfaces_api_errors_and_truncation() {
+    let error = parse_chat_completion_response(
+        429,
+        br#"{"error":{"message":"rate limited"}}"#,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "DeepSeek API HTTP 429: rate limited"
+    );
+
+    let truncated = parse_chat_completion_response(
+        200,
+        r#"{"choices":[{"finish_reason":"length","message":{"content":"事件：未完成"}}]}"#
+            .as_bytes(),
+    )
+    .unwrap_err();
+    assert!(truncated.contains("truncated"));
+}
+
+#[test]
+fn chat_completion_response_returns_trimmed_content() {
+    let text = parse_chat_completion_response(
+        200,
+        r#"{"choices":[{"finish_reason":"stop","message":{"content":" 事件：开门 \n"}}]}"#
+            .as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(text, "事件：开门");
 }
 
 #[test]

@@ -71,9 +71,9 @@ use crate::{
 
 const REPLAY_FORMAT_VERSION: u32 = 1;
 const CAMERA_SAMPLE_SECONDS: f32 = 0.1;
-const MIN_DIALOGUE_MS: u64 = 2_400;
-const MAX_DIALOGUE_MS: u64 = 10_000;
-const HISTORY_DIALOGUE_GAP_MS: u64 = 280;
+const MIN_DIALOGUE_MS: u64 = 1_800;
+const MAX_DIALOGUE_MS: u64 = 6_500;
+const HISTORY_DIALOGUE_GAP_MS: u64 = 180;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
@@ -289,7 +289,7 @@ impl Default for ReplayStudio {
             message_counts: HashMap::new(),
             pre_playback_scene: None,
             video_path: DEFAULT_VIDEO_PATH.to_owned(),
-            video_fps: 30,
+            video_fps: 15,
             project_export_path: DEFAULT_REPLAY_PATH.to_owned(),
             project_import_path: DEFAULT_REPLAY_PATH.to_owned(),
             video_render: None,
@@ -752,7 +752,7 @@ fn replay_controls(
 
     ui.separator();
     ui.heading("DeepSeek 制作提要");
-    ui.small("只整理当前发布范围内已经说过的内容，供 DM 审核；不会续写剧情、改写玩家台词或读取其他队伍的隐藏内容。");
+    ui.small("使用 deepseek-v4-pro 思考模式，只整理当前发布范围内已经说过的内容，供 DM 审核；不会续写剧情、改写玩家台词或读取其他队伍的隐藏内容。");
     if ui
         .add_enabled(
             studio
@@ -810,12 +810,14 @@ fn replay_controls(
     ui.text_edit_singleline(&mut studio.video_path);
     ui.horizontal(|ui| {
         ui.label("帧率");
-        for fps in [24, 30, 60] {
-            ui.selectable_value(
-                &mut studio.video_fps,
-                fps,
-                format!("{fps} FPS"),
-            );
+        for (fps, label) in [
+            (12, "12 FPS 极速"),
+            (15, "15 FPS 快速"),
+            (24, "24 FPS 电影"),
+            (30, "30 FPS 流畅"),
+            (60, "60 FPS 高质量"),
+        ] {
+            ui.selectable_value(&mut studio.video_fps, fps, label);
         }
     });
     if let Some(replay) = studio.replay.as_ref() {
@@ -1028,7 +1030,7 @@ fn build_from_history(
     studio.playback_ms = 0;
     studio.replay = Some(replay);
     studio.status = format!(
-        "已从现有聊天生成 {0} 条连续对话；切换间隔约 0.28 秒",
+        "已从现有聊天生成 {0} 条连续对话；切换间隔约 0.18 秒",
         visible.len()
     );
 }
@@ -1595,13 +1597,13 @@ fn dialogue_identity(
 }
 
 fn dialogue_duration_ms(text: &str) -> u64 {
-    let reading_ms = text.chars().fold(1_150_u64, |total, character| {
+    let reading_ms = text.chars().fold(700_u64, |total, character| {
         let character_ms = match character {
-            '。' | '！' | '？' | '!' | '?' | '；' | ';' => 300,
-            '，' | ',' | '、' | '：' | ':' => 170,
-            character if character.is_whitespace() => 25,
-            character if is_cjk_character(character) => 165,
-            _ => 70,
+            '。' | '！' | '？' | '!' | '?' | '；' | ';' => 220,
+            '，' | ',' | '、' | '：' | ':' => 100,
+            character if character.is_whitespace() => 15,
+            character if is_cjk_character(character) => 105,
+            _ => 45,
         };
         total.saturating_add(character_ms)
     });
@@ -1648,6 +1650,7 @@ fn dialogue_overlay(
         egui::Id::new("replay-dialogue"),
     );
     let painter = ctx.layer_painter(layer);
+    let accent = speaker_accent(dialogue.sender_id);
     painter.rect_filled(
         dialogue_rect,
         0.0,
@@ -1705,10 +1708,7 @@ fn dialogue_overlay(
             avatar_rect.center().x,
             avatar_rect.bottom() - radius,
         );
-        painter.circle_filled(center, radius, match dialogue.side {
-            DialogueSide::Left => egui::Color32::from_rgb(72, 121, 170),
-            DialogueSide::Right => egui::Color32::from_rgb(214, 116, 154),
-        });
+        painter.circle_filled(center, radius, accent);
         painter.text(
             center,
             egui::Align2::CENTER_CENTER,
@@ -1729,6 +1729,10 @@ fn dialogue_overlay(
         egui::Stroke::new(2.0, egui::Color32::from_gray(25)),
         egui::StrokeKind::Inside,
     );
+    painter.line_segment(
+        [name_rect.left_top(), name_rect.right_top()],
+        egui::Stroke::new(6.0, accent),
+    );
     painter.text(
         name_rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -1746,16 +1750,13 @@ fn dialogue_overlay(
             egui::pos2(role_left, name_rect.bottom()),
             egui::vec2(role_width, 38.0),
         );
-        painter.rect_filled(role_rect, 0.0, match dialogue.side {
-            DialogueSide::Left => egui::Color32::from_rgb(96, 155, 207),
-            DialogueSide::Right => egui::Color32::from_rgb(238, 107, 160),
-        });
+        painter.rect_filled(role_rect, 0.0, accent);
         painter.text(
             role_rect.center(),
             egui::Align2::CENTER_CENTER,
             &dialogue.role,
             egui::FontId::proportional(21.0),
-            egui::Color32::from_gray(30),
+            egui::Color32::WHITE,
         );
     }
     let text_width = (dialogue_rect.width() - avatar_width * 0.45 - 90.0).max(240.0);
@@ -1777,6 +1778,22 @@ fn dialogue_overlay(
         galley,
         egui::Color32::from_gray(35),
     );
+}
+
+fn speaker_accent(sender_id: u64) -> egui::Color32 {
+    const PALETTE: [(u8, u8, u8); 8] = [
+        (67, 126, 181),
+        (194, 91, 137),
+        (45, 145, 137),
+        (202, 132, 48),
+        (126, 99, 181),
+        (73, 145, 88),
+        (196, 96, 70),
+        (51, 139, 177),
+    ];
+    let mixed = sender_id ^ sender_id.rotate_right(23) ^ sender_id.rotate_left(17);
+    let (red, green, blue) = PALETTE[mixed as usize % PALETTE.len()];
+    egui::Color32::from_rgb(red, green, blue)
 }
 
 fn replay_avatar_texture(
@@ -2005,12 +2022,29 @@ mod tests {
         assert!(
             dialogue_duration_ms("等等！发生什么了？") > dialogue_duration_ms("等等发生什么了")
         );
+        assert!(
+            dialogue_duration_ms(
+                "最近上班没以前忙碌了，做独立游戏的间隔可以让ai大人继续维护老项目了哈哈哈"
+            ) < 6_000
+        );
     }
 
     #[test]
     fn dm_is_composed_left_and_player_right() {
         assert_eq!(speaker_side(true), DialogueSide::Left);
         assert_eq!(speaker_side(false), DialogueSide::Right);
+    }
+
+    #[test]
+    fn speaker_colors_are_stable_and_distinguish_people() {
+        assert_eq!(
+            speaker_accent(1_670_426_821),
+            speaker_accent(1_670_426_821)
+        );
+        assert_ne!(
+            speaker_accent(1_670_426_821),
+            speaker_accent(2_383_680_235)
+        );
     }
 
     #[test]
