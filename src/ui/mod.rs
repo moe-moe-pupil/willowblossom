@@ -65,6 +65,7 @@ use crate::voxel::{
     VoxelEditorState,
     VoxelLightTool,
     VoxelPossessionState,
+    VoxelTeleportDestination,
     MAX_VOXEL_BRUSH_RADIUS,
 };
 
@@ -379,6 +380,20 @@ fn paint_voxel_creative_item_icon(
             thin_line((0.58, 0.0), (0.92, 0.0));
             thin_line((0.0, -0.92), (0.0, -0.68));
         },
+        VoxelCreativeItem::TeleportTool => {
+            circle(0.0, 0.0, 0.76);
+            circle(0.0, 0.0, 0.42);
+            painter.arrow(
+                point(-0.92, 0.0),
+                egui::vec2(0.7 * scale, 0.0),
+                stroke,
+            );
+            painter.arrow(
+                point(0.22, 0.0),
+                egui::vec2(0.7 * scale, 0.0),
+                stroke,
+            );
+        },
         VoxelCreativeItem::Mode(VoxelEditMode::Add) => {
             box_outline((-0.75, -0.75), (0.35, 0.35));
             plus(0.48, 0.48, 0.4);
@@ -518,6 +533,10 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
         VoxelCreativeItem::PlayerPossessionTool => (
             "PL接管器",
             egui::Color32::from_rgb(116, 82, 238),
+        ),
+        VoxelCreativeItem::TeleportTool => (
+            "传送器",
+            egui::Color32::from_rgb(50, 184, 210),
         ),
         VoxelCreativeItem::Mode(mode) => match mode {
             VoxelEditMode::Add => (
@@ -13396,6 +13415,27 @@ pub fn ui_system(
                                     }
                                     ui.small(name);
                                 });
+                                let teleport_tool = VoxelCreativeItem::TeleportTool;
+                                let (name, _) = voxel_creative_item_visual(teleport_tool);
+                                ui.vertical_centered(|ui| {
+                                    if voxel_creative_drag_source(
+                                        ui,
+                                        egui::Id::new("voxel_catalog_teleport_tool"),
+                                        VoxelCreativeDragPayload::Catalog(teleport_tool),
+                                        teleport_tool,
+                                        voxel_editor.creative_hotbar
+                                            [voxel_editor.selected_hotbar_slot]
+                                            == Some(teleport_tool),
+                                        48.0,
+                                        None,
+                                    )
+                                    .on_hover_text("GM右键打开目的地列表，可传送到空间站、战斗舰或行星科研站")
+                                    .clicked()
+                                    {
+                                        picked_item = Some(teleport_tool);
+                                    }
+                                    ui.small(name);
+                                });
                                 let tool_gun = VoxelCreativeItem::ToolGun;
                                 let (name, _) = voxel_creative_item_visual(tool_gun);
                                 ui.vertical_centered(|ui| {
@@ -13438,7 +13478,7 @@ pub fn ui_system(
                                         }
                                         ui.small(name);
                                     });
-                                    if (index + 3) % 4 == 0 {
+                                    if (index + 4) % 4 == 0 {
                                         ui.end_row();
                                     }
                                 }
@@ -13461,6 +13501,38 @@ pub fn ui_system(
                 }
                 if !window_open {
                     voxel_editor.creative_inventory_open = false;
+                }
+            }
+
+            if voxel_editor.teleport_menu_open {
+                let mut window_open = true;
+                egui::Window::new("传送器")
+                    .id(egui::Id::new("voxel_teleport_tool_window"))
+                    .anchor(
+                        egui::Align2::CENTER_CENTER,
+                        egui::Vec2::ZERO,
+                    )
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut window_open)
+                    .show(ctx, |ui| {
+                        ui.label("选择目的地");
+                        ui.small("传送只移动GM；被接管的生存玩家不会受到影响。");
+                        ui.separator();
+                        for destination in VoxelTeleportDestination::ALL {
+                            if ui
+                                .add_sized(
+                                    egui::vec2(220.0, 28.0),
+                                    egui::Button::new(destination.label()),
+                                )
+                                .clicked()
+                            {
+                                voxel_editor.request_teleport(destination);
+                            }
+                        }
+                    });
+                if !window_open {
+                    voxel_editor.teleport_menu_open = false;
                 }
             }
 
@@ -13499,6 +13571,7 @@ pub fn ui_system(
 
             if voxel_editor.first_person_enabled
                 && !voxel_editor.creative_inventory_open
+                && !voxel_editor.teleport_menu_open
                 && !voxel_possession.player_inventory_open
             {
                 let center = viewport.center();

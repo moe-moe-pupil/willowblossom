@@ -364,6 +364,68 @@ pub(crate) enum VoxelCreativeItem {
     Mode(VoxelEditMode),
     ToolGun,
     PlayerPossessionTool,
+    TeleportTool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VoxelTeleportDestination {
+    ResearchStation,
+    SensorStation,
+    CannonStation,
+    CombatSpaceship,
+    PlanetScienceLab,
+}
+
+impl VoxelTeleportDestination {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::ResearchStation,
+        Self::SensorStation,
+        Self::CannonStation,
+        Self::CombatSpaceship,
+        Self::PlanetScienceLab,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ResearchStation => "研究空间站",
+            Self::SensorStation => "传感空间站",
+            Self::CannonStation => "巨炮空间站",
+            Self::CombatSpaceship => "战斗舰",
+            Self::PlanetScienceLab => "行星科研站",
+        }
+    }
+
+    fn player_position(self) -> Vec3 {
+        let floor_offset =
+            Vec3::Y * (VOXEL_SIZE + FIRST_PERSON_RADIUS + FIRST_PERSON_BODY_LENGTH * 0.5);
+        match self {
+            Self::ResearchStation => {
+                (RESEARCH_STATION_CENTER + IVec3::new(10, 0, 10)).as_vec3() * VOXEL_SIZE
+                    + floor_offset
+            },
+            Self::SensorStation => {
+                (SENSOR_STATION_CENTER + IVec3::new(10, 0, 10)).as_vec3() * VOXEL_SIZE
+                    + floor_offset
+            },
+            Self::CannonStation => {
+                (CANNON_STATION_CENTER + IVec3::new(10, 0, 10)).as_vec3() * VOXEL_SIZE
+                    + floor_offset
+            },
+            Self::CombatSpaceship => {
+                (COMBAT_SPACESHIP_CENTER + IVec3::new(1, 0, 0)).as_vec3() * VOXEL_SIZE
+                    + floor_offset
+            },
+            Self::PlanetScienceLab => {
+                ORBITAL_PLANET_CENTER
+                    + Vec3::new(
+                        PLANET_SCIENCE_LAB_CENTER.x as f32,
+                        PLANET_SCIENCE_LAB_FLOOR_Y as f32,
+                        PLANET_SCIENCE_LAB_CENTER.y as f32,
+                    ) * VOXEL_SIZE
+                    + floor_offset
+            },
+        }
+    }
 }
 
 #[derive(Component, Clone)]
@@ -577,6 +639,7 @@ pub(crate) struct VoxelEditorState {
     pub first_person_flying: bool,
     pub first_person_speed: f32,
     pub creative_inventory_open: bool,
+    pub teleport_menu_open: bool,
     pub creative_hotbar: [Option<VoxelCreativeItem>; 10],
     pub selected_hotbar_slot: usize,
     equipped_item: Option<VoxelCreativeItem>,
@@ -621,6 +684,7 @@ pub(crate) struct VoxelEditorState {
     first_person_space_tap_elapsed: f32,
     first_person_was_enabled: bool,
     first_person_cursor_released: bool,
+    teleport_requested: Option<VoxelTeleportDestination>,
 }
 
 impl Default for VoxelEditorState {
@@ -636,9 +700,10 @@ impl Default for VoxelEditorState {
             reset_requested: false,
             view_reset_requested: false,
             first_person_enabled: true,
-            first_person_flying: false,
+            first_person_flying: true,
             first_person_speed: FIRST_PERSON_SPEED,
             creative_inventory_open: false,
+            teleport_menu_open: false,
             creative_hotbar: default_creative_hotbar(),
             selected_hotbar_slot: 0,
             equipped_item: Some(VoxelCreativeItem::Material(1)),
@@ -683,6 +748,7 @@ impl Default for VoxelEditorState {
             first_person_space_tap_elapsed: f32::INFINITY,
             first_person_was_enabled: false,
             first_person_cursor_released: false,
+            teleport_requested: None,
         }
     }
 }
@@ -710,6 +776,7 @@ impl VoxelEditorState {
 
     pub(crate) fn select_material(&mut self, material: u8) {
         self.equipped_item = Some(VoxelCreativeItem::Material(material));
+        self.teleport_menu_open = false;
         self.material = material;
         self.mode = VoxelEditMode::Add;
         self.light_tool = None;
@@ -743,6 +810,13 @@ impl VoxelEditorState {
                 self.light_tool = None;
                 self.selected_light = None;
             },
+            VoxelCreativeItem::TeleportTool => {
+                self.light_tool = None;
+                self.selected_light = None;
+            },
+        }
+        if item != VoxelCreativeItem::TeleportTool {
+            self.teleport_menu_open = false;
         }
     }
 
@@ -757,6 +831,7 @@ impl VoxelEditorState {
             self.equipped_item = None;
             self.light_tool = None;
             self.selected_light = None;
+            self.teleport_menu_open = false;
         }
     }
 
@@ -772,6 +847,7 @@ impl VoxelEditorState {
                 self.equipped_item = None;
                 self.light_tool = None;
                 self.selected_light = None;
+                self.teleport_menu_open = false;
             }
         }
     }
@@ -788,6 +864,7 @@ impl VoxelEditorState {
                 self.equipped_item = None;
                 self.light_tool = None;
                 self.selected_light = None;
+                self.teleport_menu_open = false;
             }
         }
     }
@@ -809,6 +886,9 @@ impl VoxelEditorState {
         if self.is_player_possession_tool_equipped() {
             return "PL接管器".to_owned();
         }
+        if self.is_teleport_tool_equipped() {
+            return "传送器".to_owned();
+        }
         self.light_tool
             .map_or_else(
                 || self.mode.label(),
@@ -823,6 +903,15 @@ impl VoxelEditorState {
 
     pub(crate) fn is_player_possession_tool_equipped(&self) -> bool {
         self.equipped_item == Some(VoxelCreativeItem::PlayerPossessionTool)
+    }
+
+    pub(crate) fn is_teleport_tool_equipped(&self) -> bool {
+        self.equipped_item == Some(VoxelCreativeItem::TeleportTool)
+    }
+
+    pub(crate) fn request_teleport(&mut self, destination: VoxelTeleportDestination) {
+        self.teleport_requested = Some(destination);
+        self.teleport_menu_open = false;
     }
 
     pub(crate) fn cycle_tool_gun_mode(&mut self) {
@@ -983,6 +1072,7 @@ impl Plugin for TrpgVoxelPlugin {
                     place_creative_light,
                     sync_selected_voxel_light,
                     edit_voxel_grid,
+                    use_voxel_teleport_tool,
                     drag_voxel_physics_body,
                     make_selection_physical,
                     rebuild_voxel_orbital_planet,
@@ -995,6 +1085,7 @@ impl Plugin for TrpgVoxelPlugin {
                     rebuild_voxel_geometry,
                     sync_voxel_radiance_volume,
                     sync_voxel_lighting,
+                    apply_voxel_teleport,
                     control_first_person_player,
                     control_voxel_camera,
                     sync_possessed_player_camera,
@@ -1055,6 +1146,7 @@ fn voxel_editor_shortcuts(
         return;
     }
     if keyboard.just_pressed(KeyCode::KeyE) {
+        editor.teleport_menu_open = false;
         if possession.active_user_id.is_some() {
             possession.player_inventory_open = !possession.player_inventory_open;
             editor.creative_inventory_open = false;
@@ -2808,6 +2900,14 @@ fn voxel_player_camera_panel(
             Without<VoxelViewportCamera>,
         ),
     >,
+    mut first_person_players: Query<
+        (&mut Transform, &mut LinearVelocity),
+        (
+            With<VoxelFirstPersonPlayer>,
+            Without<VoxelViewportCamera>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else { return };
     let mut user_ids = runtimes.cameras.keys().copied().collect::<Vec<_>>();
@@ -2981,7 +3081,16 @@ fn voxel_player_camera_panel(
                 }
             }
             if ui.button("使用当前PL视角").clicked() {
-                apply_voxel_player_view_to_editor(&mut voxel_editor, &transform);
+                let player_view = *transform;
+                if let Ok((mut player_transform, mut velocity)) = first_person_players.single_mut()
+                {
+                    apply_voxel_player_view_to_dm(
+                        &mut voxel_editor,
+                        &mut player_transform,
+                        &mut velocity,
+                        &player_view,
+                    );
+                }
             }
             ui.label("位置");
             ui.horizontal(|ui| {
@@ -3067,7 +3176,7 @@ fn voxel_player_hotbar_slot_label(
 fn apply_voxel_player_view_to_editor(editor: &mut VoxelEditorState, transform: &Transform) {
     let (yaw, pitch, _) = transform.rotation.to_euler(EulerRot::YXZ);
     editor.first_person_enabled = true;
-    editor.first_person_flying = false;
+    editor.first_person_flying = true;
     editor.camera_yaw = yaw;
     editor.camera_pitch = pitch;
     editor.camera_focus = orbit_focus_preserving_camera_position(
@@ -3076,6 +3185,17 @@ fn apply_voxel_player_view_to_editor(editor: &mut VoxelEditorState, transform: &
         pitch,
         editor.camera_distance,
     );
+}
+
+fn apply_voxel_player_view_to_dm(
+    editor: &mut VoxelEditorState,
+    player_transform: &mut Transform,
+    velocity: &mut LinearVelocity,
+    player_view: &Transform,
+) {
+    apply_voxel_player_view_to_editor(editor, player_view);
+    player_transform.translation = first_person_player_position(player_view.translation);
+    velocity.0 = Vec3::ZERO;
 }
 
 fn sync_voxel_player_standees(
@@ -5534,10 +5654,13 @@ fn edit_voxel_grid(
             editor.redo.clear();
         }
     }
-    if possession.active_user_id.is_some() || editor.is_player_possession_tool_equipped() {
+    if possession.active_user_id.is_some()
+        || editor.is_player_possession_tool_equipped()
+        || editor.is_teleport_tool_equipped()
+    {
         return;
     }
-    if editor.creative_inventory_open {
+    if editor.creative_inventory_open || editor.teleport_menu_open {
         return;
     }
     let left_pressed = mouse.pressed(MouseButton::Left);
@@ -5980,6 +6103,52 @@ fn edit_voxel_grid(
     }
 }
 
+fn use_voxel_teleport_tool(
+    mouse: Res<ButtonInput<MouseButton>>,
+    egui_input: Res<EguiWantsInput>,
+    possession: Res<VoxelPossessionState>,
+    mut editor: ResMut<VoxelEditorState>,
+) {
+    if possession.active_user_id.is_some()
+        || !editor.is_teleport_tool_equipped()
+        || editor.creative_inventory_open
+        || editor.teleport_menu_open
+        || !mouse.just_pressed(MouseButton::Right)
+        || voxel_world_pointer_blocked(
+            egui_input.wants_any_pointer_input(),
+            editor.right_started_over_ui,
+        )
+    {
+        return;
+    }
+    editor.teleport_menu_open = true;
+}
+
+fn apply_voxel_teleport(
+    mut editor: ResMut<VoxelEditorState>,
+    possession: Res<VoxelPossessionState>,
+    mut players: Query<
+        (&mut Transform, &mut LinearVelocity),
+        (
+            With<VoxelFirstPersonPlayer>,
+            Without<VoxelViewportCamera>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
+) {
+    let Some(destination) = editor.teleport_requested.take() else { return };
+    if possession.active_user_id.is_some() {
+        editor.teleport_menu_open = false;
+        return;
+    }
+    let Ok((mut transform, mut velocity)) = players.single_mut() else { return };
+    transform.translation = destination.player_position();
+    velocity.0 = Vec3::ZERO;
+    editor.first_person_enabled = true;
+    editor.first_person_flying = true;
+    editor.first_person_space_tap_elapsed = f32::INFINITY;
+}
+
 fn voxel_world_pointer_blocked(egui_owns_pointer: bool, interaction_started_over_ui: bool) -> bool {
     egui_owns_pointer || interaction_started_over_ui
 }
@@ -6237,6 +6406,7 @@ fn control_first_person_player(
             editor.first_person_was_enabled = true;
             editor.first_person_flying = false;
             editor.creative_inventory_open = false;
+            editor.teleport_menu_open = false;
             possession.turn_start_position = Some(transform.translation);
             possession.last_player_position = Some(transform.translation);
             possession.movement_turn = possession_world_turn(manager.as_deref(), user_id);
@@ -6244,7 +6414,7 @@ fn control_first_person_player(
         } else {
             possession.turn_start_position = None;
             possession.last_player_position = None;
-            editor.first_person_flying = false;
+            editor.first_person_flying = true;
         }
     }
 
@@ -6262,6 +6432,7 @@ fn control_first_person_player(
         editor.first_person_enabled = true;
         editor.first_person_flying = false;
         editor.creative_inventory_open = false;
+        editor.teleport_menu_open = false;
         if possession.reset_movement_requested {
             if let Some(turn_start) = possession.turn_start_position {
                 transform.translation = turn_start;
@@ -6300,6 +6471,7 @@ fn control_first_person_player(
         return;
     }
     if editor.creative_inventory_open
+        || editor.teleport_menu_open
         || possession.player_inventory_open
         || editor.first_person_cursor_released
     {
@@ -6555,8 +6727,11 @@ fn control_voxel_camera(
             possession.player_inventory_open = false;
         } else if editor.creative_inventory_open {
             editor.creative_inventory_open = false;
+        } else if editor.teleport_menu_open {
+            editor.teleport_menu_open = false;
+        } else {
+            editor.first_person_cursor_released = true;
         }
-        editor.first_person_cursor_released = true;
     }
     let entering_first_person = editor.first_person_enabled && !editor.first_person_was_enabled;
     let exiting_first_person = !editor.first_person_enabled && editor.first_person_was_enabled;
@@ -6579,7 +6754,9 @@ fn control_voxel_camera(
         }
     }
     editor.first_person_was_enabled = editor.first_person_enabled;
-    let inventory_open = editor.creative_inventory_open || possession.player_inventory_open;
+    let inventory_open = editor.creative_inventory_open
+        || editor.teleport_menu_open
+        || possession.player_inventory_open;
     let cursor_in_viewport = windows
         .single()
         .ok()
@@ -6723,6 +6900,8 @@ fn draw_voxel_target(
     };
     let (hit, explosion_origin, planet_target, planet_cell_target) = if editor
         .creative_inventory_open
+        || editor.teleport_menu_open
+        || editor.is_teleport_tool_equipped()
         || voxel_world_pointer_blocked(
             egui_input.wants_any_pointer_input(),
             editor.left_started_over_ui || editor.right_started_over_ui,
@@ -7070,17 +7249,95 @@ mod tests {
         ));
         let mut editor = VoxelEditorState {
             first_person_enabled: true,
-            first_person_flying: true,
+            first_person_flying: false,
             ..default()
         };
+        let mut dm_body = Transform::from_xyz(-10.0, -10.0, -10.0);
+        let mut velocity = LinearVelocity(Vec3::splat(5.0));
 
-        apply_voxel_player_view_to_editor(&mut editor, &player_view);
-        let gm_view = editor_camera_transform(&editor);
+        apply_voxel_player_view_to_dm(
+            &mut editor,
+            &mut dm_body,
+            &mut velocity,
+            &player_view,
+        );
 
         assert!(editor.first_person_enabled);
-        assert!(!editor.first_person_flying);
-        assert!(gm_view.translation.distance(player_view.translation) < 0.000_1);
-        assert!(gm_view.forward().dot(*player_view.forward()) > 0.999_9);
+        assert!(editor.first_person_flying);
+        assert_eq!(
+            dm_body.translation,
+            first_person_player_position(player_view.translation)
+        );
+        assert_eq!(velocity.0, Vec3::ZERO);
+        let rotation = Quat::from_euler(
+            EulerRot::YXZ,
+            editor.camera_yaw,
+            editor.camera_pitch,
+            0.0,
+        );
+        assert!((rotation * Vec3::NEG_Z).dot(*player_view.forward()) > 0.999_9);
+    }
+
+    #[test]
+    fn dm_starts_in_creative_flight() {
+        let editor = VoxelEditorState::default();
+
+        assert!(editor.first_person_enabled);
+        assert!(editor.first_person_flying);
+    }
+
+    #[test]
+    fn teleport_destinations_use_canonical_world_landmarks() {
+        assert_eq!(
+            VoxelTeleportDestination::ResearchStation.player_position(),
+            (RESEARCH_STATION_CENTER + IVec3::new(10, 0, 10)).as_vec3() * VOXEL_SIZE
+                + Vec3::Y * 0.5
+        );
+        assert_eq!(
+            VoxelTeleportDestination::CombatSpaceship.player_position(),
+            (COMBAT_SPACESHIP_CENTER + IVec3::new(1, 0, 0)).as_vec3() * VOXEL_SIZE + Vec3::Y * 0.5
+        );
+        assert_eq!(
+            VoxelTeleportDestination::PlanetScienceLab.player_position(),
+            ORBITAL_PLANET_CENTER
+                + Vec3::new(
+                    PLANET_SCIENCE_LAB_CENTER.x as f32,
+                    PLANET_SCIENCE_LAB_FLOOR_Y as f32,
+                    PLANET_SCIENCE_LAB_CENTER.y as f32,
+                ) * VOXEL_SIZE
+                + Vec3::Y * 0.5
+        );
+    }
+
+    #[test]
+    fn teleport_request_moves_only_the_dm_body() {
+        let destination = VoxelTeleportDestination::SensorStation;
+        let mut editor = VoxelEditorState::default();
+        editor.request_teleport(destination);
+        let mut app = App::new();
+        app.insert_resource(editor)
+            .init_resource::<VoxelPossessionState>()
+            .add_systems(Update, apply_voxel_teleport);
+        let player = app
+            .world_mut()
+            .spawn((
+                VoxelFirstPersonPlayer,
+                Transform::default(),
+                LinearVelocity(Vec3::ONE),
+            ))
+            .id();
+
+        app.update();
+
+        let entity = app.world().entity(player);
+        assert_eq!(
+            entity.get::<Transform>().unwrap().translation,
+            destination.player_position()
+        );
+        assert_eq!(
+            entity.get::<LinearVelocity>().unwrap().0,
+            Vec3::ZERO
+        );
     }
 
     #[test]
@@ -8471,6 +8728,10 @@ mod tests {
         editor.put_in_selected_hotbar(VoxelCreativeItem::PlayerPossessionTool);
         assert!(editor.is_player_possession_tool_equipped());
         assert_eq!(editor.active_tool_label(), "PL接管器");
+
+        editor.put_in_selected_hotbar(VoxelCreativeItem::TeleportTool);
+        assert!(editor.is_teleport_tool_equipped());
+        assert_eq!(editor.active_tool_label(), "传送器");
     }
 
     #[test]
@@ -8478,6 +8739,7 @@ mod tests {
         let mut inventory = VoxelInventoryStore::default();
         inventory.hotbar[2] = Some(VoxelCreativeItem::ToolGun);
         inventory.hotbar[3] = Some(VoxelCreativeItem::PlayerPossessionTool);
+        inventory.hotbar[5] = Some(VoxelCreativeItem::TeleportTool);
         inventory.hotbar[4] = Some(VoxelCreativeItem::Mode(
             VoxelEditMode::Drag,
         ));
@@ -8758,6 +9020,18 @@ mod tests {
         let editor = app.world().resource::<VoxelEditorState>();
         assert!(editor.first_person_enabled);
         assert!(!editor.first_person_flying);
+
+        app.world_mut()
+            .resource_mut::<VoxelPossessionState>()
+            .release();
+        app.update();
+
+        assert!(
+            app.world()
+                .resource::<VoxelEditorState>()
+                .first_person_flying,
+            "releasing a survival player should restore DM creative flight"
+        );
     }
 
     #[test]
