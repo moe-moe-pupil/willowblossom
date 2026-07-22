@@ -3184,11 +3184,7 @@ fn sync_voxel_player_standees(
 
 fn voxel_player_standee_transform(camera_transform: &Transform) -> Transform { *camera_transform }
 
-fn voxel_player_standee_back_label_transform() -> Transform {
-    Transform::from_xyz(0.0, 0.0, -0.015).with_rotation(Quat::from_rotation_y(
-        std::f32::consts::PI,
-    ))
-}
+fn voxel_player_standee_back_label_transform() -> Transform { Transform::from_xyz(0.0, 0.0, 0.015) }
 
 fn voxel_player_standee_back_label_image() -> Image {
     const SIZE: u32 = 128;
@@ -6157,6 +6153,8 @@ fn control_first_person_player(
                 transform.translation = first_person_player_position(camera_transform.translation);
             }
             velocity.0 = Vec3::ZERO;
+            editor.first_person_enabled = true;
+            editor.first_person_was_enabled = true;
             editor.first_person_flying = false;
             editor.creative_inventory_open = false;
             possession.turn_start_position = Some(transform.translation);
@@ -6166,6 +6164,7 @@ fn control_first_person_player(
         } else {
             possession.turn_start_position = None;
             possession.last_player_position = None;
+            editor.first_person_enabled = false;
             editor.first_person_flying = false;
         }
     }
@@ -6181,6 +6180,8 @@ fn control_first_person_player(
             possession.reset_turn_overrides();
         }
         possession.movement_limit = movement_limit;
+        editor.first_person_enabled = true;
+        editor.first_person_flying = false;
         editor.creative_inventory_open = false;
         if possession.reset_movement_requested {
             if let Some(turn_start) = possession.turn_start_position {
@@ -6471,7 +6472,7 @@ fn control_voxel_camera(
             possession.player_inventory_open = false;
         } else if editor.creative_inventory_open {
             editor.creative_inventory_open = false;
-        } else if editor.first_person_enabled {
+        } else if editor.first_person_enabled && possession.active_user_id.is_none() {
             editor.first_person_enabled = false;
             editor.first_person_flying = false;
         }
@@ -6961,8 +6962,8 @@ mod tests {
     fn player_standee_back_label_faces_away_from_the_portrait() {
         let transform = voxel_player_standee_back_label_transform();
 
-        assert!(transform.translation.z < 0.0);
-        assert!((transform.rotation * Vec3::Z).abs_diff_eq(Vec3::NEG_Z, 0.000_01));
+        assert!(transform.translation.z > 0.0);
+        assert!((transform.rotation * Vec3::Z).abs_diff_eq(Vec3::Z, 0.000_01));
     }
 
     #[test]
@@ -8560,7 +8561,7 @@ mod tests {
     }
 
     #[test]
-    fn possession_keeps_the_dm_free_camera_when_first_person_is_off() {
+    fn possession_locks_the_dm_to_the_player_first_person_view() {
         let player_view = Transform::from_xyz(3.0, 4.0, 5.0);
         let mut possession = VoxelPossessionState::default();
         possession.possess(42);
@@ -8586,7 +8587,7 @@ mod tests {
         app.update();
 
         let editor = app.world().resource::<VoxelEditorState>();
-        assert!(!editor.first_person_enabled);
+        assert!(editor.first_person_enabled);
         assert!(!editor.first_person_flying);
     }
 

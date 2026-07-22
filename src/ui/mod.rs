@@ -12884,13 +12884,18 @@ pub fn ui_system(
                         if ui.button("视图复位").clicked() {
                             voxel_editor.view_reset_requested = true;
                         }
-                        if ui
-                            .selectable_label(
-                                voxel_editor.first_person_enabled,
-                                "第一人称",
+                        let first_person_toggle = ui
+                            .add_enabled(
+                                voxel_possession.active_user_id.is_none(),
+                                egui::Button::new("第一人称")
+                                    .selected(voxel_editor.first_person_enabled),
                             )
-                            .on_hover_text("进入后锁定鼠标；按 Esc 退出")
-                            .clicked()
+                            .on_hover_text(if voxel_possession.active_user_id.is_some() {
+                                "接管玩家时固定使用该玩家的第一人称视角"
+                            } else {
+                                "进入后锁定鼠标；按 Esc 退出"
+                            });
+                        if first_person_toggle.clicked()
                         {
                             voxel_editor.first_person_enabled = !voxel_editor.first_person_enabled;
                         }
