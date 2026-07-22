@@ -24,7 +24,10 @@ use ab_glyph::{
 use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
-    camera::RenderTarget,
+    camera::{
+        visibility::RenderLayers,
+        RenderTarget,
+    },
     core_pipeline::prepass::DepthPrepass,
     image::{
         ImageAddressMode,
@@ -46,6 +49,7 @@ use bevy::{
     render::{
         render_resource::{
             Extent3d,
+            Face,
             TextureDimension,
             TextureFormat,
             TextureUsages,
@@ -86,6 +90,7 @@ use crate::{
         NapcatIOSender,
         NapcatMessageManager,
         NapcatOutboundMessage,
+        PlayerCharacter,
     },
     scene::SceneCaptureRequests,
     voxel_radiance::{
@@ -96,6 +101,9 @@ use crate::{
 };
 
 const VOXEL_SIZE: f32 = 0.25;
+const VOXEL_DM_GIZMO_RENDER_LAYER: usize = 1;
+const PLAYER_STANDEE_FRONT_NORMAL: Vec3 = Vec3::NEG_Z;
+const PLAYER_STANDEE_BACK_NORMAL: Vec3 = Vec3::Z;
 pub(crate) const MAX_VOXEL_BRUSH_RADIUS: i32 = 50;
 const MAX_RAY_DISTANCE: f32 = 200.0;
 const PLANET_MAX_RAY_DISTANCE: f32 = 600.0;
@@ -2603,12 +2611,16 @@ fn animate_voxel_auto_doors(
 
 fn setup_voxel_view(
     mut commands: Commands,
+    mut gizmo_config: ResMut<GizmoConfigStore>,
     editor: Res<VoxelEditorState>,
     radiance_volume: Res<VoxelRadianceVolume>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut standard_materials: ResMut<Assets<StandardMaterial>>,
     voxel_materials: Res<VoxelMaterials>,
 ) {
+    for (_, config, _) in gizmo_config.iter_mut() {
+        config.render_layers = RenderLayers::layer(VOXEL_DM_GIZMO_RENDER_LAYER);
+    }
     commands.spawn((
         DirectionalLight {
             illuminance: DEFAULT_KEY_LIGHT_ILLUMINANCE,
@@ -2645,6 +2657,7 @@ fn setup_voxel_view(
             ..default()
         }),
         editor_camera_transform(&editor),
+        RenderLayers::from_layers(&[0, VOXEL_DM_GIZMO_RENDER_LAYER]),
         VoxelViewportCamera,
         // Render egui through this camera's target so the 3D clear pass resets
         // the UI every frame before egui is composited after post-processing.
@@ -2728,6 +2741,9 @@ fn sync_voxel_player_cameras(
         .map(|request| request.user_id)
         .collect::<HashSet<_>>();
     if let Some(manager) = manager.as_deref() {
+        user_ids.extend(completed_voxel_player_user_ids(
+            &manager.player_characters,
+        ));
         if let Some(group) = manager.current_group() {
             user_ids.extend(
                 group
@@ -2746,9 +2762,7 @@ fn sync_voxel_player_cameras(
         if runtimes.cameras.contains_key(&user_id) {
             continue;
         }
-        let transform = persisted_voxel_player_camera(&store, user_id)
-            .map(voxel_player_camera_transform)
-            .unwrap_or(default_transform);
+        let transform = initial_voxel_player_camera_transform(&store, user_id, default_transform);
         spawn_voxel_player_camera(
             &mut commands,
             &mut images,
@@ -3151,12 +3165,15 @@ fn sync_voxel_player_standees(
                 let back_label_material = materials.add(StandardMaterial {
                     base_color_texture: Some(back_label_texture),
                     alpha_mode: AlphaMode::Opaque,
-                    cull_mode: None,
+                    cull_mode: Some(Face::Back),
                     unlit: true,
                     ..default()
                 });
+                let back_material = materials.add(voxel_player_standee_back_material());
                 let mut entity_commands = commands.spawn((
-                    Mesh3d(meshes.add(Plane3d::new(Vec3::Z, size * 0.5).mesh())),
+                    Mesh3d(
+                        meshes.add(Plane3d::new(PLAYER_STANDEE_FRONT_NORMAL, size * 0.5).mesh()),
+                    ),
                     MeshMaterial3d(materials.add(voxel_player_standee_material(texture))),
                     voxel_player_standee_transform(&camera_transform),
                     Visibility::Visible,
@@ -3166,13 +3183,28 @@ fn sync_voxel_player_standees(
                         half_size: size * 0.5,
                     },
                 ));
-                entity_commands.with_child((
-                    Mesh3d(
-                        meshes.add(Plane3d::new(Vec3::Z, Vec2::splat(VOXEL_SIZE * 0.42)).mesh()),
-                    ),
-                    MeshMaterial3d(back_label_material),
-                    voxel_player_standee_back_label_transform(),
-                ));
+                entity_commands.with_children(|parent| {
+                    parent.spawn((
+                        Mesh3d(
+                            meshes.add(Plane3d::new(PLAYER_STANDEE_BACK_NORMAL, size * 0.5).mesh()),
+                        ),
+                        MeshMaterial3d(back_material),
+                        voxel_player_standee_back_transform(),
+                    ));
+                    parent.spawn((
+                        Mesh3d(
+                            meshes.add(
+                                Plane3d::new(
+                                    PLAYER_STANDEE_BACK_NORMAL,
+                                    Vec2::splat(VOXEL_SIZE * 0.42),
+                                )
+                                .mesh(),
+                            ),
+                        ),
+                        MeshMaterial3d(back_label_material),
+                        voxel_player_standee_back_label_transform(),
+                    ));
+                });
                 let entity = entity_commands.id();
                 assets.entities.insert(user_id, entity);
             },
@@ -3186,7 +3218,9 @@ fn sync_voxel_player_standees(
 
 fn voxel_player_standee_transform(camera_transform: &Transform) -> Transform { *camera_transform }
 
-fn voxel_player_standee_back_label_transform() -> Transform { Transform::from_xyz(0.0, 0.0, 0.015) }
+fn voxel_player_standee_back_transform() -> Transform { Transform::from_xyz(0.0, 0.0, 0.005) }
+
+fn voxel_player_standee_back_label_transform() -> Transform { Transform::from_xyz(0.0, 0.0, 0.01) }
 
 fn voxel_player_standee_back_label_image() -> Image {
     const SIZE: u32 = 128;
@@ -3246,7 +3280,17 @@ fn voxel_player_standee_material(texture: Handle<Image>) -> StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: Some(texture),
         alpha_mode: AlphaMode::Opaque,
-        cull_mode: None,
+        cull_mode: Some(Face::Back),
+        unlit: true,
+        ..default()
+    }
+}
+
+fn voxel_player_standee_back_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::srgb(0.14, 0.025, 0.025),
+        alpha_mode: AlphaMode::Opaque,
+        cull_mode: Some(Face::Back),
         unlit: true,
         ..default()
     }
@@ -3552,6 +3596,7 @@ fn spawn_voxel_player_camera(
                 ..default()
             }),
             RenderTarget::Image(target.clone().into()),
+            RenderLayers::layer(0),
             transform,
             VoxelPlayerCaptureCamera { user_id },
         ))
@@ -3589,6 +3634,25 @@ fn persisted_voxel_player_camera(
         .cameras
         .iter()
         .find(|camera| camera.user_id == user_id)
+}
+
+fn completed_voxel_player_user_ids(
+    characters: &HashMap<String, PlayerCharacter>,
+) -> impl Iterator<Item = u64> + '_ {
+    characters
+        .iter()
+        .filter(|(_, character)| character.inited)
+        .filter_map(|(target_id, _)| target_id.parse::<u64>().ok())
+}
+
+fn initial_voxel_player_camera_transform(
+    store: &VoxelPlayerCameraStore,
+    user_id: u64,
+    dm_transform: Transform,
+) -> Transform {
+    persisted_voxel_player_camera(store, user_id)
+        .map(voxel_player_camera_transform)
+        .unwrap_or(dm_transform)
 }
 
 fn voxel_player_camera_transform(camera: &PersistedVoxelPlayerCamera) -> Transform {
@@ -3658,11 +3722,24 @@ fn voxel_player_standee_visible_to(
 ) -> bool {
     let Some(manager) = manager else { return false };
     let requester = manager.player_access_for_user(requester_id);
-    if requester.is_gm || requester_id == standee_user_id {
-        return true;
-    }
     let standee = manager.player_access_for_user(standee_user_id);
-    requester.party_id.is_some() && requester.party_id == standee.party_id
+    voxel_player_standee_visible_for_access(
+        requester_id,
+        standee_user_id,
+        requester.is_gm,
+        requester.party_id.as_deref(),
+        standee.party_id.as_deref(),
+    )
+}
+
+fn voxel_player_standee_visible_for_access(
+    requester_id: u64,
+    standee_user_id: u64,
+    requester_is_gm: bool,
+    requester_party_id: Option<&str>,
+    standee_party_id: Option<&str>,
+) -> bool {
+    requester_id != standee_user_id && (requester_is_gm || requester_party_id == standee_party_id)
 }
 
 fn voxel_capture_file_uri(path: &Path) -> Result<String, String> {
@@ -6915,6 +6992,45 @@ mod tests {
     }
 
     #[test]
+    fn completed_players_are_the_canonical_camera_roster() {
+        let mut characters = HashMap::new();
+        characters.insert("42".to_owned(), PlayerCharacter {
+            inited: true,
+            ..default()
+        });
+        characters.insert(
+            "43".to_owned(),
+            PlayerCharacter::default(),
+        );
+        characters.insert(
+            "not-a-qq-number".to_owned(),
+            PlayerCharacter {
+                inited: true,
+                ..default()
+            },
+        );
+
+        assert_eq!(
+            completed_voxel_player_user_ids(&characters).collect::<HashSet<_>>(),
+            HashSet::from([42])
+        );
+    }
+
+    #[test]
+    fn new_player_camera_starts_at_the_current_dm_view() {
+        let store = VoxelPlayerCameraStore::default();
+        let dm_view = Transform::from_xyz(7.0, 8.0, 9.0).with_rotation(Quat::from_rotation_y(0.75));
+
+        let player_view = initial_voxel_player_camera_transform(&store, 42, dm_view);
+
+        assert_eq!(
+            player_view.translation,
+            dm_view.translation
+        );
+        assert_eq!(player_view.rotation, dm_view.rotation);
+    }
+
+    #[test]
     fn player_capture_target_supports_render_and_readback() {
         let image = voxel_player_capture_image();
         assert_eq!(
@@ -6996,7 +7112,12 @@ mod tests {
         let transform = voxel_player_standee_back_label_transform();
 
         assert!(transform.translation.z > 0.0);
-        assert!((transform.rotation * Vec3::Z).abs_diff_eq(Vec3::Z, 0.000_01));
+        assert_eq!(PLAYER_STANDEE_FRONT_NORMAL, Vec3::NEG_Z);
+        assert_eq!(PLAYER_STANDEE_BACK_NORMAL, Vec3::Z);
+        assert_eq!(
+            PLAYER_STANDEE_FRONT_NORMAL.dot(PLAYER_STANDEE_BACK_NORMAL),
+            -1.0
+        );
     }
 
     #[test]
@@ -7031,6 +7152,28 @@ mod tests {
             material.alpha_mode,
             AlphaMode::Opaque
         ));
+        assert_eq!(material.cull_mode, Some(Face::Back));
+        assert_eq!(
+            voxel_player_standee_back_material().cull_mode,
+            Some(Face::Back)
+        );
+    }
+
+    #[test]
+    fn player_capture_hides_self_but_shows_unassigned_peers() {
+        assert!(!voxel_player_standee_visible_for_access(42, 42, false, None, None,));
+        assert!(voxel_player_standee_visible_for_access(
+            42, 43, false, None, None,
+        ));
+        assert!(
+            !voxel_player_standee_visible_for_access(
+                42,
+                43,
+                false,
+                Some("party-a"),
+                Some("party-b"),
+            )
+        );
     }
 
     #[test]
