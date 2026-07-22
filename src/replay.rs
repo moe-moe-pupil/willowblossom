@@ -84,8 +84,10 @@ const MAX_DIALOGUE_MS: u64 = 4_875;
 const HISTORY_DIALOGUE_GAP_MS: u64 = 135;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
-const ONNX_TTS_MODEL_DIR: &str = ".data/willowblossom/tts/vits-icefall-zh-aishell3";
-const ONNX_TTS_SPEAKER_COUNT: i32 = 174;
+const ONNX_TTS_MODEL_DIR: &str = ".data/willowblossom/tts/kokoro-int8-multi-lang-v1_1";
+const ONNX_TTS_SPEAKER_COUNT: i32 = 103;
+const ONNX_TTS_FIRST_CHINESE_SPEAKER: i32 = 3;
+const ONNX_TTS_CHINESE_SPEAKER_COUNT: i32 = 100;
 const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
 const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
 
@@ -553,7 +555,7 @@ impl PreviewSpeechController {
         global_volume: f32,
         settings: &SpeakerVoiceSettings,
     ) -> Result<(), String> {
-        if dialogue_language(&line.text) == "zh-CN" && onnx_tts_is_available() {
+        if onnx_tts_is_available() {
             if self.onnx_worker.is_none() {
                 self.onnx_worker = Some(start_onnx_preview_worker()?);
             }
@@ -684,12 +686,14 @@ fn onnx_tts_model_dir() -> PathBuf {
 fn onnx_tts_is_available() -> bool {
     let root = onnx_tts_model_dir();
     [
-        "model.onnx",
-        "lexicon.txt",
+        "model.int8.onnx",
+        "voices.bin",
+        "lexicon-us-en.txt",
+        "lexicon-zh.txt",
         "tokens.txt",
-        "phone.fst",
-        "date.fst",
-        "number.fst",
+        "phone-zh.fst",
+        "date-zh.fst",
+        "number-zh.fst",
     ]
     .iter()
     .all(|name| root.join(name).is_file())
@@ -698,8 +702,8 @@ fn onnx_tts_is_available() -> bool {
 fn create_onnx_tts() -> Result<sherpa_onnx::OfflineTts, String> {
     use sherpa_onnx::{
         OfflineTtsConfig,
+        OfflineTtsKokoroModelConfig,
         OfflineTtsModelConfig,
-        OfflineTtsVitsModelConfig,
     };
 
     if !onnx_tts_is_available() {
@@ -711,10 +715,16 @@ fn create_onnx_tts() -> Result<sherpa_onnx::OfflineTts, String> {
     let path = |name: &str| root.join(name).to_string_lossy().into_owned();
     let config = OfflineTtsConfig {
         model: OfflineTtsModelConfig {
-            vits: OfflineTtsVitsModelConfig {
-                model: Some(path("model.onnx")),
-                lexicon: Some(path("lexicon.txt")),
+            kokoro: OfflineTtsKokoroModelConfig {
+                model: Some(path("model.int8.onnx")),
+                voices: Some(path("voices.bin")),
                 tokens: Some(path("tokens.txt")),
+                data_dir: Some(path("espeak-ng-data")),
+                lexicon: Some(
+                    ["lexicon-us-en.txt", "lexicon-zh.txt"]
+                        .map(|name| path(name))
+                        .join(","),
+                ),
                 ..Default::default()
             },
             num_threads: thread::available_parallelism()
@@ -724,7 +734,7 @@ fn create_onnx_tts() -> Result<sherpa_onnx::OfflineTts, String> {
             ..Default::default()
         },
         rule_fsts: Some(
-            ["phone.fst", "date.fst", "number.fst"]
+            ["phone-zh.fst", "date-zh.fst", "number-zh.fst"]
                 .map(|name| path(name))
                 .join(","),
         ),
@@ -733,7 +743,7 @@ fn create_onnx_tts() -> Result<sherpa_onnx::OfflineTts, String> {
         ..Default::default()
     };
     sherpa_onnx::OfflineTts::create(&config)
-        .ok_or_else(|| "无法加载 AISHELL3 中文 ONNX 语音模型".to_owned())
+        .ok_or_else(|| "无法加载 Kokoro 中英文 ONNX 语音模型".to_owned())
 }
 
 fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
@@ -781,8 +791,8 @@ fn generate_onnx_wav(
         .generate_with_config(
             text,
             &GenerationConfig {
-                sid: speaker_id.rem_euclid(ONNX_TTS_SPEAKER_COUNT),
-                speed: speed.clamp(0.7, 2.8),
+                sid: speaker_id.clamp(0, ONNX_TTS_SPEAKER_COUNT - 1),
+                speed: speed.clamp(0.85, 1.45),
                 silence_scale: 0.12,
                 ..Default::default()
             },
@@ -1376,7 +1386,7 @@ fn replay_controls(
             }
         }
     });
-    ui.small("中文台词默认使用本地 AISHELL3 ONNX（174 种音色），其他语言或模型不可用时回退到 Windows TTS。预览会随台词同步停止；导出逐帧阶段保持静音，最后一次性混合语音和音乐。语音仅处理已通过发布范围筛选的回放台词，不上传网络。");
+    ui.small("台词默认使用本地 Kokoro 24 kHz ONNX（100 种中英文角色音色），模型不可用时回退到 Windows TTS。预览会随台词同步停止；导出逐帧阶段保持静音，最后一次性混合语音和音乐。语音仅处理已通过发布范围筛选的回放台词，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -1515,7 +1525,7 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         .default_width(520.0)
         .max_width(620.0)
         .show(ctx, |ui| {
-            ui.label("为每个角色分配 AISHELL3 的独立中文音色（0–173），并调整基础语速和相对音量。长台词会自动加速，以尽量在下一句前说完；设置同时用于播放预览和 MP4 导出。Windows 声音和音调仅用于非中文或 ONNX 不可用时的回退。");
+            ui.label("为每个角色分配 Kokoro 的独立中文音色（3–57 女声，58–102 男声），并调整基础语速和相对音量。自动加速已限制在清晰范围内，不会再用变调重采样强塞台词；设置同时用于播放预览和 MP4 导出。Windows 声音和音调仅用于 ONNX 不可用时的回退。");
             if speakers.is_empty() {
                 ui.label("请先录制回放或从现有聊天生成回放。");
                 return;
@@ -1540,9 +1550,14 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                         });
                         let speaker_id = settings
                             .onnx_speaker_id
-                            .get_or_insert((*sender_id % ONNX_TTS_SPEAKER_COUNT as u64) as i32);
+                            .get_or_insert_with(|| default_onnx_speaker_id(*sender_id));
+                        if !(ONNX_TTS_FIRST_CHINESE_SPEAKER..ONNX_TTS_SPEAKER_COUNT)
+                            .contains(speaker_id)
+                        {
+                            *speaker_id = default_onnx_speaker_id(*sender_id);
+                        }
                         settings_changed |= ui
-                            .add(egui::Slider::new(speaker_id, 0..=173).text("ONNX 中文音色"))
+                            .add(egui::Slider::new(speaker_id, 3..=102).text("Kokoro 中文音色"))
                             .changed();
                         egui::ComboBox::from_id_salt(("replay-voice", sender_id))
                             .selected_text(settings.voice_name.as_deref().unwrap_or("自动分配"))
@@ -2318,11 +2333,7 @@ fn write_narration_track(
             .and_then(|cue| {
                 let local = sample_index - cue.start_sample;
                 (local < cue.output_samples).then(|| {
-                    let source_index = if cue.samples.len() as u64 > cue.output_samples {
-                        local.saturating_mul(cue.samples.len() as u64) / cue.output_samples
-                    } else {
-                        local
-                    };
+                    let source_index = local;
                     let fade_samples = 96_u64.min(cue.output_samples / 2).max(1);
                     let fade_in = (local as f32 / fade_samples as f32).clamp(0.0, 1.0);
                     let fade_out =
@@ -2385,7 +2396,7 @@ fn default_speaker_voice_settings(sender_id: u64) -> SpeakerVoiceSettings {
     let (pitch, speech_rate) = speaker_voice_profile(sender_id);
     SpeakerVoiceSettings {
         voice_name: None,
-        onnx_speaker_id: Some((sender_id % ONNX_TTS_SPEAKER_COUNT as u64) as i32),
+        onnx_speaker_id: Some(default_onnx_speaker_id(sender_id)),
         pitch,
         speech_rate,
         volume: 1.0,
@@ -2395,11 +2406,17 @@ fn default_speaker_voice_settings(sender_id: u64) -> SpeakerVoiceSettings {
 fn onnx_speaker_id(settings: &SpeakerVoiceSettings, sender_id: u64) -> i32 {
     settings
         .onnx_speaker_id
-        .unwrap_or((sender_id % ONNX_TTS_SPEAKER_COUNT as u64) as i32)
-        .rem_euclid(ONNX_TTS_SPEAKER_COUNT)
+        .filter(|speaker_id| {
+            (ONNX_TTS_FIRST_CHINESE_SPEAKER..ONNX_TTS_SPEAKER_COUNT).contains(speaker_id)
+        })
+        .unwrap_or_else(|| default_onnx_speaker_id(sender_id))
 }
 
-fn onnx_speed(relative_rate: i32) -> f32 { (1.0 + relative_rate as f32 / 100.0).clamp(0.7, 2.8) }
+fn default_onnx_speaker_id(sender_id: u64) -> i32 {
+    ONNX_TTS_FIRST_CHINESE_SPEAKER + (sender_id % ONNX_TTS_CHINESE_SPEAKER_COUNT as u64) as i32
+}
+
+fn onnx_speed(relative_rate: i32) -> f32 { (1.0 + relative_rate as f32 / 200.0).clamp(0.85, 1.45) }
 
 fn dialogue_language(text: &str) -> &'static str {
     if text.chars().any(is_cjk_character) {
@@ -2419,18 +2436,14 @@ fn synthesize_speech_batch(
     let mut windows_jobs = Vec::new();
     if let Ok(tts) = create_onnx_tts() {
         for job in jobs {
-            if job.language == "zh-CN" {
-                let wav = generate_onnx_wav(
-                    &tts,
-                    &job.text,
-                    job.onnx_speaker_id,
-                    (job.speech_rate as f32 / 100.0).clamp(0.7, 2.8),
-                )?;
-                fs::write(&job.output_path, wav)
-                    .map_err(|err| format!("无法保存 ONNX 角色语音：{err}"))?;
-            } else {
-                windows_jobs.push(job);
-            }
+            let wav = generate_onnx_wav(
+                &tts,
+                &job.text,
+                job.onnx_speaker_id,
+                onnx_speed(job.speech_rate - 100),
+            )?;
+            fs::write(&job.output_path, wav)
+                .map_err(|err| format!("无法保存 ONNX 角色语音：{err}"))?;
         }
     } else {
         windows_jobs.extend(jobs);
@@ -3465,6 +3478,8 @@ mod tests {
             18
         );
         assert!(fitted_speech_rate(18, &"很长的中文台词".repeat(8), 4_875) > 18);
+        assert!((onnx_speed(18) - 1.09).abs() < 0.001);
+        assert_eq!(onnx_speed(180), 1.45);
     }
 
     #[test]
@@ -3580,24 +3595,19 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the downloaded AISHELL3 ONNX model"]
-    fn aishell3_onnx_synthesizes_distinct_chinese_speakers() {
+    #[ignore = "requires the downloaded Kokoro ONNX model"]
+    fn kokoro_onnx_synthesizes_distinct_chinese_speakers() {
         let tts = create_onnx_tts().unwrap();
+        assert_eq!(tts.sample_rate(), 24_000);
         assert_eq!(
             tts.num_speakers(),
             ONNX_TTS_SPEAKER_COUNT
         );
-        let first = generate_onnx_wav(
-            &tts,
-            "你好，这是离线中文语音。",
-            10,
-            1.4,
-        )
-        .unwrap();
+        let first = generate_onnx_wav(&tts, "你好，这是离线中文语音。", 3, 1.4).unwrap();
         let second = generate_onnx_wav(
             &tts,
             "你好，这是离线中文语音。",
-            33,
+            58,
             1.4,
         )
         .unwrap();
