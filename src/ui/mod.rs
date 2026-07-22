@@ -5602,7 +5602,7 @@ fn character_editor_ui(
         skill_pool,
     );
     ui.separator();
-    changed |= character_inventory_editor_ui(ui, character, skill_pool);
+    changed |= character_inventory_editor_ui(ui, character, skill_pool, false);
     ui.separator();
     changed |= character_skill_editor_ui(
         ui,
@@ -6825,13 +6825,14 @@ fn character_inventory_editor_ui(
     ui: &mut Ui,
     character: &mut PlayerCharacter,
     skill_pool: &[SkillPoolEntry],
+    default_open: bool,
 ) -> bool {
     let mut changed = false;
     changed |= normalize_inventory(&mut character.inventory);
     changed |= normalize_character_hotbar(character);
 
     egui::CollapsingHeader::new("背包 / 装备")
-        .default_open(false)
+        .default_open(default_open)
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 changed |= ui
@@ -12827,6 +12828,46 @@ pub fn ui_system(
                                 }
                             });
                     });
+                if voxel_possession.player_inventory_open {
+                    let target_id = possessed_user_id.to_string();
+                    let skill_pool_snapshot = manager.skill_pool.clone();
+                    let mut window_open = true;
+                    let mut inventory_changed = false;
+                    if let Some(character) = manager.player_characters.get_mut(&target_id) {
+                        let title = format!(
+                            "玩家背包 · {}",
+                            if character.name.trim().is_empty() {
+                                target_id.as_str()
+                            } else {
+                                character.name.trim()
+                            }
+                        );
+                        egui::Window::new(title)
+                            .id(egui::Id::new(("voxel_player_inventory", possessed_user_id)))
+                            .default_width(620.0)
+                            .resizable(true)
+                            .open(&mut window_open)
+                            .show(ctx, |ui| {
+                                ui.small("E关闭 · GM可编辑装备、1-9快捷栏和背包物品");
+                                inventory_changed |= ui
+                                    .push_id(("possessed_inventory", possessed_user_id), |ui| {
+                                        character_inventory_editor_ui(
+                                            ui,
+                                            character,
+                                            &skill_pool_snapshot,
+                                            true,
+                                        )
+                                    })
+                                    .inner;
+                            });
+                    } else {
+                        window_open = false;
+                    }
+                    voxel_possession.player_inventory_open = window_open;
+                    if inventory_changed {
+                        manager.persist().ok();
+                    }
+                }
             } else {
             let mut hotbar_drop = None;
             let mut hotbar_clicked = None;
@@ -13130,7 +13171,10 @@ pub fn ui_system(
             }
             }
 
-            if voxel_editor.first_person_enabled && !voxel_editor.creative_inventory_open {
+            if voxel_editor.first_person_enabled
+                && !voxel_editor.creative_inventory_open
+                && !voxel_possession.player_inventory_open
+            {
                 let center = viewport.center();
                 let painter = ui.painter();
                 let stroke = Stroke::new(2.0, egui::Color32::WHITE);

@@ -370,6 +370,7 @@ pub(crate) struct VoxelPossessionState {
     pub active_user_id: Option<u64>,
     applied_user_id: Option<u64>,
     pub selected_hotbar_slot: usize,
+    pub player_inventory_open: bool,
     pub movement_used: f32,
     pub movement_limit: f32,
     movement_turn: u32,
@@ -387,6 +388,7 @@ impl Default for VoxelPossessionState {
             active_user_id: None,
             applied_user_id: None,
             selected_hotbar_slot: 0,
+            player_inventory_open: false,
             movement_used: 0.0,
             movement_limit: 0.0,
             movement_turn: 0,
@@ -416,6 +418,7 @@ impl VoxelPossessionState {
     }
 
     fn reset_turn_overrides(&mut self) {
+        self.player_inventory_open = false;
         self.reset_movement_requested = false;
         self.movement_limit_bypassed = false;
         self.movement_bypass_confirmation_pending = false;
@@ -1030,14 +1033,21 @@ fn voxel_editor_shortcuts(
     keyboard: Res<ButtonInput<KeyCode>>,
     egui_input: Res<EguiWantsInput>,
     mut editor: ResMut<VoxelEditorState>,
+    mut possession: ResMut<VoxelPossessionState>,
 ) {
     if egui_input.wants_any_keyboard_input() {
         return;
     }
     if keyboard.just_pressed(KeyCode::KeyE) {
-        editor.creative_inventory_open = !editor.creative_inventory_open;
+        if possession.active_user_id.is_some() {
+            possession.player_inventory_open = !possession.player_inventory_open;
+            editor.creative_inventory_open = false;
+        } else {
+            editor.creative_inventory_open = !editor.creative_inventory_open;
+        }
     }
     if keyboard.just_pressed(KeyCode::KeyR)
+        && possession.active_user_id.is_none()
         && !editor.creative_inventory_open
         && editor.is_tool_gun_equipped()
     {
@@ -1056,8 +1066,15 @@ fn voxel_editor_shortcuts(
         (KeyCode::Digit0, 9),
     ] {
         if keyboard.just_pressed(key) {
-            editor.select_hotbar_slot(slot);
+            if possession.active_user_id.is_some() && slot < 9 {
+                possession.selected_hotbar_slot = slot;
+            } else if possession.active_user_id.is_none() {
+                editor.select_hotbar_slot(slot);
+            }
         }
+    }
+    if possession.active_user_id.is_some() {
+        return;
     }
     if !keyboard.just_pressed(KeyCode::KeyZ) {
         return;
@@ -6087,22 +6104,6 @@ fn control_first_person_player(
         editor.first_person_enabled = true;
         editor.first_person_flying = false;
         editor.creative_inventory_open = false;
-        for (key, slot) in [
-            (KeyCode::Digit1, 0),
-            (KeyCode::Digit2, 1),
-            (KeyCode::Digit3, 2),
-            (KeyCode::Digit4, 3),
-            (KeyCode::Digit5, 4),
-            (KeyCode::Digit6, 5),
-            (KeyCode::Digit7, 6),
-            (KeyCode::Digit8, 7),
-            (KeyCode::Digit9, 8),
-        ] {
-            if keyboard.just_pressed(key) {
-                possession.selected_hotbar_slot = slot;
-            }
-        }
-
         if possession.reset_movement_requested {
             if let Some(turn_start) = possession.turn_start_position {
                 transform.translation = turn_start;
@@ -6140,7 +6141,7 @@ fn control_first_person_player(
         velocity.z = 0.0;
         return;
     }
-    if editor.creative_inventory_open {
+    if editor.creative_inventory_open || possession.player_inventory_open {
         velocity.x = 0.0;
         velocity.z = 0.0;
         if editor.first_person_flying {
@@ -6382,7 +6383,9 @@ fn control_voxel_camera(
     egui_input: Res<EguiWantsInput>,
 ) {
     if keyboard.just_pressed(KeyCode::Escape) {
-        if editor.creative_inventory_open {
+        if possession.player_inventory_open {
+            possession.player_inventory_open = false;
+        } else if editor.creative_inventory_open {
             editor.creative_inventory_open = false;
         } else if editor.first_person_enabled {
             editor.first_person_enabled = false;
@@ -6410,8 +6413,9 @@ fn control_voxel_camera(
         }
     }
     editor.first_person_was_enabled = editor.first_person_enabled;
+    let inventory_open = editor.creative_inventory_open || possession.player_inventory_open;
     if let Ok(mut cursor) = cursor_options.single_mut() {
-        if editor.first_person_enabled && !editor.creative_inventory_open {
+        if editor.first_person_enabled && !inventory_open {
             cursor.visible = false;
             cursor.grab_mode = CursorGrabMode::Locked;
         } else {
@@ -6437,14 +6441,14 @@ fn control_voxel_camera(
         sum + event.delta
     });
     if editor.first_person_enabled {
-        if !editor.creative_inventory_open {
+        if !inventory_open {
             editor.camera_yaw -= delta.x * 0.0025;
             editor.camera_pitch = (editor.camera_pitch - delta.y * 0.0025).clamp(-1.5, 1.5);
         }
         let wheel_steps = wheel.read().fold(0, |steps, event| {
             steps + event.y.signum() as i32
         });
-        if !editor.creative_inventory_open && wheel_steps != 0 {
+        if !inventory_open && wheel_steps != 0 {
             if possession.active_user_id.is_some() {
                 possession.selected_hotbar_slot = cycled_hotbar_slot(
                     possession.selected_hotbar_slot,
@@ -8056,6 +8060,7 @@ mod tests {
         app.init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<EguiWantsInput>()
             .init_resource::<VoxelEditorState>()
+            .init_resource::<VoxelPossessionState>()
             .add_systems(Update, voxel_editor_shortcuts);
         let mut keyboard = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
         keyboard.press(KeyCode::ControlLeft);
@@ -8073,6 +8078,7 @@ mod tests {
         app.init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<EguiWantsInput>()
             .init_resource::<VoxelEditorState>()
+            .init_resource::<VoxelPossessionState>()
             .add_systems(Update, voxel_editor_shortcuts);
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
@@ -8091,6 +8097,7 @@ mod tests {
         app.init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<EguiWantsInput>()
             .init_resource::<VoxelEditorState>()
+            .init_resource::<VoxelPossessionState>()
             .add_systems(Update, voxel_editor_shortcuts);
         app.world_mut()
             .resource_mut::<VoxelEditorState>()
@@ -8107,6 +8114,44 @@ mod tests {
             app.world().resource::<VoxelEditorState>().light_tool,
             None
         );
+    }
+
+    #[test]
+    fn possessed_player_shortcuts_do_not_change_creative_toolbar() {
+        let mut possession = VoxelPossessionState::default();
+        possession.possess(42);
+        let mut editor = VoxelEditorState::default();
+        editor.select_hotbar_slot(0);
+
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<EguiWantsInput>()
+            .insert_resource(editor)
+            .insert_resource(possession)
+            .add_systems(Update, voxel_editor_shortcuts);
+        {
+            let mut keyboard = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keyboard.press(KeyCode::Digit5);
+            keyboard.press(KeyCode::KeyE);
+        }
+
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .resource::<VoxelEditorState>()
+                .selected_hotbar_slot,
+            0,
+            "survival number keys must not select creative toolbar buttons"
+        );
+        assert!(
+            !app.world()
+                .resource::<VoxelEditorState>()
+                .creative_inventory_open
+        );
+        let possession = app.world().resource::<VoxelPossessionState>();
+        assert_eq!(possession.selected_hotbar_slot, 4);
+        assert!(possession.player_inventory_open);
     }
 
     #[test]
