@@ -754,6 +754,19 @@ impl Default for VoxelEditorState {
 }
 
 impl VoxelEditorState {
+    pub(crate) fn set_viewport_bounds(
+        &mut self,
+        viewport_min: Vec2,
+        viewport_max: Vec2,
+        toolbar_bottom: f32,
+    ) {
+        self.viewport_min = Vec2::new(
+            viewport_min.x,
+            viewport_min.y.max(toolbar_bottom),
+        );
+        self.viewport_max = viewport_max;
+    }
+
     fn contains_cursor(&self, cursor: Vec2) -> bool {
         cursor.cmpge(self.viewport_min).all() && cursor.cmple(self.viewport_max).all()
     }
@@ -7352,6 +7365,19 @@ mod tests {
             &editor,
         )
         .is_none());
+    }
+
+    #[test]
+    fn viewport_bounds_exclude_the_top_toolbar_from_cursor_recapture() {
+        let mut editor = VoxelEditorState::default();
+        editor.set_viewport_bounds(
+            Vec2::new(300.0, 50.0),
+            Vec2::new(1_600.0, 900.0),
+            160.0,
+        );
+
+        assert!(!editor.contains_cursor(Vec2::new(800.0, 120.0)));
+        assert!(editor.contains_cursor(Vec2::new(800.0, 200.0)));
     }
 
     #[test]

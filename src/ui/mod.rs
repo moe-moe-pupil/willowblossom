@@ -12807,16 +12807,8 @@ pub fn ui_system(
         .show(&mut viewport_ui, |ui| {
             let viewport = ui.max_rect();
             let pixels_per_point = ctx.pixels_per_point();
-            voxel_editor.viewport_min = bevy::prelude::Vec2::new(
-                viewport.min.x * pixels_per_point,
-                viewport.min.y * pixels_per_point,
-            );
-            voxel_editor.viewport_max = bevy::prelude::Vec2::new(
-                viewport.max.x * pixels_per_point,
-                viewport.max.y * pixels_per_point,
-            );
 
-            egui::Frame::new()
+            let toolbar = egui::Frame::new()
                 .fill(egui::Color32::from_black_alpha(210))
                 .corner_radius(4)
                 .inner_margin(6)
@@ -13103,6 +13095,17 @@ pub fn ui_system(
                         });
                     }
                 });
+            voxel_editor.set_viewport_bounds(
+                bevy::prelude::Vec2::new(
+                    viewport.min.x * pixels_per_point,
+                    viewport.min.y * pixels_per_point,
+                ),
+                bevy::prelude::Vec2::new(
+                    viewport.max.x * pixels_per_point,
+                    viewport.max.y * pixels_per_point,
+                ),
+                toolbar.response.rect.max.y * pixels_per_point,
+            );
 
             if let Some(possessed_user_id) = voxel_possession.active_user_id {
                 voxel_editor.creative_inventory_open = false;
