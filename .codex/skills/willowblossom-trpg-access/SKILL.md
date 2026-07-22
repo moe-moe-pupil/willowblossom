@@ -76,6 +76,8 @@ Summaries must be labeled by scope in the app state, for example public summary,
 
 Display Chinese text first in all user-facing UI. Existing or new labels, buttons, window titles, tooltips, empty states, and help text should be written in Chinese by default; keep English only when it is a protocol/API name, compact game stat abbreviation, player-authored content, or a secondary clarification after the Chinese text.
 
+Do not place character, inventory, item-effect, or other editable form controls inside `menu_button`, popup, or context-menu surfaces. Use an inline collapsing section, scrollable panel, or normal window so pointer input and keyboard focus remain reliable.
+
 Prefer GUI controls over chat commands for:
 
 - selecting the active campaign,

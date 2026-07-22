@@ -103,6 +103,8 @@ After patching:
 
 - Keep `.default_width(...)` as the starting size only. It is not a maximum.
 - Prefer `.max_width(...)` on resizable windows that contain text editors or columns.
+- Cap long editor windows to the viewport with `.max_height(...)` and enable vertical scrolling so controls remain reachable.
+- Keep editable forms out of `menu_button`, popup, and context-menu surfaces; use inline collapsing sections or normal scrollable windows.
 - Avoid `desired_width(ui.available_width())` unless the parent has already been capped.
 - Clamp widths with realistic minimum and maximum values near the widget that requests size.
 - Use `horizontal_wrapped` or separate rows for dense control groups that do not need to stay on one line.

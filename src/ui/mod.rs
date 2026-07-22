@@ -4263,6 +4263,7 @@ fn quick_character_windows(
             .width()
             .min(CHARACTER_WINDOW_MAX_WIDTH)
             .max(CHARACTER_WINDOW_MIN_WIDTH);
+        let window_max_height = (ctx.content_rect().height() - 32.0).max(240.0);
         egui::Window::new(format!("角色：{display_name}"))
             .id(Id::new((
                 "quick_character_window",
@@ -4272,6 +4273,8 @@ fn quick_character_windows(
             .default_width(CHARACTER_WINDOW_DEFAULT_WIDTH)
             .min_width(CHARACTER_WINDOW_MIN_WIDTH)
             .max_width(window_max_width)
+            .max_height(window_max_height)
+            .vscroll(true)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.set_max_width(window_max_width);
@@ -7069,16 +7072,32 @@ fn character_inventory_editor_ui(
                             if ui.button("-").on_hover_text("移除物品").clicked() {
                                 remove_index = Some(index);
                             }
-                            ui.menu_button(
-                                format!("加成 {}", item.stat_effects.len()),
-                                |ui| {
-                                    changed |= item_stat_effects_editor_ui(ui, &mut item.stat_effects);
-                                },
-                            );
                         });
                         ui.end_row();
                     }
                 });
+
+            if !character.inventory.items.is_empty() {
+                ui.collapsing("背包物品属性加成", |ui| {
+                    for (index, item) in character.inventory.items.iter_mut().enumerate() {
+                        ui.push_id(("inventory_item_stat_effects", index), |ui| {
+                            ui.collapsing(
+                                format!(
+                                    "{} · {}项加成",
+                                    item_display_name(item),
+                                    item.stat_effects.len()
+                                ),
+                                |ui| {
+                                    changed |= item_stat_effects_editor_ui(
+                                        ui,
+                                        &mut item.stat_effects,
+                                    );
+                                },
+                            );
+                        });
+                    }
+                });
+            }
 
             if let Some(index) = equip_index {
                 remove_character_inventory_item(character, index, true);
