@@ -12,6 +12,7 @@ use std::{
         PathBuf,
     },
     process::Command,
+    sync::Arc,
     thread,
     time::{
         SystemTime,
@@ -41,6 +42,7 @@ use bevy_persistent::Persistent;
 use crossbeam_channel::{
     bounded,
     Receiver,
+    Sender,
 };
 use serde::{
     Deserialize,
@@ -82,6 +84,8 @@ const MAX_DIALOGUE_MS: u64 = 4_875;
 const HISTORY_DIALOGUE_GAP_MS: u64 = 135;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
+const ONNX_TTS_MODEL_DIR: &str = ".data/willowblossom/tts/vits-icefall-zh-aishell3";
+const ONNX_TTS_SPEAKER_COUNT: i32 = 174;
 const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
 const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
 
@@ -228,6 +232,8 @@ struct ReplayDialogue {
 struct SpeakerVoiceSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     voice_name: Option<String>,
+    #[serde(default)]
+    onnx_speaker_id: Option<i32>,
     pitch: i32,
     speech_rate: i32,
     volume: f32,
@@ -313,8 +319,29 @@ struct VideoEncodingJob {
 #[derive(Resource, Default)]
 struct PreviewSpeechController {
     active_cue: Option<(u64, usize)>,
+    onnx_worker: Option<OnnxPreviewWorker>,
+    audio_entity: Option<Entity>,
     #[cfg(windows)]
-    worker: Option<PreviewSpeechWorker>,
+    windows_worker: Option<PreviewSpeechWorker>,
+}
+
+struct OnnxPreviewWorker {
+    requests: Sender<OnnxPreviewRequest>,
+    results: Receiver<OnnxPreviewResult>,
+}
+
+struct OnnxPreviewRequest {
+    cue: (u64, usize),
+    text: String,
+    speaker_id: i32,
+    speed: f32,
+    volume: f32,
+}
+
+struct OnnxPreviewResult {
+    cue: (u64, usize),
+    wav: Result<Vec<u8>, String>,
+    volume: f32,
 }
 
 #[cfg(windows)]
@@ -444,7 +471,12 @@ fn advance_replay(time: Res<Time>, mut studio: ResMut<ReplayStudio>) {
     }
 }
 
-fn preview_replay_speech(studio: Res<ReplayStudio>, mut speech: ResMut<PreviewSpeechController>) {
+fn preview_replay_speech(
+    mut commands: Commands,
+    studio: Res<ReplayStudio>,
+    mut speech: ResMut<PreviewSpeechController>,
+    mut audio_sources: ResMut<Assets<AudioSource>>,
+) {
     let active = (studio.mode == ReplayMode::Playing && studio.speech_enabled)
         .then(|| {
             studio.replay.as_ref().and_then(|replay| {
@@ -459,11 +491,40 @@ fn preview_replay_speech(studio: Res<ReplayStudio>, mut speech: ResMut<PreviewSp
         })
         .flatten();
     let cue = active.map(|(replay_id, index, _)| (replay_id, index));
+    while let Some(result) = speech
+        .onnx_worker
+        .as_ref()
+        .and_then(|worker| worker.results.try_recv().ok())
+    {
+        if Some(result.cue) != cue {
+            continue;
+        }
+        match result.wav {
+            Ok(wav) => {
+                let source = audio_sources.add(AudioSource {
+                    bytes: Arc::from(wav),
+                });
+                let entity = commands
+                    .spawn((
+                        AudioPlayer::new(source),
+                        PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(
+                            result.volume,
+                        )),
+                    ))
+                    .id();
+                speech.audio_entity = Some(entity);
+            },
+            Err(err) => eprintln!("failed to synthesize ONNX preview speech: {err}"),
+        }
+    }
     if speech.active_cue == cue {
         return;
     }
 
-    if let Err(err) = speech.stop() {
+    if let Some(entity) = speech.audio_entity.take() {
+        commands.entity(entity).try_despawn();
+    }
+    if let Err(err) = speech.stop_windows() {
         eprintln!("failed to stop replay preview speech: {err}");
     }
     speech.active_cue = cue;
@@ -474,7 +535,12 @@ fn preview_replay_speech(studio: Res<ReplayStudio>, mut speech: ResMut<PreviewSp
         .and_then(|replay| replay.speaker_voice_settings.get(&line.sender_id))
         .cloned()
         .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
-    if let Err(err) = speech.speak(line, studio.speech_volume, &settings) {
+    if let Err(err) = speech.speak(
+        cue.expect("active dialogue has a cue"),
+        line,
+        studio.speech_volume,
+        &settings,
+    ) {
         eprintln!("failed to play replay preview speech: {err}");
     }
 }
@@ -482,10 +548,35 @@ fn preview_replay_speech(studio: Res<ReplayStudio>, mut speech: ResMut<PreviewSp
 impl PreviewSpeechController {
     fn speak(
         &mut self,
+        cue: (u64, usize),
         line: &ReplayDialogue,
         global_volume: f32,
         settings: &SpeakerVoiceSettings,
     ) -> Result<(), String> {
+        if dialogue_language(&line.text) == "zh-CN" && onnx_tts_is_available() {
+            if self.onnx_worker.is_none() {
+                self.onnx_worker = Some(start_onnx_preview_worker()?);
+            }
+            let rate = fitted_speech_rate(
+                settings.speech_rate,
+                &line.text,
+                line.duration_ms,
+            );
+            let request = OnnxPreviewRequest {
+                cue,
+                text: line.text.clone(),
+                speaker_id: onnx_speaker_id(settings, line.sender_id),
+                speed: onnx_speed(rate),
+                volume: (global_volume * settings.volume).clamp(0.0, 1.0),
+            };
+            return self
+                .onnx_worker
+                .as_ref()
+                .expect("ONNX worker was initialized")
+                .requests
+                .send(request)
+                .map_err(|err| format!("ONNX preview worker stopped: {err}"));
+        }
         self.send(PreviewSpeechRequest::Speak {
             text: &line.text,
             language: dialogue_language(&line.text),
@@ -504,15 +595,14 @@ impl PreviewSpeechController {
         })
     }
 
-    fn stop(&mut self) -> Result<(), String> {
-        self.active_cue = None;
+    fn stop_windows(&mut self) -> Result<(), String> {
         self.send_if_running(PreviewSpeechRequest::Stop)
     }
 
     #[cfg(windows)]
     fn send(&mut self, request: PreviewSpeechRequest<'_>) -> Result<(), String> {
-        if self.worker.is_none() {
-            self.worker = Some(start_preview_speech_worker()?);
+        if self.windows_worker.is_none() {
+            self.windows_worker = Some(start_preview_speech_worker()?);
         }
         self.send_if_running(request)
     }
@@ -524,7 +614,7 @@ impl PreviewSpeechController {
 
     #[cfg(windows)]
     fn send_if_running(&mut self, request: PreviewSpeechRequest<'_>) -> Result<(), String> {
-        let Some(worker) = self.worker.as_mut() else { return Ok(()) };
+        let Some(worker) = self.windows_worker.as_mut() else { return Ok(()) };
         let encoded = preview_speech_wire_line(&request)?;
         if let Err(err) = worker
             .input
@@ -533,7 +623,7 @@ impl PreviewSpeechController {
         {
             let _ = worker.child.kill();
             let _ = worker.child.wait();
-            self.worker = None;
+            self.windows_worker = None;
             return Err(format!(
                 "preview speech worker stopped: {err}"
             ));
@@ -558,7 +648,7 @@ fn preview_speech_wire_line(request: &PreviewSpeechRequest<'_>) -> Result<Vec<u8
 #[cfg(windows)]
 impl Drop for PreviewSpeechController {
     fn drop(&mut self) {
-        if let Some(worker) = self.worker.as_mut() {
+        if let Some(worker) = self.windows_worker.as_mut() {
             let _ = worker.child.kill();
             let _ = worker.child.wait();
         }
@@ -585,6 +675,155 @@ fn start_preview_speech_worker() -> Result<PreviewSpeechWorker, String> {
         .take()
         .ok_or_else(|| "Windows preview speech did not open its input stream".to_owned())?;
     Ok(PreviewSpeechWorker { child, input })
+}
+
+fn onnx_tts_model_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(ONNX_TTS_MODEL_DIR)
+}
+
+fn onnx_tts_is_available() -> bool {
+    let root = onnx_tts_model_dir();
+    [
+        "model.onnx",
+        "lexicon.txt",
+        "tokens.txt",
+        "phone.fst",
+        "date.fst",
+        "number.fst",
+    ]
+    .iter()
+    .all(|name| root.join(name).is_file())
+}
+
+fn create_onnx_tts() -> Result<sherpa_onnx::OfflineTts, String> {
+    use sherpa_onnx::{
+        OfflineTtsConfig,
+        OfflineTtsModelConfig,
+        OfflineTtsVitsModelConfig,
+    };
+
+    if !onnx_tts_is_available() {
+        return Err(format!(
+            "未找到中文 ONNX 语音模型：{ONNX_TTS_MODEL_DIR}"
+        ));
+    }
+    let root = onnx_tts_model_dir();
+    let path = |name: &str| root.join(name).to_string_lossy().into_owned();
+    let config = OfflineTtsConfig {
+        model: OfflineTtsModelConfig {
+            vits: OfflineTtsVitsModelConfig {
+                model: Some(path("model.onnx")),
+                lexicon: Some(path("lexicon.txt")),
+                tokens: Some(path("tokens.txt")),
+                ..Default::default()
+            },
+            num_threads: thread::available_parallelism()
+                .map(|threads| threads.get().min(4) as i32)
+                .unwrap_or(2),
+            provider: Some("cpu".to_owned()),
+            ..Default::default()
+        },
+        rule_fsts: Some(
+            ["phone.fst", "date.fst", "number.fst"]
+                .map(|name| path(name))
+                .join(","),
+        ),
+        max_num_sentences: 1,
+        silence_scale: 0.12,
+        ..Default::default()
+    };
+    sherpa_onnx::OfflineTts::create(&config)
+        .ok_or_else(|| "无法加载 AISHELL3 中文 ONNX 语音模型".to_owned())
+}
+
+fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
+    let tts = create_onnx_tts()?;
+    let (request_tx, request_rx) = bounded::<OnnxPreviewRequest>(4);
+    let (result_tx, result_rx) = bounded::<OnnxPreviewResult>(4);
+    thread::Builder::new()
+        .name("replay-onnx-preview".to_owned())
+        .spawn(move || {
+            while let Ok(request) = request_rx.recv() {
+                let wav = generate_onnx_wav(
+                    &tts,
+                    &request.text,
+                    request.speaker_id,
+                    request.speed,
+                );
+                if result_tx
+                    .send(OnnxPreviewResult {
+                        cue: request.cue,
+                        wav,
+                        volume: request.volume,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .map_err(|err| format!("无法启动 ONNX 预览线程：{err}"))?;
+    Ok(OnnxPreviewWorker {
+        requests: request_tx,
+        results: result_rx,
+    })
+}
+
+fn generate_onnx_wav(
+    tts: &sherpa_onnx::OfflineTts,
+    text: &str,
+    speaker_id: i32,
+    speed: f32,
+) -> Result<Vec<u8>, String> {
+    use sherpa_onnx::GenerationConfig;
+
+    let audio = tts
+        .generate_with_config(
+            text,
+            &GenerationConfig {
+                sid: speaker_id.rem_euclid(ONNX_TTS_SPEAKER_COUNT),
+                speed: speed.clamp(0.7, 2.8),
+                silence_scale: 0.12,
+                ..Default::default()
+            },
+            None::<fn(&[f32], f32) -> bool>,
+        )
+        .ok_or_else(|| "ONNX 未能生成语音".to_owned())?;
+    let source_rate = tts.sample_rate().max(1) as u32;
+    let samples = resample_f32_to_pcm16(audio.samples(), source_rate, 32_000);
+    let data_bytes = samples.len().saturating_mul(2);
+    let mut wav = Vec::with_capacity(44 + data_bytes);
+    write_wav_header(
+        &mut wav,
+        32_000,
+        1,
+        16,
+        data_bytes as u32,
+    )?;
+    for sample in samples {
+        wav.write_all(&sample.to_le_bytes())
+            .map_err(|err| format!("写入 ONNX WAV 失败：{err}"))?;
+    }
+    Ok(wav)
+}
+
+fn resample_f32_to_pcm16(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<i16> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let output_len = samples
+        .len()
+        .saturating_mul(target_rate as usize)
+        .div_ceil(source_rate as usize);
+    (0..output_len)
+        .map(|index| {
+            let position = index as f64 * source_rate as f64 / target_rate as f64;
+            let left = position.floor() as usize;
+            let right = (left + 1).min(samples.len() - 1);
+            let fraction = (position - left as f64) as f32;
+            pcm_i16(samples[left] + (samples[right] - samples[left]) * fraction)
+        })
+        .collect()
 }
 
 fn render_video_frames(
@@ -1107,7 +1346,7 @@ fn replay_controls(
     ui.horizontal(|ui| {
         ui.checkbox(
             &mut studio.speech_enabled,
-            "角色语音（预览与导出，Windows 免费离线 TTS）",
+            "角色语音（预览与导出，ONNX 中文离线 TTS）",
         );
         ui.add_enabled(
             studio.speech_enabled,
@@ -1137,7 +1376,7 @@ fn replay_controls(
             }
         }
     });
-    ui.small("预览时语音会随当前台词立即播放，暂停、跳转或切换台词时同步停止；每位 QQ 发言者使用稳定的不同低音调音色。语音仅处理回放中已通过发布范围筛选的台词，不上传网络。");
+    ui.small("中文台词默认使用本地 AISHELL3 ONNX（174 种音色），其他语言或模型不可用时回退到 Windows TTS。预览会随台词同步停止；导出逐帧阶段保持静音，最后一次性混合语音和音乐。语音仅处理已通过发布范围筛选的回放台词，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -1276,7 +1515,7 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         .default_width(520.0)
         .max_width(620.0)
         .show(ctx, |ui| {
-            ui.label("为每个角色单独选择已安装的中文（zh-CN）Windows 声音，并调整音调、基础语速和相对音量。长台词会自动加速，以尽量在下一句前说完；设置同时用于播放预览和 MP4 导出。");
+            ui.label("为每个角色分配 AISHELL3 的独立中文音色（0–173），并调整基础语速和相对音量。长台词会自动加速，以尽量在下一句前说完；设置同时用于播放预览和 MP4 导出。Windows 声音和音调仅用于非中文或 ONNX 不可用时的回退。");
             if speakers.is_empty() {
                 ui.label("请先录制回放或从现有聊天生成回放。");
                 return;
@@ -1299,6 +1538,12 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                             }
                             ui.small(format!("QQ {sender_id}"));
                         });
+                        let speaker_id = settings
+                            .onnx_speaker_id
+                            .get_or_insert((*sender_id % ONNX_TTS_SPEAKER_COUNT as u64) as i32);
+                        settings_changed |= ui
+                            .add(egui::Slider::new(speaker_id, 0..=173).text("ONNX 中文音色"))
+                            .changed();
                         egui::ComboBox::from_id_salt(("replay-voice", sender_id))
                             .selected_text(settings.voice_name.as_deref().unwrap_or("自动分配"))
                             .width(300.0)
@@ -1317,7 +1562,7 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                                 }
                             });
                         settings_changed |= ui
-                            .add(egui::Slider::new(&mut settings.pitch, -50..=20).text("音调"))
+                            .add(egui::Slider::new(&mut settings.pitch, -50..=20).text("回退音调"))
                             .changed();
                         settings_changed |= ui
                             .add(
@@ -1752,6 +1997,9 @@ fn check_ffmpeg() -> Result<(), String> {
 
 #[cfg(windows)]
 fn check_speech_synthesizer() -> Result<(), String> {
+    if onnx_tts_is_available() {
+        return Ok(());
+    }
     let script = r#"Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }); $s.Dispose(); if ($voices.Count -eq 0) { exit 2 }"#;
     let mut command = Command::new("powershell.exe");
     command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
@@ -1769,7 +2017,9 @@ fn check_speech_synthesizer() -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn check_speech_synthesizer() -> Result<(), String> {
-    Err("角色语音目前使用 Windows 免费离线 TTS；请关闭角色语音后导出".to_owned())
+    onnx_tts_is_available()
+        .then_some(())
+        .ok_or_else(|| "未找到中文 ONNX 语音模型；请关闭角色语音后导出".to_owned())
 }
 
 #[cfg(windows)]
@@ -1970,6 +2220,7 @@ struct SpeechSynthesisJob {
     language: &'static str,
     voice_name: Option<String>,
     voice_slot: u64,
+    onnx_speaker_id: i32,
     pitch: i32,
     speech_rate: i32,
 }
@@ -2011,8 +2262,9 @@ fn write_narration_track(
                     .to_string_lossy()
                     .into_owned(),
                 language: dialogue_language(&line.text),
-                voice_name: settings.voice_name,
+                voice_name: settings.voice_name.clone(),
                 voice_slot: line.sender_id,
+                onnx_speaker_id: onnx_speaker_id(&settings, line.sender_id),
                 pitch: settings.pitch,
                 speech_rate: ssml_rate_percent(fitted_speech_rate(
                     settings.speech_rate,
@@ -2133,11 +2385,21 @@ fn default_speaker_voice_settings(sender_id: u64) -> SpeakerVoiceSettings {
     let (pitch, speech_rate) = speaker_voice_profile(sender_id);
     SpeakerVoiceSettings {
         voice_name: None,
+        onnx_speaker_id: Some((sender_id % ONNX_TTS_SPEAKER_COUNT as u64) as i32),
         pitch,
         speech_rate,
         volume: 1.0,
     }
 }
+
+fn onnx_speaker_id(settings: &SpeakerVoiceSettings, sender_id: u64) -> i32 {
+    settings
+        .onnx_speaker_id
+        .unwrap_or((sender_id % ONNX_TTS_SPEAKER_COUNT as u64) as i32)
+        .rem_euclid(ONNX_TTS_SPEAKER_COUNT)
+}
+
+fn onnx_speed(relative_rate: i32) -> f32 { (1.0 + relative_rate as f32 / 100.0).clamp(0.7, 2.8) }
 
 fn dialogue_language(text: &str) -> &'static str {
     if text.chars().any(is_cjk_character) {
@@ -2147,10 +2409,43 @@ fn dialogue_language(text: &str) -> &'static str {
     }
 }
 
-#[cfg(windows)]
 fn synthesize_speech_batch(
     working_directory: &Path,
     jobs: &[SpeechSynthesisJob],
+) -> Result<(), String> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let mut windows_jobs = Vec::new();
+    if let Ok(tts) = create_onnx_tts() {
+        for job in jobs {
+            if job.language == "zh-CN" {
+                let wav = generate_onnx_wav(
+                    &tts,
+                    &job.text,
+                    job.onnx_speaker_id,
+                    (job.speech_rate as f32 / 100.0).clamp(0.7, 2.8),
+                )?;
+                fs::write(&job.output_path, wav)
+                    .map_err(|err| format!("无法保存 ONNX 角色语音：{err}"))?;
+            } else {
+                windows_jobs.push(job);
+            }
+        }
+    } else {
+        windows_jobs.extend(jobs);
+    }
+    if windows_jobs.is_empty() {
+        Ok(())
+    } else {
+        synthesize_windows_speech_batch(working_directory, &windows_jobs)
+    }
+}
+
+#[cfg(windows)]
+fn synthesize_windows_speech_batch(
+    working_directory: &Path,
+    jobs: &[&SpeechSynthesisJob],
 ) -> Result<(), String> {
     if jobs.is_empty() {
         return Ok(());
@@ -2183,9 +2478,9 @@ fn synthesize_speech_batch(
 }
 
 #[cfg(not(windows))]
-fn synthesize_speech_batch(
+fn synthesize_windows_speech_batch(
     _working_directory: &Path,
-    _jobs: &[SpeechSynthesisJob],
+    _jobs: &[&SpeechSynthesisJob],
 ) -> Result<(), String> {
     Err("当前系统不支持 Windows 离线语音合成".to_owned())
 }
@@ -3237,6 +3532,7 @@ mod tests {
             .speaker_voice_settings
             .insert(42, SpeakerVoiceSettings {
                 voice_name: Some("Test Voice".to_owned()),
+                onnx_speaker_id: Some(17),
                 pitch: -25,
                 speech_rate: 12,
                 volume: 0.75,
@@ -3250,6 +3546,7 @@ mod tests {
             Some("Test Voice")
         );
         assert_eq!(settings.pitch, -25);
+        assert_eq!(settings.onnx_speaker_id, Some(17));
         assert_eq!(settings.speech_rate, 12);
         assert_eq!(settings.volume, 0.75);
     }
@@ -3283,9 +3580,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the downloaded AISHELL3 ONNX model"]
+    fn aishell3_onnx_synthesizes_distinct_chinese_speakers() {
+        let tts = create_onnx_tts().unwrap();
+        assert_eq!(
+            tts.num_speakers(),
+            ONNX_TTS_SPEAKER_COUNT
+        );
+        let first = generate_onnx_wav(
+            &tts,
+            "你好，这是离线中文语音。",
+            10,
+            1.4,
+        )
+        .unwrap();
+        let second = generate_onnx_wav(
+            &tts,
+            "你好，这是离线中文语音。",
+            33,
+            1.4,
+        )
+        .unwrap();
+        assert_eq!(&first[0..4], b"RIFF");
+        assert!(first.len() > 44);
+        assert_ne!(first, second);
+    }
+
+    #[test]
     #[cfg(windows)]
-    #[ignore = "requires installed Windows speech voices"]
-    fn windows_tts_assigns_distinct_speaker_profiles() {
+    #[ignore = "requires the downloaded ONNX model or installed Windows speech voices"]
+    fn tts_assigns_distinct_speaker_profiles() {
         let directory = tempfile::tempdir().unwrap();
         let mut first_line = test_dialogue(0, 1_350, DialogueSide::Left);
         first_line.text = "这是同一句角色语音测试。".to_owned();
@@ -3317,7 +3641,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires FFmpeg, FFprobe, and an installed Windows speech voice"]
+    #[ignore = "requires FFmpeg, FFprobe, and an offline speech backend"]
     fn encoded_replay_mixes_music_and_character_speech() {
         let directory = tempfile::tempdir().unwrap();
         for index in 0..10 {

@@ -26,7 +26,7 @@ mock_touch = []
 # The bevy engine <3
 # Default feautres are disabled because we are using audio from a different source (kira)
 # We also add trace_tracy for profiling
-bevy = { version = "=0.19.0" }
+bevy = { version = "=0.19.0", features = ["wav"] }
 
 bevy_asset_loader = { version = "0.27.0", features = [
     "progress_tracking",
@@ -62,6 +62,7 @@ futures-lite = "2.6.1"
 bevy_egui = { version = "=0.41.0", features = ["serde"] }
 egui = { version = "=0.35.0", features = ["persistence"] }
 serde_json = "1.0.150"
+sherpa-onnx = { version = "1.13.4", default-features = false, features = ["shared"] }
 base64 = "0.22.1"
 tempfile = "3.20.0"
 dirs = "6.0.0"
