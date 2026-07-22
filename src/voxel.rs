@@ -4925,15 +4925,126 @@ fn allocate_fragment_parts(source_sizes: &[usize], max_parts: usize) -> Vec<usiz
     counts
 }
 
-fn split_voxel_cells(cells: Vec<(IVec3, u8)>, requested_parts: usize) -> Vec<Vec<(IVec3, u8)>> {
+#[derive(Clone, Copy)]
+struct FragmentRng(u64);
+
+impl FragmentRng {
+    fn new(seed: u64) -> Self { Self(seed.max(1)) }
+
+    fn next(&mut self) -> u64 {
+        // A small deterministic generator keeps fragmentation testable while each
+        // explosion supplies a different seed.
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn index(&mut self, len: usize) -> usize { (self.next() as usize) % len }
+}
+
+const VOXEL_NEIGHBORS: [IVec3; 6] = [
+    IVec3::X,
+    IVec3::NEG_X,
+    IVec3::Y,
+    IVec3::NEG_Y,
+    IVec3::Z,
+    IVec3::NEG_Z,
+];
+
+fn explosion_fragment_seed(origin: Vec3, sequence: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    origin.x.to_bits().hash(&mut hasher);
+    origin.y.to_bits().hash(&mut hasher);
+    origin.z.to_bits().hash(&mut hasher);
+    sequence.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn split_voxel_cells_randomly(
+    mut cells: Vec<(IVec3, u8)>,
+    requested_parts: usize,
+    seed: u64,
+) -> Vec<Vec<(IVec3, u8)>> {
     let part_count = requested_parts.min(cells.len());
     if part_count == 0 {
         return Vec::new();
     }
-    let cell_count = cells.len();
+
+    let mut rng = FragmentRng::new(seed);
+    for index in (1..cells.len()).rev() {
+        let other = rng.index(index + 1);
+        cells.swap(index, other);
+    }
+
+    let mut unassigned = cells.iter().copied().collect::<HashMap<_, _>>();
     let mut parts = vec![Vec::new(); part_count];
-    for (index, cell) in cells.into_iter().enumerate() {
-        parts[index * part_count / cell_count].push(cell);
+    let mut frontiers = vec![Vec::new(); part_count];
+
+    for (part_index, (cell, _)) in cells.iter().copied().take(part_count).enumerate() {
+        let material = unassigned.remove(&cell).unwrap();
+        parts[part_index].push((cell, material));
+        frontiers[part_index].extend(VOXEL_NEIGHBORS.map(|offset| cell + offset));
+    }
+
+    while !unassigned.is_empty() {
+        let smallest_size = parts
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                frontiers[*index]
+                    .iter()
+                    .any(|cell| unassigned.contains_key(cell))
+            })
+            .map(|(_, part)| part.len())
+            .min();
+
+        let Some(smallest_size) = smallest_size else {
+            // Disconnected source components can exhaust every active frontier.
+            // Keep the body budget fixed and attach a new island to a smallest part.
+            let part_index = parts
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, part)| part.len())
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            let remaining = cells
+                .iter()
+                .map(|(cell, _)| *cell)
+                .filter(|cell| unassigned.contains_key(cell))
+                .collect::<Vec<_>>();
+            let cell = remaining[rng.index(remaining.len())];
+            let material = unassigned.remove(&cell).unwrap();
+            parts[part_index].push((cell, material));
+            frontiers[part_index].extend(VOXEL_NEIGHBORS.map(|offset| cell + offset));
+            continue;
+        };
+
+        // Let any nearly-smallest cluster grow. This balances mass without creating
+        // the regular bands produced by sorted list slicing.
+        let candidates = parts
+            .iter()
+            .enumerate()
+            .filter(|(index, part)| {
+                part.len() <= smallest_size + 1
+                    && frontiers[*index]
+                        .iter()
+                        .any(|cell| unassigned.contains_key(cell))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let part_index = candidates[rng.index(candidates.len())];
+
+        loop {
+            let frontier_index = rng.index(frontiers[part_index].len());
+            let cell = frontiers[part_index].swap_remove(frontier_index);
+            let Some(material) = unassigned.remove(&cell) else {
+                continue;
+            };
+            parts[part_index].push((cell, material));
+            frontiers[part_index].extend(VOXEL_NEIGHBORS.map(|offset| cell + offset));
+            break;
+        }
     }
     parts
 }
@@ -5015,10 +5126,11 @@ fn spawn_planet_explosion_fragments(
     materials: &VoxelMaterials,
     planet_transform: &GlobalTransform,
     removed: Vec<(IVec3, u8)>,
+    fragment_seed: u64,
 ) -> Vec<Entity> {
     let part_count = removed.len().min(MAX_EXPLOSION_NEW_PHYSICS_BODIES);
     let mut fragments = Vec::with_capacity(part_count);
-    for cells in split_voxel_cells(removed, part_count) {
+    for cells in split_voxel_cells_randomly(removed, part_count, fragment_seed) {
         let origin = cells
             .iter()
             .map(|(cell, _)| *cell)
@@ -5637,6 +5749,7 @@ fn edit_voxel_grid(
     mut editor: ResMut<VoxelEditorState>,
     possession: Res<VoxelPossessionState>,
     egui_input: Res<EguiWantsInput>,
+    mut explosion_sequence: Local<u64>,
 ) {
     let egui_owns_pointer = egui_input.wants_any_pointer_input();
     if mouse.just_pressed(MouseButton::Left) {
@@ -5744,6 +5857,8 @@ fn edit_voxel_grid(
             .filter(|hit| nearest_non_planet.is_none_or(|distance| hit.distance < distance))
         {
             let interaction_point = ray.origin + *ray.direction * planet_hit.distance;
+            *explosion_sequence = explosion_sequence.wrapping_add(1);
+            let fragment_seed = explosion_fragment_seed(interaction_point, *explosion_sequence);
             if let Ok((mut planet, transform)) = planets.single_mut() {
                 let local_origin = transform
                     .affine()
@@ -5761,6 +5876,7 @@ fn edit_voxel_grid(
                     &materials,
                     transform,
                     removed,
+                    fragment_seed,
                 );
                 let fragment_count = fragments.len();
                 if fragment_count > 0 {
@@ -5791,6 +5907,8 @@ fn edit_voxel_grid(
         };
         let interaction_point = ray.origin + *ray.direction * interaction_distance;
         let target = if action == VoxelPhysicsAction::Explode {
+            *explosion_sequence = explosion_sequence.wrapping_add(1);
+            let fragment_seed = explosion_fragment_seed(interaction_point, *explosion_sequence);
             let explosion_radius = editor.physics_explosion_radius.max(VOXEL_SIZE);
             let mut target = clicked_body;
             let selected = selected_solid_voxels_in_radius(
@@ -5831,8 +5949,14 @@ fn edit_voxel_grid(
                 &source_sizes,
                 MAX_EXPLOSION_NEW_PHYSICS_BODIES,
             );
-            for ((entity, cells, transform, linear_velocity, angular_velocity), part_count) in
-                affected_bodies.into_iter().zip(part_counts.iter().copied())
+            let affected_body_count = affected_bodies.len();
+            for (
+                source_index,
+                ((entity, cells, transform, linear_velocity, angular_velocity), part_count),
+            ) in affected_bodies
+                .into_iter()
+                .zip(part_counts.iter().copied())
+                .enumerate()
             {
                 if part_count == 0 {
                     continue;
@@ -5841,7 +5965,11 @@ fn edit_voxel_grid(
                 if target == Some(entity) {
                     target = None;
                 }
-                for cells in split_voxel_cells(cells, part_count) {
+                for cells in split_voxel_cells_randomly(
+                    cells,
+                    part_count,
+                    fragment_seed.wrapping_add(source_index as u64),
+                ) {
                     let origin = cells
                         .iter()
                         .map(|(cell, _)| *cell)
@@ -5876,7 +6004,11 @@ fn edit_voxel_grid(
                 for (cell, _) in &selected {
                     grid.set(*cell, 0);
                 }
-                for cells in split_voxel_cells(selected, static_part_count) {
+                for cells in split_voxel_cells_randomly(
+                    selected,
+                    static_part_count,
+                    fragment_seed.wrapping_add(affected_body_count as u64),
+                ) {
                     let fragment = spawn_voxel_physics_body(
                         &mut commands,
                         &mut meshes,
@@ -8418,12 +8550,71 @@ mod tests {
         assert_eq!(counts, vec![40]);
 
         let cells = (0..8_656).map(|x| (IVec3::new(x, 0, 0), 1)).collect();
-        let parts = split_voxel_cells(cells, counts[0]);
+        let parts = split_voxel_cells_randomly(cells, counts[0], 7);
         assert_eq!(parts.len(), 40);
         assert_eq!(
             parts.iter().map(Vec::len).sum::<usize>(),
             8_656
         );
+    }
+
+    #[test]
+    fn explosion_fragments_grow_as_connected_irregular_clusters() {
+        let cells = prism(IVec3::ZERO, IVec3::splat(8))
+            .map(|cell| (cell, 1))
+            .collect::<Vec<_>>();
+        let parts = split_voxel_cells_randomly(cells.clone(), 12, 0xbad5_eed);
+
+        assert_eq!(parts.len(), 12);
+        let assigned = parts
+            .iter()
+            .flatten()
+            .map(|(cell, _)| *cell)
+            .collect::<HashSet<_>>();
+        assert_eq!(assigned.len(), cells.len());
+
+        for part in &parts {
+            let part_cells = part.iter().map(|(cell, _)| *cell).collect::<HashSet<_>>();
+            let mut reached = HashSet::from([part[0].0]);
+            let mut frontier = vec![part[0].0];
+            while let Some(cell) = frontier.pop() {
+                for neighbor in VOXEL_NEIGHBORS.map(|offset| cell + offset) {
+                    if part_cells.contains(&neighbor) && reached.insert(neighbor) {
+                        frontier.push(neighbor);
+                    }
+                }
+            }
+            assert_eq!(reached.len(), part.len());
+        }
+
+        assert!(parts.iter().any(|part| {
+            let min = part
+                .iter()
+                .map(|(cell, _)| *cell)
+                .reduce(IVec3::min)
+                .unwrap();
+            let max = part
+                .iter()
+                .map(|(cell, _)| *cell)
+                .reduce(IVec3::max)
+                .unwrap();
+            let dimensions = max - min + IVec3::ONE;
+            dimensions.x as usize * dimensions.y as usize * dimensions.z as usize > part.len()
+        }));
+    }
+
+    #[test]
+    fn explosion_fragment_seed_changes_the_break_pattern() {
+        let cells = prism(IVec3::ZERO, IVec3::splat(6))
+            .map(|cell| (cell, 1))
+            .collect::<Vec<_>>();
+
+        let first = split_voxel_cells_randomly(cells.clone(), 8, 11);
+        let repeated = split_voxel_cells_randomly(cells.clone(), 8, 11);
+        let different = split_voxel_cells_randomly(cells, 8, 12);
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, different);
     }
 
     #[test]
