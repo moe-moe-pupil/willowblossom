@@ -613,6 +613,7 @@ pub(crate) struct VoxelEditorState {
     restore_scene_requested: Option<usize>,
     first_person_space_tap_elapsed: f32,
     first_person_was_enabled: bool,
+    first_person_cursor_released: bool,
 }
 
 impl Default for VoxelEditorState {
@@ -627,7 +628,7 @@ impl Default for VoxelEditorState {
             redo_requested: false,
             reset_requested: false,
             view_reset_requested: false,
-            first_person_enabled: false,
+            first_person_enabled: true,
             first_person_flying: false,
             first_person_speed: FIRST_PERSON_SPEED,
             creative_inventory_open: false,
@@ -674,6 +675,7 @@ impl Default for VoxelEditorState {
             restore_scene_requested: None,
             first_person_space_tap_elapsed: f32::INFINITY,
             first_person_was_enabled: false,
+            first_person_cursor_released: false,
         }
     }
 }
@@ -3051,7 +3053,7 @@ fn voxel_player_hotbar_slot_label(
 
 fn apply_voxel_player_view_to_editor(editor: &mut VoxelEditorState, transform: &Transform) {
     let (yaw, pitch, _) = transform.rotation.to_euler(EulerRot::YXZ);
-    editor.first_person_enabled = false;
+    editor.first_person_enabled = true;
     editor.first_person_flying = false;
     editor.camera_yaw = yaw;
     editor.camera_pitch = pitch;
@@ -4191,6 +4193,9 @@ fn viewport_ray(
     camera_transform: &GlobalTransform,
     editor: &VoxelEditorState,
 ) -> Option<Ray3d> {
+    if editor.first_person_cursor_released {
+        return None;
+    }
     let screen_position = if editor.first_person_enabled {
         (editor.viewport_min + editor.viewport_max) * 0.5
     } else {
@@ -6164,7 +6169,6 @@ fn control_first_person_player(
         } else {
             possession.turn_start_position = None;
             possession.last_player_position = None;
-            editor.first_person_enabled = false;
             editor.first_person_flying = false;
         }
     }
@@ -6220,7 +6224,10 @@ fn control_first_person_player(
         velocity.z = 0.0;
         return;
     }
-    if editor.creative_inventory_open || possession.player_inventory_open {
+    if editor.creative_inventory_open
+        || possession.player_inventory_open
+        || editor.first_person_cursor_released
+    {
         velocity.x = 0.0;
         velocity.z = 0.0;
         if editor.first_person_flying {
@@ -6467,15 +6474,14 @@ fn control_voxel_camera(
     mut possession: ResMut<VoxelPossessionState>,
     egui_input: Res<EguiWantsInput>,
 ) {
+    editor.first_person_enabled = true;
     if keyboard.just_pressed(KeyCode::Escape) {
         if possession.player_inventory_open {
             possession.player_inventory_open = false;
         } else if editor.creative_inventory_open {
             editor.creative_inventory_open = false;
-        } else if editor.first_person_enabled && possession.active_user_id.is_none() {
-            editor.first_person_enabled = false;
-            editor.first_person_flying = false;
         }
+        editor.first_person_cursor_released = true;
     }
     let entering_first_person = editor.first_person_enabled && !editor.first_person_was_enabled;
     let exiting_first_person = !editor.first_person_enabled && editor.first_person_was_enabled;
@@ -6499,8 +6505,21 @@ fn control_voxel_camera(
     }
     editor.first_person_was_enabled = editor.first_person_enabled;
     let inventory_open = editor.creative_inventory_open || possession.player_inventory_open;
+    let cursor_in_viewport = windows
+        .single()
+        .ok()
+        .and_then(Window::cursor_position)
+        .is_some_and(|cursor| editor.contains_cursor(cursor));
+    if editor.first_person_cursor_released
+        && !inventory_open
+        && mouse.just_pressed(MouseButton::Left)
+        && cursor_in_viewport
+        && !egui_input.wants_pointer_input()
+    {
+        editor.first_person_cursor_released = false;
+    }
     if let Ok(mut cursor) = cursor_options.single_mut() {
-        if editor.first_person_enabled && !inventory_open {
+        if !inventory_open && !editor.first_person_cursor_released {
             cursor.visible = false;
             cursor.grab_mode = CursorGrabMode::Locked;
         } else {
@@ -6526,14 +6545,14 @@ fn control_voxel_camera(
         sum + event.delta
     });
     if editor.first_person_enabled {
-        if !inventory_open {
+        if !inventory_open && !editor.first_person_cursor_released {
             editor.camera_yaw -= delta.x * 0.0025;
             editor.camera_pitch = (editor.camera_pitch - delta.y * 0.0025).clamp(-1.5, 1.5);
         }
         let wheel_steps = wheel.read().fold(0, |steps, event| {
             steps + event.y.signum() as i32
         });
-        if !inventory_open && wheel_steps != 0 {
+        if !inventory_open && !editor.first_person_cursor_released && wheel_steps != 0 {
             if possession.active_user_id.is_some() {
                 possession.selected_hotbar_slot = cycled_hotbar_slot(
                     possession.selected_hotbar_slot,
@@ -6928,7 +6947,7 @@ mod tests {
     }
 
     #[test]
-    fn current_player_view_moves_the_gm_orbit_camera() {
+    fn current_player_view_keeps_the_dm_in_first_person() {
         let player_view = Transform::from_xyz(4.0, 5.0, 6.0).with_rotation(Quat::from_euler(
             EulerRot::YXZ,
             0.4,
@@ -6944,10 +6963,24 @@ mod tests {
         apply_voxel_player_view_to_editor(&mut editor, &player_view);
         let gm_view = editor_camera_transform(&editor);
 
-        assert!(!editor.first_person_enabled);
+        assert!(editor.first_person_enabled);
         assert!(!editor.first_person_flying);
         assert!(gm_view.translation.distance(player_view.translation) < 0.000_1);
         assert!(gm_view.forward().dot(*player_view.forward()) > 0.999_9);
+    }
+
+    #[test]
+    fn released_first_person_cursor_blocks_viewport_actions() {
+        let mut editor = VoxelEditorState::default();
+        editor.first_person_cursor_released = true;
+
+        assert!(viewport_ray(
+            &Window::default(),
+            &Camera::default(),
+            &GlobalTransform::default(),
+            &editor,
+        )
+        .is_none());
     }
 
     #[test]

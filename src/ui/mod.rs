@@ -12884,21 +12884,6 @@ pub fn ui_system(
                         if ui.button("视图复位").clicked() {
                             voxel_editor.view_reset_requested = true;
                         }
-                        let first_person_toggle = ui
-                            .add_enabled(
-                                voxel_possession.active_user_id.is_none(),
-                                egui::Button::new("第一人称")
-                                    .selected(voxel_editor.first_person_enabled),
-                            )
-                            .on_hover_text(if voxel_possession.active_user_id.is_some() {
-                                "接管玩家时固定使用该玩家的第一人称视角"
-                            } else {
-                                "进入后锁定鼠标；按 Esc 退出"
-                            });
-                        if first_person_toggle.clicked()
-                        {
-                            voxel_editor.first_person_enabled = !voxel_editor.first_person_enabled;
-                        }
                         ui.label("移动速度");
                         ui.add(
                             egui::DragValue::new(&mut voxel_editor.first_person_speed)
@@ -12935,7 +12920,7 @@ pub fn ui_system(
                             "左键拆除 · 右键放置/使用"
                         };
                         ui.small(format!(
-                            "{movement_hint} · 当前工具：{} · {interaction_hint} · 滚轮选择快捷栏 · Esc 退出",
+                            "{movement_hint} · 当前工具：{} · {interaction_hint} · 滚轮选择快捷栏 · Esc 释放鼠标 · 点击游戏画面重新锁定",
                             voxel_editor.active_tool_label()
                         ));
                     } else {
