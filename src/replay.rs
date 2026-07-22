@@ -839,6 +839,35 @@ fn replay_controls(
             start_video_export(studio, capture_active, grids, windows);
         }
     });
+    let can_auto_direct = manager.active_campaign_id().is_some()
+        && studio.mode == ReplayMode::Idle
+        && studio.video_render.is_none()
+        && studio.video_encoding.is_none();
+    if ui
+        .add_enabled(
+            can_auto_direct,
+            egui::Button::new("DeepSeek 整理 + 自动导演并导出"),
+        )
+        .on_hover_text("从所选发布范围的现有聊天重建回放，生成确定性镜头轨迹，并立即开始导出 MP4。DeepSeek 仅生成制作提要。")
+        .clicked()
+    {
+        build_from_history(studio, manager, camera, grids);
+        if let (Some(replay), Ok(base_camera)) = (studio.replay.as_mut(), camera.single()) {
+            replay.camera = automatic_camera_track(
+                base_camera,
+                &replay.dialogue,
+                replay.duration_ms,
+            );
+        }
+        let summary_queued = studio.replay.as_ref().is_some_and(|replay| {
+            queue_replay_summary(replay, deepseek_sender, deepseek_manager).is_ok()
+        });
+        if summary_queued {
+            let _ = deepseek_manager.persist();
+        }
+        start_video_export(studio, capture_active, grids, windows);
+    }
+    ui.small("一键模式会自动完成：读取可见聊天 → 请求事实性制作提要 → 编排平滑镜头 → 逐帧渲染 → FFmpeg 输出 MP4。");
     ui.small("导出时会隐藏编辑器界面，逐帧渲染台词层，再用 FFmpeg 编码 H.264 视频。按 Esc 可取消逐帧渲染。");
 
     ui.collapsing(
@@ -1388,6 +1417,45 @@ fn camera_keyframe(time_ms: u64, transform: &Transform) -> ReplayCameraKeyframe 
     }
 }
 
+fn automatic_camera_track(
+    base: &Transform,
+    dialogue: &[ReplayDialogue],
+    duration_ms: u64,
+) -> Vec<ReplayCameraKeyframe> {
+    let mut frames = Vec::with_capacity(dialogue.len().saturating_mul(2).saturating_add(2));
+    frames.push(camera_keyframe(0, base));
+    let camera_right = base.rotation * Vec3::X;
+    let camera_forward = base.rotation * Vec3::NEG_Z;
+    for (index, line) in dialogue.iter().enumerate() {
+        let side = match line.side {
+            DialogueSide::Left => -1.0,
+            DialogueSide::Right => 1.0,
+        };
+        let mut shot = base.clone();
+        shot.translation += camera_right * side * 0.45;
+        if index % 3 == 1 {
+            shot.translation += camera_forward * 0.20;
+        }
+        shot.rotation = Quat::from_rotation_y(-side * 0.025) * base.rotation;
+        frames.push(camera_keyframe(line.time_ms, &shot));
+        frames.push(camera_keyframe(
+            line.time_ms.saturating_add(line.duration_ms),
+            &shot,
+        ));
+    }
+    frames.push(camera_keyframe(duration_ms, base));
+    frames.sort_by_key(|frame| frame.time_ms);
+    frames.dedup_by(|right, left| {
+        if right.time_ms == left.time_ms {
+            *left = right.clone();
+            true
+        } else {
+            false
+        }
+    });
+    frames
+}
+
 fn interpolated_camera(frames: &[ReplayCameraKeyframe], time_ms: u64) -> Option<Transform> {
     let first = frames.first()?;
     let next_index = frames.partition_point(|frame| frame.time_ms <= time_ms);
@@ -1899,6 +1967,31 @@ mod tests {
     }
 
     #[test]
+    fn automatic_director_tracks_speaker_side_and_returns_to_base() {
+        let base = Transform::from_xyz(2.0, 3.0, 4.0);
+        let dialogue = [
+            test_dialogue(350, 2_400, DialogueSide::Left),
+            test_dialogue(3_030, 2_400, DialogueSide::Right),
+        ];
+        let frames = automatic_camera_track(&base, &dialogue, 5_430);
+        assert!(frames
+            .windows(2)
+            .all(|pair| pair[0].time_ms < pair[1].time_ms));
+        assert_eq!(
+            frames.first().unwrap().translation,
+            base.translation.to_array()
+        );
+        assert_eq!(
+            frames.last().unwrap().translation,
+            base.translation.to_array()
+        );
+        let left = frames.iter().find(|frame| frame.time_ms == 350).unwrap();
+        let right = frames.iter().find(|frame| frame.time_ms == 3_030).unwrap();
+        assert!(left.translation[0] < base.translation.x);
+        assert!(right.translation[0] > base.translation.x);
+    }
+
+    #[test]
     fn dialogue_duration_is_readable_and_bounded() {
         assert_eq!(
             dialogue_duration_ms("短句"),
@@ -1947,5 +2040,20 @@ mod tests {
             "0",
             "-i",
         ]);
+    }
+
+    fn test_dialogue(time_ms: u64, duration_ms: u64, side: DialogueSide) -> ReplayDialogue {
+        ReplayDialogue {
+            time_ms,
+            duration_ms,
+            sender_id: 1,
+            name: "测试".to_owned(),
+            role: String::new(),
+            text: "台词".to_owned(),
+            avatar: String::new(),
+            avatar_data_url: None,
+            visibility: Visibility::Public,
+            side,
+        }
     }
 }
