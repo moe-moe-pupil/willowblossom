@@ -64,6 +64,7 @@ use crate::voxel::{
     VoxelEditMode,
     VoxelEditorState,
     VoxelLightTool,
+    VoxelPossessionState,
     MAX_VOXEL_BRUSH_RADIUS,
 };
 
@@ -887,6 +888,7 @@ pub struct UiSystemLocals<'w, 's> {
     chat_player_visible_previews: Local<'s, HashMap<String, String>>,
     chat_list_player_visible_filter: Local<'s, Option<String>>,
     voxel_editor: ResMut<'w, VoxelEditorState>,
+    voxel_possession: ResMut<'w, VoxelPossessionState>,
     battle_store: Option<ResMut<'w, Persistent<BattleRoundStore>>>,
 }
 
@@ -7119,6 +7121,29 @@ fn character_hotbar_slot_label(slot: CharacterHotbarSlot, character: &PlayerChar
     }
 }
 
+fn character_hotbar_slot_short_label(
+    slot: CharacterHotbarSlot,
+    character: &PlayerCharacter,
+) -> String {
+    let label = match slot {
+        CharacterHotbarSlot::Empty => return "空".to_owned(),
+        CharacterHotbarSlot::Item(index) => {
+            character.inventory.items.get(index).map(item_display_name)
+        },
+        CharacterHotbarSlot::Skill(index) => character.skill_names.get(index).cloned(),
+    }
+    .unwrap_or_else(|| "空".to_owned());
+    let label = label.trim();
+    if label.chars().count() <= 6 {
+        label.to_owned()
+    } else {
+        format!(
+            "{}…",
+            label.chars().take(5).collect::<String>()
+        )
+    }
+}
+
 fn shift_character_hotbar_after_remove(
     hotbar: &mut [CharacterHotbarSlot],
     removed: CharacterHotbarSlot,
@@ -12252,6 +12277,7 @@ pub fn ui_system(
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
     let voxel_editor: &mut VoxelEditorState = &mut locals.voxel_editor;
+    let voxel_possession: &mut VoxelPossessionState = &mut locals.voxel_possession;
     let battle_store = &mut locals.battle_store;
 
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -12757,6 +12783,51 @@ pub fn ui_system(
                     }
                 });
 
+            if let Some(possessed_user_id) = voxel_possession.active_user_id {
+                voxel_editor.creative_inventory_open = false;
+                egui::Area::new(egui::Id::new("voxel_player_hotbar"))
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_black_alpha(210))
+                            .corner_radius(4)
+                            .inner_margin(4)
+                            .show(ui, |ui| {
+                                if let Some(character) = manager
+                                    .player_characters
+                                    .get(&possessed_user_id.to_string())
+                                {
+                                    ui.horizontal(|ui| {
+                                        for (slot, entry) in
+                                            character.inventory.hotbar.iter().enumerate()
+                                        {
+                                            let full_label =
+                                                character_hotbar_slot_label(*entry, character);
+                                            let short_label =
+                                                character_hotbar_slot_short_label(*entry, character);
+                                            let selected =
+                                                voxel_possession.selected_hotbar_slot == slot;
+                                            let response = ui.add_sized(
+                                                [62.0, 44.0],
+                                                egui::Button::new(format!(
+                                                    "{}\n{}",
+                                                    slot + 1,
+                                                    short_label
+                                                ))
+                                                .selected(selected),
+                                            );
+                                            if response.on_hover_text(full_label).clicked() {
+                                                voxel_possession.selected_hotbar_slot = slot;
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    ui.label("该玩家还没有角色物品栏");
+                                }
+                            });
+                    });
+            } else {
             let mut hotbar_drop = None;
             let mut hotbar_clicked = None;
             let mut hotbar_delete = None;
@@ -13056,6 +13127,7 @@ pub fn ui_system(
                         }
                     }
                 }
+            }
             }
 
             if voxel_editor.first_person_enabled && !voxel_editor.creative_inventory_open {

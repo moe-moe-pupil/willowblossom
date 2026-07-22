@@ -373,7 +373,11 @@ pub(crate) struct VoxelPossessionState {
     pub movement_used: f32,
     pub movement_limit: f32,
     movement_turn: u32,
+    turn_start_position: Option<Vec3>,
     last_player_position: Option<Vec3>,
+    reset_movement_requested: bool,
+    movement_limit_bypassed: bool,
+    movement_bypass_confirmation_pending: bool,
     persist_elapsed: f32,
 }
 
@@ -386,19 +390,35 @@ impl Default for VoxelPossessionState {
             movement_used: 0.0,
             movement_limit: 0.0,
             movement_turn: 0,
+            turn_start_position: None,
             last_player_position: None,
+            reset_movement_requested: false,
+            movement_limit_bypassed: false,
+            movement_bypass_confirmation_pending: false,
             persist_elapsed: 0.0,
         }
     }
 }
 
 impl VoxelPossessionState {
-    pub(crate) fn possess(&mut self, user_id: u64) { self.active_user_id = Some(user_id); }
+    pub(crate) fn possess(&mut self, user_id: u64) {
+        self.active_user_id = Some(user_id);
+        self.reset_turn_overrides();
+    }
 
-    pub(crate) fn release(&mut self) { self.active_user_id = None; }
+    pub(crate) fn release(&mut self) {
+        self.active_user_id = None;
+        self.reset_turn_overrides();
+    }
 
     pub(crate) fn movement_remaining(&self) -> f32 {
         (self.movement_limit - self.movement_used).max(0.0)
+    }
+
+    fn reset_turn_overrides(&mut self) {
+        self.reset_movement_requested = false;
+        self.movement_limit_bypassed = false;
+        self.movement_bypass_confirmation_pending = false;
     }
 }
 
@@ -2844,11 +2864,52 @@ fn voxel_player_camera_panel(
             });
             if possessing_selected {
                 ui.small(format!(
-                    "本轮移动 {:.2}/{:.2}，剩余 {:.2}",
+                    "本轮移动 {:.2}/{:.2}，剩余 {:.2}{}",
                     possession.movement_used,
                     possession.movement_limit,
                     possession.movement_remaining(),
+                    if possession.movement_limit_bypassed { "（已允许超限）" } else { "" },
                 ));
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            possession.turn_start_position.is_some(),
+                            egui::Button::new("撤销本轮移动"),
+                        )
+                        .on_hover_text("返回本轮开始位置，并把本轮已用移动距离归零")
+                        .clicked()
+                    {
+                        possession.reset_movement_requested = true;
+                    }
+                    if possession.movement_limit_bypassed {
+                        if ui.button("恢复移动上限").clicked() {
+                            possession.movement_limit_bypassed = false;
+                        }
+                    } else if possession.movement_bypass_confirmation_pending {
+                        if ui
+                            .add(
+                                egui::Button::new("再次确认：允许超限移动")
+                                    .fill(egui::Color32::from_rgb(150, 35, 35)),
+                            )
+                            .clicked()
+                        {
+                            possession.movement_limit_bypassed = true;
+                            possession.movement_bypass_confirmation_pending = false;
+                        }
+                        if ui.button("取消").clicked() {
+                            possession.movement_bypass_confirmation_pending = false;
+                        }
+                    } else if ui
+                        .add(
+                            egui::Button::new("危险：突破移动上限")
+                                .fill(egui::Color32::from_rgb(100, 30, 30)),
+                        )
+                        .on_hover_text("需要再次确认；只对当前接管和当前回合有效")
+                        .clicked()
+                    {
+                        possession.movement_bypass_confirmation_pending = true;
+                    }
+                });
                 ui.horizontal_wrapped(|ui| {
                     if let Some(character) = manager
                         .as_deref()
@@ -5987,6 +6048,7 @@ fn control_first_person_player(
         possession.applied_user_id = possession.active_user_id;
         possession.movement_used = 0.0;
         possession.persist_elapsed = 0.0;
+        possession.reset_turn_overrides();
         if let Some(user_id) = possession.active_user_id {
             if let Some((camera_transform, _)) = capture_cameras
                 .iter()
@@ -5999,10 +6061,12 @@ fn control_first_person_player(
             editor.first_person_was_enabled = true;
             editor.first_person_flying = false;
             editor.creative_inventory_open = false;
+            possession.turn_start_position = Some(transform.translation);
             possession.last_player_position = Some(transform.translation);
             possession.movement_turn = possession_world_turn(manager.as_deref(), user_id);
             possession.movement_limit = possession_final_movement(manager.as_deref(), user_id);
         } else {
+            possession.turn_start_position = None;
             possession.last_player_position = None;
             editor.first_person_enabled = false;
             editor.first_person_flying = false;
@@ -6015,7 +6079,9 @@ fn control_first_person_player(
         if possession.movement_turn != world_turn {
             possession.movement_turn = world_turn;
             possession.movement_used = 0.0;
+            possession.turn_start_position = Some(transform.translation);
             possession.last_player_position = Some(transform.translation);
+            possession.reset_turn_overrides();
         }
         possession.movement_limit = movement_limit;
         editor.first_person_enabled = true;
@@ -6037,12 +6103,21 @@ fn control_first_person_player(
             }
         }
 
-        if let Some(previous) = possession.last_player_position {
-            let (clamped, movement_used, exhausted) = clamp_horizontal_movement_step(
+        if possession.reset_movement_requested {
+            if let Some(turn_start) = possession.turn_start_position {
+                transform.translation = turn_start;
+                velocity.0 = Vec3::ZERO;
+                possession.movement_used = 0.0;
+                possession.last_player_position = Some(turn_start);
+            }
+            possession.reset_movement_requested = false;
+        } else if let Some(previous) = possession.last_player_position {
+            let (clamped, movement_used, exhausted) = resolve_horizontal_movement_step(
                 previous,
                 transform.translation,
                 possession.movement_used,
                 possession.movement_limit,
+                possession.movement_limit_bypassed,
             );
             transform.translation = clamped;
             possession.movement_used = movement_used;
@@ -6101,8 +6176,9 @@ fn control_first_person_player(
     let movement =
         (forward * forward_input as f32 + right * right_input as f32).clamp_length_max(1.0);
     let movement_speed = editor.first_person_speed.max(VOXEL_SIZE);
-    let movement_allowed =
-        possession.active_user_id.is_none() || possession.movement_remaining() > f32::EPSILON;
+    let movement_allowed = possession.active_user_id.is_none()
+        || possession.movement_limit_bypassed
+        || possession.movement_remaining() > f32::EPSILON;
     let movement = if movement_allowed { movement } else { Vec3::ZERO };
     velocity.x = movement.x * movement_speed;
     velocity.z = movement.z * movement_speed;
@@ -6172,6 +6248,33 @@ fn clamp_horizontal_movement_step(
         ),
         movement_limit,
         true,
+    )
+}
+
+fn resolve_horizontal_movement_step(
+    previous: Vec3,
+    current: Vec3,
+    movement_used: f32,
+    movement_limit: f32,
+    bypass_limit: bool,
+) -> (Vec3, f32, bool) {
+    if !bypass_limit {
+        return clamp_horizontal_movement_step(
+            previous,
+            current,
+            movement_used,
+            movement_limit,
+        );
+    }
+    let distance = Vec2::new(
+        current.x - previous.x,
+        current.z - previous.z,
+    )
+    .length();
+    (
+        current,
+        movement_used.max(0.0) + distance,
+        false,
     )
 }
 
@@ -8282,5 +8385,82 @@ mod tests {
         assert_eq!(position, Vec3::new(3.0, 1.0, 4.0));
         assert!((used - 6.0).abs() < 0.0001);
         assert!(!exhausted);
+    }
+
+    #[test]
+    fn confirmed_movement_bypass_allows_and_records_distance_past_limit() {
+        let current = Vec3::new(6.0, 1.0, 8.0);
+        let (position, used, exhausted) =
+            resolve_horizontal_movement_step(Vec3::ZERO, current, 4.0, 5.0, true);
+
+        assert_eq!(position, current);
+        assert!((used - 14.0).abs() < 0.0001);
+        assert!(!exhausted);
+    }
+
+    #[test]
+    fn possession_change_clears_dangerous_movement_override() {
+        let mut possession = VoxelPossessionState::default();
+        possession.movement_limit_bypassed = true;
+        possession.movement_bypass_confirmation_pending = true;
+
+        possession.possess(42);
+
+        assert!(!possession.movement_limit_bypassed);
+        assert!(!possession.movement_bypass_confirmation_pending);
+    }
+
+    #[test]
+    fn movement_reset_returns_possessed_player_to_turn_start() {
+        let turn_start = Vec3::new(2.0, 3.0, 4.0);
+        let mut possession = VoxelPossessionState {
+            active_user_id: Some(42),
+            applied_user_id: Some(42),
+            movement_used: 3.5,
+            turn_start_position: Some(turn_start),
+            last_player_position: Some(Vec3::new(7.0, 3.0, 4.0)),
+            reset_movement_requested: true,
+            ..default()
+        };
+        possession.movement_limit = 10.0;
+
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(VoxelEditorState::default())
+            .insert_resource(possession)
+            .add_systems(Update, control_first_person_player);
+        let player = app
+            .world_mut()
+            .spawn((
+                VoxelFirstPersonPlayer,
+                ShapeHits::default(),
+                Transform::from_translation(Vec3::new(7.0, 3.0, 4.0)),
+                LinearVelocity(Vec3::new(4.0, 0.0, 0.0)),
+                ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
+            ))
+            .id();
+
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .entity(player)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            turn_start
+        );
+        assert_eq!(
+            app.world()
+                .entity(player)
+                .get::<LinearVelocity>()
+                .unwrap()
+                .0,
+            Vec3::ZERO
+        );
+        let possession = app.world().resource::<VoxelPossessionState>();
+        assert_eq!(possession.movement_used, 0.0);
+        assert!(!possession.reset_movement_requested);
     }
 }
