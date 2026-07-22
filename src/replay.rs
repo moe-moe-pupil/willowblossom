@@ -1,0 +1,1208 @@
+use std::{
+    collections::HashMap,
+    fs,
+    path::{
+        Path,
+        PathBuf,
+    },
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
+    },
+};
+
+use base64::{
+    engine::general_purpose::STANDARD as BASE64,
+    Engine,
+};
+use bevy::{
+    prelude::*,
+    transform::TransformSystems,
+};
+use bevy_egui::{
+    egui,
+    EguiContexts,
+    EguiPrimaryContextPass,
+};
+use bevy_persistent::Persistent;
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use voxxelmaxx::prelude::*;
+
+use crate::{
+    napcat::{
+        CampaignMessage,
+        NapcatMessageManager,
+        PlayerAccess,
+        PlayerCharacter,
+        Visibility,
+    },
+    ui,
+    voxel::{
+        TrpgVoxelGrid,
+        VoxelViewportCamera,
+    },
+};
+
+const REPLAY_FORMAT_VERSION: u32 = 1;
+const CAMERA_SAMPLE_SECONDS: f32 = 0.1;
+const MIN_DIALOGUE_MS: u64 = 2_400;
+const MAX_DIALOGUE_MS: u64 = 10_000;
+const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
+
+pub struct ReplayPlugin;
+
+impl Plugin for ReplayPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<ReplayStudio>()
+            .add_systems(Update, (record_replay, advance_replay))
+            .add_systems(
+                PostUpdate,
+                apply_replay_camera.before(TransformSystems::Propagate),
+            )
+            .add_systems(
+                EguiPrimaryContextPass,
+                replay_studio_ui.after(ui::ui_system),
+            );
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "scope", content = "id", rename_all = "snake_case")]
+enum ReplayAudience {
+    Public,
+    Party(String),
+    Player(u64),
+    Gm,
+}
+
+impl Default for ReplayAudience {
+    fn default() -> Self { Self::Public }
+}
+
+impl ReplayAudience {
+    fn label(&self) -> String {
+        match self {
+            Self::Public => "公开".to_owned(),
+            Self::Party(id) => format!("队伍：{id}"),
+            Self::Player(id) => format!("玩家：{id}"),
+            Self::Gm => "GM（包含私密内容）".to_owned(),
+        }
+    }
+
+    fn can_read(&self, message: &CampaignMessage, manager: &NapcatMessageManager) -> bool {
+        let player_access = match self {
+            Self::Player(player_id) => Some(manager.player_access_for_user(*player_id)),
+            _ => None,
+        };
+        self.can_read_visibility(
+            &message.visibility,
+            player_access.as_ref(),
+        )
+    }
+
+    fn can_read_visibility(
+        &self,
+        visibility: &Visibility,
+        player_access: Option<&PlayerAccess>,
+    ) -> bool {
+        match self {
+            Self::Public => matches!(visibility, Visibility::Public),
+            Self::Party(party_id) => {
+                matches!(visibility, Visibility::Public)
+                    || matches!(visibility, Visibility::Party(id) if id == party_id)
+            },
+            Self::Player(_) => player_access.is_some_and(|access| access.can_read(visibility)),
+            Self::Gm => PlayerAccess {
+                is_gm: true,
+                ..Default::default()
+            }
+            .can_read(visibility),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplayFile {
+    format_version: u32,
+    title: String,
+    campaign_id: String,
+    created_at_unix_ms: u64,
+    duration_ms: u64,
+    audience: ReplayAudience,
+    scene: ReplayScene,
+    camera: Vec<ReplayCameraKeyframe>,
+    dialogue: Vec<ReplayDialogue>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ReplayScene {
+    voxels: Vec<ReplayVoxel>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+struct ReplayVoxel {
+    position: [i32; 3],
+    material: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplayCameraKeyframe {
+    time_ms: u64,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplayDialogue {
+    time_ms: u64,
+    duration_ms: u64,
+    sender_id: u64,
+    name: String,
+    role: String,
+    text: String,
+    avatar: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    avatar_data_url: Option<String>,
+    visibility: Visibility,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayMode {
+    Idle,
+    Recording,
+    Playing,
+    Paused,
+}
+
+impl Default for ReplayMode {
+    fn default() -> Self { Self::Idle }
+}
+
+#[derive(Resource)]
+struct ReplayStudio {
+    mode: ReplayMode,
+    replay: Option<ReplayFile>,
+    audience: ReplayAudience,
+    record_elapsed_ms: u64,
+    playback_ms: u64,
+    playback_speed: f32,
+    camera_sample_accumulator: f32,
+    message_counts: HashMap<String, usize>,
+    pre_playback_scene: Option<ReplayScene>,
+    export_path: String,
+    import_path: String,
+    status: String,
+    panel_open: bool,
+}
+
+impl Default for ReplayStudio {
+    fn default() -> Self {
+        Self {
+            mode: ReplayMode::Idle,
+            replay: None,
+            audience: ReplayAudience::Public,
+            record_elapsed_ms: 0,
+            playback_ms: 0,
+            playback_speed: 1.0,
+            camera_sample_accumulator: 0.0,
+            message_counts: HashMap::new(),
+            pre_playback_scene: None,
+            export_path: DEFAULT_REPLAY_PATH.to_owned(),
+            import_path: DEFAULT_REPLAY_PATH.to_owned(),
+            status: "尚未创建回放".to_owned(),
+            panel_open: true,
+        }
+    }
+}
+
+fn record_replay(
+    time: Res<Time>,
+    manager: Res<Persistent<NapcatMessageManager>>,
+    camera: Query<&Transform, With<VoxelViewportCamera>>,
+    mut studio: ResMut<ReplayStudio>,
+) {
+    if studio.mode != ReplayMode::Recording {
+        return;
+    }
+
+    let delta_seconds = time.delta_secs();
+    studio.record_elapsed_ms = studio
+        .record_elapsed_ms
+        .saturating_add((delta_seconds * 1_000.0).round() as u64);
+    studio.camera_sample_accumulator += delta_seconds;
+
+    if studio.camera_sample_accumulator >= CAMERA_SAMPLE_SECONDS {
+        studio.camera_sample_accumulator %= CAMERA_SAMPLE_SECONDS;
+        let record_elapsed_ms = studio.record_elapsed_ms;
+        if let (Ok(transform), Some(replay)) = (camera.single(), studio.replay.as_mut()) {
+            replay.camera.push(camera_keyframe(
+                record_elapsed_ms,
+                transform,
+            ));
+        }
+    }
+
+    let audience = studio.audience.clone();
+    let record_elapsed_ms = studio.record_elapsed_ms;
+    let targets = manager.messages.keys().cloned().collect::<Vec<_>>();
+    let mut captured = Vec::new();
+    for target_id in targets {
+        let messages = &manager.messages[&target_id];
+        let seen = studio
+            .message_counts
+            .get(&target_id)
+            .copied()
+            .unwrap_or_default();
+        for message in messages.iter().skip(seen) {
+            let campaign_message = manager.campaign_message_for_target(&target_id, message);
+            if audience.can_read(&campaign_message, &manager) {
+                if let Some(dialogue) = dialogue_from_message(
+                    &campaign_message,
+                    &manager,
+                    record_elapsed_ms,
+                ) {
+                    captured.push(dialogue);
+                }
+            }
+        }
+        studio.message_counts.insert(target_id, messages.len());
+    }
+    let record_elapsed_ms = studio.record_elapsed_ms;
+    if let Some(replay) = studio.replay.as_mut() {
+        replay.dialogue.extend(captured);
+        replay.duration_ms = record_elapsed_ms;
+    }
+}
+
+fn advance_replay(time: Res<Time>, mut studio: ResMut<ReplayStudio>) {
+    if studio.mode != ReplayMode::Playing {
+        return;
+    }
+    let Some(duration_ms) = studio.replay.as_ref().map(|replay| replay.duration_ms) else {
+        studio.mode = ReplayMode::Idle;
+        return;
+    };
+    let delta_ms = (time.delta_secs() * studio.playback_speed * 1_000.0).round() as u64;
+    studio.playback_ms = studio.playback_ms.saturating_add(delta_ms).min(duration_ms);
+    if studio.playback_ms >= duration_ms {
+        studio.mode = ReplayMode::Paused;
+    }
+}
+
+fn apply_replay_camera(
+    studio: Res<ReplayStudio>,
+    mut camera: Query<&mut Transform, With<VoxelViewportCamera>>,
+) {
+    if !matches!(
+        studio.mode,
+        ReplayMode::Playing | ReplayMode::Paused
+    ) {
+        return;
+    }
+    let Some(replay) = studio.replay.as_ref() else { return };
+    let Some(transform) = interpolated_camera(&replay.camera, studio.playback_ms) else {
+        return;
+    };
+    if let Ok(mut camera) = camera.single_mut() {
+        *camera = transform;
+    }
+}
+
+fn replay_studio_ui(
+    mut contexts: EguiContexts,
+    manager: Res<Persistent<NapcatMessageManager>>,
+    mut studio: ResMut<ReplayStudio>,
+    camera: Query<&Transform, With<VoxelViewportCamera>>,
+    mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    mut avatar_textures: Local<HashMap<String, egui::TextureHandle>>,
+) {
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+
+    egui::Area::new(egui::Id::new("replay-studio-button"))
+        .anchor(
+            egui::Align2::RIGHT_TOP,
+            egui::vec2(-12.0, 44.0),
+        )
+        .show(ctx, |ui| {
+            if ui.button("🎬 回放").clicked() {
+                studio.panel_open = !studio.panel_open;
+            }
+        });
+
+    if studio.panel_open {
+        let mut open = studio.panel_open;
+        egui::Window::new("TRPG 回放工作室")
+            .id(egui::Id::new("trpg-replay-studio"))
+            .open(&mut open)
+            .default_width(390.0)
+            .show(ctx, |ui| {
+                replay_controls(
+                    ui,
+                    &manager,
+                    &mut studio,
+                    &camera,
+                    &mut grids,
+                )
+            });
+        studio.panel_open = open;
+    }
+
+    if matches!(
+        studio.mode,
+        ReplayMode::Playing | ReplayMode::Paused
+    ) {
+        if let Some(dialogue) = studio
+            .replay
+            .as_ref()
+            .and_then(|replay| active_dialogue(&replay.dialogue, studio.playback_ms))
+            .cloned()
+        {
+            dialogue_overlay(ctx, &dialogue, &mut avatar_textures);
+        }
+    }
+}
+
+fn replay_controls(
+    ui: &mut egui::Ui,
+    manager: &NapcatMessageManager,
+    studio: &mut ReplayStudio,
+    camera: &Query<&Transform, With<VoxelViewportCamera>>,
+    grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+) {
+    ui.label("记录体素场景、自由镜头和可见对话，并在应用内确定性回放。");
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("发布范围");
+        egui::ComboBox::from_id_salt("replay-audience")
+            .selected_text(studio.audience.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut studio.audience,
+                    ReplayAudience::Public,
+                    "公开",
+                );
+                if let Some(group) = manager.current_group() {
+                    let mut parties = group.parties.keys().cloned().collect::<Vec<_>>();
+                    parties.sort();
+                    for party in parties {
+                        ui.selectable_value(
+                            &mut studio.audience,
+                            ReplayAudience::Party(party.clone()),
+                            format!("队伍：{party}"),
+                        );
+                    }
+                    let mut players = group
+                        .players
+                        .iter()
+                        .filter_map(|id| id.parse::<u64>().ok())
+                        .collect::<Vec<_>>();
+                    players.sort_unstable();
+                    for player in players {
+                        ui.selectable_value(
+                            &mut studio.audience,
+                            ReplayAudience::Player(player),
+                            format!("玩家：{player}"),
+                        );
+                    }
+                }
+                ui.selectable_value(
+                    &mut studio.audience,
+                    ReplayAudience::Gm,
+                    "GM（包含私密内容）",
+                );
+            });
+    });
+    if studio.audience == ReplayAudience::Gm {
+        ui.colored_label(
+            egui::Color32::from_rgb(210, 90, 70),
+            "GM 回放可能包含私聊、隐藏队伍和系统内容，请勿公开发布。",
+        );
+    }
+
+    ui.horizontal(|ui| match studio.mode {
+        ReplayMode::Recording => {
+            ui.label(format!(
+                "● 录制中 {}",
+                format_time(studio.record_elapsed_ms)
+            ));
+            if ui.button("停止录制").clicked() {
+                stop_recording(studio);
+            }
+        },
+        ReplayMode::Playing | ReplayMode::Paused => {
+            if ui
+                .button(if studio.mode == ReplayMode::Playing { "暂停" } else { "继续" })
+                .clicked()
+            {
+                studio.mode = if studio.mode == ReplayMode::Playing {
+                    ReplayMode::Paused
+                } else {
+                    ReplayMode::Playing
+                };
+            }
+            if ui.button("停止回放").clicked() {
+                stop_playback(studio, grids);
+            }
+        },
+        ReplayMode::Idle => {
+            if ui.button("开始录制").clicked() {
+                start_recording(studio, manager, camera, grids);
+            }
+            if ui.button("从现有聊天生成").clicked() {
+                build_from_history(studio, manager, camera, grids);
+            }
+        },
+    });
+
+    if let Some(replay) = studio.replay.as_ref() {
+        ui.label(format!(
+            "{} · {} · {} 个镜头帧 · {} 条对话 · {} 个体素",
+            replay.title,
+            format_time(replay.duration_ms),
+            replay.camera.len(),
+            replay.dialogue.len(),
+            replay.scene.voxels.len(),
+        ));
+    }
+
+    if !matches!(studio.mode, ReplayMode::Recording) && studio.replay.is_some() {
+        let duration = studio.replay.as_ref().unwrap().duration_ms.max(1);
+        ui.horizontal(|ui| {
+            if !matches!(
+                studio.mode,
+                ReplayMode::Playing | ReplayMode::Paused
+            ) && ui.button("▶ 播放").clicked()
+            {
+                start_playback(studio, grids);
+            }
+            ui.add(
+                egui::Slider::new(&mut studio.playback_ms, 0..=duration)
+                    .show_value(false)
+                    .text("时间轴"),
+            );
+            ui.label(format!(
+                "{} / {}",
+                format_time(studio.playback_ms),
+                format_time(duration)
+            ));
+        });
+        ui.horizontal(|ui| {
+            ui.label("速度");
+            for speed in [0.5, 1.0, 2.0, 4.0] {
+                ui.selectable_value(
+                    &mut studio.playback_speed,
+                    speed,
+                    format!("{speed}×"),
+                );
+            }
+        });
+    }
+
+    ui.separator();
+    ui.label("导出路径");
+    ui.text_edit_singleline(&mut studio.export_path);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                studio.replay.is_some(),
+                egui::Button::new("导出回放"),
+            )
+            .clicked()
+        {
+            studio.status = match studio
+                .replay
+                .as_ref()
+                .ok_or_else(|| "没有可导出的回放".to_owned())
+                .and_then(|replay| export_replay(replay, &studio.export_path))
+            {
+                Ok(()) => format!("已导出到 {}", studio.export_path),
+                Err(err) => format!("导出失败：{err}"),
+            };
+        }
+    });
+    ui.label("导入路径");
+    ui.text_edit_singleline(&mut studio.import_path);
+    if ui.button("导入回放").clicked() {
+        match import_replay(&studio.import_path) {
+            Ok(replay) => {
+                stop_playback(studio, grids);
+                studio.playback_ms = 0;
+                studio.audience = replay.audience.clone();
+                studio.status = format!("已导入：{}", replay.title);
+                studio.replay = Some(replay);
+            },
+            Err(err) => studio.status = format!("导入失败：{err}"),
+        }
+    }
+    if !studio.status.is_empty() {
+        ui.small(studio.status.as_str());
+    }
+}
+
+fn start_recording(
+    studio: &mut ReplayStudio,
+    manager: &NapcatMessageManager,
+    camera: &Query<&Transform, With<VoxelViewportCamera>>,
+    grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+) {
+    let Some(campaign_id) = manager.active_campaign_id() else {
+        studio.status = "请先选择跑团组（战役）".to_owned();
+        return;
+    };
+    let scene = grids
+        .single_mut()
+        .map(|grid| capture_scene(&grid))
+        .unwrap_or_default();
+    let mut replay = new_replay(
+        manager,
+        campaign_id,
+        studio.audience.clone(),
+        scene,
+    );
+    if let Ok(transform) = camera.single() {
+        replay.camera.push(camera_keyframe(0, transform));
+    }
+    studio.message_counts = manager
+        .messages
+        .iter()
+        .map(|(target, messages)| (target.clone(), messages.len()))
+        .collect();
+    studio.record_elapsed_ms = 0;
+    studio.camera_sample_accumulator = 0.0;
+    studio.playback_ms = 0;
+    studio.replay = Some(replay);
+    studio.mode = ReplayMode::Recording;
+    studio.status = "开始录制；只会收录所选发布范围可见的消息".to_owned();
+}
+
+fn stop_recording(studio: &mut ReplayStudio) {
+    if let Some(replay) = studio.replay.as_mut() {
+        replay.duration_ms = studio.record_elapsed_ms.max(
+            replay
+                .dialogue
+                .iter()
+                .map(|line| line.time_ms.saturating_add(line.duration_ms))
+                .max()
+                .unwrap_or_default(),
+        );
+    }
+    studio.mode = ReplayMode::Idle;
+    studio.playback_ms = 0;
+    studio.status = "录制已停止，可以预览或导出".to_owned();
+}
+
+fn build_from_history(
+    studio: &mut ReplayStudio,
+    manager: &NapcatMessageManager,
+    camera: &Query<&Transform, With<VoxelViewportCamera>>,
+    grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+) {
+    let Some(campaign_id) = manager.active_campaign_id() else {
+        studio.status = "请先选择跑团组（战役）".to_owned();
+        return;
+    };
+    let scene = grids
+        .single_mut()
+        .map(|grid| capture_scene(&grid))
+        .unwrap_or_default();
+    let mut replay = new_replay(
+        manager,
+        campaign_id.clone(),
+        studio.audience.clone(),
+        scene,
+    );
+    let mut visible = manager
+        .messages
+        .iter()
+        .flat_map(|(target, messages)| {
+            messages
+                .iter()
+                .map(|message| manager.campaign_message_for_target(target, message))
+                .collect::<Vec<_>>()
+        })
+        .filter(|message| message.campaign_id == campaign_id)
+        .filter(|message| studio.audience.can_read(message, manager))
+        .filter(|message| !message.text.trim().is_empty())
+        .collect::<Vec<_>>();
+    visible.sort_by_key(|message| message.time);
+    let first_time = visible
+        .first()
+        .map(|message| message.time)
+        .unwrap_or_default();
+    for message in &visible {
+        let time_ms = message
+            .time
+            .saturating_sub(first_time)
+            .saturating_mul(1_000);
+        if let Some(dialogue) = dialogue_from_message(message, manager, time_ms) {
+            replay.dialogue.push(dialogue);
+        }
+    }
+    replay.duration_ms = replay
+        .dialogue
+        .iter()
+        .map(|line| line.time_ms.saturating_add(line.duration_ms))
+        .max()
+        .unwrap_or(5_000);
+    if let Ok(transform) = camera.single() {
+        replay.camera.push(camera_keyframe(0, transform));
+        replay.camera.push(camera_keyframe(
+            replay.duration_ms,
+            transform,
+        ));
+    }
+    studio.playback_ms = 0;
+    studio.replay = Some(replay);
+    studio.status = format!(
+        "已从现有聊天生成 {0} 条对话",
+        visible.len()
+    );
+}
+
+fn new_replay(
+    manager: &NapcatMessageManager,
+    campaign_id: String,
+    audience: ReplayAudience,
+    scene: ReplayScene,
+) -> ReplayFile {
+    let title = manager
+        .current_trpg_group
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("TRPG 回放")
+        .to_owned();
+    ReplayFile {
+        format_version: REPLAY_FORMAT_VERSION,
+        title,
+        campaign_id,
+        created_at_unix_ms: unix_time_ms(),
+        duration_ms: 0,
+        audience,
+        scene,
+        camera: Vec::new(),
+        dialogue: Vec::new(),
+    }
+}
+
+fn start_playback(
+    studio: &mut ReplayStudio,
+    grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+) {
+    let Some(scene) = studio.replay.as_ref().map(|replay| replay.scene.clone()) else {
+        return;
+    };
+    if let Ok(mut grid) = grids.single_mut() {
+        studio.pre_playback_scene = Some(capture_scene(&grid));
+        apply_scene(&mut grid, &scene);
+    }
+    studio.playback_ms = studio.playback_ms.min(
+        studio
+            .replay
+            .as_ref()
+            .map(|replay| replay.duration_ms)
+            .unwrap_or_default(),
+    );
+    studio.mode = ReplayMode::Playing;
+    studio.status = "正在回放；停止后会恢复当前体素场景".to_owned();
+}
+
+fn stop_playback(studio: &mut ReplayStudio, grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>) {
+    if let Some(scene) = studio.pre_playback_scene.take() {
+        if let Ok(mut grid) = grids.single_mut() {
+            apply_scene(&mut grid, &scene);
+        }
+    }
+    if matches!(
+        studio.mode,
+        ReplayMode::Playing | ReplayMode::Paused
+    ) {
+        studio.mode = ReplayMode::Idle;
+    }
+    studio.playback_ms = 0;
+}
+
+fn capture_scene(grid: &Grid<u8>) -> ReplayScene {
+    let voxels = grid
+        .iter()
+        .flat_map(|(chunk_position, chunk)| {
+            prism(IVec3::ZERO, DIMS).filter_map(move |local| {
+                let material = chunk[local];
+                (material != 0).then_some(ReplayVoxel {
+                    position: (*chunk_position * DIMS + local).to_array(),
+                    material,
+                })
+            })
+        })
+        .collect();
+    ReplayScene { voxels }
+}
+
+fn apply_scene(grid: &mut Mut<Grid<u8>>, scene: &ReplayScene) {
+    let occupied = grid
+        .iter()
+        .flat_map(|(chunk_position, chunk)| {
+            prism(IVec3::ZERO, DIMS)
+                .filter(|local| chunk[*local] != 0)
+                .map(|local| *chunk_position * DIMS + local)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for cell in occupied {
+        grid.set(cell, 0);
+    }
+    for voxel in &scene.voxels {
+        grid.set(
+            IVec3::from_array(voxel.position),
+            voxel.material,
+        );
+    }
+}
+
+fn camera_keyframe(time_ms: u64, transform: &Transform) -> ReplayCameraKeyframe {
+    ReplayCameraKeyframe {
+        time_ms,
+        translation: transform.translation.to_array(),
+        rotation: transform.rotation.to_array(),
+    }
+}
+
+fn interpolated_camera(frames: &[ReplayCameraKeyframe], time_ms: u64) -> Option<Transform> {
+    let first = frames.first()?;
+    let next_index = frames.partition_point(|frame| frame.time_ms <= time_ms);
+    if next_index == 0 {
+        return Some(frame_transform(first));
+    }
+    if next_index >= frames.len() {
+        return Some(frame_transform(frames.last().unwrap()));
+    }
+    let left = &frames[next_index - 1];
+    let right = &frames[next_index];
+    let span = right.time_ms.saturating_sub(left.time_ms).max(1);
+    let t = time_ms.saturating_sub(left.time_ms) as f32 / span as f32;
+    let left_rotation = Quat::from_array(left.rotation).normalize();
+    let right_rotation = Quat::from_array(right.rotation).normalize();
+    Some(Transform {
+        translation: Vec3::from_array(left.translation)
+            .lerp(Vec3::from_array(right.translation), t),
+        rotation: left_rotation.slerp(right_rotation, t),
+        ..default()
+    })
+}
+
+fn frame_transform(frame: &ReplayCameraKeyframe) -> Transform {
+    Transform {
+        translation: Vec3::from_array(frame.translation),
+        rotation: Quat::from_array(frame.rotation).normalize(),
+        ..default()
+    }
+}
+
+fn dialogue_from_message(
+    message: &CampaignMessage,
+    manager: &NapcatMessageManager,
+    time_ms: u64,
+) -> Option<ReplayDialogue> {
+    let text = message.text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let character = manager
+        .player_characters
+        .get(&message.sender_id.to_string());
+    let (name, role, avatar) = dialogue_identity(message, character);
+    Some(ReplayDialogue {
+        time_ms,
+        duration_ms: dialogue_duration_ms(text),
+        sender_id: message.sender_id,
+        name,
+        role,
+        text: text.to_owned(),
+        avatar,
+        avatar_data_url: None,
+        visibility: message.visibility.clone(),
+    })
+}
+
+fn dialogue_identity(
+    message: &CampaignMessage,
+    character: Option<&PlayerCharacter>,
+) -> (String, String, String) {
+    let Some(character) = character else {
+        return (
+            message.sender_name.clone(),
+            String::new(),
+            String::new(),
+        );
+    };
+    let name = if character.nickname.trim().is_empty() {
+        if character.name.trim().is_empty() {
+            message.sender_name.clone()
+        } else {
+            character.name.clone()
+        }
+    } else {
+        character.nickname.clone()
+    };
+    let role = if !character.name.trim().is_empty() && character.name.trim() != name.trim() {
+        character.name.clone()
+    } else {
+        String::new()
+    };
+    (name, role, character.image.clone())
+}
+
+fn dialogue_duration_ms(text: &str) -> u64 {
+    (text.chars().count() as u64 * 90 + 1_800).clamp(MIN_DIALOGUE_MS, MAX_DIALOGUE_MS)
+}
+
+fn active_dialogue(dialogue: &[ReplayDialogue], time_ms: u64) -> Option<&ReplayDialogue> {
+    dialogue
+        .iter()
+        .rev()
+        .find(|line| time_ms >= line.time_ms && time_ms < line.time_ms + line.duration_ms)
+}
+
+fn dialogue_overlay(
+    ctx: &egui::Context,
+    dialogue: &ReplayDialogue,
+    textures: &mut HashMap<String, egui::TextureHandle>,
+) {
+    let screen = ctx.content_rect();
+    let box_height = (screen.height() * 0.27).clamp(150.0, 290.0);
+    let margin = (screen.width() * 0.035).clamp(24.0, 70.0);
+    let dialogue_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            screen.left() + margin,
+            screen.bottom() - margin - box_height,
+        ),
+        egui::pos2(
+            screen.right() - margin,
+            screen.bottom() - margin,
+        ),
+    );
+    let layer = egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("replay-dialogue"),
+    );
+    let painter = ctx.layer_painter(layer);
+    painter.rect_filled(
+        dialogue_rect,
+        0.0,
+        egui::Color32::from_white_alpha(235),
+    );
+    painter.rect_stroke(
+        dialogue_rect,
+        0.0,
+        egui::Stroke::new(2.0, egui::Color32::from_gray(25)),
+        egui::StrokeKind::Inside,
+    );
+
+    let avatar_width = (screen.width() * 0.30).clamp(230.0, 520.0);
+    let avatar_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            dialogue_rect.right() - avatar_width,
+            screen.top() + 70.0,
+        ),
+        egui::pos2(
+            dialogue_rect.right() - 15.0,
+            dialogue_rect.top() + 28.0,
+        ),
+    );
+    if let Some(texture) = replay_avatar_texture(ctx, dialogue, textures) {
+        let size = texture.size_vec2();
+        let scale = (avatar_rect.width() / size.x)
+            .min(avatar_rect.height() / size.y)
+            .max(0.0);
+        let fitted_size = size * scale;
+        let fitted_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                avatar_rect.center().x - fitted_size.x * 0.5,
+                avatar_rect.bottom() - fitted_size.y,
+            ),
+            fitted_size,
+        );
+        painter.image(
+            texture.id(),
+            fitted_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    } else {
+        let center = egui::pos2(
+            avatar_rect.center().x,
+            avatar_rect.bottom() - 82.0,
+        );
+        painter.circle_filled(
+            center,
+            72.0,
+            egui::Color32::from_rgb(214, 116, 154),
+        );
+        painter.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            dialogue.name.chars().next().unwrap_or('角'),
+            egui::FontId::proportional(54.0),
+            egui::Color32::WHITE,
+        );
+    }
+
+    let name_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            dialogue_rect.left() + 40.0,
+            dialogue_rect.top() - 102.0,
+        ),
+        egui::vec2(225.0, 66.0),
+    );
+    painter.rect_filled(
+        name_rect,
+        0.0,
+        egui::Color32::from_white_alpha(245),
+    );
+    painter.rect_stroke(
+        name_rect,
+        0.0,
+        egui::Stroke::new(2.0, egui::Color32::from_gray(25)),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        name_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        &dialogue.name,
+        egui::FontId::proportional(34.0),
+        egui::Color32::from_gray(25),
+    );
+    if !dialogue.role.trim().is_empty() {
+        let role_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                name_rect.left() + 20.0,
+                name_rect.bottom(),
+            ),
+            egui::vec2(180.0, 38.0),
+        );
+        painter.rect_filled(
+            role_rect,
+            0.0,
+            egui::Color32::from_rgb(238, 107, 160),
+        );
+        painter.text(
+            role_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            &dialogue.role,
+            egui::FontId::proportional(21.0),
+            egui::Color32::from_gray(30),
+        );
+    }
+    let text_width = (dialogue_rect.width() - avatar_width * 0.45 - 90.0).max(240.0);
+    let galley = painter.layout(
+        dialogue.text.clone(),
+        egui::FontId::proportional((screen.width() / 52.0).clamp(25.0, 42.0)),
+        egui::Color32::from_gray(35),
+        text_width,
+    );
+    painter.galley(
+        egui::pos2(
+            dialogue_rect.left() + 70.0,
+            dialogue_rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        egui::Color32::from_gray(35),
+    );
+}
+
+fn replay_avatar_texture(
+    ctx: &egui::Context,
+    dialogue: &ReplayDialogue,
+    textures: &mut HashMap<String, egui::TextureHandle>,
+) -> Option<egui::TextureHandle> {
+    let key = dialogue
+        .avatar_data_url
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(dialogue.avatar.as_str())
+        .trim();
+    if key.is_empty() {
+        return None;
+    }
+    if let Some(texture) = textures.get(key) {
+        return Some(texture.clone());
+    }
+    let bytes = if let Some((_, encoded)) = key.split_once(";base64,") {
+        BASE64.decode(encoded).ok()?
+    } else {
+        fs::read(key).ok()?
+    };
+    let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    let texture = ctx.load_texture(
+        format!("replay-avatar:{key}"),
+        color_image,
+        egui::TextureOptions::LINEAR,
+    );
+    textures.insert(key.to_owned(), texture.clone());
+    Some(texture)
+}
+
+fn export_replay(replay: &ReplayFile, path: &str) -> Result<(), String> {
+    let mut portable = replay.clone();
+    for dialogue in &mut portable.dialogue {
+        if dialogue.avatar_data_url.is_none() {
+            dialogue.avatar_data_url = avatar_data_url(&dialogue.avatar);
+        }
+    }
+    let bytes = serde_json::to_vec(&portable).map_err(|err| err.to_string())?;
+    let path = normalized_path(path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::write(&path, bytes).map_err(|err| err.to_string())
+}
+
+fn import_replay(path: &str) -> Result<ReplayFile, String> {
+    let path = normalized_path(path)?;
+    let bytes = fs::read(path).map_err(|err| err.to_string())?;
+    let replay: ReplayFile = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
+    if replay.format_version != REPLAY_FORMAT_VERSION {
+        return Err(format!(
+            "不支持的回放版本 {}（当前支持 {}）",
+            replay.format_version, REPLAY_FORMAT_VERSION
+        ));
+    }
+    Ok(replay)
+}
+
+fn avatar_data_url(source: &str) -> Option<String> {
+    let path = source.trim();
+    if path.is_empty() || path.starts_with("http://") || path.starts_with("https://") {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let mime = match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        _ => "image/png",
+    };
+    Some(format!(
+        "data:{mime};base64,{}",
+        BASE64.encode(bytes)
+    ))
+}
+
+fn normalized_path(path: &str) -> Result<PathBuf, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("路径不能为空".to_owned());
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn format_time(time_ms: u64) -> String {
+    let seconds = time_ms / 1_000;
+    format!(
+        "{:02}:{:02}",
+        seconds / 60,
+        seconds % 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_replay_excludes_private_dialogue() {
+        assert!(ReplayAudience::Public.can_read_visibility(&Visibility::Public, None));
+        assert!(!ReplayAudience::Public.can_read_visibility(&Visibility::Player(7), None));
+        assert!(
+            !ReplayAudience::Public.can_read_visibility(
+                &Visibility::Party("split-a".to_owned()),
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn party_replay_only_includes_its_party_and_public() {
+        let audience = ReplayAudience::Party("split-a".to_owned());
+        assert!(audience.can_read_visibility(&Visibility::Public, None));
+        assert!(audience.can_read_visibility(
+            &Visibility::Party("split-a".to_owned()),
+            None
+        ));
+        assert!(!audience.can_read_visibility(
+            &Visibility::Party("split-b".to_owned()),
+            None
+        ));
+    }
+
+    #[test]
+    fn player_and_gm_replays_follow_access_rules() {
+        let access = PlayerAccess {
+            player_id: 7,
+            party_id: Some("split-a".to_owned()),
+            ..Default::default()
+        };
+        let player = ReplayAudience::Player(7);
+        assert!(player.can_read_visibility(&Visibility::Player(7), Some(&access)));
+        assert!(player.can_read_visibility(
+            &Visibility::Party("split-a".to_owned()),
+            Some(&access),
+        ));
+        assert!(!player.can_read_visibility(&Visibility::Player(8), Some(&access)));
+        assert!(ReplayAudience::Gm.can_read_visibility(&Visibility::Gm, None));
+        assert!(ReplayAudience::Gm.can_read_visibility(&Visibility::System, None));
+    }
+
+    #[test]
+    fn camera_interpolation_is_smooth_and_clamped() {
+        let frames = vec![
+            ReplayCameraKeyframe {
+                time_ms: 0,
+                translation: [0.0, 0.0, 0.0],
+                rotation: Quat::IDENTITY.to_array(),
+            },
+            ReplayCameraKeyframe {
+                time_ms: 1_000,
+                translation: [10.0, 0.0, 0.0],
+                rotation: Quat::from_rotation_y(1.0).to_array(),
+            },
+        ];
+        assert_eq!(
+            interpolated_camera(&frames, 500).unwrap().translation.x,
+            5.0
+        );
+        assert_eq!(
+            interpolated_camera(&frames, 2_000).unwrap().translation.x,
+            10.0
+        );
+    }
+
+    #[test]
+    fn dialogue_duration_is_readable_and_bounded() {
+        assert_eq!(
+            dialogue_duration_ms("短句"),
+            MIN_DIALOGUE_MS
+        );
+        assert_eq!(
+            dialogue_duration_ms(&"长".repeat(1_000)),
+            MAX_DIALOGUE_MS
+        );
+    }
+}

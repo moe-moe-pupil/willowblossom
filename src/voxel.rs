@@ -183,7 +183,7 @@ impl Connector for TrpgVoxelConnector {
 pub struct TrpgVoxelGrid;
 
 #[derive(Component)]
-struct VoxelViewportCamera;
+pub(crate) struct VoxelViewportCamera;
 
 #[derive(Component)]
 struct VoxelPlayerCaptureCamera {

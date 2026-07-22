@@ -3,6 +3,7 @@ mod camera;
 mod deepseek;
 mod moonberry_talents;
 mod napcat;
+mod replay;
 pub mod rule_engine;
 mod scene;
 mod ui;
@@ -237,6 +238,7 @@ impl Plugin for GamePlugin {
             battle_round::BattleRoundPlugin,
             camera::CameraPlugin,
             napcat::NapcatPlugin,
+            replay::ReplayPlugin,
             rule_engine::RuleEnginePlugin,
             ui::UIPlugin,
             voxel::TrpgVoxelPlugin,

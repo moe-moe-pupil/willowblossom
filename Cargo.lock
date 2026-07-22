@@ -9067,6 +9067,7 @@ dependencies = [
  "ab_glyph",
  "async-compat",
  "avian3d",
+ "base64",
  "bevy",
  "bevy-inspector-egui",
  "bevy-persistent",
