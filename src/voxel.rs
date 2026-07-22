@@ -108,7 +108,7 @@ const MAX_RAY_DISTANCE: f32 = 200.0;
 const PLANET_MAX_RAY_DISTANCE: f32 = 600.0;
 const EDIT_REPEAT_DELAY: f32 = 0.32;
 const EDIT_REPEAT_INTERVAL: f32 = 0.09;
-const TRPG_PHYSICS_SUBSTEPS: u32 = 2;
+const TRPG_PHYSICS_SUBSTEPS: u32 = 1;
 const ORBITAL_PLANET_RADIUS: f32 = 12.125 * 10.0;
 // Keep the old upper surface at the same scene height after increasing radius.
 const ORBITAL_PLANET_CENTER: Vec3 = Vec3::new(0.0, -251.125, 0.0);
@@ -116,7 +116,6 @@ const ORBITAL_PLANET_VOXEL_RADIUS: i32 = 485;
 const ORBITAL_PLANET_CAP_RADIUS: i32 = 128;
 const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
-const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 40;
 const VOXEL_MATERIAL_COUNT: usize = 10;
 const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
 const VOXEL_RADIANCE_MAX_DIMENSION: i32 = 192;
@@ -1044,8 +1043,8 @@ impl Plugin for TrpgVoxelPlugin {
             ConnectivityPlugin::<TrpgVoxelConnector>::default(),
             VoxelRadianceCascadePlugin,
         ))
-        // Avian defaults to six substeps. Two is sufficient for this creative TRPG scene and
-        // avoids repeating the solver six times when an explosion creates many fragments.
+        // Player observation is a prepared screenshot, so one inexpensive physics substep is
+        // sufficient and avoids repeating the solver when explosions create many fragments.
         .insert_resource(SubstepCount(TRPG_PHYSICS_SUBSTEPS))
         .insert_resource(Gravity::ZERO)
         .init_resource::<VoxelEditorState>()
@@ -1085,6 +1084,7 @@ impl Plugin for TrpgVoxelPlugin {
                     place_creative_light,
                     sync_selected_voxel_light,
                     edit_voxel_grid,
+                    despawn_unsupported_voxel_auto_doors,
                     use_voxel_teleport_tool,
                     drag_voxel_physics_body,
                     make_selection_physical,
@@ -2455,6 +2455,43 @@ fn voxel_auto_door_should_open(door: &VoxelAutoDoor, player_position: Vec3) -> b
     );
     horizontal.length() <= door.trigger_radius
         && (player_position.y - door.trigger_center.y).abs() <= door.trigger_half_height
+}
+
+fn voxel_auto_door_has_support(grid: &Grid<u8>, door_cells: &HashSet<IVec3>) -> bool {
+    door_cells.iter().any(|cell| {
+        VOXEL_NEIGHBORS.into_iter().any(|offset| {
+            let neighbor = *cell + offset;
+            !door_cells.contains(&neighbor)
+                && grid.get(neighbor).is_some_and(TrpgVoxelConnector::solid)
+        })
+    })
+}
+
+fn despawn_unsupported_voxel_auto_doors(
+    mut commands: Commands,
+    grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
+    doors: Query<(Entity, &VoxelAutoDoor)>,
+) {
+    let Ok(grid) = grids.single() else { return };
+    let mut groups = HashMap::<(u32, u32, u32), (Vec<Entity>, HashSet<IVec3>)>::new();
+    for (entity, door) in &doors {
+        let key = (
+            door.trigger_center.x.to_bits(),
+            door.trigger_center.y.to_bits(),
+            door.trigger_center.z.to_bits(),
+        );
+        let (entities, cells) = groups.entry(key).or_default();
+        entities.push(entity);
+        cells.extend(door.cells.iter().copied());
+    }
+    for (_, (entities, cells)) in groups {
+        if voxel_auto_door_has_support(grid, &cells) {
+            continue;
+        }
+        for entity in entities {
+            commands.entity(entity).despawn();
+        }
+    }
 }
 
 fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
@@ -4889,37 +4926,7 @@ fn physics_body_intersects_radius(
     })
 }
 
-fn allocate_fragment_parts(source_sizes: &[usize], max_parts: usize) -> Vec<usize> {
-    let mut counts = vec![0; source_sizes.len()];
-    let initial_parts = source_sizes
-        .iter()
-        .filter(|size| **size > 0)
-        .count()
-        .min(max_parts);
-    for (count, _) in counts
-        .iter_mut()
-        .zip(source_sizes.iter())
-        .filter(|(_, size)| **size > 0)
-        .take(initial_parts)
-    {
-        *count = 1;
-    }
-
-    let mut remaining = max_parts.saturating_sub(initial_parts);
-    while remaining > 0 {
-        let Some(index) = (0..source_sizes.len())
-            .filter(|index| counts[*index] > 0 && counts[*index] < source_sizes[*index])
-            .max_by(|left, right| {
-                (source_sizes[*left] * counts[*right]).cmp(&(source_sizes[*right] * counts[*left]))
-            })
-        else {
-            break;
-        };
-        counts[index] += 1;
-        remaining -= 1;
-    }
-    counts
-}
+fn explosion_fragment_part_counts(source_sizes: &[usize]) -> Vec<usize> { source_sizes.to_vec() }
 
 #[derive(Clone, Copy)]
 struct FragmentRng(u64);
@@ -5124,7 +5131,7 @@ fn spawn_planet_explosion_fragments(
     removed: Vec<(IVec3, u8)>,
     fragment_seed: u64,
 ) -> Vec<Entity> {
-    let part_count = removed.len().min(MAX_EXPLOSION_NEW_PHYSICS_BODIES);
+    let part_count = removed.len();
     let mut fragments = Vec::with_capacity(part_count);
     for cells in split_voxel_cells_randomly(removed, part_count, fragment_seed) {
         let origin = cells
@@ -5941,10 +5948,7 @@ fn edit_voxel_grid(
                 .chain(std::iter::once(selected.len()))
                 .filter(|size| *size > 0)
                 .collect::<Vec<_>>();
-            let part_counts = allocate_fragment_parts(
-                &source_sizes,
-                MAX_EXPLOSION_NEW_PHYSICS_BODIES,
-            );
+            let part_counts = explosion_fragment_part_counts(&source_sizes);
             let affected_body_count = affected_bodies.len();
             for (
                 source_index,
@@ -8076,8 +8080,8 @@ mod tests {
     }
 
     #[test]
-    fn trpg_physics_uses_fewer_substeps_than_avian_default() {
-        assert_eq!(TRPG_PHYSICS_SUBSTEPS, 2);
+    fn trpg_physics_uses_one_snapshot_oriented_substep() {
+        assert_eq!(TRPG_PHYSICS_SUBSTEPS, 1);
         assert!(TRPG_PHYSICS_SUBSTEPS < SubstepCount::default().0);
     }
 
@@ -8125,6 +8129,10 @@ mod tests {
             .flat_map(|door| &door.cells)
             .all(|cell| { grid.get(*cell).copied().unwrap_or(0) == 0 }));
         for door in &doors {
+            assert!(voxel_auto_door_has_support(
+                grid,
+                &door.cells.iter().copied().collect()
+            ));
             let panels = voxel_auto_door_panels(door);
             assert!(panels.iter().all(|panel| {
                 (panel.open_translation.y - panel.closed_translation.y).abs() < f32::EPSILON
@@ -8151,6 +8159,43 @@ mod tests {
         let lights = voxel_interior_lights();
         assert_eq!(lights.len(), 88);
         assert!(lights.iter().all(|(position, _)| position.y > 0.0));
+    }
+
+    #[test]
+    fn auto_door_is_destroyed_when_all_surrounding_voxels_are_empty() {
+        let (mut app, grid_entity) = test_grid();
+        app.add_systems(
+            Update,
+            despawn_unsupported_voxel_auto_doors,
+        );
+        let door = voxel_auto_doors().remove(0);
+        let panels = voxel_auto_door_panels(&door);
+        let panel_entities = panels
+            .iter()
+            .cloned()
+            .map(|panel| app.world_mut().spawn(panel).id())
+            .collect::<Vec<_>>();
+        let door_cells = door.cells.iter().copied().collect::<HashSet<_>>();
+
+        {
+            let mut grid_entity = app.world_mut().entity_mut(grid_entity);
+            let mut grid = grid_entity.get_mut::<Grid<u8>>().unwrap();
+            for cell in &door_cells {
+                for offset in VOXEL_NEIGHBORS {
+                    grid.set(*cell + offset, 0);
+                }
+            }
+            assert!(!voxel_auto_door_has_support(
+                &grid,
+                &door_cells
+            ));
+        }
+
+        app.update();
+
+        assert!(panel_entities
+            .into_iter()
+            .all(|entity| app.world().get_entity(entity).is_err()));
     }
 
     #[test]
@@ -8538,16 +8583,13 @@ mod tests {
     }
 
     #[test]
-    fn explosion_fragment_budget_caps_large_areas_at_forty_parts() {
-        let counts = allocate_fragment_parts(
-            &[8_656],
-            MAX_EXPLOSION_NEW_PHYSICS_BODIES,
-        );
-        assert_eq!(counts, vec![40]);
+    fn explosion_fragment_count_is_not_capped() {
+        let counts = explosion_fragment_part_counts(&[8_656]);
+        assert_eq!(counts, vec![8_656]);
 
         let cells = (0..8_656).map(|x| (IVec3::new(x, 0, 0), 1)).collect();
         let parts = split_voxel_cells_randomly(cells, counts[0], 7);
-        assert_eq!(parts.len(), 40);
+        assert_eq!(parts.len(), 8_656);
         assert_eq!(
             parts.iter().map(Vec::len).sum::<usize>(),
             8_656
@@ -8614,18 +8656,15 @@ mod tests {
     }
 
     #[test]
-    fn each_explosion_gets_forty_new_parts_regardless_of_existing_bodies() {
+    fn each_explosion_splits_every_affected_voxel() {
         let unaffected_existing_body_count = 250;
-        let counts = allocate_fragment_parts(
-            &[12, 8, 8_656],
-            MAX_EXPLOSION_NEW_PHYSICS_BODIES,
-        );
+        let counts = explosion_fragment_part_counts(&[12, 8, 8_656]);
 
         let new_body_count = counts.iter().sum::<usize>();
-        assert_eq!(new_body_count, 40);
+        assert_eq!(new_body_count, 8_676);
         assert_eq!(
             unaffected_existing_body_count + new_body_count,
-            290
+            8_926
         );
         assert!(counts.iter().all(|count| *count > 0));
     }
