@@ -69,15 +69,16 @@ use crate::{
     voxel::{
         cached_or_local_voxel_standee_path,
         TrpgVoxelGrid,
+        VoxelPlayerStandee,
         VoxelViewportCamera,
     },
 };
 
 const REPLAY_FORMAT_VERSION: u32 = 1;
 const CAMERA_SAMPLE_SECONDS: f32 = 0.1;
-const MIN_DIALOGUE_MS: u64 = 1_800;
-const MAX_DIALOGUE_MS: u64 = 6_500;
-const HISTORY_DIALOGUE_GAP_MS: u64 = 180;
+const MIN_DIALOGUE_MS: u64 = 900;
+const MAX_DIALOGUE_MS: u64 = 3_250;
+const HISTORY_DIALOGUE_GAP_MS: u64 = 90;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
@@ -253,6 +254,8 @@ struct ReplayStudio {
     video_fps: u32,
     music_enabled: bool,
     music_volume: f32,
+    speech_enabled: bool,
+    speech_volume: f32,
     project_export_path: String,
     project_import_path: String,
     video_render: Option<VideoRenderJob>,
@@ -269,6 +272,9 @@ struct VideoRenderJob {
     duration_ms: u64,
     music_enabled: bool,
     music_volume: f32,
+    speech_enabled: bool,
+    speech_volume: f32,
+    dialogue: Vec<ReplayDialogue>,
     total_frames: u64,
     next_frame: u64,
     capture_pending: bool,
@@ -301,6 +307,8 @@ impl Default for ReplayStudio {
             video_fps: 15,
             music_enabled: true,
             music_volume: 0.35,
+            speech_enabled: true,
+            speech_volume: 0.90,
             project_export_path: DEFAULT_REPLAY_PATH.to_owned(),
             project_import_path: DEFAULT_REPLAY_PATH.to_owned(),
             video_render: None,
@@ -507,6 +515,9 @@ fn finish_video_capture(
     let duration_ms = job.duration_ms;
     let music_enabled = job.music_enabled;
     let music_volume = job.music_volume;
+    let speech_enabled = job.speech_enabled;
+    let speech_volume = job.speech_volume;
+    let dialogue = job.dialogue;
     let (sender, receiver) = bounded(1);
     thread::spawn(move || {
         let result = encode_video_frames(
@@ -516,6 +527,9 @@ fn finish_video_capture(
             duration_ms,
             music_enabled,
             music_volume,
+            speech_enabled,
+            speech_volume,
+            &dialogue,
         );
         let _ = sender.send(result);
     });
@@ -574,6 +588,7 @@ fn replay_studio_ui(
     mut deepseek_manager: ResMut<Persistent<DeepseekManager>>,
     mut studio: ResMut<ReplayStudio>,
     camera: Query<&Transform, With<VoxelViewportCamera>>,
+    standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut capture_active: ResMut<ReplayVideoCaptureActive>,
@@ -608,6 +623,7 @@ fn replay_studio_ui(
                     &mut deepseek_manager,
                     &mut studio,
                     &camera,
+                    &standees,
                     &mut grids,
                     &mut windows,
                     &mut capture_active,
@@ -638,6 +654,7 @@ fn replay_controls(
     deepseek_manager: &mut Persistent<DeepseekManager>,
     studio: &mut ReplayStudio,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
+    standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
     capture_active: &mut ReplayVideoCaptureActive,
@@ -863,6 +880,19 @@ fn replay_controls(
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
     });
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut studio.speech_enabled,
+            "角色语音（Windows 免费离线 TTS）",
+        );
+        ui.add_enabled(
+            studio.speech_enabled,
+            egui::Slider::new(&mut studio.speech_volume, 0.20..=1.00)
+                .text("语音音量")
+                .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+        );
+    });
+    ui.small("每位 QQ 发言者使用稳定的不同音色；优先分配已安装的中文声音，不足时使用不同音高和语速。语音仅处理回放中已通过发布范围筛选的台词，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -898,10 +928,15 @@ fn replay_controls(
     {
         build_from_history(studio, manager, camera, grids);
         if let (Some(replay), Ok(base_camera)) = (studio.replay.as_mut(), camera.single()) {
+            let speaker_positions = standees
+                .iter()
+                .map(|(transform, standee)| (standee.user_id, transform.translation))
+                .collect::<HashMap<_, _>>();
             replay.camera = automatic_camera_track(
                 base_camera,
                 &replay.dialogue,
                 replay.duration_ms,
+                &speaker_positions,
             );
         }
         let summary_queued = studio.replay.as_ref().is_some_and(|replay| {
@@ -912,8 +947,8 @@ fn replay_controls(
         }
         start_video_export(studio, capture_active, grids, windows);
     }
-    ui.small("一键模式会自动完成：读取可见聊天 → 请求事实性制作提要 → 编排平滑镜头 → 逐帧渲染 → FFmpeg 输出 MP4。");
-    ui.small("导出时会隐藏编辑器界面，逐帧渲染台词层，再用 FFmpeg 编码 H.264 视频。按 Esc 可取消逐帧渲染。");
+    ui.small("一键模式会自动完成：读取可见聊天 → 请求事实性制作提要 → 编排平滑镜头 → 逐帧渲染 → 生成角色语音 → FFmpeg 输出 MP4。");
+    ui.small("导出时会隐藏编辑器界面，逐帧渲染台词层，再用 FFmpeg 编码 H.264/AAC 视频。按 Esc 可取消逐帧渲染。");
 
     ui.collapsing(
         "回放项目数据（JSON，可选）",
@@ -1073,7 +1108,7 @@ fn build_from_history(
     studio.playback_ms = 0;
     studio.replay = Some(replay);
     studio.status = format!(
-        "已从现有聊天生成 {0} 条连续对话；切换间隔约 0.18 秒",
+        "已从现有聊天生成 {0} 条连续对话；切换间隔约 0.09 秒",
         visible.len()
     );
 }
@@ -1215,7 +1250,12 @@ fn start_video_export(
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
 ) {
-    let Some(duration_ms) = studio.replay.as_ref().map(|replay| replay.duration_ms) else {
+    let Some((duration_ms, dialogue)) = studio.replay.as_ref().map(|replay| {
+        (
+            replay.duration_ms,
+            replay.dialogue.clone(),
+        )
+    }) else {
         studio.status = "没有可渲染的回放".to_owned();
         return;
     };
@@ -1229,6 +1269,12 @@ fn start_video_export(
     if let Err(err) = check_ffmpeg() {
         studio.status = err;
         return;
+    }
+    if studio.speech_enabled && !dialogue.is_empty() {
+        if let Err(err) = check_speech_synthesizer() {
+            studio.status = err;
+            return;
+        }
     }
     if let Some(parent) = output_path
         .parent()
@@ -1286,6 +1332,9 @@ fn start_video_export(
         duration_ms,
         music_enabled: studio.music_enabled,
         music_volume: studio.music_volume,
+        speech_enabled: studio.speech_enabled,
+        speech_volume: studio.speech_volume,
+        dialogue,
         total_frames,
         next_frame: 0,
         capture_pending: false,
@@ -1339,6 +1388,28 @@ fn check_ffmpeg() -> Result<(), String> {
         })
 }
 
+#[cfg(windows)]
+fn check_speech_synthesizer() -> Result<(), String> {
+    let script = r#"Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }); $s.Dispose(); if ($voices.Count -eq 0) { exit 2 }"#;
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    hide_command_window(&mut command);
+    command
+        .output()
+        .map_err(|err| format!("无法启动 Windows 语音合成：{err}"))
+        .and_then(|output| {
+            output.status.success().then_some(()).ok_or_else(|| {
+                "未找到可用的 Windows 语音。请在系统语言设置中安装语音，或关闭“角色语音”后导出"
+                    .to_owned()
+            })
+        })
+}
+
+#[cfg(not(windows))]
+fn check_speech_synthesizer() -> Result<(), String> {
+    Err("角色语音目前使用 Windows 免费离线 TTS；请关闭角色语音后导出".to_owned())
+}
+
 fn encode_video_frames(
     frames_path: &Path,
     output_path: &Path,
@@ -1346,9 +1417,13 @@ fn encode_video_frames(
     duration_ms: u64,
     music_enabled: bool,
     music_volume: f32,
+    speech_enabled: bool,
+    speech_volume: f32,
+    dialogue: &[ReplayDialogue],
 ) -> Result<(), String> {
     let frame_pattern = frames_path.join("frame_%06d.png");
     let soundtrack_path = frames_path.join("original-relaxing-soundtrack.wav");
+    let narration_path = frames_path.join("character-narration.wav");
     if music_enabled {
         write_relaxing_soundtrack(
             &soundtrack_path,
@@ -1356,13 +1431,36 @@ fn encode_video_frames(
             music_volume,
         )?;
     }
+    let speech_enabled = speech_enabled && !dialogue.is_empty();
+    if speech_enabled {
+        write_narration_track(
+            &narration_path,
+            frames_path,
+            duration_ms,
+            speech_volume,
+            dialogue,
+        )?;
+    }
     let temporary_output = temporary_video_output_path(output_path);
     let mut command = Command::new("ffmpeg");
     command.args(ffmpeg_arguments(fps));
     command.arg(frame_pattern);
-    if music_enabled {
+    let mut next_input = 1;
+    let music_input = if music_enabled {
         command.arg("-i").arg(&soundtrack_path);
-    }
+        let input = next_input;
+        next_input += 1;
+        Some(input)
+    } else {
+        None
+    };
+    let speech_input = if speech_enabled {
+        command.arg("-i").arg(&narration_path);
+        let input = next_input;
+        Some(input)
+    } else {
+        None
+    };
     command.args([
         "-vf",
         "pad=ceil(iw/2)*2:ceil(ih/2)*2",
@@ -1377,7 +1475,25 @@ fn encode_video_frames(
         "-movflags",
         "+faststart",
     ]);
-    if music_enabled {
+    match (music_input, speech_input) {
+        (Some(music), Some(speech)) => {
+            command.args([
+                "-filter_complex",
+                &format!(
+                    "[{music}:a][{speech}:a]amix=inputs=2:duration=longest:normalize=0:dropout_transition=0[aout]"
+                ),
+                "-map",
+                "0:v:0",
+                "-map",
+                "[aout]",
+            ]);
+        },
+        (Some(audio), None) | (None, Some(audio)) => {
+            command.args(["-map", "0:v:0", "-map", &format!("{audio}:a:0")]);
+        },
+        (None, None) => {},
+    }
+    if music_enabled || speech_enabled {
         command.args(["-c:a", "aac", "-b:a", "160k", "-shortest"]);
     }
     command.arg(&temporary_output);
@@ -1408,6 +1524,228 @@ fn encode_video_frames(
     } else {
         tail
     })
+}
+
+struct SynthesizedSpeechCue {
+    start_sample: u64,
+    output_samples: u64,
+    samples: Vec<i16>,
+    side: DialogueSide,
+}
+
+#[derive(Serialize)]
+struct SpeechSynthesisJob {
+    text: String,
+    output_path: String,
+    language: &'static str,
+    voice_slot: u64,
+    pitch: i32,
+    speech_rate: i32,
+}
+
+fn write_narration_track(
+    path: &Path,
+    working_directory: &Path,
+    duration_ms: u64,
+    volume: f32,
+    dialogue: &[ReplayDialogue],
+) -> Result<(), String> {
+    const SAMPLE_RATE: u32 = 32_000;
+    const CHANNELS: u16 = 2;
+    const BITS_PER_SAMPLE: u16 = 16;
+    let sample_count = duration_ms
+        .saturating_mul(SAMPLE_RATE as u64)
+        .saturating_add(999)
+        / 1_000;
+    let data_bytes = sample_count
+        .saturating_mul(CHANNELS as u64)
+        .saturating_mul((BITS_PER_SAMPLE / 8) as u64);
+    if data_bytes > (u32::MAX - 36) as u64 {
+        return Err("回放过长，无法生成 WAV 角色语音".to_owned());
+    }
+
+    let speech_jobs = dialogue
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let (pitch, speech_rate) = speaker_voice_profile(line.sender_id);
+            SpeechSynthesisJob {
+                text: line.text.clone(),
+                output_path: working_directory
+                    .join(format!("speech-{index:05}.wav"))
+                    .to_string_lossy()
+                    .into_owned(),
+                language: if line.text.chars().any(is_cjk_character) { "zh-CN" } else { "en-US" },
+                voice_slot: line.sender_id,
+                pitch,
+                speech_rate,
+            }
+        })
+        .collect::<Vec<_>>();
+    synthesize_speech_batch(working_directory, &speech_jobs)?;
+
+    let mut cues = Vec::with_capacity(dialogue.len());
+    for (index, line) in dialogue.iter().enumerate() {
+        let wav_path = working_directory.join(format!("speech-{index:05}.wav"));
+        let samples = read_pcm16_mono_wav(&wav_path)?;
+        if samples.is_empty() {
+            return Err(format!("角色 {} 的语音为空", line.name));
+        }
+        let max_output_samples = line.duration_ms.saturating_mul(SAMPLE_RATE as u64) / 1_000;
+        cues.push(SynthesizedSpeechCue {
+            start_sample: line.time_ms.saturating_mul(SAMPLE_RATE as u64) / 1_000,
+            output_samples: (samples.len() as u64).min(max_output_samples).max(1),
+            samples,
+            side: line.side,
+        });
+    }
+    cues.sort_by_key(|cue| cue.start_sample);
+
+    let file = fs::File::create(path).map_err(|err| format!("无法创建角色语音轨道：{err}"))?;
+    let mut writer = BufWriter::new(file);
+    write_wav_header(
+        &mut writer,
+        SAMPLE_RATE,
+        CHANNELS,
+        BITS_PER_SAMPLE,
+        data_bytes as u32,
+    )?;
+    let volume = volume.clamp(0.0, 1.0);
+    let mut cue_index = 0_usize;
+    for sample_index in 0..sample_count {
+        while cue_index + 1 < cues.len() && sample_index >= cues[cue_index + 1].start_sample {
+            cue_index += 1;
+        }
+        let sample = cues
+            .get(cue_index)
+            .filter(|cue| sample_index >= cue.start_sample)
+            .and_then(|cue| {
+                let local = sample_index - cue.start_sample;
+                (local < cue.output_samples).then(|| {
+                    let source_index = if cue.samples.len() as u64 > cue.output_samples {
+                        local.saturating_mul(cue.samples.len() as u64) / cue.output_samples
+                    } else {
+                        local
+                    };
+                    let fade_samples = 96_u64.min(cue.output_samples / 2).max(1);
+                    let fade_in = (local as f32 / fade_samples as f32).clamp(0.0, 1.0);
+                    let fade_out =
+                        ((cue.output_samples - local) as f32 / fade_samples as f32).clamp(0.0, 1.0);
+                    let envelope = smoothstep(fade_in) * smoothstep(fade_out);
+                    (cue.samples[source_index as usize] as f32 / i16::MAX as f32)
+                        * envelope
+                        * volume
+                })
+            })
+            .unwrap_or(0.0);
+        let (left_pan, right_pan) = cues
+            .get(cue_index)
+            .map(|cue| match cue.side {
+                DialogueSide::Left => (1.0, 0.82),
+                DialogueSide::Right => (0.82, 1.0),
+            })
+            .unwrap_or((1.0, 1.0));
+        writer
+            .write_all(&pcm_i16(sample * left_pan).to_le_bytes())
+            .and_then(|_| writer.write_all(&pcm_i16(sample * right_pan).to_le_bytes()))
+            .map_err(|err| format!("写入角色语音轨道失败：{err}"))?;
+    }
+    writer
+        .flush()
+        .map_err(|err| format!("完成角色语音轨道失败：{err}"))
+}
+
+fn speaker_voice_profile(sender_id: u64) -> (i32, i32) {
+    const PITCHES: [i32; 8] = [-14, 10, -7, 16, 1, 7, -10, 13];
+    const RATES: [i32; 8] = [18, 24, 14, 28, 10, 21, 16, 26];
+    let profile = (sender_id as usize) % PITCHES.len();
+    (PITCHES[profile], RATES[profile])
+}
+
+#[cfg(windows)]
+fn synthesize_speech_batch(
+    working_directory: &Path,
+    jobs: &[SpeechSynthesisJob],
+) -> Result<(), String> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let manifest_path = working_directory.join("speech-jobs.json");
+    let manifest = serde_json::to_vec(&serde_json::json!({ "jobs": jobs }))
+        .map_err(|err| format!("无法整理角色语音任务：{err}"))?;
+    fs::write(&manifest_path, manifest).map_err(|err| format!("无法保存角色语音任务：{err}"))?;
+    let script = r#"& { param($manifestPath) Add-Type -AssemblyName System.Speech; $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json; $jobs = @($manifest.jobs); $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo -ArgumentList 32000,([System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen),([System.Speech.AudioFormat.AudioChannel]::Mono); foreach ($job in $jobs) { $culture = [Globalization.CultureInfo]::GetCultureInfo([string]$job.language); $voices = @($s.GetInstalledVoices($culture) | Where-Object { $_.Enabled }); if ($voices.Count -eq 0) { $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }) }; if ($voices.Count -eq 0) { throw 'No installed speech voice' }; $voice = $voices[[int64]$job.voice_slot % $voices.Count]; $s.SelectVoice($voice.VoiceInfo.Name); $s.SetOutputToWaveFile([string]$job.output_path, $format); $escaped = [Security.SecurityElement]::Escape([string]$job.text); $pitch = [int]$job.pitch; $speechRate = [int]$job.speech_rate; $language = [string]$job.language; $ssml = "<speak version='1.0' xml:lang='$language'><prosody pitch='$pitch%' rate='$speechRate%'>$escaped</prosody></speak>"; $s.SpeakSsml($ssml); $s.SetOutputToNull() }; $s.Dispose() }"#;
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .arg(&manifest_path);
+    hide_command_window(&mut command);
+    let output = command
+        .output()
+        .map_err(|err| format!("无法启动 Windows 语音合成：{err}"))?;
+    if output.status.success() && jobs.iter().all(|job| Path::new(&job.output_path).exists()) {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(if detail.is_empty() {
+        format!(
+            "Windows 语音合成退出码：{}",
+            output.status
+        )
+    } else {
+        detail
+    })
+}
+
+#[cfg(not(windows))]
+fn synthesize_speech_batch(
+    _working_directory: &Path,
+    _jobs: &[SpeechSynthesisJob],
+) -> Result<(), String> {
+    Err("当前系统不支持 Windows 离线语音合成".to_owned())
+}
+
+fn read_pcm16_mono_wav(path: &Path) -> Result<Vec<i16>, String> {
+    let bytes = fs::read(path).map_err(|err| format!("无法读取角色语音 WAV：{err}"))?;
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("角色语音不是有效的 WAV 文件".to_owned());
+    }
+    let mut offset = 12_usize;
+    let mut valid_format = false;
+    let mut audio_data = None;
+    while offset + 8 <= bytes.len() {
+        let chunk_id = &bytes[offset..offset + 4];
+        let chunk_size =
+            u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let data_start = offset + 8;
+        let data_end = data_start.saturating_add(chunk_size);
+        if data_end > bytes.len() {
+            return Err("角色语音 WAV 数据不完整".to_owned());
+        }
+        if chunk_id == b"fmt " && chunk_size >= 16 {
+            let audio_format =
+                u16::from_le_bytes(bytes[data_start..data_start + 2].try_into().unwrap());
+            let channels =
+                u16::from_le_bytes(bytes[data_start + 2..data_start + 4].try_into().unwrap());
+            let sample_rate =
+                u32::from_le_bytes(bytes[data_start + 4..data_start + 8].try_into().unwrap());
+            let bits =
+                u16::from_le_bytes(bytes[data_start + 14..data_start + 16].try_into().unwrap());
+            valid_format =
+                audio_format == 1 && channels == 1 && sample_rate == 32_000 && bits == 16;
+        } else if chunk_id == b"data" {
+            audio_data = Some(&bytes[data_start..data_end]);
+        }
+        offset = data_end.saturating_add(chunk_size % 2);
+    }
+    if !valid_format {
+        return Err("角色语音 WAV 必须是 32 kHz、16 位、单声道 PCM".to_owned());
+    }
+    let audio_data = audio_data.ok_or_else(|| "角色语音 WAV 缺少音频数据".to_owned())?;
+    Ok(audio_data
+        .chunks_exact(2)
+        .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+        .collect())
 }
 
 fn write_relaxing_soundtrack(path: &Path, duration_ms: u64, volume: f32) -> Result<(), String> {
@@ -1600,29 +1938,48 @@ fn automatic_camera_track(
     base: &Transform,
     dialogue: &[ReplayDialogue],
     duration_ms: u64,
+    speaker_positions: &HashMap<u64, Vec3>,
 ) -> Vec<ReplayCameraKeyframe> {
-    let mut frames = Vec::with_capacity(dialogue.len().saturating_mul(2).saturating_add(2));
+    let mut frames = Vec::with_capacity(dialogue.len().saturating_mul(3).saturating_add(2));
     frames.push(camera_keyframe(0, base));
-    let camera_right = base.rotation * Vec3::X;
-    let camera_forward = base.rotation * Vec3::NEG_Z;
+    let mut current = base.clone();
     for (index, line) in dialogue.iter().enumerate() {
-        let side = match line.side {
-            DialogueSide::Left => -1.0,
-            DialogueSide::Right => 1.0,
-        };
-        let mut shot = base.clone();
-        shot.translation += camera_right * side * 0.45;
-        if index % 3 == 1 {
-            shot.translation += camera_forward * 0.20;
+        frames.push(camera_keyframe(line.time_ms, &current));
+        let line_end = line.time_ms.saturating_add(line.duration_ms);
+        if let Some(target) = speaker_positions.get(&line.sender_id) {
+            let arrival_ms = line
+                .time_ms
+                .saturating_add((line.duration_ms / 3).clamp(160, 360))
+                .min(line_end);
+            let focused = speaker_camera_shot(
+                base,
+                *target,
+                line.sender_id,
+                index,
+                0.0,
+            );
+            let settled = speaker_camera_shot(
+                base,
+                *target,
+                line.sender_id,
+                index,
+                1.0,
+            );
+            frames.push(camera_keyframe(arrival_ms, &focused));
+            frames.push(camera_keyframe(line_end, &settled));
+            current = settled;
+        } else {
+            let drifted = fallback_camera_drift(&current, line.sender_id, index);
+            frames.push(camera_keyframe(line_end, &drifted));
+            current = drifted;
         }
-        shot.rotation = Quat::from_rotation_y(-side * 0.025) * base.rotation;
-        frames.push(camera_keyframe(line.time_ms, &shot));
-        frames.push(camera_keyframe(
-            line.time_ms.saturating_add(line.duration_ms),
-            &shot,
-        ));
     }
-    frames.push(camera_keyframe(duration_ms, base));
+    if frames
+        .last()
+        .is_some_and(|frame| frame.time_ms < duration_ms)
+    {
+        frames.push(camera_keyframe(duration_ms, &current));
+    }
     frames.sort_by_key(|frame| frame.time_ms);
     frames.dedup_by(|right, left| {
         if right.time_ms == left.time_ms {
@@ -1633,6 +1990,53 @@ fn automatic_camera_track(
         }
     });
     frames
+}
+
+fn speaker_camera_shot(
+    base: &Transform,
+    target: Vec3,
+    sender_id: u64,
+    index: usize,
+    settle: f32,
+) -> Transform {
+    let seed = cinematic_seed(sender_id, index);
+    let angle = seed * std::f32::consts::TAU;
+    let mut approach = base.translation - target;
+    approach.y = 0.0;
+    let approach = approach
+        .try_normalize()
+        .unwrap_or_else(|| Vec3::new(angle.cos(), 0.0, angle.sin()));
+    let lateral = Vec3::new(-approach.z, 0.0, approach.x);
+    let distance = 5.2 + cinematic_seed(sender_id.rotate_left(11), index) * 1.8 - settle * 0.25;
+    let shoulder = (cinematic_seed(sender_id.rotate_left(23), index) - 0.5) * 1.2;
+    let height = 1.15 + cinematic_seed(sender_id.rotate_left(37), index) * 0.75;
+    let position =
+        target + approach * distance + lateral * (shoulder + settle * 0.12) + Vec3::Y * height;
+    Transform::from_translation(position).looking_at(target + Vec3::Y * 0.25, Vec3::Y)
+}
+
+fn fallback_camera_drift(current: &Transform, sender_id: u64, index: usize) -> Transform {
+    let right = current.rotation * Vec3::X;
+    let up = current.rotation * Vec3::Y;
+    let forward = current.rotation * Vec3::NEG_Z;
+    let horizontal = (cinematic_seed(sender_id, index) - 0.5) * 0.9;
+    let vertical = (cinematic_seed(sender_id.rotate_left(17), index) - 0.5) * 0.35;
+    let dolly = 0.18 + cinematic_seed(sender_id.rotate_left(31), index) * 0.32;
+    let position = current.translation + right * horizontal + up * vertical + forward * dolly;
+    let focus = current.translation + forward * 18.0 + right * horizontal * 0.7;
+    Transform::from_translation(position).looking_at(focus, Vec3::Y)
+}
+
+fn cinematic_seed(sender_id: u64, index: usize) -> f32 {
+    let mut value = sender_id
+        .wrapping_add((index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .wrapping_add(0xa076_1d64_78bd_642f);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    (value as u32) as f32 / u32::MAX as f32
 }
 
 fn interpolated_camera(frames: &[ReplayCameraKeyframe], time_ms: u64) -> Option<Transform> {
@@ -1774,13 +2178,13 @@ fn dialogue_identity(
 }
 
 fn dialogue_duration_ms(text: &str) -> u64 {
-    let reading_ms = text.chars().fold(700_u64, |total, character| {
+    let reading_ms = text.chars().fold(350_u64, |total, character| {
         let character_ms = match character {
-            '。' | '！' | '？' | '!' | '?' | '；' | ';' => 220,
-            '，' | ',' | '、' | '：' | ':' => 100,
-            character if character.is_whitespace() => 15,
-            character if is_cjk_character(character) => 105,
-            _ => 45,
+            '。' | '！' | '？' | '!' | '?' | '；' | ';' => 110,
+            '，' | ',' | '、' | '：' | ':' => 50,
+            character if character.is_whitespace() => 8,
+            character if is_cjk_character(character) => 53,
+            _ => 23,
         };
         total.saturating_add(character_ms)
     });
@@ -2161,13 +2565,23 @@ mod tests {
     }
 
     #[test]
-    fn automatic_director_tracks_speaker_side_and_returns_to_base() {
+    fn automatic_director_focuses_known_speakers() {
         let base = Transform::from_xyz(2.0, 3.0, 4.0);
-        let dialogue = [
+        let mut dialogue = [
             test_dialogue(350, 2_400, DialogueSide::Left),
             test_dialogue(3_030, 2_400, DialogueSide::Right),
         ];
-        let frames = automatic_camera_track(&base, &dialogue, 5_430);
+        dialogue[1].sender_id = 2;
+        let speaker_positions = HashMap::from([
+            (1, Vec3::new(-8.0, 1.0, 2.0)),
+            (2, Vec3::new(9.0, 1.0, -3.0)),
+        ]);
+        let frames = automatic_camera_track(
+            &base,
+            &dialogue,
+            5_430,
+            &speaker_positions,
+        );
         assert!(frames
             .windows(2)
             .all(|pair| pair[0].time_ms < pair[1].time_ms));
@@ -2175,14 +2589,27 @@ mod tests {
             frames.first().unwrap().translation,
             base.translation.to_array()
         );
-        assert_eq!(
+        for (arrival_ms, target) in [(710, speaker_positions[&1]), (3_390, speaker_positions[&2])] {
+            let frame = frames
+                .iter()
+                .find(|frame| frame.time_ms == arrival_ms)
+                .unwrap();
+            let shot = frame_transform(frame);
+            let forward = shot.rotation * Vec3::NEG_Z;
+            let to_speaker = (target + Vec3::Y * 0.25 - shot.translation).normalize();
+            assert!(forward.dot(to_speaker) > 0.99);
+        }
+    }
+
+    #[test]
+    fn automatic_director_drifts_when_speaker_has_no_standee() {
+        let base = Transform::from_xyz(2.0, 3.0, 4.0);
+        let dialogue = [test_dialogue(350, 1_200, DialogueSide::Right)];
+        let frames = automatic_camera_track(&base, &dialogue, 1_550, &HashMap::new());
+        assert_ne!(
             frames.last().unwrap().translation,
             base.translation.to_array()
         );
-        let left = frames.iter().find(|frame| frame.time_ms == 350).unwrap();
-        let right = frames.iter().find(|frame| frame.time_ms == 3_030).unwrap();
-        assert!(left.translation[0] < base.translation.x);
-        assert!(right.translation[0] > base.translation.x);
     }
 
     #[test]
@@ -2234,7 +2661,8 @@ mod tests {
 
     #[test]
     fn historical_dialogue_transition_is_brief() {
-        assert!(HISTORY_DIALOGUE_GAP_MS < 500);
+        assert_eq!(HISTORY_DIALOGUE_GAP_MS, 90);
+        assert_eq!(MIN_DIALOGUE_MS, 900);
     }
 
     #[test]
@@ -2266,22 +2694,54 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires FFmpeg and FFprobe"]
-    fn encoded_replay_contains_aac_background_music() {
+    #[cfg(windows)]
+    #[ignore = "requires installed Windows speech voices"]
+    fn windows_tts_assigns_distinct_speaker_profiles() {
         let directory = tempfile::tempdir().unwrap();
-        for index in 0..2 {
+        let mut first_line = test_dialogue(0, 900, DialogueSide::Left);
+        first_line.text = "这是同一句角色语音测试。".to_owned();
+        let mut second_line = test_dialogue(1_000, 900, DialogueSide::Right);
+        second_line.sender_id = 2;
+        second_line.text = first_line.text.clone();
+        write_narration_track(
+            &directory.path().join("narration.wav"),
+            directory.path(),
+            2_000,
+            0.90,
+            &[first_line, second_line],
+        )
+        .unwrap();
+        let first = directory.path().join("speech-00000.wav");
+        let second = directory.path().join("speech-00001.wav");
+        assert!(!read_pcm16_mono_wav(&first).unwrap().is_empty());
+        assert_ne!(
+            fs::read(first).unwrap(),
+            fs::read(second).unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg, FFprobe, and an installed Windows speech voice"]
+    fn encoded_replay_mixes_music_and_character_speech() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..10 {
             image::RgbImage::from_pixel(64, 64, image::Rgb([24, 30, 36]))
                 .save(directory.path().join(frame_file_name(index)))
                 .unwrap();
         }
-        let output = directory.path().join("music-test.mp4");
+        let output = directory.path().join("speech-music-test.mp4");
+        let mut dialogue = test_dialogue(0, 900, DialogueSide::Right);
+        dialogue.text = "你好，这是角色语音。".to_owned();
         encode_video_frames(
             directory.path(),
             &output,
             10,
-            200,
+            1_000,
             true,
             0.35,
+            true,
+            0.90,
+            &[dialogue],
         )
         .unwrap();
         let probe = Command::new("ffprobe")

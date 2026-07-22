@@ -191,8 +191,8 @@ struct VoxelPlayerCaptureCamera {
 }
 
 #[derive(Component)]
-struct VoxelPlayerStandee {
-    user_id: u64,
+pub(crate) struct VoxelPlayerStandee {
+    pub(crate) user_id: u64,
     image_source: String,
     half_size: Vec2,
 }
