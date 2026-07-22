@@ -1196,6 +1196,7 @@ impl Plugin for UIPlugin {
                 EguiPrimaryContextPass,
                 ui_system
                     .run_if(resource_exists::<Persistent<CachedMemory>>)
+                    .run_if(crate::replay::replay_video_capture_inactive)
                     .after(load_ui_memory),
             );
     }

@@ -1287,7 +1287,7 @@ impl Plugin for TrpgVoxelPlugin {
                     sync_voxel_player_cameras,
                     sync_voxel_player_standees,
                     capture_voxel_player_view,
-                    draw_voxel_target,
+                    draw_voxel_target.run_if(crate::replay::replay_video_capture_inactive),
                     animate_planet_clouds,
                     animate_voxel_materials,
                     persist_voxel_inventory,
@@ -1297,7 +1297,10 @@ impl Plugin for TrpgVoxelPlugin {
             )
                 .chain(),
         )
-        .add_systems(EguiPrimaryContextPass, voxel_player_camera_panel);
+        .add_systems(
+            EguiPrimaryContextPass,
+            voxel_player_camera_panel.run_if(crate::replay::replay_video_capture_inactive),
+        );
     }
 }
 

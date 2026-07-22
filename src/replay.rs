@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::HashMap,
     fs,
@@ -5,6 +7,8 @@ use std::{
         Path,
         PathBuf,
     },
+    process::Command,
+    thread,
     time::{
         SystemTime,
         UNIX_EPOCH,
@@ -17,7 +21,12 @@ use base64::{
 };
 use bevy::{
     prelude::*,
+    render::view::screenshot::{
+        Screenshot,
+        ScreenshotCaptured,
+    },
     transform::TransformSystems,
+    window::PrimaryWindow,
 };
 use bevy_egui::{
     egui,
@@ -25,10 +34,15 @@ use bevy_egui::{
     EguiPrimaryContextPass,
 };
 use bevy_persistent::Persistent;
+use crossbeam_channel::{
+    bounded,
+    Receiver,
+};
 use serde::{
     Deserialize,
     Serialize,
 };
+use tempfile::TempDir;
 use voxxelmaxx::prelude::*;
 
 use crate::{
@@ -50,14 +64,28 @@ const REPLAY_FORMAT_VERSION: u32 = 1;
 const CAMERA_SAMPLE_SECONDS: f32 = 0.1;
 const MIN_DIALOGUE_MS: u64 = 2_400;
 const MAX_DIALOGUE_MS: u64 = 10_000;
+const MIN_HISTORY_DIALOGUE_GAP_MS: u64 = 1_200;
+const MAX_HISTORY_DIALOGUE_GAP_MS: u64 = 8_000;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
+const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
+const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
+const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
 
 pub struct ReplayPlugin;
 
 impl Plugin for ReplayPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ReplayStudio>()
-            .add_systems(Update, (record_replay, advance_replay))
+            .init_resource::<ReplayVideoCaptureActive>()
+            .add_systems(
+                Update,
+                (
+                    record_replay,
+                    advance_replay,
+                    render_video_frames,
+                    poll_video_encoding,
+                ),
+            )
             .add_systems(
                 PostUpdate,
                 apply_replay_camera.before(TransformSystems::Propagate),
@@ -67,6 +95,13 @@ impl Plugin for ReplayPlugin {
                 replay_studio_ui.after(ui::ui_system),
             );
     }
+}
+
+#[derive(Resource, Default)]
+pub(crate) struct ReplayVideoCaptureActive(pub bool);
+
+pub(crate) fn replay_video_capture_inactive(active: Res<ReplayVideoCaptureActive>) -> bool {
+    !active.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,6 +202,16 @@ struct ReplayDialogue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     avatar_data_url: Option<String>,
     visibility: Visibility,
+    #[serde(default)]
+    side: DialogueSide,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DialogueSide {
+    Left,
+    #[default]
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,10 +237,35 @@ struct ReplayStudio {
     camera_sample_accumulator: f32,
     message_counts: HashMap<String, usize>,
     pre_playback_scene: Option<ReplayScene>,
-    export_path: String,
-    import_path: String,
+    video_path: String,
+    video_fps: u32,
+    project_export_path: String,
+    project_import_path: String,
+    video_render: Option<VideoRenderJob>,
+    video_encoding: Option<VideoEncodingJob>,
     status: String,
     panel_open: bool,
+}
+
+struct VideoRenderJob {
+    id: u64,
+    frames: TempDir,
+    output_path: PathBuf,
+    fps: u32,
+    total_frames: u64,
+    next_frame: u64,
+    capture_pending: bool,
+    pending_seconds: f32,
+    warmup_frames: u8,
+    failure: Option<String>,
+    original_window_title: String,
+    original_window_resizable: bool,
+}
+
+struct VideoEncodingJob {
+    _frames: TempDir,
+    output_path: PathBuf,
+    result: Receiver<Result<(), String>>,
 }
 
 impl Default for ReplayStudio {
@@ -210,8 +280,12 @@ impl Default for ReplayStudio {
             camera_sample_accumulator: 0.0,
             message_counts: HashMap::new(),
             pre_playback_scene: None,
-            export_path: DEFAULT_REPLAY_PATH.to_owned(),
-            import_path: DEFAULT_REPLAY_PATH.to_owned(),
+            video_path: DEFAULT_VIDEO_PATH.to_owned(),
+            video_fps: 30,
+            project_export_path: DEFAULT_REPLAY_PATH.to_owned(),
+            project_import_path: DEFAULT_REPLAY_PATH.to_owned(),
+            video_render: None,
+            video_encoding: None,
             status: "尚未创建回放".to_owned(),
             panel_open: true,
         }
@@ -292,6 +366,159 @@ fn advance_replay(time: Res<Time>, mut studio: ResMut<ReplayStudio>) {
     }
 }
 
+fn render_video_frames(
+    mut commands: Commands,
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut studio: ResMut<ReplayStudio>,
+    mut capture_active: ResMut<ReplayVideoCaptureActive>,
+    mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    let Some(job) = studio.video_render.as_mut() else {
+        return;
+    };
+
+    if keys.just_pressed(KeyCode::Escape) {
+        job.failure = Some("视频导出已取消".to_owned());
+    }
+    if job.capture_pending {
+        job.pending_seconds += time.delta_secs();
+        if job.pending_seconds >= VIDEO_CAPTURE_TIMEOUT_SECONDS {
+            job.failure = Some("等待画面截图超时".to_owned());
+            job.capture_pending = false;
+        }
+    }
+
+    if let Some(error) = job.failure.clone() {
+        finish_video_capture(
+            &mut studio,
+            &mut capture_active,
+            &mut grids,
+            &mut windows,
+            Err(error),
+        );
+        return;
+    }
+    if job.capture_pending {
+        return;
+    }
+    if job.warmup_frames > 0 {
+        job.warmup_frames -= 1;
+        return;
+    }
+    if job.next_frame >= job.total_frames {
+        finish_video_capture(
+            &mut studio,
+            &mut capture_active,
+            &mut grids,
+            &mut windows,
+            Ok(()),
+        );
+        return;
+    }
+
+    let job_id = job.id;
+    let frame_index = job.next_frame;
+    let frame_path = job.frames.path().join(frame_file_name(frame_index));
+    let playback_ms = frame_time_ms(frame_index, job.fps);
+    let total_frames = job.total_frames;
+    job.capture_pending = true;
+    job.pending_seconds = 0.0;
+    studio.playback_ms = playback_ms;
+    if let Ok(mut window) = windows.single_mut() {
+        window.title = format!(
+            "正在渲染视频 {}/{}（Esc 取消）",
+            frame_index + 1,
+            total_frames
+        );
+    }
+
+    commands.spawn(Screenshot::primary_window()).observe(
+        move |captured: On<ScreenshotCaptured>, mut studio: ResMut<ReplayStudio>| {
+            let save_result = captured
+                .image
+                .clone()
+                .try_into_dynamic()
+                .map_err(|err| err.to_string())
+                .and_then(|image| {
+                    image
+                        .to_rgb8()
+                        .save(&frame_path)
+                        .map_err(|err| err.to_string())
+                });
+            let Some(job) = studio.video_render.as_mut().filter(|job| job.id == job_id) else {
+                return;
+            };
+            job.capture_pending = false;
+            job.pending_seconds = 0.0;
+            match save_result {
+                Ok(()) => job.next_frame += 1,
+                Err(err) => job.failure = Some(format!("保存视频帧失败：{err}")),
+            }
+        },
+    );
+}
+
+fn finish_video_capture(
+    studio: &mut ReplayStudio,
+    capture_active: &mut ReplayVideoCaptureActive,
+    grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    windows: &mut Query<&mut Window, With<PrimaryWindow>>,
+    result: Result<(), String>,
+) {
+    let Some(job) = studio.video_render.take() else {
+        return;
+    };
+    capture_active.0 = false;
+    if let Ok(mut window) = windows.single_mut() {
+        window.title = job.original_window_title;
+        window.resizable = job.original_window_resizable;
+    }
+    stop_playback(studio, grids);
+
+    if let Err(err) = result {
+        studio.status = err;
+        return;
+    }
+
+    let frames_path = job.frames.path().to_owned();
+    let output_path = job.output_path.clone();
+    let fps = job.fps;
+    let (sender, receiver) = bounded(1);
+    thread::spawn(move || {
+        let result = encode_video_frames(&frames_path, &output_path, fps);
+        let _ = sender.send(result);
+    });
+    studio.status = format!(
+        "正在使用 FFmpeg 编码 {}",
+        job.output_path.display()
+    );
+    studio.video_encoding = Some(VideoEncodingJob {
+        _frames: job.frames,
+        output_path: job.output_path,
+        result: receiver,
+    });
+}
+
+fn poll_video_encoding(mut studio: ResMut<ReplayStudio>) {
+    let Some(job) = studio.video_encoding.as_ref() else {
+        return;
+    };
+    let Ok(result) = job.result.try_recv() else {
+        return;
+    };
+    let output_path = job.output_path.clone();
+    studio.video_encoding = None;
+    studio.status = match result {
+        Ok(()) => format!(
+            "MP4 视频已导出到 {}",
+            output_path.display()
+        ),
+        Err(err) => format!("视频编码失败：{err}"),
+    };
+}
+
 fn apply_replay_camera(
     studio: Res<ReplayStudio>,
     mut camera: Query<&mut Transform, With<VoxelViewportCamera>>,
@@ -317,22 +544,26 @@ fn replay_studio_ui(
     mut studio: ResMut<ReplayStudio>,
     camera: Query<&Transform, With<VoxelViewportCamera>>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut capture_active: ResMut<ReplayVideoCaptureActive>,
     mut avatar_textures: Local<HashMap<String, egui::TextureHandle>>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else { return };
 
-    egui::Area::new(egui::Id::new("replay-studio-button"))
-        .anchor(
-            egui::Align2::RIGHT_TOP,
-            egui::vec2(-12.0, 44.0),
-        )
-        .show(ctx, |ui| {
-            if ui.button("🎬 回放").clicked() {
-                studio.panel_open = !studio.panel_open;
-            }
-        });
+    if !capture_active.0 {
+        egui::Area::new(egui::Id::new("replay-studio-button"))
+            .anchor(
+                egui::Align2::RIGHT_TOP,
+                egui::vec2(-12.0, 44.0),
+            )
+            .show(ctx, |ui| {
+                if ui.button("🎬 回放").clicked() {
+                    studio.panel_open = !studio.panel_open;
+                }
+            });
+    }
 
-    if studio.panel_open {
+    if studio.panel_open && !capture_active.0 {
         let mut open = studio.panel_open;
         egui::Window::new("TRPG 回放工作室")
             .id(egui::Id::new("trpg-replay-studio"))
@@ -345,6 +576,8 @@ fn replay_studio_ui(
                     &mut studio,
                     &camera,
                     &mut grids,
+                    &mut windows,
+                    &mut capture_active,
                 )
             });
         studio.panel_open = open;
@@ -371,6 +604,8 @@ fn replay_controls(
     studio: &mut ReplayStudio,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    windows: &mut Query<&mut Window, With<PrimaryWindow>>,
+    capture_active: &mut ReplayVideoCaptureActive,
 ) {
     ui.label("记录体素场景、自由镜头和可见对话，并在应用内确定性回放。");
     ui.separator();
@@ -502,41 +737,83 @@ fn replay_controls(
     }
 
     ui.separator();
-    ui.label("导出路径");
-    ui.text_edit_singleline(&mut studio.export_path);
+    ui.heading("导出 MP4 视频");
+    ui.label("视频路径");
+    ui.text_edit_singleline(&mut studio.video_path);
+    ui.horizontal(|ui| {
+        ui.label("帧率");
+        for fps in [24, 30, 60] {
+            ui.selectable_value(
+                &mut studio.video_fps,
+                fps,
+                format!("{fps} FPS"),
+            );
+        }
+    });
+    if let Some(replay) = studio.replay.as_ref() {
+        ui.small(format!(
+            "预计渲染 {} 帧，视频时长 {}",
+            video_frame_count(replay.duration_ms, studio.video_fps),
+            format_time(replay.duration_ms)
+        ));
+    }
+    let can_export_video = studio.replay.is_some()
+        && studio.video_encoding.is_none()
+        && studio.mode != ReplayMode::Recording;
     ui.horizontal(|ui| {
         if ui
             .add_enabled(
-                studio.replay.is_some(),
-                egui::Button::new("导出回放"),
+                can_export_video,
+                egui::Button::new("渲染并导出 MP4"),
             )
             .clicked()
         {
-            studio.status = match studio
-                .replay
-                .as_ref()
-                .ok_or_else(|| "没有可导出的回放".to_owned())
-                .and_then(|replay| export_replay(replay, &studio.export_path))
-            {
-                Ok(()) => format!("已导出到 {}", studio.export_path),
-                Err(err) => format!("导出失败：{err}"),
-            };
+            start_video_export(studio, capture_active, grids, windows);
         }
     });
-    ui.label("导入路径");
-    ui.text_edit_singleline(&mut studio.import_path);
-    if ui.button("导入回放").clicked() {
-        match import_replay(&studio.import_path) {
-            Ok(replay) => {
-                stop_playback(studio, grids);
-                studio.playback_ms = 0;
-                studio.audience = replay.audience.clone();
-                studio.status = format!("已导入：{}", replay.title);
-                studio.replay = Some(replay);
-            },
-            Err(err) => studio.status = format!("导入失败：{err}"),
-        }
-    }
+    ui.small("导出时会隐藏编辑器界面，逐帧渲染台词层，再用 FFmpeg 编码 H.264 视频。按 Esc 可取消逐帧渲染。");
+
+    ui.collapsing(
+        "回放项目数据（JSON，可选）",
+        |ui| {
+            ui.label("项目导出路径");
+            ui.text_edit_singleline(&mut studio.project_export_path);
+            if ui
+                .add_enabled(
+                    studio.replay.is_some(),
+                    egui::Button::new("保存回放项目"),
+                )
+                .clicked()
+            {
+                studio.status = match studio
+                    .replay
+                    .as_ref()
+                    .ok_or_else(|| "没有可保存的回放".to_owned())
+                    .and_then(|replay| export_replay(replay, &studio.project_export_path))
+                {
+                    Ok(()) => format!(
+                        "回放项目已保存到 {}",
+                        studio.project_export_path
+                    ),
+                    Err(err) => format!("项目保存失败：{err}"),
+                };
+            }
+            ui.label("项目导入路径");
+            ui.text_edit_singleline(&mut studio.project_import_path);
+            if ui.button("载入回放项目").clicked() {
+                match import_replay(&studio.project_import_path) {
+                    Ok(replay) => {
+                        stop_playback(studio, grids);
+                        studio.playback_ms = 0;
+                        studio.audience = replay.audience.clone();
+                        studio.status = format!("已载入项目：{}", replay.title);
+                        studio.replay = Some(replay);
+                    },
+                    Err(err) => studio.status = format!("项目载入失败：{err}"),
+                }
+            }
+        },
+    );
     if !studio.status.is_empty() {
         ui.small(studio.status.as_str());
     }
@@ -628,16 +905,17 @@ fn build_from_history(
         .filter(|message| !message.text.trim().is_empty())
         .collect::<Vec<_>>();
     visible.sort_by_key(|message| message.time);
-    let first_time = visible
-        .first()
-        .map(|message| message.time)
-        .unwrap_or_default();
+    let mut timeline_ms: u64 = 0;
+    let mut previous_message_time = None;
     for message in &visible {
-        let time_ms = message
-            .time
-            .saturating_sub(first_time)
-            .saturating_mul(1_000);
-        if let Some(dialogue) = dialogue_from_message(message, manager, time_ms) {
+        if let Some(previous_time) = previous_message_time {
+            timeline_ms = timeline_ms.saturating_add(history_dialogue_gap_ms(
+                previous_time,
+                message.time,
+            ));
+        }
+        previous_message_time = Some(message.time);
+        if let Some(dialogue) = dialogue_from_message(message, manager, timeline_ms) {
             replay.dialogue.push(dialogue);
         }
     }
@@ -660,6 +938,16 @@ fn build_from_history(
         "已从现有聊天生成 {0} 条对话",
         visible.len()
     );
+}
+
+fn history_dialogue_gap_ms(previous_time: u64, current_time: u64) -> u64 {
+    current_time
+        .saturating_sub(previous_time)
+        .saturating_mul(1_000)
+        .clamp(
+            MIN_HISTORY_DIALOGUE_GAP_MS,
+            MAX_HISTORY_DIALOGUE_GAP_MS,
+        )
 }
 
 fn new_replay(
@@ -722,6 +1010,214 @@ fn stop_playback(studio: &mut ReplayStudio, grids: &mut Query<&mut Grid<u8>, Wit
         studio.mode = ReplayMode::Idle;
     }
     studio.playback_ms = 0;
+}
+
+fn start_video_export(
+    studio: &mut ReplayStudio,
+    capture_active: &mut ReplayVideoCaptureActive,
+    grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    windows: &mut Query<&mut Window, With<PrimaryWindow>>,
+) {
+    let Some(duration_ms) = studio.replay.as_ref().map(|replay| replay.duration_ms) else {
+        studio.status = "没有可渲染的回放".to_owned();
+        return;
+    };
+    let output_path = match normalized_video_path(&studio.video_path) {
+        Ok(path) => path,
+        Err(err) => {
+            studio.status = format!("视频路径无效：{err}");
+            return;
+        },
+    };
+    if let Err(err) = check_ffmpeg() {
+        studio.status = err;
+        return;
+    }
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        if let Err(err) = fs::create_dir_all(parent) {
+            studio.status = format!("无法创建视频目录：{err}");
+            return;
+        }
+    }
+    let temp_root = Path::new(".data")
+        .join("willowblossom")
+        .join("video-render-cache");
+    if let Err(err) = fs::create_dir_all(&temp_root) {
+        studio.status = format!("无法创建视频帧缓存目录：{err}");
+        return;
+    }
+    let frames = match tempfile::Builder::new()
+        .prefix("render-")
+        .tempdir_in(&temp_root)
+    {
+        Ok(frames) => frames,
+        Err(err) => {
+            studio.status = format!("无法创建视频帧缓存：{err}");
+            return;
+        },
+    };
+
+    if matches!(
+        studio.mode,
+        ReplayMode::Playing | ReplayMode::Paused
+    ) {
+        stop_playback(studio, grids);
+    }
+    start_playback(studio, grids);
+    studio.mode = ReplayMode::Paused;
+    studio.playback_ms = 0;
+    let fps = studio.video_fps.clamp(1, 120);
+    let total_frames = video_frame_count(duration_ms, fps);
+    let Ok(mut window) = windows.single_mut() else {
+        stop_playback(studio, grids);
+        studio.status = "找不到主窗口，无法渲染视频".to_owned();
+        return;
+    };
+    let original_window_title = window.title.clone();
+    let original_window_resizable = window.resizable;
+    window.resizable = false;
+    window.title = format!("正在准备视频渲染（共 {total_frames} 帧）");
+    capture_active.0 = true;
+    studio.video_render = Some(VideoRenderJob {
+        id: unix_time_ms(),
+        frames,
+        output_path,
+        fps,
+        total_frames,
+        next_frame: 0,
+        capture_pending: false,
+        pending_seconds: 0.0,
+        warmup_frames: VIDEO_CAPTURE_WARMUP_FRAMES,
+        failure: None,
+        original_window_title,
+        original_window_resizable,
+    });
+    studio.status = format!("正在逐帧渲染 {total_frames} 帧");
+}
+
+fn video_frame_count(duration_ms: u64, fps: u32) -> u64 {
+    (duration_ms.saturating_mul(fps as u64).saturating_add(999) / 1_000).max(1)
+}
+
+fn frame_time_ms(frame_index: u64, fps: u32) -> u64 {
+    frame_index.saturating_mul(1_000) / fps.max(1) as u64
+}
+
+fn frame_file_name(frame_index: u64) -> String { format!("frame_{frame_index:06}.png") }
+
+fn normalized_video_path(path: &str) -> Result<PathBuf, String> {
+    let mut path = normalized_path(path)?;
+    if path.extension().is_none() {
+        path.set_extension("mp4");
+    }
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("mp4"))
+    {
+        return Err("视频文件必须使用 .mp4 扩展名".to_owned());
+    }
+    Ok(path)
+}
+
+fn check_ffmpeg() -> Result<(), String> {
+    let mut command = Command::new("ffmpeg");
+    command.arg("-version");
+    hide_command_window(&mut command);
+    command
+        .output()
+        .map_err(|_| "未找到 FFmpeg，请安装 FFmpeg 并将 ffmpeg 加入 PATH".to_owned())
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then_some(())
+                .ok_or_else(|| "FFmpeg 无法启动，请检查安装".to_owned())
+        })
+}
+
+fn encode_video_frames(frames_path: &Path, output_path: &Path, fps: u32) -> Result<(), String> {
+    let frame_pattern = frames_path.join("frame_%06d.png");
+    let temporary_output = temporary_video_output_path(output_path);
+    let mut command = Command::new("ffmpeg");
+    command.args(ffmpeg_arguments(fps));
+    command.arg(frame_pattern);
+    command.args([
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+    ]);
+    command.arg(&temporary_output);
+    hide_command_window(&mut command);
+    let output = command
+        .output()
+        .map_err(|err| format!("无法启动 FFmpeg：{err}"))?;
+    if output.status.success() {
+        if output_path.exists() {
+            fs::remove_file(output_path).map_err(|err| format!("无法替换已有视频：{err}"))?;
+        }
+        return fs::rename(&temporary_output, output_path)
+            .map_err(|err| format!("无法完成视频文件：{err}"));
+    }
+    let _ = fs::remove_file(&temporary_output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail = stderr
+        .lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Err(if tail.is_empty() {
+        format!("FFmpeg 退出码：{}", output.status)
+    } else {
+        tail
+    })
+}
+
+fn temporary_video_output_path(output_path: &Path) -> PathBuf {
+    let file_stem = output_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("replay");
+    output_path.with_file_name(format!(
+        ".{file_stem}.rendering-{}.mp4",
+        unix_time_ms()
+    ))
+}
+
+fn ffmpeg_arguments(fps: u32) -> Vec<String> {
+    vec![
+        "-y".to_owned(),
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+        "-framerate".to_owned(),
+        fps.max(1).to_string(),
+        "-start_number".to_owned(),
+        "0".to_owned(),
+        "-i".to_owned(),
+    ]
+}
+
+fn hide_command_window(command: &mut Command) {
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
 }
 
 fn capture_scene(grid: &Grid<u8>) -> ReplayScene {
@@ -813,6 +1309,11 @@ fn dialogue_from_message(
         .player_characters
         .get(&message.sender_id.to_string());
     let (name, role, avatar) = dialogue_identity(message, character);
+    let side = speaker_side(
+        manager
+            .current_group()
+            .is_some_and(|group| group.gm_users.contains(&message.sender_id)),
+    );
     Some(ReplayDialogue {
         time_ms,
         duration_ms: dialogue_duration_ms(text),
@@ -823,7 +1324,16 @@ fn dialogue_from_message(
         avatar,
         avatar_data_url: None,
         visibility: message.visibility.clone(),
+        side,
     })
+}
+
+fn speaker_side(is_gm: bool) -> DialogueSide {
+    if is_gm {
+        DialogueSide::Left
+    } else {
+        DialogueSide::Right
+    }
 }
 
 fn dialogue_identity(
@@ -901,13 +1411,14 @@ fn dialogue_overlay(
     );
 
     let avatar_width = (screen.width() * 0.30).clamp(230.0, 520.0);
+    let avatar_left = match dialogue.side {
+        DialogueSide::Left => dialogue_rect.left() + 15.0,
+        DialogueSide::Right => dialogue_rect.right() - avatar_width,
+    };
     let avatar_rect = egui::Rect::from_min_max(
+        egui::pos2(avatar_left, screen.top() + 70.0),
         egui::pos2(
-            dialogue_rect.right() - avatar_width,
-            screen.top() + 70.0,
-        ),
-        egui::pos2(
-            dialogue_rect.right() - 15.0,
+            avatar_left + avatar_width - 15.0,
             dialogue_rect.top() + 28.0,
         ),
     );
@@ -935,11 +1446,10 @@ fn dialogue_overlay(
             avatar_rect.center().x,
             avatar_rect.bottom() - 82.0,
         );
-        painter.circle_filled(
-            center,
-            72.0,
-            egui::Color32::from_rgb(214, 116, 154),
-        );
+        painter.circle_filled(center, 72.0, match dialogue.side {
+            DialogueSide::Left => egui::Color32::from_rgb(72, 121, 170),
+            DialogueSide::Right => egui::Color32::from_rgb(214, 116, 154),
+        });
         painter.text(
             center,
             egui::Align2::CENTER_CENTER,
@@ -949,12 +1459,14 @@ fn dialogue_overlay(
         );
     }
 
+    let name_width = 225.0;
+    let name_left = match dialogue.side {
+        DialogueSide::Left => dialogue_rect.left() + 40.0,
+        DialogueSide::Right => dialogue_rect.right() - name_width - 40.0,
+    };
     let name_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            dialogue_rect.left() + 40.0,
-            dialogue_rect.top() - 102.0,
-        ),
-        egui::vec2(225.0, 66.0),
+        egui::pos2(name_left, dialogue_rect.top() - 102.0),
+        egui::vec2(name_width, 66.0),
     );
     painter.rect_filled(
         name_rect,
@@ -975,18 +1487,19 @@ fn dialogue_overlay(
         egui::Color32::from_gray(25),
     );
     if !dialogue.role.trim().is_empty() {
+        let role_width = 180.0;
+        let role_left = match dialogue.side {
+            DialogueSide::Left => name_rect.left() + 20.0,
+            DialogueSide::Right => name_rect.right() - role_width - 20.0,
+        };
         let role_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                name_rect.left() + 20.0,
-                name_rect.bottom(),
-            ),
-            egui::vec2(180.0, 38.0),
+            egui::pos2(role_left, name_rect.bottom()),
+            egui::vec2(role_width, 38.0),
         );
-        painter.rect_filled(
-            role_rect,
-            0.0,
-            egui::Color32::from_rgb(238, 107, 160),
-        );
+        painter.rect_filled(role_rect, 0.0, match dialogue.side {
+            DialogueSide::Left => egui::Color32::from_rgb(96, 155, 207),
+            DialogueSide::Right => egui::Color32::from_rgb(238, 107, 160),
+        });
         painter.text(
             role_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -996,6 +1509,10 @@ fn dialogue_overlay(
         );
     }
     let text_width = (dialogue_rect.width() - avatar_width * 0.45 - 90.0).max(240.0);
+    let text_left = match dialogue.side {
+        DialogueSide::Left => dialogue_rect.left() + avatar_width * 0.45 + 60.0,
+        DialogueSide::Right => dialogue_rect.left() + 70.0,
+    };
     let galley = painter.layout(
         dialogue.text.clone(),
         egui::FontId::proportional((screen.width() / 52.0).clamp(25.0, 42.0)),
@@ -1004,7 +1521,7 @@ fn dialogue_overlay(
     );
     painter.galley(
         egui::pos2(
-            dialogue_rect.left() + 70.0,
+            text_left,
             dialogue_rect.center().y - galley.size().y * 0.5,
         ),
         galley,
@@ -1055,7 +1572,10 @@ fn export_replay(replay: &ReplayFile, path: &str) -> Result<(), String> {
     }
     let bytes = serde_json::to_vec(&portable).map_err(|err| err.to_string())?;
     let path = normalized_path(path)?;
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     fs::write(&path, bytes).map_err(|err| err.to_string())
@@ -1204,5 +1724,48 @@ mod tests {
             dialogue_duration_ms(&"长".repeat(1_000)),
             MAX_DIALOGUE_MS
         );
+    }
+
+    #[test]
+    fn dm_is_composed_left_and_player_right() {
+        assert_eq!(speaker_side(true), DialogueSide::Left);
+        assert_eq!(speaker_side(false), DialogueSide::Right);
+    }
+
+    #[test]
+    fn video_timeline_uses_exact_frame_rate() {
+        assert_eq!(video_frame_count(1_000, 30), 30);
+        assert_eq!(video_frame_count(1, 30), 1);
+        assert_eq!(frame_time_ms(15, 30), 500);
+        assert_eq!(frame_file_name(12), "frame_000012.png");
+    }
+
+    #[test]
+    fn historical_chat_gaps_are_bounded_for_video() {
+        assert_eq!(
+            history_dialogue_gap_ms(10, 10),
+            MIN_HISTORY_DIALOGUE_GAP_MS
+        );
+        assert_eq!(history_dialogue_gap_ms(10, 13), 3_000);
+        assert_eq!(
+            history_dialogue_gap_ms(10, 10_000),
+            MAX_HISTORY_DIALOGUE_GAP_MS
+        );
+    }
+
+    #[test]
+    fn ffmpeg_arguments_describe_numbered_png_input() {
+        let arguments = ffmpeg_arguments(30);
+        assert_eq!(arguments, [
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-framerate",
+            "30",
+            "-start_number",
+            "0",
+            "-i",
+        ]);
     }
 }
