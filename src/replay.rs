@@ -521,12 +521,10 @@ impl PreviewSpeechController {
     #[cfg(windows)]
     fn send_if_running(&mut self, request: PreviewSpeechRequest<'_>) -> Result<(), String> {
         let Some(worker) = self.worker.as_mut() else { return Ok(()) };
-        let mut json = serde_json::to_vec(&request)
-            .map_err(|err| format!("unable to prepare preview speech: {err}"))?;
-        json.push(b'\n');
+        let encoded = preview_speech_wire_line(&request)?;
         if let Err(err) = worker
             .input
-            .write_all(&json)
+            .write_all(&encoded)
             .and_then(|_| worker.input.flush())
         {
             let _ = worker.child.kill();
@@ -545,6 +543,14 @@ impl PreviewSpeechController {
     }
 }
 
+fn preview_speech_wire_line(request: &PreviewSpeechRequest<'_>) -> Result<Vec<u8>, String> {
+    let json = serde_json::to_vec(request)
+        .map_err(|err| format!("unable to prepare preview speech: {err}"))?;
+    let mut encoded = BASE64.encode(json).into_bytes();
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
 #[cfg(windows)]
 impl Drop for PreviewSpeechController {
     fn drop(&mut self) {
@@ -559,7 +565,7 @@ impl Drop for PreviewSpeechController {
 fn start_preview_speech_worker() -> Result<PreviewSpeechWorker, String> {
     use std::process::Stdio;
 
-    let script = r#"& { Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToDefaultAudioDevice(); while (($line = [Console]::In.ReadLine()) -ne $null) { try { $job = $line | ConvertFrom-Json; $s.SpeakAsyncCancelAll(); if ([string]$job.op -eq 'stop') { continue }; if (-not [string]::IsNullOrWhiteSpace([string]$job.voice_name)) { $s.SelectVoice([string]$job.voice_name) } else { $culture = [Globalization.CultureInfo]::GetCultureInfo([string]$job.language); $voices = @($s.GetInstalledVoices($culture) | Where-Object { $_.Enabled }); if ($voices.Count -eq 0) { $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }) }; if ($voices.Count -eq 0) { continue }; $voice = $voices[[int64]$job.voice_slot % $voices.Count]; $s.SelectVoice($voice.VoiceInfo.Name) }; $s.Volume = [Math]::Max(0, [Math]::Min(100, [int]$job.volume)); $escaped = [Security.SecurityElement]::Escape([string]$job.text); $pitch = [int]$job.pitch; $speechRate = [int]$job.speech_rate; $language = [string]$job.language; $ssml = "<speak version='1.0' xml:lang='$language'><prosody pitch='$pitch%' rate='$speechRate%'>$escaped</prosody></speak>"; $null = $s.SpeakSsmlAsync($ssml) } catch {} }; $s.SpeakAsyncCancelAll(); $s.Dispose() }"#;
+    let script = r#"& { Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToDefaultAudioDevice(); while (($line = [Console]::In.ReadLine()) -ne $null) { try { $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line)); $job = $json | ConvertFrom-Json; $s.SpeakAsyncCancelAll(); if ([string]$job.op -eq 'stop') { continue }; $selected = $false; if (-not [string]::IsNullOrWhiteSpace([string]$job.voice_name)) { $candidate = @($s.GetInstalledVoices() | Where-Object { $_.Enabled -and $_.VoiceInfo.Name -eq [string]$job.voice_name -and ([string]$job.language -ne 'zh-CN' -or $_.VoiceInfo.Culture.Name -eq 'zh-CN') }) | Select-Object -First 1; if ($null -ne $candidate) { $s.SelectVoice($candidate.VoiceInfo.Name); $selected = $true } }; if (-not $selected) { $culture = [Globalization.CultureInfo]::GetCultureInfo([string]$job.language); $voices = @($s.GetInstalledVoices($culture) | Where-Object { $_.Enabled }); if ($voices.Count -eq 0) { $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }) }; if ($voices.Count -eq 0) { continue }; $voice = $voices[[int64]$job.voice_slot % $voices.Count]; $s.SelectVoice($voice.VoiceInfo.Name) }; $s.Volume = [Math]::Max(0, [Math]::Min(100, [int]$job.volume)); $escaped = [Security.SecurityElement]::Escape([string]$job.text); $pitch = [int]$job.pitch; $speechRate = [int]$job.speech_rate; $language = [string]$job.language; $ssml = "<speak version='1.0' xml:lang='$language'><prosody pitch='$pitch%' rate='$speechRate%'>$escaped</prosody></speak>"; $null = $s.SpeakSsmlAsync($ssml) } catch {} }; $s.SpeakAsyncCancelAll(); $s.Dispose() }"#;
     let mut command = Command::new("powershell.exe");
     command
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -1112,6 +1118,15 @@ fn replay_controls(
                     Ok(voices) => {
                         studio.installed_speech_voices = voices;
                         studio.speech_voices_loaded = true;
+                        if let Some(replay) = studio.replay.as_mut() {
+                            for settings in replay.speaker_voice_settings.values_mut() {
+                                if settings.voice_name.as_ref().is_some_and(|voice| {
+                                    !studio.installed_speech_voices.contains(voice)
+                                }) {
+                                    settings.voice_name = None;
+                                }
+                            }
+                        }
                     },
                     Err(err) => studio.status = format!("读取 Windows 语音失败：{err}"),
                 }
@@ -1257,7 +1272,7 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         .default_width(520.0)
         .max_width(620.0)
         .show(ctx, |ui| {
-            ui.label("为每个角色单独选择 Windows 声音，并调整音调、语速和相对音量。设置同时用于播放预览和 MP4 导出。");
+            ui.label("为每个角色单独选择已安装的中文（zh-CN）Windows 声音，并调整音调、语速和相对音量。设置同时用于播放预览和 MP4 导出。");
             if speakers.is_empty() {
                 ui.label("请先录制回放或从现有聊天生成回放。");
                 return;
@@ -1754,7 +1769,7 @@ fn check_speech_synthesizer() -> Result<(), String> {
 
 #[cfg(windows)]
 fn installed_speech_voice_names() -> Result<Vec<String>, String> {
-    let script = r#"[Console]::OutputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.GetInstalledVoices() | Where-Object { $_.Enabled } | ForEach-Object { $_.VoiceInfo.Name }; $s.Dispose()"#;
+    let script = r#"[Console]::OutputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.GetInstalledVoices() | Where-Object { $_.Enabled -and $_.VoiceInfo.Culture.Name -eq 'zh-CN' } | ForEach-Object { $_.VoiceInfo.Name }; $s.Dispose()"#;
     let mut command = Command::new("powershell.exe");
     command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     hide_command_window(&mut command);
@@ -1776,7 +1791,10 @@ fn installed_speech_voice_names() -> Result<Vec<String>, String> {
     voices.sort();
     voices.dedup();
     if voices.is_empty() {
-        Err("未找到已安装的 Windows 语音".to_owned())
+        Err(
+            "未找到已安装的中文（zh-CN）Windows 语音，请先在 Windows 语言设置中安装中文语音"
+                .to_owned(),
+        )
     } else {
         Ok(voices)
     }
@@ -2074,7 +2092,7 @@ fn write_narration_track(
 }
 
 fn speaker_voice_profile(sender_id: u64) -> (i32, i32) {
-    const PITCHES: [i32; 8] = [-22, -12, -18, -8, -20, -14, -24, -10];
+    const PITCHES: [i32; 8] = [-12, -6, -10, -4, -11, -7, -14, -5];
     const RATES: [i32; 8] = [18, 24, 14, 28, 10, 21, 16, 26];
     let profile = (sender_id as usize) % PITCHES.len();
     (PITCHES[profile], RATES[profile])
@@ -2110,7 +2128,7 @@ fn synthesize_speech_batch(
     let manifest = serde_json::to_vec(&serde_json::json!({ "jobs": jobs }))
         .map_err(|err| format!("无法整理角色语音任务：{err}"))?;
     fs::write(&manifest_path, manifest).map_err(|err| format!("无法保存角色语音任务：{err}"))?;
-    let script = r#"& { param($manifestPath) Add-Type -AssemblyName System.Speech; $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json; $jobs = @($manifest.jobs); $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo -ArgumentList 32000,([System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen),([System.Speech.AudioFormat.AudioChannel]::Mono); foreach ($job in $jobs) { if (-not [string]::IsNullOrWhiteSpace([string]$job.voice_name)) { $s.SelectVoice([string]$job.voice_name) } else { $culture = [Globalization.CultureInfo]::GetCultureInfo([string]$job.language); $voices = @($s.GetInstalledVoices($culture) | Where-Object { $_.Enabled }); if ($voices.Count -eq 0) { $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }) }; if ($voices.Count -eq 0) { throw 'No installed speech voice' }; $voice = $voices[[int64]$job.voice_slot % $voices.Count]; $s.SelectVoice($voice.VoiceInfo.Name) }; $s.SetOutputToWaveFile([string]$job.output_path, $format); $escaped = [Security.SecurityElement]::Escape([string]$job.text); $pitch = [int]$job.pitch; $speechRate = [int]$job.speech_rate; $language = [string]$job.language; $ssml = "<speak version='1.0' xml:lang='$language'><prosody pitch='$pitch%' rate='$speechRate%'>$escaped</prosody></speak>"; $s.SpeakSsml($ssml); $s.SetOutputToNull() }; $s.Dispose() }"#;
+    let script = r#"& { param($manifestPath) Add-Type -AssemblyName System.Speech; $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json; $jobs = @($manifest.jobs); $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo -ArgumentList 32000,([System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen),([System.Speech.AudioFormat.AudioChannel]::Mono); foreach ($job in $jobs) { $selected = $false; if (-not [string]::IsNullOrWhiteSpace([string]$job.voice_name)) { $candidate = @($s.GetInstalledVoices() | Where-Object { $_.Enabled -and $_.VoiceInfo.Name -eq [string]$job.voice_name -and ([string]$job.language -ne 'zh-CN' -or $_.VoiceInfo.Culture.Name -eq 'zh-CN') }) | Select-Object -First 1; if ($null -ne $candidate) { $s.SelectVoice($candidate.VoiceInfo.Name); $selected = $true } }; if (-not $selected) { $culture = [Globalization.CultureInfo]::GetCultureInfo([string]$job.language); $voices = @($s.GetInstalledVoices($culture) | Where-Object { $_.Enabled }); if ($voices.Count -eq 0) { $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }) }; if ($voices.Count -eq 0) { throw 'No installed speech voice' }; $voice = $voices[[int64]$job.voice_slot % $voices.Count]; $s.SelectVoice($voice.VoiceInfo.Name) }; $s.SetOutputToWaveFile([string]$job.output_path, $format); $escaped = [Security.SecurityElement]::Escape([string]$job.text); $pitch = [int]$job.pitch; $speechRate = [int]$job.speech_rate; $language = [string]$job.language; $ssml = "<speak version='1.0' xml:lang='$language'><prosody pitch='$pitch%' rate='$speechRate%'>$escaped</prosody></speak>"; $s.SpeakSsml($ssml); $s.SetOutputToNull() }; $s.Dispose() }"#;
     let mut command = Command::new("powershell.exe");
     command
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -3138,9 +3156,29 @@ mod tests {
     }
 
     #[test]
+    fn preview_speech_wire_preserves_chinese_utf8() {
+        let request = PreviewSpeechRequest::Speak {
+            text: "萌萌打开了舱门。",
+            language: "zh-CN",
+            voice_name: None,
+            voice_slot: 42,
+            pitch: -18,
+            speech_rate: 10,
+            volume: 90,
+        };
+
+        let wire = preview_speech_wire_line(&request).unwrap();
+        assert!(wire[..wire.len() - 1].iter().all(u8::is_ascii));
+        let json = BASE64.decode(&wire[..wire.len() - 1]).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["text"], "萌萌打开了舱门。");
+        assert_eq!(value["language"], "zh-CN");
+    }
+
+    #[test]
     fn speaker_voice_profiles_use_distinct_lower_pitches() {
         let profiles = (0..8).map(speaker_voice_profile).collect::<Vec<_>>();
-        assert!(profiles.iter().all(|(pitch, _)| *pitch <= -8));
+        assert!(profiles.iter().all(|(pitch, _)| (-14..=-4).contains(pitch)));
         assert!(profiles.windows(2).all(|pair| pair[0] != pair[1]));
     }
 
