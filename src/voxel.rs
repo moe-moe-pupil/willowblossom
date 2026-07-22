@@ -101,8 +101,8 @@ use crate::{
 };
 
 const VOXEL_SIZE: f32 = 0.25;
-/// Minecraft-style horizontal chunk radius around the DM and every player camera.
-const VOXEL_CHUNK_LOAD_RADIUS: i32 = 8;
+/// Horizontal physics-body chunk radius around the DM and every player camera.
+const VOXEL_PHYSICS_CHUNK_LOAD_RADIUS: i32 = 8;
 const VOXEL_DM_GIZMO_RENDER_LAYER: usize = 1;
 const PLAYER_STANDEE_PLANE_NORMAL: Vec3 = Vec3::Z;
 pub(crate) const MAX_VOXEL_BRUSH_RADIUS: i32 = 50;
@@ -260,21 +260,15 @@ struct VoxelPhysicsBody {
     cells: Vec<(IVec3, u8)>,
 }
 
-#[derive(Component)]
-struct VoxelChunkUnloaded(Visibility);
-
 #[derive(Resource, Default)]
-struct LoadedVoxelChunks {
+struct VoxelPhysicsChunkLoader {
     columns: HashSet<IVec2>,
+    unloaded_bodies: Vec<VoxelPhysicsBodySnapshot>,
 }
 
-impl LoadedVoxelChunks {
+impl VoxelPhysicsChunkLoader {
     fn contains_world_position(&self, position: Vec3) -> bool {
         self.columns.contains(&voxel_chunk_column(position))
-    }
-
-    fn contains_chunk(&self, chunk: IVec3) -> bool {
-        self.columns.contains(&IVec2::new(chunk.x, chunk.z))
     }
 }
 
@@ -1239,7 +1233,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPlayerCaptureState>()
         .init_resource::<VoxelPlayerStandeeAssets>()
         .init_resource::<VoxelToolGunDragState>()
-        .init_resource::<LoadedVoxelChunks>()
+        .init_resource::<VoxelPhysicsChunkLoader>()
         .insert_resource(player_camera_store)
         .insert_resource(inventory_store)
         .insert_resource(toolbar_settings_store)
@@ -1280,7 +1274,7 @@ impl Plugin for TrpgVoxelPlugin {
                 )
                     .chain(),
                 (
-                    update_loaded_voxel_chunks,
+                    update_loaded_voxel_physics_chunks,
                     stream_voxel_physics_bodies,
                     animate_voxel_auto_doors,
                     rebuild_voxel_geometry,
@@ -1600,20 +1594,9 @@ fn radiance_voxel_color(material: u8) -> [u8; 4] {
     }
 }
 
-#[cfg(test)]
 fn build_voxel_radiance_image(grid: &Grid<u8>) -> (Image, Vec3, f32, Vec3) {
-    build_voxel_radiance_image_for_chunks(grid, None)
-}
-
-fn build_voxel_radiance_image_for_chunks(
-    grid: &Grid<u8>,
-    loaded: Option<&LoadedVoxelChunks>,
-) -> (Image, Vec3, f32, Vec3) {
     let solid_cells = grid
         .iter()
-        .filter(|(chunk_position, _)| {
-            loaded.is_none_or(|loaded| loaded.contains_chunk(**chunk_position))
-        })
         .flat_map(|(chunk_position, chunk)| {
             prism(IVec3::ZERO, DIMS).filter_map(move |local| {
                 let material = chunk[local];
@@ -1680,15 +1663,13 @@ fn build_voxel_radiance_image_for_chunks(
 
 fn setup_voxel_radiance_volume(
     grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
-    loaded: Res<LoadedVoxelChunks>,
     mut images: ResMut<Assets<Image>>,
     mut volume: ResMut<VoxelRadianceVolume>,
 ) {
     let Ok(grid) = grids.single() else {
         return;
     };
-    let (image, volume_min, voxel_world_size, volume_dimensions) =
-        build_voxel_radiance_image_for_chunks(grid, Some(&loaded));
+    let (image, volume_min, voxel_world_size, volume_dimensions) = build_voxel_radiance_image(grid);
     volume.image = images.add(image);
     volume.volume_min = volume_min;
     volume.voxel_world_size = voxel_world_size;
@@ -1696,8 +1677,7 @@ fn setup_voxel_radiance_volume(
 }
 
 fn sync_voxel_radiance_volume(
-    grids: Query<Ref<Grid<u8>>, With<TrpgVoxelGrid>>,
-    loaded: Res<LoadedVoxelChunks>,
+    grids: Query<&Grid<u8>, (With<TrpgVoxelGrid>, Changed<Grid<u8>>)>,
     editor: Res<VoxelEditorState>,
     mut images: ResMut<Assets<Image>>,
     mut volume: ResMut<VoxelRadianceVolume>,
@@ -1706,11 +1686,7 @@ fn sync_voxel_radiance_volume(
     let Ok(grid) = grids.single() else {
         return;
     };
-    if !grid.is_changed() && !loaded.is_changed() {
-        return;
-    }
-    let (image, volume_min, voxel_world_size, volume_dimensions) =
-        build_voxel_radiance_image_for_chunks(&grid, Some(&loaded));
+    let (image, volume_min, voxel_world_size, volume_dimensions) = build_voxel_radiance_image(grid);
     if images.contains(&volume.image) {
         *images.get_mut(&volume.image).unwrap() = image;
     } else {
@@ -4778,12 +4754,12 @@ fn voxel_chunk_column(world_position: Vec3) -> IVec2 {
     )
 }
 
-fn loaded_chunk_columns(anchors: impl IntoIterator<Item = Vec3>) -> HashSet<IVec2> {
+fn loaded_physics_chunk_columns(anchors: impl IntoIterator<Item = Vec3>) -> HashSet<IVec2> {
     let mut columns = HashSet::new();
     for anchor in anchors {
         let center = voxel_chunk_column(anchor);
-        for z in -VOXEL_CHUNK_LOAD_RADIUS..=VOXEL_CHUNK_LOAD_RADIUS {
-            for x in -VOXEL_CHUNK_LOAD_RADIUS..=VOXEL_CHUNK_LOAD_RADIUS {
+        for z in -VOXEL_PHYSICS_CHUNK_LOAD_RADIUS..=VOXEL_PHYSICS_CHUNK_LOAD_RADIUS {
+            for x in -VOXEL_PHYSICS_CHUNK_LOAD_RADIUS..=VOXEL_PHYSICS_CHUNK_LOAD_RADIUS {
                 columns.insert(center + IVec2::new(x, z));
             }
         }
@@ -4791,11 +4767,11 @@ fn loaded_chunk_columns(anchors: impl IntoIterator<Item = Vec3>) -> HashSet<IVec
     columns
 }
 
-fn update_loaded_voxel_chunks(
+fn update_loaded_voxel_physics_chunks(
     editor: Res<VoxelEditorState>,
     dm_camera: Query<&Transform, With<VoxelViewportCamera>>,
     player_cameras: Query<&Transform, With<VoxelPlayerCaptureCamera>>,
-    mut loaded: ResMut<LoadedVoxelChunks>,
+    mut loader: ResMut<VoxelPhysicsChunkLoader>,
 ) {
     let dm_position = if editor.first_person_enabled {
         dm_camera
@@ -4805,64 +4781,78 @@ fn update_loaded_voxel_chunks(
     } else {
         editor.camera_focus
     };
-    let columns = loaded_chunk_columns(
+    let columns = loaded_physics_chunk_columns(
         std::iter::once(dm_position)
             .chain(player_cameras.iter().map(|transform| transform.translation)),
     );
-    if loaded.columns != columns {
-        loaded.columns = columns;
+    if loader.columns != columns {
+        loader.columns = columns;
     }
 }
 
 fn voxel_physics_body_is_loaded(
     body: &VoxelPhysicsBody,
     transform: &Transform,
-    loaded: &LoadedVoxelChunks,
+    loader: &VoxelPhysicsChunkLoader,
 ) -> bool {
     let affine = transform.compute_affine();
     body.cells.iter().any(|(cell, _)| {
         let local_center = (cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
-        loaded.contains_world_position(affine.transform_point3(local_center))
+        loader.contains_world_position(affine.transform_point3(local_center))
     })
 }
 
 fn stream_voxel_physics_bodies(
     mut commands: Commands,
-    loaded: Res<LoadedVoxelChunks>,
-    mut bodies: Query<(
+    mut loader: ResMut<VoxelPhysicsChunkLoader>,
+    bodies: Query<(
         Entity,
         &VoxelPhysicsBody,
         &Transform,
-        &mut Visibility,
-        Option<&VoxelChunkUnloaded>,
+        &LinearVelocity,
+        &AngularVelocity,
     )>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
 ) {
-    for (entity, body, transform, mut visibility, unloaded) in &mut bodies {
-        let should_load = voxel_physics_body_is_loaded(body, transform, &loaded);
-        match (should_load, unloaded) {
-            (true, Some(unloaded)) => {
-                *visibility = unloaded.0;
-                commands
-                    .entity(entity)
-                    .remove::<(VoxelChunkUnloaded, RigidBodyDisabled)>();
-            },
-            (false, None) => {
-                let previous_visibility = *visibility;
-                *visibility = Visibility::Hidden;
-                commands.entity(entity).insert((
-                    VoxelChunkUnloaded(previous_visibility),
-                    RigidBodyDisabled,
-                ));
-            },
-            _ => {},
+    for (entity, body, transform, linear_velocity, angular_velocity) in &bodies {
+        if voxel_physics_body_is_loaded(body, transform, &loader) {
+            continue;
         }
+        loader.unloaded_bodies.push(VoxelPhysicsBodySnapshot {
+            body: body.clone(),
+            transform: *transform,
+            linear_velocity: *linear_velocity,
+            angular_velocity: *angular_velocity,
+        });
+        commands.entity(entity).despawn();
+    }
+
+    let cached = std::mem::take(&mut loader.unloaded_bodies);
+    for snapshot in cached {
+        if !voxel_physics_body_is_loaded(
+            &snapshot.body,
+            &snapshot.transform,
+            &loader,
+        ) {
+            loader.unloaded_bodies.push(snapshot);
+            continue;
+        }
+        spawn_voxel_physics_body_at(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            snapshot.body.cells,
+            snapshot.transform,
+            snapshot.linear_velocity,
+            snapshot.angular_velocity,
+        );
     }
 }
 
 fn rebuild_voxel_geometry(
     mut commands: Commands,
-    grids: Query<Ref<Grid<u8>>, With<TrpgVoxelGrid>>,
-    loaded: Res<LoadedVoxelChunks>,
+    grids: Query<&Grid<u8>, (With<TrpgVoxelGrid>, Changed<Grid<u8>>)>,
     old_geometry: Query<Entity, With<VoxelGeometry>>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
@@ -4870,15 +4860,11 @@ fn rebuild_voxel_geometry(
     let Ok(grid) = grids.single() else {
         return;
     };
-    if !grid.is_changed() && !loaded.is_changed() {
-        return;
-    }
-
     for entity in &old_geometry {
         commands.entity(entity).despawn();
     }
 
-    let (material_meshes, collider_voxels) = build_loaded_voxel_meshes(&grid, &loaded);
+    let (material_meshes, collider_voxels) = build_voxel_meshes(grid);
     for (material_id, mesh) in material_meshes {
         commands.spawn((
             Mesh3d(meshes.add(mesh)),
@@ -4895,7 +4881,6 @@ fn rebuild_voxel_geometry(
     }
 }
 
-#[cfg(test)]
 fn build_voxel_meshes(grid: &Grid<u8>) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
     let cells = grid
         .iter()
@@ -4906,23 +4891,6 @@ fn build_voxel_meshes(grid: &Grid<u8>) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
                     (material != 0).then_some((*chunk_position * DIMS + local, material))
                 })
                 .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    build_voxel_meshes_from_cells(&cells)
-}
-
-fn build_loaded_voxel_meshes(
-    grid: &Grid<u8>,
-    loaded: &LoadedVoxelChunks,
-) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
-    let cells = grid
-        .iter()
-        .filter(|(chunk_position, _)| loaded.contains_chunk(**chunk_position))
-        .flat_map(|(chunk_position, chunk)| {
-            prism(IVec3::ZERO, DIMS).filter_map(move |local| {
-                let material = chunk[local];
-                (material != 0).then_some((*chunk_position * DIMS + local, material))
-            })
         })
         .collect::<Vec<_>>();
     build_voxel_meshes_from_cells(&cells)
@@ -5069,6 +5037,7 @@ fn animate_voxel_materials(
 fn handle_editor_requests(
     mut commands: Commands,
     mut editor: ResMut<VoxelEditorState>,
+    mut physics_loader: ResMut<VoxelPhysicsChunkLoader>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     physics_bodies: Query<Entity, With<VoxelPhysicsBody>>,
     placed_lights: Query<Entity, With<VoxelPlacedLight>>,
@@ -5077,6 +5046,7 @@ fn handle_editor_requests(
         return;
     };
     if editor.reset_requested {
+        physics_loader.unloaded_bodies.clear();
         for entity in &physics_bodies {
             commands.entity(entity).despawn();
         }
@@ -5535,6 +5505,7 @@ fn spawn_planet_explosion_fragments(
 fn process_voxel_scene_history(
     mut commands: Commands,
     mut editor: ResMut<VoxelEditorState>,
+    mut physics_loader: ResMut<VoxelPhysicsChunkLoader>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     physics_bodies: Query<(
         Entity,
@@ -5553,7 +5524,7 @@ fn process_voxel_scene_history(
             return;
         };
         let voxels = voxel_cells(grid);
-        let physics_bodies = physics_bodies
+        let mut physics_bodies = physics_bodies
             .iter()
             .map(
                 |(_, body, transform, linear_velocity, angular_velocity)| {
@@ -5566,6 +5537,7 @@ fn process_voxel_scene_history(
                 },
             )
             .collect::<Vec<_>>();
+        physics_bodies.extend(physics_loader.unloaded_bodies.iter().cloned());
         let placed_lights = placed_lights
             .iter()
             .map(|(_, light)| light.clone())
@@ -5609,6 +5581,7 @@ fn process_voxel_scene_history(
     for (entity, ..) in &physics_bodies {
         commands.entity(entity).despawn();
     }
+    physics_loader.unloaded_bodies.clear();
     for (entity, _) in &placed_lights {
         commands.entity(entity).despawn();
     }
@@ -7702,35 +7675,19 @@ mod tests {
     }
 
     #[test]
-    fn chunk_loading_unions_dm_and_player_neighborhoods() {
+    fn physics_chunk_loading_unions_dm_and_player_neighborhoods() {
         let chunk_size = VOXEL_SIZE * DIMS.x as f32;
-        let columns = loaded_chunk_columns([Vec3::ZERO, Vec3::new(chunk_size * 30.0, 0.0, 0.0)]);
+        let columns =
+            loaded_physics_chunk_columns([Vec3::ZERO, Vec3::new(chunk_size * 30.0, 0.0, 0.0)]);
         assert!(columns.contains(&IVec2::ZERO));
         assert!(columns.contains(&IVec2::new(30, 0)));
-        assert!(columns.contains(&IVec2::splat(VOXEL_CHUNK_LOAD_RADIUS)));
+        assert!(columns.contains(&IVec2::splat(
+            VOXEL_PHYSICS_CHUNK_LOAD_RADIUS
+        )));
         assert!(!columns.contains(&IVec2::new(
-            VOXEL_CHUNK_LOAD_RADIUS + 1,
+            VOXEL_PHYSICS_CHUNK_LOAD_RADIUS + 1,
             0
         )));
-    }
-
-    #[test]
-    fn streamed_voxel_mesh_excludes_unloaded_chunks() {
-        let mut app = App::new();
-        let entity = app.world_mut().spawn(Grid::<u8>::new()).id();
-        {
-            let mut entity_mut = app.world_mut().entity_mut(entity);
-            let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
-            grid.set(IVec3::ZERO, 1);
-            grid.set(IVec3::new(DIMS.x * 3, 0, 0), 2);
-        }
-        let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
-        let loaded = LoadedVoxelChunks {
-            columns: HashSet::from([IVec2::ZERO]),
-        };
-        let (meshes, collider_cells) = build_loaded_voxel_meshes(grid, &loaded);
-        assert_eq!(meshes.len(), 1);
-        assert_eq!(collider_cells, vec![IVec3::ZERO]);
     }
 
     #[test]
@@ -7739,19 +7696,82 @@ mod tests {
             local_center: Vec3::ZERO,
             cells: vec![(IVec3::ZERO, 1), (IVec3::new(DIMS.x, 0, 0), 1)],
         };
-        let loaded = LoadedVoxelChunks {
+        let loader = VoxelPhysicsChunkLoader {
             columns: HashSet::from([IVec2::X]),
+            ..default()
         };
         assert!(voxel_physics_body_is_loaded(
             &body,
             &Transform::IDENTITY,
-            &loaded
+            &loader
         ));
         assert!(!voxel_physics_body_is_loaded(
             &body,
             &Transform::from_xyz(100.0, 0.0, 0.0),
-            &loaded
+            &loader
         ));
+    }
+
+    #[test]
+    fn distant_physics_body_is_cached_and_respawned_without_disabling_rigid_body() {
+        let mut app = App::new();
+        app.init_resource::<VoxelPhysicsChunkLoader>()
+            .init_resource::<Assets<Mesh>>()
+            .insert_resource(VoxelMaterials {
+                handles: std::array::from_fn(|_| Handle::default()),
+                planet_ocean: Handle::default(),
+            })
+            .add_systems(Update, stream_voxel_physics_bodies);
+        let position = Vec3::new(
+            VOXEL_SIZE * DIMS.x as f32 * 20.0,
+            0.0,
+            0.0,
+        );
+        app.world_mut().spawn((
+            VoxelPhysicsBody {
+                local_center: Vec3::splat(VOXEL_SIZE * 0.5),
+                cells: vec![(IVec3::ZERO, 1)],
+            },
+            Transform::from_translation(position),
+            LinearVelocity(Vec3::X),
+            AngularVelocity(Vec3::Y),
+        ));
+
+        app.update();
+
+        assert_eq!(
+            app.world_mut()
+                .query_filtered::<Entity, With<VoxelPhysicsBody>>()
+                .iter(app.world())
+                .count(),
+            0
+        );
+        assert_eq!(
+            app.world()
+                .resource::<VoxelPhysicsChunkLoader>()
+                .unloaded_bodies
+                .len(),
+            1
+        );
+
+        app.world_mut()
+            .resource_mut::<VoxelPhysicsChunkLoader>()
+            .columns
+            .insert(voxel_chunk_column(position));
+        app.update();
+
+        assert_eq!(
+            app.world_mut()
+                .query_filtered::<Entity, With<VoxelPhysicsBody>>()
+                .iter(app.world())
+                .count(),
+            1
+        );
+        assert!(app
+            .world()
+            .resource::<VoxelPhysicsChunkLoader>()
+            .unloaded_bodies
+            .is_empty());
     }
 
     #[test]
@@ -8711,6 +8731,7 @@ mod tests {
     fn scene_history_restores_grid_and_physics_body_state() {
         let (mut app, grid_entity) = test_grid();
         app.init_resource::<VoxelEditorState>()
+            .init_resource::<VoxelPhysicsChunkLoader>()
             .init_resource::<Assets<Mesh>>()
             .insert_resource(VoxelMaterials {
                 handles: std::array::from_fn(|_| Handle::default()),
