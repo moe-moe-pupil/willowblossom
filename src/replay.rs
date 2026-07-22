@@ -77,9 +77,9 @@ use crate::{
 
 const REPLAY_FORMAT_VERSION: u32 = 1;
 const CAMERA_SAMPLE_SECONDS: f32 = 0.1;
-const MIN_DIALOGUE_MS: u64 = 900;
-const MAX_DIALOGUE_MS: u64 = 3_250;
-const HISTORY_DIALOGUE_GAP_MS: u64 = 90;
+const MIN_DIALOGUE_MS: u64 = 1_350;
+const MAX_DIALOGUE_MS: u64 = 4_875;
+const HISTORY_DIALOGUE_GAP_MS: u64 = 135;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
@@ -492,7 +492,11 @@ impl PreviewSpeechController {
             voice_name: settings.voice_name.as_deref(),
             voice_slot: line.sender_id,
             pitch: settings.pitch,
-            speech_rate: settings.speech_rate,
+            speech_rate: ssml_rate_percent(fitted_speech_rate(
+                settings.speech_rate,
+                &line.text,
+                line.duration_ms,
+            )),
             volume: (global_volume * settings.volume)
                 .clamp(0.0, 1.0)
                 .mul_add(100.0, 0.0)
@@ -1272,7 +1276,7 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         .default_width(520.0)
         .max_width(620.0)
         .show(ctx, |ui| {
-            ui.label("为每个角色单独选择已安装的中文（zh-CN）Windows 声音，并调整音调、语速和相对音量。设置同时用于播放预览和 MP4 导出。");
+            ui.label("为每个角色单独选择已安装的中文（zh-CN）Windows 声音，并调整音调、基础语速和相对音量。长台词会自动加速，以尽量在下一句前说完；设置同时用于播放预览和 MP4 导出。");
             if speakers.is_empty() {
                 ui.label("请先录制回放或从现有聊天生成回放。");
                 return;
@@ -1317,8 +1321,9 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                             .changed();
                         settings_changed |= ui
                             .add(
-                                egui::Slider::new(&mut settings.speech_rate, -30..=60)
-                                    .text("语速"),
+                                egui::Slider::new(&mut settings.speech_rate, -30..=180)
+                                    .text("基础语速")
+                                    .custom_formatter(|value, _| format!("{value:+.0}%")),
                             )
                             .changed();
                         settings_changed |= ui
@@ -1454,7 +1459,7 @@ fn build_from_history(
     studio.playback_ms = 0;
     studio.replay = Some(replay);
     studio.status = format!(
-        "已从现有聊天生成 {0} 条连续对话；切换间隔约 0.09 秒",
+        "已从现有聊天生成 {0} 条连续对话；切换间隔约 0.135 秒",
         visible.len()
     );
 }
@@ -2009,7 +2014,11 @@ fn write_narration_track(
                 voice_name: settings.voice_name,
                 voice_slot: line.sender_id,
                 pitch: settings.pitch,
-                speech_rate: settings.speech_rate,
+                speech_rate: ssml_rate_percent(fitted_speech_rate(
+                    settings.speech_rate,
+                    &line.text,
+                    line.duration_ms,
+                )),
             }
         })
         .collect::<Vec<_>>();
@@ -2097,6 +2106,28 @@ fn speaker_voice_profile(sender_id: u64) -> (i32, i32) {
     let profile = (sender_id as usize) % PITCHES.len();
     (PITCHES[profile], RATES[profile])
 }
+
+fn fitted_speech_rate(base_rate: i32, text: &str, duration_ms: u64) -> i32 {
+    let estimated_ms = text.chars().fold(250_u64, |total, character| {
+        let character_ms = match character {
+            '。' | '！' | '？' | '!' | '?' | '；' | ';' => 280,
+            '，' | ',' | '、' | '：' | ':' => 160,
+            character if character.is_whitespace() => 15,
+            character if is_cjk_character(character) => 250,
+            _ => 45,
+        };
+        total.saturating_add(character_ms)
+    });
+    let speaking_window_ms = duration_ms.saturating_sub(120).max(1);
+    let required_rate = estimated_ms
+        .saturating_mul(100)
+        .saturating_add(speaking_window_ms - 1)
+        / speaking_window_ms;
+    let required_percent_faster = required_rate.saturating_sub(100) as i32;
+    base_rate.max(required_percent_faster).clamp(-30, 180)
+}
+
+fn ssml_rate_percent(relative_rate: i32) -> i32 { (100 + relative_rate).clamp(70, 280) }
 
 fn default_speaker_voice_settings(sender_id: u64) -> SpeakerVoiceSettings {
     let (pitch, speech_rate) = speaker_voice_profile(sender_id);
@@ -2646,7 +2677,10 @@ fn dialogue_duration_ms(text: &str) -> u64 {
         };
         total.saturating_add(character_ms)
     });
-    reading_ms.clamp(MIN_DIALOGUE_MS, MAX_DIALOGUE_MS)
+    reading_ms
+        .saturating_mul(3)
+        .saturating_div(2)
+        .clamp(MIN_DIALOGUE_MS, MAX_DIALOGUE_MS)
 }
 
 fn is_cjk_character(character: char) -> bool {
@@ -3122,8 +3156,20 @@ mod tests {
 
     #[test]
     fn historical_dialogue_transition_is_brief() {
-        assert_eq!(HISTORY_DIALOGUE_GAP_MS, 90);
-        assert_eq!(MIN_DIALOGUE_MS, 900);
+        assert_eq!(HISTORY_DIALOGUE_GAP_MS, 135);
+        assert_eq!(MIN_DIALOGUE_MS, 1_350);
+        assert_eq!(MAX_DIALOGUE_MS, 4_875);
+    }
+
+    #[test]
+    fn speech_rate_is_valid_ssml_and_auto_fits_long_lines() {
+        assert_eq!(ssml_rate_percent(18), 118);
+        assert_eq!(ssml_rate_percent(-30), 70);
+        assert_eq!(
+            fitted_speech_rate(18, "短句", 4_875),
+            18
+        );
+        assert!(fitted_speech_rate(18, &"很长的中文台词".repeat(8), 4_875) > 18);
     }
 
     #[test]
@@ -3241,15 +3287,15 @@ mod tests {
     #[ignore = "requires installed Windows speech voices"]
     fn windows_tts_assigns_distinct_speaker_profiles() {
         let directory = tempfile::tempdir().unwrap();
-        let mut first_line = test_dialogue(0, 900, DialogueSide::Left);
+        let mut first_line = test_dialogue(0, 1_350, DialogueSide::Left);
         first_line.text = "这是同一句角色语音测试。".to_owned();
-        let mut second_line = test_dialogue(1_000, 900, DialogueSide::Right);
+        let mut second_line = test_dialogue(1_485, 1_350, DialogueSide::Right);
         second_line.sender_id = 2;
         second_line.text = first_line.text.clone();
         write_narration_track(
             &directory.path().join("narration.wav"),
             directory.path(),
-            2_000,
+            2_835,
             0.90,
             &[first_line, second_line],
             &HashMap::new(),
@@ -3257,7 +3303,13 @@ mod tests {
         .unwrap();
         let first = directory.path().join("speech-00000.wav");
         let second = directory.path().join("speech-00001.wav");
-        assert!(!read_pcm16_mono_wav(&first).unwrap().is_empty());
+        let first_samples = read_pcm16_mono_wav(&first).unwrap();
+        assert!(!first_samples.is_empty());
+        assert!(
+            first_samples.len() <= 32_000 * 1_350 / 1_000,
+            "synthesized {} samples for a 1350 ms cue",
+            first_samples.len()
+        );
         assert_ne!(
             fs::read(first).unwrap(),
             fs::read(second).unwrap()
