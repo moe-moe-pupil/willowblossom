@@ -91,11 +91,13 @@ impl Plugin for ReplayPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ReplayStudio>()
             .init_resource::<ReplayVideoCaptureActive>()
+            .init_resource::<PreviewSpeechController>()
             .add_systems(
                 Update,
                 (
                     record_replay,
                     advance_replay,
+                    preview_replay_speech.after(advance_replay),
                     render_video_frames,
                     poll_video_encoding,
                 ),
@@ -184,6 +186,8 @@ struct ReplayFile {
     scene: ReplayScene,
     camera: Vec<ReplayCameraKeyframe>,
     dialogue: Vec<ReplayDialogue>,
+    #[serde(default)]
+    speaker_voice_settings: HashMap<u64, SpeakerVoiceSettings>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -218,6 +222,15 @@ struct ReplayDialogue {
     visibility: Visibility,
     #[serde(default)]
     side: DialogueSide,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SpeakerVoiceSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    voice_name: Option<String>,
+    pitch: i32,
+    speech_rate: i32,
+    volume: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -257,6 +270,9 @@ struct ReplayStudio {
     music_volume: f32,
     speech_enabled: bool,
     speech_volume: f32,
+    speech_settings_open: bool,
+    installed_speech_voices: Vec<String>,
+    speech_voices_loaded: bool,
     deepseek_custom_prompt: String,
     project_export_path: String,
     project_import_path: String,
@@ -276,6 +292,7 @@ struct VideoRenderJob {
     music_volume: f32,
     speech_enabled: bool,
     speech_volume: f32,
+    speaker_voice_settings: HashMap<u64, SpeakerVoiceSettings>,
     dialogue: Vec<ReplayDialogue>,
     total_frames: u64,
     next_frame: u64,
@@ -291,6 +308,34 @@ struct VideoEncodingJob {
     _frames: TempDir,
     output_path: PathBuf,
     result: Receiver<Result<(), String>>,
+}
+
+#[derive(Resource, Default)]
+struct PreviewSpeechController {
+    active_cue: Option<(u64, usize)>,
+    #[cfg(windows)]
+    worker: Option<PreviewSpeechWorker>,
+}
+
+#[cfg(windows)]
+struct PreviewSpeechWorker {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum PreviewSpeechRequest<'a> {
+    Speak {
+        text: &'a str,
+        language: &'static str,
+        voice_name: Option<&'a str>,
+        voice_slot: u64,
+        pitch: i32,
+        speech_rate: i32,
+        volume: u8,
+    },
+    Stop,
 }
 
 impl Default for ReplayStudio {
@@ -311,6 +356,9 @@ impl Default for ReplayStudio {
             music_volume: 0.35,
             speech_enabled: true,
             speech_volume: 0.90,
+            speech_settings_open: false,
+            installed_speech_voices: Vec::new(),
+            speech_voices_loaded: false,
             deepseek_custom_prompt: String::new(),
             project_export_path: DEFAULT_REPLAY_PATH.to_owned(),
             project_import_path: DEFAULT_REPLAY_PATH.to_owned(),
@@ -394,6 +442,139 @@ fn advance_replay(time: Res<Time>, mut studio: ResMut<ReplayStudio>) {
     if studio.playback_ms >= duration_ms {
         studio.mode = ReplayMode::Paused;
     }
+}
+
+fn preview_replay_speech(studio: Res<ReplayStudio>, mut speech: ResMut<PreviewSpeechController>) {
+    let active = (studio.mode == ReplayMode::Playing && studio.speech_enabled)
+        .then(|| {
+            studio.replay.as_ref().and_then(|replay| {
+                active_dialogue_index(&replay.dialogue, studio.playback_ms).map(|index| {
+                    (
+                        replay.created_at_unix_ms,
+                        index,
+                        &replay.dialogue[index],
+                    )
+                })
+            })
+        })
+        .flatten();
+    let cue = active.map(|(replay_id, index, _)| (replay_id, index));
+    if speech.active_cue == cue {
+        return;
+    }
+
+    if let Err(err) = speech.stop() {
+        eprintln!("failed to stop replay preview speech: {err}");
+    }
+    speech.active_cue = cue;
+    let Some((_, _, line)) = active else { return };
+    let settings = studio
+        .replay
+        .as_ref()
+        .and_then(|replay| replay.speaker_voice_settings.get(&line.sender_id))
+        .cloned()
+        .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
+    if let Err(err) = speech.speak(line, studio.speech_volume, &settings) {
+        eprintln!("failed to play replay preview speech: {err}");
+    }
+}
+
+impl PreviewSpeechController {
+    fn speak(
+        &mut self,
+        line: &ReplayDialogue,
+        global_volume: f32,
+        settings: &SpeakerVoiceSettings,
+    ) -> Result<(), String> {
+        self.send(PreviewSpeechRequest::Speak {
+            text: &line.text,
+            language: dialogue_language(&line.text),
+            voice_name: settings.voice_name.as_deref(),
+            voice_slot: line.sender_id,
+            pitch: settings.pitch,
+            speech_rate: settings.speech_rate,
+            volume: (global_volume * settings.volume)
+                .clamp(0.0, 1.0)
+                .mul_add(100.0, 0.0)
+                .round() as u8,
+        })
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        self.active_cue = None;
+        self.send_if_running(PreviewSpeechRequest::Stop)
+    }
+
+    #[cfg(windows)]
+    fn send(&mut self, request: PreviewSpeechRequest<'_>) -> Result<(), String> {
+        if self.worker.is_none() {
+            self.worker = Some(start_preview_speech_worker()?);
+        }
+        self.send_if_running(request)
+    }
+
+    #[cfg(not(windows))]
+    fn send(&mut self, _request: PreviewSpeechRequest<'_>) -> Result<(), String> {
+        Err("replay preview speech currently requires Windows offline TTS".to_owned())
+    }
+
+    #[cfg(windows)]
+    fn send_if_running(&mut self, request: PreviewSpeechRequest<'_>) -> Result<(), String> {
+        let Some(worker) = self.worker.as_mut() else { return Ok(()) };
+        let mut json = serde_json::to_vec(&request)
+            .map_err(|err| format!("unable to prepare preview speech: {err}"))?;
+        json.push(b'\n');
+        if let Err(err) = worker
+            .input
+            .write_all(&json)
+            .and_then(|_| worker.input.flush())
+        {
+            let _ = worker.child.kill();
+            let _ = worker.child.wait();
+            self.worker = None;
+            return Err(format!(
+                "preview speech worker stopped: {err}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn send_if_running(&mut self, _request: PreviewSpeechRequest<'_>) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PreviewSpeechController {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.as_mut() {
+            let _ = worker.child.kill();
+            let _ = worker.child.wait();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn start_preview_speech_worker() -> Result<PreviewSpeechWorker, String> {
+    use std::process::Stdio;
+
+    let script = r#"& { Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToDefaultAudioDevice(); while (($line = [Console]::In.ReadLine()) -ne $null) { try { $job = $line | ConvertFrom-Json; $s.SpeakAsyncCancelAll(); if ([string]$job.op -eq 'stop') { continue }; if (-not [string]::IsNullOrWhiteSpace([string]$job.voice_name)) { $s.SelectVoice([string]$job.voice_name) } else { $culture = [Globalization.CultureInfo]::GetCultureInfo([string]$job.language); $voices = @($s.GetInstalledVoices($culture) | Where-Object { $_.Enabled }); if ($voices.Count -eq 0) { $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }) }; if ($voices.Count -eq 0) { continue }; $voice = $voices[[int64]$job.voice_slot % $voices.Count]; $s.SelectVoice($voice.VoiceInfo.Name) }; $s.Volume = [Math]::Max(0, [Math]::Min(100, [int]$job.volume)); $escaped = [Security.SecurityElement]::Escape([string]$job.text); $pitch = [int]$job.pitch; $speechRate = [int]$job.speech_rate; $language = [string]$job.language; $ssml = "<speak version='1.0' xml:lang='$language'><prosody pitch='$pitch%' rate='$speechRate%'>$escaped</prosody></speak>"; $null = $s.SpeakSsmlAsync($ssml) } catch {} }; $s.SpeakAsyncCancelAll(); $s.Dispose() }"#;
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_command_window(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("unable to start Windows preview speech: {err}"))?;
+    let input = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Windows preview speech did not open its input stream".to_owned())?;
+    Ok(PreviewSpeechWorker { child, input })
 }
 
 fn render_video_frames(
@@ -520,6 +701,7 @@ fn finish_video_capture(
     let music_volume = job.music_volume;
     let speech_enabled = job.speech_enabled;
     let speech_volume = job.speech_volume;
+    let speaker_voice_settings = job.speaker_voice_settings;
     let dialogue = job.dialogue;
     let (sender, receiver) = bounded(1);
     thread::spawn(move || {
@@ -533,6 +715,7 @@ fn finish_video_capture(
             speech_enabled,
             speech_volume,
             &dialogue,
+            &speaker_voice_settings,
         );
         let _ = sender.send(result);
     });
@@ -637,6 +820,10 @@ fn replay_studio_ui(
                 )
             });
         studio.panel_open = open;
+    }
+
+    if studio.speech_settings_open && !capture_active.0 {
+        speech_settings_window(ctx, &mut studio);
     }
 
     if matches!(
@@ -910,7 +1097,7 @@ fn replay_controls(
     ui.horizontal(|ui| {
         ui.checkbox(
             &mut studio.speech_enabled,
-            "角色语音（Windows 免费离线 TTS）",
+            "角色语音（预览与导出，Windows 免费离线 TTS）",
         );
         ui.add_enabled(
             studio.speech_enabled,
@@ -918,8 +1105,20 @@ fn replay_controls(
                 .text("语音音量")
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
+        if ui.button("角色语音设置…").clicked() {
+            studio.speech_settings_open = true;
+            if !studio.speech_voices_loaded {
+                match installed_speech_voice_names() {
+                    Ok(voices) => {
+                        studio.installed_speech_voices = voices;
+                        studio.speech_voices_loaded = true;
+                    },
+                    Err(err) => studio.status = format!("读取 Windows 语音失败：{err}"),
+                }
+            }
+        }
     });
-    ui.small("每位 QQ 发言者使用稳定的不同音色；优先分配已安装的中文声音，不足时使用不同音高和语速。语音仅处理回放中已通过发布范围筛选的台词，不上传网络。");
+    ui.small("预览时语音会随当前台词立即播放，暂停、跳转或切换台词时同步停止；每位 QQ 发言者使用稳定的不同低音调音色。语音仅处理回放中已通过发布范围筛选的台词，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -1027,6 +1226,104 @@ fn replay_controls(
     );
     if !studio.status.is_empty() {
         ui.small(studio.status.as_str());
+    }
+}
+
+fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
+    let mut open = studio.speech_settings_open;
+    let speakers = studio
+        .replay
+        .as_ref()
+        .map(|replay| {
+            let mut speakers = Vec::<(u64, String, String)>::new();
+            for line in &replay.dialogue {
+                if !speakers.iter().any(|(id, ..)| *id == line.sender_id) {
+                    speakers.push((
+                        line.sender_id,
+                        line.name.clone(),
+                        line.role.clone(),
+                    ));
+                }
+            }
+            speakers
+        })
+        .unwrap_or_default();
+    let voices = studio.installed_speech_voices.clone();
+    let mut settings_changed = false;
+
+    egui::Window::new("角色语音设置")
+        .id(egui::Id::new("replay-speaker-voice-settings"))
+        .open(&mut open)
+        .default_width(520.0)
+        .max_width(620.0)
+        .show(ctx, |ui| {
+            ui.label("为每个角色单独选择 Windows 声音，并调整音调、语速和相对音量。设置同时用于播放预览和 MP4 导出。");
+            if speakers.is_empty() {
+                ui.label("请先录制回放或从现有聊天生成回放。");
+                return;
+            }
+            egui::ScrollArea::vertical().max_height(560.0).show(ui, |ui| {
+                for (sender_id, name, role) in &speakers {
+                    let defaults = default_speaker_voice_settings(*sender_id);
+                    let settings = studio
+                        .replay
+                        .as_mut()
+                        .expect("speaker list requires a replay")
+                        .speaker_voice_settings
+                        .entry(*sender_id)
+                        .or_insert_with(|| defaults.clone());
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading(name);
+                            if !role.trim().is_empty() {
+                                ui.label(role.as_str());
+                            }
+                            ui.small(format!("QQ {sender_id}"));
+                        });
+                        egui::ComboBox::from_id_salt(("replay-voice", sender_id))
+                            .selected_text(settings.voice_name.as_deref().unwrap_or("自动分配"))
+                            .width(300.0)
+                            .show_ui(ui, |ui| {
+                                settings_changed |= ui
+                                    .selectable_value(&mut settings.voice_name, None, "自动分配")
+                                    .changed();
+                                for voice in &voices {
+                                    settings_changed |= ui
+                                        .selectable_value(
+                                            &mut settings.voice_name,
+                                            Some(voice.clone()),
+                                            voice,
+                                        )
+                                        .changed();
+                                }
+                            });
+                        settings_changed |= ui
+                            .add(egui::Slider::new(&mut settings.pitch, -50..=20).text("音调"))
+                            .changed();
+                        settings_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut settings.speech_rate, -30..=60)
+                                    .text("语速"),
+                            )
+                            .changed();
+                        settings_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut settings.volume, 0.20..=1.20)
+                                    .text("相对音量")
+                                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+                            )
+                            .changed();
+                        if ui.button("恢复该角色默认值").clicked() {
+                            *settings = defaults;
+                            settings_changed = true;
+                        }
+                    });
+                }
+            });
+        });
+    studio.speech_settings_open = open;
+    if settings_changed {
+        studio.status = "角色语音设置已更新，将用于下一句预览和视频导出".to_owned();
     }
 }
 
@@ -1243,6 +1540,7 @@ fn new_replay(
         scene,
         camera: Vec::new(),
         dialogue: Vec::new(),
+        speaker_voice_settings: HashMap::new(),
     }
 }
 
@@ -1289,12 +1587,15 @@ fn start_video_export(
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
 ) {
-    let Some((duration_ms, dialogue)) = studio.replay.as_ref().map(|replay| {
-        (
-            replay.duration_ms,
-            replay.dialogue.clone(),
-        )
-    }) else {
+    let Some((duration_ms, dialogue, speaker_voice_settings)) =
+        studio.replay.as_ref().map(|replay| {
+            (
+                replay.duration_ms,
+                replay.dialogue.clone(),
+                replay.speaker_voice_settings.clone(),
+            )
+        })
+    else {
         studio.status = "没有可渲染的回放".to_owned();
         return;
     };
@@ -1373,6 +1674,7 @@ fn start_video_export(
         music_volume: studio.music_volume,
         speech_enabled: studio.speech_enabled,
         speech_volume: studio.speech_volume,
+        speaker_voice_settings,
         dialogue,
         total_frames,
         next_frame: 0,
@@ -1450,6 +1752,41 @@ fn check_speech_synthesizer() -> Result<(), String> {
     Err("角色语音目前使用 Windows 免费离线 TTS；请关闭角色语音后导出".to_owned())
 }
 
+#[cfg(windows)]
+fn installed_speech_voice_names() -> Result<Vec<String>, String> {
+    let script = r#"[Console]::OutputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.GetInstalledVoices() | Where-Object { $_.Enabled } | ForEach-Object { $_.VoiceInfo.Name }; $s.Dispose()"#;
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    hide_command_window(&mut command);
+    let output = command
+        .output()
+        .map_err(|err| format!("无法启动 Windows 语音列表：{err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Windows 语音列表退出码：{}",
+            output.status
+        ));
+    }
+    let mut voices = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    voices.sort();
+    voices.dedup();
+    if voices.is_empty() {
+        Err("未找到已安装的 Windows 语音".to_owned())
+    } else {
+        Ok(voices)
+    }
+}
+
+#[cfg(not(windows))]
+fn installed_speech_voice_names() -> Result<Vec<String>, String> {
+    Err("角色语音设置目前需要 Windows 离线 TTS".to_owned())
+}
+
 fn encode_video_frames(
     frames_path: &Path,
     output_path: &Path,
@@ -1460,6 +1797,7 @@ fn encode_video_frames(
     speech_enabled: bool,
     speech_volume: f32,
     dialogue: &[ReplayDialogue],
+    speaker_voice_settings: &HashMap<u64, SpeakerVoiceSettings>,
 ) -> Result<(), String> {
     let frame_pattern = frames_path.join("frame_%06d.png");
     let soundtrack_path = frames_path.join("original-relaxing-soundtrack.wav");
@@ -1479,6 +1817,7 @@ fn encode_video_frames(
             duration_ms,
             speech_volume,
             dialogue,
+            speaker_voice_settings,
         )?;
     }
     let temporary_output = temporary_video_output_path(output_path);
@@ -1598,6 +1937,7 @@ struct SynthesizedSpeechCue {
     output_samples: u64,
     samples: Vec<i16>,
     side: DialogueSide,
+    volume: f32,
 }
 
 #[derive(Serialize)]
@@ -1605,6 +1945,7 @@ struct SpeechSynthesisJob {
     text: String,
     output_path: String,
     language: &'static str,
+    voice_name: Option<String>,
     voice_slot: u64,
     pitch: i32,
     speech_rate: i32,
@@ -1616,6 +1957,7 @@ fn write_narration_track(
     duration_ms: u64,
     volume: f32,
     dialogue: &[ReplayDialogue],
+    speaker_settings: &HashMap<u64, SpeakerVoiceSettings>,
 ) -> Result<(), String> {
     const SAMPLE_RATE: u32 = 32_000;
     const CHANNELS: u16 = 2;
@@ -1635,17 +1977,21 @@ fn write_narration_track(
         .iter()
         .enumerate()
         .map(|(index, line)| {
-            let (pitch, speech_rate) = speaker_voice_profile(line.sender_id);
+            let settings = speaker_settings
+                .get(&line.sender_id)
+                .cloned()
+                .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
             SpeechSynthesisJob {
                 text: line.text.clone(),
                 output_path: working_directory
                     .join(format!("speech-{index:05}.wav"))
                     .to_string_lossy()
                     .into_owned(),
-                language: if line.text.chars().any(is_cjk_character) { "zh-CN" } else { "en-US" },
+                language: dialogue_language(&line.text),
+                voice_name: settings.voice_name,
                 voice_slot: line.sender_id,
-                pitch,
-                speech_rate,
+                pitch: settings.pitch,
+                speech_rate: settings.speech_rate,
             }
         })
         .collect::<Vec<_>>();
@@ -1664,6 +2010,10 @@ fn write_narration_track(
             output_samples: (samples.len() as u64).min(max_output_samples).max(1),
             samples,
             side: line.side,
+            volume: speaker_settings
+                .get(&line.sender_id)
+                .map(|settings| settings.volume)
+                .unwrap_or(1.0),
         });
     }
     cues.sort_by_key(|cue| cue.start_sample);
@@ -1702,6 +2052,7 @@ fn write_narration_track(
                     (cue.samples[source_index as usize] as f32 / i16::MAX as f32)
                         * envelope
                         * volume
+                        * cue.volume
                 })
             })
             .unwrap_or(0.0);
@@ -1723,10 +2074,28 @@ fn write_narration_track(
 }
 
 fn speaker_voice_profile(sender_id: u64) -> (i32, i32) {
-    const PITCHES: [i32; 8] = [-14, 10, -7, 16, 1, 7, -10, 13];
+    const PITCHES: [i32; 8] = [-22, -12, -18, -8, -20, -14, -24, -10];
     const RATES: [i32; 8] = [18, 24, 14, 28, 10, 21, 16, 26];
     let profile = (sender_id as usize) % PITCHES.len();
     (PITCHES[profile], RATES[profile])
+}
+
+fn default_speaker_voice_settings(sender_id: u64) -> SpeakerVoiceSettings {
+    let (pitch, speech_rate) = speaker_voice_profile(sender_id);
+    SpeakerVoiceSettings {
+        voice_name: None,
+        pitch,
+        speech_rate,
+        volume: 1.0,
+    }
+}
+
+fn dialogue_language(text: &str) -> &'static str {
+    if text.chars().any(is_cjk_character) {
+        "zh-CN"
+    } else {
+        "en-US"
+    }
 }
 
 #[cfg(windows)]
@@ -1741,7 +2110,7 @@ fn synthesize_speech_batch(
     let manifest = serde_json::to_vec(&serde_json::json!({ "jobs": jobs }))
         .map_err(|err| format!("无法整理角色语音任务：{err}"))?;
     fs::write(&manifest_path, manifest).map_err(|err| format!("无法保存角色语音任务：{err}"))?;
-    let script = r#"& { param($manifestPath) Add-Type -AssemblyName System.Speech; $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json; $jobs = @($manifest.jobs); $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo -ArgumentList 32000,([System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen),([System.Speech.AudioFormat.AudioChannel]::Mono); foreach ($job in $jobs) { $culture = [Globalization.CultureInfo]::GetCultureInfo([string]$job.language); $voices = @($s.GetInstalledVoices($culture) | Where-Object { $_.Enabled }); if ($voices.Count -eq 0) { $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }) }; if ($voices.Count -eq 0) { throw 'No installed speech voice' }; $voice = $voices[[int64]$job.voice_slot % $voices.Count]; $s.SelectVoice($voice.VoiceInfo.Name); $s.SetOutputToWaveFile([string]$job.output_path, $format); $escaped = [Security.SecurityElement]::Escape([string]$job.text); $pitch = [int]$job.pitch; $speechRate = [int]$job.speech_rate; $language = [string]$job.language; $ssml = "<speak version='1.0' xml:lang='$language'><prosody pitch='$pitch%' rate='$speechRate%'>$escaped</prosody></speak>"; $s.SpeakSsml($ssml); $s.SetOutputToNull() }; $s.Dispose() }"#;
+    let script = r#"& { param($manifestPath) Add-Type -AssemblyName System.Speech; $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json; $jobs = @($manifest.jobs); $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo -ArgumentList 32000,([System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen),([System.Speech.AudioFormat.AudioChannel]::Mono); foreach ($job in $jobs) { if (-not [string]::IsNullOrWhiteSpace([string]$job.voice_name)) { $s.SelectVoice([string]$job.voice_name) } else { $culture = [Globalization.CultureInfo]::GetCultureInfo([string]$job.language); $voices = @($s.GetInstalledVoices($culture) | Where-Object { $_.Enabled }); if ($voices.Count -eq 0) { $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }) }; if ($voices.Count -eq 0) { throw 'No installed speech voice' }; $voice = $voices[[int64]$job.voice_slot % $voices.Count]; $s.SelectVoice($voice.VoiceInfo.Name) }; $s.SetOutputToWaveFile([string]$job.output_path, $format); $escaped = [Security.SecurityElement]::Escape([string]$job.text); $pitch = [int]$job.pitch; $speechRate = [int]$job.speech_rate; $language = [string]$job.language; $ssml = "<speak version='1.0' xml:lang='$language'><prosody pitch='$pitch%' rate='$speechRate%'>$escaped</prosody></speak>"; $s.SpeakSsml($ssml); $s.SetOutputToNull() }; $s.Dispose() }"#;
     let mut command = Command::new("powershell.exe");
     command
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -2273,10 +2642,13 @@ fn is_cjk_character(character: char) -> bool {
 }
 
 fn active_dialogue(dialogue: &[ReplayDialogue], time_ms: u64) -> Option<&ReplayDialogue> {
-    dialogue
-        .iter()
-        .rev()
-        .find(|line| time_ms >= line.time_ms && time_ms < line.time_ms + line.duration_ms)
+    active_dialogue_index(dialogue, time_ms).map(|index| &dialogue[index])
+}
+
+fn active_dialogue_index(dialogue: &[ReplayDialogue], time_ms: u64) -> Option<usize> {
+    dialogue.iter().rposition(|line| {
+        time_ms >= line.time_ms && time_ms < line.time_ms.saturating_add(line.duration_ms)
+    })
 }
 
 fn dialogue_overlay(
@@ -2737,6 +3109,68 @@ mod tests {
     }
 
     #[test]
+    fn preview_cue_tracks_the_visible_dialogue_only() {
+        let dialogue = [
+            test_dialogue(100, 900, DialogueSide::Left),
+            test_dialogue(1_100, 900, DialogueSide::Right),
+        ];
+
+        assert_eq!(
+            active_dialogue_index(&dialogue, 99),
+            None
+        );
+        assert_eq!(
+            active_dialogue_index(&dialogue, 100),
+            Some(0)
+        );
+        assert_eq!(
+            active_dialogue_index(&dialogue, 999),
+            Some(0)
+        );
+        assert_eq!(
+            active_dialogue_index(&dialogue, 1_000),
+            None
+        );
+        assert_eq!(
+            active_dialogue_index(&dialogue, 1_100),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn speaker_voice_profiles_use_distinct_lower_pitches() {
+        let profiles = (0..8).map(speaker_voice_profile).collect::<Vec<_>>();
+        assert!(profiles.iter().all(|(pitch, _)| *pitch <= -8));
+        assert!(profiles.windows(2).all(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn replay_voice_settings_are_optional_and_round_trip() {
+        let old_json = r#"{"format_version":1,"title":"test","campaign_id":"c","created_at_unix_ms":1,"duration_ms":0,"audience":{"scope":"public"},"scene":{"voxels":[]},"camera":[],"dialogue":[]}"#;
+        let mut replay: ReplayFile = serde_json::from_str(old_json).unwrap();
+        assert!(replay.speaker_voice_settings.is_empty());
+        replay
+            .speaker_voice_settings
+            .insert(42, SpeakerVoiceSettings {
+                voice_name: Some("Test Voice".to_owned()),
+                pitch: -25,
+                speech_rate: 12,
+                volume: 0.75,
+            });
+
+        let restored: ReplayFile =
+            serde_json::from_str(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let settings = &restored.speaker_voice_settings[&42];
+        assert_eq!(
+            settings.voice_name.as_deref(),
+            Some("Test Voice")
+        );
+        assert_eq!(settings.pitch, -25);
+        assert_eq!(settings.speech_rate, 12);
+        assert_eq!(settings.volume, 0.75);
+    }
+
+    #[test]
     fn ffmpeg_arguments_describe_numbered_png_input() {
         let arguments = ffmpeg_arguments(30);
         assert_eq!(arguments, [
@@ -2780,6 +3214,7 @@ mod tests {
             2_000,
             0.90,
             &[first_line, second_line],
+            &HashMap::new(),
         )
         .unwrap();
         let first = directory.path().join("speech-00000.wav");
@@ -2813,6 +3248,7 @@ mod tests {
             true,
             0.90,
             &[dialogue],
+            &HashMap::new(),
         )
         .unwrap();
         let probe = Command::new("ffprobe")
