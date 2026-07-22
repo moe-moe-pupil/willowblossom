@@ -404,7 +404,7 @@ pub enum EquipmentSlot {
     None,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct InventoryItem {
     #[serde(default)]
     pub name: String,
@@ -424,6 +424,8 @@ pub struct InventoryItem {
     pub item_level: u32,
     #[serde(default)]
     pub soulbound: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stat_effects: Vec<BuffEffect>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -447,6 +449,7 @@ impl Default for InventoryItem {
             max_stack: default_item_max_stack(),
             item_level: 0,
             soulbound: false,
+            stat_effects: Vec::new(),
         }
     }
 }
@@ -2557,6 +2560,8 @@ pub struct NapcatMessageManager {
     pub random_pools: HashMap<String, RandomPool>,
     #[serde(default)]
     pub skill_pool: Vec<SkillPoolEntry>,
+    #[serde(default)]
+    pub item_pool: Vec<InventoryItem>,
     #[serde(default)]
     pub unit_pool: HashMap<String, UnitPoolEntry>,
 }
@@ -5151,6 +5156,7 @@ fn setup(mut commands: Commands) {
         rejected_chat_targets: HashSet::default(),
         random_pools: HashMap::default(),
         skill_pool: Vec::new(),
+        item_pool: Vec::new(),
         unit_pool: HashMap::default(),
     };
     let config_dir = Path::new(".data").join("willowblossom");
@@ -7851,6 +7857,7 @@ mod tests {
             rejected_chat_targets: HashSet::default(),
             random_pools: HashMap::default(),
             skill_pool: Vec::new(),
+            item_pool: Vec::new(),
             unit_pool: HashMap::default(),
         }
     }

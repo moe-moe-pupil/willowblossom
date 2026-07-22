@@ -809,6 +809,8 @@ pub(crate) struct TrpgGroupSettingsState {
     random_pool_entry_drafts: HashMap<String, RandomPoolEntry>,
     unit_pool_draft: UnitPoolEntry,
     skill_pool_draft: SkillPoolEntry,
+    item_pool_draft: InventoryItem,
+    item_pool_award_target: String,
     party_name_drafts: HashMap<String, String>,
     party_merge_targets: HashMap<(String, String), String>,
     export_path: String,
@@ -831,6 +833,7 @@ enum PoolWindowTab {
     Random,
     Unit,
     Skill,
+    Item,
 }
 
 #[derive(Default)]
@@ -842,6 +845,7 @@ pub(crate) struct CharacterEditState {
     quick_cast_skill_index: HashMap<String, usize>,
     pending_force_cast: Option<(String, usize)>,
     skill_pool_selected_index: HashMap<String, usize>,
+    item_pool_selected_index: HashMap<String, usize>,
     exp_award_drafts: HashMap<String, i32>,
 }
 
@@ -994,6 +998,10 @@ fn pool_menu_button(
                 format!("技能池 ({})", manager.skill_pool.len()),
                 PoolWindowTab::Skill,
             ),
+            (
+                format!("物品池 ({})", manager.item_pool.len()),
+                PoolWindowTab::Item,
+            ),
         ] {
             if ui.button(label).clicked() {
                 state.pool_window_tab = tab;
@@ -1055,6 +1063,11 @@ fn pool_management_window(
                     PoolWindowTab::Skill,
                     format!("技能池 ({})", manager.skill_pool.len()),
                 );
+                ui.selectable_value(
+                    &mut state.pool_window_tab,
+                    PoolWindowTab::Item,
+                    format!("物品池 ({})", manager.item_pool.len()),
+                );
             });
             ui.separator();
             egui::ScrollArea::vertical()
@@ -1092,6 +1105,9 @@ fn pool_management_window(
                         )
                     },
                     PoolWindowTab::Skill => changed |= skill_pool_settings_ui(ui, manager, state),
+                    PoolWindowTab::Item => {
+                        changed |= item_pool_settings_ui(ui, manager, state, &player_targets)
+                    },
                 });
         });
     state.pool_window_open = open;
@@ -4264,6 +4280,7 @@ fn quick_character_windows(
                     ui.monospace(&target_id);
                 });
                 let skill_pool_snapshot = manager.skill_pool.clone();
+                let item_pool_snapshot = manager.item_pool.clone();
                 let stat_config = manager.character_stat_config_for_target(&target_id);
                 let character = manager
                     .player_characters
@@ -4302,6 +4319,7 @@ fn quick_character_windows(
                         character_edit_state,
                         rule_engine_state,
                         &skill_pool_snapshot,
+                        &item_pool_snapshot,
                         stat_config,
                     );
                 });
@@ -5311,6 +5329,7 @@ fn character_editor_ui(
     edit_state: &mut CharacterEditState,
     rule_engine_state: &mut RuleEngineState,
     skill_pool: &[SkillPoolEntry],
+    item_pool: &[InventoryItem],
     stat_config: TrpgBasicConfig,
 ) -> bool {
     let mut changed = false;
@@ -5602,7 +5621,19 @@ fn character_editor_ui(
         skill_pool,
     );
     ui.separator();
-    changed |= character_inventory_editor_ui(ui, character, skill_pool, false);
+    let (inventory_changed, equipment_changed) = character_inventory_editor_ui(
+        ui, target_id, character, edit_state, skill_pool, item_pool, false,
+    );
+    changed |= inventory_changed;
+    if equipment_changed {
+        sync_character_buffs(
+            target_id,
+            character,
+            &stat_config,
+            rule_engine_state,
+            skill_pool,
+        );
+    }
     ui.separator();
     changed |= character_skill_editor_ui(
         ui,
@@ -6823,17 +6854,46 @@ fn character_buff_editor_ui(
 
 fn character_inventory_editor_ui(
     ui: &mut Ui,
+    target_id: &str,
     character: &mut PlayerCharacter,
+    edit_state: &mut CharacterEditState,
     skill_pool: &[SkillPoolEntry],
+    item_pool: &[InventoryItem],
     default_open: bool,
-) -> bool {
+) -> (bool, bool) {
     let mut changed = false;
+    let mut equipment_changed = false;
     changed |= normalize_inventory(&mut character.inventory);
     changed |= normalize_character_hotbar(character);
 
     egui::CollapsingHeader::new("背包 / 装备")
         .default_open(default_open)
         .show(ui, |ui| {
+            if !item_pool.is_empty() {
+                let selected = edit_state
+                    .item_pool_selected_index
+                    .entry(target_id.to_owned())
+                    .or_insert(0);
+                if *selected >= item_pool.len() {
+                    *selected = 0;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt(("character_item_pool", target_id))
+                        .selected_text(item_display_name(&item_pool[*selected]))
+                        .show_ui(ui, |ui| {
+                            for (index, item) in item_pool.iter().enumerate() {
+                                ui.selectable_value(selected, index, item_display_name(item));
+                            }
+                        });
+                    if ui.button("从物品池加入背包").clicked() {
+                        add_item_to_inventory(
+                            &mut character.inventory,
+                            item_pool[*selected].clone(),
+                        );
+                        changed = true;
+                    }
+                });
+            }
             ui.horizontal_wrapped(|ui| {
                 changed |= ui
                     .add(
@@ -6869,10 +6929,20 @@ fn character_inventory_editor_ui(
                                 item_display_name(item),
                             );
                             ui.small(format!("物品等级 {}", item.item_level));
+                            if !item.stat_effects.is_empty() {
+                                ui.small(
+                                    item.stat_effects
+                                        .iter()
+                                        .map(format_buff_effect)
+                                        .collect::<Vec<_>>()
+                                        .join("，"),
+                                );
+                            }
                             if ui.button("卸下").clicked() {
                                 if let Some(item) = character.inventory.equipment.remove(&slot) {
                                     add_item_to_inventory(&mut character.inventory, item);
                                     changed = true;
+                                    equipment_changed = true;
                                 }
                             }
                         } else {
@@ -6999,6 +7069,12 @@ fn character_inventory_editor_ui(
                             if ui.button("-").on_hover_text("移除物品").clicked() {
                                 remove_index = Some(index);
                             }
+                            ui.menu_button(
+                                format!("加成 {}", item.stat_effects.len()),
+                                |ui| {
+                                    changed |= item_stat_effects_editor_ui(ui, &mut item.stat_effects);
+                                },
+                            );
                         });
                         ui.end_row();
                     }
@@ -7007,6 +7083,7 @@ fn character_inventory_editor_ui(
             if let Some(index) = equip_index {
                 remove_character_inventory_item(character, index, true);
                 changed = true;
+                equipment_changed = true;
             }
             if let Some(index) = remove_index {
                 remove_character_inventory_item(character, index, false);
@@ -7016,7 +7093,7 @@ fn character_inventory_editor_ui(
 
     changed |= normalize_inventory(&mut character.inventory);
     changed |= normalize_character_hotbar(character);
-    changed
+    (changed, equipment_changed)
 }
 
 fn buff_kind_combo(ui: &mut Ui, kind: &mut BuffKind) -> bool {
@@ -7237,6 +7314,7 @@ fn same_stackable_item(left: &InventoryItem, right: &InventoryItem) -> bool {
         && left.max_stack == right.max_stack
         && left.item_level == right.item_level
         && left.soulbound == right.soulbound
+        && left.stat_effects == right.stat_effects
         && left.max_stack > 1
 }
 
@@ -7429,6 +7507,9 @@ pub(crate) fn sync_character_buffs(
 
 fn character_effective_buffs(target_id: &str, character: &PlayerCharacter) -> Vec<BuffSpec> {
     let mut buffs = character.active_buffs.clone();
+    buffs.extend(character_equipment_buffs(
+        target_id, character,
+    ));
     buffs.extend(character_legacy_passive_buffs(
         target_id, character,
     ));
@@ -7438,9 +7519,39 @@ fn character_effective_buffs(target_id: &str, character: &PlayerCharacter) -> Ve
 
 fn character_effect_sync_needed(target_id: &str, character: &PlayerCharacter) -> bool {
     let has_effects = !character.active_buffs.is_empty()
+        || !character_equipment_buffs(target_id, character).is_empty()
         || !character_legacy_passive_buffs(target_id, character).is_empty()
         || !character_moonberry_talent_passive_buffs(target_id, character).is_empty();
     has_effects != character.buff_base_stats.is_some()
+}
+
+fn character_equipment_buffs(target_id: &str, character: &PlayerCharacter) -> Vec<BuffSpec> {
+    let mut equipment = character.inventory.equipment.iter().collect::<Vec<_>>();
+    equipment.sort_by_key(|(slot, _)| equipment_slot_sort_key(**slot));
+    equipment
+        .into_iter()
+        .filter(|(_, item)| !item.stat_effects.is_empty())
+        .map(|(slot, item)| BuffSpec {
+            name: format!("装备 · {}", item_display_name(item)),
+            kind: BuffKind::Physical,
+            priority: 0,
+            turns_remaining: 0,
+            source_id: format!(
+                "{target_id}:equipment:{}",
+                equipment_slot_sort_key(*slot)
+            ),
+            beneficial: true,
+            effects: item.stat_effects.clone(),
+            tick_actions: Vec::new(),
+        })
+        .collect()
+}
+
+fn equipment_slot_sort_key(slot: EquipmentSlot) -> u8 {
+    equipment_slot_options()
+        .iter()
+        .position(|candidate| *candidate == slot)
+        .unwrap_or(usize::MAX) as u8
 }
 
 fn character_legacy_passive_buffs(target_id: &str, character: &PlayerCharacter) -> Vec<BuffSpec> {
@@ -9648,6 +9759,179 @@ fn normalized_manual_skill_pool_entry(draft: &SkillPoolEntry) -> Option<SkillPoo
     })
 }
 
+fn item_pool_settings_ui(
+    ui: &mut Ui,
+    manager: &mut NapcatMessageManager,
+    state: &mut TrpgGroupSettingsState,
+    player_targets: &[String],
+) -> bool {
+    let mut changed = false;
+    ui.heading("物品池");
+    ui.small("物品池是GM模板库；发给玩家时会复制一份，装备后属性加成立即进入最终数值。");
+
+    if !player_targets.is_empty() {
+        if !player_targets.contains(&state.item_pool_award_target) {
+            state.item_pool_award_target = player_targets[0].clone();
+        }
+        egui::ComboBox::from_label("发放给玩家")
+            .selected_text(target_display_name(
+                manager,
+                &state.item_pool_award_target,
+            ))
+            .show_ui(ui, |ui| {
+                for target_id in player_targets {
+                    ui.selectable_value(
+                        &mut state.item_pool_award_target,
+                        target_id.clone(),
+                        target_display_name(manager, target_id),
+                    );
+                }
+            });
+    }
+
+    let mut remove_index = None;
+    let mut award_index = None;
+    for (index, item) in manager.item_pool.iter_mut().enumerate() {
+        ui.push_id(("item_pool_entry", index), |ui| {
+            ui.collapsing(
+                format!(
+                    "{} · {} · {}项加成",
+                    item_display_name(item),
+                    equipment_slot_label(item.equipment_slot),
+                    item.stat_effects.len()
+                ),
+                |ui| {
+                    changed |= inventory_item_definition_ui(ui, item);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !player_targets.is_empty(),
+                                egui::Button::new("发给玩家"),
+                            )
+                            .clicked()
+                        {
+                            award_index = Some(index);
+                        }
+                        if ui.button("从物品池移除").clicked() {
+                            remove_index = Some(index);
+                        }
+                    });
+                },
+            );
+        });
+    }
+    if let Some(index) = award_index {
+        if let Some(item) = manager.item_pool.get(index).cloned() {
+            let character = manager
+                .player_characters
+                .entry(state.item_pool_award_target.clone())
+                .or_default();
+            add_item_to_inventory(&mut character.inventory, item);
+            changed = true;
+        }
+    }
+    if let Some(index) = remove_index {
+        manager.item_pool.remove(index);
+        changed = true;
+    }
+
+    ui.separator();
+    ui.collapsing("添加物品模板", |ui| {
+        changed |= inventory_item_definition_ui(ui, &mut state.item_pool_draft);
+        if ui.button("加入物品池").clicked() {
+            let mut item = state.item_pool_draft.clone();
+            if !item.name.trim().is_empty() {
+                item.name = item.name.trim().to_owned();
+                normalize_item(&mut item);
+                manager.item_pool.push(item);
+                state.item_pool_draft = InventoryItem::default();
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+fn inventory_item_definition_ui(ui: &mut Ui, item: &mut InventoryItem) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("物品");
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut item.name).desired_width(150.0))
+            .changed();
+        changed |= item_quality_combo(ui, &mut item.quality);
+        changed |= equipment_slot_combo(ui, &mut item.equipment_slot);
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut item.item_level)
+                    .range(0..=9999)
+                    .prefix("等级 "),
+            )
+            .changed();
+        changed |= ui.checkbox(&mut item.soulbound, "绑定").changed();
+    });
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut item.stack)
+                    .range(1..=9999)
+                    .prefix("数量 "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut item.max_stack)
+                    .range(1..=9999)
+                    .prefix("堆叠上限 "),
+            )
+            .changed();
+    });
+    ui.label("描述");
+    changed |= ui
+        .add(
+            egui::TextEdit::multiline(&mut item.description)
+                .desired_rows(2)
+                .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
+        )
+        .changed();
+    ui.collapsing(
+        format!(
+            "装备属性加成 ({})",
+            item.stat_effects.len()
+        ),
+        |ui| {
+            changed |= item_stat_effects_editor_ui(ui, &mut item.stat_effects);
+        },
+    );
+    changed
+}
+
+fn item_stat_effects_editor_ui(ui: &mut Ui, effects: &mut Vec<BuffEffect>) -> bool {
+    let before = effects.clone();
+    let mut remove_index = None;
+    for (index, effect) in effects.iter_mut().enumerate() {
+        ui.push_id(("item_stat_effect", index), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                buff_field_combo(ui, &mut effect.field);
+                buff_value_ui(ui, &mut effect.value);
+                if ui.button("-").on_hover_text("移除属性加成").clicked() {
+                    remove_index = Some(index);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove_index {
+        effects.remove(index);
+    }
+    if ui.button("+ 属性加成").clicked() {
+        effects.push(BuffEffect {
+            field: BuffField::Speed,
+            value: BuffValue::Add(0.0),
+        });
+    }
+    *effects != before
+}
+
 fn skill_pool_entry_name(entry: &SkillPoolEntry) -> String {
     if entry.name.trim().is_empty() {
         "未命名技能".to_owned()
@@ -11465,6 +11749,7 @@ fn trpg_group_settings_window(
                         for target_id in &player_targets {
                             let display_name = target_display_name(manager, target_id);
                             let skill_pool_snapshot = manager.skill_pool.clone();
+                            let item_pool_snapshot = manager.item_pool.clone();
                             let stat_config = manager.character_stat_config_for_target(target_id);
                             let character = manager
                                 .player_characters
@@ -11507,6 +11792,7 @@ fn trpg_group_settings_window(
                                             character_edit_state,
                                             rule_engine_state,
                                             &skill_pool_snapshot,
+                                            &item_pool_snapshot,
                                             stat_config,
                                         );
                                     });
@@ -12831,8 +13117,11 @@ pub fn ui_system(
                 if voxel_possession.player_inventory_open {
                     let target_id = possessed_user_id.to_string();
                     let skill_pool_snapshot = manager.skill_pool.clone();
+                    let item_pool_snapshot = manager.item_pool.clone();
+                    let stat_config = manager.character_stat_config_for_target(&target_id);
                     let mut window_open = true;
                     let mut inventory_changed = false;
+                    let mut equipment_changed = false;
                     if let Some(character) = manager.player_characters.get_mut(&target_id) {
                         let title = format!(
                             "玩家背包 · {}",
@@ -12849,17 +13138,31 @@ pub fn ui_system(
                             .open(&mut window_open)
                             .show(ctx, |ui| {
                                 ui.small("E关闭 · GM可编辑装备、1-9快捷栏和背包物品");
-                                inventory_changed |= ui
+                                let result = ui
                                     .push_id(("possessed_inventory", possessed_user_id), |ui| {
                                         character_inventory_editor_ui(
                                             ui,
+                                            &target_id,
                                             character,
+                                            character_edit_state,
                                             &skill_pool_snapshot,
+                                            &item_pool_snapshot,
                                             true,
                                         )
                                     })
                                     .inner;
+                                inventory_changed |= result.0;
+                                equipment_changed |= result.1;
                             });
+                        if equipment_changed {
+                            sync_character_buffs(
+                                &target_id,
+                                character,
+                                &stat_config,
+                                &mut rule_engine_state,
+                                &skill_pool_snapshot,
+                            );
+                        }
                     } else {
                         window_open = false;
                     }
@@ -13496,6 +13799,7 @@ mod tests {
             rejected_chat_targets: HashSet::default(),
             random_pools: HashMap::default(),
             skill_pool: Vec::new(),
+            item_pool: Vec::new(),
             unit_pool: HashMap::default(),
         }
     }
@@ -14503,6 +14807,56 @@ mod tests {
         assert_eq!(inventory.items.len(), 2);
         assert_eq!(inventory.items[0].stack, 5);
         assert_eq!(inventory.items[1].stack, 2);
+    }
+
+    #[test]
+    fn equipped_item_effects_apply_and_are_removed_from_final_stats() {
+        let mut character = PlayerCharacter::default();
+        character
+            .inventory
+            .equipment
+            .insert(EquipmentSlot::Feet, InventoryItem {
+                name: "疾风靴".to_owned(),
+                equipment_slot: EquipmentSlot::Feet,
+                stat_effects: vec![
+                    BuffEffect {
+                        field: BuffField::Speed,
+                        value: BuffValue::Add(2.0),
+                    },
+                    BuffEffect {
+                        field: BuffField::MaxHp,
+                        value: BuffValue::Add(10.0),
+                    },
+                ],
+                ..Default::default()
+            });
+        let mut rules = RuleEngineState::default();
+        let config = TrpgBasicConfig::default();
+
+        sync_character_buffs(
+            "player",
+            &mut character,
+            &config,
+            &mut rules,
+            &[],
+        );
+
+        assert!((character.speed - 5.0).abs() < 0.0001);
+        assert!((character.max_hp - 15.0).abs() < 0.0001);
+        assert!(character.buff_base_stats.is_some());
+
+        character.inventory.equipment.clear();
+        sync_character_buffs(
+            "player",
+            &mut character,
+            &config,
+            &mut rules,
+            &[],
+        );
+
+        assert!((character.speed - 3.0).abs() < 0.0001);
+        assert!((character.max_hp - 5.0).abs() < 0.0001);
+        assert!(character.buff_base_stats.is_none());
     }
 
     #[test]

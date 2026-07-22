@@ -6911,6 +6911,7 @@ mod tests {
             rejected_chat_targets: HashSet::default(),
             random_pools: HashMap::default(),
             skill_pool: Vec::new(),
+            item_pool: Vec::new(),
             unit_pool: HashMap::default(),
         }
     }
