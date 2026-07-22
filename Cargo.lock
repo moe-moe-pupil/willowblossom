@@ -9062,7 +9062,7 @@ dependencies = [
 
 [[package]]
 name = "willowblossom"
-version = "0.12.3"
+version = "0.0.1"
 dependencies = [
  "ab_glyph",
  "async-compat",
