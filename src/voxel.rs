@@ -3357,11 +3357,7 @@ fn voxel_player_standee_back_transform() -> Transform {
     ))
 }
 
-fn voxel_player_standee_back_label_transform() -> Transform {
-    Transform::from_xyz(0.0, 0.0, -0.01).with_rotation(Quat::from_rotation_y(
-        std::f32::consts::PI,
-    ))
-}
+fn voxel_player_standee_back_label_transform() -> Transform { Transform::from_xyz(0.0, 0.0, 0.01) }
 
 fn voxel_player_standee_back_label_image() -> Image {
     const SIZE: u32 = 128;
@@ -7521,15 +7517,15 @@ mod tests {
     }
 
     #[test]
-    fn player_standee_back_label_faces_away_from_the_portrait() {
+    fn player_standee_back_label_uses_the_opposite_face() {
         let back = voxel_player_standee_back_transform();
         let transform = voxel_player_standee_back_label_transform();
 
         assert!(back.translation.z < 0.0);
-        assert!(transform.translation.z < back.translation.z);
+        assert!(transform.translation.z > 0.0);
         assert_eq!(PLAYER_STANDEE_PLANE_NORMAL, Vec3::Z);
         assert!((back.rotation * Vec3::Z).abs_diff_eq(Vec3::NEG_Z, 0.000_01));
-        assert!((transform.rotation * Vec3::Z).abs_diff_eq(Vec3::NEG_Z, 0.000_01));
+        assert!((transform.rotation * Vec3::Z).abs_diff_eq(Vec3::Z, 0.000_01));
     }
 
     #[test]
