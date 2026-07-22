@@ -116,6 +116,7 @@ const ORBITAL_PLANET_VOXEL_RADIUS: i32 = 485;
 const ORBITAL_PLANET_CAP_RADIUS: i32 = 128;
 const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
+const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
 const VOXEL_MATERIAL_COUNT: usize = 10;
 const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
 const VOXEL_RADIANCE_MAX_DIMENSION: i32 = 192;
@@ -615,6 +616,155 @@ impl Default for VoxelInventoryStore {
     }
 }
 
+#[derive(Resource, Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct VoxelToolbarSettingsStore {
+    brush_radius: i32,
+    first_person_speed: f32,
+    placed_light_color: [f32; 3],
+    placed_light_intensity: f32,
+    placed_light_range: f32,
+    physics_push_pull_impulse: f32,
+    physics_explosion_impulse: f32,
+    physics_explosion_radius: f32,
+    ambient_brightness: f32,
+    key_light_illuminance: f32,
+    key_light_color: [f32; 3],
+    fill_light_illuminance: f32,
+    fill_light_color: [f32; 3],
+    radiance_intensity: f32,
+}
+
+impl Default for VoxelToolbarSettingsStore {
+    fn default() -> Self {
+        Self {
+            brush_radius: 0,
+            first_person_speed: FIRST_PERSON_SPEED,
+            placed_light_color: [1.0, 0.78, 0.48],
+            placed_light_intensity: 1_800.0,
+            placed_light_range: 8.0,
+            physics_push_pull_impulse: 4.0,
+            physics_explosion_impulse: 14.0,
+            physics_explosion_radius: 6.0,
+            ambient_brightness: DEFAULT_AMBIENT_BRIGHTNESS,
+            key_light_illuminance: DEFAULT_KEY_LIGHT_ILLUMINANCE,
+            key_light_color: [1.0, 1.0, 1.0],
+            fill_light_illuminance: DEFAULT_FILL_LIGHT_ILLUMINANCE,
+            fill_light_color: [0.5, 0.65, 1.0],
+            radiance_intensity: DEFAULT_RADIANCE_INTENSITY,
+        }
+    }
+}
+
+impl VoxelToolbarSettingsStore {
+    fn from_editor(editor: &VoxelEditorState) -> Self {
+        Self {
+            brush_radius: editor.brush_radius,
+            first_person_speed: editor.first_person_speed,
+            placed_light_color: editor.placed_light_color,
+            placed_light_intensity: editor.placed_light_intensity,
+            placed_light_range: editor.placed_light_range,
+            physics_push_pull_impulse: editor.physics_push_pull_impulse,
+            physics_explosion_impulse: editor.physics_explosion_impulse,
+            physics_explosion_radius: editor.physics_explosion_radius,
+            ambient_brightness: editor.ambient_brightness,
+            key_light_illuminance: editor.key_light_illuminance,
+            key_light_color: editor.key_light_color,
+            fill_light_illuminance: editor.fill_light_illuminance,
+            fill_light_color: editor.fill_light_color,
+            radiance_intensity: editor.radiance_intensity,
+        }
+    }
+
+    fn apply_to(&self, editor: &mut VoxelEditorState) {
+        let defaults = Self::default();
+        editor.brush_radius = self.brush_radius.clamp(0, MAX_VOXEL_BRUSH_RADIUS);
+        editor.first_person_speed = finite_clamp(
+            self.first_person_speed,
+            0.25,
+            50.0,
+            defaults.first_person_speed,
+        );
+        editor.placed_light_color = finite_color(
+            self.placed_light_color,
+            defaults.placed_light_color,
+        );
+        editor.placed_light_intensity = finite_clamp(
+            self.placed_light_intensity,
+            0.0,
+            100_000.0,
+            defaults.placed_light_intensity,
+        );
+        editor.placed_light_range = finite_clamp(
+            self.placed_light_range,
+            0.25,
+            100.0,
+            defaults.placed_light_range,
+        );
+        editor.physics_push_pull_impulse = finite_clamp(
+            self.physics_push_pull_impulse,
+            0.1,
+            200.0,
+            defaults.physics_push_pull_impulse,
+        );
+        editor.physics_explosion_impulse = finite_clamp(
+            self.physics_explosion_impulse,
+            0.1,
+            500.0,
+            defaults.physics_explosion_impulse,
+        );
+        editor.physics_explosion_radius = finite_clamp(
+            self.physics_explosion_radius,
+            VOXEL_SIZE,
+            100.0,
+            defaults.physics_explosion_radius,
+        );
+        editor.ambient_brightness = finite_clamp(
+            self.ambient_brightness,
+            0.0,
+            500.0,
+            defaults.ambient_brightness,
+        );
+        editor.key_light_illuminance = finite_clamp(
+            self.key_light_illuminance,
+            0.0,
+            50_000.0,
+            defaults.key_light_illuminance,
+        );
+        editor.key_light_color = finite_color(
+            self.key_light_color,
+            defaults.key_light_color,
+        );
+        editor.fill_light_illuminance = finite_clamp(
+            self.fill_light_illuminance,
+            0.0,
+            50_000.0,
+            defaults.fill_light_illuminance,
+        );
+        editor.fill_light_color = finite_color(
+            self.fill_light_color,
+            defaults.fill_light_color,
+        );
+        editor.radiance_intensity = finite_clamp(
+            self.radiance_intensity,
+            0.0,
+            3.0,
+            defaults.radiance_intensity,
+        );
+    }
+}
+
+fn finite_clamp(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
+
+fn finite_color(color: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|index| finite_clamp(color[index], 0.0, 1.0, fallback[index]))
+}
+
 fn default_creative_hotbar() -> [Option<VoxelCreativeItem>; 10] {
     std::array::from_fn(|index| {
         Some(VoxelCreativeItem::Material(
@@ -1037,6 +1187,19 @@ impl Plugin for TrpgVoxelPlugin {
             .revert_to_default_on_deserialization_errors(true)
             .build()
             .expect("failed to initialize voxel creative inventory store");
+        let toolbar_settings_store = Persistent::<VoxelToolbarSettingsStore>::builder()
+            .name("voxel_toolbar_settings")
+            .format(StorageFormat::Toml)
+            .path(
+                Path::new(".data")
+                    .join("willowblossom")
+                    .join("voxel_toolbar_settings.toml"),
+            )
+            .default(VoxelToolbarSettingsStore::default())
+            .revertible(true)
+            .revert_to_default_on_deserialization_errors(true)
+            .build()
+            .expect("failed to initialize voxel toolbar settings");
         app.add_plugins((
             PhysicsPlugins::default(),
             VoxelPlugin::<u8>::default(),
@@ -1058,10 +1221,12 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelToolGunDragState>()
         .insert_resource(player_camera_store)
         .insert_resource(inventory_store)
+        .insert_resource(toolbar_settings_store)
         .add_systems(
             Startup,
             (
                 load_voxel_inventory,
+                load_voxel_toolbar_settings,
                 setup_voxel_materials,
                 setup_voxel_grid,
                 populate_voxel_grid,
@@ -1109,6 +1274,7 @@ impl Plugin for TrpgVoxelPlugin {
                     animate_planet_clouds,
                     animate_voxel_materials,
                     persist_voxel_inventory,
+                    persist_voxel_toolbar_settings,
                 )
                     .chain(),
             )
@@ -1146,6 +1312,27 @@ fn persist_voxel_inventory(
     **store = snapshot;
     if let Err(err) = store.persist() {
         eprintln!("failed to persist voxel creative inventory: {err}");
+    }
+}
+
+fn load_voxel_toolbar_settings(
+    store: Res<Persistent<VoxelToolbarSettingsStore>>,
+    mut editor: ResMut<VoxelEditorState>,
+) {
+    store.apply_to(&mut editor);
+}
+
+fn persist_voxel_toolbar_settings(
+    editor: Res<VoxelEditorState>,
+    mut store: ResMut<Persistent<VoxelToolbarSettingsStore>>,
+) {
+    let snapshot = VoxelToolbarSettingsStore::from_editor(&editor);
+    if **store == snapshot {
+        return;
+    }
+    **store = snapshot;
+    if let Err(err) = store.persist() {
+        eprintln!("failed to persist voxel toolbar settings: {err}");
     }
 }
 
@@ -4926,7 +5113,37 @@ fn physics_body_intersects_radius(
     })
 }
 
-fn explosion_fragment_part_counts(source_sizes: &[usize]) -> Vec<usize> { source_sizes.to_vec() }
+fn allocate_fragment_parts(source_sizes: &[usize], max_parts: usize) -> Vec<usize> {
+    let mut counts = vec![0; source_sizes.len()];
+    let initial_parts = source_sizes
+        .iter()
+        .filter(|size| **size > 0)
+        .count()
+        .min(max_parts);
+    for (count, _) in counts
+        .iter_mut()
+        .zip(source_sizes.iter())
+        .filter(|(_, size)| **size > 0)
+        .take(initial_parts)
+    {
+        *count = 1;
+    }
+
+    let mut remaining = max_parts.saturating_sub(initial_parts);
+    while remaining > 0 {
+        let Some(index) = (0..source_sizes.len())
+            .filter(|index| counts[*index] > 0 && counts[*index] < source_sizes[*index])
+            .max_by(|left, right| {
+                (source_sizes[*left] * counts[*right]).cmp(&(source_sizes[*right] * counts[*left]))
+            })
+        else {
+            break;
+        };
+        counts[index] += 1;
+        remaining -= 1;
+    }
+    counts
+}
 
 #[derive(Clone, Copy)]
 struct FragmentRng(u64);
@@ -5131,7 +5348,7 @@ fn spawn_planet_explosion_fragments(
     removed: Vec<(IVec3, u8)>,
     fragment_seed: u64,
 ) -> Vec<Entity> {
-    let part_count = removed.len();
+    let part_count = removed.len().min(MAX_EXPLOSION_NEW_PHYSICS_BODIES);
     let mut fragments = Vec::with_capacity(part_count);
     for cells in split_voxel_cells_randomly(removed, part_count, fragment_seed) {
         let origin = cells
@@ -5948,7 +6165,10 @@ fn edit_voxel_grid(
                 .chain(std::iter::once(selected.len()))
                 .filter(|size| *size > 0)
                 .collect::<Vec<_>>();
-            let part_counts = explosion_fragment_part_counts(&source_sizes);
+            let part_counts = allocate_fragment_parts(
+                &source_sizes,
+                MAX_EXPLOSION_NEW_PHYSICS_BODIES,
+            );
             let affected_body_count = affected_bodies.len();
             for (
                 source_index,
@@ -6867,6 +7087,10 @@ fn control_voxel_camera(
     egui_input: Res<EguiWantsInput>,
 ) {
     editor.first_person_enabled = true;
+    let window_focused = windows.single().is_ok_and(|window| window.focused);
+    if !window_focused {
+        editor.first_person_cursor_released = true;
+    }
     if keyboard.just_pressed(KeyCode::Escape) {
         if possession.player_inventory_open {
             possession.player_inventory_open = false;
@@ -6908,6 +7132,7 @@ fn control_voxel_camera(
         .and_then(Window::cursor_position)
         .is_some_and(|cursor| editor.contains_cursor(cursor));
     if editor.first_person_cursor_released
+        && window_focused
         && !inventory_open
         && mouse.just_pressed(MouseButton::Left)
         && cursor_in_viewport
@@ -6916,7 +7141,11 @@ fn control_voxel_camera(
         editor.first_person_cursor_released = false;
     }
     if let Ok(mut cursor) = cursor_options.single_mut() {
-        if !inventory_open && !editor.first_person_cursor_released {
+        if should_grab_first_person_cursor(
+            window_focused,
+            inventory_open,
+            editor.first_person_cursor_released,
+        ) {
             cursor.visible = false;
             cursor.grab_mode = CursorGrabMode::Locked;
         } else {
@@ -7026,6 +7255,14 @@ fn control_voxel_camera(
             perspective.fov = PerspectiveProjection::default().fov;
         }
     }
+}
+
+fn should_grab_first_person_cursor(
+    window_focused: bool,
+    inventory_open: bool,
+    cursor_released: bool,
+) -> bool {
+    window_focused && !inventory_open && !cursor_released
 }
 
 fn draw_voxel_target(
@@ -7497,6 +7734,22 @@ mod tests {
             &editor,
         )
         .is_none());
+    }
+
+    #[test]
+    fn first_person_cursor_is_only_grabbed_while_window_is_focused() {
+        assert!(should_grab_first_person_cursor(
+            true, false, false
+        ));
+        assert!(!should_grab_first_person_cursor(
+            false, false, false
+        ));
+        assert!(!should_grab_first_person_cursor(
+            true, true, false
+        ));
+        assert!(!should_grab_first_person_cursor(
+            true, false, true
+        ));
     }
 
     #[test]
@@ -8583,13 +8836,16 @@ mod tests {
     }
 
     #[test]
-    fn explosion_fragment_count_is_not_capped() {
-        let counts = explosion_fragment_part_counts(&[8_656]);
-        assert_eq!(counts, vec![8_656]);
+    fn explosion_fragment_budget_caps_large_areas_at_sixty_parts() {
+        let counts = allocate_fragment_parts(
+            &[8_656],
+            MAX_EXPLOSION_NEW_PHYSICS_BODIES,
+        );
+        assert_eq!(counts, vec![60]);
 
         let cells = (0..8_656).map(|x| (IVec3::new(x, 0, 0), 1)).collect();
         let parts = split_voxel_cells_randomly(cells, counts[0], 7);
-        assert_eq!(parts.len(), 8_656);
+        assert_eq!(parts.len(), 60);
         assert_eq!(
             parts.iter().map(Vec::len).sum::<usize>(),
             8_656
@@ -8656,15 +8912,18 @@ mod tests {
     }
 
     #[test]
-    fn each_explosion_splits_every_affected_voxel() {
+    fn each_explosion_gets_sixty_new_parts_regardless_of_existing_bodies() {
         let unaffected_existing_body_count = 250;
-        let counts = explosion_fragment_part_counts(&[12, 8, 8_656]);
+        let counts = allocate_fragment_parts(
+            &[12, 8, 8_656],
+            MAX_EXPLOSION_NEW_PHYSICS_BODIES,
+        );
 
         let new_body_count = counts.iter().sum::<usize>();
-        assert_eq!(new_body_count, 8_676);
+        assert_eq!(new_body_count, 60);
         assert_eq!(
             unaffected_existing_body_count + new_body_count,
-            8_926
+            310
         );
         assert!(counts.iter().all(|count| *count > 0));
     }
@@ -9020,6 +9279,56 @@ mod tests {
             .unwrap();
 
         assert_eq!(*loaded, inventory);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn voxel_toolbar_settings_persist_as_toml_and_restore_editor_values() {
+        let mut editor = VoxelEditorState::default();
+        editor.brush_radius = 7;
+        editor.first_person_speed = 9.5;
+        editor.placed_light_color = [0.1, 0.2, 0.3];
+        editor.placed_light_intensity = 2_400.0;
+        editor.placed_light_range = 12.0;
+        editor.physics_push_pull_impulse = 17.0;
+        editor.physics_explosion_impulse = 31.0;
+        editor.physics_explosion_radius = 18.5;
+        editor.ambient_brightness = 95.0;
+        editor.key_light_illuminance = 9_000.0;
+        editor.key_light_color = [0.8, 0.7, 0.6];
+        editor.fill_light_illuminance = 2_100.0;
+        editor.fill_light_color = [0.3, 0.4, 0.5];
+        editor.radiance_intensity = 0.85;
+        let settings = VoxelToolbarSettingsStore::from_editor(&editor);
+
+        let path = std::env::temp_dir().join(format!(
+            "willowblossom_voxel_toolbar_settings_{}.toml",
+            std::process::id()
+        ));
+        let mut store = Persistent::<VoxelToolbarSettingsStore>::builder()
+            .name("test_voxel_toolbar_settings")
+            .format(StorageFormat::Toml)
+            .path(&path)
+            .default(VoxelToolbarSettingsStore::default())
+            .build()
+            .unwrap();
+        *store = settings.clone();
+        store.persist().unwrap();
+        let loaded = Persistent::<VoxelToolbarSettingsStore>::builder()
+            .name("test_voxel_toolbar_settings_reload")
+            .format(StorageFormat::Toml)
+            .path(&path)
+            .default(VoxelToolbarSettingsStore::default())
+            .build()
+            .unwrap();
+        let mut restored = VoxelEditorState::default();
+        loaded.apply_to(&mut restored);
+
+        assert_eq!(*loaded, settings);
+        assert_eq!(
+            VoxelToolbarSettingsStore::from_editor(&restored),
+            settings
+        );
         fs::remove_file(path).unwrap();
     }
 

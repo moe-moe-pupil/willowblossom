@@ -13088,7 +13088,7 @@ pub fn ui_system(
                                     .range(0.25..=100.0)
                                     .speed(0.25),
                             );
-                            ui.label("右键点击爆心；每次爆炸最多新建40个物理碎块，超额方块会合并");
+                            ui.label("右键点击爆心；每次爆炸最多新建60个物理碎块，超额方块会合并");
                             if let Some(status) = voxel_editor.physics_status() {
                                 ui.small(status);
                             }
