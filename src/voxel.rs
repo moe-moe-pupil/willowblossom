@@ -76,6 +76,7 @@ use voxxelmaxx::prelude::*;
 
 use crate::{
     napcat::{
+        CharacterHotbarSlot,
         NapcatIOSender,
         NapcatMessageManager,
         NapcatOutboundMessage,
@@ -361,6 +362,43 @@ struct VoxelPlacedLight {
 
 #[derive(Component)]
 struct VoxelFirstPersonPlayer;
+
+#[derive(Resource)]
+pub(crate) struct VoxelPossessionState {
+    pub active_user_id: Option<u64>,
+    applied_user_id: Option<u64>,
+    pub selected_hotbar_slot: usize,
+    pub movement_used: f32,
+    pub movement_limit: f32,
+    movement_turn: u32,
+    last_player_position: Option<Vec3>,
+    persist_elapsed: f32,
+}
+
+impl Default for VoxelPossessionState {
+    fn default() -> Self {
+        Self {
+            active_user_id: None,
+            applied_user_id: None,
+            selected_hotbar_slot: 0,
+            movement_used: 0.0,
+            movement_limit: 0.0,
+            movement_turn: 0,
+            last_player_position: None,
+            persist_elapsed: 0.0,
+        }
+    }
+}
+
+impl VoxelPossessionState {
+    pub(crate) fn possess(&mut self, user_id: u64) { self.active_user_id = Some(user_id); }
+
+    pub(crate) fn release(&mut self) { self.active_user_id = None; }
+
+    pub(crate) fn movement_remaining(&self) -> f32 {
+        (self.movement_limit - self.movement_used).max(0.0)
+    }
+}
 
 #[derive(Component, Clone)]
 struct VoxelAutoDoor {
@@ -857,6 +895,7 @@ impl Plugin for TrpgVoxelPlugin {
         .insert_resource(SubstepCount(TRPG_PHYSICS_SUBSTEPS))
         .insert_resource(Gravity::ZERO)
         .init_resource::<VoxelEditorState>()
+        .init_resource::<VoxelPossessionState>()
         .init_resource::<VoxelRadianceVolume>()
         .init_resource::<SceneCaptureRequests>()
         .init_resource::<VoxelPlayerCameraRuntimes>()
@@ -905,6 +944,7 @@ impl Plugin for TrpgVoxelPlugin {
                     sync_voxel_lighting,
                     control_first_person_player,
                     control_voxel_camera,
+                    sync_possessed_player_camera,
                     sync_voxel_player_cameras,
                     sync_voxel_player_standees,
                     capture_voxel_player_view,
@@ -2675,6 +2715,7 @@ fn voxel_player_camera_panel(
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
     mut editor: ResMut<VoxelPlayerCameraEditor>,
     mut voxel_editor: ResMut<VoxelEditorState>,
+    mut possession: ResMut<VoxelPossessionState>,
     mut runtimes: ResMut<VoxelPlayerCameraRuntimes>,
     mut store: ResMut<Persistent<VoxelPlayerCameraStore>>,
     viewport_camera: Query<
@@ -2760,6 +2801,58 @@ fn voxel_player_camera_panel(
                 });
             editor.selected_user_id = Some(selected);
 
+            ui.separator();
+            let possessing_selected = possession.active_user_id == Some(selected);
+            ui.horizontal(|ui| {
+                if possessing_selected {
+                    if ui.button("解除接管").clicked() {
+                        possession.release();
+                        if let Err(err) = store.persist() {
+                            eprintln!("failed to persist released player camera: {err}");
+                        }
+                    }
+                } else if ui.button("GM接管PL").clicked() {
+                    if possession.active_user_id.is_some() {
+                        if let Err(err) = store.persist() {
+                            eprintln!("failed to persist previous possessed player camera: {err}");
+                        }
+                    }
+                    possession.possess(selected);
+                }
+                if let Some(active) = possession.active_user_id {
+                    ui.small(format!(
+                        "正在接管：{}",
+                        voxel_player_display_name(manager.as_deref(), active)
+                    ));
+                } else {
+                    ui.small("GM创造模式");
+                }
+            });
+            if possessing_selected {
+                ui.small(format!(
+                    "本轮移动 {:.2}/{:.2}，剩余 {:.2}",
+                    possession.movement_used,
+                    possession.movement_limit,
+                    possession.movement_remaining(),
+                ));
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(character) = manager
+                        .as_deref()
+                        .and_then(|manager| manager.player_characters.get(&selected.to_string()))
+                    {
+                        for (index, slot) in character.inventory.hotbar.iter().enumerate() {
+                            let label = voxel_player_hotbar_slot_label(*slot, character);
+                            ui.selectable_value(
+                                &mut possession.selected_hotbar_slot,
+                                index,
+                                format!("{} {label}", index + 1),
+                            );
+                        }
+                    }
+                });
+                ui.small("生存模式：不可飞行或编辑方块；数字键1-9切换物品/主动技能。");
+            }
+
             let Some((_, mut transform)) = capture_cameras
                 .iter_mut()
                 .find(|(camera, _)| camera.user_id == selected)
@@ -2821,6 +2914,40 @@ fn voxel_player_camera_panel(
                 }
             }
         });
+}
+
+fn voxel_player_hotbar_slot_label(
+    slot: CharacterHotbarSlot,
+    character: &crate::napcat::PlayerCharacter,
+) -> String {
+    match slot {
+        CharacterHotbarSlot::Empty => "空".to_owned(),
+        CharacterHotbarSlot::Item(index) => character
+            .inventory
+            .items
+            .get(index)
+            .map(|item| {
+                let name = item.name.trim();
+                if name.is_empty() {
+                    "未命名物品".to_owned()
+                } else {
+                    name.to_owned()
+                }
+            })
+            .unwrap_or_else(|| "空".to_owned()),
+        CharacterHotbarSlot::Skill(index) => character
+            .skill_names
+            .get(index)
+            .map(|name| {
+                let name = name.trim();
+                if name.is_empty() {
+                    "未命名技能".to_owned()
+                } else {
+                    name.to_owned()
+                }
+            })
+            .unwrap_or_else(|| "空".to_owned()),
+    }
 }
 
 fn apply_voxel_player_view_to_editor(editor: &mut VoxelEditorState, transform: &Transform) {
@@ -4772,8 +4899,12 @@ fn place_creative_light(
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
     mut editor: ResMut<VoxelEditorState>,
+    possession: Res<VoxelPossessionState>,
     egui_input: Res<EguiWantsInput>,
 ) {
+    if possession.active_user_id.is_some() {
+        return;
+    }
     let Some(tool) = editor.light_tool else {
         return;
     };
@@ -5026,6 +5157,7 @@ fn edit_voxel_grid(
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
     mut editor: ResMut<VoxelEditorState>,
+    possession: Res<VoxelPossessionState>,
     egui_input: Res<EguiWantsInput>,
 ) {
     let egui_owns_pointer = egui_input.wants_any_pointer_input();
@@ -5056,6 +5188,9 @@ fn edit_voxel_grid(
             editor.undo.push(stroke);
             editor.redo.clear();
         }
+    }
+    if possession.active_user_id.is_some() {
+        return;
     }
     if editor.creative_inventory_open {
         return;
@@ -5709,22 +5844,108 @@ fn control_first_person_player(
     mut commands: Commands,
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
     mut editor: ResMut<VoxelEditorState>,
+    mut possession: ResMut<VoxelPossessionState>,
     mut players: Query<
         (
             Entity,
             &ShapeHits,
+            &mut Transform,
             &mut LinearVelocity,
             &mut ConstantLinearAcceleration,
             Has<Sensor>,
         ),
-        With<VoxelFirstPersonPlayer>,
+        (
+            With<VoxelFirstPersonPlayer>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
+    capture_cameras: Query<
+        (&Transform, &VoxelPlayerCaptureCamera),
+        (
+            With<VoxelPlayerCaptureCamera>,
+            Without<VoxelFirstPersonPlayer>,
+        ),
     >,
 ) {
-    let Ok((entity, ground_hits, mut velocity, mut acceleration, is_sensor)) = players.single_mut()
+    let Ok((entity, ground_hits, mut transform, mut velocity, mut acceleration, is_sensor)) =
+        players.single_mut()
     else {
         return;
     };
+
+    if possession.active_user_id != possession.applied_user_id {
+        possession.applied_user_id = possession.active_user_id;
+        possession.movement_used = 0.0;
+        possession.persist_elapsed = 0.0;
+        if let Some(user_id) = possession.active_user_id {
+            if let Some((camera_transform, _)) = capture_cameras
+                .iter()
+                .find(|(_, camera)| camera.user_id == user_id)
+            {
+                transform.translation = first_person_player_position(camera_transform.translation);
+            }
+            velocity.0 = Vec3::ZERO;
+            editor.first_person_enabled = true;
+            editor.first_person_was_enabled = true;
+            editor.first_person_flying = false;
+            editor.creative_inventory_open = false;
+            possession.last_player_position = Some(transform.translation);
+            possession.movement_turn = possession_world_turn(manager.as_deref(), user_id);
+            possession.movement_limit = possession_final_movement(manager.as_deref(), user_id);
+        } else {
+            possession.last_player_position = None;
+            editor.first_person_enabled = false;
+            editor.first_person_flying = false;
+        }
+    }
+
+    if let Some(user_id) = possession.active_user_id {
+        let world_turn = possession_world_turn(manager.as_deref(), user_id);
+        let movement_limit = possession_final_movement(manager.as_deref(), user_id);
+        if possession.movement_turn != world_turn {
+            possession.movement_turn = world_turn;
+            possession.movement_used = 0.0;
+            possession.last_player_position = Some(transform.translation);
+        }
+        possession.movement_limit = movement_limit;
+        editor.first_person_enabled = true;
+        editor.first_person_flying = false;
+        editor.creative_inventory_open = false;
+        for (key, slot) in [
+            (KeyCode::Digit1, 0),
+            (KeyCode::Digit2, 1),
+            (KeyCode::Digit3, 2),
+            (KeyCode::Digit4, 3),
+            (KeyCode::Digit5, 4),
+            (KeyCode::Digit6, 5),
+            (KeyCode::Digit7, 6),
+            (KeyCode::Digit8, 7),
+            (KeyCode::Digit9, 8),
+        ] {
+            if keyboard.just_pressed(key) {
+                possession.selected_hotbar_slot = slot;
+            }
+        }
+
+        if let Some(previous) = possession.last_player_position {
+            let (clamped, movement_used, exhausted) = clamp_horizontal_movement_step(
+                previous,
+                transform.translation,
+                possession.movement_used,
+                possession.movement_limit,
+            );
+            transform.translation = clamped;
+            possession.movement_used = movement_used;
+            if exhausted {
+                velocity.x = 0.0;
+                velocity.z = 0.0;
+            }
+        }
+        possession.last_player_position = Some(transform.translation);
+    }
+
     if !editor.first_person_enabled {
         editor.first_person_flying = false;
         editor.first_person_space_tap_elapsed = f32::INFINITY;
@@ -5747,7 +5968,8 @@ fn control_first_person_player(
     }
 
     editor.first_person_space_tap_elapsed += time.delta_secs();
-    if keyboard.just_pressed(KeyCode::Space)
+    if possession.active_user_id.is_none()
+        && keyboard.just_pressed(KeyCode::Space)
         && register_first_person_space_tap(&mut editor.first_person_space_tap_elapsed)
     {
         editor.first_person_flying = !editor.first_person_flying;
@@ -5771,6 +5993,9 @@ fn control_first_person_player(
     let movement =
         (forward * forward_input as f32 + right * right_input as f32).clamp_length_max(1.0);
     let movement_speed = editor.first_person_speed.max(VOXEL_SIZE);
+    let movement_allowed =
+        possession.active_user_id.is_none() || possession.movement_remaining() > f32::EPSILON;
+    let movement = if movement_allowed { movement } else { Vec3::ZERO };
     velocity.x = movement.x * movement_speed;
     velocity.z = movement.z * movement_speed;
 
@@ -5788,6 +6013,108 @@ fn control_first_person_player(
         .any(|hit| (-hit.normal2).angle_between(Vec3::Y).abs() <= 55.0_f32.to_radians());
     if grounded && keyboard.just_pressed(KeyCode::Space) {
         velocity.y = FIRST_PERSON_JUMP_SPEED;
+    }
+}
+
+fn possession_world_turn(manager: Option<&Persistent<NapcatMessageManager>>, user_id: u64) -> u32 {
+    let Some(manager) = manager else { return 0 };
+    let target_id = user_id.to_string();
+    manager
+        .trpg_groups
+        .values()
+        .filter(|group| group.players.iter().any(|player| player == &target_id))
+        .map(|group| {
+            group
+                .player_turns
+                .get(&target_id)
+                .map(|turn| turn.turns_passed)
+                .unwrap_or(group.world_turn)
+        })
+        .max()
+        .unwrap_or_default()
+}
+
+fn clamp_horizontal_movement_step(
+    previous: Vec3,
+    current: Vec3,
+    movement_used: f32,
+    movement_limit: f32,
+) -> (Vec3, f32, bool) {
+    let movement_limit = movement_limit.max(0.0);
+    let movement_used = movement_used.clamp(0.0, movement_limit);
+    let delta = Vec2::new(
+        current.x - previous.x,
+        current.z - previous.z,
+    );
+    let distance = delta.length();
+    let remaining = (movement_limit - movement_used).max(0.0);
+    if distance <= remaining || distance <= f32::EPSILON {
+        return (
+            current,
+            (movement_used + distance).min(movement_limit),
+            remaining <= f32::EPSILON,
+        );
+    }
+    let fraction = remaining / distance;
+    (
+        Vec3::new(
+            previous.x + delta.x * fraction,
+            current.y,
+            previous.z + delta.y * fraction,
+        ),
+        movement_limit,
+        true,
+    )
+}
+
+fn possession_final_movement(
+    manager: Option<&Persistent<NapcatMessageManager>>,
+    user_id: u64,
+) -> f32 {
+    manager
+        .and_then(|manager| manager.player_characters.get(&user_id.to_string()))
+        .map(|character| character.speed.max(0.0))
+        .unwrap_or_default()
+}
+
+fn sync_possessed_player_camera(
+    time: Res<Time>,
+    mut possession: ResMut<VoxelPossessionState>,
+    viewport_camera: Query<
+        &Transform,
+        (
+            With<VoxelViewportCamera>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
+    mut capture_cameras: Query<
+        (
+            &VoxelPlayerCaptureCamera,
+            &mut Transform,
+        ),
+        (
+            With<VoxelPlayerCaptureCamera>,
+            Without<VoxelViewportCamera>,
+        ),
+    >,
+    mut store: ResMut<Persistent<VoxelPlayerCameraStore>>,
+) {
+    let Some(user_id) = possession.active_user_id else { return };
+    let Ok(viewport_transform) = viewport_camera.single() else { return };
+    let Some((_, mut capture_transform)) = capture_cameras
+        .iter_mut()
+        .find(|(camera, _)| camera.user_id == user_id)
+    else {
+        return;
+    };
+    *capture_transform = *viewport_transform;
+    upsert_voxel_player_camera(&mut store, user_id, viewport_transform);
+    possession.persist_elapsed += time.delta_secs();
+    if possession.persist_elapsed >= 0.5 {
+        possession.persist_elapsed = 0.0;
+        if let Err(err) = store.persist() {
+            eprintln!("failed to persist possessed player camera: {err}");
+        }
     }
 }
 
@@ -5840,6 +6167,7 @@ fn control_voxel_camera(
         ),
     >,
     mut editor: ResMut<VoxelEditorState>,
+    mut possession: ResMut<VoxelPossessionState>,
     egui_input: Res<EguiWantsInput>,
 ) {
     if keyboard.just_pressed(KeyCode::Escape) {
@@ -5906,12 +6234,20 @@ fn control_voxel_camera(
             steps + event.y.signum() as i32
         });
         if !editor.creative_inventory_open && wheel_steps != 0 {
-            let slot = cycled_hotbar_slot(
-                editor.selected_hotbar_slot,
-                wheel_steps,
-                editor.creative_hotbar.len(),
-            );
-            editor.select_hotbar_slot(slot);
+            if possession.active_user_id.is_some() {
+                possession.selected_hotbar_slot = cycled_hotbar_slot(
+                    possession.selected_hotbar_slot,
+                    wheel_steps,
+                    9,
+                );
+            } else {
+                let slot = cycled_hotbar_slot(
+                    editor.selected_hotbar_slot,
+                    wheel_steps,
+                    editor.creative_hotbar.len(),
+                );
+                editor.select_hotbar_slot(slot);
+            }
         }
         let Ok((player_transform, _)) = players.single() else {
             return;
@@ -7466,12 +7802,14 @@ mod tests {
         app.insert_resource(Time::<()>::default())
             .insert_resource(ButtonInput::<KeyCode>::default())
             .insert_resource(editor)
+            .init_resource::<VoxelPossessionState>()
             .add_systems(Update, control_first_person_player);
         let player = app
             .world_mut()
             .spawn((
                 VoxelFirstPersonPlayer,
                 ShapeHits::default(),
+                Transform::default(),
                 LinearVelocity::ZERO,
                 ConstantLinearAcceleration::new(0.0, 0.0, 0.0),
             ))
@@ -7791,5 +8129,33 @@ mod tests {
         assert_eq!(placed.range, 12.0);
         assert_eq!(point.intensity, 3_200.0);
         assert_eq!(point.range, 12.0);
+    }
+
+    #[test]
+    fn survival_movement_is_clamped_to_final_movement_budget() {
+        let previous = Vec3::new(1.0, 2.0, 1.0);
+        let current = Vec3::new(7.0, 3.0, 9.0);
+        let (clamped, used, exhausted) =
+            clamp_horizontal_movement_step(previous, current, 2.0, 7.0);
+
+        assert!((clamped.x - 4.0).abs() < 0.0001);
+        assert!((clamped.z - 5.0).abs() < 0.0001);
+        assert_eq!(clamped.y, current.y);
+        assert!((used - 7.0).abs() < 0.0001);
+        assert!(exhausted);
+    }
+
+    #[test]
+    fn survival_movement_accumulates_path_length_without_clamping() {
+        let (position, used, exhausted) = clamp_horizontal_movement_step(
+            Vec3::ZERO,
+            Vec3::new(3.0, 1.0, 4.0),
+            1.0,
+            10.0,
+        );
+
+        assert_eq!(position, Vec3::new(3.0, 1.0, 4.0));
+        assert!((used - 6.0).abs() < 0.0001);
+        assert!(!exhausted);
     }
 }

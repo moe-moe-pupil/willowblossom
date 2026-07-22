@@ -663,6 +663,7 @@ use crate::{
         CampaignMessage,
         CharacterBuffBaseStats,
         CharacterCreationStep,
+        CharacterHotbarSlot,
         CharacterInventory,
         CharacterSkillMetadata,
         CharacterSkillSourceKind,
@@ -5586,7 +5587,7 @@ fn character_editor_ui(
         skill_pool,
     );
     ui.separator();
-    changed |= character_inventory_editor_ui(ui, character);
+    changed |= character_inventory_editor_ui(ui, character, skill_pool);
     ui.separator();
     changed |= character_skill_editor_ui(
         ui,
@@ -5867,6 +5868,10 @@ fn character_skill_editor_ui(
         character.skill_mp_costs.remove(index);
         character.skill_cooldown_turns.remove(index);
         character.skill_metadata.remove(index);
+        shift_character_hotbar_after_remove(
+            &mut character.inventory.hotbar,
+            CharacterHotbarSlot::Skill(index),
+        );
         shift_skill_last_cast_turns_after_remove(
             &mut character.skill_last_cast_turns,
             index,
@@ -6801,9 +6806,14 @@ fn character_buff_editor_ui(
     changed
 }
 
-fn character_inventory_editor_ui(ui: &mut Ui, character: &mut PlayerCharacter) -> bool {
+fn character_inventory_editor_ui(
+    ui: &mut Ui,
+    character: &mut PlayerCharacter,
+    skill_pool: &[SkillPoolEntry],
+) -> bool {
     let mut changed = false;
     changed |= normalize_inventory(&mut character.inventory);
+    changed |= normalize_character_hotbar(character);
 
     egui::CollapsingHeader::new("背包 / 装备")
         .default_open(false)
@@ -6852,6 +6862,63 @@ fn character_inventory_editor_ui(ui: &mut Ui, character: &mut PlayerCharacter) -
                         } else {
                             ui.small("空");
                         }
+                    });
+                }
+            });
+
+            ui.collapsing("生存快捷栏", |ui| {
+                ui.small("GM可把背包物品或已批准的主动技能放进玩家的1-9快捷栏。");
+                let active_skills = character_active_hotbar_skills(character, skill_pool);
+                let active_skill_indexes = active_skills
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect::<HashSet<_>>();
+                for slot in &mut character.inventory.hotbar {
+                    if matches!(slot, CharacterHotbarSlot::Skill(index) if !active_skill_indexes.contains(index))
+                    {
+                        *slot = CharacterHotbarSlot::Empty;
+                        changed = true;
+                    }
+                }
+                for slot_index in 0..character.inventory.hotbar.len() {
+                    let selected_text = character_hotbar_slot_label(
+                        character.inventory.hotbar[slot_index],
+                        character,
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}", slot_index + 1));
+                        egui::ComboBox::from_id_salt(("character_hotbar", slot_index))
+                            .selected_text(selected_text)
+                            .width(180.0)
+                            .show_ui(ui, |ui| {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut character.inventory.hotbar[slot_index],
+                                        CharacterHotbarSlot::Empty,
+                                        "空",
+                                    )
+                                    .changed();
+                                for item_index in 0..character.inventory.items.len() {
+                                    let label =
+                                        item_display_name(&character.inventory.items[item_index]);
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut character.inventory.hotbar[slot_index],
+                                            CharacterHotbarSlot::Item(item_index),
+                                            format!("物品 · {label}"),
+                                        )
+                                        .changed();
+                                }
+                                for (skill_index, label) in &active_skills {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut character.inventory.hotbar[slot_index],
+                                            CharacterHotbarSlot::Skill(*skill_index),
+                                            format!("技能 · {label}"),
+                                        )
+                                        .changed();
+                                }
+                            });
                     });
                 }
             });
@@ -6922,16 +6989,17 @@ fn character_inventory_editor_ui(ui: &mut Ui, character: &mut PlayerCharacter) -
                 });
 
             if let Some(index) = equip_index {
-                equip_inventory_item(&mut character.inventory, index);
+                remove_character_inventory_item(character, index, true);
                 changed = true;
             }
             if let Some(index) = remove_index {
-                character.inventory.items.remove(index);
+                remove_character_inventory_item(character, index, false);
                 changed = true;
             }
         });
 
     changed |= normalize_inventory(&mut character.inventory);
+    changed |= normalize_character_hotbar(character);
     changed
 }
 
@@ -6959,6 +7027,10 @@ fn normalize_inventory(inventory: &mut CharacterInventory) -> bool {
         inventory.bag_slots = 1;
         changed = true;
     }
+    if inventory.hotbar.len() != 9 {
+        inventory.hotbar.resize(9, CharacterHotbarSlot::Empty);
+        changed = true;
+    }
     for item in &mut inventory.items {
         changed |= normalize_item(item);
     }
@@ -6971,6 +7043,113 @@ fn normalize_inventory(inventory: &mut CharacterInventory) -> bool {
         .retain(|slot, item| *slot != EquipmentSlot::None && item.equipment_slot == *slot);
     changed |= inventory.equipment.len() != before_equipment;
     changed
+}
+
+fn normalize_character_hotbar(character: &mut PlayerCharacter) -> bool {
+    let item_count = character.inventory.items.len();
+    let skill_count = character.skill_names.len();
+    let mut changed = false;
+    for slot in &mut character.inventory.hotbar {
+        let valid = match *slot {
+            CharacterHotbarSlot::Empty => true,
+            CharacterHotbarSlot::Item(index) => index < item_count,
+            CharacterHotbarSlot::Skill(index) => index < skill_count,
+        };
+        if !valid {
+            *slot = CharacterHotbarSlot::Empty;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn character_active_hotbar_skills(
+    character: &mut PlayerCharacter,
+    skill_pool: &[SkillPoolEntry],
+) -> Vec<(usize, String)> {
+    quick_cast_skills(character)
+        .into_iter()
+        .filter(|skill| {
+            quick_cast_effect(
+                &skill.note,
+                &skill.arg_values,
+                skill.skill_type.as_deref(),
+                skill.legacy_buff_machine_json.as_deref(),
+                skill_pool,
+            )
+            .is_some()
+        })
+        .map(|skill| (skill.index, skill.name))
+        .collect()
+}
+
+fn character_hotbar_slot_label(slot: CharacterHotbarSlot, character: &PlayerCharacter) -> String {
+    match slot {
+        CharacterHotbarSlot::Empty => "空".to_owned(),
+        CharacterHotbarSlot::Item(index) => character
+            .inventory
+            .items
+            .get(index)
+            .map(|item| format!("物品 · {}", item_display_name(item)))
+            .unwrap_or_else(|| "空".to_owned()),
+        CharacterHotbarSlot::Skill(index) => character
+            .skill_names
+            .get(index)
+            .map(|name| {
+                let name = name.trim();
+                format!(
+                    "技能 · {}",
+                    if name.is_empty() { "未命名技能" } else { name }
+                )
+            })
+            .unwrap_or_else(|| "空".to_owned()),
+    }
+}
+
+fn shift_character_hotbar_after_remove(
+    hotbar: &mut [CharacterHotbarSlot],
+    removed: CharacterHotbarSlot,
+) {
+    for slot in hotbar {
+        *slot = match (*slot, removed) {
+            (CharacterHotbarSlot::Item(index), CharacterHotbarSlot::Item(removed_index))
+                if index == removed_index =>
+            {
+                CharacterHotbarSlot::Empty
+            },
+            (CharacterHotbarSlot::Item(index), CharacterHotbarSlot::Item(removed_index))
+                if index > removed_index =>
+            {
+                CharacterHotbarSlot::Item(index - 1)
+            },
+            (CharacterHotbarSlot::Skill(index), CharacterHotbarSlot::Skill(removed_index))
+                if index == removed_index =>
+            {
+                CharacterHotbarSlot::Empty
+            },
+            (CharacterHotbarSlot::Skill(index), CharacterHotbarSlot::Skill(removed_index))
+                if index > removed_index =>
+            {
+                CharacterHotbarSlot::Skill(index - 1)
+            },
+            (current, _) => current,
+        };
+    }
+}
+
+fn remove_character_inventory_item(character: &mut PlayerCharacter, index: usize, equip: bool) {
+    if index >= character.inventory.items.len() {
+        return;
+    }
+    shift_character_hotbar_after_remove(
+        &mut character.inventory.hotbar,
+        CharacterHotbarSlot::Item(index),
+    );
+    if equip {
+        equip_inventory_item(&mut character.inventory, index);
+    } else {
+        character.inventory.items.remove(index);
+    }
 }
 
 fn normalize_item(item: &mut InventoryItem) -> bool {
@@ -14193,6 +14372,41 @@ mod tests {
         );
         assert_eq!(inventory.items.len(), 1);
         assert_eq!(inventory.items[0].name, "旧剑");
+    }
+
+    #[test]
+    fn removing_inventory_and_skill_entries_repairs_hotbar_indexes() {
+        let mut character = PlayerCharacter::default();
+        character.inventory.items = vec![
+            InventoryItem {
+                name: "药水".to_owned(),
+                ..Default::default()
+            },
+            InventoryItem {
+                name: "绳索".to_owned(),
+                ..Default::default()
+            },
+        ];
+        character.skill_names = vec!["被移除".to_owned(), "冲刺".to_owned()];
+        character.inventory.hotbar = vec![
+            CharacterHotbarSlot::Item(0),
+            CharacterHotbarSlot::Item(1),
+            CharacterHotbarSlot::Skill(0),
+            CharacterHotbarSlot::Skill(1),
+        ];
+
+        remove_character_inventory_item(&mut character, 0, false);
+        shift_character_hotbar_after_remove(
+            &mut character.inventory.hotbar,
+            CharacterHotbarSlot::Skill(0),
+        );
+
+        assert_eq!(character.inventory.hotbar, vec![
+            CharacterHotbarSlot::Empty,
+            CharacterHotbarSlot::Item(0),
+            CharacterHotbarSlot::Empty,
+            CharacterHotbarSlot::Skill(0),
+        ]);
     }
 
     #[test]

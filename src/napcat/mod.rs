@@ -426,6 +426,15 @@ pub struct InventoryItem {
     pub soulbound: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "index")]
+pub enum CharacterHotbarSlot {
+    #[default]
+    Empty,
+    Item(usize),
+    Skill(usize),
+}
+
 impl Default for InventoryItem {
     fn default() -> Self {
         Self {
@@ -452,6 +461,8 @@ pub struct CharacterInventory {
     pub items: Vec<InventoryItem>,
     #[serde(default)]
     pub equipment: HashMap<EquipmentSlot, InventoryItem>,
+    #[serde(default = "default_character_hotbar")]
+    pub hotbar: Vec<CharacterHotbarSlot>,
 }
 
 impl Default for CharacterInventory {
@@ -461,6 +472,7 @@ impl Default for CharacterInventory {
             gold: 0,
             items: Vec::new(),
             equipment: HashMap::default(),
+            hotbar: default_character_hotbar(),
         }
     }
 }
@@ -1160,6 +1172,8 @@ fn default_item_stack() -> u32 { 1 }
 fn default_item_max_stack() -> u32 { 1 }
 
 fn default_bag_slots() -> usize { 16 }
+
+fn default_character_hotbar() -> Vec<CharacterHotbarSlot> { vec![CharacterHotbarSlot::Empty; 9] }
 
 fn default_random_pool_weight() -> f32 { 1.0 }
 
@@ -12964,5 +12978,22 @@ mod tests {
         let timer = group.legacy_negative_timer("b").unwrap();
         assert_eq!(timer.negative_layers, 1);
         assert_eq!(timer.remaining_ms, 0);
+    }
+
+    #[test]
+    fn legacy_character_inventory_defaults_to_nine_empty_hotbar_slots() {
+        let inventory = serde_json::from_value::<CharacterInventory>(serde_json::json!({
+            "bag_slots": 16,
+            "gold": 4,
+            "items": [],
+            "equipment": {}
+        }))
+        .expect("legacy inventory should deserialize");
+
+        assert_eq!(inventory.hotbar.len(), 9);
+        assert!(inventory
+            .hotbar
+            .iter()
+            .all(|slot| *slot == CharacterHotbarSlot::Empty));
     }
 }
