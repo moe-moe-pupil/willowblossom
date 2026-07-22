@@ -6094,6 +6094,9 @@ fn handle_private_player_command(
     }
 
     let command = private_command_body(text)?;
+    if command.eq_ignore_ascii_case("help") || command == "帮助" {
+        return Some(format_private_help());
+    }
     match command {
         "抽取天赋" => Some(draw_character_talent(
             manager,
@@ -6126,6 +6129,25 @@ fn handle_private_player_command(
         )),
         _ => None,
     }
+}
+
+fn format_private_help() -> String {
+    [
+        "玩家命令帮助",
+        "命令前缀可混用半角【.】或全角【。】，例如 .help / 。help。",
+        "【.兑换】开始创建角色",
+        "【.状态】查看角色当前状态",
+        "【.已兑换】查看技能与兑换内容",
+        "【.冷却】查看技能冷却",
+        "【.频道人员】查看当前可见频道成员",
+        "【.指南】查看当前TRPG组指南",
+        "【.观察】或【.gc】请求玩家观察画面",
+        "【.抽取天赋】抽取普通天赋",
+        "【.抽取辅助天赋】抽取辅助天赋",
+        "【.<属性> <点数>】为已完成角色投入属性点，例如 .力量 1 或 。agi 2",
+        "建卡过程中：【.】下一步，【..】上一步；属性阶段直接发送数字。",
+    ]
+    .join("\n")
 }
 
 fn draw_character_talent(
@@ -10279,6 +10301,29 @@ mod tests {
         assert!(response.contains("角色：晨星"));
         assert!(response.contains("HP："));
         assert!(response.contains("力量"));
+    }
+
+    #[test]
+    fn private_help_command_accepts_halfwidth_and_fullwidth_prefixes() {
+        let mut manager = empty_manager();
+        let mut responses = Vec::new();
+
+        for command in [".help", "。help"] {
+            responses.push(
+                handle_character_creation_message(
+                    &mut manager,
+                    &test_message_with_text(NapcatMessageType::Private, command),
+                    "2",
+                )
+                .unwrap(),
+            );
+        }
+
+        assert_eq!(responses[0], responses[1]);
+        assert!(responses[0].contains("玩家命令帮助"));
+        assert!(responses[0].contains(".兑换"));
+        assert!(responses[0].contains("。agi 2"));
+        assert!(responses[0].contains("【..】上一步"));
     }
 
     #[test]
