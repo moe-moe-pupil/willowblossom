@@ -6098,6 +6098,7 @@ fn handle_private_player_command(
         return Some(format_private_help());
     }
     match command {
+        "属性说明" => Some(format_private_attribute_help()),
         "抽取天赋" => Some(draw_character_talent(
             manager,
             target_id,
@@ -6137,6 +6138,7 @@ fn format_private_help() -> String {
         "命令前缀可混用半角【.】或全角【。】，例如 .help / 。help。",
         "【.兑换】开始创建角色",
         "【.状态】查看角色当前状态",
+        "【.属性说明】查看八项属性的完整说明",
         "【.已兑换】查看技能与兑换内容",
         "【.冷却】查看技能冷却",
         "【.频道人员】查看当前可见频道成员",
@@ -6146,6 +6148,21 @@ fn format_private_help() -> String {
         "【.抽取辅助天赋】抽取辅助天赋",
         "【.<属性> <点数>】为已完成角色投入属性点，例如 .力量 1 或 。agi 2",
         "建卡过程中：【.】下一步，【..】上一步；属性阶段直接发送数字。",
+    ]
+    .join("\n")
+}
+
+fn format_private_attribute_help() -> String {
+    [
+        "属性说明",
+        "力量（STR）：每点力量提供1点生命值、0.5米/秒移动速度、0.1%体型和2.5物理攻击加值。",
+        "敏捷（AGI）：每点敏捷提供1米/秒移动速度和2%攻击速度。100%攻速可一轮行动两次；不足100%的攻速会提供基于力量的基础物理攻击百分比提升。",
+        "灵巧（DEX）：每点灵巧提供0.5米/秒移动速度、3远程物理攻击加值和1近战物理攻击加值。",
+        "体质（VIT）：每点体质提供3点生命值；脱战后且非重伤时提供1点/轮生命回复；减少1%因受伤状态遭受的属性惩罚。",
+        "智力（INT）：每点智力提供5点魔法值、1%魔法额外消耗、2%法术伤害和1%治疗加成。达到10点可感知周围环境的魔力；达到15点可模糊感知周围存在的法术类buff或正在释放的法术类技能，不受视野阻碍限制。",
+        "智慧（WIS）：每点智慧提供2.5点魔法值、脱战后1点/轮魔法回复、更好的精神力引导与控制，以及2%治疗加成。",
+        "知识（K）：每点知识提供额外线索、情报和操作部分设备的能力。达到10点可完整认识自身，得知自己的具体生命值和自己对目标造成的具体伤害；达到20点可消耗一个观察小动作，分析buff或技能的伤害/治疗数值与持续时间。",
+        "魅力（CHA）：每点魅力提供额外的NPC交流好感、0.05召唤物上限和2%召唤物伤害加成。",
     ]
     .join("\n")
 }
@@ -6481,10 +6498,28 @@ fn format_private_character_status(manager: &NapcatMessageManager, target_id: &s
         );
     }
 
-    let mut sections = vec![
+    let total_status = character_total_status(character);
+    let hp_status = private_character_hp_status(character.hp, character.max_hp);
+    let health = if total_status.k >= 10 {
+        format!(
+            "生命：{} / {} 【{}】",
+            format_character_number(character.hp),
+            format_character_number(character.max_hp),
+            hp_status,
+        )
+    } else {
+        format!("生命：【{hp_status}】")
+    };
+    let sections = vec![
         format!(
             "角色：{}",
             character_display_name(character, target_id)
+        ),
+        health,
+        format!(
+            "魔法：{} / {}",
+            format_character_number(character.mp),
+            format_character_number(character.max_mp)
         ),
         format!(
             "等级：{}  经验：{} / {}",
@@ -6493,39 +6528,30 @@ fn format_private_character_status(manager: &NapcatMessageManager, target_id: &s
             character_next_level_exp(character.level)
         ),
         format!(
-            "HP：{}/{}  MP：{}/{}",
-            format_character_number(character.hp),
-            format_character_number(character.max_hp),
-            format_character_number(character.mp),
-            format_character_number(character.max_mp)
-        ),
-        format!(
-            "本轮承伤：{}  本轮受疗：{}",
-            format_character_number(character.damage_taken_this_turn),
-            format_character_number(character.healing_taken_this_turn)
-        ),
-        format!(
-            "速度：{}",
-            format_character_number(character.speed)
-        ),
-        format!(
             "剩余属性点：{}",
             character.status_points
         ),
         format_character_status_totals(character),
     ];
 
-    if !character.active_buffs.is_empty() {
-        let buffs = character
-            .active_buffs
-            .iter()
-            .map(|buff| buff.name.as_str())
-            .collect::<Vec<_>>()
-            .join("、");
-        sections.push(format!("状态效果：{buffs}"));
-    }
-
     sections.join("\n")
+}
+
+fn private_character_hp_status(hp: f32, max_hp: f32) -> &'static str {
+    if max_hp <= 0.0 {
+        return "濒死";
+    }
+    if hp > max_hp * 0.8 {
+        "无伤"
+    } else if hp > max_hp * 0.6 {
+        "轻伤"
+    } else if hp > max_hp * 0.4 {
+        "中伤"
+    } else if hp > max_hp * 0.05 {
+        "重伤"
+    } else {
+        "濒死"
+    }
 }
 
 fn format_private_character_skills(manager: &NapcatMessageManager, target_id: &str) -> String {
@@ -10299,8 +10325,50 @@ mod tests {
         .unwrap();
 
         assert!(response.contains("角色：晨星"));
-        assert!(response.contains("HP："));
+        assert!(response.contains("生命：【无伤】"));
+        assert!(!response.contains("生命：5 / 5"));
+        assert!(!response.contains("本轮承伤"));
+        assert!(!response.contains("速度："));
         assert!(response.contains("力量"));
+    }
+
+    #[test]
+    fn private_status_reveals_exact_health_at_ten_total_knowledge() {
+        let mut manager = empty_manager();
+        let mut character = completed_character("观星者");
+        character.hp = 4.0;
+        character.max_hp = 10.0;
+        character.status.k = 7;
+        character.extra_status.k = 3;
+        manager.player_characters.insert("2".to_owned(), character);
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "。状态"),
+            "2",
+        )
+        .unwrap();
+
+        assert!(response.contains("生命：4 / 10 【重伤】"));
+    }
+
+    #[test]
+    fn private_attribute_help_accepts_both_prefixes_and_lists_all_attributes() {
+        let mut manager = empty_manager();
+        for command in [".属性说明", "。属性说明"] {
+            let response = handle_character_creation_message(
+                &mut manager,
+                &test_message_with_text(NapcatMessageType::Private, command),
+                "2",
+            )
+            .unwrap();
+
+            for attribute in ["STR", "AGI", "DEX", "VIT", "INT", "WIS", "K", "CHA"] {
+                assert!(response.contains(attribute));
+            }
+            assert!(response.contains("达到10点可完整认识自身"));
+            assert!(response.contains("达到20点可消耗一个观察小动作"));
+        }
     }
 
     #[test]
@@ -10322,6 +10390,7 @@ mod tests {
         assert_eq!(responses[0], responses[1]);
         assert!(responses[0].contains("玩家命令帮助"));
         assert!(responses[0].contains(".兑换"));
+        assert!(responses[0].contains(".属性说明"));
         assert!(responses[0].contains("。agi 2"));
         assert!(responses[0].contains("【..】上一步"));
     }
