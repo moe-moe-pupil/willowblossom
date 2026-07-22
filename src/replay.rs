@@ -3,6 +3,10 @@ use std::os::windows::process::CommandExt;
 use std::{
     collections::HashMap,
     fs,
+    io::{
+        BufWriter,
+        Write,
+    },
     path::{
         Path,
         PathBuf,
@@ -247,6 +251,8 @@ struct ReplayStudio {
     pre_playback_scene: Option<ReplayScene>,
     video_path: String,
     video_fps: u32,
+    music_enabled: bool,
+    music_volume: f32,
     project_export_path: String,
     project_import_path: String,
     video_render: Option<VideoRenderJob>,
@@ -260,6 +266,9 @@ struct VideoRenderJob {
     frames: TempDir,
     output_path: PathBuf,
     fps: u32,
+    duration_ms: u64,
+    music_enabled: bool,
+    music_volume: f32,
     total_frames: u64,
     next_frame: u64,
     capture_pending: bool,
@@ -290,6 +299,8 @@ impl Default for ReplayStudio {
             pre_playback_scene: None,
             video_path: DEFAULT_VIDEO_PATH.to_owned(),
             video_fps: 15,
+            music_enabled: true,
+            music_volume: 0.35,
             project_export_path: DEFAULT_REPLAY_PATH.to_owned(),
             project_import_path: DEFAULT_REPLAY_PATH.to_owned(),
             video_render: None,
@@ -493,9 +504,19 @@ fn finish_video_capture(
     let frames_path = job.frames.path().to_owned();
     let output_path = job.output_path.clone();
     let fps = job.fps;
+    let duration_ms = job.duration_ms;
+    let music_enabled = job.music_enabled;
+    let music_volume = job.music_volume;
     let (sender, receiver) = bounded(1);
     thread::spawn(move || {
-        let result = encode_video_frames(&frames_path, &output_path, fps);
+        let result = encode_video_frames(
+            &frames_path,
+            &output_path,
+            fps,
+            duration_ms,
+            music_enabled,
+            music_volume,
+        );
         let _ = sender.send(result);
     });
     studio.status = format!(
@@ -799,6 +820,16 @@ fn replay_controls(
                     ui.label("DM 制作提要（不会自动写入台词）");
                     ui.label(&block.latest);
                 });
+                ui.collapsing(
+                    "查看 DeepSeek API 原始响应",
+                    |ui| {
+                        ui.monospace(&block.latest);
+                        if ui.button("复制原始响应").clicked() {
+                            ui.ctx().copy_text(block.latest.clone());
+                        }
+                        ui.small("显示 API 返回的 message.content；不会显示 API 密钥或思考过程。");
+                    },
+                );
             }
         }
     }
@@ -819,6 +850,18 @@ fn replay_controls(
         ] {
             ui.selectable_value(&mut studio.video_fps, fps, label);
         }
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut studio.music_enabled,
+            "原创舒缓纯音乐",
+        );
+        ui.add_enabled(
+            studio.music_enabled,
+            egui::Slider::new(&mut studio.music_volume, 0.05..=0.60)
+                .text("音量")
+                .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+        );
     });
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
@@ -1240,6 +1283,9 @@ fn start_video_export(
         frames,
         output_path,
         fps,
+        duration_ms,
+        music_enabled: studio.music_enabled,
+        music_volume: studio.music_volume,
         total_frames,
         next_frame: 0,
         capture_pending: false,
@@ -1293,12 +1339,30 @@ fn check_ffmpeg() -> Result<(), String> {
         })
 }
 
-fn encode_video_frames(frames_path: &Path, output_path: &Path, fps: u32) -> Result<(), String> {
+fn encode_video_frames(
+    frames_path: &Path,
+    output_path: &Path,
+    fps: u32,
+    duration_ms: u64,
+    music_enabled: bool,
+    music_volume: f32,
+) -> Result<(), String> {
     let frame_pattern = frames_path.join("frame_%06d.png");
+    let soundtrack_path = frames_path.join("original-relaxing-soundtrack.wav");
+    if music_enabled {
+        write_relaxing_soundtrack(
+            &soundtrack_path,
+            duration_ms,
+            music_volume,
+        )?;
+    }
     let temporary_output = temporary_video_output_path(output_path);
     let mut command = Command::new("ffmpeg");
     command.args(ffmpeg_arguments(fps));
     command.arg(frame_pattern);
+    if music_enabled {
+        command.arg("-i").arg(&soundtrack_path);
+    }
     command.args([
         "-vf",
         "pad=ceil(iw/2)*2:ceil(ih/2)*2",
@@ -1313,6 +1377,9 @@ fn encode_video_frames(frames_path: &Path, output_path: &Path, fps: u32) -> Resu
         "-movflags",
         "+faststart",
     ]);
+    if music_enabled {
+        command.args(["-c:a", "aac", "-b:a", "160k", "-shortest"]);
+    }
     command.arg(&temporary_output);
     hide_command_window(&mut command);
     let output = command
@@ -1342,6 +1409,116 @@ fn encode_video_frames(frames_path: &Path, output_path: &Path, fps: u32) -> Resu
         tail
     })
 }
+
+fn write_relaxing_soundtrack(path: &Path, duration_ms: u64, volume: f32) -> Result<(), String> {
+    const SAMPLE_RATE: u32 = 32_000;
+    const CHANNELS: u16 = 2;
+    const BITS_PER_SAMPLE: u16 = 16;
+    const CHORDS: [[f32; 3]; 4] = [
+        [220.00, 261.63, 329.63],
+        [174.61, 220.00, 261.63],
+        [130.81, 164.81, 196.00],
+        [196.00, 246.94, 293.66],
+    ];
+    let sample_count = duration_ms
+        .saturating_mul(SAMPLE_RATE as u64)
+        .saturating_add(999)
+        / 1_000;
+    let data_bytes = sample_count
+        .saturating_mul(CHANNELS as u64)
+        .saturating_mul((BITS_PER_SAMPLE / 8) as u64);
+    if data_bytes > (u32::MAX - 36) as u64 {
+        return Err("回放过长，无法生成 WAV 背景音乐".to_owned());
+    }
+    let file = fs::File::create(path).map_err(|err| format!("无法创建背景音乐：{err}"))?;
+    let mut writer = BufWriter::new(file);
+    write_wav_header(
+        &mut writer,
+        SAMPLE_RATE,
+        CHANNELS,
+        BITS_PER_SAMPLE,
+        data_bytes as u32,
+    )?;
+    let duration_seconds = duration_ms as f32 / 1_000.0;
+    let fade_in_seconds = (duration_seconds * 0.20).clamp(0.10, 3.0);
+    let fade_out_seconds = (duration_seconds * 0.20).clamp(0.10, 4.0);
+    let volume = volume.clamp(0.0, 1.0);
+    for index in 0..sample_count {
+        let time = index as f32 / SAMPLE_RATE as f32;
+        let section = ((time / 8.0).floor() as usize) % CHORDS.len();
+        let next_section = (section + 1) % CHORDS.len();
+        let section_time = time % 8.0;
+        let crossfade = smoothstep(((section_time - 7.0) / 1.0).clamp(0.0, 1.0));
+        let current_pad = chord_wave(CHORDS[section], time, 0.0);
+        let next_pad = chord_wave(CHORDS[next_section], time, 0.0);
+        let current_pad_right = chord_wave(CHORDS[section], time, 0.08);
+        let next_pad_right = chord_wave(CHORDS[next_section], time, 0.08);
+        let pad_left = current_pad * (1.0 - crossfade) + next_pad * crossfade;
+        let pad_right = current_pad_right * (1.0 - crossfade) + next_pad_right * crossfade;
+        let arpeggio_step = ((time / 2.0).floor() as usize) % 3;
+        let arpeggio_time = time % 2.0;
+        let arpeggio_envelope = (std::f32::consts::PI * arpeggio_time / 2.0)
+            .sin()
+            .max(0.0)
+            .powi(2);
+        let arpeggio_frequency = CHORDS[section][arpeggio_step] * 2.0;
+        let arpeggio_left = (std::f32::consts::TAU * arpeggio_frequency * time).sin();
+        let arpeggio_right = (std::f32::consts::TAU * arpeggio_frequency * time + 0.18).sin();
+        let breathing = 0.88 + 0.12 * (std::f32::consts::TAU * 0.06 * time).sin();
+        let fade_in = (time / fade_in_seconds).clamp(0.0, 1.0);
+        let fade_out = ((duration_seconds - time) / fade_out_seconds).clamp(0.0, 1.0);
+        let envelope = smoothstep(fade_in) * smoothstep(fade_out) * breathing * volume;
+        let left = (pad_left * 0.28 + arpeggio_left * arpeggio_envelope * 0.07) * envelope;
+        let right = (pad_right * 0.28 + arpeggio_right * arpeggio_envelope * 0.07) * envelope;
+        writer
+            .write_all(&pcm_i16(left).to_le_bytes())
+            .and_then(|_| writer.write_all(&pcm_i16(right).to_le_bytes()))
+            .map_err(|err| format!("写入背景音乐失败：{err}"))?;
+    }
+    writer
+        .flush()
+        .map_err(|err| format!("完成背景音乐失败：{err}"))
+}
+
+fn write_wav_header(
+    writer: &mut impl Write,
+    sample_rate: u32,
+    channels: u16,
+    bits_per_sample: u16,
+    data_bytes: u32,
+) -> Result<(), String> {
+    let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
+    let block_align = channels * bits_per_sample / 8;
+    writer
+        .write_all(b"RIFF")
+        .and_then(|_| writer.write_all(&(36 + data_bytes).to_le_bytes()))
+        .and_then(|_| writer.write_all(b"WAVEfmt "))
+        .and_then(|_| writer.write_all(&16_u32.to_le_bytes()))
+        .and_then(|_| writer.write_all(&1_u16.to_le_bytes()))
+        .and_then(|_| writer.write_all(&channels.to_le_bytes()))
+        .and_then(|_| writer.write_all(&sample_rate.to_le_bytes()))
+        .and_then(|_| writer.write_all(&byte_rate.to_le_bytes()))
+        .and_then(|_| writer.write_all(&block_align.to_le_bytes()))
+        .and_then(|_| writer.write_all(&bits_per_sample.to_le_bytes()))
+        .and_then(|_| writer.write_all(b"data"))
+        .and_then(|_| writer.write_all(&data_bytes.to_le_bytes()))
+        .map_err(|err| format!("写入 WAV 文件头失败：{err}"))
+}
+
+fn chord_wave(frequencies: [f32; 3], time: f32, phase: f32) -> f32 {
+    frequencies
+        .into_iter()
+        .enumerate()
+        .map(|(index, frequency)| {
+            (std::f32::consts::TAU * frequency * time + phase * (index + 1) as f32).sin()
+        })
+        .sum::<f32>()
+        / 3.0
+}
+
+fn smoothstep(value: f32) -> f32 { value * value * (3.0 - 2.0 * value) }
+
+fn pcm_i16(value: f32) -> i16 { (value.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16 }
 
 fn temporary_video_output_path(output_path: &Path) -> PathBuf {
     let file_stem = output_path
@@ -2074,6 +2251,58 @@ mod tests {
             "0",
             "-i",
         ]);
+    }
+
+    #[test]
+    fn original_relaxing_music_is_a_non_silent_stereo_wav() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("music.wav");
+        write_relaxing_soundtrack(&path, 250, 0.35).unwrap();
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[22..24], &2_u16.to_le_bytes());
+        assert!(bytes[44..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg and FFprobe"]
+    fn encoded_replay_contains_aac_background_music() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..2 {
+            image::RgbImage::from_pixel(64, 64, image::Rgb([24, 30, 36]))
+                .save(directory.path().join(frame_file_name(index)))
+                .unwrap();
+        }
+        let output = directory.path().join("music-test.mp4");
+        encode_video_frames(
+            directory.path(),
+            &output,
+            10,
+            200,
+            true,
+            0.35,
+        )
+        .unwrap();
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(probe.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&probe.stdout).trim(),
+            "aac"
+        );
     }
 
     fn test_dialogue(time_ms: u64, duration_ms: u64, side: DialogueSide) -> ReplayDialogue {
