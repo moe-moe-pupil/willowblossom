@@ -9064,6 +9064,7 @@ dependencies = [
 name = "willowblossom"
 version = "0.12.3"
 dependencies = [
+ "ab_glyph",
  "async-compat",
  "avian3d",
  "bevy",

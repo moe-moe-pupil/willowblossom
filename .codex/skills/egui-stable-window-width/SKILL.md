@@ -18,6 +18,7 @@ Check these first:
 - A resizable `egui::Window` with only `.default_width(...)` and no `.max_width(...)`.
 - Child widgets using `.desired_width(ui.available_width())`, `f32::INFINITY`, or a value derived directly from the already-expanded window.
 - `ui.columns(...)` containing single-line `TextEdit` fields. Columns divide the parent width, so the parent may expand to satisfy the editors.
+- `Grid::num_columns(...)` inside an auto-sized window. In egui 0.35 it makes the last column fill the parent's remaining width, which can feed the parent width back into the grid and produce large gaps or full-screen growth.
 - `ui.horizontal(...)` rows containing many controls or long text. Use `horizontal_wrapped` or break rows when fixed-width compact controls are acceptable.
 - Persisted egui window memory. After a bad layout has saved a huge width, the fix may look ineffective until the window id changes or egui memory is cleared.
 
@@ -90,6 +91,26 @@ ui.horizontal(|ui| {
 });
 ```
 
+For fixed-size item catalogs, cap the window and omit `num_columns`; call `end_row()` at the intended boundary and cap cell widths. Version the window and grid ids once if their persisted layout already contains the oversized width:
+
+```rust
+egui::Window::new("Catalog")
+    .id(Id::new("catalog_v2"))
+    .default_width(440.0)
+    .min_width(440.0)
+    .max_width(440.0)
+    .resizable(false)
+    .show(ctx, |ui| {
+        ui.set_max_width(440.0);
+        Grid::new("catalog_grid_v2")
+            .min_col_width(56.0)
+            .max_col_width(72.0)
+            .show(ui, |ui| {
+                // Add cells and call ui.end_row() after each logical row.
+            });
+    });
+```
+
 ## Verification
 
 After patching:
@@ -103,6 +124,7 @@ After patching:
 
 - Keep `.default_width(...)` as the starting size only. It is not a maximum.
 - Prefer `.max_width(...)` on resizable windows that contain text editors or columns.
+- Avoid `Grid::num_columns(...)` in auto-sized catalog windows; use explicit `end_row()` boundaries and bounded column widths.
 - Cap long editor windows to the viewport with `.max_height(...)` and enable vertical scrolling so controls remain reachable.
 - Keep editable forms out of `menu_button`, popup, and context-menu surfaces; use inline collapsing sections or normal scrollable windows.
 - Avoid `desired_width(ui.available_width())` unless the parent has already been capped.

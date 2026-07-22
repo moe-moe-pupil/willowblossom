@@ -15,6 +15,12 @@ use std::{
     },
 };
 
+use ab_glyph::{
+    point,
+    Font,
+    FontRef,
+    PxScale,
+};
 use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
@@ -186,6 +192,7 @@ struct VoxelPlayerStandee {
 struct VoxelPlayerStandeeAssets {
     entities: HashMap<u64, Entity>,
     textures: HashMap<String, Handle<Image>>,
+    back_label_texture: Option<Handle<Image>>,
     failed_sources: HashSet<String>,
 }
 
@@ -3135,19 +3142,36 @@ fn sync_voxel_player_standees(
         ) {
             Ok((texture, image_size)) => {
                 let size = voxel_player_standee_size(image_size);
-                let entity = commands
-                    .spawn((
-                        Mesh3d(meshes.add(Plane3d::new(Vec3::Z, size * 0.5).mesh())),
-                        MeshMaterial3d(materials.add(voxel_player_standee_material(texture))),
-                        voxel_player_standee_transform(&camera_transform),
-                        Visibility::Visible,
-                        VoxelPlayerStandee {
-                            user_id,
-                            image_source,
-                            half_size: size * 0.5,
-                        },
-                    ))
-                    .id();
+                let back_label_texture = assets
+                    .back_label_texture
+                    .get_or_insert_with(|| images.add(voxel_player_standee_back_label_image()))
+                    .clone();
+                let back_label_material = materials.add(StandardMaterial {
+                    base_color_texture: Some(back_label_texture),
+                    alpha_mode: AlphaMode::Opaque,
+                    cull_mode: None,
+                    unlit: true,
+                    ..default()
+                });
+                let mut entity_commands = commands.spawn((
+                    Mesh3d(meshes.add(Plane3d::new(Vec3::Z, size * 0.5).mesh())),
+                    MeshMaterial3d(materials.add(voxel_player_standee_material(texture))),
+                    voxel_player_standee_transform(&camera_transform),
+                    Visibility::Visible,
+                    VoxelPlayerStandee {
+                        user_id,
+                        image_source,
+                        half_size: size * 0.5,
+                    },
+                ));
+                entity_commands.with_child((
+                    Mesh3d(
+                        meshes.add(Plane3d::new(Vec3::Z, Vec2::splat(VOXEL_SIZE * 0.42)).mesh()),
+                    ),
+                    MeshMaterial3d(back_label_material),
+                    voxel_player_standee_back_label_transform(),
+                ));
+                let entity = entity_commands.id();
                 assets.entities.insert(user_id, entity);
             },
             Err(err) => {
@@ -3159,6 +3183,65 @@ fn sync_voxel_player_standees(
 }
 
 fn voxel_player_standee_transform(camera_transform: &Transform) -> Transform { *camera_transform }
+
+fn voxel_player_standee_back_label_transform() -> Transform {
+    Transform::from_xyz(0.0, 0.0, -0.015).with_rotation(Quat::from_rotation_y(
+        std::f32::consts::PI,
+    ))
+}
+
+fn voxel_player_standee_back_label_image() -> Image {
+    const SIZE: u32 = 128;
+    const BACKGROUND: [u8; 3] = [166, 13, 13];
+    let mut pixels = vec![0; (SIZE * SIZE * 4) as usize];
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], u8::MAX]);
+    }
+
+    let font = FontRef::try_from_slice(include_bytes!(
+        "../assets/fonts/AlibabaHealthFont.ttf"
+    ))
+    .expect("bundled Chinese font should be valid");
+    let scale = PxScale::from(96.0);
+    let glyph_id = font.glyph_id('背');
+    let unpositioned = glyph_id.with_scale_and_position(scale, point(0.0, 0.0));
+    let bounds = font
+        .outline_glyph(unpositioned)
+        .expect("bundled Chinese font should contain 背")
+        .px_bounds();
+    let position = point(
+        (SIZE as f32 - bounds.width()) * 0.5 - bounds.min.x,
+        (SIZE as f32 - bounds.height()) * 0.5 - bounds.min.y,
+    );
+    let glyph = glyph_id.with_scale_and_position(scale, position);
+    font.outline_glyph(glyph)
+        .expect("bundled Chinese font should contain 背")
+        .draw(|x, y, coverage| {
+            if x >= SIZE || y >= SIZE {
+                return;
+            }
+            let index = ((y * SIZE + x) * 4) as usize;
+            for channel in 0..3 {
+                pixels[index + channel] = (BACKGROUND[channel] as f32 * (1.0 - coverage)
+                    + u8::MAX as f32 * coverage)
+                    .round() as u8;
+            }
+        });
+
+    let mut image = Image::new(
+        Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+    image
+}
 
 fn voxel_player_standee_material(texture: Handle<Image>) -> StandardMaterial {
     StandardMaterial {
@@ -6074,8 +6157,6 @@ fn control_first_person_player(
                 transform.translation = first_person_player_position(camera_transform.translation);
             }
             velocity.0 = Vec3::ZERO;
-            editor.first_person_enabled = true;
-            editor.first_person_was_enabled = true;
             editor.first_person_flying = false;
             editor.creative_inventory_open = false;
             possession.turn_start_position = Some(transform.translation);
@@ -6085,7 +6166,6 @@ fn control_first_person_player(
         } else {
             possession.turn_start_position = None;
             possession.last_player_position = None;
-            editor.first_person_enabled = false;
             editor.first_person_flying = false;
         }
     }
@@ -6101,8 +6181,6 @@ fn control_first_person_player(
             possession.reset_turn_overrides();
         }
         possession.movement_limit = movement_limit;
-        editor.first_person_enabled = true;
-        editor.first_person_flying = false;
         editor.creative_inventory_open = false;
         if possession.reset_movement_requested {
             if let Some(turn_start) = possession.turn_start_position {
@@ -6291,6 +6369,7 @@ fn possession_final_movement(
 
 fn sync_possessed_player_camera(
     time: Res<Time>,
+    editor: Res<VoxelEditorState>,
     mut possession: ResMut<VoxelPossessionState>,
     viewport_camera: Query<
         &Transform,
@@ -6311,7 +6390,12 @@ fn sync_possessed_player_camera(
     >,
     mut store: ResMut<Persistent<VoxelPlayerCameraStore>>,
 ) {
-    let Some(user_id) = possession.active_user_id else { return };
+    let Some(user_id) = possession
+        .active_user_id
+        .filter(|_| editor.first_person_enabled)
+    else {
+        return;
+    };
     let Ok(viewport_transform) = viewport_camera.single() else { return };
     let Some((_, mut capture_transform)) = capture_cameras
         .iter_mut()
@@ -6871,6 +6955,26 @@ mod tests {
 
         assert_eq!(size.y, VOXEL_SIZE * 2.0);
         assert_eq!(size.x, VOXEL_SIZE);
+    }
+
+    #[test]
+    fn player_standee_back_label_faces_away_from_the_portrait() {
+        let transform = voxel_player_standee_back_label_transform();
+
+        assert!(transform.translation.z < 0.0);
+        assert!((transform.rotation * Vec3::Z).abs_diff_eq(Vec3::NEG_Z, 0.000_01));
+    }
+
+    #[test]
+    fn player_standee_back_label_texture_contains_the_chinese_glyph() {
+        let image = voxel_player_standee_back_label_image();
+        let pixels = image.data.as_ref().expect("back label keeps CPU texels");
+
+        assert_eq!(image.width(), 128);
+        assert_eq!(image.height(), 128);
+        assert!(pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] > 200 && pixel[1] > 100 && pixel[2] > 100));
     }
 
     #[test]
@@ -8453,6 +8557,37 @@ mod tests {
 
         assert!(!possession.movement_limit_bypassed);
         assert!(!possession.movement_bypass_confirmation_pending);
+    }
+
+    #[test]
+    fn possession_keeps_the_dm_free_camera_when_first_person_is_off() {
+        let player_view = Transform::from_xyz(3.0, 4.0, 5.0);
+        let mut possession = VoxelPossessionState::default();
+        possession.possess(42);
+
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(VoxelEditorState::default())
+            .insert_resource(possession)
+            .add_systems(Update, control_first_person_player);
+        app.world_mut().spawn((
+            VoxelPlayerCaptureCamera { user_id: 42 },
+            player_view,
+        ));
+        app.world_mut().spawn((
+            VoxelFirstPersonPlayer,
+            ShapeHits::default(),
+            Transform::default(),
+            LinearVelocity::ZERO,
+            ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
+        ));
+
+        app.update();
+
+        let editor = app.world().resource::<VoxelEditorState>();
+        assert!(!editor.first_person_enabled);
+        assert!(!editor.first_person_flying);
     }
 
     #[test]

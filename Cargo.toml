@@ -42,6 +42,7 @@ bevy-persistent = { version = "0.11.0", features = [
 ] } # Persistent values (for saving)
 
 # Core
+ab_glyph = "0.2.32"
 rand = { version = "0.10.1" }
 serde = { version = "1.0.228", features = ["derive"] }
 

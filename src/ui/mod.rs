@@ -13264,21 +13264,26 @@ pub fn ui_system(
 
             let mut inventory_rect = None;
             if voxel_editor.creative_inventory_open {
+                const CREATIVE_INVENTORY_WIDTH: f32 = 440.0;
                 let mut picked_item = None;
                 let mut delete_selected = false;
                 let mut window_open = true;
                 let inventory_window = egui::Window::new("创造模式物品栏")
                     .id(egui::Id::new(
-                        "voxel_creative_inventory",
+                        "voxel_creative_inventory_v2",
                     ))
                     .anchor(
                         egui::Align2::CENTER_CENTER,
                         egui::Vec2::ZERO,
                     )
                     .collapsible(false)
+                    .default_width(CREATIVE_INVENTORY_WIDTH)
+                    .min_width(CREATIVE_INVENTORY_WIDTH)
+                    .max_width(CREATIVE_INVENTORY_WIDTH)
                     .resizable(false)
                     .open(&mut window_open)
                     .show(ctx, |ui| {
+                        ui.set_max_width(CREATIVE_INVENTORY_WIDTH);
                         ui.label("浏览全部物品 · 拖入快捷栏 · 拖出物品栏删除 · 创造模式无限数量");
                         ui.horizontal(|ui| {
                             ui.label(format!(
@@ -13295,8 +13300,9 @@ pub fn ui_system(
                         });
                         ui.add_space(6.0);
                         ui.strong("建筑方块");
-                        egui::Grid::new("voxel_creative_inventory_grid")
-                            .num_columns(5)
+                        egui::Grid::new("voxel_creative_inventory_grid_v2")
+                            .min_col_width(56.0)
+                            .max_col_width(72.0)
                             .spacing(egui::vec2(10.0, 10.0))
                             .show(ui, |ui| {
                                 for (index, (material, name, _color)) in
@@ -13328,8 +13334,9 @@ pub fn ui_system(
                             });
                         ui.separator();
                         ui.strong("灯光与工具");
-                        egui::Grid::new("voxel_creative_light_inventory_grid")
-                            .num_columns(3)
+                        egui::Grid::new("voxel_creative_light_inventory_grid_v2")
+                            .min_col_width(56.0)
+                            .max_col_width(72.0)
                             .spacing(egui::vec2(10.0, 10.0))
                             .show(ui, |ui| {
                                 for (index, tool) in VoxelLightTool::ALL.into_iter().enumerate() {
@@ -13371,8 +13378,9 @@ pub fn ui_system(
                             });
                         ui.separator();
                         ui.strong("编辑工具");
-                        egui::Grid::new("voxel_creative_mode_inventory_grid")
-                            .num_columns(4)
+                        egui::Grid::new("voxel_creative_mode_inventory_grid_v2")
+                            .min_col_width(48.0)
+                            .max_col_width(72.0)
                             .spacing(egui::vec2(10.0, 10.0))
                             .show(ui, |ui| {
                                 let possession_tool = VoxelCreativeItem::PlayerPossessionTool;
@@ -13440,7 +13448,7 @@ pub fn ui_system(
                                         }
                                         ui.small(name);
                                     });
-                                    if (index + 2) % 4 == 0 {
+                                    if (index + 3) % 4 == 0 {
                                         ui.end_row();
                                     }
                                 }
