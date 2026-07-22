@@ -1,8 +1,15 @@
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::{
-    collections::HashMap,
+    collections::{
+        hash_map::DefaultHasher,
+        HashMap,
+    },
     fs,
+    hash::{
+        Hash,
+        Hasher,
+    },
     io::{
         BufWriter,
         Write,
@@ -41,6 +48,7 @@ use bevy_egui::{
 use bevy_persistent::Persistent;
 use crossbeam_channel::{
     bounded,
+    unbounded,
     Receiver,
     Sender,
 };
@@ -321,7 +329,10 @@ struct VideoEncodingJob {
 #[derive(Resource, Default)]
 struct PreviewSpeechController {
     active_cue: Option<(u64, usize)>,
+    prepared_signature: Option<u64>,
+    onnx_cache: HashMap<(u64, usize), (Vec<u8>, f32)>,
     onnx_worker: Option<OnnxPreviewWorker>,
+    onnx_failed: bool,
     audio_entity: Option<Entity>,
     #[cfg(windows)]
     windows_worker: Option<PreviewSpeechWorker>,
@@ -333,6 +344,7 @@ struct OnnxPreviewWorker {
 }
 
 struct OnnxPreviewRequest {
+    signature: u64,
     cue: (u64, usize),
     text: String,
     speaker_id: i32,
@@ -341,6 +353,7 @@ struct OnnxPreviewRequest {
 }
 
 struct OnnxPreviewResult {
+    signature: u64,
     cue: (u64, usize),
     wav: Result<Vec<u8>, String>,
     volume: f32,
@@ -458,7 +471,11 @@ fn record_replay(
     }
 }
 
-fn advance_replay(time: Res<Time>, mut studio: ResMut<ReplayStudio>) {
+fn advance_replay(
+    time: Res<Time>,
+    speech: Res<PreviewSpeechController>,
+    mut studio: ResMut<ReplayStudio>,
+) {
     if studio.mode != ReplayMode::Playing {
         return;
     }
@@ -467,7 +484,35 @@ fn advance_replay(time: Res<Time>, mut studio: ResMut<ReplayStudio>) {
         return;
     };
     let delta_ms = (time.delta_secs() * studio.playback_speed * 1_000.0).round() as u64;
-    studio.playback_ms = studio.playback_ms.saturating_add(delta_ms).min(duration_ms);
+    let proposed_ms = studio.playback_ms.saturating_add(delta_ms).min(duration_ms);
+    if studio.speech_enabled && onnx_tts_is_available() && !speech.onnx_failed {
+        if let Some(replay) = studio.replay.as_ref() {
+            let current = active_dialogue_index(&replay.dialogue, studio.playback_ms);
+            let proposed = active_dialogue_index(&replay.dialogue, proposed_ms);
+            if proposed != current {
+                if let Some(index) = proposed {
+                    let signature = replay_voice_signature(replay, studio.speech_volume);
+                    if !speech.onnx_cue_ready(
+                        signature,
+                        (replay.created_at_unix_ms, index),
+                    ) {
+                        return;
+                    }
+                }
+            } else if studio.playback_ms == 0 {
+                if let Some(index) = proposed {
+                    let signature = replay_voice_signature(replay, studio.speech_volume);
+                    if !speech.onnx_cue_ready(
+                        signature,
+                        (replay.created_at_unix_ms, index),
+                    ) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    studio.playback_ms = proposed_ms;
     if studio.playback_ms >= duration_ms {
         studio.mode = ReplayMode::Paused;
     }
@@ -479,6 +524,14 @@ fn preview_replay_speech(
     mut speech: ResMut<PreviewSpeechController>,
     mut audio_sources: ResMut<Assets<AudioSource>>,
 ) {
+    if studio.speech_enabled && onnx_tts_is_available() {
+        if let Some(replay) = studio.replay.as_ref() {
+            if let Err(err) = speech.prepare_onnx_replay(replay, studio.speech_volume) {
+                speech.onnx_failed = true;
+                eprintln!("failed to prepare ONNX preview speech: {err}");
+            }
+        }
+    }
     let active = (studio.mode == ReplayMode::Playing && studio.speech_enabled)
         .then(|| {
             studio.replay.as_ref().and_then(|replay| {
@@ -493,43 +546,38 @@ fn preview_replay_speech(
         })
         .flatten();
     let cue = active.map(|(replay_id, index, _)| (replay_id, index));
-    while let Some(result) = speech
+    let results = speech
         .onnx_worker
         .as_ref()
-        .and_then(|worker| worker.results.try_recv().ok())
-    {
-        if Some(result.cue) != cue {
+        .map(|worker| worker.results.try_iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut newly_ready_current = false;
+    for result in results {
+        if Some(result.signature) != speech.prepared_signature {
             continue;
         }
         match result.wav {
             Ok(wav) => {
-                let source = audio_sources.add(AudioSource {
-                    bytes: Arc::from(wav),
-                });
-                let entity = commands
-                    .spawn((
-                        AudioPlayer::new(source),
-                        PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(
-                            result.volume,
-                        )),
-                    ))
-                    .id();
-                speech.audio_entity = Some(entity);
+                newly_ready_current |= Some(result.cue) == cue;
+                speech.onnx_cache.insert(result.cue, (wav, result.volume));
             },
             Err(err) => eprintln!("failed to synthesize ONNX preview speech: {err}"),
         }
     }
-    if speech.active_cue == cue {
+    let cue_changed = speech.active_cue != cue;
+    if !cue_changed && !newly_ready_current {
         return;
     }
 
-    if let Some(entity) = speech.audio_entity.take() {
-        commands.entity(entity).try_despawn();
+    if cue_changed {
+        if let Some(entity) = speech.audio_entity.take() {
+            commands.entity(entity).try_despawn();
+        }
+        if let Err(err) = speech.stop_windows() {
+            eprintln!("failed to stop replay preview speech: {err}");
+        }
+        speech.active_cue = cue;
     }
-    if let Err(err) = speech.stop_windows() {
-        eprintln!("failed to stop replay preview speech: {err}");
-    }
-    speech.active_cue = cue;
     let Some((_, _, line)) = active else { return };
     let settings = studio
         .replay
@@ -537,48 +585,85 @@ fn preview_replay_speech(
         .and_then(|replay| replay.speaker_voice_settings.get(&line.sender_id))
         .cloned()
         .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
-    if let Err(err) = speech.speak(
-        cue.expect("active dialogue has a cue"),
-        line,
-        studio.speech_volume,
-        &settings,
-    ) {
-        eprintln!("failed to play replay preview speech: {err}");
+    let active_cue = cue.expect("active dialogue has a cue");
+    if let Some((wav, volume)) = speech.onnx_cache.get(&active_cue).cloned() {
+        let source = audio_sources.add(AudioSource {
+            bytes: Arc::from(wav),
+        });
+        speech.audio_entity = Some(
+            commands
+                .spawn((
+                    AudioPlayer::new(source),
+                    PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(volume)),
+                ))
+                .id(),
+        );
+    } else if speech.onnx_failed || !onnx_tts_is_available() {
+        if let Err(err) = speech.speak_windows(line, studio.speech_volume, &settings) {
+            eprintln!("failed to play replay preview speech: {err}");
+        }
     }
 }
 
 impl PreviewSpeechController {
-    fn speak(
+    fn prepare_onnx_replay(
         &mut self,
-        cue: (u64, usize),
-        line: &ReplayDialogue,
+        replay: &ReplayFile,
         global_volume: f32,
-        settings: &SpeakerVoiceSettings,
     ) -> Result<(), String> {
-        if onnx_tts_is_available() {
-            if self.onnx_worker.is_none() {
-                self.onnx_worker = Some(start_onnx_preview_worker()?);
-            }
+        let signature = replay_voice_signature(replay, global_volume);
+        if self.prepared_signature == Some(signature) {
+            return Ok(());
+        }
+        if self.prepared_signature.is_some() {
+            self.onnx_worker = None;
+        }
+        if self.onnx_worker.is_none() {
+            self.onnx_worker = Some(start_onnx_preview_worker()?);
+        }
+        self.prepared_signature = Some(signature);
+        self.onnx_cache.clear();
+        self.active_cue = None;
+        let worker = self
+            .onnx_worker
+            .as_ref()
+            .expect("ONNX worker was initialized");
+        for (index, line) in replay.dialogue.iter().enumerate() {
+            let settings = replay
+                .speaker_voice_settings
+                .get(&line.sender_id)
+                .cloned()
+                .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
             let rate = fitted_speech_rate(
                 settings.speech_rate,
                 &line.text,
                 line.duration_ms,
             );
-            let request = OnnxPreviewRequest {
-                cue,
-                text: line.text.clone(),
-                speaker_id: onnx_speaker_id(settings, line.sender_id),
-                speed: onnx_speed(rate),
-                volume: (global_volume * settings.volume).clamp(0.0, 1.0),
-            };
-            return self
-                .onnx_worker
-                .as_ref()
-                .expect("ONNX worker was initialized")
+            worker
                 .requests
-                .send(request)
-                .map_err(|err| format!("ONNX preview worker stopped: {err}"));
+                .send(OnnxPreviewRequest {
+                    signature,
+                    cue: (replay.created_at_unix_ms, index),
+                    text: line.text.clone(),
+                    speaker_id: onnx_speaker_id(&settings, line.sender_id),
+                    speed: onnx_speed(rate),
+                    volume: (global_volume * settings.volume).clamp(0.0, 1.0),
+                })
+                .map_err(|err| format!("ONNX preview worker stopped: {err}"))?;
         }
+        Ok(())
+    }
+
+    fn onnx_cue_ready(&self, signature: u64, cue: (u64, usize)) -> bool {
+        self.prepared_signature == Some(signature) && self.onnx_cache.contains_key(&cue)
+    }
+
+    fn speak_windows(
+        &mut self,
+        line: &ReplayDialogue,
+        global_volume: f32,
+        settings: &SpeakerVoiceSettings,
+    ) -> Result<(), String> {
         self.send(PreviewSpeechRequest::Speak {
             text: &line.text,
             language: dialogue_language(&line.text),
@@ -748,8 +833,8 @@ fn create_onnx_tts() -> Result<sherpa_onnx::OfflineTts, String> {
 
 fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
     let tts = create_onnx_tts()?;
-    let (request_tx, request_rx) = bounded::<OnnxPreviewRequest>(4);
-    let (result_tx, result_rx) = bounded::<OnnxPreviewResult>(4);
+    let (request_tx, request_rx) = unbounded::<OnnxPreviewRequest>();
+    let (result_tx, result_rx) = unbounded::<OnnxPreviewResult>();
     thread::Builder::new()
         .name("replay-onnx-preview".to_owned())
         .spawn(move || {
@@ -762,6 +847,7 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                 );
                 if result_tx
                     .send(OnnxPreviewResult {
+                        signature: request.signature,
                         cue: request.cue,
                         wav,
                         volume: request.volume,
@@ -2414,6 +2500,28 @@ fn onnx_speaker_id(settings: &SpeakerVoiceSettings, sender_id: u64) -> i32 {
 
 fn default_onnx_speaker_id(sender_id: u64) -> i32 {
     ONNX_TTS_FIRST_CHINESE_SPEAKER + (sender_id % ONNX_TTS_CHINESE_SPEAKER_COUNT as u64) as i32
+}
+
+fn replay_voice_signature(replay: &ReplayFile, global_volume: f32) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    replay.created_at_unix_ms.hash(&mut hasher);
+    global_volume.to_bits().hash(&mut hasher);
+    for line in &replay.dialogue {
+        line.sender_id.hash(&mut hasher);
+        line.duration_ms.hash(&mut hasher);
+        line.text.hash(&mut hasher);
+    }
+    let mut settings = replay.speaker_voice_settings.iter().collect::<Vec<_>>();
+    settings.sort_by_key(|(sender_id, _)| **sender_id);
+    for (sender_id, voice) in settings {
+        sender_id.hash(&mut hasher);
+        voice.voice_name.hash(&mut hasher);
+        voice.onnx_speaker_id.hash(&mut hasher);
+        voice.pitch.hash(&mut hasher);
+        voice.speech_rate.hash(&mut hasher);
+        voice.volume.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn onnx_speed(relative_rate: i32) -> f32 { (1.0 + relative_rate as f32 / 200.0).clamp(0.85, 1.45) }
