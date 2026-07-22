@@ -69,6 +69,9 @@ use crate::{
         SUPPORT_TALENT_POOL,
     },
     rule_engine::{
+        apply_skill_type_damage_default,
+        parse_rule_with_named_args,
+        Action,
         BuffEffect,
         BuffField,
         BuffKind,
@@ -76,6 +79,7 @@ use crate::{
         BuffTickAction,
         BuffValue,
         DamageType,
+        ValueExpr,
     },
     scene::{
         SceneCaptureRequest,
@@ -969,6 +973,10 @@ pub struct PlayerCharacter {
     pub buff_base_stats: Option<CharacterBuffBaseStats>,
     #[serde(default)]
     pub inventory: CharacterInventory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_weave_analysis_turn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_weave_analysis_campaign_id: Option<String>,
 }
 
 impl Default for PlayerCharacter {
@@ -1008,6 +1016,8 @@ impl Default for PlayerCharacter {
             active_buffs: Vec::new(),
             buff_base_stats: None,
             inventory: CharacterInventory::default(),
+            last_weave_analysis_turn: None,
+            last_weave_analysis_campaign_id: None,
         }
     }
 }
@@ -1250,6 +1260,10 @@ pub struct TrpgBasicConfig {
     pub agi_speed: f32,
     #[serde(default = "default_dex_speed")]
     pub dex_speed: f32,
+    #[serde(skip)]
+    pub weave_magic_damage_bonus: f32,
+    #[serde(skip)]
+    pub weave_mp_regen_bonus: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1292,8 +1306,75 @@ impl Default for TrpgBasicConfig {
             str_speed: default_str_speed(),
             agi_speed: default_agi_speed(),
             dex_speed: default_dex_speed(),
+            weave_magic_damage_bonus: 0.0,
+            weave_mp_regen_bonus: 0.0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeaveState {
+    pub magic_damage_bonus_percent: u8,
+    pub mp_regen_bonus_percent: u8,
+    pub strongest_direction: &'static str,
+}
+
+pub fn campaign_weave_state(campaign_id: &str) -> WeaveState {
+    let mut seed = 0xcbf29ce484222325_u64;
+    for byte in campaign_id.trim().as_bytes() {
+        seed ^= u64::from(*byte);
+        seed = seed.wrapping_mul(0x100000001b3);
+    }
+    let mut random_bits = splitmix64(seed);
+    let magic_damage_bonus_percent = (0..5)
+        .map(|_| {
+            let success = random_bits & 1;
+            random_bits >>= 1;
+            success as u8
+        })
+        .sum();
+    let mp_regen_bonus_percent = (0..10)
+        .map(|_| {
+            let success = random_bits & 1;
+            random_bits >>= 1;
+            success as u8
+        })
+        .sum();
+    const DIRECTIONS: [&str; 8] = [
+        "北方",
+        "东北方",
+        "东方",
+        "东南方",
+        "南方",
+        "西南方",
+        "西方",
+        "西北方",
+    ];
+    WeaveState {
+        magic_damage_bonus_percent,
+        mp_regen_bonus_percent,
+        strongest_direction: DIRECTIONS[((random_bits >> 15) as usize) % DIRECTIONS.len()],
+    }
+}
+
+pub fn trpg_config_with_weave(
+    mut config: TrpgBasicConfig,
+    campaign_id: &str,
+    int_: i32,
+) -> TrpgBasicConfig {
+    if int_ >= 10 {
+        let weave = campaign_weave_state(campaign_id);
+        config.weave_magic_damage_bonus = f32::from(weave.magic_damage_bonus_percent) / 100.0;
+        config.weave_mp_regen_bonus = f32::from(weave.mp_regen_bonus_percent) / 100.0;
+    }
+    config
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
 }
 
 fn default_base_max_hp() -> f32 { 5.0 }
@@ -3795,9 +3876,20 @@ impl NapcatMessageManager {
     }
 
     pub fn character_stat_config_for_target(&self, target_id: &str) -> TrpgBasicConfig {
-        self.group_for_player_target(target_id)
-            .map(|group| group.basic_config)
-            .unwrap_or_default()
+        let Some(group) = self.group_for_player_target(target_id) else {
+            return TrpgBasicConfig::default();
+        };
+        let int_ = self
+            .player_characters
+            .get(target_id)
+            .map(character_total_status)
+            .map(|status| status.int_)
+            .unwrap_or_default();
+        trpg_config_with_weave(
+            group.basic_config,
+            &group.campaign_id,
+            int_,
+        )
     }
 
     pub fn active_campaign_id(&self) -> Option<String> {
@@ -6097,6 +6189,11 @@ fn handle_private_player_command(
     if command.eq_ignore_ascii_case("help") || command == "帮助" {
         return Some(format_private_help());
     }
+    if let Some(query) = private_weave_query(command) {
+        return Some(format_private_weave(
+            manager, target_id, query,
+        ));
+    }
     match command {
         "属性说明" => Some(format_private_attribute_help()),
         "抽取天赋" => Some(draw_character_talent(
@@ -6139,6 +6236,7 @@ fn format_private_help() -> String {
         "【.兑换】开始创建角色",
         "【.状态】查看角色当前状态",
         "【.属性说明】查看八项属性的完整说明",
+        "【.魔网】或【.weave】感知魔网；INT 20时可用【.魔网 名称】分析已感知的buff或技能",
         "【.已兑换】查看技能与兑换内容",
         "【.冷却】查看技能冷却",
         "【.频道人员】查看当前可见频道成员",
@@ -6159,12 +6257,315 @@ fn format_private_attribute_help() -> String {
         "敏捷（AGI）：每点敏捷提供1米/秒移动速度和2%攻击速度。100%攻速可一轮行动两次；不足100%的攻速会提供基于力量的基础物理攻击百分比提升。",
         "灵巧（DEX）：每点灵巧提供0.5米/秒移动速度、3远程物理攻击加值和1近战物理攻击加值。",
         "体质（VIT）：每点体质提供3点生命值；脱战后且非重伤时提供1点/轮生命回复；减少1%因受伤状态遭受的属性惩罚。",
-        "智力（INT）：每点智力提供5点魔法值、1%魔法额外消耗、2%法术伤害和1%治疗加成。达到10点可感知周围环境的魔力；达到15点可模糊感知周围存在的法术类buff或正在释放的法术类技能，不受视野阻碍限制。",
+        "智力（INT）：每点智力提供5点魔法值、1%魔法额外消耗、2%法术伤害和1%治疗加成。达到10点可感知周围环境的魔力并接入魔网；达到15点可模糊感知周围存在的法术类buff或正在释放的法术类技能，不受视野阻碍限制；达到20点可消耗一个观察小动作，分析已感知buff或技能的伤害、治疗数值与持续时间。",
         "智慧（WIS）：每点智慧提供2.5点魔法值、脱战后1点/轮魔法回复、更好的精神力引导与控制，以及2%治疗加成。",
         "知识（K）：每点知识提供额外线索、情报和操作部分设备的能力。达到10点可完整认识自身，得知自己的具体生命值和自己对目标造成的具体伤害；达到20点可消耗一个观察小动作，分析buff或技能的伤害/治疗数值与持续时间。",
         "魅力（CHA）：每点魅力提供额外的NPC交流好感、0.05召唤物上限和2%召唤物伤害加成。",
     ]
     .join("\n")
+}
+
+fn private_weave_query(command: &str) -> Option<&str> {
+    let command = command.trim();
+    if command == "魔网" {
+        return Some("");
+    }
+    if let Some(query) = command.strip_prefix("魔网") {
+        return query.starts_with(char::is_whitespace).then(|| query.trim());
+    }
+    if command.eq_ignore_ascii_case("weave") {
+        return Some("");
+    }
+    command
+        .get(..5)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("weave"))
+        .and_then(|_| command.get(5..))
+        .filter(|query| query.starts_with(char::is_whitespace))
+        .map(str::trim)
+}
+
+fn format_private_weave(
+    manager: &mut NapcatMessageManager,
+    target_id: &str,
+    query: &str,
+) -> String {
+    let Some(character) = manager.player_characters.get(target_id) else {
+        return "你还没有角色卡。输入【.兑换】开始建卡。".to_owned();
+    };
+    if !character.inited {
+        return "角色卡尚未完成，暂时无法感知魔网。".to_owned();
+    }
+    let int_ = character_total_status(character).int_;
+    if int_ < 10 {
+        return "你的智力尚未达到10点，无法感知魔网。".to_owned();
+    }
+    let Some(group) = manager.group_for_player_target(target_id) else {
+        return "你当前不在TRPG组中，无法定位魔网。".to_owned();
+    };
+    let campaign_id = group.campaign_id.clone();
+    let weave = campaign_weave_state(&campaign_id);
+    let mut lines = vec![format!(
+        "目前魔网法力浓度: {}%, 最强魔网节点方向：{}。",
+        weave.magic_damage_bonus_percent, weave.strongest_direction
+    )];
+    lines.push(format!(
+        "魔网加成：法术伤害+{}%，魔法回复+{}%。",
+        weave.magic_damage_bonus_percent, weave.mp_regen_bonus_percent
+    ));
+
+    if int_ >= 15 {
+        let sensed = sensed_magic_signatures(manager, target_id);
+        if sensed.is_empty() {
+            lines.push("魔力感知：未感知到法术类buff或本轮正在释放的法术。".to_owned());
+        } else {
+            lines.push(format!(
+                "魔力感知：{}。",
+                sensed.join("；")
+            ));
+        }
+    }
+
+    if query.is_empty() {
+        if int_ >= 20 {
+            lines.push("可输入【.魔网 buff或技能名称】消耗本轮的观察小动作进行分析。".to_owned());
+        }
+        return lines.join("\n");
+    }
+    if int_ < 20 {
+        lines.push("你的智力尚未达到20点，无法分析魔力结构。".to_owned());
+        return lines.join("\n");
+    }
+
+    let current_turn = current_player_cooldown_turn(manager, target_id);
+    if character.last_weave_analysis_turn == Some(current_turn)
+        && character.last_weave_analysis_campaign_id.as_deref() == Some(campaign_id.as_str())
+    {
+        lines.push("你本轮已经消耗过观察小动作分析魔网。".to_owned());
+        return lines.join("\n");
+    }
+    let Some(analysis) = analyze_sensed_magic(manager, target_id, query) else {
+        lines.push(format!(
+            "没有找到可分析的已感知魔力结构：{query}。"
+        ));
+        return lines.join("\n");
+    };
+    if let Some(character) = manager.player_characters.get_mut(target_id) {
+        character.last_weave_analysis_turn = Some(current_turn);
+        character.last_weave_analysis_campaign_id = Some(campaign_id);
+    }
+    lines.push(format!("魔力分析：{analysis}"));
+    lines.join("\n")
+}
+
+fn sensed_magic_signatures(manager: &NapcatMessageManager, target_id: &str) -> Vec<String> {
+    let Some(group) = manager.group_for_player_target(target_id) else {
+        return Vec::new();
+    };
+    let Ok(player_id) = target_id.parse::<u64>() else {
+        return Vec::new();
+    };
+    let access = group.player_access(player_id);
+    let mut sensed = Vec::new();
+    for member_id in group
+        .players
+        .iter()
+        .filter(|member_id| visible_channel_member(group, &access, member_id))
+    {
+        let Some(character) = manager.player_characters.get(member_id) else {
+            continue;
+        };
+        let owner = character_display_name(character, member_id);
+        for buff in character
+            .active_buffs
+            .iter()
+            .filter(|buff| buff.kind == BuffKind::Magic)
+        {
+            sensed.push(format!("{owner}身上的{}", buff.name));
+        }
+        let turn = current_player_cooldown_turn(manager, member_id);
+        for (index, metadata) in character.skill_metadata.iter().enumerate() {
+            if metadata.is_approved()
+                && moonberry_skill_type_is_spell(metadata.skill_type.as_deref())
+                && character.skill_last_cast_turns.get(&index.to_string()) == Some(&turn)
+            {
+                sensed.push(format!(
+                    "{owner}正在释放{}",
+                    character_skill_display_name(character, index)
+                ));
+            }
+        }
+    }
+    sensed.sort();
+    sensed.dedup();
+    sensed
+}
+
+fn analyze_sensed_magic(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    query: &str,
+) -> Option<String> {
+    let group = manager.group_for_player_target(target_id)?;
+    let access = group.player_access(target_id.parse().ok()?);
+    for member_id in group
+        .players
+        .iter()
+        .filter(|member_id| visible_channel_member(group, &access, member_id))
+    {
+        let Some(character) = manager.player_characters.get(member_id) else {
+            continue;
+        };
+        let owner = character_display_name(character, member_id);
+        if let Some(buff) = character
+            .active_buffs
+            .iter()
+            .find(|buff| buff.kind == BuffKind::Magic && magic_name_matches(&buff.name, query))
+        {
+            return Some(format_magic_buff_analysis(&owner, buff));
+        }
+        let current_turn = current_player_cooldown_turn(manager, member_id);
+        for (index, metadata) in character.skill_metadata.iter().enumerate() {
+            let own_skill = member_id == target_id;
+            let being_cast =
+                character.skill_last_cast_turns.get(&index.to_string()) == Some(&current_turn);
+            let name = character_skill_display_name(character, index);
+            if metadata.is_approved()
+                && moonberry_skill_type_is_spell(metadata.skill_type.as_deref())
+                && (own_skill || being_cast)
+                && magic_name_matches(&name, query)
+            {
+                return Some(format_magic_skill_analysis(
+                    &owner, character, index, metadata,
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn magic_name_matches(name: &str, query: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    let query = query.trim().to_lowercase();
+    !query.is_empty() && (name == query || name.contains(&query))
+}
+
+fn format_magic_buff_analysis(owner: &str, buff: &BuffSpec) -> String {
+    let duration = if buff.turns_remaining <= 0 {
+        "永久".to_owned()
+    } else {
+        format!("剩余{}轮", buff.turns_remaining)
+    };
+    let effects = buff
+        .tick_actions
+        .iter()
+        .map(|action| match action {
+            BuffTickAction::Damage { amount, .. } => {
+                format!(
+                    "每轮伤害{}",
+                    format_character_number(*amount)
+                )
+            },
+            BuffTickAction::FixedDamage { amount, .. } => {
+                format!(
+                    "每轮固定伤害{}",
+                    format_character_number(*amount)
+                )
+            },
+            BuffTickAction::Heal { amount } => {
+                format!(
+                    "每轮治疗{}",
+                    format_character_number(*amount)
+                )
+            },
+        })
+        .collect::<Vec<_>>();
+    let effects = if effects.is_empty() {
+        "无直接伤害或治疗".to_owned()
+    } else {
+        effects.join("、")
+    };
+    format!(
+        "{owner}身上的{}：{effects}，持续时间：{duration}",
+        buff.name
+    )
+}
+
+fn format_magic_skill_analysis(
+    owner: &str,
+    character: &PlayerCharacter,
+    index: usize,
+    metadata: &CharacterSkillMetadata,
+) -> String {
+    let name = character_skill_display_name(character, index);
+    let note = character
+        .skill_notes
+        .get(index)
+        .map(String::as_str)
+        .unwrap_or_default();
+    let args = skill_rule_args(&metadata.args);
+    let action_details = parse_rule_with_named_args(
+        note,
+        &args.numeric_values,
+        &args.text_values,
+    )
+    .ok()
+    .map(|ast| apply_skill_type_damage_default(ast, metadata.skill_type.as_deref()))
+    .map(|ast| {
+        ast.actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Damage {
+                    amount: ValueExpr::Number(amount),
+                    ..
+                } => Some(format!(
+                    "伤害{}",
+                    format_character_number(*amount)
+                )),
+                Action::Heal {
+                    amount: ValueExpr::Number(amount),
+                    ..
+                } => Some(format!(
+                    "治疗{}",
+                    format_character_number(*amount)
+                )),
+                Action::GrantBuff { buff, .. } => Some(format!(
+                    "buff {}轮",
+                    if buff.turns_remaining <= 0 {
+                        "永久".to_owned()
+                    } else {
+                        buff.turns_remaining.to_string()
+                    }
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    let action_details = if action_details.is_empty() {
+        "未解析出直接伤害、治疗或持续时间".to_owned()
+    } else {
+        action_details.join("、")
+    };
+    let base_cost = character
+        .skill_mp_costs
+        .get(index)
+        .copied()
+        .unwrap_or_default();
+    let cost = character_effective_skill_mp_cost(
+        character,
+        base_cost,
+        metadata.skill_type.as_deref(),
+    );
+    let cooldown = character
+        .skill_cooldown_turns
+        .get(index)
+        .copied()
+        .unwrap_or_default();
+    format!(
+        "{owner}的{name}：{action_details}，MP消耗{}，冷却{}轮",
+        format_character_number(cost),
+        cooldown
+    )
 }
 
 fn draw_character_talent(
@@ -6571,11 +6972,6 @@ fn format_private_character_skills(manager: &NapcatMessageManager, target_id: &s
             .get(index)
             .map(|note| note.trim())
             .unwrap_or_default();
-        let mp_cost = character
-            .skill_mp_costs
-            .get(index)
-            .copied()
-            .unwrap_or_default();
         let cooldown = character
             .skill_cooldown_turns
             .get(index)
@@ -6586,6 +6982,15 @@ fn format_private_character_skills(manager: &NapcatMessageManager, target_id: &s
             .get(index)
             .cloned()
             .unwrap_or_default();
+        let mp_cost = character_effective_skill_mp_cost(
+            character,
+            character
+                .skill_mp_costs
+                .get(index)
+                .copied()
+                .unwrap_or_default(),
+            metadata.skill_type.as_deref(),
+        );
         let mut details = Vec::new();
         if !metadata.pc_approved {
             details.push("PC待确认".to_owned());
@@ -7077,7 +7482,8 @@ pub fn update_character_from_status_with_config(
     character.hp_regen = total.vit.max(0) as f32 * config.vit_hp_reg;
     character.max_mp = total.int_ as f32 * config.int_max_mp + total.wis as f32 * config.wis_max_mp;
     character.mp = character.max_mp.max(0.0);
-    character.mp_regen = total.wis.max(0) as f32 * config.wis_mp_reg;
+    character.mp_regen =
+        total.wis.max(0) as f32 * config.wis_mp_reg * (1.0 + config.weave_mp_regen_bonus.max(0.0));
     character.speed = config.basic_speed
         + total.str_.max(0) as f32 * config.str_speed
         + total.agi.max(0) as f32 * config.agi_speed
@@ -7445,6 +7851,19 @@ pub fn moonberry_skill_type_is_spell(skill_type: Option<&str>) -> bool {
     matches!(skill_type.map(str::trim), Some("法术"))
 }
 
+pub fn character_effective_skill_mp_cost(
+    character: &PlayerCharacter,
+    base_cost: f32,
+    skill_type: Option<&str>,
+) -> f32 {
+    let base_cost = base_cost.max(0.0);
+    if !moonberry_skill_type_is_spell(skill_type) {
+        return base_cost;
+    }
+    let int_ = character_total_status(character).int_.max(0) as f32;
+    base_cost * (1.0 + int_ * 0.01)
+}
+
 pub fn moonberry_effective_skill_range_radius_with_multiplier(
     skill_range: Option<i32>,
     minimum_range_meters: f32,
@@ -7678,7 +8097,10 @@ pub fn status_damage_attribute_multiplier(
     kind: TrpgDamageBonusKind,
 ) -> f32 {
     match kind {
-        TrpgDamageBonusKind::Magical => 1.0 + total.int_ as f32 * config.int_damage_bonus,
+        TrpgDamageBonusKind::Magical => {
+            1.0 + total.int_ as f32 * config.int_damage_bonus
+                + config.weave_magic_damage_bonus.max(0.0)
+        },
         TrpgDamageBonusKind::Physical => {
             1.0 + total.str_ as f32 * config.str_damage_bonus
                 + (total.agi % 50) as f32 * config.agi_damage_bonus
@@ -10369,6 +10791,248 @@ mod tests {
             assert!(response.contains("达到10点可完整认识自身"));
             assert!(response.contains("达到20点可消耗一个观察小动作"));
         }
+    }
+
+    #[test]
+    fn campaign_weave_is_stable_and_uses_binomial_bounds() {
+        let first = campaign_weave_state("campaign-alpha");
+        let second = campaign_weave_state("campaign-alpha");
+
+        assert_eq!(first, second);
+        assert!(first.magic_damage_bonus_percent <= 5);
+        assert!(first.mp_regen_bonus_percent <= 10);
+        assert!([
+            "北方",
+            "东北方",
+            "东方",
+            "东南方",
+            "南方",
+            "西南方",
+            "西方",
+            "西北方",
+        ]
+        .contains(&first.strongest_direction));
+    }
+
+    #[test]
+    fn intelligence_increases_only_spell_mp_costs() {
+        let character = PlayerCharacter {
+            status: CharacterStatus {
+                int_: 20,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(
+            (character_effective_skill_mp_cost(&character, 10.0, Some("法术")) - 12.0).abs()
+                < 0.0001
+        );
+        assert!(
+            (character_effective_skill_mp_cost(&character, 10.0, Some("动作")) - 10.0).abs()
+                < 0.0001
+        );
+    }
+
+    #[test]
+    fn weave_config_adds_magic_damage_and_mana_regeneration() {
+        let mut character = PlayerCharacter {
+            status: CharacterStatus {
+                int_: 10,
+                wis: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = trpg_config_with_weave(
+            TrpgBasicConfig::default(),
+            "weave-bonus-test",
+            10,
+        );
+        let weave = campaign_weave_state("weave-bonus-test");
+
+        update_character_from_status_with_config(&mut character, &config);
+
+        let expected_damage = 1.0
+            + 10.0 * config.int_damage_bonus
+            + f32::from(weave.magic_damage_bonus_percent) / 100.0;
+        let expected_regen =
+            10.0 * config.wis_mp_reg * (1.0 + f32::from(weave.mp_regen_bonus_percent) / 100.0);
+        assert!(
+            (character_damage_attribute_multiplier(
+                &character,
+                &config,
+                TrpgDamageBonusKind::Magical,
+            ) - expected_damage)
+                .abs()
+                < 0.0001
+        );
+        assert!((character.mp_regen - expected_regen).abs() < 0.0001);
+        assert_eq!(character.max_mp, 75.0);
+        assert!((character_healing_attribute_multiplier(&character, &config) - 1.3).abs() < 0.0001);
+    }
+
+    #[test]
+    fn private_weave_aliases_require_ten_int_and_report_same_campaign_field() {
+        let mut manager = empty_manager();
+        let mut character = completed_character("织法者");
+        character.status.int_ = 9;
+        manager.player_characters.insert("2".to_owned(), character);
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            campaign_id: "weave-test".to_owned(),
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        });
+
+        let denied = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".weave"),
+            "2",
+        )
+        .unwrap();
+        assert!(denied.contains("智力尚未达到10点"));
+
+        manager.player_characters.get_mut("2").unwrap().status.int_ = 10;
+        let halfwidth = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".weave"),
+            "2",
+        )
+        .unwrap();
+        let fullwidth = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "。魔网"),
+            "2",
+        )
+        .unwrap();
+
+        assert_eq!(halfwidth, fullwidth);
+        assert!(halfwidth.contains("目前魔网法力浓度:"));
+        assert!(halfwidth.contains("最强魔网节点方向："));
+        assert!(halfwidth.contains("法术伤害+"));
+        assert!(halfwidth.contains("魔法回复+"));
+    }
+
+    #[test]
+    fn twenty_int_can_analyze_a_sensed_magic_buff_once_per_turn() {
+        let mut manager = empty_manager();
+        let mut character = completed_character("析法者");
+        character.status.int_ = 20;
+        character.active_buffs.push(BuffSpec {
+            name: "灼烧术".to_owned(),
+            kind: BuffKind::Magic,
+            priority: 0,
+            turns_remaining: 3,
+            source_id: "spell:burn".to_owned(),
+            beneficial: false,
+            effects: Vec::new(),
+            tick_actions: vec![BuffTickAction::Damage {
+                amount: 4.0,
+                damage_type: DamageType::Magical,
+            }],
+        });
+        manager.player_characters.insert("2".to_owned(), character);
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            campaign_id: "analysis-test".to_owned(),
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        });
+
+        let analysis = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(
+                NapcatMessageType::Private,
+                "。魔网 灼烧术",
+            ),
+            "2",
+        )
+        .unwrap();
+        assert!(analysis.contains("每轮伤害4"));
+        assert!(analysis.contains("持续时间：剩余3轮"));
+
+        let repeated = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(
+                NapcatMessageType::Private,
+                ".weave 灼烧术",
+            ),
+            "2",
+        )
+        .unwrap();
+        assert!(repeated.contains("本轮已经消耗过观察小动作"));
+    }
+
+    #[test]
+    fn fifteen_int_senses_magic_in_its_party_without_leaking_other_parties() {
+        let mut manager = empty_manager();
+        let mut observer = completed_character("观测者");
+        observer.status.int_ = 15;
+        let mut ally = completed_character("同伴");
+        ally.active_buffs.push(BuffSpec {
+            name: "星辉护盾".to_owned(),
+            kind: BuffKind::Magic,
+            priority: 0,
+            turns_remaining: 2,
+            source_id: "spell:shield".to_owned(),
+            beneficial: true,
+            effects: Vec::new(),
+            tick_actions: Vec::new(),
+        });
+        ally.skill_names.push("流星术".to_owned());
+        ally.skill_notes.push("造成5点魔法伤害".to_owned());
+        ally.skill_mp_costs.push(2.0);
+        ally.skill_cooldown_turns.push(1);
+        ally.skill_metadata.push(CharacterSkillMetadata {
+            skill_type: Some("法术".to_owned()),
+            ..Default::default()
+        });
+        ally.skill_last_cast_turns.insert("0".to_owned(), 0);
+        let mut outsider = completed_character("隔离者");
+        outsider.active_buffs.push(BuffSpec {
+            name: "秘密结界".to_owned(),
+            kind: BuffKind::Magic,
+            priority: 0,
+            turns_remaining: 2,
+            source_id: "spell:secret".to_owned(),
+            beneficial: true,
+            effects: Vec::new(),
+            tick_actions: Vec::new(),
+        });
+        manager.player_characters.insert("2".to_owned(), observer);
+        manager.player_characters.insert("3".to_owned(), ally);
+        manager.player_characters.insert("4".to_owned(), outsider);
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            campaign_id: "sense-test".to_owned(),
+            players: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
+            parties: HashMap::from([
+                ("red".to_owned(), TrpgParty {
+                    name: "red".to_owned(),
+                    players: vec!["2".to_owned(), "3".to_owned()],
+                }),
+                ("blue".to_owned(), TrpgParty {
+                    name: "blue".to_owned(),
+                    players: vec!["4".to_owned()],
+                }),
+            ]),
+            player_parties: HashMap::from([
+                ("2".to_owned(), "red".to_owned()),
+                ("3".to_owned(), "red".to_owned()),
+                ("4".to_owned(), "blue".to_owned()),
+            ]),
+            ..Default::default()
+        });
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".魔网"),
+            "2",
+        )
+        .unwrap();
+
+        assert!(response.contains("同伴身上的星辉护盾"));
+        assert!(response.contains("同伴正在释放流星术"));
+        assert!(!response.contains("秘密结界"));
+        assert!(!response.contains("隔离者"));
     }
 
     #[test]

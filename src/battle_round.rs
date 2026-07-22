@@ -53,6 +53,7 @@ use crate::{
         character_dominion_max_hp_gain_rate,
         character_dying_target_healing_modifier,
         character_echoing_memory_healing_rates,
+        character_effective_skill_mp_cost,
         character_endless_pain_bonus_damage_per_stack,
         character_fatigue_walker_available,
         character_fighting_spirit_damage_taken_multiplier,
@@ -97,6 +98,7 @@ use crate::{
         skill_rule_args,
         status_damage_attribute_multiplier,
         status_healing_attribute_multiplier,
+        trpg_config_with_weave,
         wounded_healing_dealt_multiplier,
         CharacterStatus,
         NapcatMessageManager,
@@ -6048,12 +6050,18 @@ fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
                     .skill_metadata
                     .get(index)
                     .and_then(|metadata| metadata.legacy_buff_machine_json.clone()),
-                mp_cost: character
-                    .skill_mp_costs
-                    .get(index)
-                    .copied()
-                    .unwrap_or_default()
-                    .max(0.0),
+                mp_cost: character_effective_skill_mp_cost(
+                    character,
+                    character
+                        .skill_mp_costs
+                        .get(index)
+                        .copied()
+                        .unwrap_or_default(),
+                    character
+                        .skill_metadata
+                        .get(index)
+                        .and_then(|metadata| metadata.skill_type.as_deref()),
+                ),
                 cooldown_turns: character
                     .skill_cooldown_turns
                     .get(index)
@@ -6115,12 +6123,26 @@ fn encounter_basic_config(
     manager: &NapcatMessageManager,
     actor_id: &str,
 ) -> TrpgBasicConfig {
-    encounter
+    let group_config = encounter
         .trpg_group
         .as_deref()
         .and_then(|group_name| manager.trpg_groups.get(group_name))
-        .map(|group| group.basic_config)
-        .unwrap_or_else(|| manager.character_stat_config_for_target(actor_id))
+        .map(|group| {
+            (
+                group.basic_config,
+                group.campaign_id.as_str(),
+            )
+        });
+    if let Some((config, campaign_id)) = group_config {
+        let int_ = manager
+            .player_characters
+            .get(actor_id)
+            .map(|character| character.status.int_ + character.extra_status.int_)
+            .unwrap_or_default();
+        trpg_config_with_weave(config, campaign_id, int_)
+    } else {
+        manager.character_stat_config_for_target(actor_id)
+    }
 }
 
 fn participant_status(participant: &BattleParticipantSnapshot) -> CharacterStatus {
@@ -9258,7 +9280,11 @@ mod tests {
             .iter()
             .find(|participant| participant.target_id == "b")
             .unwrap();
-        assert!((target.hp - 29.5).abs() < 0.0001);
+        let weave_bonus =
+            f32::from(crate::napcat::campaign_weave_state("default").magic_damage_bonus_percent)
+                / 100.0;
+        let expected_hp = 50.0 - 10.0 * (2.05 + weave_bonus);
+        assert!((target.hp - expected_hp).abs() < 0.0001);
     }
 
     #[test]

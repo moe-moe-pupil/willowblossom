@@ -645,6 +645,7 @@ use crate::{
         character_damage_dealt_talent_buffs,
         character_damage_taken_attribute_multiplier,
         character_dying_target_healing_modifier,
+        character_effective_skill_mp_cost,
         character_fatigue_walker_available,
         character_healing_attribute_multiplier,
         character_large_hit_damage_taken_modifier,
@@ -4589,14 +4590,17 @@ fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
                     .get(index)
                     .cloned()
                     .unwrap_or_default(),
-                skill_type: metadata.skill_type,
+                skill_type: metadata.skill_type.clone(),
                 legacy_buff_machine_json: metadata.legacy_buff_machine_json,
-                mp_cost: character
-                    .skill_mp_costs
-                    .get(index)
-                    .copied()
-                    .unwrap_or_default()
-                    .max(0.0),
+                mp_cost: character_effective_skill_mp_cost(
+                    character,
+                    character
+                        .skill_mp_costs
+                        .get(index)
+                        .copied()
+                        .unwrap_or_default(),
+                    metadata.skill_type.as_deref(),
+                ),
                 cooldown_turns: character
                     .skill_cooldown_turns
                     .get(index)
@@ -8004,7 +8008,9 @@ fn derived_stats_for_total_status(
             .max(1.0),
         hp_regen: total.vit.max(0) as f32 * config.vit_hp_reg,
         max_mp: total.int_ as f32 * config.int_max_mp + total.wis as f32 * config.wis_max_mp,
-        mp_regen: total.wis.max(0) as f32 * config.wis_mp_reg,
+        mp_regen: total.wis.max(0) as f32
+            * config.wis_mp_reg
+            * (1.0 + config.weave_mp_regen_bonus.max(0.0)),
         speed: config.basic_speed
             + total.str_.max(0) as f32 * config.str_speed
             + total.agi.max(0) as f32 * config.agi_speed
