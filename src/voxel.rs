@@ -102,8 +102,7 @@ use crate::{
 
 const VOXEL_SIZE: f32 = 0.25;
 const VOXEL_DM_GIZMO_RENDER_LAYER: usize = 1;
-const PLAYER_STANDEE_FRONT_NORMAL: Vec3 = Vec3::NEG_Z;
-const PLAYER_STANDEE_BACK_NORMAL: Vec3 = Vec3::Z;
+const PLAYER_STANDEE_PLANE_NORMAL: Vec3 = Vec3::Z;
 pub(crate) const MAX_VOXEL_BRUSH_RADIUS: i32 = 50;
 const MAX_RAY_DISTANCE: f32 = 200.0;
 const PLANET_MAX_RAY_DISTANCE: f32 = 600.0;
@@ -3169,12 +3168,12 @@ fn sync_voxel_player_standees(
                     unlit: true,
                     ..default()
                 });
-                let back_material = materials.add(voxel_player_standee_back_material());
+                let portrait_material = materials.add(voxel_player_standee_material(texture));
                 let mut entity_commands = commands.spawn((
                     Mesh3d(
-                        meshes.add(Plane3d::new(PLAYER_STANDEE_FRONT_NORMAL, size * 0.5).mesh()),
+                        meshes.add(Plane3d::new(PLAYER_STANDEE_PLANE_NORMAL, size * 0.5).mesh()),
                     ),
-                    MeshMaterial3d(materials.add(voxel_player_standee_material(texture))),
+                    MeshMaterial3d(portrait_material.clone()),
                     voxel_player_standee_transform(&camera_transform),
                     Visibility::Visible,
                     VoxelPlayerStandee {
@@ -3186,16 +3185,17 @@ fn sync_voxel_player_standees(
                 entity_commands.with_children(|parent| {
                     parent.spawn((
                         Mesh3d(
-                            meshes.add(Plane3d::new(PLAYER_STANDEE_BACK_NORMAL, size * 0.5).mesh()),
+                            meshes
+                                .add(Plane3d::new(PLAYER_STANDEE_PLANE_NORMAL, size * 0.5).mesh()),
                         ),
-                        MeshMaterial3d(back_material),
+                        MeshMaterial3d(portrait_material),
                         voxel_player_standee_back_transform(),
                     ));
                     parent.spawn((
                         Mesh3d(
                             meshes.add(
                                 Plane3d::new(
-                                    PLAYER_STANDEE_BACK_NORMAL,
+                                    PLAYER_STANDEE_PLANE_NORMAL,
                                     Vec2::splat(VOXEL_SIZE * 0.42),
                                 )
                                 .mesh(),
@@ -3218,9 +3218,17 @@ fn sync_voxel_player_standees(
 
 fn voxel_player_standee_transform(camera_transform: &Transform) -> Transform { *camera_transform }
 
-fn voxel_player_standee_back_transform() -> Transform { Transform::from_xyz(0.0, 0.0, 0.005) }
+fn voxel_player_standee_back_transform() -> Transform {
+    Transform::from_xyz(0.0, 0.0, -0.005).with_rotation(Quat::from_rotation_y(
+        std::f32::consts::PI,
+    ))
+}
 
-fn voxel_player_standee_back_label_transform() -> Transform { Transform::from_xyz(0.0, 0.0, 0.01) }
+fn voxel_player_standee_back_label_transform() -> Transform {
+    Transform::from_xyz(0.0, 0.0, -0.01).with_rotation(Quat::from_rotation_y(
+        std::f32::consts::PI,
+    ))
+}
 
 fn voxel_player_standee_back_label_image() -> Image {
     const SIZE: u32 = 128;
@@ -3279,16 +3287,6 @@ fn voxel_player_standee_material(texture: Handle<Image>) -> StandardMaterial {
     StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: Some(texture),
-        alpha_mode: AlphaMode::Opaque,
-        cull_mode: Some(Face::Back),
-        unlit: true,
-        ..default()
-    }
-}
-
-fn voxel_player_standee_back_material() -> StandardMaterial {
-    StandardMaterial {
-        base_color: Color::srgb(0.14, 0.025, 0.025),
         alpha_mode: AlphaMode::Opaque,
         cull_mode: Some(Face::Back),
         unlit: true,
@@ -7109,15 +7107,14 @@ mod tests {
 
     #[test]
     fn player_standee_back_label_faces_away_from_the_portrait() {
+        let back = voxel_player_standee_back_transform();
         let transform = voxel_player_standee_back_label_transform();
 
-        assert!(transform.translation.z > 0.0);
-        assert_eq!(PLAYER_STANDEE_FRONT_NORMAL, Vec3::NEG_Z);
-        assert_eq!(PLAYER_STANDEE_BACK_NORMAL, Vec3::Z);
-        assert_eq!(
-            PLAYER_STANDEE_FRONT_NORMAL.dot(PLAYER_STANDEE_BACK_NORMAL),
-            -1.0
-        );
+        assert!(back.translation.z < 0.0);
+        assert!(transform.translation.z < back.translation.z);
+        assert_eq!(PLAYER_STANDEE_PLANE_NORMAL, Vec3::Z);
+        assert!((back.rotation * Vec3::Z).abs_diff_eq(Vec3::NEG_Z, 0.000_01));
+        assert!((transform.rotation * Vec3::Z).abs_diff_eq(Vec3::NEG_Z, 0.000_01));
     }
 
     #[test]
@@ -7153,10 +7150,6 @@ mod tests {
             AlphaMode::Opaque
         ));
         assert_eq!(material.cull_mode, Some(Face::Back));
-        assert_eq!(
-            voxel_player_standee_back_material().cull_mode,
-            Some(Face::Back)
-        );
     }
 
     #[test]
