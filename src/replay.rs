@@ -455,7 +455,7 @@ fn render_video_frames(
     studio.playback_ms = playback_ms;
     if let Ok(mut window) = windows.single_mut() {
         window.title = format!(
-            "正在渲染视频 {}/{}（Esc 取消）",
+            "正在渲染视频 {}/{}（此阶段静音，完成后加入音乐和语音；Esc 取消）",
             frame_index + 1,
             total_frames
         );
@@ -979,7 +979,8 @@ fn replay_controls(
             ui.text_edit_singleline(&mut studio.project_import_path);
             if ui.button("载入回放项目").clicked() {
                 match import_replay(&studio.project_import_path) {
-                    Ok(replay) => {
+                    Ok(mut replay) => {
+                        normalize_dialogue_sides(&mut replay, manager);
                         stop_playback(studio, grids);
                         studio.playback_ms = 0;
                         studio.audience = replay.audience.clone();
@@ -1344,7 +1345,8 @@ fn start_video_export(
         original_window_title,
         original_window_resizable,
     });
-    studio.status = format!("正在逐帧渲染 {total_frames} 帧");
+    studio.status =
+        format!("正在逐帧渲染 {total_frames} 帧；截图阶段静音，全部帧完成后自动合成音乐和角色语音");
 }
 
 fn video_frame_count(duration_ms: u64, fps: u32) -> u64 {
@@ -1502,6 +1504,12 @@ fn encode_video_frames(
         .output()
         .map_err(|err| format!("无法启动 FFmpeg：{err}"))?;
     if output.status.success() {
+        if music_enabled || speech_enabled {
+            if let Err(err) = verify_audio_signal(&temporary_output) {
+                let _ = fs::remove_file(&temporary_output);
+                return Err(err);
+            }
+        }
         if output_path.exists() {
             fs::remove_file(output_path).map_err(|err| format!("无法替换已有视频：{err}"))?;
         }
@@ -1524,6 +1532,27 @@ fn encode_video_frames(
     } else {
         tail
     })
+}
+
+fn verify_audio_signal(video_path: &Path) -> Result<(), String> {
+    let mut command = Command::new("ffmpeg");
+    command.args(["-v", "error", "-i"]).arg(video_path).args([
+        "-map", "0:a:0", "-t", "30", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1",
+    ]);
+    hide_command_window(&mut command);
+    let output = command
+        .output()
+        .map_err(|err| format!("无法检查视频音轨：{err}"))?;
+    if !output.status.success() {
+        return Err("视频音轨缺失或无法解码；未保存静音视频".to_owned());
+    }
+    let has_signal = output
+        .stdout
+        .chunks_exact(2)
+        .any(|sample| i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs() > 32);
+    has_signal
+        .then_some(())
+        .ok_or_else(|| "视频音轨完全静音；未保存静音视频".to_owned())
 }
 
 struct SynthesizedSpeechCue {
@@ -2079,9 +2108,7 @@ fn dialogue_from_message(
     if text.is_empty() {
         return None;
     }
-    let is_gm = manager
-        .current_group()
-        .is_some_and(|group| group.gm_users.contains(&message.sender_id));
+    let is_gm = manager.is_gm_user(message.sender_id);
     let character = manager
         .player_characters
         .get(&message.sender_id.to_string())
@@ -2110,6 +2137,12 @@ fn dialogue_from_message(
         visibility: message.visibility.clone(),
         side,
     })
+}
+
+fn normalize_dialogue_sides(replay: &mut ReplayFile, manager: &NapcatMessageManager) {
+    for dialogue in &mut replay.dialogue {
+        dialogue.side = speaker_side(manager.is_gm_user(dialogue.sender_id));
+    }
 }
 
 fn resolve_character_image_source(manager: &NapcatMessageManager, source: &str) -> String {

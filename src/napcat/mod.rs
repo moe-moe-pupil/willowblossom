@@ -3775,6 +3775,20 @@ impl NapcatMessageManager {
             .and_then(|group_name| self.trpg_groups.get(group_name))
     }
 
+    pub fn napcat_self_id(&self) -> Option<u64> {
+        self.messages
+            .values()
+            .flatten()
+            .map(|message| message.data.self_id)
+            .find(|self_id| *self_id != 0)
+    }
+
+    pub fn is_gm_user(&self, user_id: u64) -> bool {
+        self.current_group()
+            .is_some_and(|group| group.gm_users.contains(&user_id))
+            || self.napcat_self_id() == Some(user_id)
+    }
+
     pub fn group_name_for_player_target(&self, target_id: &str) -> Option<&str> {
         if let Some(group_name) = self.current_trpg_group.as_deref().filter(|group_name| {
             self.trpg_groups
@@ -8256,6 +8270,21 @@ mod tests {
                 access_scope_resolved: false,
             },
         }
+    }
+
+    #[test]
+    fn napcat_self_account_is_always_recognized_as_gm() {
+        let mut manager = empty_manager();
+        let mut message = test_message(NapcatMessageType::Private);
+        message.data.self_id = 3_432_505_351;
+        manager.messages.insert("player".to_owned(), vec![message]);
+
+        assert_eq!(
+            manager.napcat_self_id(),
+            Some(3_432_505_351)
+        );
+        assert!(manager.is_gm_user(3_432_505_351));
+        assert!(!manager.is_gm_user(1_670_426_821));
     }
 
     #[test]
