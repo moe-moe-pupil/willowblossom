@@ -56,6 +56,7 @@ use crate::{
         DeepseekManager,
         DeepseekRequest,
         DeepseekSummaryBlock,
+        DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS,
     },
     napcat::{
         CampaignMessage,
@@ -256,6 +257,7 @@ struct ReplayStudio {
     music_volume: f32,
     speech_enabled: bool,
     speech_volume: f32,
+    deepseek_custom_prompt: String,
     project_export_path: String,
     project_import_path: String,
     video_render: Option<VideoRenderJob>,
@@ -309,6 +311,7 @@ impl Default for ReplayStudio {
             music_volume: 0.35,
             speech_enabled: true,
             speech_volume: 0.90,
+            deepseek_custom_prompt: String::new(),
             project_export_path: DEFAULT_REPLAY_PATH.to_owned(),
             project_import_path: DEFAULT_REPLAY_PATH.to_owned(),
             video_render: None,
@@ -611,11 +614,15 @@ fn replay_studio_ui(
 
     if studio.panel_open && !capture_active.0 {
         let mut open = studio.panel_open;
+        let max_window_width = (ctx.content_rect().width() - 32.0).clamp(360.0, 620.0);
         egui::Window::new("TRPG 回放工作室")
             .id(egui::Id::new("trpg-replay-studio"))
             .open(&mut open)
             .default_width(390.0)
+            .min_width(360.0)
+            .max_width(max_window_width)
             .show(ctx, |ui| {
+                ui.set_max_width(max_window_width);
                 replay_controls(
                     ui,
                     &manager,
@@ -791,6 +798,25 @@ fn replay_controls(
     ui.separator();
     ui.heading("DeepSeek 制作提要");
     ui.small("使用 deepseek-v4-pro 思考模式，只整理当前发布范围内已经说过的内容，供 DM 审核；不会续写剧情、改写玩家台词或读取其他队伍的隐藏内容。");
+    ui.label("自定义整理要求");
+    let prompt_width = ui.available_width().clamp(220.0, 560.0);
+    ui.add(
+        egui::TextEdit::multiline(&mut studio.deepseek_custom_prompt)
+            .desired_rows(3)
+            .desired_width(prompt_width)
+            .hint_text("例如：重点列出未解决问题；保留角色和地点原名；措辞更简洁"),
+    );
+    let prompt_chars = studio.deepseek_custom_prompt.chars().count();
+    if prompt_chars > DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS {
+        ui.colored_label(
+            egui::Color32::from_rgb(210, 90, 70),
+            format!("已输入 {prompt_chars} 字；仅发送前 {DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS} 字"),
+        );
+    } else {
+        ui.small(format!(
+            "{prompt_chars}/{DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS} 字；只影响事实提要的格式与重点，不能扩大可见范围或续写剧情"
+        ));
+    }
     if ui
         .add_enabled(
             studio
@@ -810,6 +836,7 @@ fn replay_controls(
                     replay,
                     deepseek_sender,
                     deepseek_manager,
+                    &studio.deepseek_custom_prompt,
                 )
             }) {
             Ok(()) => {
@@ -940,7 +967,13 @@ fn replay_controls(
             );
         }
         let summary_queued = studio.replay.as_ref().is_some_and(|replay| {
-            queue_replay_summary(replay, deepseek_sender, deepseek_manager).is_ok()
+            queue_replay_summary(
+                replay,
+                deepseek_sender,
+                deepseek_manager,
+                &studio.deepseek_custom_prompt,
+            )
+            .is_ok()
         });
         if summary_queued {
             let _ = deepseek_manager.persist();
@@ -1144,6 +1177,7 @@ fn queue_replay_summary(
     replay: &ReplayFile,
     sender: Option<&DeepseekIOSender>,
     manager: &mut DeepseekManager,
+    custom_prompt: &str,
 ) -> Result<(), String> {
     if replay.dialogue.is_empty() {
         return Err("回放中没有可整理的台词".to_owned());
@@ -1152,8 +1186,8 @@ fn queue_replay_summary(
     let summary_key = replay_summary_key(replay);
     let message_count = replay.dialogue.len();
     if let Some(block) = replay_summary_block(replay, manager) {
-        if block.pending || !block.latest.trim().is_empty() {
-            return Err("这版台词已经整理过；新增台词后可以再次整理".to_owned());
+        if block.pending {
+            return Err("这版台词正在整理，请等待当前请求完成".to_owned());
         }
     }
     let text = replay
@@ -1166,6 +1200,10 @@ fn queue_replay_summary(
         target_id: summary_key.clone(),
         message_count,
         text,
+        custom_prompt: custom_prompt
+            .chars()
+            .take(DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS)
+            .collect(),
     })
     .map(Message::text)
     .map_err(|err| err.to_string())?;

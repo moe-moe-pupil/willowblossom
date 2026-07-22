@@ -3315,6 +3315,7 @@ fn queue_summary_if_needed_for_scope(
         target_id: summary_key.to_owned(),
         message_count,
         text,
+        custom_prompt: String::new(),
     };
 
     let send_result = serde_json::to_string(&request)
