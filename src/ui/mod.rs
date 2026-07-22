@@ -369,6 +369,15 @@ fn paint_voxel_creative_item_icon(
             box_outline((-0.58, -0.42), (0.12, -0.04));
             dot(-0.22, -0.23, 0.09);
         },
+        VoxelCreativeItem::PlayerPossessionTool => {
+            circle(0.0, -0.35, 0.28);
+            line((-0.58, 0.85), (-0.35, 0.18));
+            line((-0.35, 0.18), (0.35, 0.18));
+            line((0.35, 0.18), (0.58, 0.85));
+            thin_line((-0.92, 0.0), (-0.58, 0.0));
+            thin_line((0.58, 0.0), (0.92, 0.0));
+            thin_line((0.0, -0.92), (0.0, -0.68));
+        },
         VoxelCreativeItem::Mode(VoxelEditMode::Add) => {
             box_outline((-0.75, -0.75), (0.35, 0.35));
             plus(0.48, 0.48, 0.4);
@@ -504,6 +513,10 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
         VoxelCreativeItem::ToolGun => (
             "工具枪",
             egui::Color32::from_rgb(238, 116, 30),
+        ),
+        VoxelCreativeItem::PlayerPossessionTool => (
+            "PL接管器",
+            egui::Color32::from_rgb(116, 82, 238),
         ),
         VoxelCreativeItem::Mode(mode) => match mode {
             VoxelEditMode::Add => (
@@ -12571,7 +12584,9 @@ pub fn ui_system(
                         } else {
                             "WASD 移动 · 空格跳跃 · 双击空格飞行"
                         };
-                        let interaction_hint = if voxel_editor.is_tool_gun_equipped() {
+                        let interaction_hint = if voxel_editor.is_player_possession_tool_equipped() {
+                            "右键选择/接管玩家 · 右键空处解除"
+                        } else if voxel_editor.is_tool_gun_equipped() {
                             "右键发射 · R切换模式"
                         } else {
                             "左键拆除 · 右键放置/使用"
@@ -12581,7 +12596,9 @@ pub fn ui_system(
                             voxel_editor.active_tool_label()
                         ));
                     } else {
-                        let interaction_hint = if voxel_editor.is_tool_gun_equipped() {
+                        let interaction_hint = if voxel_editor.is_player_possession_tool_equipped() {
+                            "右键选择/接管玩家 · 右键空处解除"
+                        } else if voxel_editor.is_tool_gun_equipped() {
                             "右键发射 · R切换模式"
                         } else {
                             "左键拆除 · 右键放置/使用"
@@ -12918,6 +12935,29 @@ pub fn ui_system(
                             .num_columns(4)
                             .spacing(egui::vec2(10.0, 10.0))
                             .show(ui, |ui| {
+                                let possession_tool = VoxelCreativeItem::PlayerPossessionTool;
+                                let (name, _) = voxel_creative_item_visual(possession_tool);
+                                ui.vertical_centered(|ui| {
+                                    if voxel_creative_drag_source(
+                                        ui,
+                                        egui::Id::new("voxel_catalog_player_possession_tool"),
+                                        VoxelCreativeDragPayload::Catalog(possession_tool),
+                                        possession_tool,
+                                        voxel_editor.creative_hotbar
+                                            [voxel_editor.selected_hotbar_slot]
+                                            == Some(possession_tool),
+                                        48.0,
+                                        None,
+                                    )
+                                    .on_hover_text(
+                                        "GM右键玩家立绘即可选择并接管；右键空处解除接管",
+                                    )
+                                    .clicked()
+                                    {
+                                        picked_item = Some(possession_tool);
+                                    }
+                                    ui.small(name);
+                                });
                                 let tool_gun = VoxelCreativeItem::ToolGun;
                                 let (name, _) = voxel_creative_item_visual(tool_gun);
                                 ui.vertical_centered(|ui| {

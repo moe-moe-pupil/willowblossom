@@ -179,6 +179,7 @@ struct VoxelPlayerCaptureCamera {
 struct VoxelPlayerStandee {
     user_id: u64,
     image_source: String,
+    half_size: Vec2,
 }
 
 #[derive(Resource, Default)]
@@ -348,6 +349,7 @@ pub(crate) enum VoxelCreativeItem {
     Light(VoxelLightTool),
     Mode(VoxelEditMode),
     ToolGun,
+    PlayerPossessionTool,
 }
 
 #[derive(Component, Clone)]
@@ -698,6 +700,10 @@ impl VoxelEditorState {
                 self.light_tool = None;
                 self.selected_light = None;
             },
+            VoxelCreativeItem::PlayerPossessionTool => {
+                self.light_tool = None;
+                self.selected_light = None;
+            },
         }
     }
 
@@ -761,6 +767,9 @@ impl VoxelEditorState {
                 self.tool_gun_mode.label()
             );
         }
+        if self.is_player_possession_tool_equipped() {
+            return "PL接管器".to_owned();
+        }
         self.light_tool
             .map_or_else(
                 || self.mode.label(),
@@ -771,6 +780,10 @@ impl VoxelEditorState {
 
     pub(crate) fn is_tool_gun_equipped(&self) -> bool {
         self.equipped_item == Some(VoxelCreativeItem::ToolGun)
+    }
+
+    pub(crate) fn is_player_possession_tool_equipped(&self) -> bool {
+        self.equipped_item == Some(VoxelCreativeItem::PlayerPossessionTool)
     }
 
     pub(crate) fn cycle_tool_gun_mode(&mut self) {
@@ -927,6 +940,7 @@ impl Plugin for TrpgVoxelPlugin {
                 (
                     voxel_editor_shortcuts,
                     handle_editor_requests,
+                    use_player_possession_tool,
                     place_creative_light,
                     sync_selected_voxel_light,
                     edit_voxel_grid,
@@ -3052,6 +3066,7 @@ fn sync_voxel_player_standees(
                         VoxelPlayerStandee {
                             user_id,
                             image_source,
+                            half_size: size * 0.5,
                         },
                     ))
                     .id();
@@ -4031,6 +4046,99 @@ fn viewport_ray(
         .ok()
 }
 
+fn use_player_possession_tool(
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
+    standees: Query<(
+        &VoxelPlayerStandee,
+        &GlobalTransform,
+        &Visibility,
+    )>,
+    mut editor: ResMut<VoxelEditorState>,
+    mut possession: ResMut<VoxelPossessionState>,
+    mut camera_editor: ResMut<VoxelPlayerCameraEditor>,
+    camera_store: ResMut<Persistent<VoxelPlayerCameraStore>>,
+    egui_input: Res<EguiWantsInput>,
+) {
+    if !editor.is_player_possession_tool_equipped()
+        || editor.creative_inventory_open
+        || !mouse.just_pressed(MouseButton::Right)
+        || egui_input.wants_any_pointer_input()
+    {
+        return;
+    }
+    let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single()) else {
+        return;
+    };
+    let Some(ray) = viewport_ray(
+        window,
+        camera,
+        camera_transform,
+        &editor,
+    ) else {
+        return;
+    };
+    let selected = standees
+        .iter()
+        .filter_map(|(standee, transform, visibility)| {
+            if *visibility == Visibility::Hidden {
+                return None;
+            }
+            ray_intersects_player_standee(ray, transform, standee.half_size)
+                .map(|distance| (standee.user_id, distance))
+        })
+        .filter(|(_, distance)| *distance <= MAX_RAY_DISTANCE)
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(user_id, _)| user_id);
+
+    if let Err(err) = camera_store.persist() {
+        eprintln!("failed to persist player camera before possession tool action: {err}");
+    }
+    match selected {
+        Some(user_id) if possession.active_user_id == Some(user_id) => {
+            possession.release();
+            camera_editor.selected_user_id = Some(user_id);
+            editor.physics_status = Some(format!("已解除PL {user_id}的接管"));
+        },
+        Some(user_id) => {
+            possession.possess(user_id);
+            camera_editor.selected_user_id = Some(user_id);
+            editor.physics_status = Some(format!("已选择并接管PL {user_id}"));
+        },
+        None if possession.active_user_id.is_some() => {
+            possession.release();
+            editor.physics_status = Some("已解除PL接管".to_owned());
+        },
+        None => {
+            editor.physics_status = Some("没有瞄准玩家立绘".to_owned());
+        },
+    }
+}
+
+fn ray_intersects_player_standee(
+    ray: Ray3d,
+    transform: &GlobalTransform,
+    half_size: Vec2,
+) -> Option<f32> {
+    let inverse = transform.to_matrix().inverse();
+    let local_origin = inverse.transform_point3(ray.origin);
+    let local_direction = inverse.transform_vector3(*ray.direction);
+    if local_direction.z.abs() <= f32::EPSILON {
+        return None;
+    }
+    let local_distance = -local_origin.z / local_direction.z;
+    if local_distance < 0.0 {
+        return None;
+    }
+    let local_hit = local_origin + local_direction * local_distance;
+    if local_hit.x.abs() > half_size.x || local_hit.y.abs() > half_size.y {
+        return None;
+    }
+    let world_hit = transform.transform_point(local_hit);
+    Some(ray.origin.distance(world_hit))
+}
+
 fn rebuild_voxel_geometry(
     mut commands: Commands,
     grids: Query<&Grid<u8>, (With<TrpgVoxelGrid>, Changed<Grid<u8>>)>,
@@ -4902,7 +5010,7 @@ fn place_creative_light(
     possession: Res<VoxelPossessionState>,
     egui_input: Res<EguiWantsInput>,
 ) {
-    if possession.active_user_id.is_some() {
+    if possession.active_user_id.is_some() || editor.is_player_possession_tool_equipped() {
         return;
     }
     let Some(tool) = editor.light_tool else {
@@ -5189,7 +5297,7 @@ fn edit_voxel_grid(
             editor.redo.clear();
         }
     }
-    if possession.active_user_id.is_some() {
+    if possession.active_user_id.is_some() || editor.is_player_possession_tool_equipped() {
         return;
     }
     if editor.creative_inventory_open {
@@ -6659,6 +6767,18 @@ mod tests {
     }
 
     #[test]
+    fn possession_tool_ray_selects_only_inside_player_standee_bounds() {
+        let standee = GlobalTransform::from_translation(Vec3::new(0.0, 0.0, -5.0));
+        let center_ray = Ray3d::new(Vec3::ZERO, Dir3::NEG_Z);
+        let missed_ray = Ray3d::new(Vec3::X, Dir3::NEG_Z);
+
+        let distance = ray_intersects_player_standee(center_ray, &standee, Vec2::splat(0.5))
+            .expect("center ray should hit standee");
+        assert!((distance - 5.0).abs() < 0.0001);
+        assert!(ray_intersects_player_standee(missed_ray, &standee, Vec2::splat(0.5),).is_none());
+    }
+
+    #[test]
     fn player_standee_material_is_opaque() {
         let material = voxel_player_standee_material(Handle::<Image>::default());
 
@@ -7925,12 +8045,17 @@ mod tests {
         assert_eq!(editor.creative_hotbar[3], None);
         assert_eq!(editor.light_tool, None);
         assert_eq!(editor.active_tool_label(), "空手");
+
+        editor.put_in_selected_hotbar(VoxelCreativeItem::PlayerPossessionTool);
+        assert!(editor.is_player_possession_tool_equipped());
+        assert_eq!(editor.active_tool_label(), "PL接管器");
     }
 
     #[test]
     fn creative_inventory_snapshot_persists_as_toml() {
         let mut inventory = VoxelInventoryStore::default();
         inventory.hotbar[2] = Some(VoxelCreativeItem::ToolGun);
+        inventory.hotbar[3] = Some(VoxelCreativeItem::PlayerPossessionTool);
         inventory.hotbar[4] = Some(VoxelCreativeItem::Mode(
             VoxelEditMode::Drag,
         ));
