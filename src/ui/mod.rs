@@ -819,6 +819,9 @@ pub(crate) struct TrpgGroupSettingsState {
     focused_group_name: Option<String>,
     pending_character_delete: Option<String>,
     pending_party_delete: Option<(String, String)>,
+    pending_turn_zero_reset: Option<String>,
+    pending_initial_stats_restore: Option<String>,
+    group_reset_status: HashMap<String, String>,
     legacy_send_pane_status: HashMap<String, String>,
     legacy_team_chat_status: HashMap<String, String>,
     legacy_team_chat_edit_drafts: HashMap<String, String>,
@@ -7698,17 +7701,126 @@ fn moonberry_talent_passive_effects(
     }
 }
 
+fn capture_missing_group_initial_player_states(
+    manager: &mut NapcatMessageManager,
+    group_name: &str,
+) -> usize {
+    let Some(group) = manager.trpg_groups.get(group_name) else {
+        return 0;
+    };
+    let players = group.players.clone();
+    let snapshots = players
+        .iter()
+        .filter_map(|target_id| {
+            manager
+                .player_characters
+                .get(target_id)
+                .cloned()
+                .map(|character| (target_id.clone(), character))
+        })
+        .collect::<Vec<_>>();
+    let Some(group) = manager.trpg_groups.get_mut(group_name) else {
+        return 0;
+    };
+    let mut captured = 0;
+    group
+        .initial_player_states
+        .retain(|target_id, _| players.contains(target_id));
+    for (target_id, character) in snapshots {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            group.initial_player_states.entry(target_id)
+        {
+            entry.insert(character);
+            captured += 1;
+        }
+    }
+    captured
+}
+
+fn restore_character_initial_turn_stats(
+    character: &mut PlayerCharacter,
+    initial: &PlayerCharacter,
+) {
+    character.hp = initial.hp;
+    character.max_hp = initial.max_hp;
+    character.hp_regen = initial.hp_regen;
+    character.mp = initial.mp;
+    character.max_mp = initial.max_mp;
+    character.mp_regen = initial.mp_regen;
+    character.level = initial.level;
+    character.exp = initial.exp;
+    character.speed = initial.speed;
+    character.damage_dealt_modifier = initial.damage_dealt_modifier;
+    character.healing_dealt_modifier = initial.healing_dealt_modifier;
+    character.damage_taken_modifier = initial.damage_taken_modifier;
+    character.healing_taken_modifier = initial.healing_taken_modifier;
+    character.damage_taken_this_turn = initial.damage_taken_this_turn;
+    character.healing_taken_this_turn = initial.healing_taken_this_turn;
+    character.status = initial.status.clone();
+    character.extra_status = initial.extra_status.clone();
+    character.skill_last_cast_turns = initial.skill_last_cast_turns.clone();
+    character.skill_cooldown_ready_turns = initial.skill_cooldown_ready_turns.clone();
+    character.active_buffs = initial.active_buffs.clone();
+    character.buff_base_stats = initial.buff_base_stats.clone();
+}
+
+fn restore_group_initial_player_stats(
+    manager: &mut NapcatMessageManager,
+    group_name: &str,
+    rule_engine_state: &mut RuleEngineState,
+) -> (usize, usize) {
+    let Some(group) = manager.trpg_groups.get(group_name) else {
+        return (0, 0);
+    };
+    let players = group.players.clone();
+    let initial_states = group.initial_player_states.clone();
+    let skill_pool_snapshot = manager.skill_pool.clone();
+    let mut restored = 0;
+    let mut missing = 0;
+    for target_id in players {
+        let Some(initial) = initial_states.get(&target_id) else {
+            missing += 1;
+            continue;
+        };
+        let stat_config = manager.character_stat_config_for_target(&target_id);
+        let Some(character) = manager.player_characters.get_mut(&target_id) else {
+            missing += 1;
+            continue;
+        };
+        restore_character_initial_turn_stats(character, initial);
+        sync_character_buffs(
+            &target_id,
+            character,
+            &stat_config,
+            rule_engine_state,
+            &skill_pool_snapshot,
+        );
+        restored += 1;
+    }
+    (restored, missing)
+}
+
 fn advance_group_world_turn(
     manager: &mut NapcatMessageManager,
     group_name: &str,
     rule_engine_state: &mut RuleEngineState,
 ) -> bool {
+    let should_capture = manager
+        .trpg_groups
+        .get(group_name)
+        .is_some_and(|group| group.world_turn == 0);
+    let captured = if should_capture {
+        capture_missing_group_initial_player_states(manager, group_name)
+    } else {
+        0
+    };
     let Some(group) = manager.trpg_groups.get_mut(group_name) else {
         return false;
     };
     let players = group.players.clone();
-    let mut changed = group.advance_world_turn();
-    if changed {
+    let advanced = group.advance_world_turn();
+    let mut changed = captured > 0 || advanced;
+    if advanced {
         changed |= reset_turn_totals_for_players(manager, &players);
         changed |= advance_buffs_for_players(manager, &players, rule_engine_state);
     }
@@ -7722,6 +7834,15 @@ fn mark_group_player_turn(
     acted: bool,
     rule_engine_state: &mut RuleEngineState,
 ) -> bool {
+    let should_capture = manager
+        .trpg_groups
+        .get(group_name)
+        .is_some_and(|group| group.world_turn == 0);
+    let captured = if should_capture {
+        capture_missing_group_initial_player_states(manager, group_name)
+    } else {
+        0
+    };
     let Some(group) = manager.trpg_groups.get_mut(group_name) else {
         return false;
     };
@@ -7736,7 +7857,7 @@ fn mark_group_player_turn(
         let _ = reset_turn_totals_for_players(manager, &players);
         advance_buffs_for_players(manager, &players, rule_engine_state);
     }
-    changed
+    captured > 0 || changed
 }
 
 fn set_group_player_waiting(
@@ -11754,6 +11875,8 @@ fn trpg_group_settings_window(
     let mut turn_action: Option<(String, String, bool)> = None;
     let mut turn_reset: Option<String> = None;
     let mut turn_advance: Option<String> = None;
+    let mut turn_zero_reset: Option<String> = None;
+    let mut initial_stats_restore: Option<String> = None;
     let mut legacy_negative_action: Option<(String, String, LegacyNegativeAction)> = None;
     let mut legacy_surface_action: Option<(String, LegacyGroupSurfaceAction)> = None;
     let mut settings_open = state.open;
@@ -11937,7 +12060,55 @@ fn trpg_group_settings_window(
                                 if ui.button("重置行动").clicked() {
                                     turn_reset = Some(group_name.clone());
                                 }
+                                if state.pending_turn_zero_reset.as_deref()
+                                    == Some(group_name.as_str())
+                                {
+                                    if ui
+                                        .button("确认轮次全部归零")
+                                        .on_hover_text("世界轮次和所有玩家轮次都会设为0")
+                                        .clicked()
+                                    {
+                                        turn_zero_reset = Some(group_name.clone());
+                                        state.pending_turn_zero_reset = None;
+                                    }
+                                    if ui.button("取消").clicked() {
+                                        state.pending_turn_zero_reset = None;
+                                    }
+                                } else if ui
+                                    .button("轮次全部归零")
+                                    .on_hover_text("需要再次确认；不会自动恢复角色状态")
+                                    .clicked()
+                                {
+                                    state.pending_turn_zero_reset = Some(group_name.clone());
+                                }
+                                if state.pending_initial_stats_restore.as_deref()
+                                    == Some(group_name.as_str())
+                                {
+                                    if ui
+                                        .button("确认恢复首轮前状态")
+                                        .on_hover_text(
+                                            "恢复所有玩家在第一次行动前保存的HP、MP、属性、buff和冷却状态",
+                                        )
+                                        .clicked()
+                                    {
+                                        initial_stats_restore = Some(group_name.clone());
+                                        state.pending_initial_stats_restore = None;
+                                    }
+                                    if ui.button("取消").clicked() {
+                                        state.pending_initial_stats_restore = None;
+                                    }
+                                } else if ui
+                                    .button("恢复首轮前状态")
+                                    .on_hover_text("需要再次确认；不会使用建卡完成时的默认值")
+                                    .clicked()
+                                {
+                                    state.pending_initial_stats_restore =
+                                        Some(group_name.clone());
+                                }
                             });
+                            if let Some(status) = state.group_reset_status.get(&group_name) {
+                                ui.small(status);
+                            }
 
                             ui.collapsing("团设与建卡规则", |ui| {
                                 if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
@@ -12486,6 +12657,44 @@ fn trpg_group_settings_window(
             manager.as_mut(),
             &group_name,
             rule_engine_state,
+        );
+    }
+    if let Some(group_name) = turn_zero_reset {
+        let captured = capture_missing_group_initial_player_states(
+            manager.as_mut(),
+            &group_name,
+        );
+        let reset = manager
+            .trpg_groups
+            .get_mut(&group_name)
+            .is_some_and(TrpgGroup::reset_all_turns);
+        changed |= captured > 0 || reset;
+        state.group_reset_status.insert(
+            group_name,
+            if captured == 0 {
+                "轮次已全部归零；已有首轮前状态快照保持不变".to_owned()
+            } else {
+                format!("轮次已全部归零；为 {captured} 个玩家建立了新的首轮前状态快照")
+            },
+        );
+    }
+    if let Some(group_name) = initial_stats_restore {
+        let (restored, missing) = restore_group_initial_player_stats(
+            manager.as_mut(),
+            &group_name,
+            rule_engine_state,
+        );
+        changed |= restored > 0;
+        state.group_reset_status.insert(
+            group_name,
+            if restored == 0 {
+                "没有可恢复的首轮前状态；旧跑团请先确认一次“轮次全部归零”以建立基线"
+                    .to_owned()
+            } else if missing == 0 {
+                format!("已恢复 {restored} 个玩家的首轮前状态")
+            } else {
+                format!("已恢复 {restored} 个玩家；另有 {missing} 个玩家没有首轮前快照")
+            },
         );
     }
     if let Some((group_name, target_id, action)) = legacy_negative_action {
@@ -17923,6 +18132,65 @@ mod tests {
         let target = &manager.player_characters["target"];
         assert_eq!(target.damage_taken_this_turn, 0.0);
         assert_eq!(target.healing_taken_this_turn, 0.0);
+    }
+
+    #[test]
+    fn group_restores_the_persisted_pre_first_turn_player_stats() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                name: "原角色名".to_owned(),
+                hp: 18.0,
+                max_hp: 24.0,
+                mp: 7.0,
+                max_mp: 12.0,
+                level: 3,
+                exp: 4,
+                damage_taken_this_turn: 2.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["target".to_owned()],
+            ..Default::default()
+        });
+        let mut rule_engine_state = RuleEngineState::default();
+        assert!(advance_group_world_turn(
+            &mut manager,
+            "party",
+            &mut rule_engine_state,
+        ));
+        assert_eq!(
+            manager.trpg_groups["party"].initial_player_states["target"].hp,
+            18.0
+        );
+        {
+            let character = manager.player_characters.get_mut("target").unwrap();
+            character.name = "后来改名".to_owned();
+            character.hp = 1.0;
+            character.max_hp = 30.0;
+            character.mp = 0.0;
+            character.level = 9;
+            character.exp = 99;
+        }
+
+        assert_eq!(
+            restore_group_initial_player_stats(
+                &mut manager,
+                "party",
+                &mut rule_engine_state,
+            ),
+            (1, 0)
+        );
+
+        let character = &manager.player_characters["target"];
+        assert_eq!(character.name, "后来改名");
+        assert_eq!(character.hp, 18.0);
+        assert_eq!(character.max_hp, 24.0);
+        assert_eq!(character.mp, 7.0);
+        assert_eq!(character.level, 3);
+        assert_eq!(character.exp, 4);
+        assert_eq!(character.damage_taken_this_turn, 2.0);
     }
 
     #[test]

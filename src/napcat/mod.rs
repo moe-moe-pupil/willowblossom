@@ -1592,6 +1592,8 @@ pub struct TrpgGroup {
     pub world_turn: u32,
     #[serde(default)]
     pub player_turns: HashMap<String, TrpgPlayerTurnState>,
+    #[serde(default)]
+    pub initial_player_states: HashMap<String, PlayerCharacter>,
 }
 
 impl Default for TrpgGroup {
@@ -1620,6 +1622,7 @@ impl Default for TrpgGroup {
             group_chats: Vec::new(),
             world_turn: 0,
             player_turns: HashMap::default(),
+            initial_player_states: HashMap::default(),
         }
     }
 }
@@ -1672,7 +1675,12 @@ impl TrpgGroup {
         let before_len = self.player_turns.len();
         self.player_turns
             .retain(|target_id, _| self.players.contains(target_id));
-        let mut changed = player_len != self.players.len() || before_len != self.player_turns.len();
+        let initial_state_len = self.initial_player_states.len();
+        self.initial_player_states
+            .retain(|target_id, _| self.players.contains(target_id));
+        let mut changed = player_len != self.players.len()
+            || before_len != self.player_turns.len()
+            || initial_state_len != self.initial_player_states.len();
 
         for target_id in &self.players {
             if !self.player_turns.contains_key(target_id) {
@@ -2492,6 +2500,20 @@ impl TrpgGroup {
                 changed = true;
             }
         }
+        changed
+    }
+
+    pub fn reset_all_turns(&mut self) -> bool {
+        let mut changed = self.sync_turn_players();
+        changed |= self.world_turn != 0;
+        self.world_turn = 0;
+        for turn in self.player_turns.values_mut() {
+            changed |= turn.turns_passed != 0 || turn.acted || turn.skipped;
+            turn.turns_passed = 0;
+            turn.acted = false;
+            turn.skipped = false;
+        }
+        changed |= self.reset_all_legacy_negative_timers();
         changed
     }
 
@@ -13656,6 +13678,35 @@ mod tests {
         assert_eq!(group.world_turn, 1);
         assert_eq!(group.player_turns["a"].turns_passed, 1);
         assert_eq!(group.player_turns["b"].turns_passed, 1);
+    }
+
+    #[test]
+    fn trpg_group_reset_all_turns_sets_world_and_player_clocks_to_zero() {
+        let mut group = TrpgGroup {
+            players: vec!["a".to_owned(), "b".to_owned()],
+            world_turn: 8,
+            player_turns: HashMap::from([
+                ("a".to_owned(), TrpgPlayerTurnState {
+                    turns_passed: 8,
+                    acted: true,
+                    skipped: false,
+                }),
+                ("b".to_owned(), TrpgPlayerTurnState {
+                    turns_passed: 7,
+                    acted: false,
+                    skipped: true,
+                }),
+            ]),
+            ..Default::default()
+        };
+
+        assert!(group.reset_all_turns());
+
+        assert_eq!(group.world_turn, 0);
+        assert!(group.player_turns.values().all(|turn| {
+            turn.turns_passed == 0 && !turn.acted && !turn.skipped
+        }));
+        assert!(!group.reset_all_turns());
     }
 
     #[test]
