@@ -443,9 +443,9 @@ impl Default for ReplayStudio {
             video_path: DEFAULT_VIDEO_PATH.to_owned(),
             video_fps: 15,
             music_enabled: true,
-            music_volume: 0.35,
+            music_volume: 0.65,
             speech_enabled: true,
-            speech_volume: 0.90,
+            speech_volume: 1.25,
             speech_settings_open: false,
             deepseek_custom_prompt: String::new(),
             project_export_path: DEFAULT_REPLAY_PATH.to_owned(),
@@ -540,6 +540,9 @@ fn record_replay(
         } else {
             dialogue_end
         };
+        if !record_camera_enabled {
+            extend_replay_for_speech(replay);
+        }
         if captured_any && !record_camera_enabled {
             if let Ok(base) = camera.single() {
                 replay.camera = turn_based_camera_track(
@@ -705,11 +708,6 @@ impl PreviewSpeechController {
                 .get(&line.sender_id)
                 .cloned()
                 .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
-            let rate = fitted_speech_rate(
-                settings.speech_rate,
-                &line.text,
-                line.duration_ms,
-            );
             worker
                 .requests
                 .send(OnnxPreviewRequest {
@@ -721,8 +719,11 @@ impl PreviewSpeechController {
                         line.sender_id,
                     ),
                     emotion: resolved_emotivoice_emotion(settings.emotion.as_deref()).to_owned(),
-                    speed: combined_onnx_speed(rate, replay.master_speech_speed),
-                    volume: (global_volume * settings.volume).clamp(0.0, 1.0),
+                    speed: combined_onnx_speed(
+                        settings.speech_rate,
+                        replay.master_speech_speed,
+                    ),
+                    volume: (global_volume * settings.volume).max(0.0),
                 })
                 .map_err(|err| format!("EmotiVoice preview worker stopped: {err}"))?;
         }
@@ -1574,7 +1575,7 @@ fn replay_controls(
         );
         ui.add_enabled(
             studio.music_enabled,
-            egui::Slider::new(&mut studio.music_volume, 0.05..=0.60)
+            egui::Slider::new(&mut studio.music_volume, 0.05..=1.50)
                 .text("音量")
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
@@ -1586,21 +1587,26 @@ fn replay_controls(
         );
         ui.add_enabled(
             studio.speech_enabled,
-            egui::Slider::new(&mut studio.speech_volume, 0.20..=1.00)
+            egui::Slider::new(&mut studio.speech_volume, 0.20..=2.00)
                 .text("语音音量")
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
         if let Some(replay) = studio.replay.as_mut() {
             ui.add_enabled_ui(studio.speech_enabled, |ui| {
                 ui.label("整体语速");
-                ui.add(
-                    egui::DragValue::new(&mut replay.master_speech_speed)
-                        .speed(0.05)
-                        .range(0.10..=f32::INFINITY)
-                        .fixed_decimals(2)
-                        .suffix("×"),
-                )
-                .on_hover_text("同时调整所有角色在播放预览和 MP4 导出中的语速；没有上限。");
+                let changed = ui
+                    .add(
+                        egui::DragValue::new(&mut replay.master_speech_speed)
+                            .speed(0.05)
+                            .range(0.10..=f32::INFINITY)
+                            .fixed_decimals(2)
+                            .suffix("×"),
+                    )
+                    .on_hover_text("同时调整所有角色在播放预览和 MP4 导出中的语速；没有上限。")
+                    .changed();
+                if changed {
+                    extend_replay_for_speech(replay);
+                }
             });
         }
         if let Some(replay) = studio.replay.as_mut() {
@@ -1619,6 +1625,7 @@ fn replay_controls(
             if changed {
                 let new_duration = replay.master_dialogue_duration;
                 retime_replay(replay, previous_duration, new_duration);
+                extend_replay_for_speech(replay);
                 studio.playback_ms = studio.playback_ms.min(replay.duration_ms);
             }
         }
@@ -1626,7 +1633,7 @@ fn replay_controls(
             studio.speech_settings_open = true;
         }
     });
-    ui.small("整体语速默认 1.30×；整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。预览与导出共用同一条时间线和 EmotiVoice 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
+    ui.small("整体语速默认 1.30×；长台词不会自动加速，而会自动延长字幕和镜头时间，确保角色保持固定语速。整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。预览与导出共用同一条时间线和 EmotiVoice 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -1879,6 +1886,9 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         });
     studio.speech_settings_open = open;
     if settings_changed {
+        if let Some(replay) = studio.replay.as_mut() {
+            extend_replay_for_speech(replay);
+        }
         studio.status = "角色语音设置已更新，将用于下一句预览和视频导出".to_owned();
     }
 }
@@ -1940,6 +1950,7 @@ fn stop_recording(studio: &mut ReplayStudio) {
         } else {
             dialogue_end
         };
+        extend_replay_for_speech(replay);
     }
     studio.mode = ReplayMode::Idle;
     studio.playback_ms = 0;
@@ -1996,6 +2007,7 @@ fn build_from_history(
         retain_dialogue_with_standees(&mut replay.dialogue, &speaker_positions);
     spatially_order_dialogue_turns(&mut replay.dialogue, &speaker_positions);
     replay.duration_ms = retime_dialogue_turns(&mut replay.dialogue);
+    extend_replay_for_speech(&mut replay);
     if let Ok(transform) = camera.single() {
         replay.camera = turn_based_camera_track(
             transform,
@@ -2219,6 +2231,7 @@ fn apply_ready_director_plan(
         .last()
         .map(|line| line.time_ms.saturating_add(line.duration_ms))
         .unwrap_or(5_000);
+    extend_replay_for_speech(replay);
 
     let base = camera
         .single()
@@ -2290,6 +2303,9 @@ fn start_playback(
     studio: &mut ReplayStudio,
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
 ) {
+    if let Some(replay) = studio.replay.as_mut() {
+        extend_replay_for_speech(replay);
+    }
     let Some(scene) = studio.replay.as_ref().map(|replay| replay.scene.clone()) else {
         return;
     };
@@ -2323,6 +2339,9 @@ fn start_video_export(
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
 ) {
+    if let Some(replay) = studio.replay.as_mut() {
+        extend_replay_for_speech(replay);
+    }
     let Some((duration_ms, dialogue, master_speech_speed, speaker_voice_settings)) =
         studio.replay.as_ref().map(|replay| {
             (
@@ -2673,11 +2692,6 @@ fn write_narration_track(
                 .get(&line.sender_id)
                 .cloned()
                 .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
-            let fitted_rate = fitted_speech_rate(
-                settings.speech_rate,
-                &line.text,
-                line.duration_ms,
-            );
             SpeechSynthesisJob {
                 text: speech_text_for_line(line),
                 output_path: working_directory
@@ -2689,7 +2703,10 @@ fn write_narration_track(
                     line.sender_id,
                 ),
                 emotion: resolved_emotivoice_emotion(settings.emotion.as_deref()).to_owned(),
-                onnx_speed: combined_onnx_speed(fitted_rate, master_speech_speed),
+                onnx_speed: combined_onnx_speed(
+                    settings.speech_rate,
+                    master_speech_speed,
+                ),
                 duration_ms: line.duration_ms,
             }
         })
@@ -2726,7 +2743,7 @@ fn write_narration_track(
         BITS_PER_SAMPLE,
         data_bytes as u32,
     )?;
-    let volume = volume.clamp(0.0, 1.0);
+    let volume = volume.max(0.0);
     let mut cue_index = 0_usize;
     for sample_index in 0..sample_count {
         while cue_index + 1 < cues.len() && sample_index >= cues[cue_index + 1].start_sample {
@@ -2819,8 +2836,8 @@ fn speaker_voice_profile(sender_id: u64) -> (i32, i32) {
     (0, RATES[profile])
 }
 
-fn fitted_speech_rate(base_rate: i32, text: &str, duration_ms: u64) -> i32 {
-    let estimated_ms = text.chars().fold(250_u64, |total, character| {
+fn estimated_speech_duration_ms(text: &str) -> u64 {
+    text.chars().fold(250_u64, |total, character| {
         let character_ms = match character {
             '。' | '！' | '？' | '!' | '?' | '；' | ';' => 280,
             '，' | ',' | '、' | '：' | ':' => 160,
@@ -2829,14 +2846,78 @@ fn fitted_speech_rate(base_rate: i32, text: &str, duration_ms: u64) -> i32 {
             _ => 45,
         };
         total.saturating_add(character_ms)
-    });
-    let speaking_window_ms = duration_ms.saturating_sub(120).max(1);
-    let required_rate = estimated_ms
-        .saturating_mul(100)
-        .saturating_add(speaking_window_ms - 1)
-        / speaking_window_ms;
-    let required_percent_faster = required_rate.saturating_sub(100) as i32;
-    base_rate.max(required_percent_faster).clamp(-30, 180)
+    })
+}
+
+fn minimum_speech_window_ms(text: &str, relative_rate: i32, master_speed: f32) -> u64 {
+    let speed = combined_onnx_speed(relative_rate, master_speed) as f64;
+    ((estimated_speech_duration_ms(text) as f64 * 1.20 / speed).ceil() as u64)
+        .saturating_add(250)
+}
+
+fn stretched_replay_time(time_ms: u64, segments: &[(u64, u64, u64, u64)]) -> u64 {
+    let mut accumulated_extension = 0_u64;
+    for &(old_start, old_end, new_start, new_end) in segments {
+        if time_ms < old_start {
+            return time_ms.saturating_add(accumulated_extension);
+        }
+        if time_ms <= old_end {
+            let old_duration = old_end.saturating_sub(old_start).max(1);
+            let new_duration = new_end.saturating_sub(new_start);
+            let elapsed = time_ms.saturating_sub(old_start);
+            return new_start.saturating_add(
+                ((elapsed as u128 * new_duration as u128) / old_duration as u128) as u64,
+            );
+        }
+        accumulated_extension = new_end.saturating_sub(old_end);
+    }
+    time_ms.saturating_add(accumulated_extension)
+}
+
+fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
+    let mut accumulated_extension = 0_u64;
+    let mut segments = Vec::with_capacity(replay.dialogue.len());
+    let mut updated_lines = Vec::with_capacity(replay.dialogue.len());
+
+    for line in &replay.dialogue {
+        let settings = replay
+            .speaker_voice_settings
+            .get(&line.sender_id)
+            .cloned()
+            .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
+        let required_duration = minimum_speech_window_ms(
+            &speech_text_for_line(line),
+            settings.speech_rate,
+            replay.master_speech_speed,
+        );
+        let new_duration = line.duration_ms.max(required_duration);
+        let new_start = line.time_ms.saturating_add(accumulated_extension);
+        let old_end = line.time_ms.saturating_add(line.duration_ms);
+        let new_end = new_start.saturating_add(new_duration);
+        segments.push((
+            line.time_ms,
+            old_end,
+            new_start,
+            new_end,
+        ));
+        updated_lines.push((new_start, new_duration));
+        accumulated_extension =
+            accumulated_extension.saturating_add(new_duration.saturating_sub(line.duration_ms));
+    }
+
+    if accumulated_extension == 0 {
+        return false;
+    }
+
+    for (line, (new_start, new_duration)) in replay.dialogue.iter_mut().zip(updated_lines) {
+        line.time_ms = new_start;
+        line.duration_ms = new_duration;
+    }
+    for frame in &mut replay.camera {
+        frame.time_ms = stretched_replay_time(frame.time_ms, &segments);
+    }
+    replay.duration_ms = stretched_replay_time(replay.duration_ms, &segments);
+    true
 }
 
 fn default_master_speech_speed() -> f32 { 1.30 }
@@ -2940,27 +3021,20 @@ fn synthesize_speech_batch(
     let mut tts = create_onnx_tts()?;
     for job in jobs {
         let max_samples = job.duration_ms.saturating_mul(32_000) / 1_000;
-        let mut speed = job.onnx_speed;
-        for attempt in 0..3 {
-            let wav = tts.synthesize(
-                &job.text,
-                &job.speaker,
-                &job.emotion,
-                speed,
-            )?;
-            fs::write(&job.output_path, wav)
-                .map_err(|err| format!("无法保存 EmotiVoice 角色语音：{err}"))?;
-            let samples = read_pcm16_mono_wav(Path::new(&job.output_path))?;
-            if samples.len() as u64 <= max_samples {
-                break;
-            }
-            if attempt == 2 {
-                return Err(format!(
-                    "EmotiVoice 无法在 {} 毫秒内完整读完台词",
-                    job.duration_ms
-                ));
-            }
-            speed *= (samples.len() as f32 / max_samples.max(1) as f32) * 1.06;
+        let wav = tts.synthesize(
+            &job.text,
+            &job.speaker,
+            &job.emotion,
+            job.onnx_speed,
+        )?;
+        fs::write(&job.output_path, wav)
+            .map_err(|err| format!("无法保存 EmotiVoice 角色语音：{err}"))?;
+        let samples = read_pcm16_mono_wav(Path::new(&job.output_path))?;
+        if samples.len() as u64 > max_samples {
+            return Err(format!(
+                "EmotiVoice 生成的语音超过 {} 毫秒；请提高整体语速或延长整体台词停留",
+                job.duration_ms
+            ));
         }
     }
     Ok(())
@@ -3022,7 +3096,7 @@ fn write_jrpg_soundtrack(path: &Path, duration_ms: u64, volume: f32) -> Result<(
     let fade_out_start = (duration_seconds - fade_seconds).max(0.0);
     let filter = format!(
         "volume={:.4},afade=t=in:st=0:d={fade_seconds:.3},afade=t=out:st={fade_out_start:.3}:d={fade_seconds:.3}",
-        volume.clamp(0.0, 1.0)
+        volume.max(0.0)
     );
     let mut command = Command::new("ffmpeg");
     command
@@ -4476,12 +4550,15 @@ mod tests {
     }
 
     #[test]
-    fn emotivoice_speed_auto_fits_long_lines() {
-        assert_eq!(
-            fitted_speech_rate(18, "短句", 4_875),
-            18
-        );
-        assert!(fitted_speech_rate(18, &"很长的中文台词".repeat(8), 4_875) > 18);
+    fn emotivoice_keeps_configured_speed_and_extends_long_lines() {
+        let configured_speed = combined_onnx_speed(18, 1.30);
+        assert!(minimum_speech_window_ms("短句", 18, 1.30) < MIN_DIALOGUE_MS);
+        assert!(minimum_speech_window_ms(&"很长的中文台词".repeat(8), 18, 1.30) > 4_875);
+        assert!((configured_speed - combined_onnx_speed(18, 1.30)).abs() < f32::EPSILON);
+        let stretched = [(350, 1_000, 350, 2_000), (1_270, 2_000, 2_270, 3_000)];
+        assert_eq!(stretched_replay_time(1_000, &stretched), 2_000);
+        assert_eq!(stretched_replay_time(1_135, &stretched), 2_135);
+        assert_eq!(stretched_replay_time(2_500, &stretched), 3_500);
         assert!((onnx_speed(18) - 1.09).abs() < 0.001);
         assert_eq!(onnx_speed(180), 1.45);
         assert_eq!(default_master_speech_speed(), 1.30);
@@ -4513,6 +4590,13 @@ mod tests {
             scaled_dialogue_duration_ms("短句", 2.0),
             MIN_DIALOGUE_MS * 2
         );
+    }
+
+    #[test]
+    fn replay_audio_defaults_are_clearly_audible() {
+        let studio = ReplayStudio::default();
+        assert_eq!(studio.music_volume, 0.65);
+        assert_eq!(studio.speech_volume, 1.25);
     }
 
     #[test]
