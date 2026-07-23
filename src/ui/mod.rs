@@ -1363,13 +1363,7 @@ fn chat_window(
         )
     };
     let window_id = current_group
-        .map(|group_name| {
-            Id::new((
-                group_name,
-                target_id,
-                "group_member_chat_window_v2",
-            ))
-        })
+        .map(|group_name| group_member_chat_window_id(group_name, target_id))
         .unwrap_or_else(|| standalone_chat_window_id(id, target_id));
     let mut window = egui::Window::new(nickname)
         .open(&mut window_open)
@@ -1667,7 +1661,10 @@ fn chat_window(
 
     if let Some(group_name) = current_group {
         ctx.set_sublayer(
-            egui::LayerId::new(egui::Order::Middle, Id::new(group_name)),
+            egui::LayerId::new(
+                egui::Order::Middle,
+                chat_group_window_id(group_name),
+            ),
             egui::LayerId::new(egui::Order::Middle, window_id),
         );
     }
@@ -1818,6 +1815,18 @@ fn standalone_chat_window_id(id: Id, target_id: &str) -> Id {
     ))
 }
 
+fn chat_group_window_id(group_name: &str) -> Id { Id::new((group_name, "chat_group_window_v2")) }
+
+fn group_member_chat_window_id(group_name: &str, target_id: &str) -> Id {
+    // v3 intentionally resets invalid v2 window geometry, including persisted
+    // zero-size member windows that cannot be grabbed or resized.
+    Id::new((
+        group_name,
+        target_id,
+        "group_member_chat_window_v3",
+    ))
+}
+
 fn focus_standalone_chat_window(ctx: &Context, target_id: &str) {
     let window_id = standalone_chat_window_id(Id::new(target_id), target_id);
     let mut collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -1897,7 +1906,7 @@ fn group_member_leave_button(ctx: &Context, window_id: Id, window_rect: Rect) ->
         window_rect.top() + 3.0,
     );
     egui::Area::new(window_id.with("leave_group_button"))
-        .order(egui::Order::Middle)
+        .order(egui::Order::Foreground)
         .fixed_pos(button_pos)
         .show(ctx, |ui| {
             ui.small_button("离开")
@@ -14130,10 +14139,7 @@ pub fn ui_system(
                 let response = egui::Window::new(group_title)
                     .open(&mut group_open)
                     .constrain_to(ui.max_rect())
-                    .id(Id::new((
-                        k.as_str(),
-                        "chat_group_window_v2",
-                    )))
+                    .id(chat_group_window_id(k.as_str()))
                     .default_pos(ui.max_rect().left_top() + egui::vec2(12.0, 12.0))
                     .default_size(group_size)
                     .min_size(CHAT_WINDOW_MIN_SIZE)
@@ -14438,6 +14444,26 @@ mod tests {
         assert_eq!(
             ctx.memory(|memory| memory.area_rect(window_id).unwrap().min),
             egui::pos2(310.0, 260.0)
+        );
+    }
+
+    #[test]
+    fn group_member_window_is_layered_above_its_actual_group_window() {
+        let ctx = Context::default();
+        let parent = egui::LayerId::new(
+            egui::Order::Middle,
+            chat_group_window_id("狂妄号"),
+        );
+        let child = egui::LayerId::new(
+            egui::Order::Middle,
+            group_member_chat_window_id("狂妄号", "1670426821"),
+        );
+
+        ctx.set_sublayer(parent, child);
+
+        assert_eq!(
+            ctx.memory(|memory| memory.areas().parent_layer(child)),
+            Some(parent)
         );
     }
 
