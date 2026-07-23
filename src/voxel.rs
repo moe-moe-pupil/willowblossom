@@ -125,6 +125,7 @@ const ORBITAL_PLANET_VOXEL_RADIUS: i32 = 485;
 const ORBITAL_PLANET_CAP_RADIUS: i32 = 128;
 const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
+const VOXEL_SCENE_AUTOSAVE_SECONDS: f32 = 30.0;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
 const VOXEL_MATERIAL_COUNT: usize = 10;
 const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
@@ -301,6 +302,62 @@ struct VoxelSceneSnapshot {
     voxels: Vec<(IVec3, u8)>,
     physics_bodies: Vec<VoxelPhysicsBodySnapshot>,
     placed_lights: Vec<VoxelPlacedLight>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PersistedVoxelCell {
+    position: [i32; 3],
+    material: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PersistedVoxelPhysicsBody {
+    cells: Vec<PersistedVoxelCell>,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    scale: [f32; 3],
+    linear_velocity: [f32; 3],
+    angular_velocity: [f32; 3],
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PersistedVoxelPlacedLight {
+    kind: VoxelLightTool,
+    cell: [i32; 3],
+    color: [f32; 3],
+    intensity: f32,
+    range: f32,
+    direction: [f32; 3],
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    scale: [f32; 3],
+    linear_velocity: [f32; 3],
+    angular_velocity: [f32; 3],
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct PersistedVoxelScene {
+    voxels: Vec<PersistedVoxelCell>,
+    planet: Option<PersistedVoxelPlanet>,
+    physics_bodies: Vec<PersistedVoxelPhysicsBody>,
+    placed_lights: Vec<PersistedVoxelPlacedLight>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct PersistedVoxelPlanet {
+    cells: Vec<PersistedVoxelCell>,
+    removed: Vec<[i32; 3]>,
+}
+
+#[derive(Resource, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct VoxelSceneStore {
+    scene: Option<PersistedVoxelScene>,
+}
+
+#[derive(Resource, Default)]
+struct VoxelScenePersistenceState {
+    elapsed_seconds: f32,
+    force_save: bool,
 }
 
 #[derive(Component)]
@@ -852,6 +909,7 @@ pub(crate) struct VoxelEditorState {
     next_scene_snapshot_number: u64,
     save_scene_requested: bool,
     restore_scene_requested: Option<usize>,
+    reset_scene_confirmation: bool,
     first_person_space_tap_elapsed: f32,
     first_person_was_enabled: bool,
     first_person_cursor_released: bool,
@@ -916,6 +974,7 @@ impl Default for VoxelEditorState {
             next_scene_snapshot_number: 1,
             save_scene_requested: false,
             restore_scene_requested: None,
+            reset_scene_confirmation: false,
             first_person_space_tap_elapsed: f32::INFINITY,
             first_person_was_enabled: false,
             // Keep the OS cursor free until the user explicitly clicks the 3D viewport.
@@ -1147,6 +1206,21 @@ impl VoxelEditorState {
         }
     }
 
+    pub(crate) fn reset_scene_confirmation(&self) -> bool { self.reset_scene_confirmation }
+
+    pub(crate) fn request_reset_scene_confirmation(&mut self) {
+        self.reset_scene_confirmation = true;
+    }
+
+    pub(crate) fn cancel_reset_scene_confirmation(&mut self) {
+        self.reset_scene_confirmation = false;
+    }
+
+    pub(crate) fn confirm_reset_scene(&mut self) {
+        self.reset_scene_confirmation = false;
+        self.reset_requested = true;
+    }
+
     fn selection_bounds(&self) -> Option<(IVec3, IVec3)> {
         let start = self.selection_anchor?;
         let end = self.selection_end?;
@@ -1223,6 +1297,19 @@ impl Plugin for TrpgVoxelPlugin {
             .revert_to_default_on_deserialization_errors(true)
             .build()
             .expect("failed to initialize voxel toolbar settings");
+        let scene_store = Persistent::<VoxelSceneStore>::builder()
+            .name("voxel_scene")
+            .format(StorageFormat::Bincode)
+            .path(
+                Path::new(".data")
+                    .join("willowblossom")
+                    .join("voxel_scene.bin"),
+            )
+            .default(VoxelSceneStore::default())
+            .revertible(true)
+            .revert_to_default_on_deserialization_errors(true)
+            .build()
+            .expect("failed to initialize voxel scene store");
         app.add_plugins((
             PhysicsPlugins::default(),
             VoxelPlugin::<u8>::default(),
@@ -1244,9 +1331,11 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPlayerStandeeAssets>()
         .init_resource::<VoxelToolGunDragState>()
         .init_resource::<VoxelPhysicsChunkLoader>()
+        .init_resource::<VoxelScenePersistenceState>()
         .insert_resource(player_camera_store)
         .insert_resource(inventory_store)
         .insert_resource(toolbar_settings_store)
+        .insert_resource(scene_store)
         .add_systems(
             Startup,
             (
@@ -1255,11 +1344,12 @@ impl Plugin for TrpgVoxelPlugin {
                 setup_voxel_materials,
                 setup_voxel_grid,
                 populate_voxel_grid,
-                setup_voxel_radiance_volume,
                 setup_voxel_auto_doors,
                 setup_voxel_interior_lights,
                 setup_voxel_sample_props,
+                setup_voxel_radiance_volume,
                 setup_voxel_view,
+                load_persisted_voxel_scene,
                 setup_voxel_player_cameras,
             )
                 .chain(),
@@ -1303,6 +1393,7 @@ impl Plugin for TrpgVoxelPlugin {
                     animate_voxel_materials,
                     persist_voxel_inventory,
                     persist_voxel_toolbar_settings,
+                    persist_voxel_scene,
                 )
                     .chain(),
             )
@@ -1364,6 +1455,310 @@ fn persist_voxel_toolbar_settings(
     **store = snapshot;
     if let Err(err) = store.persist() {
         eprintln!("failed to persist voxel toolbar settings: {err}");
+    }
+}
+
+fn persisted_voxel_cell(cell: IVec3, material: u8) -> PersistedVoxelCell {
+    PersistedVoxelCell {
+        position: cell.to_array(),
+        material,
+    }
+}
+
+fn persisted_voxel_physics_body(
+    body: &VoxelPhysicsBody,
+    transform: &Transform,
+    linear_velocity: &LinearVelocity,
+    angular_velocity: &AngularVelocity,
+) -> PersistedVoxelPhysicsBody {
+    PersistedVoxelPhysicsBody {
+        cells: body
+            .cells
+            .iter()
+            .map(|(cell, material)| persisted_voxel_cell(*cell, *material))
+            .collect(),
+        translation: transform.translation.to_array(),
+        rotation: transform.rotation.to_array(),
+        scale: transform.scale.to_array(),
+        linear_velocity: linear_velocity.0.to_array(),
+        angular_velocity: angular_velocity.0.to_array(),
+    }
+}
+
+fn persisted_voxel_light(
+    light: &VoxelPlacedLight,
+    transform: &Transform,
+    linear_velocity: Option<&LinearVelocity>,
+    angular_velocity: Option<&AngularVelocity>,
+) -> PersistedVoxelPlacedLight {
+    PersistedVoxelPlacedLight {
+        kind: light.kind,
+        cell: light.cell.to_array(),
+        color: light.color,
+        intensity: light.intensity,
+        range: light.range,
+        direction: light.direction.to_array(),
+        translation: transform.translation.to_array(),
+        rotation: transform.rotation.to_array(),
+        scale: transform.scale.to_array(),
+        linear_velocity: linear_velocity
+            .unwrap_or(&LinearVelocity::ZERO)
+            .0
+            .to_array(),
+        angular_velocity: angular_velocity
+            .unwrap_or(&AngularVelocity::ZERO)
+            .0
+            .to_array(),
+    }
+}
+
+fn runtime_voxel_physics_body(
+    body: &PersistedVoxelPhysicsBody,
+) -> (
+    Vec<(IVec3, u8)>,
+    Transform,
+    LinearVelocity,
+    AngularVelocity,
+) {
+    (
+        body.cells
+            .iter()
+            .map(|cell| {
+                (
+                    IVec3::from_array(cell.position),
+                    cell.material,
+                )
+            })
+            .collect(),
+        Transform {
+            translation: Vec3::from_array(body.translation),
+            rotation: Quat::from_array(body.rotation).normalize(),
+            scale: Vec3::from_array(body.scale),
+        },
+        LinearVelocity(Vec3::from_array(body.linear_velocity)),
+        AngularVelocity(Vec3::from_array(body.angular_velocity)),
+    )
+}
+
+fn runtime_voxel_light(light: &PersistedVoxelPlacedLight) -> VoxelPlacedLight {
+    VoxelPlacedLight {
+        kind: light.kind,
+        cell: IVec3::from_array(light.cell),
+        color: finite_color(light.color, [1.0, 0.78, 0.48]),
+        intensity: finite_clamp(light.intensity, 0.0, 100_000.0, 1_800.0),
+        range: finite_clamp(light.range, VOXEL_SIZE, 100.0, 8.0),
+        direction: Vec3::from_array(light.direction),
+    }
+}
+
+fn load_persisted_voxel_scene(
+    mut commands: Commands,
+    store: Res<Persistent<VoxelSceneStore>>,
+    mut physics_loader: ResMut<VoxelPhysicsChunkLoader>,
+    mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    physics_bodies: Query<Entity, With<VoxelPhysicsBody>>,
+    placed_lights: Query<Entity, With<VoxelPlacedLight>>,
+    mut planets: Query<&mut VoxelOrbitalPlanet>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
+) {
+    let Some(scene) = store.scene.as_ref() else {
+        return;
+    };
+    let Ok(mut grid) = grids.single_mut() else {
+        return;
+    };
+    for cell in occupied_cells(&grid) {
+        grid.set(cell, 0);
+    }
+    for cell in &scene.voxels {
+        if cell.material != 0 {
+            grid.set(
+                IVec3::from_array(cell.position),
+                cell.material,
+            );
+        }
+    }
+    if let (Some(saved_planet), Ok(mut planet)) = (
+        scene.planet.as_ref(),
+        planets.single_mut(),
+    ) {
+        planet.cells = saved_planet
+            .cells
+            .iter()
+            .filter(|cell| cell.material != 0)
+            .map(|cell| {
+                (
+                    IVec3::from_array(cell.position),
+                    cell.material,
+                )
+            })
+            .collect();
+        planet.removed = saved_planet
+            .removed
+            .iter()
+            .copied()
+            .map(IVec3::from_array)
+            .collect();
+        planet.dirty = true;
+    }
+    for entity in &physics_bodies {
+        commands.entity(entity).despawn();
+    }
+    for entity in &placed_lights {
+        commands.entity(entity).despawn();
+    }
+    physics_loader.unloaded_bodies.clear();
+    for body in &scene.physics_bodies {
+        let (cells, transform, linear_velocity, angular_velocity) =
+            runtime_voxel_physics_body(body);
+        if cells.is_empty() {
+            continue;
+        }
+        spawn_voxel_physics_body_at(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            cells,
+            transform,
+            linear_velocity,
+            angular_velocity,
+        );
+    }
+    for light in &scene.placed_lights {
+        let entity = spawn_voxel_placed_light(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            runtime_voxel_light(light),
+        );
+        if light.kind == VoxelLightTool::Physics {
+            commands.entity(entity).insert((
+                Transform {
+                    translation: Vec3::from_array(light.translation),
+                    rotation: Quat::from_array(light.rotation).normalize(),
+                    scale: Vec3::from_array(light.scale),
+                },
+                LinearVelocity(Vec3::from_array(light.linear_velocity)),
+                AngularVelocity(Vec3::from_array(light.angular_velocity)),
+            ));
+        }
+    }
+}
+
+fn persist_voxel_scene(
+    time: Res<Time>,
+    mut app_exit: MessageReader<AppExit>,
+    mut persistence: ResMut<VoxelScenePersistenceState>,
+    grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
+    planets: Query<&VoxelOrbitalPlanet>,
+    physics_loader: Res<VoxelPhysicsChunkLoader>,
+    physics_bodies: Query<(
+        &VoxelPhysicsBody,
+        &Transform,
+        &LinearVelocity,
+        &AngularVelocity,
+    )>,
+    placed_lights: Query<(
+        &VoxelPlacedLight,
+        &Transform,
+        Option<&LinearVelocity>,
+        Option<&AngularVelocity>,
+    )>,
+    mut store: ResMut<Persistent<VoxelSceneStore>>,
+) {
+    persistence.elapsed_seconds += time.delta_secs();
+    let exiting = app_exit.read().next().is_some();
+    if !exiting
+        && !persistence.force_save
+        && persistence.elapsed_seconds < VOXEL_SCENE_AUTOSAVE_SECONDS
+    {
+        return;
+    }
+    persistence.elapsed_seconds = 0.0;
+    persistence.force_save = false;
+    let Ok(grid) = grids.single() else {
+        return;
+    };
+    let mut voxels = voxel_cells(grid)
+        .into_iter()
+        .map(|(cell, material)| persisted_voxel_cell(cell, material))
+        .collect::<Vec<_>>();
+    voxels.sort_unstable_by_key(|cell| cell.position);
+    let planet = planets.single().ok().map(|planet| {
+        let mut cells = planet
+            .cells
+            .iter()
+            .map(|(cell, material)| persisted_voxel_cell(*cell, *material))
+            .collect::<Vec<_>>();
+        cells.sort_unstable_by_key(|cell| cell.position);
+        let mut removed = planet
+            .removed
+            .iter()
+            .map(|cell| cell.to_array())
+            .collect::<Vec<_>>();
+        removed.sort_unstable();
+        PersistedVoxelPlanet { cells, removed }
+    });
+    let mut physics_bodies = physics_bodies
+        .iter()
+        .map(
+            |(body, transform, linear_velocity, angular_velocity)| {
+                persisted_voxel_physics_body(
+                    body,
+                    transform,
+                    linear_velocity,
+                    angular_velocity,
+                )
+            },
+        )
+        .collect::<Vec<_>>();
+    physics_bodies.extend(
+        physics_loader.unloaded_bodies.iter().map(|snapshot| {
+            persisted_voxel_physics_body(
+                &snapshot.body,
+                &snapshot.transform,
+                &snapshot.linear_velocity,
+                &snapshot.angular_velocity,
+            )
+        }),
+    );
+    physics_bodies.sort_by_key(|body| {
+        (
+            body.translation.map(f32::to_bits),
+            body.rotation.map(f32::to_bits),
+            body.cells.first().map_or([0; 3], |cell| cell.position),
+            body.cells.len(),
+        )
+    });
+    let mut placed_lights = placed_lights
+        .iter()
+        .map(
+            |(light, transform, linear_velocity, angular_velocity)| {
+                persisted_voxel_light(
+                    light,
+                    transform,
+                    linear_velocity,
+                    angular_velocity,
+                )
+            },
+        )
+        .collect::<Vec<_>>();
+    placed_lights.sort_unstable_by_key(|light| light.cell);
+    let snapshot = VoxelSceneStore {
+        scene: Some(PersistedVoxelScene {
+            voxels,
+            planet,
+            physics_bodies,
+            placed_lights,
+        }),
+    };
+    if **store == snapshot {
+        return;
+    }
+    **store = snapshot;
+    if let Err(err) = store.persist() {
+        eprintln!("failed to persist voxel scene: {err}");
     }
 }
 
@@ -2921,11 +3316,19 @@ fn setup_voxel_sample_props(
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
+    spawn_default_voxel_physics_props(&mut commands, &mut meshes, &materials);
+}
+
+fn spawn_default_voxel_physics_props(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &VoxelMaterials,
+) {
     for (cells, transform) in voxel_physics_prop_specs() {
         spawn_voxel_physics_body_at(
-            &mut commands,
-            &mut meshes,
-            &materials,
+            commands,
+            meshes,
+            materials,
             cells,
             transform,
             LinearVelocity::ZERO,
@@ -5067,9 +5470,13 @@ fn handle_editor_requests(
     mut commands: Commands,
     mut editor: ResMut<VoxelEditorState>,
     mut physics_loader: ResMut<VoxelPhysicsChunkLoader>,
+    mut persistence: ResMut<VoxelScenePersistenceState>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     physics_bodies: Query<Entity, With<VoxelPhysicsBody>>,
     placed_lights: Query<Entity, With<VoxelPlacedLight>>,
+    mut planets: Query<&mut VoxelOrbitalPlanet>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
 ) {
     let Ok(mut grid) = grids.single_mut() else {
         return;
@@ -5087,14 +5494,21 @@ fn handle_editor_requests(
             grid.set(position, 0);
         }
         populate_default_grid(&mut grid);
+        if let Ok(mut planet) = planets.single_mut() {
+            planet.cells = voxel_orbital_planet_cells().into_iter().collect();
+            planet.removed.clear();
+            planet.dirty = true;
+        }
+        spawn_default_voxel_physics_props(&mut commands, &mut meshes, &materials);
         editor.undo.clear();
         editor.redo.clear();
         editor.selection_anchor = None;
         editor.selection_end = None;
         editor.selection_is_planet = false;
         editor.selected_light = None;
-        editor.physics_status = None;
+        editor.physics_status = Some("Scene reset to defaults and saved".to_owned());
         editor.reset_requested = false;
+        persistence.force_save = true;
     }
     if editor.undo_requested {
         if let Some(stroke) = editor.undo.pop() {
@@ -5535,6 +5949,7 @@ fn process_voxel_scene_history(
     mut commands: Commands,
     mut editor: ResMut<VoxelEditorState>,
     mut physics_loader: ResMut<VoxelPhysicsChunkLoader>,
+    mut persistence: ResMut<VoxelScenePersistenceState>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     physics_bodies: Query<(
         Entity,
@@ -5590,6 +6005,7 @@ fn process_voxel_scene_history(
             snapshot.physics_bodies.len(),
             snapshot.placed_lights.len()
         ));
+        persistence.force_save = true;
     }
 
     let Some(snapshot_index) = editor.restore_scene_requested.take() else {
@@ -5644,6 +6060,7 @@ fn process_voxel_scene_history(
     editor.selected_light = None;
     editor.physics_action_requested = None;
     editor.physics_status = Some(format!("已恢复 {}", snapshot.name));
+    persistence.force_save = true;
 }
 
 fn voxel_cells(grid: &Grid<u8>) -> Vec<(IVec3, u8)> {
@@ -8817,10 +9234,115 @@ mod tests {
     }
 
     #[test]
+    fn reset_scene_requires_an_explicit_second_confirmation() {
+        let mut editor = VoxelEditorState::default();
+
+        editor.request_reset_scene_confirmation();
+        assert!(editor.reset_scene_confirmation());
+        assert!(!editor.reset_requested);
+
+        editor.cancel_reset_scene_confirmation();
+        assert!(!editor.reset_scene_confirmation());
+        assert!(!editor.reset_requested);
+
+        editor.request_reset_scene_confirmation();
+        editor.confirm_reset_scene();
+        assert!(!editor.reset_scene_confirmation());
+        assert!(editor.reset_requested);
+    }
+
+    #[test]
+    fn persisted_scene_keeps_voxel_and_physics_state_in_bincode() {
+        let transform = Transform {
+            translation: Vec3::new(2.0, 3.0, 4.0),
+            rotation: Quat::from_rotation_y(0.75),
+            scale: Vec3::new(1.0, 1.5, 0.8),
+        };
+        let body = VoxelPhysicsBody {
+            local_center: Vec3::splat(VOXEL_SIZE),
+            cells: vec![(IVec3::new(1, 2, 3), 7)],
+        };
+        let persisted_body = persisted_voxel_physics_body(
+            &body,
+            &transform,
+            &LinearVelocity(Vec3::new(5.0, 6.0, 7.0)),
+            &AngularVelocity(Vec3::new(0.1, 0.2, 0.3)),
+        );
+        let light = VoxelPlacedLight {
+            kind: VoxelLightTool::Physics,
+            cell: IVec3::new(8, 9, 10),
+            color: [0.2, 0.4, 0.8],
+            intensity: 2_400.0,
+            range: 9.0,
+            direction: Vec3::NEG_Z,
+        };
+        let persisted_light = persisted_voxel_light(
+            &light,
+            &transform,
+            Some(&LinearVelocity(Vec3::X * 4.0)),
+            Some(&AngularVelocity(Vec3::Y * 2.0)),
+        );
+        let store = VoxelSceneStore {
+            scene: Some(PersistedVoxelScene {
+                voxels: vec![persisted_voxel_cell(IVec3::new(11, 12, 13), 4)],
+                planet: Some(PersistedVoxelPlanet {
+                    cells: vec![persisted_voxel_cell(IVec3::new(14, 15, 16), 6)],
+                    removed: vec![[17, 18, 19]],
+                }),
+                physics_bodies: vec![persisted_body],
+                placed_lights: vec![persisted_light],
+            }),
+        };
+
+        let bytes = StorageFormat::Bincode
+            .serialize("voxel_scene_test", &store)
+            .unwrap();
+        let restored: VoxelSceneStore = StorageFormat::Bincode
+            .deserialize("voxel_scene_test", &bytes)
+            .unwrap();
+
+        assert_eq!(restored, store);
+        let scene = restored.scene.unwrap();
+        let (_, restored_transform, linear_velocity, angular_velocity) =
+            runtime_voxel_physics_body(&scene.physics_bodies[0]);
+        assert_eq!(
+            restored_transform.translation,
+            transform.translation
+        );
+        assert_eq!(
+            restored_transform.scale,
+            transform.scale
+        );
+        assert!(restored_transform
+            .rotation
+            .abs_diff_eq(transform.rotation, 0.000_001));
+        assert_eq!(
+            linear_velocity.0,
+            Vec3::new(5.0, 6.0, 7.0)
+        );
+        assert_eq!(
+            angular_velocity.0,
+            Vec3::new(0.1, 0.2, 0.3)
+        );
+        assert_eq!(scene.placed_lights[0].translation, [
+            2.0, 3.0, 4.0
+        ]);
+        assert_eq!(
+            scene.planet.as_ref().unwrap().removed,
+            vec![[17, 18, 19]]
+        );
+        assert_eq!(
+            scene.placed_lights[0].linear_velocity,
+            [4.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
     fn scene_history_restores_grid_and_physics_body_state() {
         let (mut app, grid_entity) = test_grid();
         app.init_resource::<VoxelEditorState>()
             .init_resource::<VoxelPhysicsChunkLoader>()
+            .init_resource::<VoxelScenePersistenceState>()
             .init_resource::<Assets<Mesh>>()
             .insert_resource(VoxelMaterials {
                 handles: std::array::from_fn(|_| Handle::default()),

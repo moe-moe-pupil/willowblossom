@@ -12888,8 +12888,27 @@ pub fn ui_system(
                         if ui.button("重做").clicked() {
                             voxel_editor.redo_requested = true;
                         }
-                        if ui.button("重置").clicked() {
-                            voxel_editor.reset_requested = true;
+                        if voxel_editor.reset_scene_confirmation() {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button("Confirm Reset Scene")
+                                    .on_hover_text(
+                                        "Delete the saved scene and restore all default voxels, physics props, and lights",
+                                    )
+                                    .clicked()
+                                {
+                                    voxel_editor.confirm_reset_scene();
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    voxel_editor.cancel_reset_scene_confirmation();
+                                }
+                            });
+                        } else if ui
+                            .button("Reset Scene")
+                            .on_hover_text("Requires a second confirmation")
+                            .clicked()
+                        {
+                            voxel_editor.request_reset_scene_confirmation();
                         }
                         if ui.button("保存当前场景").clicked() {
                             voxel_editor.request_scene_snapshot();
