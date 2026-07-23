@@ -92,7 +92,14 @@ use crate::{
         NapcatOutboundMessage,
         PlayerCharacter,
     },
-    scene::SceneCaptureRequests,
+    rule_engine::{
+        BuffField,
+        BuffValue,
+    },
+    scene::{
+        SceneCaptureRequests,
+        SceneCharacterPositions,
+    },
     voxel_radiance::{
         VoxelRadianceCascade,
         VoxelRadianceCascadePlugin,
@@ -134,6 +141,7 @@ const FIRST_PERSON_JUMP_SPEED: f32 = 3.4;
 const FIRST_PERSON_FLY_SPEED: f32 = 3.5;
 const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
+const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
 const ORBITAL_LAYOUT_SCALE: i32 = 5;
 const RESEARCH_STATION_CENTER: IVec3 = IVec3::new(-100 * ORBITAL_LAYOUT_SCALE, 0, 0);
 const SENSOR_STATION_CENTER: IVec3 = IVec3::new(100 * ORBITAL_LAYOUT_SCALE, 0, 0);
@@ -1229,6 +1237,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPossessionState>()
         .init_resource::<VoxelRadianceVolume>()
         .init_resource::<SceneCaptureRequests>()
+        .init_resource::<SceneCharacterPositions>()
         .init_resource::<VoxelPlayerCameraRuntimes>()
         .init_resource::<VoxelPlayerCameraEditor>()
         .init_resource::<VoxelPlayerCaptureState>()
@@ -1287,6 +1296,7 @@ impl Plugin for TrpgVoxelPlugin {
                     sync_possessed_player_camera,
                     sync_voxel_player_cameras,
                     sync_voxel_player_standees,
+                    sync_voxel_scene_character_positions,
                     capture_voxel_player_view,
                     draw_voxel_target.run_if(crate::replay::replay_video_capture_inactive),
                     animate_planet_clouds,
@@ -3592,6 +3602,21 @@ fn sync_voxel_player_standees(
             },
         }
     }
+}
+
+fn sync_voxel_scene_character_positions(
+    mut positions: ResMut<SceneCharacterPositions>,
+    standees: Query<(&VoxelPlayerStandee, &Transform)>,
+) {
+    positions.positions.clear();
+    positions.positions.extend(
+        standees.iter().map(|(standee, transform)| {
+            (
+                standee.user_id.to_string(),
+                transform.translation,
+            )
+        }),
+    );
 }
 
 fn voxel_player_standee_transform(camera_transform: &Transform) -> Transform { *camera_transform }
@@ -7113,8 +7138,30 @@ fn possession_final_movement(
 ) -> f32 {
     manager
         .and_then(|manager| manager.player_characters.get(&user_id.to_string()))
-        .map(|character| character.speed.max(0.0))
+        .map(possession_character_movement)
         .unwrap_or_default()
+}
+
+fn possession_character_movement(character: &PlayerCharacter) -> f32 {
+    let mut speed = character.speed.max(0.0);
+    if character.buff_base_stats.is_none() {
+        let mut equipment = character.inventory.equipment.iter().collect::<Vec<_>>();
+        equipment.sort_by_key(|(slot, _)| format!("{slot:?}"));
+        for effect in equipment
+            .into_iter()
+            .flat_map(|(_, item)| &item.stat_effects)
+            .filter(|effect| effect.field == BuffField::Speed)
+        {
+            let base = speed;
+            match effect.value {
+                BuffValue::Add(value) => speed += value,
+                BuffValue::AddPercent(percent) => speed *= 1.0 + percent / 100.0,
+                BuffValue::Set(value) => speed = value,
+                BuffValue::SetPercentOfBase(percent) => speed = base * percent / 100.0,
+            }
+        }
+    }
+    (speed + DEFAULT_POSSESSION_MOVEMENT_BONUS).max(0.0)
 }
 
 fn sync_possessed_player_camera(
@@ -8025,6 +8072,33 @@ mod tests {
 
         assert_eq!(size.y, VOXEL_SIZE * 2.0);
         assert_eq!(size.x, VOXEL_SIZE);
+    }
+
+    #[test]
+    fn voxel_standees_publish_positions_for_scene_commands() {
+        let mut app = App::new();
+        app.init_resource::<SceneCharacterPositions>().add_systems(
+            Update,
+            sync_voxel_scene_character_positions,
+        );
+        app.world_mut().spawn((
+            VoxelPlayerStandee {
+                user_id: 1_670_426_821,
+                image_source: "avatar.png".to_owned(),
+                half_size: Vec2::splat(VOXEL_SIZE),
+            },
+            Transform::from_xyz(12.0, 3.0, -8.0),
+        ));
+
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .resource::<SceneCharacterPositions>()
+                .positions
+                .get("1670426821"),
+            Some(&Vec3::new(12.0, 3.0, -8.0))
+        );
     }
 
     #[test]
@@ -9768,6 +9842,35 @@ mod tests {
         assert_eq!(clamped.y, current.y);
         assert!((used - 7.0).abs() < 0.0001);
         assert!(exhausted);
+    }
+
+    #[test]
+    fn possession_movement_adds_default_and_runtime_equipment_allowance() {
+        let mut character = PlayerCharacter {
+            speed: 4.5,
+            ..Default::default()
+        };
+        assert!((possession_character_movement(&character) - 14.5).abs() < 0.0001);
+
+        character.inventory.equipment.insert(
+            crate::napcat::EquipmentSlot::Feet,
+            crate::napcat::InventoryItem {
+                equipment_slot: crate::napcat::EquipmentSlot::Feet,
+                stat_effects: vec![crate::rule_engine::BuffEffect {
+                    field: BuffField::Speed,
+                    value: BuffValue::Add(10.0),
+                }],
+                ..Default::default()
+            },
+        );
+        assert!((possession_character_movement(&character) - 24.5).abs() < 0.0001);
+
+        character.speed = 14.5;
+        character.buff_base_stats = Some(crate::napcat::CharacterBuffBaseStats {
+            speed: 4.5,
+            ..crate::napcat::CharacterBuffBaseStats::from_character(&PlayerCharacter::default())
+        });
+        assert!((possession_character_movement(&character) - 24.5).abs() < 0.0001);
     }
 
     #[test]
