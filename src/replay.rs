@@ -1612,19 +1612,35 @@ fn replay_controls(
             start_video_export(studio, capture_active, grids, windows);
         }
     });
-    let can_auto_direct = studio.deepseek_director_enabled
-        && manager.active_campaign_id().is_some()
-        && studio.mode == ReplayMode::Idle
-        && studio.video_render.is_none()
-        && studio.video_encoding.is_none();
+    let has_applied_director_plan =
+        studio.replay.is_some() && studio.director_response_hash.is_some();
+    let can_auto_direct = can_start_director_export(
+        studio,
+        manager.active_campaign_id().is_some(),
+    );
+    let director_export_tooltip = if has_applied_director_plan {
+        "当前 DeepSeek 导演方案已经应用；点击后直接导出，不会重复请求 API。"
+    } else {
+        "从所选发布范围的聊天重建回放，等待 DeepSeek 返回润色台词和逐句镜头方案，验证并应用后再导出 MP4。"
+    };
     if ui
         .add_enabled(
             can_auto_direct,
             egui::Button::new("DeepSeek 导演并导出"),
         )
-        .on_hover_text("从所选发布范围的聊天重建回放，等待 DeepSeek 返回润色台词和逐句镜头方案，验证并应用后再导出 MP4。")
+        .on_hover_text(director_export_tooltip)
         .clicked()
     {
+        if has_applied_director_plan {
+            start_video_export(studio, capture_active, grids, windows);
+            return;
+        }
+        if matches!(
+            studio.mode,
+            ReplayMode::Playing | ReplayMode::Paused
+        ) {
+            stop_playback(studio, grids);
+        }
         build_from_history(studio, manager, camera, grids);
         let director_queued = studio.replay.as_ref().is_some_and(|replay| {
             queue_replay_director(
@@ -1640,8 +1656,7 @@ fn replay_controls(
             studio.director_response_hash = None;
             studio.director_request_pending = true;
             studio.auto_export_after_director = true;
-            studio.status =
-                "已发送 DeepSeek 导演请求；收到并应用有效方案后自动开始导出".to_owned();
+            studio.status = "已发送 DeepSeek 导演请求；收到并应用有效方案后自动开始导出".to_owned();
             let _ = deepseek_manager.persist();
         } else {
             studio.director_request_pending = false;
@@ -1697,6 +1712,16 @@ fn replay_controls(
     if !studio.status.is_empty() {
         ui.small(studio.status.as_str());
     }
+}
+
+fn can_start_director_export(studio: &ReplayStudio, has_active_campaign: bool) -> bool {
+    studio.deepseek_director_enabled
+        && studio.mode != ReplayMode::Recording
+        && studio.video_render.is_none()
+        && studio.video_encoding.is_none()
+        && !studio.director_request_pending
+        && ((studio.replay.is_some() && studio.director_response_hash.is_some())
+            || has_active_campaign)
 }
 
 fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
@@ -4384,6 +4409,31 @@ mod tests {
             active_dialogue_index(&dialogue, 1_100),
             Some(1)
         );
+    }
+
+    #[test]
+    fn director_export_is_available_during_preview_and_reuses_an_applied_plan() {
+        let mut studio = ReplayStudio::default();
+        studio.deepseek_director_enabled = true;
+        studio.mode = ReplayMode::Paused;
+        assert!(can_start_director_export(&studio, true));
+
+        let replay_json = r#"{"format_version":1,"title":"test","campaign_id":"c","created_at_unix_ms":1,"duration_ms":0,"audience":{"scope":"public"},"scene":{"voxels":[]},"camera":[],"dialogue":[]}"#;
+        studio.replay = Some(serde_json::from_str(replay_json).unwrap());
+        studio.director_response_hash = Some(7);
+        assert!(can_start_director_export(
+            &studio, false
+        ));
+
+        studio.director_request_pending = true;
+        assert!(!can_start_director_export(
+            &studio, true
+        ));
+        studio.director_request_pending = false;
+        studio.mode = ReplayMode::Recording;
+        assert!(!can_start_director_export(
+            &studio, true
+        ));
     }
 
     #[test]
