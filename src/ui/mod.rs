@@ -821,6 +821,7 @@ pub(crate) struct TrpgGroupSettingsState {
     pending_party_delete: Option<(String, String)>,
     pending_turn_zero_reset: Option<String>,
     pending_initial_stats_restore: Option<String>,
+    pending_test_session_reset: Option<String>,
     group_reset_status: HashMap<String, String>,
     legacy_send_pane_status: HashMap<String, String>,
     legacy_team_chat_status: HashMap<String, String>,
@@ -7800,6 +7801,106 @@ fn restore_group_initial_player_stats(
     (restored, missing)
 }
 
+fn summary_key_matches_campaign_or_targets(
+    summary_key: &str,
+    campaign_id: &str,
+    target_ids: &HashSet<String>,
+) -> bool {
+    if let Some((summary_campaign_id, _)) = parse_campaign_summary_key(summary_key) {
+        return summary_campaign_id == campaign_id;
+    }
+    if target_ids.contains(summary_key) {
+        return true;
+    }
+    parse_group_summary_key(summary_key)
+        .is_some_and(|(target_id, _)| target_ids.contains(target_id))
+}
+
+fn clear_campaign_chat_messages(
+    manager: &mut NapcatMessageManager,
+    campaign_id: &str,
+) -> usize {
+    let removal_indexes = manager
+        .messages
+        .iter()
+        .map(|(target_id, messages)| {
+            let indexes = messages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, message)| {
+                    (manager
+                        .campaign_message_for_target(target_id, message)
+                        .campaign_id
+                        == campaign_id)
+                        .then_some(index)
+                })
+                .collect::<HashSet<_>>();
+            (target_id.clone(), indexes)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut removed = 0;
+    for (target_id, indexes) in removal_indexes {
+        let Some(messages) = manager.messages.get_mut(&target_id) else {
+            continue;
+        };
+        let mut index = 0;
+        messages.retain(|_| {
+            let keep = !indexes.contains(&index);
+            index += 1;
+            keep
+        });
+        removed += indexes.len();
+        manager
+            .read_message_counts
+            .insert(target_id, messages.len());
+    }
+    removed
+}
+
+fn clear_campaign_summaries(
+    manager: &mut NapcatMessageManager,
+    deepseek_manager: &mut DeepseekManager,
+    campaign_id: &str,
+    target_ids: &HashSet<String>,
+) -> usize {
+    manager.summarized_message_counts.retain(|summary_key, _| {
+        !summary_key_matches_campaign_or_targets(summary_key, campaign_id, target_ids)
+    });
+    let previous_len = deepseek_manager.summaries.len();
+    deepseek_manager.summaries.retain(|summary_key, _| {
+        !summary_key_matches_campaign_or_targets(summary_key, campaign_id, target_ids)
+    });
+    deepseek_manager.last_post_text.clear();
+    previous_len.saturating_sub(deepseek_manager.summaries.len())
+}
+
+fn clear_campaign_battle_rounds(
+    battle_store: &mut BattleRoundStore,
+    group_name: &str,
+    campaign_id: &str,
+) -> usize {
+    let removed_ids = battle_store
+        .encounters
+        .iter()
+        .filter_map(|(encounter_id, encounter)| {
+            (encounter.trpg_campaign_id.as_deref() == Some(campaign_id)
+                || encounter.trpg_group.as_deref() == Some(group_name))
+                .then_some(encounter_id.clone())
+        })
+        .collect::<HashSet<_>>();
+    battle_store
+        .encounters
+        .retain(|encounter_id, _| !removed_ids.contains(encounter_id));
+    if battle_store
+        .active_encounter_id
+        .as_ref()
+        .is_some_and(|encounter_id| removed_ids.contains(encounter_id))
+    {
+        battle_store.active_encounter_id = None;
+    }
+    removed_ids.len()
+}
+
 fn advance_group_world_turn(
     manager: &mut NapcatMessageManager,
     group_name: &str,
@@ -11855,7 +11956,7 @@ fn trpg_group_settings_window(
     deepseek_manager: &mut ResMut<Persistent<DeepseekManager>>,
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
     scene_runtime: Option<&mut VoxelMapRuntimeState>,
-    battle_store: Option<&mut Persistent<BattleRoundStore>>,
+    mut battle_store: Option<&mut Persistent<BattleRoundStore>>,
     napcat_sender: Option<&NapcatIOSender>,
     ime: &mut ImeManager,
     chat_input_msgs: &mut Local<HashMap<String, String>>,
@@ -11877,6 +11978,7 @@ fn trpg_group_settings_window(
     let mut turn_advance: Option<String> = None;
     let mut turn_zero_reset: Option<String> = None;
     let mut initial_stats_restore: Option<String> = None;
+    let mut test_session_reset: Option<String> = None;
     let mut legacy_negative_action: Option<(String, String, LegacyNegativeAction)> = None;
     let mut legacy_surface_action: Option<(String, LegacyGroupSurfaceAction)> = None;
     let mut settings_open = state.open;
@@ -11908,7 +12010,7 @@ fn trpg_group_settings_window(
                 deepseek_manager,
                 scene_store.as_deref_mut(),
                 scene_runtime,
-                battle_store,
+                battle_store.as_deref_mut(),
                 state,
             );
             ui.separator();
@@ -12104,6 +12206,31 @@ fn trpg_group_settings_window(
                                 {
                                     state.pending_initial_stats_restore =
                                         Some(group_name.clone());
+                                }
+                                if state.pending_test_session_reset.as_deref()
+                                    == Some(group_name.as_str())
+                                {
+                                    if ui
+                                        .button("确认清空测试进度")
+                                        .on_hover_text(
+                                            "恢复玩家首轮前状态、轮次归零，并清空本活动聊天、DeepSeek总结和战斗轮；保留角色、团设和场景",
+                                        )
+                                        .clicked()
+                                    {
+                                        test_session_reset = Some(group_name.clone());
+                                        state.pending_test_session_reset = None;
+                                    }
+                                    if ui.button("取消").clicked() {
+                                        state.pending_test_session_reset = None;
+                                    }
+                                } else if ui
+                                    .button("清空测试进度")
+                                    .on_hover_text(
+                                        "需要再次确认；保留玩家角色、TRPG组设置和体素场景",
+                                    )
+                                    .clicked()
+                                {
+                                    state.pending_test_session_reset = Some(group_name.clone());
                                 }
                             });
                             if let Some(status) = state.group_reset_status.get(&group_name) {
@@ -12696,6 +12823,60 @@ fn trpg_group_settings_window(
                 format!("已恢复 {restored} 个玩家；另有 {missing} 个玩家没有首轮前快照")
             },
         );
+    }
+    if let Some(group_name) = test_session_reset {
+        if let Some(group) = manager.trpg_groups.get(&group_name).cloned() {
+            let campaign_id = if group.campaign_id.trim().is_empty() {
+                "default".to_owned()
+            } else {
+                group.campaign_id.trim().to_owned()
+            };
+            let target_ids = group
+                .players
+                .iter()
+                .chain(group.group_chats.iter())
+                .cloned()
+                .collect::<HashSet<_>>();
+            let (restored, missing) = restore_group_initial_player_stats(
+                manager.as_mut(),
+                &group_name,
+                rule_engine_state,
+            );
+            let turns_reset = manager
+                .trpg_groups
+                .get_mut(&group_name)
+                .is_some_and(TrpgGroup::reset_all_turns);
+            let removed_messages =
+                clear_campaign_chat_messages(manager.as_mut(), &campaign_id);
+            let removed_summaries = clear_campaign_summaries(
+                manager.as_mut(),
+                deepseek_manager.as_mut(),
+                &campaign_id,
+                &target_ids,
+            );
+            let removed_battles = battle_store
+                .as_deref_mut()
+                .map(|battle_store| {
+                    let removed = clear_campaign_battle_rounds(
+                        battle_store,
+                        &group_name,
+                        &campaign_id,
+                    );
+                    battle_store.persist().ok();
+                    removed
+                })
+                .unwrap_or_default();
+            deepseek_manager.persist().ok();
+            chat_input_msgs.retain(|target_id, _| !target_ids.contains(target_id));
+            changed = true;
+            state.group_reset_status.insert(
+                group_name,
+                format!(
+                    "测试进度已清空：恢复 {restored} 个玩家（缺少首轮前快照 {missing}），轮次{}，删除 {removed_messages} 条聊天、{removed_summaries} 个 DeepSeek 总结、{removed_battles} 个战斗轮；角色、团设和场景已保留",
+                    if turns_reset { "已归零" } else { "原本就是0" }
+                ),
+            );
+        }
     }
     if let Some((group_name, target_id, action)) = legacy_negative_action {
         let action_changed =
@@ -14258,6 +14439,92 @@ mod tests {
         manager.trpg_groups.insert("table".to_owned(), group);
         manager.current_trpg_group = Some("table".to_owned());
         manager
+    }
+
+    #[test]
+    fn test_session_cleanup_is_campaign_scoped_and_preserves_other_data() {
+        let mut manager = empty_manager();
+        let mut campaign_message = test_private_message(2);
+        campaign_message.data.campaign_id = "campaign-a".to_owned();
+        campaign_message.data.access_scope_resolved = true;
+        let mut other_message = test_private_message(2);
+        other_message.data.campaign_id = "campaign-b".to_owned();
+        other_message.data.access_scope_resolved = true;
+        manager
+            .messages
+            .insert("2".to_owned(), vec![campaign_message, other_message]);
+        manager.read_message_counts.insert("2".to_owned(), 2);
+
+        let campaign_summary_key = SummaryScope::Private.summary_key("campaign-a", "2");
+        let other_summary_key = SummaryScope::Private.summary_key("campaign-b", "2");
+        manager
+            .summarized_message_counts
+            .insert(campaign_summary_key.clone(), 1);
+        manager
+            .summarized_message_counts
+            .insert(other_summary_key.clone(), 1);
+        let mut deepseek_manager = DeepseekManager::default();
+        deepseek_manager
+            .summaries
+            .insert(campaign_summary_key.clone(), Default::default());
+        deepseek_manager
+            .summaries
+            .insert(other_summary_key.clone(), Default::default());
+        deepseek_manager.last_post_text = "old response".to_owned();
+
+        let mut battle_store = BattleRoundStore::default();
+        battle_store.encounters.insert(
+            "campaign-a-battle".to_owned(),
+            crate::battle_round::BattleEncounter {
+                trpg_campaign_id: Some("campaign-a".to_owned()),
+                ..Default::default()
+            },
+        );
+        battle_store.encounters.insert(
+            "campaign-b-battle".to_owned(),
+            crate::battle_round::BattleEncounter {
+                trpg_campaign_id: Some("campaign-b".to_owned()),
+                ..Default::default()
+            },
+        );
+        battle_store.active_encounter_id = Some("campaign-a-battle".to_owned());
+        let targets = HashSet::from(["2".to_owned()]);
+
+        assert_eq!(
+            clear_campaign_chat_messages(&mut manager, "campaign-a"),
+            1
+        );
+        assert_eq!(
+            clear_campaign_summaries(
+                &mut manager,
+                &mut deepseek_manager,
+                "campaign-a",
+                &targets,
+            ),
+            1
+        );
+        assert_eq!(
+            clear_campaign_battle_rounds(&mut battle_store, "party-a", "campaign-a"),
+            1
+        );
+
+        assert_eq!(manager.messages["2"].len(), 1);
+        assert_eq!(manager.messages["2"][0].data.campaign_id, "campaign-b");
+        assert_eq!(manager.read_message_counts["2"], 1);
+        assert!(!manager
+            .summarized_message_counts
+            .contains_key(&campaign_summary_key));
+        assert!(manager
+            .summarized_message_counts
+            .contains_key(&other_summary_key));
+        assert!(!deepseek_manager
+            .summaries
+            .contains_key(&campaign_summary_key));
+        assert!(deepseek_manager.summaries.contains_key(&other_summary_key));
+        assert!(deepseek_manager.last_post_text.is_empty());
+        assert!(!battle_store.encounters.contains_key("campaign-a-battle"));
+        assert!(battle_store.encounters.contains_key("campaign-b-battle"));
+        assert!(battle_store.active_encounter_id.is_none());
     }
 
     fn manager_with_noncurrent_beta_targets() -> NapcatMessageManager {
