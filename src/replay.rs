@@ -92,6 +92,7 @@ const MAX_DIALOGUE_MS: u64 = 9_750;
 const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
+const BACKGROUND_MUSIC_PATH: &str = "assets/audio/jrpg2-piano.mp3";
 const ONNX_TTS_MODEL_DIR: &str = ".data/willowblossom/tts/kokoro-int8-multi-lang-v1_1";
 const ONNX_TTS_SPEAKER_COUNT: i32 = 103;
 const ONNX_TTS_FIRST_CHINESE_SPEAKER: i32 = 3;
@@ -202,6 +203,8 @@ struct ReplayFile {
     dialogue: Vec<ReplayDialogue>,
     #[serde(default = "default_master_speech_speed")]
     master_speech_speed: f32,
+    #[serde(default = "default_master_dialogue_duration")]
+    master_dialogue_duration: f32,
     #[serde(default)]
     speaker_voice_settings: HashMap<u64, SpeakerVoiceSettings>,
 }
@@ -269,8 +272,6 @@ enum DirectorMotion {
     Static,
     DollyIn,
     DollyOut,
-    OrbitLeft,
-    OrbitRight,
     DriftLeft,
     DriftRight,
 }
@@ -950,7 +951,7 @@ fn generate_onnx_wav(
             &normalized_text,
             &GenerationConfig {
                 sid: speaker_id.clamp(0, ONNX_TTS_SPEAKER_COUNT - 1),
-                speed: speed.clamp(0.85, 1.45),
+                speed: speed.max(0.10),
                 silence_scale: 0.12,
                 ..Default::default()
             },
@@ -1043,7 +1044,7 @@ fn render_video_frames(
         job.monitor_music_started = true;
         if job.music_enabled {
             let monitor_path = job.frames.path().join("render-monitor-music.wav");
-            match write_relaxing_soundtrack(
+            match write_jrpg_soundtrack(
                 &monitor_path,
                 job.duration_ms,
                 job.music_volume,
@@ -1444,7 +1445,7 @@ fn replay_controls(
 
     ui.separator();
     ui.heading("DeepSeek 视频导演");
-    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内的已有台词，并为每句选择说话人特写、远景、环境镜头和移动方式。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
+    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内的已有台词，并为每句选择镜头。存在说话人立牌时强制持续对准该角色；只有找不到立牌时才使用极慢的环境移动。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
     ui.checkbox(
         &mut studio.deepseek_director_enabled,
         "允许 DeepSeek 润色台词并控制镜头",
@@ -1572,7 +1573,7 @@ fn replay_controls(
     ui.horizontal(|ui| {
         ui.checkbox(
             &mut studio.music_enabled,
-            "原创舒缓纯音乐",
+            "CC0 二次元 JRPG 钢琴音乐",
         );
         ui.add_enabled(
             studio.music_enabled,
@@ -1593,16 +1594,36 @@ fn replay_controls(
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
         if let Some(replay) = studio.replay.as_mut() {
-            ui.add_enabled(
-                studio.speech_enabled,
-                egui::Slider::new(
-                    &mut replay.master_speech_speed,
-                    0.80..=1.40,
+            ui.add_enabled_ui(studio.speech_enabled, |ui| {
+                ui.label("整体语速");
+                ui.add(
+                    egui::DragValue::new(&mut replay.master_speech_speed)
+                        .speed(0.05)
+                        .range(0.10..=f32::INFINITY)
+                        .fixed_decimals(2)
+                        .suffix("×"),
                 )
-                .text("整体语速")
-                .custom_formatter(|value, _| format!("{value:.2}×")),
-            )
-            .on_hover_text("同时调整所有角色在播放预览和 MP4 导出中的语速。");
+                .on_hover_text("同时调整所有角色在播放预览和 MP4 导出中的语速；没有上限。");
+            });
+        }
+        if let Some(replay) = studio.replay.as_mut() {
+            let previous_duration = replay.master_dialogue_duration;
+            ui.label("整体台词停留");
+            let changed = ui
+                .add(
+                    egui::DragValue::new(&mut replay.master_dialogue_duration)
+                        .speed(0.05)
+                        .range(0.10..=f32::INFINITY)
+                        .fixed_decimals(2)
+                        .suffix("×"),
+                )
+                .on_hover_text("统一缩放字幕停留时间、台词间隔和导演镜头时间；没有上限。")
+                .changed();
+            if changed {
+                let new_duration = replay.master_dialogue_duration;
+                retime_replay(replay, previous_duration, new_duration);
+                studio.playback_ms = studio.playback_ms.min(replay.duration_ms);
+            }
         }
         if ui.button("角色语音设置…").clicked() {
             studio.speech_settings_open = true;
@@ -1626,7 +1647,7 @@ fn replay_controls(
             }
         }
     });
-    ui.small("整体语速默认 1.30×，同时用于预览与导出；台词默认使用本地 Kokoro 24 kHz ONNX（100 种中英文角色音色），模型不可用时回退到 Windows TTS。逐帧渲染时会同步监听角色语音和音乐，完成后仍使用离线高质量音轨混入 MP4。语音仅处理已通过发布范围筛选的回放台词，不上传网络。");
+    ui.small("整体语速默认 1.30×；整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。两项设置同时用于预览与导出。台词默认使用本地 Kokoro 24 kHz ONNX（100 种中英文角色音色），模型不可用时回退到 Windows TTS。逐帧渲染时会同步监听角色语音和音乐，完成后仍使用离线高质量音轨混入 MP4。语音仅处理已通过发布范围筛选的回放台词，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -2141,7 +2162,7 @@ fn apply_ready_director_plan(
             ));
         }
         line.text = text.to_owned();
-        line.duration_ms = dialogue_duration_ms(text);
+        line.duration_ms = scaled_dialogue_duration_ms(text, replay.master_dialogue_duration);
     }
     let mut timeline_ms = 350_u64;
     for line in &mut replay.dialogue {
@@ -2221,6 +2242,7 @@ fn new_replay(
         camera: Vec::new(),
         dialogue: Vec::new(),
         master_speech_speed: default_master_speech_speed(),
+        master_dialogue_duration: default_master_dialogue_duration(),
         speaker_voice_settings: HashMap::new(),
     }
 }
@@ -2495,10 +2517,10 @@ fn encode_video_frames(
     speaker_voice_settings: &HashMap<u64, SpeakerVoiceSettings>,
 ) -> Result<(), String> {
     let frame_pattern = frames_path.join("frame_%06d.png");
-    let soundtrack_path = frames_path.join("original-relaxing-soundtrack.wav");
+    let soundtrack_path = frames_path.join("jrpg2-piano-soundtrack.wav");
     let narration_path = frames_path.join("character-narration.wav");
     if music_enabled {
-        write_relaxing_soundtrack(
+        write_jrpg_soundtrack(
             &soundtrack_path,
             duration_ms,
             music_volume,
@@ -2807,21 +2829,57 @@ fn ssml_rate_percent(relative_rate: i32) -> i32 { (100 + relative_rate).clamp(70
 fn default_master_speech_speed() -> f32 { 1.30 }
 
 fn normalized_master_speech_speed(speed: f32) -> f32 {
-    if speed.is_finite() {
-        speed.clamp(0.80, 1.40)
+    if speed.is_finite() && speed > 0.0 {
+        speed.max(0.10)
     } else {
         default_master_speech_speed()
     }
 }
 
+fn default_master_dialogue_duration() -> f32 { 1.0 }
+
+fn normalized_master_dialogue_duration(duration: f32) -> f32 {
+    if duration.is_finite() && duration > 0.0 {
+        duration.max(0.10)
+    } else {
+        default_master_dialogue_duration()
+    }
+}
+
+fn scaled_millis(value: u64, ratio: f64) -> u64 {
+    ((value as f64 * ratio).round().clamp(0.0, u64::MAX as f64)) as u64
+}
+
+fn scaled_dialogue_duration_ms(text: &str, master_duration: f32) -> u64 {
+    scaled_millis(
+        dialogue_duration_ms(text),
+        normalized_master_dialogue_duration(master_duration) as f64,
+    )
+}
+
+fn retime_replay(replay: &mut ReplayFile, previous: f32, requested: f32) {
+    let previous = normalized_master_dialogue_duration(previous);
+    let requested = normalized_master_dialogue_duration(requested);
+    replay.master_dialogue_duration = requested;
+    let ratio = requested as f64 / previous as f64;
+    for line in &mut replay.dialogue {
+        line.time_ms = scaled_millis(line.time_ms, ratio);
+        line.duration_ms = scaled_millis(line.duration_ms, ratio).max(1);
+    }
+    for frame in &mut replay.camera {
+        frame.time_ms = scaled_millis(frame.time_ms, ratio);
+    }
+    replay.duration_ms = scaled_millis(replay.duration_ms, ratio).max(1);
+}
+
 fn combined_ssml_rate(relative_rate: i32, master_speed: f32) -> i32 {
     ((ssml_rate_percent(relative_rate) as f32 * normalized_master_speech_speed(master_speed))
         .round() as i32)
-        .clamp(70, 280)
+        .clamp(10, 1_000)
 }
 
 fn combined_onnx_speed(relative_rate: i32, master_speed: f32) -> f32 {
-    (onnx_speed(relative_rate) * normalized_master_speech_speed(master_speed)).clamp(0.85, 1.45)
+    onnx_speed(relative_rate) * normalized_master_speech_speed(master_speed)
 }
 
 fn default_speaker_voice_settings(sender_id: u64) -> SpeakerVoiceSettings {
@@ -2853,6 +2911,7 @@ fn replay_voice_signature(replay: &ReplayFile, global_volume: f32) -> u64 {
     replay.created_at_unix_ms.hash(&mut hasher);
     global_volume.to_bits().hash(&mut hasher);
     replay.master_speech_speed.to_bits().hash(&mut hasher);
+    replay.master_dialogue_duration.to_bits().hash(&mut hasher);
     for line in &replay.dialogue {
         line.sender_id.hash(&mut hasher);
         line.duration_ms.hash(&mut hasher);
@@ -2996,74 +3055,58 @@ fn read_pcm16_mono_wav(path: &Path) -> Result<Vec<i16>, String> {
         .collect())
 }
 
-fn write_relaxing_soundtrack(path: &Path, duration_ms: u64, volume: f32) -> Result<(), String> {
-    const SAMPLE_RATE: u32 = 32_000;
-    const CHANNELS: u16 = 2;
-    const BITS_PER_SAMPLE: u16 = 16;
-    const CHORDS: [[f32; 3]; 4] = [
-        [220.00, 261.63, 329.63],
-        [174.61, 220.00, 261.63],
-        [130.81, 164.81, 196.00],
-        [196.00, 246.94, 293.66],
-    ];
-    let sample_count = duration_ms
-        .saturating_mul(SAMPLE_RATE as u64)
-        .saturating_add(999)
-        / 1_000;
-    let data_bytes = sample_count
-        .saturating_mul(CHANNELS as u64)
-        .saturating_mul((BITS_PER_SAMPLE / 8) as u64);
-    if data_bytes > (u32::MAX - 36) as u64 {
-        return Err("回放过长，无法生成 WAV 背景音乐".to_owned());
+fn write_jrpg_soundtrack(path: &Path, duration_ms: u64, volume: f32) -> Result<(), String> {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(BACKGROUND_MUSIC_PATH);
+    if !source.is_file() {
+        return Err(format!(
+            "缺少 CC0 JRPG 背景音乐：{}",
+            source.display()
+        ));
     }
-    let file = fs::File::create(path).map_err(|err| format!("无法创建背景音乐：{err}"))?;
-    let mut writer = BufWriter::new(file);
-    write_wav_header(
-        &mut writer,
-        SAMPLE_RATE,
-        CHANNELS,
-        BITS_PER_SAMPLE,
-        data_bytes as u32,
-    )?;
-    let duration_seconds = duration_ms as f32 / 1_000.0;
-    let fade_in_seconds = (duration_seconds * 0.20).clamp(0.10, 3.0);
-    let fade_out_seconds = (duration_seconds * 0.20).clamp(0.10, 4.0);
-    let volume = volume.clamp(0.0, 1.0);
-    for index in 0..sample_count {
-        let time = index as f32 / SAMPLE_RATE as f32;
-        let section = ((time / 8.0).floor() as usize) % CHORDS.len();
-        let next_section = (section + 1) % CHORDS.len();
-        let section_time = time % 8.0;
-        let crossfade = smoothstep(((section_time - 7.0) / 1.0).clamp(0.0, 1.0));
-        let current_pad = chord_wave(CHORDS[section], time, 0.0);
-        let next_pad = chord_wave(CHORDS[next_section], time, 0.0);
-        let current_pad_right = chord_wave(CHORDS[section], time, 0.08);
-        let next_pad_right = chord_wave(CHORDS[next_section], time, 0.08);
-        let pad_left = current_pad * (1.0 - crossfade) + next_pad * crossfade;
-        let pad_right = current_pad_right * (1.0 - crossfade) + next_pad_right * crossfade;
-        let arpeggio_step = ((time / 2.0).floor() as usize) % 3;
-        let arpeggio_time = time % 2.0;
-        let arpeggio_envelope = (std::f32::consts::PI * arpeggio_time / 2.0)
-            .sin()
-            .max(0.0)
-            .powi(2);
-        let arpeggio_frequency = CHORDS[section][arpeggio_step] * 2.0;
-        let arpeggio_left = (std::f32::consts::TAU * arpeggio_frequency * time).sin();
-        let arpeggio_right = (std::f32::consts::TAU * arpeggio_frequency * time + 0.18).sin();
-        let breathing = 0.88 + 0.12 * (std::f32::consts::TAU * 0.06 * time).sin();
-        let fade_in = (time / fade_in_seconds).clamp(0.0, 1.0);
-        let fade_out = ((duration_seconds - time) / fade_out_seconds).clamp(0.0, 1.0);
-        let envelope = smoothstep(fade_in) * smoothstep(fade_out) * breathing * volume;
-        let left = (pad_left * 0.28 + arpeggio_left * arpeggio_envelope * 0.07) * envelope;
-        let right = (pad_right * 0.28 + arpeggio_right * arpeggio_envelope * 0.07) * envelope;
-        writer
-            .write_all(&pcm_i16(left).to_le_bytes())
-            .and_then(|_| writer.write_all(&pcm_i16(right).to_le_bytes()))
-            .map_err(|err| format!("写入背景音乐失败：{err}"))?;
+    let duration_seconds = (duration_ms.max(50) as f64 / 1_000.0).max(0.05);
+    let fade_seconds = (duration_seconds * 0.15).clamp(0.05, 2.0);
+    let fade_out_start = (duration_seconds - fade_seconds).max(0.0);
+    let filter = format!(
+        "volume={:.4},afade=t=in:st=0:d={fade_seconds:.3},afade=t=out:st={fade_out_start:.3}:d={fade_seconds:.3}",
+        volume.clamp(0.0, 1.0)
+    );
+    let mut command = Command::new("ffmpeg");
+    command
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-stream_loop",
+            "-1",
+            "-i",
+        ])
+        .arg(&source)
+        .args([
+            "-t",
+            &format!("{duration_seconds:.3}"),
+            "-af",
+            &filter,
+            "-ar",
+            "32000",
+            "-ac",
+            "2",
+            "-c:a",
+            "pcm_s16le",
+        ])
+        .arg(path);
+    hide_command_window(&mut command);
+    let output = command
+        .output()
+        .map_err(|err| format!("无法启动 FFmpeg 处理 JRPG 背景音乐：{err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "无法生成 JRPG 背景音乐：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
-    writer
-        .flush()
-        .map_err(|err| format!("完成背景音乐失败：{err}"))
 }
 
 fn write_wav_header(
@@ -3089,17 +3132,6 @@ fn write_wav_header(
         .and_then(|_| writer.write_all(b"data"))
         .and_then(|_| writer.write_all(&data_bytes.to_le_bytes()))
         .map_err(|err| format!("写入 WAV 文件头失败：{err}"))
-}
-
-fn chord_wave(frequencies: [f32; 3], time: f32, phase: f32) -> f32 {
-    frequencies
-        .into_iter()
-        .enumerate()
-        .map(|(index, frequency)| {
-            (std::f32::consts::TAU * frequency * time + phase * (index + 1) as f32).sin()
-        })
-        .sum::<f32>()
-        / 3.0
 }
 
 fn smoothstep(value: f32) -> f32 { value * value * (3.0 - 2.0 * value) }
@@ -3248,43 +3280,56 @@ fn director_camera_track(
     duration_ms: u64,
     speaker_positions: &HashMap<u64, Vec3>,
 ) -> Vec<ReplayCameraKeyframe> {
-    let mut frames = vec![camera_keyframe(0, base)];
     let mut current = base.clone();
+    if let (Some(line), Some(cue)) = (dialogue.first(), cues.first()) {
+        if let Some(target) = speaker_positions.get(&line.sender_id) {
+            current = director_speaker_shot(
+                base,
+                *target,
+                line.sender_id,
+                0,
+                resolved_speaker_shot(cue.shot),
+                cue.motion,
+                0.0,
+            );
+        }
+    }
+    let mut frames = vec![camera_keyframe(0, &current)];
     for (index, (line, cue)) in dialogue.iter().zip(cues).enumerate() {
         frames.push(camera_keyframe(line.time_ms, &current));
         let line_end = line.time_ms.saturating_add(line.duration_ms);
         let arrival_ms = line
             .time_ms
-            .saturating_add((line.duration_ms / 4).clamp(180, 650))
+            .saturating_add(line.duration_ms.saturating_mul(7) / 10)
             .min(line_end);
         let (arrival, settled) = if let Some(target) = speaker_positions.get(&line.sender_id) {
-            let arrival = director_speaker_shot(
-                base,
+            let speaker_shot = resolved_speaker_shot(cue.shot);
+            let desired_arrival = director_speaker_shot(
+                &current,
                 *target,
                 line.sender_id,
                 index,
-                cue.shot,
+                speaker_shot,
                 cue.motion,
                 0.0,
             );
-            let settled = director_speaker_shot(
-                base,
+            let travel_limit = (line.duration_ms as f32 / 1_000.0 * 0.55).clamp(1.0, 3.0);
+            let arrival = limit_camera_travel(&current, &desired_arrival, travel_limit);
+            let desired_settled = director_speaker_shot(
+                &arrival,
                 *target,
                 line.sender_id,
                 index,
-                cue.shot,
+                speaker_shot,
                 cue.motion,
                 1.0,
             );
+            let settle_limit = (line.duration_ms as f32 / 1_000.0 * 0.12).clamp(0.2, 0.65);
+            let settled = limit_camera_travel(&arrival, &desired_settled, settle_limit);
             (arrival, settled)
         } else {
-            let arrival = fallback_camera_drift(&current, line.sender_id, index);
-            let settled = director_environment_motion(
-                &arrival,
-                cue.motion,
-                line.sender_id,
-                index,
-            );
+            let arrival = current.clone();
+            let settled = director_environment_motion(&arrival, cue.motion);
             (arrival, settled)
         };
         frames.push(camera_keyframe(arrival_ms, &arrival));
@@ -3307,6 +3352,15 @@ fn director_camera_track(
         }
     });
     frames
+}
+
+fn resolved_speaker_shot(shot: DirectorShot) -> DirectorShot {
+    match shot {
+        DirectorShot::SpeakerClose | DirectorShot::SpeakerMedium | DirectorShot::SpeakerWide => {
+            shot
+        },
+        DirectorShot::Establishing | DirectorShot::Environment => DirectorShot::SpeakerMedium,
+    }
 }
 
 fn director_speaker_shot(
@@ -3332,21 +3386,15 @@ fn director_speaker_shot(
         DirectorShot::Establishing => 12.0,
         DirectorShot::Environment => 10.0,
     };
-    let orbit = match motion {
-        DirectorMotion::OrbitLeft => -0.18 * progress,
-        DirectorMotion::OrbitRight => 0.18 * progress,
-        _ => 0.0,
-    };
-    let approach = Quat::from_rotation_y(orbit) * approach;
     let lateral = Vec3::new(-approach.z, 0.0, approach.x);
     let distance_delta = match motion {
-        DirectorMotion::DollyIn => -0.9 * progress,
-        DirectorMotion::DollyOut => 1.1 * progress,
+        DirectorMotion::DollyIn => -0.35 * progress,
+        DirectorMotion::DollyOut => 0.35 * progress,
         _ => 0.0,
     };
     let lateral_delta = match motion {
-        DirectorMotion::DriftLeft => -0.8 * progress,
-        DirectorMotion::DriftRight => 0.8 * progress,
+        DirectorMotion::DriftLeft => -0.30 * progress,
+        DirectorMotion::DriftRight => 0.30 * progress,
         _ => 0.0,
     };
     let height = match shot {
@@ -3362,25 +3410,30 @@ fn director_speaker_shot(
     Transform::from_translation(position).looking_at(target + Vec3::Y * 0.35, Vec3::Y)
 }
 
-fn director_environment_motion(
-    current: &Transform,
-    motion: DirectorMotion,
-    sender_id: u64,
-    index: usize,
-) -> Transform {
+fn director_environment_motion(current: &Transform, motion: DirectorMotion) -> Transform {
     let right = current.rotation * Vec3::X;
     let forward = current.rotation * Vec3::NEG_Z;
     let offset = match motion {
         DirectorMotion::Static => Vec3::ZERO,
-        DirectorMotion::DollyIn => forward * 0.8,
-        DirectorMotion::DollyOut => -forward * 0.8,
-        DirectorMotion::OrbitLeft | DirectorMotion::DriftLeft => -right * 0.9 + forward * 0.2,
-        DirectorMotion::OrbitRight | DirectorMotion::DriftRight => right * 0.9 + forward * 0.2,
+        DirectorMotion::DollyIn => forward * 0.30,
+        DirectorMotion::DollyOut => -forward * 0.30,
+        DirectorMotion::DriftLeft => -right * 0.30,
+        DirectorMotion::DriftRight => right * 0.30,
     };
-    let fallback = fallback_camera_drift(current, sender_id, index);
     let position = current.translation + offset;
-    let focus = fallback.translation + fallback.rotation * Vec3::NEG_Z * 18.0;
-    Transform::from_translation(position).looking_at(focus, Vec3::Y)
+    Transform {
+        translation: position,
+        ..current.clone()
+    }
+}
+
+fn limit_camera_travel(current: &Transform, desired: &Transform, max_distance: f32) -> Transform {
+    let offset = desired.translation - current.translation;
+    Transform {
+        translation: current.translation + offset.clamp_length_max(max_distance.max(0.0)),
+        rotation: desired.rotation,
+        scale: desired.scale,
+    }
 }
 
 #[cfg(test)]
@@ -3407,6 +3460,7 @@ fn speaker_camera_shot(
     Transform::from_translation(position).looking_at(target + Vec3::Y * 0.25, Vec3::Y)
 }
 
+#[cfg(test)]
 fn fallback_camera_drift(current: &Transform, sender_id: u64, index: usize) -> Transform {
     let right = current.rotation * Vec3::X;
     let up = current.rotation * Vec3::Y;
@@ -4096,7 +4150,11 @@ mod tests {
         let forward = shot.rotation * Vec3::NEG_Z;
         let to_speaker = (target + Vec3::Y * 0.35 - shot.translation).normalize();
         assert!(forward.dot(to_speaker) > 0.99);
-        assert!(shot.translation.distance(target) < 4.0);
+        assert!(frames.windows(2).all(|pair| {
+            Vec3::from_array(pair[0].translation).distance(Vec3::from_array(pair[1].translation))
+                <= 3.01
+        }));
+        assert!(frames.iter().any(|frame| frame.time_ms == 2_240));
     }
 
     #[test]
@@ -4183,9 +4241,24 @@ mod tests {
         assert_eq!(default_master_speech_speed(), 1.30);
         assert_eq!(combined_ssml_rate(18, 1.30), 153);
         assert!((combined_onnx_speed(18, 1.30) - 1.417).abs() < 0.001);
+        assert!((combined_onnx_speed(18, 3.0) - 3.27).abs() < 0.001);
+        assert_eq!(
+            normalized_master_speech_speed(20.0),
+            20.0
+        );
         assert_eq!(
             normalized_master_speech_speed(f32::NAN),
             1.30
+        );
+        assert_eq!(default_master_dialogue_duration(), 1.0);
+        assert_eq!(
+            normalized_master_dialogue_duration(250.0),
+            250.0
+        );
+        assert_eq!(scaled_millis(4_000, 2.5), 10_000);
+        assert_eq!(
+            scaled_dialogue_duration_ms("短句", 2.0),
+            MIN_DIALOGUE_MS * 2
         );
     }
 
@@ -4261,7 +4334,9 @@ mod tests {
         let mut replay: ReplayFile = serde_json::from_str(old_json).unwrap();
         assert!(replay.speaker_voice_settings.is_empty());
         assert_eq!(replay.master_speech_speed, 1.30);
+        assert_eq!(replay.master_dialogue_duration, 1.0);
         replay.master_speech_speed = 1.15;
+        replay.master_dialogue_duration = 2.75;
         replay
             .speaker_voice_settings
             .insert(42, SpeakerVoiceSettings {
@@ -4284,6 +4359,7 @@ mod tests {
         assert_eq!(settings.speech_rate, 12);
         assert_eq!(settings.volume, 0.75);
         assert_eq!(restored.master_speech_speed, 1.15);
+        assert_eq!(restored.master_dialogue_duration, 2.75);
     }
 
     #[test]
@@ -4303,10 +4379,10 @@ mod tests {
     }
 
     #[test]
-    fn original_relaxing_music_is_a_non_silent_stereo_wav() {
+    fn cc0_jrpg_music_is_a_non_silent_stereo_wav() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("music.wav");
-        write_relaxing_soundtrack(&path, 250, 0.35).unwrap();
+        write_jrpg_soundtrack(&path, 250, 0.35).unwrap();
         let bytes = fs::read(path).unwrap();
         assert_eq!(&bytes[0..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"WAVE");
@@ -4326,8 +4402,11 @@ mod tests {
         let mixed_language = "你好AI，我在维护TRPG replay，测试English结尾。";
         let first = generate_onnx_wav(&tts, mixed_language, 3, 1.4).unwrap();
         let second = generate_onnx_wav(&tts, mixed_language, 58, 1.4).unwrap();
+        let unrestricted_fast = generate_onnx_wav(&tts, mixed_language, 3, 3.0).unwrap();
         assert_eq!(&first[0..4], b"RIFF");
         assert!(first.len() > 44);
+        assert!(unrestricted_fast.len() > 44);
+        assert!(unrestricted_fast.len() < first.len());
         assert_ne!(first, second);
     }
 

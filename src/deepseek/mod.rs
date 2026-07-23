@@ -132,11 +132,12 @@ const DIRECTOR_SYSTEM_PROMPT: &str = r#"
 2. 可以让措辞更自然、精炼、适合配音，但不得新增事实、行动、结果、线索、动机、角色或剧情。
 3. 保留原意、专有名词、数字和中英文信息；不要把玩家的话改成旁白。
 4. 台词要频繁连续，中文每句适合一次呼吸读完；不要加入长停顿说明。
-5. 有角色模型时优先聚焦当前说话者；没有时使用缓慢环境移动。
-6. 连续两句不要机械重复同一构图；禁止让镜头一直绕场景旋转。
-7. shot 只能是 speaker_close、speaker_medium、speaker_wide、establishing、environment。
-8. motion 只能是 static、dolly_in、dolly_out、orbit_left、orbit_right、drift_left、drift_right。
-9. 只返回严格 JSON，不要 Markdown、解释或代码围栏。
+5. has_character_model 为 true 时，必须使用 speaker_close、speaker_medium 或 speaker_wide，并让镜头持续对准当前说话者的角色模型；不得选择环境镜头。
+6. has_character_model 为 false 时才可使用 establishing 或 environment，并且只能进行极慢的短距离环境移动。
+7. 连续两句不要机械重复同一构图。禁止环绕、快速摇镜、快速推拉、大范围横移或跨越场景飞行。
+8. shot 只能是 speaker_close、speaker_medium、speaker_wide、establishing、environment。
+9. motion 只能是 static、dolly_in、dolly_out、drift_left、drift_right；优先 static。
+10. 只返回严格 JSON，不要 Markdown、解释或代码围栏。
 
 返回格式：
 {"dialogue":[{"index":0,"text":"润色后的原意台词","shot":"speaker_medium","motion":"dolly_in"}]}
@@ -769,6 +770,14 @@ fn director_live_api_returns_structured_shot_plan() {
         .is_some_and(|text| !text.is_empty()));
     assert!(dialogue[0]["shot"].as_str().is_some());
     assert!(dialogue[0]["motion"].as_str().is_some());
+    assert!(matches!(
+        dialogue[0]["shot"].as_str(),
+        Some("speaker_close" | "speaker_medium" | "speaker_wide")
+    ));
+    assert!(matches!(
+        dialogue[0]["motion"].as_str(),
+        Some("static" | "dolly_in" | "dolly_out" | "drift_left" | "drift_right")
+    ));
 }
 
 #[test]

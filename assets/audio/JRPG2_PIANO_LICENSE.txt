@@ -1,0 +1,11 @@
+JRPG2 Piano
+Author: Joth
+Source: https://opengameart.org/content/jrpg2-piano
+Original file: https://opengameart.org/sites/default/files/JRPG2%20Piano.mp3
+
+License: Creative Commons CC0 1.0 Universal
+https://creativecommons.org/publicdomain/zero/1.0/
+
+The OpenGameArt source page describes this as a short, loopable classic-JRPG
+piano track and marks it CC0. Attribution is not required, but the title,
+author, source, and license are retained here for provenance.
