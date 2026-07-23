@@ -3499,6 +3499,7 @@ impl NapcatMessageManager {
             .chain(self.rejected_chat_targets.iter())
             .cloned()
             .collect::<Vec<_>>();
+        target_ids.retain(|target_id| !is_internal_chat_storage_key(target_id));
         target_ids.sort();
         target_ids.dedup();
 
@@ -3611,6 +3612,30 @@ impl NapcatMessageManager {
 
     pub fn sync_chat_targets(&mut self) -> bool {
         let mut changed = false;
+        let chat_target_len = self.chat_targets.len();
+        self.chat_targets
+            .retain(|target_id, _| !is_internal_chat_storage_key(target_id));
+        changed |= chat_target_len != self.chat_targets.len();
+        let chat_target_kind_len = self.chat_target_kinds.len();
+        self.chat_target_kinds
+            .retain(|target_id, _| !is_internal_chat_storage_key(target_id));
+        changed |= chat_target_kind_len != self.chat_target_kinds.len();
+        let read_count_len = self.read_message_counts.len();
+        self.read_message_counts
+            .retain(|target_id, _| !is_internal_chat_storage_key(target_id));
+        changed |= read_count_len != self.read_message_counts.len();
+        let open_len = self.open_chat_targets.len();
+        self.open_chat_targets
+            .retain(|target_id| !is_internal_chat_storage_key(target_id));
+        changed |= open_len != self.open_chat_targets.len();
+        let pending_len = self.pending_chat_targets.len();
+        self.pending_chat_targets
+            .retain(|target_id| !is_internal_chat_storage_key(target_id));
+        changed |= pending_len != self.pending_chat_targets.len();
+        let rejected_len = self.rejected_chat_targets.len();
+        self.rejected_chat_targets
+            .retain(|target_id| !is_internal_chat_storage_key(target_id));
+        changed |= rejected_len != self.rejected_chat_targets.len();
         changed |= self.repair_ambiguous_campaign_ids();
         let message_target_kinds = self
             .messages
@@ -4249,6 +4274,12 @@ impl NapcatMessageManager {
         metadata.automatic_name = name.to_owned();
         true
     }
+}
+
+fn is_internal_chat_storage_key(target_id: &str) -> bool {
+    ["campaign:", "group:", "replay:", "replay-director:"]
+        .iter()
+        .any(|prefix| target_id.starts_with(prefix))
 }
 
 fn moonberry_group_name(group: &Value, index: usize) -> String {
@@ -9551,6 +9582,49 @@ mod tests {
         assert_eq!(export.groups[0].name, "讨论组");
         assert!(!json.contains("hello"));
         assert!(!json.contains("\"player_characters\""));
+    }
+
+    #[test]
+    fn internal_summary_keys_never_become_chat_targets() {
+        let mut manager = empty_manager();
+        manager.summarized_message_counts.insert(
+            "campaign:64656661756c74:1670426821".to_owned(),
+            84,
+        );
+        manager
+            .summarized_message_counts
+            .insert("group:976886808:public".to_owned(), 13);
+        manager
+            .summarized_message_counts
+            .insert("replay:default:public".to_owned(), 29);
+        manager.summarized_message_counts.insert(
+            "replay-director:default:public".to_owned(),
+            29,
+        );
+        manager
+            .open_chat_targets
+            .insert("replay:default:public".to_owned());
+        manager.open_chat_targets.insert("1670426821".to_owned());
+
+        assert_eq!(
+            manager
+                .chat_target_export_entries()
+                .into_iter()
+                .map(|entry| entry.target_id)
+                .collect::<Vec<_>>(),
+            vec!["1670426821".to_owned()]
+        );
+        assert!(manager.sync_chat_targets());
+        assert_eq!(
+            manager.open_chat_targets,
+            HashSet::from(["1670426821".to_owned()])
+        );
+        assert_eq!(
+            manager
+                .summarized_message_counts
+                .get("replay-director:default:public"),
+            Some(&29)
+        );
     }
 
     #[test]
