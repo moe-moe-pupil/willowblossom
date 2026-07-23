@@ -1379,21 +1379,27 @@ fn chat_window(
         .min_size(window_min_size)
         .max_size(max_window_size)
         .max_height(GROUP_CHAT_MAX_HEIGHT);
+    if current_group.is_some() {
+        // egui 0.35's TitleBar drag path restores its saved absolute position after
+        // `current_pos`; Anywhere keeps child windows movable while allowing the
+        // discussion-group-relative position below to take effect every frame.
+        window = window.drag_area(egui::WindowDrag::Anywhere);
+    }
     if let Some(group_name) = current_group {
         let offset_key = (
             group_name.to_owned(),
             target_id.to_owned(),
         );
-        if let Some(offset) = group_member_window_offsets.get(&offset_key) {
-            window = window.current_pos(group_member_position(
+        let desired_position = group_member_window_offsets
+            .get(&offset_key)
+            .map(|offset| group_member_position(constraint_rect, *offset))
+            .unwrap_or_else(|| group_member_default_pos(constraint_rect, target_id));
+        window = window
+            .current_pos(desired_position)
+            .default_pos(group_member_default_pos(
                 constraint_rect,
-                *offset,
+                target_id,
             ));
-        }
-        window = window.default_pos(group_member_default_pos(
-            constraint_rect,
-            target_id,
-        ));
     }
     let show_character_button = !is_group_chat_target(manager, target_id);
     let trpg_membership_group = focused_trpg_group_name
@@ -1674,6 +1680,11 @@ fn chat_window(
         manager.persist().ok();
         return;
     }
+    if let (Some(_), Some(response)) = (current_group, response.as_ref()) {
+        if group_member_leave_button(ctx, window_id, response.response.rect) {
+            leave_group = true;
+        }
+    }
     if let Some(group_name) = current_group {
         if leave_group {
             group_member_window_offsets.remove(&(
@@ -1878,6 +1889,22 @@ fn group_member_position(parent_rect: Rect, offset: Vec2) -> Pos2 { parent_rect.
 
 fn group_member_offset(parent_rect: Rect, member_rect: Rect) -> Vec2 {
     member_rect.min - parent_rect.min
+}
+
+fn group_member_leave_button(ctx: &Context, window_id: Id, window_rect: Rect) -> bool {
+    let button_pos = egui::pos2(
+        window_rect.right() - 69.0,
+        window_rect.top() + 3.0,
+    );
+    egui::Area::new(window_id.with("leave_group_button"))
+        .order(egui::Order::Middle)
+        .fixed_pos(button_pos)
+        .show(ctx, |ui| {
+            ui.small_button("离开")
+                .on_hover_text("离开讨论组")
+                .clicked()
+        })
+        .inner
 }
 
 fn chat_body_ui(
@@ -14372,6 +14399,45 @@ mod tests {
         assert_eq!(
             group_member_position(moved_parent, offset),
             member.min + egui::vec2(90.0, -25.0)
+        );
+    }
+
+    #[test]
+    fn collapsed_group_member_window_accepts_parent_driven_position() {
+        let ctx = Context::default();
+        let window_id = Id::new("collapsed_group_member_position_test");
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 700.0));
+        let show_at = |ctx: &Context, position: Pos2| {
+            let mut collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ctx,
+                window_id.with("collapsing"),
+                true,
+            );
+            collapsing.set_open(false);
+            collapsing.store(ctx);
+            egui::Window::new("成员")
+                .id(window_id)
+                .drag_area(egui::WindowDrag::Anywhere)
+                .current_pos(position)
+                .show(ctx, |_| {});
+        };
+
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        });
+        show_at(&ctx, egui::pos2(80.0, 90.0));
+        let _ = ctx.end_pass();
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        });
+        show_at(&ctx, egui::pos2(310.0, 260.0));
+        let _ = ctx.end_pass();
+
+        assert_eq!(
+            ctx.memory(|memory| memory.area_rect(window_id).unwrap().min),
+            egui::pos2(310.0, 260.0)
         );
     }
 
