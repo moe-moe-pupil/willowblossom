@@ -35,6 +35,7 @@ use std::{
             Ordering,
         },
         Arc,
+        OnceLock,
     },
     thread,
     time::{
@@ -1824,6 +1825,7 @@ fn can_start_director_export(studio: &ReplayStudio, has_active_campaign: bool) -
 
 fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
     let mut open = studio.speech_settings_open;
+    let installed_speakers = installed_emotivoice_speakers();
     let speakers = studio
         .replay
         .as_ref()
@@ -1849,7 +1851,16 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         .default_width(520.0)
         .max_width(620.0)
         .show(ctx, |ui| {
-            ui.label("EmotiVoice 提供 2000 多个真实训练音色。可从推荐男声/女声中选择，也可输入任意有效音色 ID；不再通过变调伪造男声。设置同时用于播放预览和 MP4 导出。");
+            ui.label(format!(
+                "EmotiVoice 已加载 {} 个真实训练音色。可从推荐男声/女声或全部已安装音色中选择，也可直接输入音色 ID。设置同时用于播放预览和 MP4 导出。",
+                installed_speakers.len()
+            ));
+            if installed_speakers.is_empty() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "未找到已安装音色目录，暂时只显示推荐音色。",
+                );
+            }
             if speakers.is_empty() {
                 ui.label("请先录制回放或从现有聊天生成回放。");
                 return;
@@ -1881,13 +1892,35 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                         let mut selected_speaker = current_speaker.clone();
                         egui::ComboBox::from_id_salt(("replay-emotivoice-speaker", sender_id))
                             .selected_text(emotivoice_speaker_label(&selected_speaker))
+                            .height(360.0)
                             .show_ui(ui, |ui| {
+                                ui.strong("推荐音色");
                                 for (speaker, label) in EMOTIVOICE_RECOMMENDED_SPEAKERS {
                                     ui.selectable_value(
                                         &mut selected_speaker,
                                         speaker.to_owned(),
                                         label,
                                     );
+                                }
+                                if !installed_speakers.is_empty() {
+                                    ui.separator();
+                                    ui.strong(format!(
+                                        "全部已安装音色（{}）",
+                                        installed_speakers.len()
+                                    ));
+                                    for speaker in installed_speakers {
+                                        if EMOTIVOICE_RECOMMENDED_SPEAKERS
+                                            .iter()
+                                            .any(|(recommended, _)| recommended == speaker)
+                                        {
+                                            continue;
+                                        }
+                                        ui.selectable_value(
+                                            &mut selected_speaker,
+                                            speaker.clone(),
+                                            format!("音色 {speaker}"),
+                                        );
+                                    }
                                 }
                             });
                         if selected_speaker != current_speaker {
@@ -2853,6 +2886,33 @@ const EMOTIVOICE_RECOMMENDED_SPEAKERS: [(&str, &str); 9] = [
 ];
 
 const EMOTIVOICE_EMOTIONS: [&str; 7] = ["普通", "开心", "悲伤", "生气", "惊讶", "厌恶", "恐惧"];
+
+fn parse_emotivoice_speaker_ids(contents: &str) -> Vec<String> {
+    let mut speakers = contents
+        .lines()
+        .filter_map(|line| {
+            let speaker = line.trim();
+            (!speaker.is_empty() && speaker.chars().all(|character| character.is_ascii_digit()))
+                .then(|| speaker.to_owned())
+        })
+        .collect::<Vec<_>>();
+    speakers.sort_by_key(|speaker| speaker.parse::<u64>().unwrap_or(u64::MAX));
+    speakers.dedup();
+    speakers
+}
+
+fn installed_emotivoice_speakers() -> &'static [String] {
+    static INSTALLED_SPEAKERS: OnceLock<Vec<String>> = OnceLock::new();
+    INSTALLED_SPEAKERS
+        .get_or_init(|| {
+            let path = Path::new(EMOTIVOICE_RUNTIME_DIR)
+                .join("EmotiVoice/data/youdao/text/speaker2");
+            fs::read_to_string(path)
+                .map(|contents| parse_emotivoice_speaker_ids(&contents))
+                .unwrap_or_default()
+        })
+        .as_slice()
+}
 
 fn emotivoice_speaker_label(speaker: &str) -> String {
     EMOTIVOICE_RECOMMENDED_SPEAKERS
@@ -4791,6 +4851,10 @@ mod tests {
         assert_eq!(
             resolved_emotivoice_emotion(None),
             "普通"
+        );
+        assert_eq!(
+            parse_emotivoice_speaker_ids("9000\n92\ninvalid\n 65 \n92\n"),
+            vec!["65", "92", "9000"]
         );
     }
 
