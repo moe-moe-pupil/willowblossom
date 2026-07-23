@@ -27,7 +27,13 @@ use std::{
         Command,
         Stdio,
     },
-    sync::Arc,
+    sync::{
+        atomic::{
+            AtomicU64,
+            Ordering,
+        },
+        Arc,
+    },
     thread,
     time::{
         SystemTime,
@@ -392,6 +398,7 @@ struct PreviewSpeechController {
 struct OnnxPreviewWorker {
     requests: Sender<OnnxPreviewRequest>,
     results: Receiver<OnnxPreviewResult>,
+    latest_signature: Arc<AtomicU64>,
 }
 
 struct OnnxPreviewRequest {
@@ -642,9 +649,6 @@ impl PreviewSpeechController {
         if self.prepared_signature == Some(signature) {
             return Ok(());
         }
-        if self.prepared_signature.is_some() {
-            self.onnx_worker = None;
-        }
         if self.onnx_worker.is_none() {
             self.onnx_worker = Some(start_onnx_preview_worker()?);
         }
@@ -655,6 +659,7 @@ impl PreviewSpeechController {
             .onnx_worker
             .as_ref()
             .expect("ONNX worker was initialized");
+        worker.latest_signature.store(signature, Ordering::Release);
         for (index, line) in replay.dialogue.iter().enumerate() {
             let settings = replay
                 .speaker_voice_settings
@@ -882,11 +887,16 @@ impl MeloTts {
 fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
     let (request_tx, request_rx) = unbounded::<OnnxPreviewRequest>();
     let (result_tx, result_rx) = unbounded::<OnnxPreviewResult>();
+    let latest_signature = Arc::new(AtomicU64::new(0));
+    let worker_signature = Arc::clone(&latest_signature);
     thread::Builder::new()
         .name("replay-melotts-preview".to_owned())
         .spawn(move || {
             let mut tts = create_onnx_tts();
             while let Ok(request) = request_rx.recv() {
+                if request.signature != worker_signature.load(Ordering::Acquire) {
+                    continue;
+                }
                 let wav = tts.as_mut().map_err(|err| err.clone()).and_then(|tts| {
                     tts.synthesize(
                         &request.text,
@@ -895,6 +905,9 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                         request.speed,
                     )
                 });
+                if request.signature != worker_signature.load(Ordering::Acquire) {
+                    continue;
+                }
                 if result_tx
                     .send(OnnxPreviewResult {
                         signature: request.signature,
@@ -912,6 +925,7 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
     Ok(OnnxPreviewWorker {
         requests: request_tx,
         results: result_rx,
+        latest_signature,
     })
 }
 
