@@ -29,6 +29,7 @@ use bevy::{
         RenderTarget,
     },
     core_pipeline::prepass::DepthPrepass,
+    ecs::system::SystemParam,
     image::{
         ImageAddressMode,
         ImageFilterMode,
@@ -115,7 +116,6 @@ const PLAYER_STANDEE_PLANE_NORMAL: Vec3 = Vec3::Z;
 pub(crate) const MAX_VOXEL_BRUSH_RADIUS: i32 = 50;
 const MAX_RAY_DISTANCE: f32 = 200.0;
 const PLANET_MAX_RAY_DISTANCE: f32 = 600.0;
-const EDIT_REPEAT_DELAY: f32 = 0.32;
 const EDIT_REPEAT_INTERVAL: f32 = 0.09;
 const TRPG_PHYSICS_SUBSTEPS: u32 = 1;
 const ORBITAL_PLANET_RADIUS: f32 = 12.125 * 10.0;
@@ -261,7 +261,40 @@ struct PendingVoxelPlayerCapture {
 }
 
 #[derive(Component)]
-struct VoxelGeometry;
+struct VoxelGeometry {
+    chunk: IVec3,
+}
+
+#[derive(Resource, Default)]
+struct VoxelGeometryDirtyChunks {
+    chunks: HashSet<IVec3>,
+}
+
+#[derive(SystemParam)]
+struct VoxelEditRuntime<'w> {
+    editor: ResMut<'w, VoxelEditorState>,
+    dirty_chunks: ResMut<'w, VoxelGeometryDirtyChunks>,
+}
+
+impl VoxelGeometryDirtyChunks {
+    fn mark_cell_and_neighbors(&mut self, cell: IVec3) {
+        let chunk = cell.div_euclid(DIMS);
+        self.chunks.insert(chunk);
+        let local = cell.rem_euclid(DIMS);
+        for (axis, negative, positive) in [
+            (local.x, IVec3::NEG_X, IVec3::X),
+            (local.y, IVec3::NEG_Y, IVec3::Y),
+            (local.z, IVec3::NEG_Z, IVec3::Z),
+        ] {
+            if axis == 0 {
+                self.chunks.insert(chunk + negative);
+            }
+            if axis == DIMS.x - 1 {
+                self.chunks.insert(chunk + positive);
+            }
+        }
+    }
+}
 
 #[derive(Component, Clone)]
 struct VoxelPhysicsBody {
@@ -892,7 +925,6 @@ pub(crate) struct VoxelEditorState {
     redo: Vec<Vec<VoxelChange>>,
     stroke_positions: HashSet<IVec3>,
     active_stroke: Vec<VoxelChange>,
-    edit_hold_seconds: f32,
     edit_repeat_seconds: f32,
     camera_focus: Vec3,
     camera_distance: f32,
@@ -957,7 +989,6 @@ impl Default for VoxelEditorState {
             redo: Vec::new(),
             stroke_positions: HashSet::new(),
             active_stroke: Vec::new(),
-            edit_hold_seconds: 0.0,
             edit_repeat_seconds: 0.0,
             camera_focus: DEFAULT_SCENE_CAMERA_FOCUS,
             camera_distance: DEFAULT_SCENE_CAMERA_DISTANCE,
@@ -1331,6 +1362,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPlayerStandeeAssets>()
         .init_resource::<VoxelToolGunDragState>()
         .init_resource::<VoxelPhysicsChunkLoader>()
+        .init_resource::<VoxelGeometryDirtyChunks>()
         .init_resource::<VoxelScenePersistenceState>()
         .insert_resource(player_camera_store)
         .insert_resource(inventory_store)
@@ -4991,20 +5023,12 @@ fn animate_planet_clouds(
 
 fn rebuild_voxel_orbital_planet(
     mut commands: Commands,
-    mouse: Res<ButtonInput<MouseButton>>,
-    editor: Res<VoxelEditorState>,
     mut planets: Query<(Entity, &mut VoxelOrbitalPlanet)>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
-    let batching_edits = !editor.is_tool_gun_equipped()
-        && matches!(
-            editor.mode,
-            VoxelEditMode::Add | VoxelEditMode::Remove | VoxelEditMode::Paint
-        )
-        && (mouse.pressed(MouseButton::Left) || mouse.pressed(MouseButton::Right));
     for (entity, mut planet) in &mut planets {
-        if !planet.dirty || batching_edits {
+        if !planet.dirty {
             continue;
         }
         for mesh_entity in planet.mesh_entities.drain(..) {
@@ -5285,34 +5309,93 @@ fn stream_voxel_physics_bodies(
 fn rebuild_voxel_geometry(
     mut commands: Commands,
     grids: Query<&Grid<u8>, (With<TrpgVoxelGrid>, Changed<Grid<u8>>)>,
-    old_geometry: Query<Entity, With<VoxelGeometry>>,
+    old_geometry: Query<(Entity, &VoxelGeometry)>,
+    mut dirty_chunks: ResMut<VoxelGeometryDirtyChunks>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
     let Ok(grid) = grids.single() else {
         return;
     };
-    for entity in &old_geometry {
-        commands.entity(entity).despawn();
-    }
+    let rebuild_all = dirty_chunks.chunks.is_empty();
+    let chunks = if rebuild_all {
+        old_geometry
+            .iter()
+            .for_each(|(entity, _)| commands.entity(entity).despawn());
+        grid.iter().map(|(chunk, _)| *chunk).collect::<HashSet<_>>()
+    } else {
+        let chunks = std::mem::take(&mut dirty_chunks.chunks);
+        for (entity, geometry) in &old_geometry {
+            if chunks.contains(&geometry.chunk) {
+                commands.entity(entity).despawn();
+            }
+        }
+        chunks
+    };
 
-    let (material_meshes, collider_voxels) = build_voxel_meshes(grid);
-    for (material_id, mesh) in material_meshes {
-        commands.spawn((
-            Mesh3d(meshes.add(mesh)),
-            MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
-            VoxelGeometry,
-        ));
-    }
-    if !collider_voxels.is_empty() {
-        commands.spawn((
-            RigidBody::Static,
-            canonical_voxel_collider(&collider_voxels),
-            VoxelGeometry,
-        ));
+    for chunk in chunks {
+        let (material_meshes, collider_voxels) = build_voxel_chunk_meshes(grid, chunk);
+        for (material_id, mesh) in material_meshes {
+            commands.spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
+                VoxelGeometry { chunk },
+            ));
+        }
+        if !collider_voxels.is_empty() {
+            commands.spawn((
+                RigidBody::Static,
+                canonical_voxel_collider(&collider_voxels),
+                VoxelGeometry { chunk },
+            ));
+        }
     }
 }
 
+fn build_voxel_chunk_meshes(
+    grid: &Grid<u8>,
+    chunk_position: IVec3,
+) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
+    let Some(chunk) = grid.get_chunk(chunk_position) else {
+        return (Vec::new(), Vec::new());
+    };
+    let cells = prism(IVec3::ZERO, DIMS)
+        .filter_map(|local| {
+            let material = chunk[local];
+            (material != 0).then_some((chunk_position * DIMS + local, material))
+        })
+        .collect::<Vec<_>>();
+    if cells.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut occupied = HashMap::new();
+    for neighbor in [
+        IVec3::ZERO,
+        IVec3::X,
+        IVec3::NEG_X,
+        IVec3::Y,
+        IVec3::NEG_Y,
+        IVec3::Z,
+        IVec3::NEG_Z,
+    ] {
+        let neighbor_position = chunk_position + neighbor;
+        let Some(neighbor_chunk) = grid.get_chunk(neighbor_position) else {
+            continue;
+        };
+        for local in prism(IVec3::ZERO, DIMS) {
+            let material = neighbor_chunk[local];
+            if material != 0 {
+                occupied.insert(
+                    neighbor_position * DIMS + local,
+                    material,
+                );
+            }
+        }
+    }
+    build_voxel_meshes_from_cells_with_occupied(&cells, &occupied)
+}
+
+#[cfg(test)]
 fn build_voxel_meshes(grid: &Grid<u8>) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
     let cells = grid
         .iter()
@@ -5333,8 +5416,15 @@ fn canonical_voxel_collider(cells: &[IVec3]) -> Collider {
 }
 
 fn build_voxel_meshes_from_cells(cells: &[(IVec3, u8)]) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
-    let mut material_meshes = Vec::new();
     let occupied = cells.iter().copied().collect::<HashMap<_, _>>();
+    build_voxel_meshes_from_cells_with_occupied(cells, &occupied)
+}
+
+fn build_voxel_meshes_from_cells_with_occupied(
+    cells: &[(IVec3, u8)],
+    occupied: &HashMap<IVec3, u8>,
+) -> (Vec<(u8, Mesh)>, Vec<IVec3>) {
+    let mut material_meshes = Vec::new();
     let collider_voxels = cells
         .iter()
         .filter_map(|(cell, material)| TrpgVoxelConnector::solid(material).then_some(*cell))
@@ -5350,7 +5440,7 @@ fn build_voxel_meshes_from_cells(cells: &[(IVec3, u8)]) -> (Vec<(u8, Mesh)>, Vec
                 continue;
             }
             append_voxel_faces(
-                &occupied,
+                occupied,
                 cell,
                 &mut positions,
                 &mut normals,
@@ -6280,10 +6370,14 @@ fn place_creative_light(
     )>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
-    mut editor: ResMut<VoxelEditorState>,
+    edit_runtime: VoxelEditRuntime,
     possession: Res<VoxelPossessionState>,
     egui_input: Res<EguiWantsInput>,
 ) {
+    let VoxelEditRuntime {
+        mut editor,
+        mut dirty_chunks,
+    } = edit_runtime;
     if possession.active_user_id.is_some() || editor.is_player_possession_tool_equipped() {
         return;
     }
@@ -6356,6 +6450,7 @@ fn place_creative_light(
         if light.kind == VoxelLightTool::Cube {
             if grid.get(light.cell).copied().unwrap_or(0) != 0 {
                 grid.set(light.cell, 0);
+                dirty_chunks.mark_cell_and_neighbors(light.cell);
             }
         }
         editor.physics_status = Some(format!("已移除{}", light.kind.label()));
@@ -6383,6 +6478,7 @@ fn place_creative_light(
     if tool == VoxelLightTool::Cube {
         if grid.get(cell).copied().unwrap_or(0) != 8 {
             grid.set(cell, 8);
+            dirty_chunks.mark_cell_and_neighbors(cell);
         }
     }
     spawn_voxel_placed_light(
@@ -6538,11 +6634,15 @@ fn edit_voxel_grid(
     spatial_query: SpatialQuery,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
-    mut editor: ResMut<VoxelEditorState>,
+    edit_runtime: VoxelEditRuntime,
     possession: Res<VoxelPossessionState>,
     egui_input: Res<EguiWantsInput>,
     mut explosion_sequence: Local<u64>,
 ) {
+    let VoxelEditRuntime {
+        mut editor,
+        mut dirty_chunks,
+    } = edit_runtime;
     let egui_owns_pointer = egui_input.wants_any_pointer_input();
     if mouse.just_pressed(MouseButton::Left) {
         editor.left_started_over_ui = egui_owns_pointer;
@@ -6561,12 +6661,8 @@ fn edit_voxel_grid(
         && !mouse.pressed(MouseButton::Right)
     {
         editor.stroke_positions.clear();
-        editor.edit_hold_seconds = 0.0;
         editor.edit_repeat_seconds = 0.0;
         if !editor.active_stroke.is_empty() {
-            if let Ok(mut grid) = grids.single_mut() {
-                grid.set_changed();
-            }
             let stroke = std::mem::take(&mut editor.active_stroke);
             editor.undo.push(stroke);
             editor.redo.clear();
@@ -7025,7 +7121,8 @@ fn edit_voxel_grid(
                     continue;
                 };
                 if before != after {
-                    grid.set_batched(position, after);
+                    grid.set(position, after);
+                    dirty_chunks.mark_cell_and_neighbors(position);
                     stroke.push(VoxelChange {
                         position,
                         before,
@@ -7142,13 +7239,8 @@ struct VoxelRayHit {
 
 fn edit_repeat_due(just_pressed: bool, delta_seconds: f32, editor: &mut VoxelEditorState) -> bool {
     if just_pressed {
-        editor.edit_hold_seconds = 0.0;
         editor.edit_repeat_seconds = 0.0;
         return true;
-    }
-    editor.edit_hold_seconds += delta_seconds;
-    if editor.edit_hold_seconds < EDIT_REPEAT_DELAY {
-        return false;
     }
     editor.edit_repeat_seconds += delta_seconds;
     if editor.edit_repeat_seconds < EDIT_REPEAT_INTERVAL {
@@ -9483,6 +9575,97 @@ mod tests {
     }
 
     #[test]
+    fn chunk_mesh_hides_faces_against_neighbor_chunks() {
+        let mut world = World::new();
+        let entity = world.spawn(Grid::<u8>::new()).id();
+        {
+            let mut entity_mut = world.entity_mut(entity);
+            let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
+            grid.set(IVec3::new(DIMS.x - 1, 0, 0), 1);
+            grid.set(IVec3::new(DIMS.x, 0, 0), 1);
+        }
+        let grid = world.entity(entity).get::<Grid<u8>>().unwrap();
+
+        let (meshes, colliders) = build_voxel_chunk_meshes(grid, IVec3::ZERO);
+
+        assert_eq!(colliders, vec![IVec3::new(
+            DIMS.x - 1,
+            0,
+            0
+        )]);
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(
+            meshes[0]
+                .1
+                .attribute(Mesh::ATTRIBUTE_POSITION)
+                .unwrap()
+                .len(),
+            20
+        );
+    }
+
+    #[test]
+    fn dirty_chunk_tracking_only_rebuilds_boundary_neighbors() {
+        let mut dirty = VoxelGeometryDirtyChunks::default();
+        dirty.mark_cell_and_neighbors(IVec3::new(3, 4, 5));
+        assert_eq!(
+            dirty.chunks,
+            HashSet::from([IVec3::ZERO])
+        );
+
+        dirty.chunks.clear();
+        dirty.mark_cell_and_neighbors(IVec3::new(DIMS.x - 1, 4, 5));
+        assert_eq!(
+            dirty.chunks,
+            HashSet::from([IVec3::ZERO, IVec3::X])
+        );
+    }
+
+    #[test]
+    fn immediate_edit_rebuild_keeps_unrelated_chunk_entities() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<VoxelGeometryDirtyChunks>()
+            .insert_resource(VoxelMaterials {
+                handles: std::array::from_fn(|_| Handle::default()),
+                planet_ocean: Handle::default(),
+            })
+            .add_systems(Update, rebuild_voxel_geometry);
+        let grid = Grid::<u8>::new();
+        let grid_entity = app.world_mut().spawn((TrpgVoxelGrid, grid)).id();
+        {
+            let mut entity = app.world_mut().entity_mut(grid_entity);
+            let mut grid = entity.get_mut::<Grid<u8>>().unwrap();
+            grid.set(IVec3::ZERO, 1);
+            grid.set(IVec3::new(DIMS.x + 2, 0, 0), 1);
+        }
+        app.update();
+        let unrelated_entities = app
+            .world_mut()
+            .query::<(Entity, &VoxelGeometry)>()
+            .iter(app.world())
+            .filter_map(|(entity, geometry)| (geometry.chunk == IVec3::X).then_some(entity))
+            .collect::<Vec<_>>();
+        assert!(!unrelated_entities.is_empty());
+
+        {
+            let mut entity = app.world_mut().entity_mut(grid_entity);
+            entity
+                .get_mut::<Grid<u8>>()
+                .unwrap()
+                .set(IVec3::new(1, 0, 0), 1);
+        }
+        app.world_mut()
+            .resource_mut::<VoxelGeometryDirtyChunks>()
+            .mark_cell_and_neighbors(IVec3::new(1, 0, 0));
+        app.update();
+
+        assert!(unrelated_entities
+            .into_iter()
+            .all(|entity| app.world().get_entity(entity).is_ok()));
+    }
+
+    #[test]
     fn connector_treats_zero_as_air() {
         assert!(!TrpgVoxelConnector::solid(&0));
         assert!(TrpgVoxelConnector::solid(&1));
@@ -9833,24 +10016,17 @@ mod tests {
     }
 
     #[test]
-    fn edit_repeat_waits_before_repeating() {
+    fn edit_repeat_has_no_initial_hold_debounce() {
         let mut editor = VoxelEditorState::default();
         assert!(edit_repeat_due(true, 0.0, &mut editor));
-        for _ in 0..18 {
-            assert!(!edit_repeat_due(
-                false,
-                0.016,
-                &mut editor
-            ));
-        }
         assert!(!edit_repeat_due(
             false,
-            0.04,
+            EDIT_REPEAT_INTERVAL - 0.01,
             &mut editor
         ));
         assert!(edit_repeat_due(
             false,
-            0.05,
+            0.01,
             &mut editor
         ));
     }
@@ -10284,7 +10460,7 @@ mod tests {
     }
 
     #[test]
-    fn held_voxel_edits_defer_the_grid_change_signal_until_release() {
+    fn voxel_edits_signal_geometry_rebuild_immediately() {
         let mut world = World::new();
         let entity = world.spawn(Grid::<u8>::new()).id();
         world.clear_trackers();
@@ -10292,10 +10468,8 @@ mod tests {
         let mut entity_mut = world.entity_mut(entity);
         let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
         assert!(!grid.is_changed());
-        grid.set_batched(IVec3::new(2, 3, 4), 7);
+        grid.set(IVec3::new(2, 3, 4), 7);
         assert_eq!(grid.get(IVec3::new(2, 3, 4)), Some(&7));
-        assert!(!grid.is_changed());
-        grid.set_changed();
         assert!(grid.is_changed());
     }
 
