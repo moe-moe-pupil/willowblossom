@@ -87,9 +87,9 @@ use crate::{
 
 const REPLAY_FORMAT_VERSION: u32 = 1;
 const CAMERA_SAMPLE_SECONDS: f32 = 0.1;
-const MIN_DIALOGUE_MS: u64 = 1_350;
-const MAX_DIALOGUE_MS: u64 = 4_875;
-const HISTORY_DIALOGUE_GAP_MS: u64 = 135;
+const MIN_DIALOGUE_MS: u64 = 2_700;
+const MAX_DIALOGUE_MS: u64 = 9_750;
+const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const ONNX_TTS_MODEL_DIR: &str = ".data/willowblossom/tts/kokoro-int8-multi-lang-v1_1";
@@ -805,6 +805,7 @@ fn create_onnx_tts() -> Result<sherpa_onnx::OfflineTts, String> {
                 voices: Some(path("voices.bin")),
                 tokens: Some(path("tokens.txt")),
                 data_dir: Some(path("espeak-ng-data")),
+                dict_dir: Some(path("dict")),
                 lexicon: Some(
                     ["lexicon-us-en.txt", "lexicon-zh.txt"]
                         .map(|name| path(name))
@@ -873,9 +874,13 @@ fn generate_onnx_wav(
 ) -> Result<Vec<u8>, String> {
     use sherpa_onnx::GenerationConfig;
 
+    let normalized_text = normalize_tts_text(text);
+    if normalized_text.is_empty() {
+        return Err("台词中没有可朗读的文字".to_owned());
+    }
     let audio = tts
         .generate_with_config(
-            text,
+            &normalized_text,
             &GenerationConfig {
                 sid: speaker_id.clamp(0, ONNX_TTS_SPEAKER_COUNT - 1),
                 speed: speed.clamp(0.85, 1.45),
@@ -1805,7 +1810,7 @@ fn build_from_history(
     studio.playback_ms = 0;
     studio.replay = Some(replay);
     studio.status = format!(
-        "已从现有聊天生成 {0} 条连续对话；切换间隔约 0.135 秒",
+        "已从现有聊天生成 {0} 条连续对话；切换间隔约 0.27 秒",
         visible.len()
     );
 }
@@ -3095,8 +3100,68 @@ fn dialogue_duration_ms(text: &str) -> u64 {
     });
     reading_ms
         .saturating_mul(3)
-        .saturating_div(2)
         .clamp(MIN_DIALOGUE_MS, MAX_DIALOGUE_MS)
+}
+
+fn normalize_tts_text(text: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Script {
+        Cjk,
+        Latin,
+        Other,
+    }
+
+    let mut output = String::with_capacity(text.len() + 8);
+    let mut previous_script = Script::Other;
+    let mut pending_space = false;
+    for character in text.chars() {
+        let script = if is_cjk_character(character) {
+            Script::Cjk
+        } else if character.is_ascii_alphanumeric() || matches!(character, '\'' | '-') {
+            Script::Latin
+        } else {
+            Script::Other
+        };
+        if matches!(
+            (previous_script, script),
+            (Script::Cjk, Script::Latin) | (Script::Latin, Script::Cjk)
+        ) && output
+            .chars()
+            .next_back()
+            .is_some_and(|previous| is_cjk_character(previous) || previous.is_ascii_alphanumeric())
+        {
+            output.push(' ');
+        }
+        match character {
+            character if is_cjk_character(character) || character.is_ascii_alphanumeric() => {
+                if pending_space && !output.ends_with(' ') && !output.ends_with('，') {
+                    output.push(' ');
+                }
+                output.push(character);
+                pending_space = false;
+            },
+            '\'' | '-' => {
+                output.push(character);
+                pending_space = false;
+            },
+            '。' | '！' | '？' | '，' | '、' | '：' | '；' | '.' | '!' | '?' | ',' | ':' | ';' =>
+            {
+                output.push(character);
+                pending_space = false;
+            },
+            character if character.is_whitespace() => pending_space = true,
+            _ => {
+                if !output.ends_with('，') && !output.is_empty() {
+                    output.push('，');
+                }
+                pending_space = false;
+            },
+        }
+        if script != Script::Other {
+            previous_script = script;
+        }
+    }
+    output.trim().trim_matches('，').trim().to_owned()
 }
 
 fn is_cjk_character(character: char) -> bool {
@@ -3537,10 +3602,26 @@ mod tests {
         assert!(
             dialogue_duration_ms("等等！发生什么了？") > dialogue_duration_ms("等等发生什么了")
         );
-        assert!(
-            dialogue_duration_ms(
-                "最近上班没以前忙碌了，做独立游戏的间隔可以让ai大人继续维护老项目了哈哈哈"
-            ) < 6_000
+        let long_line = dialogue_duration_ms(
+            "最近上班没以前忙碌了，做独立游戏的间隔可以让ai大人继续维护老项目了哈哈哈",
+        );
+        assert!(long_line > 6_000);
+        assert!(long_line <= MAX_DIALOGUE_MS);
+    }
+
+    #[test]
+    fn tts_text_normalization_separates_scripts_and_replaces_unknown_symbols() {
+        assert_eq!(
+            normalize_tts_text("你好AI大人，test测试🙂OK"),
+            "你好 AI 大人，test 测试，OK"
+        );
+        assert_eq!(
+            normalize_tts_text("  你好   world  "),
+            "你好 world"
+        );
+        assert_eq!(
+            normalize_tts_text("测试❓中文"),
+            "测试，中文"
         );
     }
 
@@ -3572,9 +3653,9 @@ mod tests {
 
     #[test]
     fn historical_dialogue_transition_is_brief() {
-        assert_eq!(HISTORY_DIALOGUE_GAP_MS, 135);
-        assert_eq!(MIN_DIALOGUE_MS, 1_350);
-        assert_eq!(MAX_DIALOGUE_MS, 4_875);
+        assert_eq!(HISTORY_DIALOGUE_GAP_MS, 270);
+        assert_eq!(MIN_DIALOGUE_MS, 2_700);
+        assert_eq!(MAX_DIALOGUE_MS, 9_750);
     }
 
     #[test]
@@ -3711,14 +3792,9 @@ mod tests {
             tts.num_speakers(),
             ONNX_TTS_SPEAKER_COUNT
         );
-        let first = generate_onnx_wav(&tts, "你好，这是离线中文语音。", 3, 1.4).unwrap();
-        let second = generate_onnx_wav(
-            &tts,
-            "你好，这是离线中文语音。",
-            58,
-            1.4,
-        )
-        .unwrap();
+        let mixed_language = "你好AI，我在维护TRPG replay，测试English结尾。";
+        let first = generate_onnx_wav(&tts, mixed_language, 3, 1.4).unwrap();
+        let second = generate_onnx_wav(&tts, mixed_language, 58, 1.4).unwrap();
         assert_eq!(&first[0..4], b"RIFF");
         assert!(first.len() > 44);
         assert_ne!(first, second);
