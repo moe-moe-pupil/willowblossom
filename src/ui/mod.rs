@@ -905,7 +905,7 @@ pub struct UiSystemLocals<'w, 's> {
     new_chat_group_modal_string_open: Local<'s, (String, bool)>,
     chat_input_msgs: Local<'s, HashMap<String, String>>,
     chat_scroll_states: Local<'s, HashMap<String, ChatScrollState>>,
-    previous_group_rects: Local<'s, HashMap<String, Rect>>,
+    group_member_window_offsets: Local<'s, HashMap<(String, String), Vec2>>,
     chat_list_edit_target: Local<'s, Option<String>>,
     chat_list_edit_name: Local<'s, String>,
     trpg_group_settings: Local<'s, TrpgGroupSettingsState>,
@@ -1319,7 +1319,7 @@ fn chat_window(
     group_rects: &HashMap<String, Rect>,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
     current_group: Option<&str>,
-    group_delta: Option<Vec2>,
+    group_member_window_offsets: &mut Local<HashMap<(String, String), Vec2>>,
     unread_count: usize,
     quick_character_targets: &mut Local<HashSet<String>>,
     image_textures: &mut Local<HashMap<String, TextureHandle>>,
@@ -1379,11 +1379,16 @@ fn chat_window(
         .min_size(window_min_size)
         .max_size(max_window_size)
         .max_height(GROUP_CHAT_MAX_HEIGHT);
-    if current_group.is_some() {
-        if let Some(delta) = group_delta {
-            if let Some(member_rect) = ctx.memory(|memory| memory.area_rect(window_id)) {
-                window = window.current_pos(member_rect.min + delta);
-            }
+    if let Some(group_name) = current_group {
+        let offset_key = (
+            group_name.to_owned(),
+            target_id.to_owned(),
+        );
+        if let Some(offset) = group_member_window_offsets.get(&offset_key) {
+            window = window.current_pos(group_member_position(
+                constraint_rect,
+                *offset,
+            ));
         }
         window = window.default_pos(group_member_default_pos(
             constraint_rect,
@@ -1671,6 +1676,10 @@ fn chat_window(
     }
     if let Some(group_name) = current_group {
         if leave_group {
+            group_member_window_offsets.remove(&(
+                group_name.to_owned(),
+                target_id.to_owned(),
+            ));
             if let Some(group) = manager.groups.get_mut(group_name) {
                 group.members.retain(|member_id| member_id != target_id);
                 manager.persist().ok();
@@ -1680,6 +1689,16 @@ fn chat_window(
     }
 
     if let Some(response) = response {
+        if let Some(group_name) = current_group {
+            group_member_window_offsets.insert(
+                (
+                    group_name.to_owned(),
+                    target_id.to_owned(),
+                ),
+                group_member_offset(constraint_rect, response.response.rect),
+            );
+        }
+
         if current_group.is_none() {
             paint_unread_badge(
                 ctx,
@@ -1853,6 +1872,12 @@ fn group_member_default_pos(rect: Rect, target_id: &str) -> Pos2 {
     let x = rect.left() + 12.0 + (hash % x_slots) as f32 * 36.0;
     let y = rect.top() + 12.0 + ((hash / 17) % y_slots) as f32 * 36.0;
     egui::pos2(x, y)
+}
+
+fn group_member_position(parent_rect: Rect, offset: Vec2) -> Pos2 { parent_rect.min + offset }
+
+fn group_member_offset(parent_rect: Rect, member_rect: Rect) -> Vec2 {
+    member_rect.min - parent_rect.min
 }
 
 fn chat_body_ui(
@@ -12992,7 +13017,8 @@ pub fn ui_system(
     let chat_input_msgs: &mut Local<HashMap<String, String>> = &mut locals.chat_input_msgs;
     let chat_scroll_states: &mut Local<HashMap<String, ChatScrollState>> =
         &mut locals.chat_scroll_states;
-    let previous_group_rects: &mut Local<HashMap<String, Rect>> = &mut locals.previous_group_rects;
+    let group_member_window_offsets: &mut Local<HashMap<(String, String), Vec2>> =
+        &mut locals.group_member_window_offsets;
     let chat_list_edit_target: &mut Local<Option<String>> = &mut locals.chat_list_edit_target;
     let chat_list_edit_name: &mut Local<String> = &mut locals.chat_list_edit_name;
     let trpg_group_settings: &mut Local<TrpgGroupSettingsState> = &mut locals.trpg_group_settings;
@@ -13046,8 +13072,6 @@ pub fn ui_system(
     }
 
     let mut group_rects: HashMap<String, Rect> = HashMap::default();
-    let mut group_deltas: HashMap<String, Vec2> = HashMap::default();
-    let mut latest_group_rects: HashMap<String, Rect> = HashMap::default();
     let reset_data = |new_chat_group_modal_string_bool: &mut Local<'_, (String, bool)>| {
         new_chat_group_modal_string_bool.0 = "".to_owned();
         new_chat_group_modal_string_bool.1 = false;
@@ -14114,13 +14138,6 @@ pub fn ui_system(
                         unread_count,
                     );
                     if response.inner.is_some() {
-                        if let Some(previous_rect) = previous_group_rects.get(k) {
-                            let delta = response.response.rect.min - previous_rect.min;
-                            if delta.length_sq() > 0.0 {
-                                group_deltas.insert(k.clone(), delta);
-                            }
-                        }
-                        latest_group_rects.insert(k.clone(), response.response.rect);
                         group_rects.insert(k.clone(), response.response.rect);
                     }
                 }
@@ -14128,13 +14145,19 @@ pub fn ui_system(
             if !closed_group_names.is_empty() {
                 for group_name in &closed_group_names {
                     manager.groups.remove(group_name);
-                    previous_group_rects.remove(group_name);
+                    group_member_window_offsets
+                        .retain(|(offset_group, _), _| offset_group != group_name);
                 }
                 if let Err(err) = manager.persist() {
                     eprintln!("failed to persist closed chat groups: {err}");
                 }
             }
-            **previous_group_rects = latest_group_rects;
+            group_member_window_offsets.retain(|(group_name, target_id), _| {
+                manager
+                    .groups
+                    .get(group_name)
+                    .is_some_and(|group| group.members.contains(target_id))
+            });
 
             let mut visible_targets: HashSet<String> = manager.open_chat_targets.clone();
             for group in manager.groups.values() {
@@ -14211,9 +14234,7 @@ pub fn ui_system(
                     &group_rects,
                     &mut manager,
                     current_group.as_deref(),
-                    current_group
-                        .as_deref()
-                        .and_then(|group_name| group_deltas.get(group_name).copied()),
+                    group_member_window_offsets,
                     unread_count,
                     quick_character_targets,
                     image_textures,
@@ -14334,6 +14355,25 @@ fn append_local_sent_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_member_position_follows_parent_and_preserves_offset() {
+        let first_parent = Rect::from_min_size(
+            egui::pos2(100.0, 80.0),
+            egui::vec2(500.0, 400.0),
+        );
+        let member = Rect::from_min_size(
+            egui::pos2(145.0, 150.0),
+            egui::vec2(240.0, 180.0),
+        );
+        let offset = group_member_offset(first_parent, member);
+        let moved_parent = first_parent.translate(egui::vec2(90.0, -25.0));
+
+        assert_eq!(
+            group_member_position(moved_parent, offset),
+            member.min + egui::vec2(90.0, -25.0)
+        );
+    }
 
     #[test]
     fn repeated_character_skill_rows_have_distinct_widget_ids() {
