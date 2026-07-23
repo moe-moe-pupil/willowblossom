@@ -130,17 +130,18 @@ const DIRECTOR_SYSTEM_PROMPT: &str = r#"
 必须遵守：
 1. dialogue 必须包含每个输入 index，且每个 index 恰好一次，顺序不变；不得添加或删除说话人。
 2. 可以让措辞更自然、精炼、适合配音，但不得新增事实、行动、结果、线索、动机、角色或剧情。
-3. 保留原意、专有名词、数字和中英文信息；不要把玩家的话改成旁白。
+3. text 是画面字幕：保留原意、专有名词、数字和正常中英文写法；不要把玩家的话改成旁白。
 4. 台词要频繁连续，中文每句适合一次呼吸读完；不要加入长停顿说明。
-5. has_character_model 为 true 时，必须使用 speaker_close、speaker_medium 或 speaker_wide，并让镜头持续对准当前说话者的角色模型；不得选择环境镜头。
-6. has_character_model 为 false 时才可使用 establishing 或 environment，并且只能进行极慢的短距离环境移动。
-7. 连续两句不要机械重复同一构图。禁止环绕、快速摇镜、快速推拉、大范围横移或跨越场景飞行。
-8. shot 只能是 speaker_close、speaker_medium、speaker_wide、establishing、environment。
-9. motion 只能是 static、dolly_in、dolly_out、drift_left、drift_right；优先 static。
-10. 只返回严格 JSON，不要 Markdown、解释或代码围栏。
+5. speech_text 只供中文 TTS 使用，不会显示在画面。它必须与 text 含义完全相同，但要把英文字母、英文缩写、阿拉伯数字和符号改成自然可读的中文谐音或中文读法。例如 text 为“AI领域近年来发展迅速，1个方案”时，speech_text 应为“诶艾领域近年来发展迅速，一个方案”。不得为了配音改写 text。
+6. has_character_model 为 true 时，必须使用 speaker_close、speaker_medium 或 speaker_wide，并让镜头持续对准当前说话者的角色模型；不得选择环境镜头。
+7. has_character_model 为 false 时才可使用 establishing 或 environment，并且只能进行极慢的短距离环境移动。
+8. 连续两句不要机械重复同一构图。禁止环绕、快速摇镜、快速推拉、大范围横移或跨越场景飞行。
+9. shot 只能是 speaker_close、speaker_medium、speaker_wide、establishing、environment。
+10. motion 只能是 static、dolly_in、dolly_out、drift_left、drift_right；优先 static。
+11. 只返回严格 JSON，不要 Markdown、解释或代码围栏。
 
 返回格式：
-{"dialogue":[{"index":0,"text":"润色后的原意台词","shot":"speaker_medium","motion":"dolly_in"}]}
+{"dialogue":[{"index":0,"text":"AI领域近年来发展迅速，1个方案","speech_text":"诶艾领域近年来发展迅速，一个方案","shot":"speaker_medium","motion":"dolly_in"}]}
 "#;
 
 const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
@@ -759,7 +760,7 @@ fn director_request_defaults_missing_custom_prompt() {
 #[test]
 #[ignore = "calls the live DeepSeek API"]
 fn director_live_api_returns_structured_shot_plan() {
-    let input = r#"{"dialogue":[{"index":0,"speaker_id":"1","name":"萌萌","role":"玩家","text":"我去打开舱门","has_character_model":true},{"index":1,"speaker_id":"2","name":"GM","role":"GM","text":"舱门缓慢打开。","has_character_model":false}]}"#;
+    let input = r#"{"dialogue":[{"index":0,"speaker_id":"1","name":"萌萌","role":"玩家","text":"AI帮我打开1个舱门","has_character_model":true},{"index":1,"speaker_id":"2","name":"GM","role":"GM","text":"舱门缓慢打开。","has_character_model":false}]}"#;
     let response = DeepseekManager::post_director(input, "节奏紧凑，避免连续环绕镜头").unwrap();
     let value: serde_json::Value = serde_json::from_str(&response).unwrap();
     let dialogue = value["dialogue"].as_array().unwrap();
@@ -768,6 +769,9 @@ fn director_live_api_returns_structured_shot_plan() {
     assert!(dialogue[0]["text"]
         .as_str()
         .is_some_and(|text| !text.is_empty()));
+    assert!(dialogue[0]["speech_text"]
+        .as_str()
+        .is_some_and(|text| text.contains("诶艾") && !text.contains('1')));
     assert!(dialogue[0]["shot"].as_str().is_some());
     assert!(dialogue[0]["motion"].as_str().is_some());
     assert!(matches!(

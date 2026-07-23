@@ -62,7 +62,6 @@ futures-lite = "2.6.1"
 bevy_egui = { version = "=0.41.0", features = ["serde"] }
 egui = { version = "=0.35.0", features = ["persistence"] }
 serde_json = "1.0.150"
-sherpa-onnx = { version = "1.13.4", default-features = false, features = ["shared"] }
 base64 = "0.22.1"
 tempfile = "3.20.0"
 dirs = "6.0.0"

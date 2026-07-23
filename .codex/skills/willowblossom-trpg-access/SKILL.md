@@ -13,6 +13,17 @@ Use this skill to keep TRPG knowledge boundaries explicit in Willowblossom. The 
 
 Reply to the user in English by default. The Chinese-first rule below applies to Willowblossom user-facing app UI text, not to Codex chat responses.
 
+## Network downloads
+
+Before downloading dependencies, models, repositories, or other remote assets for this workspace in PowerShell, set:
+
+```powershell
+$env:http_proxy="http://127.0.0.1:10809"
+$env:https_proxy="http://127.0.0.1:10809"
+```
+
+Keep both variables in the same shell process that performs the download.
+
 ## Repo Map
 
 - `src/napcat/mod.rs`: active QQ/NapCat websocket integration and persisted message manager.

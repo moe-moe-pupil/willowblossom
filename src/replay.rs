@@ -11,6 +11,8 @@ use std::{
         Hasher,
     },
     io::{
+        BufRead,
+        BufReader,
         BufWriter,
         Write,
     },
@@ -18,7 +20,13 @@ use std::{
         Path,
         PathBuf,
     },
-    process::Command,
+    process::{
+        Child,
+        ChildStdin,
+        ChildStdout,
+        Command,
+        Stdio,
+    },
     sync::Arc,
     thread,
     time::{
@@ -93,10 +101,7 @@ const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const BACKGROUND_MUSIC_PATH: &str = "assets/audio/jrpg2-piano.mp3";
-const ONNX_TTS_MODEL_DIR: &str = ".data/willowblossom/tts/kokoro-int8-multi-lang-v1_1";
-const ONNX_TTS_SPEAKER_COUNT: i32 = 103;
-const ONNX_TTS_FIRST_CHINESE_SPEAKER: i32 = 3;
-const ONNX_TTS_CHINESE_SPEAKER_COUNT: i32 = 100;
+const MELOTTS_RUNTIME_DIR: &str = ".data/willowblossom/tts/melotts";
 const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
 const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
 
@@ -235,6 +240,8 @@ struct ReplayDialogue {
     name: String,
     role: String,
     text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speech_text: Option<String>,
     avatar: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     avatar_data_url: Option<String>,
@@ -252,6 +259,8 @@ struct DirectorPlan {
 struct DirectorCue {
     index: usize,
     text: String,
+    #[serde(default)]
+    speech_text: String,
     shot: DirectorShot,
     motion: DirectorMotion,
 }
@@ -330,8 +339,6 @@ struct ReplayStudio {
     speech_enabled: bool,
     speech_volume: f32,
     speech_settings_open: bool,
-    installed_speech_voices: Vec<String>,
-    speech_voices_loaded: bool,
     deepseek_custom_prompt: String,
     project_export_path: String,
     project_import_path: String,
@@ -380,8 +387,6 @@ struct PreviewSpeechController {
     onnx_worker: Option<OnnxPreviewWorker>,
     onnx_failed: bool,
     audio_entity: Option<Entity>,
-    #[cfg(windows)]
-    windows_worker: Option<PreviewSpeechWorker>,
 }
 
 struct OnnxPreviewWorker {
@@ -393,7 +398,7 @@ struct OnnxPreviewRequest {
     signature: u64,
     cue: (u64, usize),
     text: String,
-    speaker_id: i32,
+    pitch: i32,
     speed: f32,
     volume: f32,
 }
@@ -403,27 +408,6 @@ struct OnnxPreviewResult {
     cue: (u64, usize),
     wav: Result<Vec<u8>, String>,
     volume: f32,
-}
-
-#[cfg(windows)]
-struct PreviewSpeechWorker {
-    child: std::process::Child,
-    input: std::process::ChildStdin,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum PreviewSpeechRequest<'a> {
-    Speak {
-        text: &'a str,
-        language: &'static str,
-        voice_name: Option<&'a str>,
-        voice_slot: u64,
-        pitch: i32,
-        speech_rate: i32,
-        volume: u8,
-    },
-    Stop,
 }
 
 impl Default for ReplayStudio {
@@ -450,8 +434,6 @@ impl Default for ReplayStudio {
             speech_enabled: true,
             speech_volume: 0.90,
             speech_settings_open: false,
-            installed_speech_voices: Vec::new(),
-            speech_voices_loaded: false,
             deepseek_custom_prompt: String::new(),
             project_export_path: DEFAULT_REPLAY_PATH.to_owned(),
             project_import_path: DEFAULT_REPLAY_PATH.to_owned(),
@@ -581,7 +563,7 @@ fn preview_replay_speech(
         if let Some(replay) = studio.replay.as_ref() {
             if let Err(err) = speech.prepare_onnx_replay(replay, studio.speech_volume) {
                 speech.onnx_failed = true;
-                eprintln!("failed to prepare ONNX preview speech: {err}");
+                eprintln!("failed to prepare MeloTTS preview speech: {err}");
             }
         }
     }
@@ -615,7 +597,10 @@ fn preview_replay_speech(
                 newly_ready_current |= Some(result.cue) == cue;
                 speech.onnx_cache.insert(result.cue, (wav, result.volume));
             },
-            Err(err) => eprintln!("failed to synthesize ONNX preview speech: {err}"),
+            Err(err) => {
+                speech.onnx_failed = true;
+                eprintln!("failed to synthesize MeloTTS preview speech: {err}");
+            },
         }
     }
     let cue_changed = speech.active_cue != cue;
@@ -627,18 +612,9 @@ fn preview_replay_speech(
         if let Some(entity) = speech.audio_entity.take() {
             commands.entity(entity).try_despawn();
         }
-        if let Err(err) = speech.stop_windows() {
-            eprintln!("failed to stop replay preview speech: {err}");
-        }
         speech.active_cue = cue;
     }
-    let Some((_, _, line)) = active else { return };
-    let settings = studio
-        .replay
-        .as_ref()
-        .and_then(|replay| replay.speaker_voice_settings.get(&line.sender_id))
-        .cloned()
-        .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
+    let Some((_, _, _line)) = active else { return };
     let active_cue = cue.expect("active dialogue has a cue");
     if let Some((wav, volume)) = speech.onnx_cache.get(&active_cue).cloned() {
         let source = audio_sources.add(AudioSource {
@@ -652,20 +628,6 @@ fn preview_replay_speech(
                 ))
                 .id(),
         );
-    } else if speech.onnx_failed || !onnx_tts_is_available() {
-        let master_speed = studio
-            .replay
-            .as_ref()
-            .map(|replay| replay.master_speech_speed)
-            .unwrap_or_else(default_master_speech_speed);
-        if let Err(err) = speech.speak_windows(
-            line,
-            studio.speech_volume,
-            master_speed,
-            &settings,
-        ) {
-            eprintln!("failed to play replay preview speech: {err}");
-        }
     }
 }
 
@@ -708,12 +670,12 @@ impl PreviewSpeechController {
                 .send(OnnxPreviewRequest {
                     signature,
                     cue: (replay.created_at_unix_ms, index),
-                    text: line.text.clone(),
-                    speaker_id: onnx_speaker_id(&settings, line.sender_id),
+                    text: speech_text_for_line(line),
+                    pitch: settings.pitch,
                     speed: combined_onnx_speed(rate, replay.master_speech_speed),
                     volume: (global_volume * settings.volume).clamp(0.0, 1.0),
                 })
-                .map_err(|err| format!("ONNX preview worker stopped: {err}"))?;
+                .map_err(|err| format!("MeloTTS preview worker stopped: {err}"))?;
         }
         Ok(())
     }
@@ -721,199 +683,204 @@ impl PreviewSpeechController {
     fn onnx_cue_ready(&self, signature: u64, cue: (u64, usize)) -> bool {
         self.prepared_signature == Some(signature) && self.onnx_cache.contains_key(&cue)
     }
-
-    fn speak_windows(
-        &mut self,
-        line: &ReplayDialogue,
-        global_volume: f32,
-        master_speed: f32,
-        settings: &SpeakerVoiceSettings,
-    ) -> Result<(), String> {
-        self.send(PreviewSpeechRequest::Speak {
-            text: &line.text,
-            language: dialogue_language(&line.text),
-            voice_name: settings.voice_name.as_deref(),
-            voice_slot: line.sender_id,
-            pitch: settings.pitch,
-            speech_rate: combined_ssml_rate(
-                fitted_speech_rate(
-                    settings.speech_rate,
-                    &line.text,
-                    line.duration_ms,
-                ),
-                master_speed,
-            ),
-            volume: (global_volume * settings.volume)
-                .clamp(0.0, 1.0)
-                .mul_add(100.0, 0.0)
-                .round() as u8,
-        })
-    }
-
-    fn stop_windows(&mut self) -> Result<(), String> {
-        self.send_if_running(PreviewSpeechRequest::Stop)
-    }
-
-    #[cfg(windows)]
-    fn send(&mut self, request: PreviewSpeechRequest<'_>) -> Result<(), String> {
-        if self.windows_worker.is_none() {
-            self.windows_worker = Some(start_preview_speech_worker()?);
-        }
-        self.send_if_running(request)
-    }
-
-    #[cfg(not(windows))]
-    fn send(&mut self, _request: PreviewSpeechRequest<'_>) -> Result<(), String> {
-        Err("replay preview speech currently requires Windows offline TTS".to_owned())
-    }
-
-    #[cfg(windows)]
-    fn send_if_running(&mut self, request: PreviewSpeechRequest<'_>) -> Result<(), String> {
-        let Some(worker) = self.windows_worker.as_mut() else { return Ok(()) };
-        let encoded = preview_speech_wire_line(&request)?;
-        if let Err(err) = worker
-            .input
-            .write_all(&encoded)
-            .and_then(|_| worker.input.flush())
-        {
-            let _ = worker.child.kill();
-            let _ = worker.child.wait();
-            self.windows_worker = None;
-            return Err(format!(
-                "preview speech worker stopped: {err}"
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(not(windows))]
-    fn send_if_running(&mut self, _request: PreviewSpeechRequest<'_>) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-fn preview_speech_wire_line(request: &PreviewSpeechRequest<'_>) -> Result<Vec<u8>, String> {
-    let json = serde_json::to_vec(request)
-        .map_err(|err| format!("unable to prepare preview speech: {err}"))?;
-    let mut encoded = BASE64.encode(json).into_bytes();
-    encoded.push(b'\n');
-    Ok(encoded)
-}
-
-#[cfg(windows)]
-impl Drop for PreviewSpeechController {
-    fn drop(&mut self) {
-        if let Some(worker) = self.windows_worker.as_mut() {
-            let _ = worker.child.kill();
-            let _ = worker.child.wait();
-        }
-    }
-}
-
-#[cfg(windows)]
-fn start_preview_speech_worker() -> Result<PreviewSpeechWorker, String> {
-    use std::process::Stdio;
-
-    let script = r#"& { Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToDefaultAudioDevice(); while (($line = [Console]::In.ReadLine()) -ne $null) { try { $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line)); $job = $json | ConvertFrom-Json; $s.SpeakAsyncCancelAll(); if ([string]$job.op -eq 'stop') { continue }; $selected = $false; if (-not [string]::IsNullOrWhiteSpace([string]$job.voice_name)) { $candidate = @($s.GetInstalledVoices() | Where-Object { $_.Enabled -and $_.VoiceInfo.Name -eq [string]$job.voice_name -and ([string]$job.language -ne 'zh-CN' -or $_.VoiceInfo.Culture.Name -eq 'zh-CN') }) | Select-Object -First 1; if ($null -ne $candidate) { $s.SelectVoice($candidate.VoiceInfo.Name); $selected = $true } }; if (-not $selected) { $culture = [Globalization.CultureInfo]::GetCultureInfo([string]$job.language); $voices = @($s.GetInstalledVoices($culture) | Where-Object { $_.Enabled }); if ($voices.Count -eq 0) { $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }) }; if ($voices.Count -eq 0) { continue }; $voice = $voices[[int64]$job.voice_slot % $voices.Count]; $s.SelectVoice($voice.VoiceInfo.Name) }; $s.Volume = [Math]::Max(0, [Math]::Min(100, [int]$job.volume)); $escaped = [Security.SecurityElement]::Escape([string]$job.text); $pitch = [int]$job.pitch; $speechRate = [int]$job.speech_rate; $language = [string]$job.language; $ssml = "<speak version='1.0' xml:lang='$language'><prosody pitch='$pitch%' rate='$speechRate%'>$escaped</prosody></speak>"; $null = $s.SpeakSsmlAsync($ssml) } catch {} }; $s.SpeakAsyncCancelAll(); $s.Dispose() }"#;
-    let mut command = Command::new("powershell.exe");
-    command
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    hide_command_window(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|err| format!("unable to start Windows preview speech: {err}"))?;
-    let input = child
-        .stdin
-        .take()
-        .ok_or_else(|| "Windows preview speech did not open its input stream".to_owned())?;
-    Ok(PreviewSpeechWorker { child, input })
-}
-
-fn onnx_tts_model_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(ONNX_TTS_MODEL_DIR)
 }
 
 fn onnx_tts_is_available() -> bool {
-    let root = onnx_tts_model_dir();
-    [
-        "model.int8.onnx",
-        "voices.bin",
-        "lexicon-us-en.txt",
-        "lexicon-zh.txt",
-        "tokens.txt",
-        "phone-zh.fst",
-        "date-zh.fst",
-        "number-zh.fst",
-    ]
-    .iter()
-    .all(|name| root.join(name).is_file())
+    melotts_python_path().is_file() && melotts_worker_path().is_file()
 }
 
-fn create_onnx_tts() -> Result<sherpa_onnx::OfflineTts, String> {
-    use sherpa_onnx::{
-        OfflineTtsConfig,
-        OfflineTtsKokoroModelConfig,
-        OfflineTtsModelConfig,
-    };
+fn melotts_root() -> PathBuf { Path::new(env!("CARGO_MANIFEST_DIR")).join(MELOTTS_RUNTIME_DIR) }
 
-    if !onnx_tts_is_available() {
-        return Err(format!(
-            "未找到中文 ONNX 语音模型：{ONNX_TTS_MODEL_DIR}"
-        ));
+fn melotts_python_path() -> PathBuf {
+    let root = melotts_root().join(".venv");
+    if cfg!(windows) {
+        root.join("Scripts").join("python.exe")
+    } else {
+        root.join("bin").join("python")
     }
-    let root = onnx_tts_model_dir();
-    let path = |name: &str| root.join(name).to_string_lossy().into_owned();
-    let config = OfflineTtsConfig {
-        model: OfflineTtsModelConfig {
-            kokoro: OfflineTtsKokoroModelConfig {
-                model: Some(path("model.int8.onnx")),
-                voices: Some(path("voices.bin")),
-                tokens: Some(path("tokens.txt")),
-                data_dir: Some(path("espeak-ng-data")),
-                dict_dir: Some(path("dict")),
-                lexicon: Some(
-                    ["lexicon-us-en.txt", "lexicon-zh.txt"]
-                        .map(|name| path(name))
-                        .join(","),
-                ),
-                ..Default::default()
-            },
-            num_threads: thread::available_parallelism()
-                .map(|threads| threads.get().min(4) as i32)
-                .unwrap_or(2),
-            provider: Some("cpu".to_owned()),
-            ..Default::default()
-        },
-        rule_fsts: Some(
-            ["phone-zh.fst", "date-zh.fst", "number-zh.fst"]
-                .map(|name| path(name))
-                .join(","),
-        ),
-        max_num_sentences: 1,
-        silence_scale: 0.12,
-        ..Default::default()
-    };
-    sherpa_onnx::OfflineTts::create(&config)
-        .ok_or_else(|| "无法加载 Kokoro 中英文 ONNX 语音模型".to_owned())
+}
+
+fn melotts_worker_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("melotts_worker.py")
+}
+
+struct MeloTts {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+    cache: TempDir,
+    sequence: u64,
+}
+
+impl Drop for MeloTts {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn create_onnx_tts() -> Result<MeloTts, String> {
+    if !onnx_tts_is_available() {
+        return Err("未安装 MeloTTS 中文运行环境；请运行 scripts/setup_melotts.ps1".to_owned());
+    }
+    let cache_root = melotts_root().join("worker-cache");
+    fs::create_dir_all(&cache_root).map_err(|err| format!("无法创建 MeloTTS 缓存目录：{err}"))?;
+    let cache = tempfile::Builder::new()
+        .prefix("worker-")
+        .tempdir_in(&cache_root)
+        .map_err(|err| format!("无法创建 MeloTTS 临时目录：{err}"))?;
+    let log = fs::File::create(cache.path().join("melotts.log"))
+        .map_err(|err| format!("无法创建 MeloTTS 日志：{err}"))?;
+    let mut command = Command::new(melotts_python_path());
+    command
+        .arg(melotts_worker_path())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env(
+            "HF_HOME",
+            melotts_root().join("huggingface"),
+        )
+        .env(
+            "PYTHONPATH",
+            melotts_root().join("MeloTTS"),
+        )
+        .env("http_proxy", "http://127.0.0.1:10809")
+        .env("https_proxy", "http://127.0.0.1:10809")
+        .env("PYTHONUTF8", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(log));
+    hide_command_window(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("无法启动 MeloTTS 中文进程：{err}"))?;
+    let input = child
+        .stdin
+        .take()
+        .ok_or_else(|| "MeloTTS 没有打开输入流".to_owned())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "MeloTTS 没有打开输出流".to_owned())?;
+    let mut output = BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if output
+            .read_line(&mut line)
+            .map_err(|err| format!("读取 MeloTTS 启动状态失败：{err}"))?
+            == 0
+        {
+            return Err("MeloTTS 在模型加载完成前退出，请查看 worker-cache 中的日志".to_owned());
+        }
+        let Ok(status) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if status.get("ready").and_then(|value| value.as_bool()) == Some(true) {
+            break;
+        }
+        if status.get("ready").and_then(|value| value.as_bool()) == Some(false) {
+            return Err(status["error"]
+                .as_str()
+                .unwrap_or("MeloTTS 中文模型加载失败")
+                .to_owned());
+        }
+    }
+    Ok(MeloTts {
+        child,
+        input,
+        output,
+        cache,
+        sequence: 0,
+    })
+}
+
+impl MeloTts {
+    fn synthesize(&mut self, text: &str, pitch: i32, speed: f32) -> Result<Vec<u8>, String> {
+        let normalized_text = normalize_tts_text(text);
+        if normalized_text.is_empty() {
+            return Err("台词中没有可朗读的中文文字".to_owned());
+        }
+        let raw_path = self
+            .cache
+            .path()
+            .join(format!("raw-{:06}.wav", self.sequence));
+        let output_path = self.cache.path().join(format!(
+            "voice-{:06}.wav",
+            self.sequence
+        ));
+        self.sequence = self.sequence.saturating_add(1);
+        let request = serde_json::json!({
+            "text": normalized_text,
+            "speed": speed.max(0.10),
+            "output_path": raw_path,
+        });
+        serde_json::to_writer(&mut self.input, &request)
+            .and_then(|_| self.input.write_all(b"\n").map_err(serde_json::Error::io))
+            .and_then(|_| self.input.flush().map_err(serde_json::Error::io))
+            .map_err(|err| format!("发送 MeloTTS 台词失败：{err}"))?;
+        let mut response = String::new();
+        self.output
+            .read_line(&mut response)
+            .map_err(|err| format!("读取 MeloTTS 结果失败：{err}"))?;
+        let response: serde_json::Value = serde_json::from_str(&response)
+            .map_err(|err| format!("MeloTTS 返回了无效结果：{err}"))?;
+        if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+            return Err(response["error"]
+                .as_str()
+                .unwrap_or("MeloTTS 中文合成失败")
+                .to_owned());
+        }
+        let pitch_factor = 2_f64.powf(pitch.clamp(-50, 30) as f64 / 120.0);
+        let filter = format!(
+            "asetrate=44100*{pitch_factor:.6},aresample=32000,atempo={:.6}",
+            1.0 / pitch_factor
+        );
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&raw_path)
+            .args([
+                "-af",
+                &filter,
+                "-ar",
+                "32000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&output_path);
+        hide_command_window(&mut command);
+        let output = command
+            .output()
+            .map_err(|err| format!("无法处理 MeloTTS 角色音调：{err}"))?;
+        let _ = fs::remove_file(&raw_path);
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        let wav = fs::read(&output_path).map_err(|err| format!("无法读取 MeloTTS WAV：{err}"))?;
+        let _ = fs::remove_file(&output_path);
+        Ok(wav)
+    }
 }
 
 fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
-    let tts = create_onnx_tts()?;
     let (request_tx, request_rx) = unbounded::<OnnxPreviewRequest>();
     let (result_tx, result_rx) = unbounded::<OnnxPreviewResult>();
     thread::Builder::new()
-        .name("replay-onnx-preview".to_owned())
+        .name("replay-melotts-preview".to_owned())
         .spawn(move || {
+            let mut tts = create_onnx_tts();
             while let Ok(request) = request_rx.recv() {
-                let wav = generate_onnx_wav(
-                    &tts,
-                    &request.text,
-                    request.speaker_id,
-                    request.speed,
-                );
+                let wav = tts.as_mut().map_err(|err| err.clone()).and_then(|tts| {
+                    tts.synthesize(
+                        &request.text,
+                        request.pitch,
+                        request.speed,
+                    )
+                });
                 if result_tx
                     .send(OnnxPreviewResult {
                         signature: request.signature,
@@ -927,72 +894,11 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                 }
             }
         })
-        .map_err(|err| format!("无法启动 ONNX 预览线程：{err}"))?;
+        .map_err(|err| format!("无法启动 MeloTTS 预览线程：{err}"))?;
     Ok(OnnxPreviewWorker {
         requests: request_tx,
         results: result_rx,
     })
-}
-
-fn generate_onnx_wav(
-    tts: &sherpa_onnx::OfflineTts,
-    text: &str,
-    speaker_id: i32,
-    speed: f32,
-) -> Result<Vec<u8>, String> {
-    use sherpa_onnx::GenerationConfig;
-
-    let normalized_text = normalize_tts_text(text);
-    if normalized_text.is_empty() {
-        return Err("台词中没有可朗读的文字".to_owned());
-    }
-    let audio = tts
-        .generate_with_config(
-            &normalized_text,
-            &GenerationConfig {
-                sid: speaker_id.clamp(0, ONNX_TTS_SPEAKER_COUNT - 1),
-                speed: speed.max(0.10),
-                silence_scale: 0.12,
-                ..Default::default()
-            },
-            None::<fn(&[f32], f32) -> bool>,
-        )
-        .ok_or_else(|| "ONNX 未能生成语音".to_owned())?;
-    let source_rate = tts.sample_rate().max(1) as u32;
-    let samples = resample_f32_to_pcm16(audio.samples(), source_rate, 32_000);
-    let data_bytes = samples.len().saturating_mul(2);
-    let mut wav = Vec::with_capacity(44 + data_bytes);
-    write_wav_header(
-        &mut wav,
-        32_000,
-        1,
-        16,
-        data_bytes as u32,
-    )?;
-    for sample in samples {
-        wav.write_all(&sample.to_le_bytes())
-            .map_err(|err| format!("写入 ONNX WAV 失败：{err}"))?;
-    }
-    Ok(wav)
-}
-
-fn resample_f32_to_pcm16(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<i16> {
-    if samples.is_empty() {
-        return Vec::new();
-    }
-    let output_len = samples
-        .len()
-        .saturating_mul(target_rate as usize)
-        .div_ceil(source_rate as usize);
-    (0..output_len)
-        .map(|index| {
-            let position = index as f64 * source_rate as f64 / target_rate as f64;
-            let left = position.floor() as usize;
-            let right = (left + 1).min(samples.len() - 1);
-            let fraction = (position - left as f64) as f32;
-            pcm_i16(samples[left] + (samples[right] - samples[left]) * fraction)
-        })
-        .collect()
 }
 
 fn render_video_frames(
@@ -1445,7 +1351,7 @@ fn replay_controls(
 
     ui.separator();
     ui.heading("DeepSeek 视频导演");
-    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内的已有台词，并为每句选择镜头。存在说话人立牌时强制持续对准该角色；只有找不到立牌时才使用极慢的环境移动。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
+    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内的已有台词，并为每句选择镜头。它还会生成只供 MeloTTS 使用的中文谐音读法，例如 AI→诶艾、1个→一个；画面字幕仍显示正常原文。存在说话人立牌时强制持续对准该角色；只有找不到立牌时才使用极慢的环境移动。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
     ui.checkbox(
         &mut studio.deepseek_director_enabled,
         "允许 DeepSeek 润色台词并控制镜头",
@@ -1585,7 +1491,7 @@ fn replay_controls(
     ui.horizontal(|ui| {
         ui.checkbox(
             &mut studio.speech_enabled,
-            "角色语音（预览与导出，ONNX 中文离线 TTS）",
+            "角色语音（预览与导出，MeloTTS 中文离线语音）",
         );
         ui.add_enabled(
             studio.speech_enabled,
@@ -1627,27 +1533,9 @@ fn replay_controls(
         }
         if ui.button("角色语音设置…").clicked() {
             studio.speech_settings_open = true;
-            if !studio.speech_voices_loaded {
-                match installed_speech_voice_names() {
-                    Ok(voices) => {
-                        studio.installed_speech_voices = voices;
-                        studio.speech_voices_loaded = true;
-                        if let Some(replay) = studio.replay.as_mut() {
-                            for settings in replay.speaker_voice_settings.values_mut() {
-                                if settings.voice_name.as_ref().is_some_and(|voice| {
-                                    !studio.installed_speech_voices.contains(voice)
-                                }) {
-                                    settings.voice_name = None;
-                                }
-                            }
-                        }
-                    },
-                    Err(err) => studio.status = format!("读取 Windows 语音失败：{err}"),
-                }
-            }
         }
     });
-    ui.small("整体语速默认 1.30×；整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。两项设置同时用于预览与导出。台词默认使用本地 Kokoro 24 kHz ONNX（100 种中英文角色音色），模型不可用时回退到 Windows TTS。逐帧渲染时会同步监听角色语音和音乐，完成后仍使用离线高质量音轨混入 MP4。语音仅处理已通过发布范围筛选的回放台词，不上传网络。");
+    ui.small("整体语速默认 1.30×；整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。预览与导出共用同一条时间线和 MeloTTS 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -1775,7 +1663,6 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
             speakers
         })
         .unwrap_or_default();
-    let voices = studio.installed_speech_voices.clone();
     let mut settings_changed = false;
 
     egui::Window::new("角色语音设置")
@@ -1784,7 +1671,7 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         .default_width(520.0)
         .max_width(620.0)
         .show(ctx, |ui| {
-            ui.label("为每个角色分配 Kokoro 的独立中文音色（3–57 女声，58–102 男声），并调整基础语速和相对音量。自动加速已限制在清晰范围内，不会再用变调重采样强塞台词；设置同时用于播放预览和 MP4 导出。Windows 声音和音调仅用于 ONNX 不可用时的回退。");
+            ui.label("MeloTTS 中文模型只有一个原生说话人；这里用稳定的角色音调、基础语速和相对音量形成不同角色声线。设置同时用于播放预览和 MP4 导出。");
             if speakers.is_empty() {
                 ui.label("请先录制回放或从现有聊天生成回放。");
                 return;
@@ -1807,36 +1694,8 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                             }
                             ui.small(format!("QQ {sender_id}"));
                         });
-                        let speaker_id = settings
-                            .onnx_speaker_id
-                            .get_or_insert_with(|| default_onnx_speaker_id(*sender_id));
-                        if !(ONNX_TTS_FIRST_CHINESE_SPEAKER..ONNX_TTS_SPEAKER_COUNT)
-                            .contains(speaker_id)
-                        {
-                            *speaker_id = default_onnx_speaker_id(*sender_id);
-                        }
                         settings_changed |= ui
-                            .add(egui::Slider::new(speaker_id, 3..=102).text("Kokoro 中文音色"))
-                            .changed();
-                        egui::ComboBox::from_id_salt(("replay-voice", sender_id))
-                            .selected_text(settings.voice_name.as_deref().unwrap_or("自动分配"))
-                            .width(300.0)
-                            .show_ui(ui, |ui| {
-                                settings_changed |= ui
-                                    .selectable_value(&mut settings.voice_name, None, "自动分配")
-                                    .changed();
-                                for voice in &voices {
-                                    settings_changed |= ui
-                                        .selectable_value(
-                                            &mut settings.voice_name,
-                                            Some(voice.clone()),
-                                            voice,
-                                        )
-                                        .changed();
-                                }
-                            });
-                        settings_changed |= ui
-                            .add(egui::Slider::new(&mut settings.pitch, -50..=20).text("回退音调"))
+                            .add(egui::Slider::new(&mut settings.pitch, -50..=30).text("角色音调"))
                             .changed();
                         settings_changed |= ui
                             .add(
@@ -2161,7 +2020,19 @@ fn apply_ready_director_plan(
                 cue.index
             ));
         }
+        if cue.speech_text.chars().count() > 700 {
+            studio.auto_export_after_director = false;
+            return Err(format!(
+                "第 {} 句 TTS 中文读音超过 700 字",
+                cue.index
+            ));
+        }
         line.text = text.to_owned();
+        line.speech_text = Some(if cue.speech_text.trim().is_empty() {
+            chinese_tts_fallback(text)
+        } else {
+            cue.speech_text.trim().to_owned()
+        });
         line.duration_ms = scaled_dialogue_duration_ms(text, replay.master_dialogue_duration);
     }
     let mut timeline_ms = 350_u64;
@@ -2258,13 +2129,7 @@ fn start_playback(
         studio.pre_playback_scene = Some(capture_scene(&grid));
         apply_scene(&mut grid, &scene);
     }
-    studio.playback_ms = studio.playback_ms.min(
-        studio
-            .replay
-            .as_ref()
-            .map(|replay| replay.duration_ms)
-            .unwrap_or_default(),
-    );
+    studio.playback_ms = 0;
     studio.mode = ReplayMode::Playing;
     studio.status = "正在回放；停止后会恢复当前体素场景".to_owned();
 }
@@ -2438,69 +2303,10 @@ fn check_ffmpeg() -> Result<(), String> {
         })
 }
 
-#[cfg(windows)]
-fn check_speech_synthesizer() -> Result<(), String> {
-    if onnx_tts_is_available() {
-        return Ok(());
-    }
-    let script = r#"Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }); $s.Dispose(); if ($voices.Count -eq 0) { exit 2 }"#;
-    let mut command = Command::new("powershell.exe");
-    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-    hide_command_window(&mut command);
-    command
-        .output()
-        .map_err(|err| format!("无法启动 Windows 语音合成：{err}"))
-        .and_then(|output| {
-            output.status.success().then_some(()).ok_or_else(|| {
-                "未找到可用的 Windows 语音。请在系统语言设置中安装语音，或关闭“角色语音”后导出"
-                    .to_owned()
-            })
-        })
-}
-
-#[cfg(not(windows))]
 fn check_speech_synthesizer() -> Result<(), String> {
     onnx_tts_is_available()
         .then_some(())
-        .ok_or_else(|| "未找到中文 ONNX 语音模型；请关闭角色语音后导出".to_owned())
-}
-
-#[cfg(windows)]
-fn installed_speech_voice_names() -> Result<Vec<String>, String> {
-    let script = r#"[Console]::OutputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.GetInstalledVoices() | Where-Object { $_.Enabled -and $_.VoiceInfo.Culture.Name -eq 'zh-CN' } | ForEach-Object { $_.VoiceInfo.Name }; $s.Dispose()"#;
-    let mut command = Command::new("powershell.exe");
-    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-    hide_command_window(&mut command);
-    let output = command
-        .output()
-        .map_err(|err| format!("无法启动 Windows 语音列表：{err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Windows 语音列表退出码：{}",
-            output.status
-        ));
-    }
-    let mut voices = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    voices.sort();
-    voices.dedup();
-    if voices.is_empty() {
-        Err(
-            "未找到已安装的中文（zh-CN）Windows 语音，请先在 Windows 语言设置中安装中文语音"
-                .to_owned(),
-        )
-    } else {
-        Ok(voices)
-    }
-}
-
-#[cfg(not(windows))]
-fn installed_speech_voice_names() -> Result<Vec<String>, String> {
-    Err("角色语音设置目前需要 Windows 离线 TTS".to_owned())
+        .ok_or_else(|| "未安装 MeloTTS 中文运行环境；请运行 scripts/setup_melotts.ps1".to_owned())
 }
 
 fn encode_video_frames(
@@ -2662,13 +2468,9 @@ struct SynthesizedSpeechCue {
 struct SpeechSynthesisJob {
     text: String,
     output_path: String,
-    language: &'static str,
-    voice_name: Option<String>,
-    voice_slot: u64,
-    onnx_speaker_id: i32,
     pitch: i32,
-    speech_rate: i32,
     onnx_speed: f32,
+    duration_ms: u64,
 }
 
 fn write_narration_track(
@@ -2708,18 +2510,14 @@ fn write_narration_track(
                 line.duration_ms,
             );
             SpeechSynthesisJob {
-                text: line.text.clone(),
+                text: speech_text_for_line(line),
                 output_path: working_directory
                     .join(format!("speech-{index:05}.wav"))
                     .to_string_lossy()
                     .into_owned(),
-                language: dialogue_language(&line.text),
-                voice_name: settings.voice_name.clone(),
-                voice_slot: line.sender_id,
-                onnx_speaker_id: onnx_speaker_id(&settings, line.sender_id),
                 pitch: settings.pitch,
-                speech_rate: combined_ssml_rate(fitted_rate, master_speech_speed),
                 onnx_speed: combined_onnx_speed(fitted_rate, master_speech_speed),
+                duration_ms: line.duration_ms,
             }
         })
         .collect::<Vec<_>>();
@@ -2824,8 +2622,6 @@ fn fitted_speech_rate(base_rate: i32, text: &str, duration_ms: u64) -> i32 {
     base_rate.max(required_percent_faster).clamp(-30, 180)
 }
 
-fn ssml_rate_percent(relative_rate: i32) -> i32 { (100 + relative_rate).clamp(70, 280) }
-
 fn default_master_speech_speed() -> f32 { 1.30 }
 
 fn normalized_master_speech_speed(speed: f32) -> f32 {
@@ -2872,12 +2668,6 @@ fn retime_replay(replay: &mut ReplayFile, previous: f32, requested: f32) {
     replay.duration_ms = scaled_millis(replay.duration_ms, ratio).max(1);
 }
 
-fn combined_ssml_rate(relative_rate: i32, master_speed: f32) -> i32 {
-    ((ssml_rate_percent(relative_rate) as f32 * normalized_master_speech_speed(master_speed))
-        .round() as i32)
-        .clamp(10, 1_000)
-}
-
 fn combined_onnx_speed(relative_rate: i32, master_speed: f32) -> f32 {
     onnx_speed(relative_rate) * normalized_master_speech_speed(master_speed)
 }
@@ -2886,24 +2676,11 @@ fn default_speaker_voice_settings(sender_id: u64) -> SpeakerVoiceSettings {
     let (pitch, speech_rate) = speaker_voice_profile(sender_id);
     SpeakerVoiceSettings {
         voice_name: None,
-        onnx_speaker_id: Some(default_onnx_speaker_id(sender_id)),
+        onnx_speaker_id: None,
         pitch,
         speech_rate,
         volume: 1.0,
     }
-}
-
-fn onnx_speaker_id(settings: &SpeakerVoiceSettings, sender_id: u64) -> i32 {
-    settings
-        .onnx_speaker_id
-        .filter(|speaker_id| {
-            (ONNX_TTS_FIRST_CHINESE_SPEAKER..ONNX_TTS_SPEAKER_COUNT).contains(speaker_id)
-        })
-        .unwrap_or_else(|| default_onnx_speaker_id(sender_id))
-}
-
-fn default_onnx_speaker_id(sender_id: u64) -> i32 {
-    ONNX_TTS_FIRST_CHINESE_SPEAKER + (sender_id % ONNX_TTS_CHINESE_SPEAKER_COUNT as u64) as i32
 }
 
 fn replay_voice_signature(replay: &ReplayFile, global_volume: f32) -> u64 {
@@ -2916,6 +2693,7 @@ fn replay_voice_signature(replay: &ReplayFile, global_volume: f32) -> u64 {
         line.sender_id.hash(&mut hasher);
         line.duration_ms.hash(&mut hasher);
         line.text.hash(&mut hasher);
+        line.speech_text.hash(&mut hasher);
     }
     let mut settings = replay.speaker_voice_settings.iter().collect::<Vec<_>>();
     settings.sort_by_key(|(sender_id, _)| **sender_id);
@@ -2932,14 +2710,6 @@ fn replay_voice_signature(replay: &ReplayFile, global_volume: f32) -> u64 {
 
 fn onnx_speed(relative_rate: i32) -> f32 { (1.0 + relative_rate as f32 / 200.0).clamp(0.85, 1.45) }
 
-fn dialogue_language(text: &str) -> &'static str {
-    if text.chars().any(is_cjk_character) {
-        "zh-CN"
-    } else {
-        "en-US"
-    }
-}
-
 fn synthesize_speech_batch(
     working_directory: &Path,
     jobs: &[SpeechSynthesisJob],
@@ -2947,69 +2717,29 @@ fn synthesize_speech_batch(
     if jobs.is_empty() {
         return Ok(());
     }
-    let mut windows_jobs = Vec::new();
-    if let Ok(tts) = create_onnx_tts() {
-        for job in jobs {
-            let wav = generate_onnx_wav(
-                &tts,
-                &job.text,
-                job.onnx_speaker_id,
-                job.onnx_speed,
-            )?;
+    let _ = working_directory;
+    let mut tts = create_onnx_tts()?;
+    for job in jobs {
+        let max_samples = job.duration_ms.saturating_mul(32_000) / 1_000;
+        let mut speed = job.onnx_speed;
+        for attempt in 0..3 {
+            let wav = tts.synthesize(&job.text, job.pitch, speed)?;
             fs::write(&job.output_path, wav)
-                .map_err(|err| format!("无法保存 ONNX 角色语音：{err}"))?;
+                .map_err(|err| format!("无法保存 MeloTTS 角色语音：{err}"))?;
+            let samples = read_pcm16_mono_wav(Path::new(&job.output_path))?;
+            if samples.len() as u64 <= max_samples {
+                break;
+            }
+            if attempt == 2 {
+                return Err(format!(
+                    "MeloTTS 无法在 {} 毫秒内完整读完台词",
+                    job.duration_ms
+                ));
+            }
+            speed *= (samples.len() as f32 / max_samples.max(1) as f32) * 1.06;
         }
-    } else {
-        windows_jobs.extend(jobs);
     }
-    if windows_jobs.is_empty() {
-        Ok(())
-    } else {
-        synthesize_windows_speech_batch(working_directory, &windows_jobs)
-    }
-}
-
-#[cfg(windows)]
-fn synthesize_windows_speech_batch(
-    working_directory: &Path,
-    jobs: &[&SpeechSynthesisJob],
-) -> Result<(), String> {
-    if jobs.is_empty() {
-        return Ok(());
-    }
-    let manifest_path = working_directory.join("speech-jobs.json");
-    let manifest = serde_json::to_vec(&serde_json::json!({ "jobs": jobs }))
-        .map_err(|err| format!("无法整理角色语音任务：{err}"))?;
-    fs::write(&manifest_path, manifest).map_err(|err| format!("无法保存角色语音任务：{err}"))?;
-    let script = r#"& { param($manifestPath) Add-Type -AssemblyName System.Speech; $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json; $jobs = @($manifest.jobs); $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo -ArgumentList 32000,([System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen),([System.Speech.AudioFormat.AudioChannel]::Mono); foreach ($job in $jobs) { $selected = $false; if (-not [string]::IsNullOrWhiteSpace([string]$job.voice_name)) { $candidate = @($s.GetInstalledVoices() | Where-Object { $_.Enabled -and $_.VoiceInfo.Name -eq [string]$job.voice_name -and ([string]$job.language -ne 'zh-CN' -or $_.VoiceInfo.Culture.Name -eq 'zh-CN') }) | Select-Object -First 1; if ($null -ne $candidate) { $s.SelectVoice($candidate.VoiceInfo.Name); $selected = $true } }; if (-not $selected) { $culture = [Globalization.CultureInfo]::GetCultureInfo([string]$job.language); $voices = @($s.GetInstalledVoices($culture) | Where-Object { $_.Enabled }); if ($voices.Count -eq 0) { $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled }) }; if ($voices.Count -eq 0) { throw 'No installed speech voice' }; $voice = $voices[[int64]$job.voice_slot % $voices.Count]; $s.SelectVoice($voice.VoiceInfo.Name) }; $s.SetOutputToWaveFile([string]$job.output_path, $format); $escaped = [Security.SecurityElement]::Escape([string]$job.text); $pitch = [int]$job.pitch; $speechRate = [int]$job.speech_rate; $language = [string]$job.language; $ssml = "<speak version='1.0' xml:lang='$language'><prosody pitch='$pitch%' rate='$speechRate%'>$escaped</prosody></speak>"; $s.SpeakSsml($ssml); $s.SetOutputToNull() }; $s.Dispose() }"#;
-    let mut command = Command::new("powershell.exe");
-    command
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .arg(&manifest_path);
-    hide_command_window(&mut command);
-    let output = command
-        .output()
-        .map_err(|err| format!("无法启动 Windows 语音合成：{err}"))?;
-    if output.status.success() && jobs.iter().all(|job| Path::new(&job.output_path).exists()) {
-        return Ok(());
-    }
-    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    Err(if detail.is_empty() {
-        format!(
-            "Windows 语音合成退出码：{}",
-            output.status
-        )
-    } else {
-        detail
-    })
-}
-
-#[cfg(not(windows))]
-fn synthesize_windows_speech_batch(
-    _working_directory: &Path,
-    _jobs: &[&SpeechSynthesisJob],
-) -> Result<(), String> {
-    Err("当前系统不支持 Windows 离线语音合成".to_owned())
+    Ok(())
 }
 
 fn read_pcm16_mono_wav(path: &Path) -> Result<Vec<i16>, String> {
@@ -3549,6 +3279,7 @@ fn dialogue_from_message(
         name,
         role,
         text: text.to_owned(),
+        speech_text: None,
         avatar,
         avatar_data_url: None,
         visibility: message.visibility.clone(),
@@ -3641,6 +3372,80 @@ fn dialogue_duration_ms(text: &str) -> u64 {
     reading_ms
         .saturating_mul(3)
         .clamp(MIN_DIALOGUE_MS, MAX_DIALOGUE_MS)
+}
+
+fn speech_text_for_line(line: &ReplayDialogue) -> String {
+    chinese_tts_fallback(
+        line.speech_text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or(&line.text),
+    )
+}
+
+fn chinese_tts_fallback(text: &str) -> String {
+    fn latin_reading(character: char) -> Option<&'static str> {
+        Some(match character.to_ascii_uppercase() {
+            'A' => "诶",
+            'B' => "比",
+            'C' => "西",
+            'D' => "迪",
+            'E' => "伊",
+            'F' => "艾弗",
+            'G' => "吉",
+            'H' => "艾尺",
+            'I' => "艾",
+            'J' => "杰",
+            'K' => "开",
+            'L' => "艾勒",
+            'M' => "艾姆",
+            'N' => "恩",
+            'O' => "欧",
+            'P' => "屁",
+            'Q' => "丘",
+            'R' => "阿尔",
+            'S' => "艾丝",
+            'T' => "踢",
+            'U' => "优",
+            'V' => "维",
+            'W' => "达布流",
+            'X' => "艾克斯",
+            'Y' => "歪",
+            'Z' => "贼德",
+            _ => return None,
+        })
+    }
+
+    let mut output = String::with_capacity(text.len() + 16);
+    for character in text.chars() {
+        if let Some(reading) = latin_reading(character) {
+            output.push_str(reading);
+            continue;
+        }
+        let reading = match character {
+            '0' => "零",
+            '1' => "一",
+            '2' => "二",
+            '3' => "三",
+            '4' => "四",
+            '5' => "五",
+            '6' => "六",
+            '7' => "七",
+            '8' => "八",
+            '9' => "九",
+            '%' => "百分号",
+            '&' => "和",
+            '+' => "加",
+            '=' => "等于",
+            _ => "",
+        };
+        if reading.is_empty() {
+            output.push(character);
+        } else {
+            output.push_str(reading);
+        }
+    }
+    output
 }
 
 fn normalize_tts_text(text: &str) -> String {
@@ -4135,6 +3940,7 @@ mod tests {
         let cues = [DirectorCue {
             index: 0,
             text: "打开舱门。".to_owned(),
+            speech_text: "打开舱门。".to_owned(),
             shot: DirectorShot::SpeakerClose,
             motion: DirectorMotion::DollyIn,
         }];
@@ -4192,6 +3998,10 @@ mod tests {
             normalize_tts_text("测试❓中文"),
             "测试，中文"
         );
+        assert_eq!(
+            chinese_tts_fallback("AI领域近年来发展迅速，1个方案"),
+            "诶艾领域近年来发展迅速，一个方案"
+        );
     }
 
     #[test]
@@ -4228,9 +4038,7 @@ mod tests {
     }
 
     #[test]
-    fn speech_rate_is_valid_ssml_and_auto_fits_long_lines() {
-        assert_eq!(ssml_rate_percent(18), 118);
-        assert_eq!(ssml_rate_percent(-30), 70);
+    fn melotts_speed_auto_fits_long_lines() {
         assert_eq!(
             fitted_speech_rate(18, "短句", 4_875),
             18
@@ -4239,7 +4047,6 @@ mod tests {
         assert!((onnx_speed(18) - 1.09).abs() < 0.001);
         assert_eq!(onnx_speed(180), 1.45);
         assert_eq!(default_master_speech_speed(), 1.30);
-        assert_eq!(combined_ssml_rate(18, 1.30), 153);
         assert!((combined_onnx_speed(18, 1.30) - 1.417).abs() < 0.001);
         assert!((combined_onnx_speed(18, 3.0) - 3.27).abs() < 0.001);
         assert_eq!(
@@ -4264,11 +4071,18 @@ mod tests {
 
     #[test]
     fn director_plan_parses_strict_json_and_markdown_fallback() {
-        let json = r#"{"dialogue":[{"index":0,"text":"打开舱门。","shot":"speaker_close","motion":"dolly_in"}]}"#;
+        let json = r#"{"dialogue":[{"index":0,"text":"AI打开1个舱门。","speech_text":"诶艾打开一个舱门。","shot":"speaker_close","motion":"dolly_in"}]}"#;
         let direct = parse_director_plan(json).unwrap();
         let fenced = parse_director_plan(&format!("```json\n{json}\n```")).unwrap();
         assert_eq!(direct.dialogue.len(), 1);
-        assert_eq!(fenced.dialogue[0].text, "打开舱门。");
+        assert_eq!(
+            fenced.dialogue[0].text,
+            "AI打开1个舱门。"
+        );
+        assert_eq!(
+            fenced.dialogue[0].speech_text,
+            "诶艾打开一个舱门。"
+        );
         assert!(parse_director_plan(r#"{"dialogue":[{"index":0}]}"#).is_err());
     }
 
@@ -4302,23 +4116,15 @@ mod tests {
     }
 
     #[test]
-    fn preview_speech_wire_preserves_chinese_utf8() {
-        let request = PreviewSpeechRequest::Speak {
-            text: "萌萌打开了舱门。",
-            language: "zh-CN",
-            voice_name: None,
-            voice_slot: 42,
-            pitch: -18,
-            speech_rate: 10,
-            volume: 90,
-        };
-
-        let wire = preview_speech_wire_line(&request).unwrap();
-        assert!(wire[..wire.len() - 1].iter().all(u8::is_ascii));
-        let json = BASE64.decode(&wire[..wire.len() - 1]).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
-        assert_eq!(value["text"], "萌萌打开了舱门。");
-        assert_eq!(value["language"], "zh-CN");
+    fn visible_and_spoken_dialogue_text_remain_separate() {
+        let mut dialogue = test_dialogue(0, 2_700, DialogueSide::Right);
+        dialogue.text = "AI领域有1个方案。".to_owned();
+        dialogue.speech_text = Some("诶艾领域有一个方案。".to_owned());
+        assert_eq!(dialogue.text, "AI领域有1个方案。");
+        assert_eq!(
+            speech_text_for_line(&dialogue),
+            "诶艾领域有一个方案。"
+        );
     }
 
     #[test]
@@ -4391,18 +4197,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the downloaded Kokoro ONNX model"]
-    fn kokoro_onnx_synthesizes_distinct_chinese_speakers() {
-        let tts = create_onnx_tts().unwrap();
-        assert_eq!(tts.sample_rate(), 24_000);
-        assert_eq!(
-            tts.num_speakers(),
-            ONNX_TTS_SPEAKER_COUNT
-        );
-        let mixed_language = "你好AI，我在维护TRPG replay，测试English结尾。";
-        let first = generate_onnx_wav(&tts, mixed_language, 3, 1.4).unwrap();
-        let second = generate_onnx_wav(&tts, mixed_language, 58, 1.4).unwrap();
-        let unrestricted_fast = generate_onnx_wav(&tts, mixed_language, 3, 3.0).unwrap();
+    #[ignore = "requires the installed MeloTTS Chinese runtime"]
+    fn melotts_synthesizes_distinct_chinese_character_variants() {
+        let mut tts = create_onnx_tts().unwrap();
+        let chinese = "你好诶艾，我在维护跑团回放。";
+        let first = tts.synthesize(chinese, -12, 1.4).unwrap();
+        let second = tts.synthesize(chinese, 20, 1.4).unwrap();
+        let unrestricted_fast = tts.synthesize(chinese, -12, 3.0).unwrap();
         assert_eq!(&first[0..4], b"RIFF");
         assert!(first.len() > 44);
         assert!(unrestricted_fast.len() > 44);
@@ -4412,7 +4213,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    #[ignore = "requires the downloaded ONNX model or installed Windows speech voices"]
+    #[ignore = "requires the installed MeloTTS Chinese runtime"]
     fn tts_assigns_distinct_speaker_profiles() {
         let directory = tempfile::tempdir().unwrap();
         let mut first_line = test_dialogue(0, 1_350, DialogueSide::Left);
@@ -4500,6 +4301,7 @@ mod tests {
             name: "测试".to_owned(),
             role: String::new(),
             text: "台词".to_owned(),
+            speech_text: None,
             avatar: String::new(),
             avatar_data_url: None,
             visibility: Visibility::Public,
