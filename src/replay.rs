@@ -69,6 +69,7 @@ use crossbeam_channel::{
     Receiver,
     Sender,
 };
+use rand::RngExt;
 use serde::{
     Deserialize,
     Serialize,
@@ -1947,6 +1948,21 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                                     }
                                 }
                             });
+                        if ui
+                            .add_enabled(
+                                !installed_speakers.is_empty(),
+                                egui::Button::new("随机音色"),
+                            )
+                            .on_hover_text("从全部已安装的 EmotiVoice 音色中随机选择")
+                            .clicked()
+                        {
+                            if let Some(random_speaker) = random_emotivoice_speaker(
+                                installed_speakers,
+                                &current_speaker,
+                            ) {
+                                selected_speaker = random_speaker;
+                            }
+                        }
                         if selected_speaker != current_speaker {
                             settings.voice_name = Some(selected_speaker);
                             settings_changed = true;
@@ -2936,6 +2952,22 @@ fn installed_emotivoice_speakers() -> &'static [String] {
                 .unwrap_or_default()
         })
         .as_slice()
+}
+
+fn random_emotivoice_speaker(speakers: &[String], current: &str) -> Option<String> {
+    let available_count = speakers
+        .iter()
+        .filter(|speaker| speaker.as_str() != current)
+        .count();
+    if available_count == 0 {
+        return speakers.first().cloned();
+    }
+    let selected_index = rand::rng().random_range(0..available_count);
+    speakers
+        .iter()
+        .filter(|speaker| speaker.as_str() != current)
+        .nth(selected_index)
+        .cloned()
 }
 
 fn emotivoice_speaker_label(speaker: &str) -> String {
@@ -4892,6 +4924,11 @@ mod tests {
             parse_emotivoice_speaker_ids("9000\n92\ninvalid\n 65 \n92\n"),
             vec!["65", "92", "9000"]
         );
+        assert_eq!(
+            random_emotivoice_speaker(&["65".to_owned(), "92".to_owned()], "65"),
+            Some("92".to_owned())
+        );
+        assert_eq!(random_emotivoice_speaker(&[], "65"), None);
     }
 
     #[test]
