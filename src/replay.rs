@@ -110,6 +110,10 @@ const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-rep
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const BACKGROUND_MUSIC_PATH: &str = "assets/audio/jrpg2-piano.mp3";
 const EMOTIVOICE_RUNTIME_DIR: &str = ".data/willowblossom/tts/emotivoice";
+const SHORT_UTTERANCE_MAX_UNITS: usize = 6;
+const SHORT_UTTERANCE_SPEED_CAP: f32 = 1.10;
+const SHORT_UTTERANCE_HEAD_PAD_MS: u64 = 80;
+const SHORT_UTTERANCE_TAIL_PAD_MS: u64 = 180;
 const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
 const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
 
@@ -859,7 +863,7 @@ impl EmotiVoiceTts {
         emotion: &str,
         speed: f32,
     ) -> Result<Vec<u8>, String> {
-        let normalized_text = normalize_tts_text(text);
+        let normalized_text = emotivoice_model_text(text);
         if normalized_text.is_empty() {
             return Err("台词中没有可朗读的中文文字".to_owned());
         }
@@ -896,7 +900,7 @@ impl EmotiVoiceTts {
                 .to_owned());
         }
         let mut command = Command::new("ffmpeg");
-        let tempo_filter = ffmpeg_atempo_filter(speed);
+        let tempo_filter = emotivoice_audio_filter(&normalized_text, speed);
         command
             .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
             .arg(&raw_path)
@@ -943,6 +947,57 @@ fn ffmpeg_atempo_filter(speed: f32) -> String {
         .map(|factor| format!("atempo={factor:.6}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn speech_unit_count(text: &str) -> usize {
+    text.chars()
+        .filter(|character| is_cjk_character(*character) || character.is_ascii_alphanumeric())
+        .count()
+}
+
+fn is_short_utterance(text: &str) -> bool {
+    let units = speech_unit_count(text);
+    units > 0 && units <= SHORT_UTTERANCE_MAX_UNITS
+}
+
+fn emotivoice_model_text(text: &str) -> String {
+    let mut normalized = normalize_tts_text(text);
+    if is_short_utterance(&normalized)
+        && !normalized.chars().next_back().is_some_and(|character| {
+            matches!(
+                character,
+                '。' | '！' | '？' | '.' | '!' | '?'
+            )
+        })
+    {
+        normalized.push('。');
+    }
+    normalized
+}
+
+fn effective_emotivoice_speed(text: &str, configured_speed: f32) -> f32 {
+    let configured_speed =
+        if configured_speed.is_finite() { configured_speed.max(0.10) } else { 1.0 };
+    if is_short_utterance(text) {
+        configured_speed.min(SHORT_UTTERANCE_SPEED_CAP)
+    } else {
+        configured_speed
+    }
+}
+
+fn emotivoice_audio_filter(text: &str, configured_speed: f32) -> String {
+    let tempo = ffmpeg_atempo_filter(effective_emotivoice_speed(
+        text,
+        configured_speed,
+    ));
+    if is_short_utterance(text) {
+        format!(
+            "adelay={SHORT_UTTERANCE_HEAD_PAD_MS},{tempo},apad=pad_dur={:.3}",
+            SHORT_UTTERANCE_TAIL_PAD_MS as f32 / 1_000.0
+        )
+    } else {
+        tempo
+    }
 }
 
 fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
@@ -1633,7 +1688,7 @@ fn replay_controls(
             studio.speech_settings_open = true;
         }
     });
-    ui.small("整体语速默认 1.30×；长台词不会自动加速，而会自动延长字幕和镜头时间，确保角色保持固定语速。整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。预览与导出共用同一条时间线和 EmotiVoice 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
+    ui.small("整体语速默认 1.30×；长台词不会自动加速，而会自动延长字幕和镜头时间，确保角色保持固定语速。六个字以内的极短台词会自动使用较自然的短句语速和首尾保护，避免吞字，不改变角色音色或音调。整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。预览与导出共用同一条时间线和 EmotiVoice 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -2850,9 +2905,18 @@ fn estimated_speech_duration_ms(text: &str) -> u64 {
 }
 
 fn minimum_speech_window_ms(text: &str, relative_rate: i32, master_speed: f32) -> u64 {
-    let speed = combined_onnx_speed(relative_rate, master_speed) as f64;
+    let speed = effective_emotivoice_speed(
+        text,
+        combined_onnx_speed(relative_rate, master_speed),
+    ) as f64;
+    let padding_ms = if is_short_utterance(text) {
+        SHORT_UTTERANCE_HEAD_PAD_MS.saturating_add(SHORT_UTTERANCE_TAIL_PAD_MS)
+    } else {
+        0
+    };
     ((estimated_speech_duration_ms(text) as f64 * 1.20 / speed).ceil() as u64)
         .saturating_add(250)
+        .saturating_add(padding_ms)
 }
 
 fn stretched_replay_time(time_ms: u64, segments: &[(u64, u64, u64, u64)]) -> u64 {
@@ -4555,10 +4619,42 @@ mod tests {
         assert!(minimum_speech_window_ms("短句", 18, 1.30) < MIN_DIALOGUE_MS);
         assert!(minimum_speech_window_ms(&"很长的中文台词".repeat(8), 18, 1.30) > 4_875);
         assert!((configured_speed - combined_onnx_speed(18, 1.30)).abs() < f32::EPSILON);
+        assert_eq!(
+            emotivoice_model_text("可以可以"),
+            "可以可以。"
+        );
+        assert_eq!(
+            emotivoice_model_text("可以吗？"),
+            "可以吗？"
+        );
+        assert!(
+            (effective_emotivoice_speed("可以可以", configured_speed) - 1.10).abs() < f32::EPSILON
+        );
+        assert!(
+            (effective_emotivoice_speed(
+                "这是一句足够长的正常台词",
+                configured_speed
+            ) - configured_speed)
+                .abs()
+                < f32::EPSILON
+        );
+        assert_eq!(
+            emotivoice_audio_filter("可以可以。", configured_speed),
+            "adelay=80,atempo=1.100000,apad=pad_dur=0.180"
+        );
         let stretched = [(350, 1_000, 350, 2_000), (1_270, 2_000, 2_270, 3_000)];
-        assert_eq!(stretched_replay_time(1_000, &stretched), 2_000);
-        assert_eq!(stretched_replay_time(1_135, &stretched), 2_135);
-        assert_eq!(stretched_replay_time(2_500, &stretched), 3_500);
+        assert_eq!(
+            stretched_replay_time(1_000, &stretched),
+            2_000
+        );
+        assert_eq!(
+            stretched_replay_time(1_135, &stretched),
+            2_135
+        );
+        assert_eq!(
+            stretched_replay_time(2_500, &stretched),
+            3_500
+        );
         assert!((onnx_speed(18) - 1.09).abs() < 0.001);
         assert_eq!(onnx_speed(180), 1.45);
         assert_eq!(default_master_speech_speed(), 1.30);
