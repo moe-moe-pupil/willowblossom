@@ -398,6 +398,7 @@ struct OnnxPreviewRequest {
     signature: u64,
     cue: (u64, usize),
     text: String,
+    voice_preset: String,
     pitch: i32,
     speed: f32,
     volume: f32,
@@ -671,6 +672,11 @@ impl PreviewSpeechController {
                     signature,
                     cue: (replay.created_at_unix_ms, index),
                     text: speech_text_for_line(line),
+                    voice_preset: resolved_voice_preset(
+                        settings.voice_name.as_deref(),
+                        line.sender_id,
+                    )
+                    .to_owned(),
                     pitch: settings.pitch,
                     speed: combined_onnx_speed(rate, replay.master_speech_speed),
                     volume: (global_volume * settings.volume).clamp(0.0, 1.0),
@@ -797,7 +803,13 @@ fn create_onnx_tts() -> Result<MeloTts, String> {
 }
 
 impl MeloTts {
-    fn synthesize(&mut self, text: &str, pitch: i32, speed: f32) -> Result<Vec<u8>, String> {
+    fn synthesize(
+        &mut self,
+        text: &str,
+        voice_preset: &str,
+        pitch: i32,
+        speed: f32,
+    ) -> Result<Vec<u8>, String> {
         let normalized_text = normalize_tts_text(text);
         if normalized_text.is_empty() {
             return Err("台词中没有可朗读的中文文字".to_owned());
@@ -832,7 +844,8 @@ impl MeloTts {
                 .unwrap_or("MeloTTS 中文合成失败")
                 .to_owned());
         }
-        let pitch_factor = 2_f64.powf(pitch.clamp(-50, 30) as f64 / 120.0);
+        let total_pitch = (voice_preset_pitch(voice_preset) + pitch).clamp(-100, 60);
+        let pitch_factor = 2_f64.powf(total_pitch as f64 / 120.0);
         let filter = format!(
             "asetrate=44100*{pitch_factor:.6},aresample=32000,atempo={:.6}",
             1.0 / pitch_factor
@@ -877,6 +890,7 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                 let wav = tts.as_mut().map_err(|err| err.clone()).and_then(|tts| {
                     tts.synthesize(
                         &request.text,
+                        &request.voice_preset,
                         request.pitch,
                         request.speed,
                     )
@@ -1459,6 +1473,9 @@ fn replay_controls(
         start_video_export(studio, capture_active, grids, windows);
     }
     ui.small("只有开启“录制 DM 自由镜头”才会持续采集镜头。DeepSeek 导演开启后会等待 API 返回，再应用润色台词和镜头决策。");
+    ui.small(
+        "较长回放会自动分批交给 DeepSeek，再按原台词顺序合并；单个批次若被截断会继续拆分重试。",
+    );
 
     ui.separator();
     ui.heading("导出 MP4 视频");
@@ -1671,7 +1688,7 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         .default_width(520.0)
         .max_width(620.0)
         .show(ctx, |ui| {
-            ui.label("MeloTTS 中文模型只有一个原生说话人；这里用稳定的角色音调、基础语速和相对音量形成不同角色声线。设置同时用于播放预览和 MP4 导出。");
+            ui.label("MeloTTS 中文模型只有一个原生说话人。下列男声/女声是稳定的音色处理预设，可为每个角色独立选择；设置同时用于播放预览和 MP4 导出。");
             if speakers.is_empty() {
                 ui.label("请先录制回放或从现有聊天生成回放。");
                 return;
@@ -1694,8 +1711,29 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                             }
                             ui.small(format!("QQ {sender_id}"));
                         });
+                        let current_preset =
+                            resolved_voice_preset(settings.voice_name.as_deref(), *sender_id);
+                        let mut selected_preset = current_preset.to_owned();
+                        egui::ComboBox::from_id_salt(("replay-voice-preset", sender_id))
+                            .selected_text(voice_preset_label(&selected_preset))
+                            .show_ui(ui, |ui| {
+                                for preset in VOICE_PRESETS {
+                                    ui.selectable_value(
+                                        &mut selected_preset,
+                                        preset.to_owned(),
+                                        voice_preset_label(preset),
+                                    );
+                                }
+                            });
+                        if selected_preset != current_preset {
+                            settings.voice_name = Some(selected_preset);
+                            settings_changed = true;
+                        }
                         settings_changed |= ui
-                            .add(egui::Slider::new(&mut settings.pitch, -50..=30).text("角色音调"))
+                            .add(
+                                egui::Slider::new(&mut settings.pitch, -30..=30)
+                                    .text("音调微调"),
+                            )
                             .changed();
                         settings_changed |= ui
                             .add(
@@ -2468,6 +2506,7 @@ struct SynthesizedSpeechCue {
 struct SpeechSynthesisJob {
     text: String,
     output_path: String,
+    voice_preset: String,
     pitch: i32,
     onnx_speed: f32,
     duration_ms: u64,
@@ -2515,6 +2554,11 @@ fn write_narration_track(
                     .join(format!("speech-{index:05}.wav"))
                     .to_string_lossy()
                     .into_owned(),
+                voice_preset: resolved_voice_preset(
+                    settings.voice_name.as_deref(),
+                    line.sender_id,
+                )
+                .to_owned(),
                 pitch: settings.pitch,
                 onnx_speed: combined_onnx_speed(fitted_rate, master_speech_speed),
                 duration_ms: line.duration_ms,
@@ -2595,11 +2639,53 @@ fn write_narration_track(
         .map_err(|err| format!("完成角色语音轨道失败：{err}"))
 }
 
+const VOICE_PRESETS: [&str; 5] = [
+    "male_deep",
+    "male_natural",
+    "neutral",
+    "female_natural",
+    "female_bright",
+];
+
+fn voice_preset_label(preset: &str) -> &'static str {
+    match preset {
+        "male_deep" => "男声·低沉",
+        "male_natural" => "男声·自然",
+        "female_natural" => "女声·自然",
+        "female_bright" => "女声·明亮",
+        _ => "中性",
+    }
+}
+
+fn voice_preset_pitch(preset: &str) -> i32 {
+    match preset {
+        "male_deep" => -72,
+        "male_natural" => -48,
+        "female_natural" => 0,
+        "female_bright" => 18,
+        _ => -24,
+    }
+}
+
+fn default_voice_preset(sender_id: u64) -> &'static str {
+    VOICE_PRESETS[(sender_id as usize) % VOICE_PRESETS.len()]
+}
+
+fn resolved_voice_preset(configured: Option<&str>, sender_id: u64) -> &'static str {
+    configured
+        .and_then(|configured| {
+            VOICE_PRESETS
+                .iter()
+                .copied()
+                .find(|preset| *preset == configured)
+        })
+        .unwrap_or_else(|| default_voice_preset(sender_id))
+}
+
 fn speaker_voice_profile(sender_id: u64) -> (i32, i32) {
-    const PITCHES: [i32; 8] = [-12, -6, -10, -4, -11, -7, -14, -5];
     const RATES: [i32; 8] = [18, 24, 14, 28, 10, 21, 16, 26];
-    let profile = (sender_id as usize) % PITCHES.len();
-    (PITCHES[profile], RATES[profile])
+    let profile = (sender_id as usize) % RATES.len();
+    (0, RATES[profile])
 }
 
 fn fitted_speech_rate(base_rate: i32, text: &str, duration_ms: u64) -> i32 {
@@ -2675,7 +2761,7 @@ fn combined_onnx_speed(relative_rate: i32, master_speed: f32) -> f32 {
 fn default_speaker_voice_settings(sender_id: u64) -> SpeakerVoiceSettings {
     let (pitch, speech_rate) = speaker_voice_profile(sender_id);
     SpeakerVoiceSettings {
-        voice_name: None,
+        voice_name: Some(default_voice_preset(sender_id).to_owned()),
         onnx_speaker_id: None,
         pitch,
         speech_rate,
@@ -2723,7 +2809,12 @@ fn synthesize_speech_batch(
         let max_samples = job.duration_ms.saturating_mul(32_000) / 1_000;
         let mut speed = job.onnx_speed;
         for attempt in 0..3 {
-            let wav = tts.synthesize(&job.text, job.pitch, speed)?;
+            let wav = tts.synthesize(
+                &job.text,
+                &job.voice_preset,
+                job.pitch,
+                speed,
+            )?;
             fs::write(&job.output_path, wav)
                 .map_err(|err| format!("无法保存 MeloTTS 角色语音：{err}"))?;
             let samples = read_pcm16_mono_wav(Path::new(&job.output_path))?;
@@ -3383,6 +3474,86 @@ fn speech_text_for_line(line: &ReplayDialogue) -> String {
     )
 }
 
+fn chinese_digit(character: char) -> Option<&'static str> {
+    Some(match character {
+        '0' => "零",
+        '1' => "一",
+        '2' => "二",
+        '3' => "三",
+        '4' => "四",
+        '5' => "五",
+        '6' => "六",
+        '7' => "七",
+        '8' => "八",
+        '9' => "九",
+        _ => return None,
+    })
+}
+
+fn chinese_integer_reading(digits: &str) -> String {
+    fn section_reading(value: u16, omit_leading_one: bool) -> String {
+        const DIGITS: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+        const UNITS: [&str; 4] = ["", "十", "百", "千"];
+        let mut output = String::new();
+        let mut pending_zero = false;
+        for position in (0..4).rev() {
+            let divisor = 10_u16.pow(position);
+            let digit = value / divisor % 10;
+            if digit == 0 {
+                pending_zero |= !output.is_empty() && value % divisor != 0;
+                continue;
+            }
+            if pending_zero {
+                output.push('零');
+                pending_zero = false;
+            }
+            if !(digit == 1 && position == 1 && output.is_empty() && omit_leading_one) {
+                output.push_str(DIGITS[digit as usize]);
+            }
+            output.push_str(UNITS[position as usize]);
+        }
+        output
+    }
+
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return "零".to_owned();
+    }
+    if trimmed.len() > 12 {
+        return digits.chars().filter_map(chinese_digit).collect();
+    }
+
+    let mut sections = Vec::new();
+    let mut end = trimmed.len();
+    while end > 0 {
+        let start = end.saturating_sub(4);
+        sections.push(trimmed[start..end].parse::<u16>().unwrap_or_default());
+        end = start;
+    }
+
+    const SECTION_UNITS: [&str; 4] = ["", "万", "亿", "万亿"];
+    let mut output = String::new();
+    let mut pending_zero = false;
+    for index in (0..sections.len()).rev() {
+        let section = sections[index];
+        if section == 0 {
+            pending_zero |= !output.is_empty();
+            continue;
+        }
+        if !output.is_empty() && (pending_zero || section < 1_000) {
+            output.push('零');
+        }
+        let omit_leading_one = output.is_empty();
+        output.push_str(&section_reading(
+            section,
+            omit_leading_one,
+        ));
+        output.push_str(SECTION_UNITS[index]);
+        pending_zero = false;
+    }
+    output
+}
+
 fn chinese_tts_fallback(text: &str) -> String {
     fn latin_reading(character: char) -> Option<&'static str> {
         Some(match character.to_ascii_uppercase() {
@@ -3416,23 +3587,44 @@ fn chinese_tts_fallback(text: &str) -> String {
         })
     }
 
+    let characters = text.chars().collect::<Vec<_>>();
     let mut output = String::with_capacity(text.len() + 16);
-    for character in text.chars() {
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        if character.is_ascii_digit() {
+            let start = index;
+            while index < characters.len() && characters[index].is_ascii_digit() {
+                index += 1;
+            }
+            output.push_str(&chinese_integer_reading(
+                &characters[start..index].iter().collect::<String>(),
+            ));
+            continue;
+        }
+        if character.is_ascii_alphabetic() {
+            let start = index;
+            while index < characters.len() && characters[index].is_ascii_alphabetic() {
+                index += 1;
+            }
+            let word = characters[start..index].iter().collect::<String>();
+            if word.eq_ignore_ascii_case("steam") {
+                output.push_str("斯地母");
+            } else {
+                for letter in word.chars() {
+                    if let Some(reading) = latin_reading(letter) {
+                        output.push_str(reading);
+                    }
+                }
+            }
+            continue;
+        }
         if let Some(reading) = latin_reading(character) {
             output.push_str(reading);
+            index += 1;
             continue;
         }
         let reading = match character {
-            '0' => "零",
-            '1' => "一",
-            '2' => "二",
-            '3' => "三",
-            '4' => "四",
-            '5' => "五",
-            '6' => "六",
-            '7' => "七",
-            '8' => "八",
-            '9' => "九",
             '%' => "百分号",
             '&' => "和",
             '+' => "加",
@@ -3444,6 +3636,7 @@ fn chinese_tts_fallback(text: &str) -> String {
         } else {
             output.push_str(reading);
         }
+        index += 1;
     }
     output
 }
@@ -3999,8 +4192,16 @@ mod tests {
             "测试，中文"
         );
         assert_eq!(
-            chinese_tts_fallback("AI领域近年来发展迅速，1个方案"),
-            "诶艾领域近年来发展迅速，一个方案"
+            chinese_tts_fallback("Steam上的AI有10个方案，另有21个备用方案"),
+            "斯地母上的诶艾有十个方案，另有二十一个备用方案"
+        );
+        assert_eq!(
+            chinese_integer_reading("101"),
+            "一百零一"
+        );
+        assert_eq!(
+            chinese_integer_reading("10010"),
+            "一万零一十"
         );
     }
 
@@ -4128,10 +4329,15 @@ mod tests {
     }
 
     #[test]
-    fn speaker_voice_profiles_use_distinct_lower_pitches() {
+    fn speaker_voice_profiles_use_distinct_timbre_presets() {
         let profiles = (0..8).map(speaker_voice_profile).collect::<Vec<_>>();
-        assert!(profiles.iter().all(|(pitch, _)| (-14..=-4).contains(pitch)));
-        assert!(profiles.windows(2).all(|pair| pair[0] != pair[1]));
+        assert!(profiles.iter().all(|(pitch, _)| *pitch == 0));
+        assert_eq!(default_voice_preset(0), "male_deep");
+        assert_eq!(default_voice_preset(1), "male_natural");
+        assert_ne!(
+            voice_preset_pitch("male_deep"),
+            voice_preset_pitch("female_natural")
+        );
     }
 
     #[test]
@@ -4201,9 +4407,9 @@ mod tests {
     fn melotts_synthesizes_distinct_chinese_character_variants() {
         let mut tts = create_onnx_tts().unwrap();
         let chinese = "你好诶艾，我在维护跑团回放。";
-        let first = tts.synthesize(chinese, -12, 1.4).unwrap();
-        let second = tts.synthesize(chinese, 20, 1.4).unwrap();
-        let unrestricted_fast = tts.synthesize(chinese, -12, 3.0).unwrap();
+        let first = tts.synthesize(chinese, "male_deep", 0, 1.4).unwrap();
+        let second = tts.synthesize(chinese, "female_bright", 0, 1.4).unwrap();
+        let unrestricted_fast = tts.synthesize(chinese, "male_deep", 0, 3.0).unwrap();
         assert_eq!(&first[0..4], b"RIFF");
         assert!(first.len() > 44);
         assert!(unrestricted_fast.len() > 44);

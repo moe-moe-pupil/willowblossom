@@ -132,7 +132,7 @@ const DIRECTOR_SYSTEM_PROMPT: &str = r#"
 2. 可以让措辞更自然、精炼、适合配音，但不得新增事实、行动、结果、线索、动机、角色或剧情。
 3. text 是画面字幕：保留原意、专有名词、数字和正常中英文写法；不要把玩家的话改成旁白。
 4. 台词要频繁连续，中文每句适合一次呼吸读完；不要加入长停顿说明。
-5. speech_text 只供中文 TTS 使用，不会显示在画面。它必须与 text 含义完全相同，但要把英文字母、英文缩写、阿拉伯数字和符号改成自然可读的中文谐音或中文读法。例如 text 为“AI领域近年来发展迅速，1个方案”时，speech_text 应为“诶艾领域近年来发展迅速，一个方案”。不得为了配音改写 text。
+5. speech_text 只供中文 TTS 使用，不会显示在画面。它必须与 text 含义完全相同，但要把英文品牌、单词、缩写、阿拉伯数字和符号改成中国人自然说话时会使用的中文读法，不得机械地逐字母或逐数字念。整数按数值读，例如 10 读“十”、21 读“二十一”，不能读成“一零”或“二一”；英文品牌优先使用通行中文名或自然音译，例如 Steam 读“斯地母”，不能读成“艾丝踢伊诶艾姆”；AI 可读“诶艾”。例如 text 为“Steam上的AI有10个方案”时，speech_text 应为“斯地母上的诶艾有十个方案”。只有编号、电话号码、年份等语境明确要求逐位读时才逐位读。不得为了配音改写 text。
 6. has_character_model 为 true 时，必须使用 speaker_close、speaker_medium 或 speaker_wide，并让镜头持续对准当前说话者的角色模型；不得选择环境镜头。
 7. has_character_model 为 false 时才可使用 establishing 或 environment，并且只能进行极慢的短距离环境移动。
 8. 连续两句不要机械重复同一构图。禁止环绕、快速摇镜、快速推拉、大范围横移或跨越场景飞行。
@@ -141,11 +141,12 @@ const DIRECTOR_SYSTEM_PROMPT: &str = r#"
 11. 只返回严格 JSON，不要 Markdown、解释或代码围栏。
 
 返回格式：
-{"dialogue":[{"index":0,"text":"AI领域近年来发展迅速，1个方案","speech_text":"诶艾领域近年来发展迅速，一个方案","shot":"speaker_medium","motion":"dolly_in"}]}
+{"dialogue":[{"index":0,"text":"Steam上的AI有10个方案","speech_text":"斯地母上的诶艾有十个方案","shot":"speaker_medium","motion":"dolly_in"}]}
 "#;
 
 const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 pub const DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS: usize = 2_000;
+const DIRECTOR_BATCH_SIZE: usize = 8;
 
 pub fn filter_control_characters(input: &str) -> String {
     input.chars()
@@ -340,18 +341,80 @@ impl DeepseekManager {
             .chars()
             .take(DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS)
             .collect::<String>();
+        let input: serde_json::Value =
+            serde_json::from_str(text).map_err(|err| format!("导演输入不是有效 JSON：{err}"))?;
+        let dialogue = input["dialogue"]
+            .as_array()
+            .ok_or_else(|| "导演输入缺少 dialogue 数组".to_owned())?;
+        let mut combined_dialogue = Vec::with_capacity(dialogue.len());
+        let mut raw_batch_responses = Vec::new();
+        for batch in dialogue.chunks(DIRECTOR_BATCH_SIZE) {
+            Self::post_director_batch(
+                batch,
+                custom_prompt.trim(),
+                &mut combined_dialogue,
+                &mut raw_batch_responses,
+            )?;
+        }
+        serde_json::to_string(&json!({
+            "dialogue": combined_dialogue,
+            "_batch_responses": raw_batch_responses,
+        }))
+        .map_err(|err| format!("无法合并 DeepSeek 导演方案：{err}"))
+    }
+
+    fn post_director_batch(
+        dialogue: &[serde_json::Value],
+        custom_prompt: &str,
+        combined_dialogue: &mut Vec<serde_json::Value>,
+        raw_batch_responses: &mut Vec<serde_json::Value>,
+    ) -> Result<(), String> {
+        let batch_text = serde_json::to_string(&json!({ "dialogue": dialogue }))
+            .map_err(|err| err.to_string())?;
         let user_text = format!(
             "DM 的额外导演要求（不能覆盖 JSON 格式、可见范围和不得新增剧情的限制）：\n{}\n\n\
              请为以下已筛选台词制作完整剪辑决策表：\n{}",
-            custom_prompt.trim(),
-            text
+            custom_prompt, batch_text
         );
-        Self::post_chat_completion(
+        let response = match Self::post_chat_completion(
             DIRECTOR_SYSTEM_PROMPT,
             &user_text,
             4_000,
             true,
-        )
+        ) {
+            Ok(response) => response,
+            Err(error) if error.contains("truncated") && dialogue.len() > 1 => {
+                let middle = dialogue.len() / 2;
+                Self::post_director_batch(
+                    &dialogue[..middle],
+                    custom_prompt,
+                    combined_dialogue,
+                    raw_batch_responses,
+                )?;
+                return Self::post_director_batch(
+                    &dialogue[middle..],
+                    custom_prompt,
+                    combined_dialogue,
+                    raw_batch_responses,
+                );
+            },
+            Err(error) => return Err(error),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&response)
+            .map_err(|err| format!("DeepSeek 导演批次返回了无效 JSON：{err}"))?;
+        let cues = parsed["dialogue"]
+            .as_array()
+            .ok_or_else(|| "DeepSeek 导演批次缺少 dialogue 数组".to_owned())?;
+        if cues.len() != dialogue.len() {
+            return Err(format!(
+                "DeepSeek 导演批次返回 {} 句，但该批次需要 {} 句",
+                cues.len(),
+                dialogue.len()
+            ));
+        }
+        combined_dialogue.extend(cues.iter().cloned());
+        raw_batch_responses.push(parsed);
+        Ok(())
     }
 }
 
@@ -760,18 +823,27 @@ fn director_request_defaults_missing_custom_prompt() {
 #[test]
 #[ignore = "calls the live DeepSeek API"]
 fn director_live_api_returns_structured_shot_plan() {
-    let input = r#"{"dialogue":[{"index":0,"speaker_id":"1","name":"萌萌","role":"玩家","text":"AI帮我打开1个舱门","has_character_model":true},{"index":1,"speaker_id":"2","name":"GM","role":"GM","text":"舱门缓慢打开。","has_character_model":false}]}"#;
+    let input = r#"{"dialogue":[{"index":0,"speaker_id":"1","name":"萌萌","role":"玩家","text":"Steam上的AI帮我打开10个舱门","has_character_model":true},{"index":1,"speaker_id":"2","name":"GM","role":"GM","text":"舱门缓慢打开。","has_character_model":false}]}"#;
     let response = DeepseekManager::post_director(input, "节奏紧凑，避免连续环绕镜头").unwrap();
     let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        value["_batch_responses"].as_array().unwrap().len(),
+        1
+    );
     let dialogue = value["dialogue"].as_array().unwrap();
     assert_eq!(dialogue.len(), 2);
     assert_eq!(dialogue[0]["index"], 0);
     assert!(dialogue[0]["text"]
         .as_str()
         .is_some_and(|text| !text.is_empty()));
-    assert!(dialogue[0]["speech_text"]
-        .as_str()
-        .is_some_and(|text| text.contains("诶艾") && !text.contains('1')));
+    assert!(
+        dialogue[0]["speech_text"].as_str().is_some_and(|text| {
+            text.contains("斯地母")
+                && text.contains("诶艾")
+                && text.contains('十')
+                && !text.contains("一零")
+        })
+    );
     assert!(dialogue[0]["shot"].as_str().is_some());
     assert!(dialogue[0]["motion"].as_str().is_some());
     assert!(matches!(

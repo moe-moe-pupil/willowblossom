@@ -910,7 +910,8 @@ impl Default for VoxelEditorState {
             restore_scene_requested: None,
             first_person_space_tap_elapsed: f32::INFINITY,
             first_person_was_enabled: false,
-            first_person_cursor_released: false,
+            // Keep the OS cursor free until the user explicitly clicks the 3D viewport.
+            first_person_cursor_released: true,
             teleport_requested: None,
         }
     }
@@ -7991,6 +7992,17 @@ mod tests {
         ));
         assert!(!should_grab_first_person_cursor(
             true, false, true
+        ));
+    }
+
+    #[test]
+    fn first_person_cursor_starts_released_until_viewport_click() {
+        let editor = VoxelEditorState::default();
+        assert!(editor.first_person_cursor_released);
+        assert!(!should_grab_first_person_cursor(
+            true,
+            false,
+            editor.first_person_cursor_released,
         ));
     }
 
