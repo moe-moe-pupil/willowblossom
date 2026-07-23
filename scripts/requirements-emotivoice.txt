@@ -1,0 +1,12 @@
+numba
+soundfile
+yacs
+jieba
+cn2an
+pypinyin
+pypinyin-dict
+librosa
+pyworld
+jsonlines
+scipy
+transformers

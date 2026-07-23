@@ -1,5 +1,3 @@
-mod mirai;
-
 use bevy::prelude::*;
 use willowblossom::GamePlugin;
 

@@ -1,6 +1,12 @@
-use std::panic::take_hook;
+use std::{
+    io::Read,
+    path::Path,
+};
 
 use async_compat::Compat;
+use bevy_egui::egui::TextureHandle;
+use bevy_persistent::prelude::*;
+extern crate dirs;
 use bevy::{
     ecs::system::CommandQueue,
     prelude::*,
@@ -10,17 +16,23 @@ use bevy::{
         IoTaskPool,
         Task,
     },
-    transform::commands,
+    utils::hashbrown::HashMap,
 };
 use crossbeam_channel::{
     unbounded,
     Receiver as CBReceiver,
     Sender as CBSender,
 };
+use dirs::state_dir;
 use futures_lite::future;
 use futures_util::{
     SinkExt,
     StreamExt,
+};
+use image::{codecs::gif::GifDecoder, AnimationDecoder, Frame};
+use serde::{
+    Deserialize,
+    Serialize,
 };
 use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::{
@@ -46,6 +58,77 @@ struct MiraiTask(Task<CommandQueue>);
 
 pub struct MiraiPlugin;
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiraiMessage {
+    pub(crate) sync_id: String,
+    pub data: MiraiMessageData,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Plain {
+    pub text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Image {
+    pub image_type: String,
+    pub url: String,
+    pub image_id: String,
+    pub path: Option<String>,
+    pub base64: Option<String>,
+    pub width: f32,
+    pub height: f32,
+    pub size: u64,
+    pub is_emoji: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Source {
+    id: u64,
+    time: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum MiraiMessageChainType {
+    Source(Source),
+    Plain(Plain),
+    Image(Image),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum MiraiMessageType {
+    FriendMessage,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiraiMessageChain {
+    #[serde(flatten)]
+    pub variant: MiraiMessageChainType,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiraiSender {
+    pub id: u64,
+    pub nickname: String,
+    pub remark: String,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiraiMessageData {
+    pub r#type: MiraiMessageType,
+    pub message_chain: Vec<MiraiMessageChain>,
+    pub sender: MiraiSender,
+}
+
+#[derive(Resource, Serialize, Deserialize)]
+pub struct MiraiMessageManager {
+    pub messages: HashMap<String, Vec<MiraiMessage>>,
+}
+
 impl Plugin for MiraiPlugin {
     fn build(&self, app: &mut App) {
         app.insert_state(ConnectionState::Disconnected)
@@ -64,6 +147,19 @@ fn setup(mut commands: Commands) {
     let task = thread_pool.spawn(Compat::new(handle_connection(
         client_to_game_sender.clone(),
     )));
+    let message_manager = MiraiMessageManager {
+        messages: HashMap::default(),
+    };
+    let config_dir = Path::new(".data").join("willowblossom");
+    commands.insert_resource(
+        Persistent::<MiraiMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(config_dir.join("messages.toml"))
+            .default(message_manager)
+            .build()
+            .expect("failed to init messages"),
+    );
     commands.insert_resource(mirai_io);
     commands.insert_resource(MiraiTask(task));
 }
@@ -132,8 +228,31 @@ fn send_message(buttons: Res<ButtonInput<MouseButton>>, sender: Res<MiraiIOSende
     }
 }
 
-fn message_system(receiver: Res<MiraiIOReceiver>) {
+fn message_system(
+    receiver: Res<MiraiIOReceiver>,
+    mut manager: ResMut<Persistent<MiraiMessageManager>>,
+) {
     if let Ok(msg) = receiver.0.try_recv() {
-        println!("{:?}", msg);
+        println!("msg => {:?}", msg);
+        if let Ok(json) = serde_json::from_str::<MiraiMessage>(&msg.to_string()) {
+            println!("json => {:?}", json);
+            if manager
+                .messages
+                .contains_key(&json.data.sender.id.to_string())
+            {
+                manager
+                    .messages
+                    .get_mut(&json.data.sender.id.to_string())
+                    .unwrap()
+                    .push(json)
+            } else {
+                manager
+                    .messages
+                    .insert(json.data.sender.id.to_string(), vec![
+                        json,
+                    ]);
+            }
+            manager.persist().ok();
+        }
     }
 }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Egui Stable Window Width"
+  short_description: "Fix egui windows that grow to full width from layout feedback."
+  default_prompt: "Use this skill to diagnose and fix an egui window or text editor that keeps expanding to the full available width after resize."

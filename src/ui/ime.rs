@@ -1,442 +1,536 @@
-use bevy::prelude::*;
+use std::collections::HashMap;
+
+use bevy::{
+    prelude::*,
+    window::Ime,
+};
 use bevy_egui::{
     egui,
-    EguiContexts,
+    input::EguiContextImeState,
 };
 use serde_json::json;
 use tungstenite::Message;
 
-use crate::mirai::MiraiIOSender;
+use crate::napcat::{
+    NapcatIOSender,
+    NapcatOutboundMessage,
+    NapcatSendResult,
+};
 
 pub struct ImePlugin;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NapcatSendTarget {
+    Private(u64),
+    Group(u64),
+}
+
 impl Plugin for ImePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(ImeManager::default())
-            .add_systems(PreUpdate, reset_unused_ime)
-            .add_systems(Update, listen_ime_events)
-            .add_systems(PostUpdate, clear_unused_ime);
+        app.insert_resource(ImeManager::default()).add_systems(
+            Update,
+            reset_egui_ime_enabled_after_commit,
+        );
     }
 }
 
-fn reset_unused_ime(mut ime: ResMut<ImeManager>) {
-    // Make all ImeText unused before update
-    for i in &mut ime.ime_texts {
-        i.is_used = false;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_text_send_tracks_private_target_until_acknowledged() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+
+        ime.queue_text_send("42", " 欢迎加入 ", &sender, vec![
+            NapcatSendTarget::Private(42),
+        ])
+        .unwrap();
+
+        let outbound = receiver.try_recv().unwrap();
+        assert_eq!(outbound.request_id, 1);
+        assert_eq!(outbound.target_id, "42");
+        assert!(outbound.message.to_string().contains("send_private_msg"));
+        assert!(outbound.message.to_string().contains("欢迎加入"));
+
+        let sent = ime.apply_send_results([NapcatSendResult {
+            request_id: outbound.request_id,
+            target_id: "42".to_owned(),
+            error: None,
+        }]);
+
+        assert_eq!(sent, vec![ChatInputSendCompletion {
+            input_id: "42".to_owned(),
+            text: "欢迎加入".to_owned(),
+            successful_targets: vec![NapcatSendTarget::Private(42)],
+            clear_input: true,
+        }]);
     }
-    ime.count = 0;
+
+    #[test]
+    fn batch_send_preserves_partial_success_and_error_after_out_of_order_failure() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+
+        ime.queue_text_send(
+            "broadcast",
+            "party update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+
+        let first = receiver.try_recv().unwrap();
+        let second = receiver.try_recv().unwrap();
+        assert!(ime
+            .apply_send_results([NapcatSendResult {
+                request_id: first.request_id,
+                target_id: "broadcast".to_owned(),
+                error: Some("recipient rejected message".to_owned()),
+            }])
+            .is_empty());
+
+        let completed = ime.apply_send_results([NapcatSendResult {
+            request_id: second.request_id,
+            target_id: "broadcast".to_owned(),
+            error: None,
+        }]);
+
+        assert_eq!(completed, vec![
+            ChatInputSendCompletion {
+                input_id: "broadcast".to_owned(),
+                text: "party update".to_owned(),
+                successful_targets: vec![NapcatSendTarget::Private(43)],
+                clear_input: false,
+            }
+        ]);
+        assert_eq!(
+            ime.send_states["broadcast"].error.as_deref(),
+            Some("recipient rejected message")
+        );
+    }
+
+    #[test]
+    fn partially_queued_batch_keeps_draft_and_records_queued_successes() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+
+        assert!(ime
+            .queue_text_send(
+                "broadcast",
+                "party update",
+                &sender,
+                vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43),]
+            )
+            .is_err());
+
+        let queued = receiver.try_recv().unwrap();
+        let completed = ime.apply_send_results([NapcatSendResult {
+            request_id: queued.request_id,
+            target_id: "broadcast".to_owned(),
+            error: None,
+        }]);
+
+        assert_eq!(completed, vec![
+            ChatInputSendCompletion {
+                input_id: "broadcast".to_owned(),
+                text: "party update".to_owned(),
+                successful_targets: vec![NapcatSendTarget::Private(42)],
+                clear_input: false,
+            }
+        ]);
+        assert!(ime.send_states["broadcast"].error.is_some());
+
+        ime.queue_text_send(
+            "broadcast",
+            "party update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+        let retry = receiver.try_recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert!(retry.message.to_string().contains("\"user_id\":43"));
+    }
+
+    #[test]
+    fn retry_after_partial_batch_sends_only_to_unacknowledged_targets() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+
+        ime.queue_text_send(
+            "broadcast",
+            "party update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+        let first = receiver.try_recv().unwrap();
+        let second = receiver.try_recv().unwrap();
+        let completed = ime.apply_send_results([
+            NapcatSendResult {
+                request_id: first.request_id,
+                target_id: "broadcast".to_owned(),
+                error: None,
+            },
+            NapcatSendResult {
+                request_id: second.request_id,
+                target_id: "broadcast".to_owned(),
+                error: Some("recipient rejected message".to_owned()),
+            },
+        ]);
+        assert_eq!(completed[0].successful_targets, vec![
+            NapcatSendTarget::Private(42)
+        ]);
+        assert!(!completed[0].clear_input);
+
+        ime.queue_text_send(
+            "broadcast",
+            "party update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+
+        let retry = receiver.try_recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert!(retry.message.to_string().contains("\"user_id\":43"));
+
+        let completed = ime.apply_send_results([NapcatSendResult {
+            request_id: retry.request_id,
+            target_id: "broadcast".to_owned(),
+            error: None,
+        }]);
+        assert_eq!(completed, vec![
+            ChatInputSendCompletion {
+                input_id: "broadcast".to_owned(),
+                text: "party update".to_owned(),
+                successful_targets: vec![NapcatSendTarget::Private(43)],
+                clear_input: true,
+            }
+        ]);
+    }
+
+    #[test]
+    fn changing_partial_batch_draft_starts_a_fresh_send_to_all_targets() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+
+        ime.queue_text_send(
+            "broadcast",
+            "first update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+        let first = receiver.try_recv().unwrap();
+        let second = receiver.try_recv().unwrap();
+        ime.apply_send_results([
+            NapcatSendResult {
+                request_id: first.request_id,
+                target_id: "broadcast".to_owned(),
+                error: None,
+            },
+            NapcatSendResult {
+                request_id: second.request_id,
+                target_id: "broadcast".to_owned(),
+                error: Some("recipient rejected message".to_owned()),
+            },
+        ]);
+
+        ime.queue_text_send(
+            "broadcast",
+            "corrected update",
+            &sender,
+            vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)],
+        )
+        .unwrap();
+
+        let first_retry = receiver.try_recv().unwrap();
+        let second_retry = receiver.try_recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert!(first_retry.message.to_string().contains("\"user_id\":42"));
+        assert!(second_retry.message.to_string().contains("\"user_id\":43"));
+    }
 }
 
-fn listen_ime_events(
-    // ime look
-    mut events: EventReader<Ime>,
-    mut ime: ResMut<ImeManager>,
-    mut windows: Query<&mut Window>,
+fn reset_egui_ime_enabled_after_commit(
+    mut events: MessageReader<Ime>,
+    mut ime_states: Query<&mut EguiContextImeState>,
 ) {
-    for event in events.read() {
-        ime.listen_ime_event(event);
+    let should_reset = events.read().any(|event| {
+        matches!(
+            event,
+            Ime::Commit { .. } | Ime::Disabled { .. } | Ime::Preedit { cursor: None, .. }
+        )
+    });
+    if !should_reset {
+        return;
     }
-    let mut window = windows.single_mut();
-    window.ime_position = ime
-        .get_focused_text()
-        .and_then(|text| Some(text.screen_pos))
-        .unwrap_or(Vec2::new(0.0, 0.0));
-}
 
-fn clear_unused_ime(
-    // delete unused ImeText after update
-    mut ime: ResMut<ImeManager>,
-) {
-    ime.ime_texts.retain(|i| i.is_used == true);
+    for mut ime_state in &mut ime_states {
+        ime_state.is_ime_allowed = false;
+        ime_state.ime_rect = None;
+    }
 }
-//////////////////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Debug, Resource)]
 pub struct ImeManager {
-    count: usize,
-    ime_texts: Vec<ImeText>,
+    next_send_request_id: u64,
+    send_states: HashMap<String, ChatInputSendState>,
 }
+
+#[derive(Debug, Default)]
+struct ChatInputSendState {
+    pending_requests: Vec<(u64, NapcatSendTarget)>,
+    successful_targets: Vec<NapcatSendTarget>,
+    delivered_text: Option<String>,
+    delivered_targets: Vec<NapcatSendTarget>,
+    pending_text: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChatInputSendCompletion {
+    pub input_id: String,
+    pub text: String,
+    pub successful_targets: Vec<NapcatSendTarget>,
+    pub clear_input: bool,
+}
+
 impl Default for ImeManager {
     fn default() -> ImeManager {
         ImeManager {
-            count: 0,
-            ime_texts: Vec::new(),
+            next_send_request_id: 1,
+            send_states: HashMap::new(),
         }
     }
 }
+
 impl ImeManager {
-    /// ```
-    /// let teo = ime.text_edit_singleline(&mut text, 200.0, ui, ctx);
-    /// if teo.response.changed() {
-    ///     println!("{:?}", text);
-    /// }
-    /// ```
-    pub fn text_edit_singleline(
+    pub fn chat_input_multiline(
         &mut self,
+        target_id: &str,
         text: &mut String,
         width: f32,
+        desired_rows: usize,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        sender: &MiraiIOSender,
+        _ctx: &egui::Context,
+        sender: &NapcatIOSender,
+        targets: Vec<NapcatSendTarget>,
     ) -> egui::text_edit::TextEditOutput {
-        if self.count >= self.ime_texts.len() {
-            self.add();
-            self.ime_texts[self.count].text = text.to_string();
+        let teo = egui::TextEdit::multiline(text)
+            .id_salt((target_id, "chat_input"))
+            .desired_width(width)
+            .desired_rows(desired_rows)
+            .lock_focus(true)
+            .return_key(None)
+            .show(ui);
+        let send_on_enter = teo.response.has_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+
+        if send_on_enter {
+            ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            });
         }
-        let teo = self.ime_texts[self.count].get_text_edit_output(
-            width,
-            text,
-            EditType::SingleLine,
-            ui,
-            ctx,
-        );
-        self.ime_texts[self.count].id = teo.response.id.short_debug_format();
-        self.count += 1;
-        return teo;
+
+        let send_state = self.send_states.entry(target_id.to_owned()).or_default();
+        if send_state.pending_requests.is_empty() {
+            if let Some(error) = &send_state.error {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+        } else {
+            ui.label("发送中...");
+        }
+
+        if send_on_enter {
+            if self
+                .send_states
+                .get(target_id)
+                .map(|state| !state.pending_requests.is_empty())
+                .unwrap_or(false)
+            {
+                return teo;
+            }
+
+            let message_text = text.trim().to_owned();
+            if message_text.is_empty() {
+                text.clear();
+                return teo;
+            }
+
+            let _ = self.queue_text_send(target_id, message_text, sender, targets);
+        }
+
+        teo
     }
 
-    /// ```
-    /// let teo = ime.text_edit_multiline(&mut text, 200.0, ui, ctx);
-    /// if teo.response.changed() {
-    ///     println!("{:?}", text);
-    /// }
-    /// ```
-    pub fn text_edit_multiline(
+    pub fn queue_text_send(
         &mut self,
-        text: &mut String,
-        width: f32,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        sender: &MiraiIOSender,
-    ) -> egui::text_edit::TextEditOutput {
-        if self.count >= self.ime_texts.len() {
-            self.add();
-            self.ime_texts[self.count].text = text.to_string();
+        target_id: &str,
+        text: impl AsRef<str>,
+        sender: &NapcatIOSender,
+        targets: Vec<NapcatSendTarget>,
+    ) -> Result<(), String> {
+        let message_text = text.as_ref().trim().to_owned();
+        if message_text.is_empty() {
+            return Ok(());
         }
-        let teo = self.ime_texts[self.count].get_text_edit_output(
-            width,
-            text,
-            EditType::MultiLine,
-            ui,
-            ctx,
-        );
-        if self.ime_texts[self.count].is_focus && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
-            println!("{}", self.ime_texts[self.count].text);
-            let err = sender
-                .0
-                .try_send(Message::Text(
-                    json!({
-                        "syncId": 123,
-                        "command": "sendFriendMessage",
-                        "subCommand": null,
-                        "content": {
-                            "target": 1670426821,
-                            "messageChain": [
-                                {
-                                    "type": "Plain",
-                                    "text": self.ime_texts[self.count].text
+
+        if targets.is_empty() {
+            let error = "没有可发送的NapCat目标".to_owned();
+            self.send_states
+                .entry(target_id.to_owned())
+                .or_default()
+                .error = Some(error.clone());
+            return Err(error);
+        }
+
+        if self
+            .send_states
+            .get(target_id)
+            .map(|state| !state.pending_requests.is_empty())
+            .unwrap_or(false)
+        {
+            return Err("上一条NapCat消息仍在发送中".to_owned());
+        }
+
+        let mut targets = targets;
+        {
+            let send_state = self.send_states.entry(target_id.to_owned()).or_default();
+            let is_retry = send_state.error.is_some()
+                && send_state.delivered_text.as_deref() == Some(message_text.as_str());
+            if is_retry {
+                targets.retain(|target| !send_state.delivered_targets.contains(target));
+            } else {
+                send_state.delivered_text = None;
+                send_state.delivered_targets.clear();
+            }
+            send_state.successful_targets.clear();
+        }
+        if targets.is_empty() {
+            let error = "当前目标均已确认送达；如需再次发送，请修改消息内容".to_owned();
+            self.send_states
+                .entry(target_id.to_owned())
+                .or_default()
+                .error = Some(error.clone());
+            return Err(error);
+        }
+
+        let mut pending_requests = Vec::new();
+        let mut error = None;
+        for target in targets {
+            let (action, id_key, id) = match &target {
+                NapcatSendTarget::Private(user_id) => ("send_private_msg", "user_id", user_id),
+                NapcatSendTarget::Group(group_id) => ("send_group_msg", "group_id", group_id),
+            };
+            let request_id = self.next_send_request_id;
+            self.next_send_request_id += 1;
+            let message = Message::Text(
+                json!({
+                    "action": action,
+                    "params": {
+                        id_key: id,
+                        "message": [
+                            {
+                                "type": "text",
+                                "data": {
+                                    "text": message_text
                                 }
-                            ]
-                        }
-                    })
-                    .to_string(),
-                ))
-                .expect("can't send message");
-            self.ime_texts[self.count].text = "".to_string();
-        }
-        self.ime_texts[self.count].id = teo.response.id.short_debug_format();
-        self.count += 1;
-        return teo;
-    }
-
-    /// ```
-    /// let teo = ime.text_edit_multiline(&mut text, 200.0, ui, ctx);
-    /// let id = teo.response.id.short_debug_format()
-    /// teo.set_text(&id, "あいうえお");
-    /// ```
-    pub fn set_text(&mut self, id: &str, text: &str) {
-        let res = self.ime_texts.iter().position(|i| &i.id == id);
-        if res.is_none() {
-            return;
-        }
-        self.ime_texts[res.unwrap()].text = text.to_string();
-    }
-
-    fn add(&mut self) {
-        // add Ime
-        let it = ImeText::new();
-        self.ime_texts.push(it);
-    }
-
-    fn get_focused_text(&mut self) -> Option<&ImeText> {
-        self.ime_texts.iter().find(|&text| text.is_focus == true)
-    }
-
-    pub fn listen_ime_event(&mut self, event: &Ime) {
-        // ime event look
-        for i in &mut self.ime_texts {
-            i.listen_ime_event(event);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum EditType {
-    SingleLine,
-    MultiLine,
-}
-
-#[derive(Debug)]
-struct ImeText {
-    id: String,
-    screen_pos: Vec2,
-    text: String,
-    ime_string: String,
-    ime_string_index: usize,
-    cursor_index: usize,
-    is_ime_input: bool,
-    is_focus: bool,
-    is_ime: bool,
-    is_cursor_move: bool,
-    edit_type: EditType,
-    is_used: bool,
-}
-impl Default for ImeText {
-    fn default() -> Self {
-        ImeText {
-            id: String::new(),
-            text: String::new(),
-            ime_string: String::new(),
-            ime_string_index: 0,
-            cursor_index: 0,
-            is_ime_input: false,
-            is_focus: false,
-            is_ime: false,
-            is_cursor_move: true,
-            edit_type: EditType::SingleLine,
-            is_used: false,
-            screen_pos: Vec2 { x: 0.0, y: 0.0 },
-        }
-    }
-}
-
-impl ImeText {
-    fn new() -> ImeText { return ImeText::default(); }
-
-    fn listen_ime_event(&mut self, event: &Ime) {
-        if !self.is_focus {
-            return;
-        }
-        match event {
-            Ime::Preedit { value, cursor, .. } if cursor.is_some() => {
-                if self.is_focus {
-                    self.ime_string = value.to_string();
-                    self.ime_string_index = self.ime_string.chars().count();
-                }
-            },
-            Ime::Commit { value, .. } => {
-                if value.is_empty() {
-                    self.is_cursor_move = false;
-                }
-                if self.is_focus {
-                    let tmp = value.to_string();
-                    if self.text.chars().count() == self.cursor_index {
-                        self.text.push_str(&tmp);
-                    } else {
-                        let mut front = String::new();
-                        let mut back = String::new();
-                        let mut cnt = 0;
-                        for c in self.text.chars() {
-                            if cnt < self.cursor_index {
-                                front.push_str(&c.to_string());
-                            } else {
-                                back.push_str(&c.to_string());
                             }
-                            cnt += 1;
-                        }
-                        self.text = format!("{}{}{}", front, tmp, back);
+                        ]
                     }
-                    self.is_ime_input = true;
-                    self.ime_string = String::new();
-                }
+                })
+                .to_string()
+                .into(),
+            );
+
+            if let Err(err) = sender.0.try_send(NapcatOutboundMessage {
+                request_id,
+                target_id: target_id.to_owned(),
+                message,
+            }) {
+                error = Some(format!(
+                    "NapCat websocket消息入队失败：{err}"
+                ));
+                break;
+            }
+            pending_requests.push((request_id, target));
+        }
+
+        let send_state = self.send_states.entry(target_id.to_owned()).or_default();
+        if !pending_requests.is_empty() {
+            send_state.pending_requests = pending_requests;
+            send_state.pending_text = Some(message_text);
+        } else {
+            send_state.pending_requests.clear();
+            send_state.pending_text = None;
+        }
+
+        match error {
+            Some(error) => {
+                send_state.error = Some(error.clone());
+                Err(error)
             },
-            Ime::Enabled { .. } => {
-                self.is_ime = true;
+            None => {
+                send_state.error = None;
+                Ok(())
             },
-            Ime::Disabled { .. } => {
-                self.is_ime = false;
-            },
-            _ => (),
         }
     }
 
-    fn get_text_edit_output(
+    pub fn apply_send_results(
         &mut self,
-        width: f32,
-        text: &mut String,
-        edit_type: EditType,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-    ) -> egui::text_edit::TextEditOutput {
-        self.edit_type = edit_type;
-        self.is_used = true;
-        let mut lyt = |ui: &egui::Ui, string: &str, wrap_width: f32| {
-            let loj = self.get_layoutjob(string, wrap_width);
-            ui.fonts(|f| f.layout_job(loj))
-        };
-        let mut tmp_text = match self.ime_string.len() {
-            0 => self.text.to_string(),
-            _ => {
-                let mut front = String::new();
-                let mut back = String::new();
-                let mut cnt = 0;
-                for c in self.text.chars() {
-                    if cnt < self.cursor_index {
-                        front.push_str(&c.to_string());
-                    } else {
-                        back.push_str(&c.to_string());
-                    }
-                    cnt += 1;
-                }
-                format!("{}{}{}", front, self.ime_string, back)
-            },
-        };
-
-        let mut teo = match self.edit_type {
-            EditType::SingleLine => egui::TextEdit::singleline(&mut tmp_text)
-                .desired_width(width)
-                .layouter(&mut lyt)
-                .show(ui),
-            _ => egui::TextEdit::multiline(&mut tmp_text)
-                .desired_width(width)
-                .layouter(&mut lyt)
-                .show(ui),
-        };
-        self.is_focus = teo.response.has_focus();
-        if !self.is_ime {
-            self.text = tmp_text.to_string();
-        }
-        if teo.cursor_range.is_some() {
-            self.cursor_index = teo.cursor_range.unwrap().primary.ccursor.index;
-        }
-        if self.is_ime_input {
-            // respose.changed()=true
-            teo.response.mark_changed();
-        }
-        if self.is_ime_input {
-            self.is_ime_input = false;
-            if self.is_cursor_move {
-                let mut res_cursor = teo.cursor_range.unwrap().primary.clone();
-                for _ in 0..self.ime_string_index {
-                    res_cursor = teo.galley.cursor_right_one_character(&res_cursor);
-                }
-                let cr = egui::text_selection::CursorRange {
-                    primary: res_cursor,
-                    secondary: res_cursor,
+        results: impl IntoIterator<Item = NapcatSendResult>,
+    ) -> Vec<ChatInputSendCompletion> {
+        let mut completions = Vec::new();
+        for result in results {
+            let Some(state) = self.send_states.get_mut(&result.target_id) else {
+                continue;
+            };
+            let Some(request_index) = state
+                .pending_requests
+                .iter()
+                .position(|(request_id, _)| *request_id == result.request_id)
+            else {
+                continue;
+            };
+            let (_, target) = state.pending_requests.remove(request_index);
+            if let Some(error) = result.error {
+                state.error = Some(error);
+            } else {
+                state.successful_targets.push(target);
+            }
+            if state.pending_requests.is_empty() {
+                let Some(text) = state.pending_text.take() else {
+                    continue;
                 };
-                teo.state.cursor.set_range(Some(cr));
+                state.delivered_text = Some(text.clone());
+                for target in &state.successful_targets {
+                    if !state.delivered_targets.contains(target) {
+                        state.delivered_targets.push(target.clone());
+                    }
+                }
+                let clear_input = state.error.is_none();
+                completions.push(ChatInputSendCompletion {
+                    input_id: result.target_id.clone(),
+                    text,
+                    successful_targets: std::mem::take(&mut state.successful_targets),
+                    clear_input,
+                });
+                if clear_input {
+                    state.delivered_text = None;
+                    state.delivered_targets.clear();
+                }
             }
         }
-        if !self.is_cursor_move {
-            self.is_cursor_move = true;
-        }
-        ui.ctx().output(|o| {
-            self.screen_pos = Vec2::new(
-                o.ime
-                    .and_then(|p| Some(p.cursor_rect.right()))
-                    .unwrap_or(0.0),
-                o.ime
-                    .and_then(|p| Some(p.cursor_rect.bottom()))
-                    .unwrap_or(0.0),
-            )
-        });
-        teo.state.clone().store(ctx, teo.response.id);
-        *text = self.text.to_string();
-        return teo;
-    }
-
-    fn get_layoutjob(&self, string: &str, width: f32) -> egui::text::LayoutJob {
-        let layout_job = match self.is_ime {
-            false => match self.edit_type {
-                EditType::SingleLine => egui::text::LayoutJob::simple_singleline(
-                    string.into(),
-                    egui::FontId::default(),
-                    egui::Color32::WHITE,
-                ),
-                _ => egui::text::LayoutJob::simple(
-                    string.into(),
-                    egui::FontId::default(),
-                    egui::Color32::WHITE,
-                    width,
-                ),
-            },
-            _ => {
-                let mut front = String::new();
-                let mut back = String::new();
-                let mut cnt = 0;
-                for c in self.text.chars() {
-                    if cnt < self.cursor_index {
-                        front.push_str(&c.to_string());
-                    } else {
-                        back.push_str(&c.to_string());
-                    }
-                    cnt += 1;
-                }
-
-                let mut lss: Vec<egui::text::LayoutSection> = vec![];
-                let mut f_cnt = 0;
-                let mut b_cnt = 0;
-                b_cnt = b_cnt + front.len();
-                let ls_front = egui::text::LayoutSection {
-                    leading_space: 0.0,
-                    byte_range: f_cnt..b_cnt,
-                    format: egui::TextFormat {
-                        color: egui::Color32::WHITE,
-                        ..Default::default()
-                    },
-                };
-                lss.push(ls_front);
-                f_cnt = b_cnt;
-
-                b_cnt = b_cnt + self.ime_string.len();
-                let ls_text = egui::text::LayoutSection {
-                    leading_space: 0.0,
-                    byte_range: f_cnt..b_cnt,
-                    format: egui::TextFormat {
-                        color: egui::Color32::GREEN,
-                        background: egui::Color32::from_rgb(0, 128, 64),
-                        ..Default::default()
-                    },
-                };
-                lss.push(ls_text);
-                f_cnt = b_cnt;
-
-                b_cnt = b_cnt + back.len();
-                let ls_back = egui::text::LayoutSection {
-                    leading_space: 0.0,
-                    byte_range: f_cnt..b_cnt,
-                    format: egui::TextFormat {
-                        color: egui::Color32::WHITE,
-                        ..Default::default()
-                    },
-                };
-                lss.push(ls_back);
-                let break_on_newline = match self.edit_type {
-                    EditType::SingleLine => false,
-                    _ => true,
-                };
-                egui::text::LayoutJob {
-                    sections: lss,
-                    text: format!("{}{}{}", front, self.ime_string, back),
-                    break_on_newline,
-                    wrap: egui::text::TextWrapping {
-                        max_width: width,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }
-            },
-        };
-        return layout_job;
+        completions
     }
 }

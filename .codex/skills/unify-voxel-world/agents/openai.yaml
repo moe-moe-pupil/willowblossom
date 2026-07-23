@@ -1,0 +1,4 @@
+interface:
+  display_name: "Unify Voxel World"
+  short_description: "Keep voxel scale and interactions consistent"
+  default_prompt: "Use $unify-voxel-world to implement this voxel-world change with consistent scale and behavior."
