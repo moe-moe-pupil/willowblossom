@@ -1696,8 +1696,20 @@ fn chat_window(
             return;
         }
 
+        // egui 0.35 moves titled windows through this dedicated title-bar response;
+        // the outer area response alone only catches a few controls such as collapse.
+        let title_drag_response = ctx.read_response(window_id.with("__title_click"));
+        let window_dragged = title_drag_response
+            .as_ref()
+            .is_some_and(egui::Response::dragged)
+            || response.response.dragged();
+        let window_drag_stopped = title_drag_response
+            .as_ref()
+            .is_some_and(egui::Response::drag_stopped)
+            || response.response.drag_stopped();
+
         if let Some(drop_pos) = ctx.input(|input| input.pointer.latest_pos()) {
-            if response.response.dragged() {
+            if window_dragged {
                 if let Some((_, preview_rect)) =
                     group_rects.iter().find(|(_, rect)| rect.contains(drop_pos))
                 {
@@ -1706,7 +1718,7 @@ fn chat_window(
             }
         }
 
-        if !response.response.drag_stopped() {
+        if !window_drag_stopped {
             return;
         }
 
@@ -7801,19 +7813,12 @@ fn restore_group_initial_player_stats(
     (restored, missing)
 }
 
-fn summary_key_matches_campaign_or_targets(
-    summary_key: &str,
-    campaign_id: &str,
-    target_ids: &HashSet<String>,
-) -> bool {
-    if let Some((summary_campaign_id, _)) = parse_campaign_summary_key(summary_key) {
-        return summary_campaign_id == campaign_id;
+fn summary_key_matches_campaign_or_legacy(summary_key: &str, campaign_id: &str) -> bool {
+    if let Some((summary_campaign_id, scope_key)) = parse_campaign_summary_key(summary_key) {
+        return summary_campaign_id == campaign_id
+            || parse_group_summary_key(scope_key).is_some();
     }
-    if target_ids.contains(summary_key) {
-        return true;
-    }
-    parse_group_summary_key(summary_key)
-        .is_some_and(|(target_id, _)| target_ids.contains(target_id))
+    true
 }
 
 fn clear_campaign_chat_messages(
@@ -7861,14 +7866,13 @@ fn clear_campaign_summaries(
     manager: &mut NapcatMessageManager,
     deepseek_manager: &mut DeepseekManager,
     campaign_id: &str,
-    target_ids: &HashSet<String>,
 ) -> usize {
     manager.summarized_message_counts.retain(|summary_key, _| {
-        !summary_key_matches_campaign_or_targets(summary_key, campaign_id, target_ids)
+        !summary_key_matches_campaign_or_legacy(summary_key, campaign_id)
     });
     let previous_len = deepseek_manager.summaries.len();
     deepseek_manager.summaries.retain(|summary_key, _| {
-        !summary_key_matches_campaign_or_targets(summary_key, campaign_id, target_ids)
+        !summary_key_matches_campaign_or_legacy(summary_key, campaign_id)
     });
     deepseek_manager.last_post_text.clear();
     previous_len.saturating_sub(deepseek_manager.summaries.len())
@@ -12852,7 +12856,6 @@ fn trpg_group_settings_window(
                 manager.as_mut(),
                 deepseek_manager.as_mut(),
                 &campaign_id,
-                &target_ids,
             );
             let removed_battles = battle_store
                 .as_deref_mut()
@@ -14457,6 +14460,8 @@ mod tests {
 
         let campaign_summary_key = SummaryScope::Private.summary_key("campaign-a", "2");
         let other_summary_key = SummaryScope::Private.summary_key("campaign-b", "2");
+        let other_group_summary_key =
+            SummaryScope::GroupPublic.summary_key("campaign-b", "99");
         manager
             .summarized_message_counts
             .insert(campaign_summary_key.clone(), 1);
@@ -14470,6 +14475,24 @@ mod tests {
         deepseek_manager
             .summaries
             .insert(other_summary_key.clone(), Default::default());
+        manager
+            .summarized_message_counts
+            .insert(other_group_summary_key.clone(), 1);
+        deepseek_manager
+            .summaries
+            .insert(other_group_summary_key.clone(), Default::default());
+        for legacy_key in [
+            "group:99:public",
+            "276168175",
+            "replay-director:default:public",
+        ] {
+            manager
+                .summarized_message_counts
+                .insert(legacy_key.to_owned(), 1);
+            deepseek_manager
+                .summaries
+                .insert(legacy_key.to_owned(), Default::default());
+        }
         deepseek_manager.last_post_text = "old response".to_owned();
 
         let mut battle_store = BattleRoundStore::default();
@@ -14488,8 +14511,6 @@ mod tests {
             },
         );
         battle_store.active_encounter_id = Some("campaign-a-battle".to_owned());
-        let targets = HashSet::from(["2".to_owned()]);
-
         assert_eq!(
             clear_campaign_chat_messages(&mut manager, "campaign-a"),
             1
@@ -14499,9 +14520,8 @@ mod tests {
                 &mut manager,
                 &mut deepseek_manager,
                 "campaign-a",
-                &targets,
             ),
-            1
+            5
         );
         assert_eq!(
             clear_campaign_battle_rounds(&mut battle_store, "party-a", "campaign-a"),
@@ -14521,6 +14541,14 @@ mod tests {
             .summaries
             .contains_key(&campaign_summary_key));
         assert!(deepseek_manager.summaries.contains_key(&other_summary_key));
+        assert!(!deepseek_manager
+            .summaries
+            .contains_key(&other_group_summary_key));
+        assert!(!deepseek_manager.summaries.contains_key("group:99:public"));
+        assert!(!deepseek_manager.summaries.contains_key("276168175"));
+        assert!(!deepseek_manager
+            .summaries
+            .contains_key("replay-director:default:public"));
         assert!(deepseek_manager.last_post_text.is_empty());
         assert!(!battle_store.encounters.contains_key("campaign-a-battle"));
         assert!(battle_store.encounters.contains_key("campaign-b-battle"));
