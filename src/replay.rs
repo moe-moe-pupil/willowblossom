@@ -4,6 +4,8 @@ use std::{
     collections::{
         hash_map::DefaultHasher,
         HashMap,
+        HashSet,
+        VecDeque,
     },
     fs,
     hash::{
@@ -460,6 +462,7 @@ fn record_replay(
     time: Res<Time>,
     manager: Res<Persistent<NapcatMessageManager>>,
     camera: Query<&Transform, With<VoxelViewportCamera>>,
+    standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     mut studio: ResMut<ReplayStudio>,
 ) {
     if studio.mode != ReplayMode::Recording {
@@ -486,7 +489,17 @@ fn record_replay(
     }
 
     let audience = studio.audience.clone();
-    let record_elapsed_ms = studio.record_elapsed_ms;
+    let speaker_positions = standee_positions(&standees);
+    let mut next_turn_ms = studio
+        .replay
+        .as_ref()
+        .and_then(|replay| replay.dialogue.last())
+        .map(|line| {
+            line.time_ms
+                .saturating_add(line.duration_ms)
+                .saturating_add(HISTORY_DIALOGUE_GAP_MS)
+        })
+        .unwrap_or(350);
     let targets = manager.messages.keys().cloned().collect::<Vec<_>>();
     let mut captured = Vec::new();
     for target_id in targets {
@@ -502,8 +515,12 @@ fn record_replay(
                 if let Some(dialogue) = dialogue_from_message(
                     &campaign_message,
                     &manager,
-                    record_elapsed_ms,
+                    next_turn_ms,
                 ) {
+                    next_turn_ms = dialogue
+                        .time_ms
+                        .saturating_add(dialogue.duration_ms)
+                        .saturating_add(HISTORY_DIALOGUE_GAP_MS);
                     captured.push(dialogue);
                 }
             }
@@ -511,9 +528,28 @@ fn record_replay(
         studio.message_counts.insert(target_id, messages.len());
     }
     let record_elapsed_ms = studio.record_elapsed_ms;
+    let record_camera_enabled = studio.record_camera_enabled;
     if let Some(replay) = studio.replay.as_mut() {
+        let captured_any = !captured.is_empty();
         replay.dialogue.extend(captured);
-        replay.duration_ms = record_elapsed_ms;
+        retain_dialogue_with_standees(&mut replay.dialogue, &speaker_positions);
+        spatially_order_dialogue_turns(&mut replay.dialogue, &speaker_positions);
+        let dialogue_end = retime_dialogue_turns(&mut replay.dialogue);
+        replay.duration_ms = if record_camera_enabled {
+            record_elapsed_ms.max(dialogue_end)
+        } else {
+            dialogue_end
+        };
+        if captured_any && !record_camera_enabled {
+            if let Ok(base) = camera.single() {
+                replay.camera = turn_based_camera_track(
+                    base,
+                    &replay.dialogue,
+                    replay.duration_ms,
+                    &speaker_positions,
+                );
+            }
+        }
     }
 }
 
@@ -1352,7 +1388,7 @@ fn replay_controls(
                 start_recording(studio, manager, camera, grids);
             }
             if ui.button("从现有聊天生成").clicked() {
-                build_from_history(studio, manager, camera, grids);
+                build_from_history(studio, manager, camera, standees, grids);
             }
         },
     });
@@ -1403,7 +1439,7 @@ fn replay_controls(
 
     ui.separator();
     ui.heading("DeepSeek 视频导演");
-    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内的已有台词，并为每句选择镜头。它还会生成只供 EmotiVoice 使用的中文谐音读法，例如 AI→诶艾、1个→一个；画面字幕仍显示正常原文。存在说话人立牌时强制持续对准该角色；只有找不到立牌时才使用极慢的环境移动。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
+    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内且场景中有立牌的玩家台词，并为每句选择镜头。回合内会从最早发言者开始，再按立牌距离依次访问最近玩家；镜头从台词第一刻起持续对准说话者。它还会生成只供 EmotiVoice 使用的中文谐音读法，画面字幕仍显示正常原文。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
     ui.checkbox(
         &mut studio.deepseek_director_enabled,
         "允许 DeepSeek 润色台词并控制镜头",
@@ -1641,7 +1677,7 @@ fn replay_controls(
         ) {
             stop_playback(studio, grids);
         }
-        build_from_history(studio, manager, camera, grids);
+        build_from_history(studio, manager, camera, standees, grids);
         let director_queued = studio.replay.as_ref().is_some_and(|replay| {
             queue_replay_director(
                 replay,
@@ -1894,14 +1930,16 @@ fn start_recording(
 
 fn stop_recording(studio: &mut ReplayStudio) {
     if let Some(replay) = studio.replay.as_mut() {
-        replay.duration_ms = studio.record_elapsed_ms.max(
-            replay
-                .dialogue
-                .iter()
-                .map(|line| line.time_ms.saturating_add(line.duration_ms))
-                .max()
-                .unwrap_or_default(),
-        );
+        let dialogue_end = replay
+            .dialogue
+            .last()
+            .map(|line| line.time_ms.saturating_add(line.duration_ms))
+            .unwrap_or(5_000);
+        replay.duration_ms = if studio.record_camera_enabled {
+            studio.record_elapsed_ms.max(dialogue_end)
+        } else {
+            dialogue_end
+        };
     }
     studio.mode = ReplayMode::Idle;
     studio.playback_ms = 0;
@@ -1912,6 +1950,7 @@ fn build_from_history(
     studio: &mut ReplayStudio,
     manager: &NapcatMessageManager,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
+    standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
 ) {
     let Some(campaign_id) = manager.active_campaign_id() else {
@@ -1928,6 +1967,7 @@ fn build_from_history(
         studio.audience.clone(),
         scene,
     );
+    let speaker_positions = standee_positions(standees);
     let mut visible = manager
         .messages
         .iter()
@@ -1952,27 +1992,26 @@ fn build_from_history(
             replay.dialogue.push(dialogue);
         }
     }
-    replay.duration_ms = replay
-        .dialogue
-        .iter()
-        .map(|line| line.time_ms.saturating_add(line.duration_ms))
-        .max()
-        .unwrap_or(5_000);
+    let ignored_count =
+        retain_dialogue_with_standees(&mut replay.dialogue, &speaker_positions);
+    spatially_order_dialogue_turns(&mut replay.dialogue, &speaker_positions);
+    replay.duration_ms = retime_dialogue_turns(&mut replay.dialogue);
     if let Ok(transform) = camera.single() {
-        replay.camera.push(camera_keyframe(0, transform));
-        replay.camera.push(camera_keyframe(
-            replay.duration_ms,
+        replay.camera = turn_based_camera_track(
             transform,
-        ));
+            &replay.dialogue,
+            replay.duration_ms,
+            &speaker_positions,
+        );
     }
     studio.playback_ms = 0;
     studio.director_request_pending = false;
     studio.director_response_hash = None;
     studio.auto_export_after_director = false;
+    let dialogue_count = replay.dialogue.len();
     studio.replay = Some(replay);
     studio.status = format!(
-        "已从现有聊天生成 {0} 条连续对话；切换间隔约 0.27 秒",
-        visible.len()
+        "已生成 {dialogue_count} 个玩家回合；同轮按立牌距离就近切换，已忽略 {ignored_count} 句无场景立牌发言"
     );
 }
 
@@ -2024,6 +2063,16 @@ fn queue_replay_director(
         .iter()
         .map(|(_, standee)| standee.user_id)
         .collect::<std::collections::HashSet<_>>();
+    let missing_standee_count = replay
+        .dialogue
+        .iter()
+        .filter(|line| !visible_standees.contains(&line.sender_id))
+        .count();
+    if missing_standee_count > 0 {
+        return Err(format!(
+            "回放中有 {missing_standee_count} 句找不到说话者立牌；请重新从当前场景聊天生成回放"
+        ));
+    }
     let dialogue = replay
         .dialogue
         .iter()
@@ -2035,7 +2084,7 @@ fn queue_replay_director(
                 "name": line.name,
                 "role": line.role,
                 "text": line.text.trim(),
-                "has_character_model": visible_standees.contains(&line.sender_id),
+                "has_character_model": true,
             })
         })
         .collect::<Vec<_>>();
@@ -2177,10 +2226,7 @@ fn apply_ready_director_plan(
         .cloned()
         .or_else(|| replay.camera.first().map(frame_transform))
         .ok_or_else(|| "找不到可用的导演基础镜头".to_owned())?;
-    let speaker_positions = standees
-        .iter()
-        .map(|(transform, standee)| (standee.user_id, transform.translation))
-        .collect::<HashMap<_, _>>();
+    let speaker_positions = standee_positions(standees);
     replay.camera = director_camera_track(
         &base,
         &replay.dialogue,
@@ -3122,24 +3168,120 @@ fn camera_keyframe(time_ms: u64, transform: &Transform) -> ReplayCameraKeyframe 
     }
 }
 
-#[cfg(test)]
-fn automatic_camera_track(
+fn spatially_order_dialogue_turns(
+    dialogue: &mut Vec<ReplayDialogue>,
+    speaker_positions: &HashMap<u64, Vec3>,
+) {
+    if dialogue.len() < 2 {
+        return;
+    }
+    let mut queues = HashMap::<u64, VecDeque<ReplayDialogue>>::new();
+    for line in dialogue.drain(..) {
+        queues.entry(line.sender_id).or_default().push_back(line);
+    }
+    let mut ordered = Vec::with_capacity(queues.values().map(VecDeque::len).sum());
+    while queues.values().any(|queue| !queue.is_empty()) {
+        let mut unplayed = queues
+            .iter()
+            .filter(|(_, queue)| !queue.is_empty())
+            .map(|(speaker_id, _)| *speaker_id)
+            .collect::<HashSet<_>>();
+        let Some(mut current_speaker) = unplayed.iter().copied().min_by_key(|speaker_id| {
+            queues
+                .get(speaker_id)
+                .and_then(|queue| queue.front())
+                .map(|line| (line.time_ms, line.sender_id))
+                .unwrap_or((u64::MAX, *speaker_id))
+        }) else {
+            break;
+        };
+        while unplayed.remove(&current_speaker) {
+            if let Some(line) = queues
+                .get_mut(&current_speaker)
+                .and_then(VecDeque::pop_front)
+            {
+                ordered.push(line);
+            }
+            let Some(current_position) = speaker_positions.get(&current_speaker) else {
+                break;
+            };
+            let Some(next_speaker) = unplayed.iter().copied().min_by(|left, right| {
+                let left_distance = speaker_positions
+                    .get(left)
+                    .map(|position| current_position.distance_squared(*position))
+                    .unwrap_or(f32::INFINITY);
+                let right_distance = speaker_positions
+                    .get(right)
+                    .map(|position| current_position.distance_squared(*position))
+                    .unwrap_or(f32::INFINITY);
+                left_distance
+                    .total_cmp(&right_distance)
+                    .then_with(|| left.cmp(right))
+            }) else {
+                break;
+            };
+            current_speaker = next_speaker;
+        }
+    }
+    *dialogue = ordered;
+}
+
+fn retain_dialogue_with_standees(
+    dialogue: &mut Vec<ReplayDialogue>,
+    speaker_positions: &HashMap<u64, Vec3>,
+) -> usize {
+    let previous_len = dialogue.len();
+    dialogue.retain(|line| speaker_positions.contains_key(&line.sender_id));
+    previous_len.saturating_sub(dialogue.len())
+}
+
+fn retime_dialogue_turns(dialogue: &mut [ReplayDialogue]) -> u64 {
+    let mut timeline_ms = 350_u64;
+    for line in dialogue {
+        line.time_ms = timeline_ms;
+        timeline_ms = line
+            .time_ms
+            .saturating_add(line.duration_ms)
+            .saturating_add(HISTORY_DIALOGUE_GAP_MS);
+    }
+    timeline_ms
+        .saturating_sub(HISTORY_DIALOGUE_GAP_MS)
+        .max(5_000)
+}
+
+fn standee_positions(
+    standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
+) -> HashMap<u64, Vec3> {
+    standees
+        .iter()
+        .map(|(transform, standee)| (standee.user_id, transform.translation))
+        .collect()
+}
+
+fn turn_based_camera_track(
     base: &Transform,
     dialogue: &[ReplayDialogue],
     duration_ms: u64,
     speaker_positions: &HashMap<u64, Vec3>,
 ) -> Vec<ReplayCameraKeyframe> {
     let mut frames = Vec::with_capacity(dialogue.len().saturating_mul(3).saturating_add(2));
-    frames.push(camera_keyframe(0, base));
-    let mut current = base.clone();
+    let mut current = dialogue
+        .first()
+        .and_then(|line| speaker_positions.get(&line.sender_id))
+        .map(|target| {
+            speaker_camera_shot(
+                base,
+                *target,
+                dialogue[0].sender_id,
+                0,
+                0.0,
+            )
+        })
+        .unwrap_or_else(|| base.clone());
+    frames.push(camera_keyframe(0, &current));
     for (index, line) in dialogue.iter().enumerate() {
-        frames.push(camera_keyframe(line.time_ms, &current));
         let line_end = line.time_ms.saturating_add(line.duration_ms);
         if let Some(target) = speaker_positions.get(&line.sender_id) {
-            let arrival_ms = line
-                .time_ms
-                .saturating_add((line.duration_ms / 3).clamp(160, 360))
-                .min(line_end);
             let focused = speaker_camera_shot(
                 base,
                 *target,
@@ -3154,13 +3296,15 @@ fn automatic_camera_track(
                 index,
                 1.0,
             );
-            frames.push(camera_keyframe(arrival_ms, &focused));
+            if line.time_ms > 0 {
+                frames.push(camera_keyframe(
+                    line.time_ms.saturating_sub(1),
+                    &current,
+                ));
+            }
+            frames.push(camera_keyframe(line.time_ms, &focused));
             frames.push(camera_keyframe(line_end, &settled));
             current = settled;
-        } else {
-            let drifted = fallback_camera_drift(&current, line.sender_id, index);
-            frames.push(camera_keyframe(line_end, &drifted));
-            current = drifted;
         }
     }
     if frames
@@ -3204,16 +3348,11 @@ fn director_camera_track(
     }
     let mut frames = vec![camera_keyframe(0, &current)];
     for (index, (line, cue)) in dialogue.iter().zip(cues).enumerate() {
-        frames.push(camera_keyframe(line.time_ms, &current));
         let line_end = line.time_ms.saturating_add(line.duration_ms);
-        let arrival_ms = line
-            .time_ms
-            .saturating_add(line.duration_ms.saturating_mul(7) / 10)
-            .min(line_end);
         let (arrival, settled) = if let Some(target) = speaker_positions.get(&line.sender_id) {
             let speaker_shot = resolved_speaker_shot(cue.shot);
             let desired_arrival = director_speaker_shot(
-                &current,
+                base,
                 *target,
                 line.sender_id,
                 index,
@@ -3221,8 +3360,7 @@ fn director_camera_track(
                 cue.motion,
                 0.0,
             );
-            let travel_limit = (line.duration_ms as f32 / 1_000.0 * 0.55).clamp(1.0, 3.0);
-            let arrival = limit_camera_travel(&current, &desired_arrival, travel_limit);
+            let arrival = desired_arrival;
             let desired_settled = director_speaker_shot(
                 &arrival,
                 *target,
@@ -3236,11 +3374,15 @@ fn director_camera_track(
             let settled = limit_camera_travel(&arrival, &desired_settled, settle_limit);
             (arrival, settled)
         } else {
-            let arrival = current.clone();
-            let settled = director_environment_motion(&arrival, cue.motion);
-            (arrival, settled)
+            continue;
         };
-        frames.push(camera_keyframe(arrival_ms, &arrival));
+        if line.time_ms > 0 {
+            frames.push(camera_keyframe(
+                line.time_ms.saturating_sub(1),
+                &current,
+            ));
+        }
+        frames.push(camera_keyframe(line.time_ms, &arrival));
         frames.push(camera_keyframe(line_end, &settled));
         current = settled;
     }
@@ -3318,23 +3460,6 @@ fn director_speaker_shot(
     Transform::from_translation(position).looking_at(target + Vec3::Y * 0.35, Vec3::Y)
 }
 
-fn director_environment_motion(current: &Transform, motion: DirectorMotion) -> Transform {
-    let right = current.rotation * Vec3::X;
-    let forward = current.rotation * Vec3::NEG_Z;
-    let offset = match motion {
-        DirectorMotion::Static => Vec3::ZERO,
-        DirectorMotion::DollyIn => forward * 0.30,
-        DirectorMotion::DollyOut => -forward * 0.30,
-        DirectorMotion::DriftLeft => -right * 0.30,
-        DirectorMotion::DriftRight => right * 0.30,
-    };
-    let position = current.translation + offset;
-    Transform {
-        translation: position,
-        ..current.clone()
-    }
-}
-
 fn limit_camera_travel(current: &Transform, desired: &Transform, max_distance: f32) -> Transform {
     let offset = desired.translation - current.translation;
     Transform {
@@ -3344,7 +3469,6 @@ fn limit_camera_travel(current: &Transform, desired: &Transform, max_distance: f
     }
 }
 
-#[cfg(test)]
 fn speaker_camera_shot(
     base: &Transform,
     target: Vec3,
@@ -3366,19 +3490,6 @@ fn speaker_camera_shot(
     let position =
         target + approach * distance + lateral * (shoulder + settle * 0.12) + Vec3::Y * height;
     Transform::from_translation(position).looking_at(target + Vec3::Y * 0.25, Vec3::Y)
-}
-
-#[cfg(test)]
-fn fallback_camera_drift(current: &Transform, sender_id: u64, index: usize) -> Transform {
-    let right = current.rotation * Vec3::X;
-    let up = current.rotation * Vec3::Y;
-    let forward = current.rotation * Vec3::NEG_Z;
-    let horizontal = (cinematic_seed(sender_id, index) - 0.5) * 0.9;
-    let vertical = (cinematic_seed(sender_id.rotate_left(17), index) - 0.5) * 0.35;
-    let dolly = 0.18 + cinematic_seed(sender_id.rotate_left(31), index) * 0.32;
-    let position = current.translation + right * horizontal + up * vertical + forward * dolly;
-    let focus = current.translation + forward * 18.0 + right * horizontal * 0.7;
-    Transform::from_translation(position).looking_at(focus, Vec3::Y)
 }
 
 fn cinematic_seed(sender_id: u64, index: usize) -> f32 {
@@ -4166,7 +4277,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_director_focuses_known_speakers() {
+    fn turn_camera_focuses_known_speakers_at_line_start() {
         let base = Transform::from_xyz(2.0, 3.0, 4.0);
         let mut dialogue = [
             test_dialogue(350, 2_400, DialogueSide::Left),
@@ -4177,20 +4288,18 @@ mod tests {
             (1, Vec3::new(-8.0, 1.0, 2.0)),
             (2, Vec3::new(9.0, 1.0, -3.0)),
         ]);
-        let frames = automatic_camera_track(
+        let frames = turn_based_camera_track(
             &base,
             &dialogue,
             5_430,
             &speaker_positions,
         );
-        assert!(frames
-            .windows(2)
-            .all(|pair| pair[0].time_ms < pair[1].time_ms));
-        assert_eq!(
-            frames.first().unwrap().translation,
-            base.translation.to_array()
+        assert!(
+            frames
+                .windows(2)
+                .all(|pair| pair[0].time_ms < pair[1].time_ms)
         );
-        for (arrival_ms, target) in [(710, speaker_positions[&1]), (3_390, speaker_positions[&2])] {
+        for (arrival_ms, target) in [(350, speaker_positions[&1]), (3_030, speaker_positions[&2])] {
             let frame = frames
                 .iter()
                 .find(|frame| frame.time_ms == arrival_ms)
@@ -4203,14 +4312,59 @@ mod tests {
     }
 
     #[test]
-    fn automatic_director_drifts_when_speaker_has_no_standee() {
-        let base = Transform::from_xyz(2.0, 3.0, 4.0);
-        let dialogue = [test_dialogue(350, 1_200, DialogueSide::Right)];
-        let frames = automatic_camera_track(&base, &dialogue, 1_550, &HashMap::new());
-        assert_ne!(
-            frames.last().unwrap().translation,
-            base.translation.to_array()
+    fn turn_order_visits_the_nearest_unplayed_standee_in_each_round() {
+        let mut dialogue = Vec::new();
+        for (index, sender_id) in [1, 2, 3, 1, 2, 3].into_iter().enumerate() {
+            let mut line = test_dialogue(
+                index as u64 * 1_000,
+                600,
+                DialogueSide::Right,
+            );
+            line.sender_id = sender_id;
+            line.text = format!("{sender_id}:{index}");
+            dialogue.push(line);
+        }
+        let positions = HashMap::from([
+            (1, Vec3::ZERO),
+            (2, Vec3::new(10.0, 0.0, 0.0)),
+            (3, Vec3::new(2.0, 0.0, 0.0)),
+        ]);
+
+        spatially_order_dialogue_turns(&mut dialogue, &positions);
+
+        assert_eq!(
+            dialogue
+                .iter()
+                .map(|line| line.sender_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 2, 1, 3, 2]
         );
+        assert_eq!(
+            dialogue
+                .iter()
+                .filter(|line| line.sender_id == 1)
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1:0", "1:3"]
+        );
+    }
+
+    #[test]
+    fn dialogue_without_a_scene_standee_is_removed() {
+        let mut dialogue = vec![
+            test_dialogue(0, 600, DialogueSide::Right),
+            test_dialogue(1_000, 600, DialogueSide::Right),
+        ];
+        dialogue[1].sender_id = 2;
+
+        let ignored = retain_dialogue_with_standees(
+            &mut dialogue,
+            &HashMap::from([(2, Vec3::ZERO)]),
+        );
+
+        assert_eq!(ignored, 1);
+        assert_eq!(dialogue.len(), 1);
+        assert_eq!(dialogue[0].sender_id, 2);
     }
 
     #[test]
@@ -4236,11 +4390,7 @@ mod tests {
         let forward = shot.rotation * Vec3::NEG_Z;
         let to_speaker = (target + Vec3::Y * 0.35 - shot.translation).normalize();
         assert!(forward.dot(to_speaker) > 0.99);
-        assert!(frames.windows(2).all(|pair| {
-            Vec3::from_array(pair[0].translation).distance(Vec3::from_array(pair[1].translation))
-                <= 3.01
-        }));
-        assert!(frames.iter().any(|frame| frame.time_ms == 2_240));
+        assert!(frames.iter().any(|frame| frame.time_ms == 350));
     }
 
     #[test]

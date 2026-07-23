@@ -124,7 +124,7 @@ const SUMMARY_SYSTEM_PROMPT: &str = "\
 待跟进：...";
 
 const DIRECTOR_SYSTEM_PROMPT: &str = r#"
-你是TRPG回放视频的剪辑导演。输入只包含已经通过发布范围检查的台词，以及场景中是否存在对应角色模型。
+你是TRPG回放视频的剪辑导演。输入只包含已经通过发布范围检查、且说话者在场景中拥有角色模型的台词；输入顺序已经按回合和角色立牌距离排好。
 你的工作是润色每句台词并为每句选择镜头，不是制作摘要。
 
 必须遵守：
@@ -133,8 +133,8 @@ const DIRECTOR_SYSTEM_PROMPT: &str = r#"
 3. text 是画面字幕：保留原意、专有名词、数字和正常中英文写法；不要把玩家的话改成旁白。
 4. 台词要频繁连续，中文每句适合一次呼吸读完；不要加入长停顿说明。
 5. speech_text 只供中文 TTS 使用，不会显示在画面。它必须与 text 含义完全相同，但要把英文品牌、单词、缩写、阿拉伯数字和符号改成中国人自然说话时会使用的中文读法，不得机械地逐字母或逐数字念。整数按数值读，例如 10 读“十”、21 读“二十一”，不能读成“一零”或“二一”；英文品牌优先使用通行中文名或自然音译，例如 Steam 读“斯地母”，不能读成“艾丝踢伊诶艾姆”；AI 可读“诶艾”。例如 text 为“Steam上的AI有10个方案”时，speech_text 应为“斯地母上的诶艾有十个方案”。只有编号、电话号码、年份等语境明确要求逐位读时才逐位读。不得为了配音改写 text。
-6. has_character_model 为 true 时，必须使用 speaker_close、speaker_medium 或 speaker_wide，并让镜头持续对准当前说话者的角色模型；不得选择环境镜头。
-7. has_character_model 为 false 时才可使用 establishing 或 environment，并且只能进行极慢的短距离环境移动。
+6. has_character_model 必须为 true；必须使用 speaker_close、speaker_medium 或 speaker_wide，并从台词开始的第一刻到结束持续对准当前说话者的角色模型，不得选择环境镜头。
+7. 不得改变输入给定的回合顺序；镜头只在说话者切换时切换到下一个角色立牌。
 8. 连续两句不要机械重复同一构图。禁止环绕、快速摇镜、快速推拉、大范围横移或跨越场景飞行。
 9. shot 只能是 speaker_close、speaker_medium、speaker_wide、establishing、environment。
 10. motion 只能是 static、dolly_in、dolly_out、drift_left、drift_right；优先 static。
