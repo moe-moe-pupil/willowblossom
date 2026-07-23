@@ -486,6 +486,7 @@ pub(crate) enum VoxelTeleportDestination {
     CannonStation,
     CombatSpaceship,
     PlanetScienceLab,
+    PlayerStandee(u64),
 }
 
 impl VoxelTeleportDestination {
@@ -504,13 +505,14 @@ impl VoxelTeleportDestination {
             Self::CannonStation => "巨炮空间站",
             Self::CombatSpaceship => "战斗舰",
             Self::PlanetScienceLab => "行星科研站",
+            Self::PlayerStandee(_) => "玩家立牌",
         }
     }
 
-    fn player_position(self) -> Vec3 {
+    fn player_position(self) -> Option<Vec3> {
         let floor_offset =
             Vec3::Y * (VOXEL_SIZE + FIRST_PERSON_RADIUS + FIRST_PERSON_BODY_LENGTH * 0.5);
-        match self {
+        Some(match self {
             Self::ResearchStation => {
                 (RESEARCH_STATION_CENTER + IVec3::new(10, 0, 10)).as_vec3() * VOXEL_SIZE
                     + floor_offset
@@ -536,7 +538,8 @@ impl VoxelTeleportDestination {
                     ) * VOXEL_SIZE
                     + floor_offset
             },
-        }
+            Self::PlayerStandee(_) => return None,
+        })
     }
 }
 
@@ -7167,7 +7170,12 @@ fn apply_voxel_teleport(
             With<VoxelFirstPersonPlayer>,
             Without<VoxelViewportCamera>,
             Without<VoxelPlayerCaptureCamera>,
+            Without<VoxelPlayerStandee>,
         ),
+    >,
+    standees: Query<
+        (&VoxelPlayerStandee, &GlobalTransform),
+        Without<VoxelFirstPersonPlayer>,
     >,
 ) {
     let Some(destination) = editor.teleport_requested.take() else { return };
@@ -7175,8 +7183,23 @@ fn apply_voxel_teleport(
         editor.teleport_menu_open = false;
         return;
     }
+    let target_position = match destination {
+        VoxelTeleportDestination::PlayerStandee(user_id) => {
+            let Some((_, standee_transform)) = standees
+                .iter()
+                .find(|(standee, _)| standee.user_id == user_id)
+            else {
+                return;
+            };
+            first_person_player_position(standee_transform.translation())
+        },
+        _ => {
+            let Some(position) = destination.player_position() else { return };
+            position
+        },
+    };
     let Ok((mut transform, mut velocity)) = players.single_mut() else { return };
-    transform.translation = destination.player_position();
+    transform.translation = target_position;
     velocity.0 = Vec3::ZERO;
     editor.first_person_enabled = true;
     editor.first_person_flying = true;
@@ -8471,22 +8494,29 @@ mod tests {
     fn teleport_destinations_use_canonical_world_landmarks() {
         assert_eq!(
             VoxelTeleportDestination::ResearchStation.player_position(),
-            (RESEARCH_STATION_CENTER + IVec3::new(10, 0, 10)).as_vec3() * VOXEL_SIZE
-                + Vec3::Y * 0.5
+            Some(
+                (RESEARCH_STATION_CENTER + IVec3::new(10, 0, 10)).as_vec3() * VOXEL_SIZE
+                    + Vec3::Y * 0.5
+            )
         );
         assert_eq!(
             VoxelTeleportDestination::CombatSpaceship.player_position(),
-            (COMBAT_SPACESHIP_CENTER + IVec3::new(1, 0, 0)).as_vec3() * VOXEL_SIZE + Vec3::Y * 0.5
+            Some(
+                (COMBAT_SPACESHIP_CENTER + IVec3::new(1, 0, 0)).as_vec3() * VOXEL_SIZE
+                    + Vec3::Y * 0.5
+            )
         );
         assert_eq!(
             VoxelTeleportDestination::PlanetScienceLab.player_position(),
-            ORBITAL_PLANET_CENTER
-                + Vec3::new(
-                    PLANET_SCIENCE_LAB_CENTER.x as f32,
-                    PLANET_SCIENCE_LAB_FLOOR_Y as f32,
-                    PLANET_SCIENCE_LAB_CENTER.y as f32,
-                ) * VOXEL_SIZE
-                + Vec3::Y * 0.5
+            Some(
+                ORBITAL_PLANET_CENTER
+                    + Vec3::new(
+                        PLANET_SCIENCE_LAB_CENTER.x as f32,
+                        PLANET_SCIENCE_LAB_FLOOR_Y as f32,
+                        PLANET_SCIENCE_LAB_CENTER.y as f32,
+                    ) * VOXEL_SIZE
+                    + Vec3::Y * 0.5
+            )
         );
     }
 
@@ -8513,7 +8543,47 @@ mod tests {
         let entity = app.world().entity(player);
         assert_eq!(
             entity.get::<Transform>().unwrap().translation,
-            destination.player_position()
+            destination.player_position().unwrap()
+        );
+        assert_eq!(
+            entity.get::<LinearVelocity>().unwrap().0,
+            Vec3::ZERO
+        );
+    }
+
+    #[test]
+    fn teleport_request_moves_the_dm_to_a_player_standee() {
+        let user_id = 1_670_426_821;
+        let standee_eye_position = Vec3::new(12.0, 3.0, -8.0);
+        let mut editor = VoxelEditorState::default();
+        editor.request_teleport(VoxelTeleportDestination::PlayerStandee(user_id));
+        let mut app = App::new();
+        app.insert_resource(editor)
+            .init_resource::<VoxelPossessionState>()
+            .add_systems(Update, apply_voxel_teleport);
+        let player = app
+            .world_mut()
+            .spawn((
+                VoxelFirstPersonPlayer,
+                Transform::default(),
+                LinearVelocity(Vec3::ONE),
+            ))
+            .id();
+        app.world_mut().spawn((
+            VoxelPlayerStandee {
+                user_id,
+                image_source: "avatar.png".to_owned(),
+                half_size: Vec2::splat(VOXEL_SIZE),
+            },
+            GlobalTransform::from_translation(standee_eye_position),
+        ));
+
+        app.update();
+
+        let entity = app.world().entity(player);
+        assert_eq!(
+            entity.get::<Transform>().unwrap().translation,
+            first_person_player_position(standee_eye_position)
         );
         assert_eq!(
             entity.get::<LinearVelocity>().unwrap().0,

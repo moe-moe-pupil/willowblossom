@@ -64,6 +64,7 @@ use crate::voxel::{
     VoxelEditMode,
     VoxelEditorState,
     VoxelLightTool,
+    VoxelPlayerStandee,
     VoxelPossessionState,
     VoxelTeleportDestination,
     MAX_VOXEL_BRUSH_RADIUS,
@@ -914,6 +915,11 @@ pub struct UiSystemLocals<'w, 's> {
     voxel_editor: ResMut<'w, VoxelEditorState>,
     voxel_possession: ResMut<'w, VoxelPossessionState>,
     battle_store: Option<ResMut<'w, Persistent<BattleRoundStore>>>,
+    player_standees: Query<
+        'w,
+        's,
+        (&'static VoxelPlayerStandee, &'static bevy::prelude::Visibility),
+    >,
 }
 
 pub struct CircleImageButton {
@@ -12612,6 +12618,7 @@ pub fn ui_system(
     let voxel_editor: &mut VoxelEditorState = &mut locals.voxel_editor;
     let voxel_possession: &mut VoxelPossessionState = &mut locals.voxel_possession;
     let battle_store = &mut locals.battle_store;
+    let player_standees = &locals.player_standees;
 
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -13552,6 +13559,50 @@ pub fn ui_system(
                                 .clicked()
                             {
                                 voxel_editor.request_teleport(destination);
+                            }
+                        }
+                        let mut standee_destinations = player_standees
+                            .iter()
+                            .filter(|(_, visibility)| {
+                                **visibility != bevy::prelude::Visibility::Hidden
+                            })
+                            .map(|(standee, _)| {
+                                let target_id = standee.user_id.to_string();
+                                let character_name = manager
+                                    .player_characters
+                                    .get(&target_id)
+                                    .map(|character| {
+                                        if !character.nickname.trim().is_empty() {
+                                            character.nickname.trim()
+                                        } else {
+                                            character.name.trim()
+                                        }
+                                    })
+                                    .filter(|name| !name.is_empty())
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| target_display_name(&manager, &target_id));
+                                (character_name, standee.user_id)
+                            })
+                            .collect::<Vec<_>>();
+                        standee_destinations.sort_by(|left, right| {
+                            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                        });
+                        if !standee_destinations.is_empty() {
+                            ui.separator();
+                            ui.strong("玩家立牌");
+                            for (name, user_id) in standee_destinations {
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(220.0, 28.0),
+                                        egui::Button::new(format!("传送到 {name}")),
+                                    )
+                                    .on_hover_text(format!("QQ：{user_id}"))
+                                    .clicked()
+                                {
+                                    voxel_editor.request_teleport(
+                                        VoxelTeleportDestination::PlayerStandee(user_id),
+                                    );
+                                }
                             }
                         }
                     });
