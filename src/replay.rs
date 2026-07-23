@@ -107,7 +107,7 @@ const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const BACKGROUND_MUSIC_PATH: &str = "assets/audio/jrpg2-piano.mp3";
-const MELOTTS_RUNTIME_DIR: &str = ".data/willowblossom/tts/melotts";
+const EMOTIVOICE_RUNTIME_DIR: &str = ".data/willowblossom/tts/emotivoice";
 const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
 const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
 
@@ -295,8 +295,11 @@ enum DirectorMotion {
 struct SpeakerVoiceSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     voice_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    emotion: Option<String>,
     #[serde(default)]
     onnx_speaker_id: Option<i32>,
+    #[serde(default)]
     pitch: i32,
     speech_rate: i32,
     volume: f32,
@@ -405,8 +408,8 @@ struct OnnxPreviewRequest {
     signature: u64,
     cue: (u64, usize),
     text: String,
-    voice_preset: String,
-    pitch: i32,
+    speaker: String,
+    emotion: String,
     speed: f32,
     volume: f32,
 }
@@ -571,7 +574,7 @@ fn preview_replay_speech(
         if let Some(replay) = studio.replay.as_ref() {
             if let Err(err) = speech.prepare_onnx_replay(replay, studio.speech_volume) {
                 speech.onnx_failed = true;
-                eprintln!("failed to prepare MeloTTS preview speech: {err}");
+                eprintln!("failed to prepare EmotiVoice preview speech: {err}");
             }
         }
     }
@@ -607,7 +610,7 @@ fn preview_replay_speech(
             },
             Err(err) => {
                 speech.onnx_failed = true;
-                eprintln!("failed to synthesize MeloTTS preview speech: {err}");
+                eprintln!("failed to synthesize EmotiVoice preview speech: {err}");
             },
         }
     }
@@ -677,16 +680,15 @@ impl PreviewSpeechController {
                     signature,
                     cue: (replay.created_at_unix_ms, index),
                     text: speech_text_for_line(line),
-                    voice_preset: resolved_voice_preset(
+                    speaker: resolved_emotivoice_speaker(
                         settings.voice_name.as_deref(),
                         line.sender_id,
-                    )
-                    .to_owned(),
-                    pitch: settings.pitch,
+                    ),
+                    emotion: resolved_emotivoice_emotion(settings.emotion.as_deref()).to_owned(),
                     speed: combined_onnx_speed(rate, replay.master_speech_speed),
                     volume: (global_volume * settings.volume).clamp(0.0, 1.0),
                 })
-                .map_err(|err| format!("MeloTTS preview worker stopped: {err}"))?;
+                .map_err(|err| format!("EmotiVoice preview worker stopped: {err}"))?;
         }
         Ok(())
     }
@@ -697,13 +699,17 @@ impl PreviewSpeechController {
 }
 
 fn onnx_tts_is_available() -> bool {
-    melotts_python_path().is_file() && melotts_worker_path().is_file()
+    emotivoice_python_path().is_file()
+        && emotivoice_worker_path().is_file()
+        && emotivoice_source_path().is_dir()
 }
 
-fn melotts_root() -> PathBuf { Path::new(env!("CARGO_MANIFEST_DIR")).join(MELOTTS_RUNTIME_DIR) }
+fn emotivoice_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(EMOTIVOICE_RUNTIME_DIR)
+}
 
-fn melotts_python_path() -> PathBuf {
-    let root = melotts_root().join(".venv");
+fn emotivoice_python_path() -> PathBuf {
+    let root = emotivoice_root().join(".venv313");
     if cfg!(windows) {
         root.join("Scripts").join("python.exe")
     } else {
@@ -711,13 +717,15 @@ fn melotts_python_path() -> PathBuf {
     }
 }
 
-fn melotts_worker_path() -> PathBuf {
+fn emotivoice_source_path() -> PathBuf { emotivoice_root().join("EmotiVoice") }
+
+fn emotivoice_worker_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
-        .join("melotts_worker.py")
+        .join("emotivoice_worker.py")
 }
 
-struct MeloTts {
+struct EmotiVoiceTts {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
@@ -725,36 +733,35 @@ struct MeloTts {
     sequence: u64,
 }
 
-impl Drop for MeloTts {
+impl Drop for EmotiVoiceTts {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-fn create_onnx_tts() -> Result<MeloTts, String> {
+fn create_onnx_tts() -> Result<EmotiVoiceTts, String> {
     if !onnx_tts_is_available() {
-        return Err("未安装 MeloTTS 中文运行环境；请运行 scripts/setup_melotts.ps1".to_owned());
+        return Err(
+            "未安装 EmotiVoice 中文运行环境；请运行 scripts/setup_emotivoice.ps1".to_owned(),
+        );
     }
-    let cache_root = melotts_root().join("worker-cache");
-    fs::create_dir_all(&cache_root).map_err(|err| format!("无法创建 MeloTTS 缓存目录：{err}"))?;
+    let cache_root = emotivoice_root().join("worker-cache");
+    fs::create_dir_all(&cache_root)
+        .map_err(|err| format!("无法创建 EmotiVoice 缓存目录：{err}"))?;
     let cache = tempfile::Builder::new()
         .prefix("worker-")
         .tempdir_in(&cache_root)
-        .map_err(|err| format!("无法创建 MeloTTS 临时目录：{err}"))?;
-    let log = fs::File::create(cache.path().join("melotts.log"))
-        .map_err(|err| format!("无法创建 MeloTTS 日志：{err}"))?;
-    let mut command = Command::new(melotts_python_path());
+        .map_err(|err| format!("无法创建 EmotiVoice 临时目录：{err}"))?;
+    let log = fs::File::create(cache.path().join("emotivoice.log"))
+        .map_err(|err| format!("无法创建 EmotiVoice 日志：{err}"))?;
+    let mut command = Command::new(emotivoice_python_path());
     command
-        .arg(melotts_worker_path())
+        .arg(emotivoice_worker_path())
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env(
-            "HF_HOME",
-            melotts_root().join("huggingface"),
-        )
-        .env(
-            "PYTHONPATH",
-            melotts_root().join("MeloTTS"),
+            "EMOTIVOICE_SOURCE",
+            emotivoice_source_path(),
         )
         .env("http_proxy", "http://127.0.0.1:10809")
         .env("https_proxy", "http://127.0.0.1:10809")
@@ -765,25 +772,25 @@ fn create_onnx_tts() -> Result<MeloTts, String> {
     hide_command_window(&mut command);
     let mut child = command
         .spawn()
-        .map_err(|err| format!("无法启动 MeloTTS 中文进程：{err}"))?;
+        .map_err(|err| format!("无法启动 EmotiVoice 中文进程：{err}"))?;
     let input = child
         .stdin
         .take()
-        .ok_or_else(|| "MeloTTS 没有打开输入流".to_owned())?;
+        .ok_or_else(|| "EmotiVoice 没有打开输入流".to_owned())?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "MeloTTS 没有打开输出流".to_owned())?;
+        .ok_or_else(|| "EmotiVoice 没有打开输出流".to_owned())?;
     let mut output = BufReader::new(stdout);
     let mut line = String::new();
     loop {
         line.clear();
         if output
             .read_line(&mut line)
-            .map_err(|err| format!("读取 MeloTTS 启动状态失败：{err}"))?
+            .map_err(|err| format!("读取 EmotiVoice 启动状态失败：{err}"))?
             == 0
         {
-            return Err("MeloTTS 在模型加载完成前退出，请查看 worker-cache 中的日志".to_owned());
+            return Err("EmotiVoice 在模型加载完成前退出，请查看 worker-cache 中的日志".to_owned());
         }
         let Ok(status) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
@@ -794,11 +801,11 @@ fn create_onnx_tts() -> Result<MeloTts, String> {
         if status.get("ready").and_then(|value| value.as_bool()) == Some(false) {
             return Err(status["error"]
                 .as_str()
-                .unwrap_or("MeloTTS 中文模型加载失败")
+                .unwrap_or("EmotiVoice 中文模型加载失败")
                 .to_owned());
         }
     }
-    Ok(MeloTts {
+    Ok(EmotiVoiceTts {
         child,
         input,
         output,
@@ -807,12 +814,12 @@ fn create_onnx_tts() -> Result<MeloTts, String> {
     })
 }
 
-impl MeloTts {
+impl EmotiVoiceTts {
     fn synthesize(
         &mut self,
         text: &str,
-        voice_preset: &str,
-        pitch: i32,
+        speaker: &str,
+        emotion: &str,
         speed: f32,
     ) -> Result<Vec<u8>, String> {
         let normalized_text = normalize_tts_text(text);
@@ -830,38 +837,35 @@ impl MeloTts {
         self.sequence = self.sequence.saturating_add(1);
         let request = serde_json::json!({
             "text": normalized_text,
+            "speaker": speaker,
+            "emotion": emotion,
             "speed": speed.max(0.10),
             "output_path": raw_path,
         });
         serde_json::to_writer(&mut self.input, &request)
             .and_then(|_| self.input.write_all(b"\n").map_err(serde_json::Error::io))
             .and_then(|_| self.input.flush().map_err(serde_json::Error::io))
-            .map_err(|err| format!("发送 MeloTTS 台词失败：{err}"))?;
+            .map_err(|err| format!("发送 EmotiVoice 台词失败：{err}"))?;
         let mut response = String::new();
         self.output
             .read_line(&mut response)
-            .map_err(|err| format!("读取 MeloTTS 结果失败：{err}"))?;
+            .map_err(|err| format!("读取 EmotiVoice 结果失败：{err}"))?;
         let response: serde_json::Value = serde_json::from_str(&response)
-            .map_err(|err| format!("MeloTTS 返回了无效结果：{err}"))?;
+            .map_err(|err| format!("EmotiVoice 返回了无效结果：{err}"))?;
         if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
             return Err(response["error"]
                 .as_str()
-                .unwrap_or("MeloTTS 中文合成失败")
+                .unwrap_or("EmotiVoice 中文合成失败")
                 .to_owned());
         }
-        let total_pitch = (voice_preset_pitch(voice_preset) + pitch).clamp(-100, 60);
-        let pitch_factor = 2_f64.powf(total_pitch as f64 / 120.0);
-        let filter = format!(
-            "asetrate=44100*{pitch_factor:.6},aresample=32000,atempo={:.6}",
-            1.0 / pitch_factor
-        );
         let mut command = Command::new("ffmpeg");
+        let tempo_filter = ffmpeg_atempo_filter(speed);
         command
             .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
             .arg(&raw_path)
             .args([
                 "-af",
-                &filter,
+                &tempo_filter,
                 "-ar",
                 "32000",
                 "-ac",
@@ -873,15 +877,35 @@ impl MeloTts {
         hide_command_window(&mut command);
         let output = command
             .output()
-            .map_err(|err| format!("无法处理 MeloTTS 角色音调：{err}"))?;
+            .map_err(|err| format!("无法转换 EmotiVoice 角色语音：{err}"))?;
         let _ = fs::remove_file(&raw_path);
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
         }
-        let wav = fs::read(&output_path).map_err(|err| format!("无法读取 MeloTTS WAV：{err}"))?;
+        let wav =
+            fs::read(&output_path).map_err(|err| format!("无法读取 EmotiVoice WAV：{err}"))?;
         let _ = fs::remove_file(&output_path);
         Ok(wav)
     }
+}
+
+fn ffmpeg_atempo_filter(speed: f32) -> String {
+    let mut remaining = if speed.is_finite() { speed.max(0.10) } else { 1.0 };
+    let mut factors = Vec::new();
+    while remaining > 2.0 {
+        factors.push(2.0);
+        remaining /= 2.0;
+    }
+    while remaining < 0.5 {
+        factors.push(0.5);
+        remaining /= 0.5;
+    }
+    factors.push(remaining);
+    factors
+        .into_iter()
+        .map(|factor| format!("atempo={factor:.6}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
@@ -890,7 +914,7 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
     let latest_signature = Arc::new(AtomicU64::new(0));
     let worker_signature = Arc::clone(&latest_signature);
     thread::Builder::new()
-        .name("replay-melotts-preview".to_owned())
+        .name("replay-emotivoice-preview".to_owned())
         .spawn(move || {
             let mut tts = create_onnx_tts();
             while let Ok(request) = request_rx.recv() {
@@ -900,8 +924,8 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                 let wav = tts.as_mut().map_err(|err| err.clone()).and_then(|tts| {
                     tts.synthesize(
                         &request.text,
-                        &request.voice_preset,
-                        request.pitch,
+                        &request.speaker,
+                        &request.emotion,
                         request.speed,
                     )
                 });
@@ -921,7 +945,7 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                 }
             }
         })
-        .map_err(|err| format!("无法启动 MeloTTS 预览线程：{err}"))?;
+        .map_err(|err| format!("无法启动 EmotiVoice 预览线程：{err}"))?;
     Ok(OnnxPreviewWorker {
         requests: request_tx,
         results: result_rx,
@@ -1379,7 +1403,7 @@ fn replay_controls(
 
     ui.separator();
     ui.heading("DeepSeek 视频导演");
-    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内的已有台词，并为每句选择镜头。它还会生成只供 MeloTTS 使用的中文谐音读法，例如 AI→诶艾、1个→一个；画面字幕仍显示正常原文。存在说话人立牌时强制持续对准该角色；只有找不到立牌时才使用极慢的环境移动。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
+    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内的已有台词，并为每句选择镜头。它还会生成只供 EmotiVoice 使用的中文谐音读法，例如 AI→诶艾、1个→一个；画面字幕仍显示正常原文。存在说话人立牌时强制持续对准该角色；只有找不到立牌时才使用极慢的环境移动。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
     ui.checkbox(
         &mut studio.deepseek_director_enabled,
         "允许 DeepSeek 润色台词并控制镜头",
@@ -1522,7 +1546,7 @@ fn replay_controls(
     ui.horizontal(|ui| {
         ui.checkbox(
             &mut studio.speech_enabled,
-            "角色语音（预览与导出，MeloTTS 中文离线语音）",
+            "角色语音（预览与导出，EmotiVoice 中文离线语音）",
         );
         ui.add_enabled(
             studio.speech_enabled,
@@ -1566,7 +1590,7 @@ fn replay_controls(
             studio.speech_settings_open = true;
         }
     });
-    ui.small("整体语速默认 1.30×；整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。预览与导出共用同一条时间线和 MeloTTS 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
+    ui.small("整体语速默认 1.30×；整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。预览与导出共用同一条时间线和 EmotiVoice 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -1702,7 +1726,7 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         .default_width(520.0)
         .max_width(620.0)
         .show(ctx, |ui| {
-            ui.label("MeloTTS 中文模型只有一个原生说话人。下列男声/女声是稳定的音色处理预设，可为每个角色独立选择；设置同时用于播放预览和 MP4 导出。");
+            ui.label("EmotiVoice 提供 2000 多个真实训练音色。可从推荐男声/女声中选择，也可输入任意有效音色 ID；不再通过变调伪造男声。设置同时用于播放预览和 MP4 导出。");
             if speakers.is_empty() {
                 ui.label("请先录制回放或从现有聊天生成回放。");
                 return;
@@ -1725,30 +1749,51 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                             }
                             ui.small(format!("QQ {sender_id}"));
                         });
-                        let current_preset =
-                            resolved_voice_preset(settings.voice_name.as_deref(), *sender_id);
-                        let mut selected_preset = current_preset.to_owned();
-                        egui::ComboBox::from_id_salt(("replay-voice-preset", sender_id))
-                            .selected_text(voice_preset_label(&selected_preset))
+                        let current_speaker =
+                            resolved_emotivoice_speaker(settings.voice_name.as_deref(), *sender_id);
+                        if settings.voice_name.as_deref() != Some(current_speaker.as_str()) {
+                            settings.voice_name = Some(current_speaker.clone());
+                            settings_changed = true;
+                        }
+                        let mut selected_speaker = current_speaker.clone();
+                        egui::ComboBox::from_id_salt(("replay-emotivoice-speaker", sender_id))
+                            .selected_text(emotivoice_speaker_label(&selected_speaker))
                             .show_ui(ui, |ui| {
-                                for preset in VOICE_PRESETS {
+                                for (speaker, label) in EMOTIVOICE_RECOMMENDED_SPEAKERS {
                                     ui.selectable_value(
-                                        &mut selected_preset,
-                                        preset.to_owned(),
-                                        voice_preset_label(preset),
+                                        &mut selected_speaker,
+                                        speaker.to_owned(),
+                                        label,
                                     );
                                 }
                             });
-                        if selected_preset != current_preset {
-                            settings.voice_name = Some(selected_preset);
+                        if selected_speaker != current_speaker {
+                            settings.voice_name = Some(selected_speaker);
                             settings_changed = true;
                         }
+                        let voice_name = settings
+                            .voice_name
+                            .get_or_insert_with(|| default_emotivoice_speaker(*sender_id).to_owned());
                         settings_changed |= ui
-                            .add(
-                                egui::Slider::new(&mut settings.pitch, -30..=30)
-                                    .text("音调微调"),
-                            )
+                            .add(egui::TextEdit::singleline(voice_name).hint_text("音色 ID，如 9000"))
                             .changed();
+                        let mut emotion =
+                            resolved_emotivoice_emotion(settings.emotion.as_deref()).to_owned();
+                        egui::ComboBox::from_id_salt(("replay-emotivoice-emotion", sender_id))
+                            .selected_text(format!("情绪：{emotion}"))
+                            .show_ui(ui, |ui| {
+                                for choice in EMOTIVOICE_EMOTIONS {
+                                    ui.selectable_value(
+                                        &mut emotion,
+                                        choice.to_owned(),
+                                        choice,
+                                    );
+                                }
+                            });
+                        if settings.emotion.as_deref() != Some(emotion.as_str()) {
+                            settings.emotion = Some(emotion);
+                            settings_changed = true;
+                        }
                         settings_changed |= ui
                             .add(
                                 egui::Slider::new(&mut settings.speech_rate, -30..=180)
@@ -2356,9 +2401,9 @@ fn check_ffmpeg() -> Result<(), String> {
 }
 
 fn check_speech_synthesizer() -> Result<(), String> {
-    onnx_tts_is_available()
-        .then_some(())
-        .ok_or_else(|| "未安装 MeloTTS 中文运行环境；请运行 scripts/setup_melotts.ps1".to_owned())
+    onnx_tts_is_available().then_some(()).ok_or_else(|| {
+        "未安装 EmotiVoice 中文运行环境；请运行 scripts/setup_emotivoice.ps1".to_owned()
+    })
 }
 
 fn encode_video_frames(
@@ -2520,8 +2565,8 @@ struct SynthesizedSpeechCue {
 struct SpeechSynthesisJob {
     text: String,
     output_path: String,
-    voice_preset: String,
-    pitch: i32,
+    speaker: String,
+    emotion: String,
     onnx_speed: f32,
     duration_ms: u64,
 }
@@ -2568,12 +2613,11 @@ fn write_narration_track(
                     .join(format!("speech-{index:05}.wav"))
                     .to_string_lossy()
                     .into_owned(),
-                voice_preset: resolved_voice_preset(
+                speaker: resolved_emotivoice_speaker(
                     settings.voice_name.as_deref(),
                     line.sender_id,
-                )
-                .to_owned(),
-                pitch: settings.pitch,
+                ),
+                emotion: resolved_emotivoice_emotion(settings.emotion.as_deref()).to_owned(),
                 onnx_speed: combined_onnx_speed(fitted_rate, master_speech_speed),
                 duration_ms: line.duration_ms,
             }
@@ -2653,47 +2697,49 @@ fn write_narration_track(
         .map_err(|err| format!("完成角色语音轨道失败：{err}"))
 }
 
-const VOICE_PRESETS: [&str; 5] = [
-    "male_deep",
-    "male_natural",
-    "neutral",
-    "female_natural",
-    "female_bright",
+const EMOTIVOICE_RECOMMENDED_SPEAKERS: [(&str, &str); 9] = [
+    ("9000", "男声 9000（推荐）"),
+    ("984", "男声 984"),
+    ("985", "男声 985"),
+    ("65", "女声 65（推荐）"),
+    ("92", "女声 92"),
+    ("102", "女声 102"),
+    ("225", "女声 225"),
+    ("1088", "女声 1088"),
+    ("1093", "女声 1093"),
 ];
 
-fn voice_preset_label(preset: &str) -> &'static str {
-    match preset {
-        "male_deep" => "男声·低沉",
-        "male_natural" => "男声·自然",
-        "female_natural" => "女声·自然",
-        "female_bright" => "女声·明亮",
-        _ => "中性",
-    }
+const EMOTIVOICE_EMOTIONS: [&str; 7] = ["普通", "开心", "悲伤", "生气", "惊讶", "厌恶", "恐惧"];
+
+fn emotivoice_speaker_label(speaker: &str) -> String {
+    EMOTIVOICE_RECOMMENDED_SPEAKERS
+        .iter()
+        .find_map(|(id, label)| (*id == speaker).then_some((*label).to_owned()))
+        .unwrap_or_else(|| format!("音色 {speaker}"))
 }
 
-fn voice_preset_pitch(preset: &str) -> i32 {
-    match preset {
-        "male_deep" => -72,
-        "male_natural" => -48,
-        "female_natural" => 0,
-        "female_bright" => 18,
-        _ => -24,
-    }
+fn default_emotivoice_speaker(sender_id: u64) -> &'static str {
+    let index = (sender_id as usize) % EMOTIVOICE_RECOMMENDED_SPEAKERS.len();
+    EMOTIVOICE_RECOMMENDED_SPEAKERS[index].0
 }
 
-fn default_voice_preset(sender_id: u64) -> &'static str {
-    VOICE_PRESETS[(sender_id as usize) % VOICE_PRESETS.len()]
+fn resolved_emotivoice_speaker(configured: Option<&str>, sender_id: u64) -> String {
+    configured
+        .map(str::trim)
+        .filter(|speaker| !speaker.is_empty() && speaker.chars().all(|ch| ch.is_ascii_digit()))
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_emotivoice_speaker(sender_id).to_owned())
 }
 
-fn resolved_voice_preset(configured: Option<&str>, sender_id: u64) -> &'static str {
+fn resolved_emotivoice_emotion(configured: Option<&str>) -> &'static str {
     configured
         .and_then(|configured| {
-            VOICE_PRESETS
+            EMOTIVOICE_EMOTIONS
                 .iter()
                 .copied()
-                .find(|preset| *preset == configured)
+                .find(|emotion| *emotion == configured.trim())
         })
-        .unwrap_or_else(|| default_voice_preset(sender_id))
+        .unwrap_or("普通")
 }
 
 fn speaker_voice_profile(sender_id: u64) -> (i32, i32) {
@@ -2775,7 +2821,8 @@ fn combined_onnx_speed(relative_rate: i32, master_speed: f32) -> f32 {
 fn default_speaker_voice_settings(sender_id: u64) -> SpeakerVoiceSettings {
     let (pitch, speech_rate) = speaker_voice_profile(sender_id);
     SpeakerVoiceSettings {
-        voice_name: Some(default_voice_preset(sender_id).to_owned()),
+        voice_name: Some(default_emotivoice_speaker(sender_id).to_owned()),
+        emotion: Some("普通".to_owned()),
         onnx_speaker_id: None,
         pitch,
         speech_rate,
@@ -2800,6 +2847,7 @@ fn replay_voice_signature(replay: &ReplayFile, global_volume: f32) -> u64 {
     for (sender_id, voice) in settings {
         sender_id.hash(&mut hasher);
         voice.voice_name.hash(&mut hasher);
+        voice.emotion.hash(&mut hasher);
         voice.onnx_speaker_id.hash(&mut hasher);
         voice.pitch.hash(&mut hasher);
         voice.speech_rate.hash(&mut hasher);
@@ -2825,19 +2873,19 @@ fn synthesize_speech_batch(
         for attempt in 0..3 {
             let wav = tts.synthesize(
                 &job.text,
-                &job.voice_preset,
-                job.pitch,
+                &job.speaker,
+                &job.emotion,
                 speed,
             )?;
             fs::write(&job.output_path, wav)
-                .map_err(|err| format!("无法保存 MeloTTS 角色语音：{err}"))?;
+                .map_err(|err| format!("无法保存 EmotiVoice 角色语音：{err}"))?;
             let samples = read_pcm16_mono_wav(Path::new(&job.output_path))?;
             if samples.len() as u64 <= max_samples {
                 break;
             }
             if attempt == 2 {
                 return Err(format!(
-                    "MeloTTS 无法在 {} 毫秒内完整读完台词",
+                    "EmotiVoice 无法在 {} 毫秒内完整读完台词",
                     job.duration_ms
                 ));
             }
@@ -4253,7 +4301,7 @@ mod tests {
     }
 
     #[test]
-    fn melotts_speed_auto_fits_long_lines() {
+    fn emotivoice_speed_auto_fits_long_lines() {
         assert_eq!(
             fitted_speech_rate(18, "短句", 4_875),
             18
@@ -4264,6 +4312,14 @@ mod tests {
         assert_eq!(default_master_speech_speed(), 1.30);
         assert!((combined_onnx_speed(18, 1.30) - 1.417).abs() < 0.001);
         assert!((combined_onnx_speed(18, 3.0) - 3.27).abs() < 0.001);
+        assert_eq!(
+            ffmpeg_atempo_filter(3.0),
+            "atempo=2.000000,atempo=1.500000"
+        );
+        assert_eq!(
+            ffmpeg_atempo_filter(0.1),
+            "atempo=0.500000,atempo=0.500000,atempo=0.500000,atempo=0.800000"
+        );
         assert_eq!(
             normalized_master_speech_speed(20.0),
             20.0
@@ -4343,14 +4399,18 @@ mod tests {
     }
 
     #[test]
-    fn speaker_voice_profiles_use_distinct_timbre_presets() {
+    fn speaker_voice_profiles_use_real_emotivoice_speakers() {
         let profiles = (0..8).map(speaker_voice_profile).collect::<Vec<_>>();
         assert!(profiles.iter().all(|(pitch, _)| *pitch == 0));
-        assert_eq!(default_voice_preset(0), "male_deep");
-        assert_eq!(default_voice_preset(1), "male_natural");
+        assert_eq!(default_emotivoice_speaker(0), "9000");
+        assert_eq!(default_emotivoice_speaker(1), "984");
         assert_ne!(
-            voice_preset_pitch("male_deep"),
-            voice_preset_pitch("female_natural")
+            default_emotivoice_speaker(0),
+            default_emotivoice_speaker(3)
+        );
+        assert_eq!(
+            resolved_emotivoice_emotion(None),
+            "普通"
         );
     }
 
@@ -4366,7 +4426,8 @@ mod tests {
         replay
             .speaker_voice_settings
             .insert(42, SpeakerVoiceSettings {
-                voice_name: Some("Test Voice".to_owned()),
+                voice_name: Some("9000".to_owned()),
+                emotion: Some("开心".to_owned()),
                 onnx_speaker_id: Some(17),
                 pitch: -25,
                 speech_rate: 12,
@@ -4378,7 +4439,11 @@ mod tests {
         let settings = &restored.speaker_voice_settings[&42];
         assert_eq!(
             settings.voice_name.as_deref(),
-            Some("Test Voice")
+            Some("9000")
+        );
+        assert_eq!(
+            settings.emotion.as_deref(),
+            Some("开心")
         );
         assert_eq!(settings.pitch, -25);
         assert_eq!(settings.onnx_speaker_id, Some(17));
@@ -4417,13 +4482,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the installed MeloTTS Chinese runtime"]
-    fn melotts_synthesizes_distinct_chinese_character_variants() {
+    #[ignore = "requires the installed EmotiVoice Chinese runtime"]
+    fn emotivoice_synthesizes_distinct_chinese_character_voices() {
         let mut tts = create_onnx_tts().unwrap();
         let chinese = "你好诶艾，我在维护跑团回放。";
-        let first = tts.synthesize(chinese, "male_deep", 0, 1.4).unwrap();
-        let second = tts.synthesize(chinese, "female_bright", 0, 1.4).unwrap();
-        let unrestricted_fast = tts.synthesize(chinese, "male_deep", 0, 3.0).unwrap();
+        let first = tts.synthesize(chinese, "9000", "普通", 1.4).unwrap();
+        let second = tts.synthesize(chinese, "92", "开心", 1.4).unwrap();
+        let unrestricted_fast = tts.synthesize(chinese, "9000", "普通", 3.0).unwrap();
         assert_eq!(&first[0..4], b"RIFF");
         assert!(first.len() > 44);
         assert!(unrestricted_fast.len() > 44);
@@ -4433,7 +4498,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    #[ignore = "requires the installed MeloTTS Chinese runtime"]
+    #[ignore = "requires the installed EmotiVoice Chinese runtime"]
     fn tts_assigns_distinct_speaker_profiles() {
         let directory = tempfile::tempdir().unwrap();
         let mut first_line = test_dialogue(0, 1_350, DialogueSide::Left);
