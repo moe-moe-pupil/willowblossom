@@ -111,7 +111,7 @@ const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const BACKGROUND_MUSIC_PATH: &str = "assets/audio/jrpg2-piano.mp3";
-const EMOTIVOICE_RUNTIME_DIR: &str = ".data/willowblossom/tts/emotivoice";
+const SPARK_TTS_RUNTIME_DIR: &str = ".data/willowblossom/tts/spark";
 const SHORT_UTTERANCE_MAX_UNITS: usize = 6;
 const SHORT_UTTERANCE_SPEED_CAP: f32 = 1.10;
 const SHORT_UTTERANCE_HEAD_PAD_MS: u64 = 80;
@@ -619,7 +619,7 @@ fn preview_replay_speech(
         if let Some(replay) = studio.replay.as_ref() {
             if let Err(err) = speech.prepare_onnx_replay(replay, studio.speech_volume) {
                 speech.onnx_failed = true;
-                eprintln!("failed to prepare EmotiVoice preview speech: {err}");
+                eprintln!("failed to prepare Spark-TTS preview speech: {err}");
             }
         }
     }
@@ -655,7 +655,7 @@ fn preview_replay_speech(
             },
             Err(err) => {
                 speech.onnx_failed = true;
-                eprintln!("failed to synthesize EmotiVoice preview speech: {err}");
+                eprintln!("failed to synthesize Spark-TTS preview speech: {err}");
             },
         }
     }
@@ -731,7 +731,7 @@ impl PreviewSpeechController {
                     ),
                     volume: (global_volume * settings.volume).max(0.0),
                 })
-                .map_err(|err| format!("EmotiVoice preview worker stopped: {err}"))?;
+                .map_err(|err| format!("Spark-TTS preview worker stopped: {err}"))?;
         }
         Ok(())
     }
@@ -745,14 +745,23 @@ fn onnx_tts_is_available() -> bool {
     emotivoice_python_path().is_file()
         && emotivoice_worker_path().is_file()
         && emotivoice_source_path().is_dir()
+        && emotivoice_model_path().is_dir()
+        && emotivoice_voice_bank_path().join("profiles.json").is_file()
+        && SPARK_TTS_VOICE_PROFILES
+            .iter()
+            .all(|(profile, _)| {
+                emotivoice_voice_bank_path()
+                    .join(format!("{profile}.wav"))
+                    .is_file()
+            })
 }
 
 fn emotivoice_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(EMOTIVOICE_RUNTIME_DIR)
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(SPARK_TTS_RUNTIME_DIR)
 }
 
 fn emotivoice_python_path() -> PathBuf {
-    let root = emotivoice_root().join(".venv313");
+    let root = emotivoice_root().join(".venv");
     if cfg!(windows) {
         root.join("Scripts").join("python.exe")
     } else {
@@ -760,15 +769,19 @@ fn emotivoice_python_path() -> PathBuf {
     }
 }
 
-fn emotivoice_source_path() -> PathBuf { emotivoice_root().join("EmotiVoice") }
+fn emotivoice_source_path() -> PathBuf { emotivoice_root().join("Spark-TTS") }
+
+fn emotivoice_model_path() -> PathBuf { emotivoice_root().join("Spark-TTS-0.5B") }
+
+fn emotivoice_voice_bank_path() -> PathBuf { emotivoice_root().join("voice-bank") }
 
 fn emotivoice_worker_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
-        .join("emotivoice_worker.py")
+        .join("sparktts_worker.py")
 }
 
-struct EmotiVoiceTts {
+struct SparkTts {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
@@ -776,38 +789,41 @@ struct EmotiVoiceTts {
     sequence: u64,
 }
 
-impl Drop for EmotiVoiceTts {
+impl Drop for SparkTts {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-fn create_onnx_tts() -> Result<EmotiVoiceTts, String> {
+fn create_onnx_tts() -> Result<SparkTts, String> {
     if !onnx_tts_is_available() {
         return Err(
-            "未安装 EmotiVoice 中文运行环境；请运行 scripts/setup_emotivoice.ps1".to_owned(),
+            "未安装 Spark-TTS 中文运行环境或 32 音色库；请运行 scripts/setup_sparktts.ps1"
+                .to_owned(),
         );
     }
     let cache_root = emotivoice_root().join("worker-cache");
     fs::create_dir_all(&cache_root)
-        .map_err(|err| format!("无法创建 EmotiVoice 缓存目录：{err}"))?;
+        .map_err(|err| format!("无法创建 Spark-TTS 缓存目录：{err}"))?;
     let cache = tempfile::Builder::new()
         .prefix("worker-")
         .tempdir_in(&cache_root)
-        .map_err(|err| format!("无法创建 EmotiVoice 临时目录：{err}"))?;
-    let log = fs::File::create(cache.path().join("emotivoice.log"))
-        .map_err(|err| format!("无法创建 EmotiVoice 日志：{err}"))?;
+        .map_err(|err| format!("无法创建 Spark-TTS 临时目录：{err}"))?;
+    let log = fs::File::create(cache.path().join("sparktts.log"))
+        .map_err(|err| format!("无法创建 Spark-TTS 日志：{err}"))?;
     let mut command = Command::new(emotivoice_python_path());
     command
         .arg(emotivoice_worker_path())
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env(
-            "EMOTIVOICE_SOURCE",
+            "SPARK_TTS_SOURCE",
             emotivoice_source_path(),
         )
-        .env("http_proxy", "http://127.0.0.1:10809")
-        .env("https_proxy", "http://127.0.0.1:10809")
+        .env("SPARK_TTS_MODEL", emotivoice_model_path())
+        .env("SPARK_TTS_VOICE_BANK", emotivoice_voice_bank_path())
+        .env("HF_HUB_OFFLINE", "1")
+        .env("TRANSFORMERS_OFFLINE", "1")
         .env("PYTHONUTF8", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -815,25 +831,25 @@ fn create_onnx_tts() -> Result<EmotiVoiceTts, String> {
     hide_command_window(&mut command);
     let mut child = command
         .spawn()
-        .map_err(|err| format!("无法启动 EmotiVoice 中文进程：{err}"))?;
+        .map_err(|err| format!("无法启动 Spark-TTS 中文进程：{err}"))?;
     let input = child
         .stdin
         .take()
-        .ok_or_else(|| "EmotiVoice 没有打开输入流".to_owned())?;
+        .ok_or_else(|| "Spark-TTS 没有打开输入流".to_owned())?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "EmotiVoice 没有打开输出流".to_owned())?;
+        .ok_or_else(|| "Spark-TTS 没有打开输出流".to_owned())?;
     let mut output = BufReader::new(stdout);
     let mut line = String::new();
     loop {
         line.clear();
         if output
             .read_line(&mut line)
-            .map_err(|err| format!("读取 EmotiVoice 启动状态失败：{err}"))?
+            .map_err(|err| format!("读取 Spark-TTS 启动状态失败：{err}"))?
             == 0
         {
-            return Err("EmotiVoice 在模型加载完成前退出，请查看 worker-cache 中的日志".to_owned());
+            return Err("Spark-TTS 在模型加载完成前退出，请查看 worker-cache 中的日志".to_owned());
         }
         let Ok(status) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
@@ -844,11 +860,11 @@ fn create_onnx_tts() -> Result<EmotiVoiceTts, String> {
         if status.get("ready").and_then(|value| value.as_bool()) == Some(false) {
             return Err(status["error"]
                 .as_str()
-                .unwrap_or("EmotiVoice 中文模型加载失败")
+                .unwrap_or("Spark-TTS 中文模型加载失败")
                 .to_owned());
         }
     }
-    Ok(EmotiVoiceTts {
+    Ok(SparkTts {
         child,
         input,
         output,
@@ -857,7 +873,7 @@ fn create_onnx_tts() -> Result<EmotiVoiceTts, String> {
     })
 }
 
-impl EmotiVoiceTts {
+impl SparkTts {
     fn synthesize(
         &mut self,
         text: &str,
@@ -888,17 +904,17 @@ impl EmotiVoiceTts {
         serde_json::to_writer(&mut self.input, &request)
             .and_then(|_| self.input.write_all(b"\n").map_err(serde_json::Error::io))
             .and_then(|_| self.input.flush().map_err(serde_json::Error::io))
-            .map_err(|err| format!("发送 EmotiVoice 台词失败：{err}"))?;
+            .map_err(|err| format!("发送 Spark-TTS 台词失败：{err}"))?;
         let mut response = String::new();
         self.output
             .read_line(&mut response)
-            .map_err(|err| format!("读取 EmotiVoice 结果失败：{err}"))?;
+            .map_err(|err| format!("读取 Spark-TTS 结果失败：{err}"))?;
         let response: serde_json::Value = serde_json::from_str(&response)
-            .map_err(|err| format!("EmotiVoice 返回了无效结果：{err}"))?;
+            .map_err(|err| format!("Spark-TTS 返回了无效结果：{err}"))?;
         if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
             return Err(response["error"]
                 .as_str()
-                .unwrap_or("EmotiVoice 中文合成失败")
+                .unwrap_or("Spark-TTS 中文合成失败")
                 .to_owned());
         }
         let mut command = Command::new("ffmpeg");
@@ -920,13 +936,13 @@ impl EmotiVoiceTts {
         hide_command_window(&mut command);
         let output = command
             .output()
-            .map_err(|err| format!("无法转换 EmotiVoice 角色语音：{err}"))?;
+            .map_err(|err| format!("无法转换 Spark-TTS 角色语音：{err}"))?;
         let _ = fs::remove_file(&raw_path);
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
         }
         let wav =
-            fs::read(&output_path).map_err(|err| format!("无法读取 EmotiVoice WAV：{err}"))?;
+            fs::read(&output_path).map_err(|err| format!("无法读取 Spark-TTS WAV：{err}"))?;
         let _ = fs::remove_file(&output_path);
         Ok(wav)
     }
@@ -1032,7 +1048,7 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
     let latest_signature = Arc::new(AtomicU64::new(0));
     let worker_signature = Arc::clone(&latest_signature);
     thread::Builder::new()
-        .name("replay-emotivoice-preview".to_owned())
+        .name("replay-sparktts-preview".to_owned())
         .spawn(move || {
             let mut tts = create_onnx_tts();
             while let Ok(request) = request_rx.recv() {
@@ -1063,7 +1079,7 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                 }
             }
         })
-        .map_err(|err| format!("无法启动 EmotiVoice 预览线程：{err}"))?;
+        .map_err(|err| format!("无法启动 Spark-TTS 预览线程：{err}"))?;
     Ok(OnnxPreviewWorker {
         requests: request_tx,
         results: result_rx,
@@ -1521,7 +1537,7 @@ fn replay_controls(
 
     ui.separator();
     ui.heading("DeepSeek 视频导演");
-    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内且场景中有立牌的玩家台词，并为每句选择镜头。回合内会从最早发言者开始，再按立牌距离依次访问最近玩家；镜头从台词第一刻起持续对准说话者。它还会生成只供 EmotiVoice 使用的中文谐音读法，画面字幕仍显示正常原文。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
+    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内且场景中有立牌的玩家台词，并为每句选择镜头。回合内会从最早发言者开始，再按立牌距离依次访问最近玩家；镜头从台词第一刻起持续对准说话者。它还会生成只供 Spark-TTS 使用的中文谐音读法，画面字幕仍显示正常原文。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
     ui.checkbox(
         &mut studio.deepseek_director_enabled,
         "允许 DeepSeek 润色台词并控制镜头",
@@ -1664,7 +1680,7 @@ fn replay_controls(
     ui.horizontal(|ui| {
         ui.checkbox(
             &mut studio.speech_enabled,
-            "角色语音（预览与导出，EmotiVoice 中文离线语音）",
+            "角色语音（预览与导出，Spark-TTS 中文离线语音）",
         );
         ui.add_enabled(
             studio.speech_enabled,
@@ -1714,7 +1730,7 @@ fn replay_controls(
             studio.speech_settings_open = true;
         }
     });
-    ui.small("整体语速默认 1.30×；长台词不会自动加速，而会自动延长字幕和镜头时间，确保角色保持固定语速。六个字以内的极短台词会自动使用较自然的短句语速和首尾保护，避免吞字，不改变角色音色或音调。整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。预览与导出共用同一条时间线和 EmotiVoice 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
+    ui.small("整体语速默认 1.30×；长台词不会自动加速，而会自动延长字幕和镜头时间，确保角色保持固定语速。六个字以内的极短台词会自动使用较自然的短句语速和首尾保护，避免吞字，不改变角色音色或音调。整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。预览与导出共用同一条时间线和 Spark-TTS 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -1877,7 +1893,7 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         .max_width(620.0)
         .show(ctx, |ui| {
             ui.label(format!(
-                "EmotiVoice 已加载 {} 个真实训练音色。可从推荐男声/女声或全部已安装音色中选择，也可直接输入音色 ID。设置同时用于播放预览和 MP4 导出。",
+                "Spark-TTS 已加载 {} 个稳定中文角色音色（16 个男声、16 个女声）。每个角色的固定参考音色同时用于播放预览和 MP4 导出，不会因台词长短而改变。",
                 installed_speakers.len()
             ));
             if installed_speakers.is_empty() {
@@ -1919,33 +1935,28 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                             .selected_text(emotivoice_speaker_label(&selected_speaker))
                             .height(360.0)
                             .show_ui(ui, |ui| {
-                                ui.strong("推荐音色");
-                                for (speaker, label) in EMOTIVOICE_RECOMMENDED_SPEAKERS {
+                                ui.strong("男声");
+                                for (speaker, label) in SPARK_TTS_VOICE_PROFILES {
+                                    if !speaker.starts_with("spark-m") {
+                                        continue;
+                                    }
                                     ui.selectable_value(
                                         &mut selected_speaker,
                                         speaker.to_owned(),
                                         label,
                                     );
                                 }
-                                if !installed_speakers.is_empty() {
-                                    ui.separator();
-                                    ui.strong(format!(
-                                        "全部已安装音色（{}）",
-                                        installed_speakers.len()
-                                    ));
-                                    for speaker in installed_speakers {
-                                        if EMOTIVOICE_RECOMMENDED_SPEAKERS
-                                            .iter()
-                                            .any(|(recommended, _)| recommended == speaker)
-                                        {
+                                ui.separator();
+                                ui.strong("女声");
+                                for (speaker, label) in SPARK_TTS_VOICE_PROFILES {
+                                    if !speaker.starts_with("spark-f") {
                                             continue;
-                                        }
-                                        ui.selectable_value(
-                                            &mut selected_speaker,
-                                            speaker.clone(),
-                                            format!("音色 {speaker}"),
-                                        );
                                     }
+                                    ui.selectable_value(
+                                        &mut selected_speaker,
+                                        speaker.to_owned(),
+                                        label,
+                                    );
                                 }
                             });
                         if ui
@@ -1953,7 +1964,7 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                                 !installed_speakers.is_empty(),
                                 egui::Button::new("随机音色"),
                             )
-                            .on_hover_text("从全部已安装的 EmotiVoice 音色中随机选择")
+                            .on_hover_text("从 32 个稳定中文角色音色中随机选择")
                             .clicked()
                         {
                             if let Some(random_speaker) = random_emotivoice_speaker(
@@ -1965,29 +1976,6 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                         }
                         if selected_speaker != current_speaker {
                             settings.voice_name = Some(selected_speaker);
-                            settings_changed = true;
-                        }
-                        let voice_name = settings
-                            .voice_name
-                            .get_or_insert_with(|| default_emotivoice_speaker(*sender_id).to_owned());
-                        settings_changed |= ui
-                            .add(egui::TextEdit::singleline(voice_name).hint_text("音色 ID，如 9000"))
-                            .changed();
-                        let mut emotion =
-                            resolved_emotivoice_emotion(settings.emotion.as_deref()).to_owned();
-                        egui::ComboBox::from_id_salt(("replay-emotivoice-emotion", sender_id))
-                            .selected_text(format!("情绪：{emotion}"))
-                            .show_ui(ui, |ui| {
-                                for choice in EMOTIVOICE_EMOTIONS {
-                                    ui.selectable_value(
-                                        &mut emotion,
-                                        choice.to_owned(),
-                                        choice,
-                                    );
-                                }
-                            });
-                        if settings.emotion.as_deref() != Some(emotion.as_str()) {
-                            settings.emotion = Some(emotion);
                             settings_changed = true;
                         }
                         settings_changed |= ui
@@ -2620,7 +2608,8 @@ fn check_ffmpeg() -> Result<(), String> {
 
 fn check_speech_synthesizer() -> Result<(), String> {
     onnx_tts_is_available().then_some(()).ok_or_else(|| {
-        "未安装 EmotiVoice 中文运行环境；请运行 scripts/setup_emotivoice.ps1".to_owned()
+        "未安装 Spark-TTS 中文运行环境或 32 音色库；请运行 scripts/setup_sparktts.ps1"
+            .to_owned()
     })
 }
 
@@ -2913,43 +2902,55 @@ fn write_narration_track(
         .map_err(|err| format!("完成角色语音轨道失败：{err}"))
 }
 
-const EMOTIVOICE_RECOMMENDED_SPEAKERS: [(&str, &str); 9] = [
-    ("9000", "男声 9000（推荐）"),
-    ("984", "男声 984"),
-    ("985", "男声 985"),
-    ("65", "女声 65（推荐）"),
-    ("92", "女声 92"),
-    ("102", "女声 102"),
-    ("225", "女声 225"),
-    ("1088", "女声 1088"),
-    ("1093", "女声 1093"),
+const SPARK_TTS_VOICE_PROFILES: [(&str, &str); 32] = [
+    ("spark-m01", "男声 01 · 深沉"),
+    ("spark-m02", "男声 02 · 厚重"),
+    ("spark-m03", "男声 03 · 沉稳"),
+    ("spark-m04", "男声 04 · 冷静"),
+    ("spark-m05", "男声 05 · 温和"),
+    ("spark-m06", "男声 06 · 硬朗"),
+    ("spark-m07", "男声 07 · 可靠"),
+    ("spark-m08", "男声 08 · 清朗"),
+    ("spark-m09", "男声 09 · 青年"),
+    ("spark-m10", "男声 10 · 成熟"),
+    ("spark-m11", "男声 11 · 克制"),
+    ("spark-m12", "男声 12 · 机敏"),
+    ("spark-m13", "男声 13 · 悠然"),
+    ("spark-m14", "男声 14 · 严肃"),
+    ("spark-m15", "男声 15 · 亲切"),
+    ("spark-m16", "男声 16 · 明快"),
+    ("spark-f01", "女声 01 · 温柔"),
+    ("spark-f02", "女声 02 · 沉静"),
+    ("spark-f03", "女声 03 · 从容"),
+    ("spark-f04", "女声 04 · 知性"),
+    ("spark-f05", "女声 05 · 可靠"),
+    ("spark-f06", "女声 06 · 清澈"),
+    ("spark-f07", "女声 07 · 成熟"),
+    ("spark-f08", "女声 08 · 克制"),
+    ("spark-f09", "女声 09 · 活泼"),
+    ("spark-f10", "女声 10 · 明快"),
+    ("spark-f11", "女声 11 · 灵动"),
+    ("spark-f12", "女声 12 · 亲切"),
+    ("spark-f13", "女声 13 · 坚定"),
+    ("spark-f14", "女声 14 · 轻盈"),
+    ("spark-f15", "女声 15 · 稚气"),
+    ("spark-f16", "女声 16 · 元气"),
 ];
 
 const EMOTIVOICE_EMOTIONS: [&str; 7] = ["普通", "开心", "悲伤", "生气", "惊讶", "厌恶", "恐惧"];
-
-fn parse_emotivoice_speaker_ids(contents: &str) -> Vec<String> {
-    let mut speakers = contents
-        .lines()
-        .filter_map(|line| {
-            let speaker = line.trim();
-            (!speaker.is_empty() && speaker.chars().all(|character| character.is_ascii_digit()))
-                .then(|| speaker.to_owned())
-        })
-        .collect::<Vec<_>>();
-    speakers.sort_by_key(|speaker| speaker.parse::<u64>().unwrap_or(u64::MAX));
-    speakers.dedup();
-    speakers
-}
 
 fn installed_emotivoice_speakers() -> &'static [String] {
     static INSTALLED_SPEAKERS: OnceLock<Vec<String>> = OnceLock::new();
     INSTALLED_SPEAKERS
         .get_or_init(|| {
-            let path = Path::new(EMOTIVOICE_RUNTIME_DIR)
-                .join("EmotiVoice/data/youdao/text/speaker2");
-            fs::read_to_string(path)
-                .map(|contents| parse_emotivoice_speaker_ids(&contents))
-                .unwrap_or_default()
+            if emotivoice_voice_bank_path().join("profiles.json").is_file() {
+                SPARK_TTS_VOICE_PROFILES
+                    .iter()
+                    .map(|(id, _)| (*id).to_owned())
+                    .collect()
+            } else {
+                Vec::new()
+            }
         })
         .as_slice()
 }
@@ -2971,21 +2972,25 @@ fn random_emotivoice_speaker(speakers: &[String], current: &str) -> Option<Strin
 }
 
 fn emotivoice_speaker_label(speaker: &str) -> String {
-    EMOTIVOICE_RECOMMENDED_SPEAKERS
+    SPARK_TTS_VOICE_PROFILES
         .iter()
         .find_map(|(id, label)| (*id == speaker).then_some((*label).to_owned()))
         .unwrap_or_else(|| format!("音色 {speaker}"))
 }
 
 fn default_emotivoice_speaker(sender_id: u64) -> &'static str {
-    let index = (sender_id as usize) % EMOTIVOICE_RECOMMENDED_SPEAKERS.len();
-    EMOTIVOICE_RECOMMENDED_SPEAKERS[index].0
+    let index = (sender_id as usize) % SPARK_TTS_VOICE_PROFILES.len();
+    SPARK_TTS_VOICE_PROFILES[index].0
 }
 
 fn resolved_emotivoice_speaker(configured: Option<&str>, sender_id: u64) -> String {
     configured
         .map(str::trim)
-        .filter(|speaker| !speaker.is_empty() && speaker.chars().all(|ch| ch.is_ascii_digit()))
+        .filter(|speaker| {
+            SPARK_TTS_VOICE_PROFILES
+                .iter()
+                .any(|(profile, _)| profile == speaker)
+        })
         .map(str::to_owned)
         .unwrap_or_else(|| default_emotivoice_speaker(sender_id).to_owned())
 }
@@ -3208,11 +3213,11 @@ fn synthesize_speech_batch(
             job.onnx_speed,
         )?;
         fs::write(&job.output_path, wav)
-            .map_err(|err| format!("无法保存 EmotiVoice 角色语音：{err}"))?;
+            .map_err(|err| format!("无法保存 Spark-TTS 角色语音：{err}"))?;
         let samples = read_pcm16_mono_wav(Path::new(&job.output_path))?;
         if samples.len() as u64 > max_samples {
             return Err(format!(
-                "EmotiVoice 生成的语音超过 {} 毫秒；请提高整体语速或延长整体台词停留",
+                "Spark-TTS 生成的语音超过 {} 毫秒；请提高整体语速或延长整体台词停留",
                 job.duration_ms
             ));
         }
@@ -4907,11 +4912,12 @@ mod tests {
     }
 
     #[test]
-    fn speaker_voice_profiles_use_real_emotivoice_speakers() {
+    fn speaker_voice_profiles_use_stable_spark_tts_profiles() {
         let profiles = (0..8).map(speaker_voice_profile).collect::<Vec<_>>();
         assert!(profiles.iter().all(|(pitch, _)| *pitch == 0));
-        assert_eq!(default_emotivoice_speaker(0), "9000");
-        assert_eq!(default_emotivoice_speaker(1), "984");
+        assert_eq!(SPARK_TTS_VOICE_PROFILES.len(), 32);
+        assert_eq!(default_emotivoice_speaker(0), "spark-m01");
+        assert_eq!(default_emotivoice_speaker(1), "spark-m02");
         assert_ne!(
             default_emotivoice_speaker(0),
             default_emotivoice_speaker(3)
@@ -4921,14 +4927,17 @@ mod tests {
             "普通"
         );
         assert_eq!(
-            parse_emotivoice_speaker_ids("9000\n92\ninvalid\n 65 \n92\n"),
-            vec!["65", "92", "9000"]
+            random_emotivoice_speaker(
+                &["spark-m01".to_owned(), "spark-f01".to_owned()],
+                "spark-m01"
+            ),
+            Some("spark-f01".to_owned())
         );
+        assert_eq!(random_emotivoice_speaker(&[], "spark-m01"), None);
         assert_eq!(
-            random_emotivoice_speaker(&["65".to_owned(), "92".to_owned()], "65"),
-            Some("92".to_owned())
+            resolved_emotivoice_speaker(Some("9000"), 0),
+            "spark-m01"
         );
-        assert_eq!(random_emotivoice_speaker(&[], "65"), None);
     }
 
     #[test]
@@ -4943,7 +4952,7 @@ mod tests {
         replay
             .speaker_voice_settings
             .insert(42, SpeakerVoiceSettings {
-                voice_name: Some("9000".to_owned()),
+                voice_name: Some("spark-m01".to_owned()),
                 emotion: Some("开心".to_owned()),
                 onnx_speaker_id: Some(17),
                 pitch: -25,
@@ -4956,7 +4965,7 @@ mod tests {
         let settings = &restored.speaker_voice_settings[&42];
         assert_eq!(
             settings.voice_name.as_deref(),
-            Some("9000")
+            Some("spark-m01")
         );
         assert_eq!(
             settings.emotion.as_deref(),
@@ -4999,13 +5008,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the installed EmotiVoice Chinese runtime"]
-    fn emotivoice_synthesizes_distinct_chinese_character_voices() {
+    #[ignore = "requires the installed Spark-TTS Chinese runtime"]
+    fn spark_tts_synthesizes_distinct_chinese_character_voices() {
         let mut tts = create_onnx_tts().unwrap();
         let chinese = "你好诶艾，我在维护跑团回放。";
-        let first = tts.synthesize(chinese, "9000", "普通", 1.4).unwrap();
-        let second = tts.synthesize(chinese, "92", "开心", 1.4).unwrap();
-        let unrestricted_fast = tts.synthesize(chinese, "9000", "普通", 3.0).unwrap();
+        let first = tts.synthesize(chinese, "spark-m01", "普通", 1.4).unwrap();
+        let second = tts.synthesize(chinese, "spark-f01", "开心", 1.4).unwrap();
+        let unrestricted_fast = tts
+            .synthesize(chinese, "spark-m01", "普通", 3.0)
+            .unwrap();
         assert_eq!(&first[0..4], b"RIFF");
         assert!(first.len() > 44);
         assert!(unrestricted_fast.len() > 44);
@@ -5015,7 +5026,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    #[ignore = "requires the installed EmotiVoice Chinese runtime"]
+    #[ignore = "requires the installed Spark-TTS Chinese runtime"]
     fn tts_assigns_distinct_speaker_profiles() {
         let directory = tempfile::tempdir().unwrap();
         let mut first_line = test_dialogue(0, 1_350, DialogueSide::Left);
