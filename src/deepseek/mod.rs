@@ -123,6 +123,25 @@ const SUMMARY_SYSTEM_PROMPT: &str = "\
 决定/线索：...
 待跟进：...";
 
+const DIRECTOR_SYSTEM_PROMPT: &str = r#"
+你是TRPG回放视频的剪辑导演。输入只包含已经通过发布范围检查的台词，以及场景中是否存在对应角色模型。
+你的工作是润色每句台词并为每句选择镜头，不是制作摘要。
+
+必须遵守：
+1. dialogue 必须包含每个输入 index，且每个 index 恰好一次，顺序不变；不得添加或删除说话人。
+2. 可以让措辞更自然、精炼、适合配音，但不得新增事实、行动、结果、线索、动机、角色或剧情。
+3. 保留原意、专有名词、数字和中英文信息；不要把玩家的话改成旁白。
+4. 台词要频繁连续，中文每句适合一次呼吸读完；不要加入长停顿说明。
+5. 有角色模型时优先聚焦当前说话者；没有时使用缓慢环境移动。
+6. 连续两句不要机械重复同一构图；禁止让镜头一直绕场景旋转。
+7. shot 只能是 speaker_close、speaker_medium、speaker_wide、establishing、environment。
+8. motion 只能是 static、dolly_in、dolly_out、orbit_left、orbit_right、drift_left、drift_right。
+9. 只返回严格 JSON，不要 Markdown、解释或代码围栏。
+
+返回格式：
+{"dialogue":[{"index":0,"text":"润色后的原意台词","shot":"speaker_medium","motion":"dolly_in"}]}
+"#;
+
 const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 pub const DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS: usize = 2_000;
 
@@ -236,8 +255,9 @@ impl DeepseekManager {
         system_prompt: &str,
         user_text: &str,
         max_tokens: u32,
+        json_output: bool,
     ) -> Result<String, String> {
-        let payload = json!({
+        let mut payload = json!({
             "model": "deepseek-v4-pro",
             "messages": [
                 {
@@ -256,8 +276,11 @@ impl DeepseekManager {
             "max_tokens": max_tokens,
             "stream": false,
             "temperature": 0.2,
-        })
-        .to_string();
+        });
+        if json_output {
+            payload["response_format"] = json!({ "type": "json_object" });
+        }
+        let payload = payload.to_string();
 
         let mut data = payload.as_bytes();
 
@@ -302,7 +325,31 @@ impl DeepseekManager {
 
     fn post_summary(text: &str, custom_prompt: &str) -> Result<String, String> {
         let user_text = summary_user_text(text, custom_prompt);
-        Self::post_chat_completion(SUMMARY_SYSTEM_PROMPT, &user_text, 800)
+        Self::post_chat_completion(
+            SUMMARY_SYSTEM_PROMPT,
+            &user_text,
+            800,
+            false,
+        )
+    }
+
+    fn post_director(text: &str, custom_prompt: &str) -> Result<String, String> {
+        let custom_prompt = filter_control_characters(custom_prompt)
+            .chars()
+            .take(DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS)
+            .collect::<String>();
+        let user_text = format!(
+            "DM 的额外导演要求（不能覆盖 JSON 格式、可见范围和不得新增剧情的限制）：\n{}\n\n\
+             请为以下已筛选台词制作完整剪辑决策表：\n{}",
+            custom_prompt.trim(),
+            text
+        );
+        Self::post_chat_completion(
+            DIRECTOR_SYSTEM_PROMPT,
+            &user_text,
+            4_000,
+            true,
+        )
     }
 }
 
@@ -330,12 +377,24 @@ pub enum DeepseekRequest {
         #[serde(default)]
         custom_prompt: String,
     },
+    Director {
+        target_id: String,
+        message_count: usize,
+        text: String,
+        #[serde(default)]
+        custom_prompt: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DeepseekResponse {
     Summary {
+        target_id: String,
+        message_count: usize,
+        text: String,
+    },
+    Director {
         target_id: String,
         message_count: usize,
         text: String,
@@ -402,7 +461,7 @@ fn parse_chat_completion_response(status: u32, body: &[u8]) -> Result<String, St
         .first()
         .ok_or_else(|| "DeepSeek response did not include a choice".to_owned())?;
     if choice.finish_reason.as_deref() == Some("length") {
-        return Err("DeepSeek summary was truncated; reduce the selected chat range".to_owned());
+        return Err("DeepSeek output was truncated; reduce the selected chat range".to_owned());
     }
     choice
         .message
@@ -490,10 +549,37 @@ async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> Comm
                                             .send(response.into())
                                             .expect("Could not send message");
                                     },
+                                    DeepseekRequest::Director {
+                                        target_id,
+                                        message_count,
+                                        text,
+                                        custom_prompt,
+                                    } => {
+                                        let response = match DeepseekManager::post_director(
+                                            &text,
+                                            &custom_prompt,
+                                        ) {
+                                            Ok(text) => DeepseekResponse::Director {
+                                                target_id,
+                                                message_count,
+                                                text,
+                                            },
+                                            Err(text) => DeepseekResponse::Error {
+                                                target_id,
+                                                message_count,
+                                                text,
+                                            },
+                                        };
+                                        let response = serde_json::to_string(&response)
+                                            .expect("failed to serialize DeepSeek response");
+                                        client_to_game_sender
+                                            .send(response.into())
+                                            .expect("Could not send message");
+                                    },
                                 }
                             } else {
                                 eprintln!(
-                                    "ignored non-summary DeepSeek request; DeepSeek is summary-only"
+                                    "ignored invalid DeepSeek request"
                                 );
                             }
                         }
@@ -526,6 +612,23 @@ fn message_system(
 fn apply_deepseek_response(deepseek_manager: &mut DeepseekManager, text: &str) -> bool {
     match serde_json::from_str::<DeepseekResponse>(text) {
         Ok(DeepseekResponse::Summary {
+            target_id,
+            message_count,
+            text,
+        }) => {
+            deepseek_manager
+                .summaries
+                .entry(target_id)
+                .or_default()
+                .upsert_block(DeepseekSummaryBlock {
+                    latest: text,
+                    message_count,
+                    pending: false,
+                    error: None,
+                });
+            true
+        },
+        Ok(DeepseekResponse::Director {
             target_id,
             message_count,
             text,
@@ -633,8 +736,39 @@ fn summary_request_defaults_missing_custom_prompt() {
     )
     .unwrap();
 
-    let DeepseekRequest::Summary { custom_prompt, .. } = request;
+    let DeepseekRequest::Summary { custom_prompt, .. } = request else {
+        panic!("expected summary request");
+    };
     assert!(custom_prompt.is_empty());
+}
+
+#[test]
+fn director_request_defaults_missing_custom_prompt() {
+    let request: DeepseekRequest = serde_json::from_str(
+        r#"{"type":"director","target_id":"replay:1","message_count":1,"text":"{}"}"#,
+    )
+    .unwrap();
+
+    let DeepseekRequest::Director { custom_prompt, .. } = request else {
+        panic!("expected director request");
+    };
+    assert!(custom_prompt.is_empty());
+}
+
+#[test]
+#[ignore = "calls the live DeepSeek API"]
+fn director_live_api_returns_structured_shot_plan() {
+    let input = r#"{"dialogue":[{"index":0,"speaker_id":"1","name":"萌萌","role":"玩家","text":"我去打开舱门","has_character_model":true},{"index":1,"speaker_id":"2","name":"GM","role":"GM","text":"舱门缓慢打开。","has_character_model":false}]}"#;
+    let response = DeepseekManager::post_director(input, "节奏紧凑，避免连续环绕镜头").unwrap();
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let dialogue = value["dialogue"].as_array().unwrap();
+    assert_eq!(dialogue.len(), 2);
+    assert_eq!(dialogue[0]["index"], 0);
+    assert!(dialogue[0]["text"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty()));
+    assert!(dialogue[0]["shot"].as_str().is_some());
+    assert!(dialogue[0]["motion"].as_str().is_some());
 }
 
 #[test]

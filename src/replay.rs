@@ -200,6 +200,8 @@ struct ReplayFile {
     scene: ReplayScene,
     camera: Vec<ReplayCameraKeyframe>,
     dialogue: Vec<ReplayDialogue>,
+    #[serde(default = "default_master_speech_speed")]
+    master_speech_speed: f32,
     #[serde(default)]
     speaker_voice_settings: HashMap<u64, SpeakerVoiceSettings>,
 }
@@ -236,6 +238,41 @@ struct ReplayDialogue {
     visibility: Visibility,
     #[serde(default)]
     side: DialogueSide,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DirectorPlan {
+    dialogue: Vec<DirectorCue>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DirectorCue {
+    index: usize,
+    text: String,
+    shot: DirectorShot,
+    motion: DirectorMotion,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DirectorShot {
+    SpeakerClose,
+    SpeakerMedium,
+    SpeakerWide,
+    Establishing,
+    Environment,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DirectorMotion {
+    Static,
+    DollyIn,
+    DollyOut,
+    OrbitLeft,
+    OrbitRight,
+    DriftLeft,
+    DriftRight,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +314,11 @@ struct ReplayStudio {
     record_elapsed_ms: u64,
     playback_ms: u64,
     playback_speed: f32,
+    record_camera_enabled: bool,
+    deepseek_director_enabled: bool,
+    director_response_hash: Option<u64>,
+    director_request_pending: bool,
+    auto_export_after_director: bool,
     camera_sample_accumulator: f32,
     message_counts: HashMap<String, usize>,
     pre_playback_scene: Option<ReplayScene>,
@@ -308,6 +350,7 @@ struct VideoRenderJob {
     music_volume: f32,
     speech_enabled: bool,
     speech_volume: f32,
+    master_speech_speed: f32,
     speaker_voice_settings: HashMap<u64, SpeakerVoiceSettings>,
     dialogue: Vec<ReplayDialogue>,
     total_frames: u64,
@@ -315,6 +358,8 @@ struct VideoRenderJob {
     capture_pending: bool,
     pending_seconds: f32,
     warmup_frames: u8,
+    monitor_music_started: bool,
+    monitor_music_entity: Option<Entity>,
     failure: Option<String>,
     original_window_title: String,
     original_window_resizable: bool,
@@ -389,6 +434,11 @@ impl Default for ReplayStudio {
             record_elapsed_ms: 0,
             playback_ms: 0,
             playback_speed: 1.0,
+            record_camera_enabled: false,
+            deepseek_director_enabled: false,
+            director_response_hash: None,
+            director_request_pending: false,
+            auto_export_after_director: false,
             camera_sample_accumulator: 0.0,
             message_counts: HashMap::new(),
             pre_playback_scene: None,
@@ -426,9 +476,11 @@ fn record_replay(
     studio.record_elapsed_ms = studio
         .record_elapsed_ms
         .saturating_add((delta_seconds * 1_000.0).round() as u64);
-    studio.camera_sample_accumulator += delta_seconds;
+    if studio.record_camera_enabled {
+        studio.camera_sample_accumulator += delta_seconds;
+    }
 
-    if studio.camera_sample_accumulator >= CAMERA_SAMPLE_SECONDS {
+    if studio.record_camera_enabled && studio.camera_sample_accumulator >= CAMERA_SAMPLE_SECONDS {
         studio.camera_sample_accumulator %= CAMERA_SAMPLE_SECONDS;
         let record_elapsed_ms = studio.record_elapsed_ms;
         if let (Ok(transform), Some(replay)) = (camera.single(), studio.replay.as_mut()) {
@@ -532,7 +584,8 @@ fn preview_replay_speech(
             }
         }
     }
-    let active = (studio.mode == ReplayMode::Playing && studio.speech_enabled)
+    let active = ((studio.mode == ReplayMode::Playing || studio.video_render.is_some())
+        && studio.speech_enabled)
         .then(|| {
             studio.replay.as_ref().and_then(|replay| {
                 active_dialogue_index(&replay.dialogue, studio.playback_ms).map(|index| {
@@ -599,7 +652,17 @@ fn preview_replay_speech(
                 .id(),
         );
     } else if speech.onnx_failed || !onnx_tts_is_available() {
-        if let Err(err) = speech.speak_windows(line, studio.speech_volume, &settings) {
+        let master_speed = studio
+            .replay
+            .as_ref()
+            .map(|replay| replay.master_speech_speed)
+            .unwrap_or_else(default_master_speech_speed);
+        if let Err(err) = speech.speak_windows(
+            line,
+            studio.speech_volume,
+            master_speed,
+            &settings,
+        ) {
             eprintln!("failed to play replay preview speech: {err}");
         }
     }
@@ -646,7 +709,7 @@ impl PreviewSpeechController {
                     cue: (replay.created_at_unix_ms, index),
                     text: line.text.clone(),
                     speaker_id: onnx_speaker_id(&settings, line.sender_id),
-                    speed: onnx_speed(rate),
+                    speed: combined_onnx_speed(rate, replay.master_speech_speed),
                     volume: (global_volume * settings.volume).clamp(0.0, 1.0),
                 })
                 .map_err(|err| format!("ONNX preview worker stopped: {err}"))?;
@@ -662,6 +725,7 @@ impl PreviewSpeechController {
         &mut self,
         line: &ReplayDialogue,
         global_volume: f32,
+        master_speed: f32,
         settings: &SpeakerVoiceSettings,
     ) -> Result<(), String> {
         self.send(PreviewSpeechRequest::Speak {
@@ -670,11 +734,14 @@ impl PreviewSpeechController {
             voice_name: settings.voice_name.as_deref(),
             voice_slot: line.sender_id,
             pitch: settings.pitch,
-            speech_rate: ssml_rate_percent(fitted_speech_rate(
-                settings.speech_rate,
-                &line.text,
-                line.duration_ms,
-            )),
+            speech_rate: combined_ssml_rate(
+                fitted_speech_rate(
+                    settings.speech_rate,
+                    &line.text,
+                    line.duration_ms,
+                ),
+                master_speed,
+            ),
             volume: (global_volume * settings.volume)
                 .clamp(0.0, 1.0)
                 .mul_add(100.0, 0.0)
@@ -931,6 +998,7 @@ fn render_video_frames(
     mut commands: Commands,
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
+    mut audio_sources: ResMut<Assets<AudioSource>>,
     mut studio: ResMut<ReplayStudio>,
     mut capture_active: ResMut<ReplayVideoCaptureActive>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
@@ -952,6 +1020,9 @@ fn render_video_frames(
     }
 
     if let Some(error) = job.failure.clone() {
+        if let Some(entity) = job.monitor_music_entity.take() {
+            commands.entity(entity).try_despawn();
+        }
         finish_video_capture(
             &mut studio,
             &mut capture_active,
@@ -968,7 +1039,39 @@ fn render_video_frames(
         job.warmup_frames -= 1;
         return;
     }
+    if !job.monitor_music_started {
+        job.monitor_music_started = true;
+        if job.music_enabled {
+            let monitor_path = job.frames.path().join("render-monitor-music.wav");
+            match write_relaxing_soundtrack(
+                &monitor_path,
+                job.duration_ms,
+                job.music_volume,
+            )
+            .and_then(|_| {
+                fs::read(&monitor_path).map_err(|err| format!("无法读取渲染监听音乐：{err}"))
+            }) {
+                Ok(wav) => {
+                    let source = audio_sources.add(AudioSource {
+                        bytes: Arc::from(wav),
+                    });
+                    job.monitor_music_entity = Some(
+                        commands
+                            .spawn((
+                                AudioPlayer::new(source),
+                                PlaybackSettings::DESPAWN,
+                            ))
+                            .id(),
+                    );
+                },
+                Err(err) => eprintln!("failed to start render monitor music: {err}"),
+            }
+        }
+    }
     if job.next_frame >= job.total_frames {
+        if let Some(entity) = job.monitor_music_entity.take() {
+            commands.entity(entity).try_despawn();
+        }
         finish_video_capture(
             &mut studio,
             &mut capture_active,
@@ -989,7 +1092,7 @@ fn render_video_frames(
     studio.playback_ms = playback_ms;
     if let Ok(mut window) = windows.single_mut() {
         window.title = format!(
-            "正在渲染视频 {}/{}（此阶段静音，完成后加入音乐和语音；Esc 取消）",
+            "正在渲染视频 {}/{}（同步监听音乐和角色语音；Esc 取消）",
             frame_index + 1,
             total_frames
         );
@@ -1051,6 +1154,7 @@ fn finish_video_capture(
     let music_volume = job.music_volume;
     let speech_enabled = job.speech_enabled;
     let speech_volume = job.speech_volume;
+    let master_speech_speed = job.master_speech_speed;
     let speaker_voice_settings = job.speaker_voice_settings;
     let dialogue = job.dialogue;
     let (sender, receiver) = bounded(1);
@@ -1064,6 +1168,7 @@ fn finish_video_capture(
             music_volume,
             speech_enabled,
             speech_volume,
+            master_speech_speed,
             &dialogue,
             &speaker_voice_settings,
         );
@@ -1203,7 +1308,7 @@ fn replay_controls(
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
     capture_active: &mut ReplayVideoCaptureActive,
 ) {
-    ui.label("记录体素场景、自由镜头和可见对话，并在应用内确定性回放。");
+    ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
     ui.separator();
     ui.horizontal(|ui| {
         ui.label("发布范围");
@@ -1252,6 +1357,11 @@ fn replay_controls(
             "GM 回放可能包含私聊、隐藏队伍和系统内容，请勿公开发布。",
         );
     }
+    ui.checkbox(
+        &mut studio.record_camera_enabled,
+        "录制 DM 自由镜头（默认关闭，点击后才采集）",
+    )
+    .on_hover_text("关闭时只记录场景和台词，不持续采集你的镜头移动。");
 
     ui.horizontal(|ui| match studio.mode {
         ReplayMode::Recording => {
@@ -1333,15 +1443,19 @@ fn replay_controls(
     }
 
     ui.separator();
-    ui.heading("DeepSeek 制作提要");
-    ui.small("使用 deepseek-v4-pro 思考模式，只整理当前发布范围内已经说过的内容，供 DM 审核；不会续写剧情、改写玩家台词或读取其他队伍的隐藏内容。");
-    ui.label("自定义整理要求");
+    ui.heading("DeepSeek 视频导演");
+    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内的已有台词，并为每句选择说话人特写、远景、环境镜头和移动方式。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
+    ui.checkbox(
+        &mut studio.deepseek_director_enabled,
+        "允许 DeepSeek 润色台词并控制镜头",
+    );
+    ui.label("自定义导演要求");
     let prompt_width = ui.available_width().clamp(220.0, 560.0);
     ui.add(
         egui::TextEdit::multiline(&mut studio.deepseek_custom_prompt)
             .desired_rows(3)
             .desired_width(prompt_width)
-            .hint_text("例如：重点列出未解决问题；保留角色和地点原名；措辞更简洁"),
+            .hint_text("例如：保留角色口癖；战斗段落使用快速切镜；安静段落多用环境远景"),
     );
     let prompt_chars = studio.deepseek_custom_prompt.chars().count();
     if prompt_chars > DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS {
@@ -1351,46 +1465,53 @@ fn replay_controls(
         );
     } else {
         ui.small(format!(
-            "{prompt_chars}/{DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS} 字；只影响事实提要的格式与重点，不能扩大可见范围或续写剧情"
+            "{prompt_chars}/{DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS} 字；可影响措辞和镜头风格，不能扩大可见范围或新增剧情"
         ));
     }
     if ui
         .add_enabled(
-            studio
-                .replay
-                .as_ref()
-                .is_some_and(|replay| !replay.dialogue.is_empty()),
-            egui::Button::new("整理现有台词"),
+            studio.deepseek_director_enabled
+                && studio
+                    .replay
+                    .as_ref()
+                    .is_some_and(|replay| !replay.dialogue.is_empty()),
+            egui::Button::new("生成并应用导演方案"),
         )
         .clicked()
     {
+        studio.director_response_hash = None;
         studio.status = match studio
             .replay
             .as_ref()
             .ok_or_else(|| "请先从现有聊天生成回放".to_owned())
             .and_then(|replay| {
-                queue_replay_summary(
+                queue_replay_director(
                     replay,
                     deepseek_sender,
                     deepseek_manager,
                     &studio.deepseek_custom_prompt,
+                    standees,
                 )
             }) {
             Ok(()) => {
+                studio.director_request_pending = true;
                 if let Err(err) = deepseek_manager.persist() {
                     format!("DeepSeek 请求已发送，但保存请求状态失败：{err}")
                 } else {
-                    "DeepSeek 正在整理可见台词；完成后会在这里显示制作提要".to_owned()
+                    "DeepSeek 正在润色台词并设计逐句镜头；返回后会自动应用".to_owned()
                 }
             },
-            Err(err) => format!("DeepSeek 整理失败：{err}"),
+            Err(err) => {
+                studio.director_request_pending = false;
+                format!("DeepSeek 导演请求失败：{err}")
+            },
         };
     }
     if let Some(replay) = studio.replay.as_ref() {
         if let Some(block) = replay_summary_block(replay, deepseek_manager) {
             if block.pending {
                 ui.spinner();
-                ui.small("正在整理……");
+                ui.small("正在生成导演方案……");
             } else if let Some(error) = &block.error {
                 ui.colored_label(
                     egui::Color32::from_rgb(210, 90, 70),
@@ -1398,8 +1519,7 @@ fn replay_controls(
                 );
             } else if !block.latest.trim().is_empty() {
                 ui.group(|ui| {
-                    ui.label("DM 制作提要（不会自动写入台词）");
-                    ui.label(&block.latest);
+                    ui.label("DeepSeek 导演方案（已验证后自动应用）");
                 });
                 ui.collapsing(
                     "查看 DeepSeek API 原始响应",
@@ -1414,7 +1534,24 @@ fn replay_controls(
             }
         }
     }
-    ui.small("镜头使用 DM 录制的自由镜头轨迹；从聊天生成时使用当前镜头。台词显示时长和切换间隔由本地确定性排版器控制。");
+    let director_applied = match apply_ready_director_plan(
+        studio,
+        deepseek_manager,
+        camera,
+        standees,
+    ) {
+        Ok(applied) => applied,
+        Err(err) => {
+            studio.auto_export_after_director = false;
+            studio.status = format!("DeepSeek 导演方案无效：{err}");
+            false
+        },
+    };
+    if director_applied && studio.auto_export_after_director {
+        studio.auto_export_after_director = false;
+        start_video_export(studio, capture_active, grids, windows);
+    }
+    ui.small("只有开启“录制 DM 自由镜头”才会持续采集镜头。DeepSeek 导演开启后会等待 API 返回，再应用润色台词和镜头决策。");
 
     ui.separator();
     ui.heading("导出 MP4 视频");
@@ -1455,6 +1592,18 @@ fn replay_controls(
                 .text("语音音量")
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
+        if let Some(replay) = studio.replay.as_mut() {
+            ui.add_enabled(
+                studio.speech_enabled,
+                egui::Slider::new(
+                    &mut replay.master_speech_speed,
+                    0.80..=1.40,
+                )
+                .text("整体语速")
+                .custom_formatter(|value, _| format!("{value:.2}×")),
+            )
+            .on_hover_text("同时调整所有角色在播放预览和 MP4 导出中的语速。");
+        }
         if ui.button("角色语音设置…").clicked() {
             studio.speech_settings_open = true;
             if !studio.speech_voices_loaded {
@@ -1477,7 +1626,7 @@ fn replay_controls(
             }
         }
     });
-    ui.small("台词默认使用本地 Kokoro 24 kHz ONNX（100 种中英文角色音色），模型不可用时回退到 Windows TTS。预览会随台词同步停止；导出逐帧阶段保持静音，最后一次性混合语音和音乐。语音仅处理已通过发布范围筛选的回放台词，不上传网络。");
+    ui.small("整体语速默认 1.30×，同时用于预览与导出；台词默认使用本地 Kokoro 24 kHz ONNX（100 种中英文角色音色），模型不可用时回退到 Windows TTS。逐帧渲染时会同步监听角色语音和音乐，完成后仍使用离线高质量音轨混入 MP4。语音仅处理已通过发布范围筛选的回放台词，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -1499,46 +1648,44 @@ fn replay_controls(
             start_video_export(studio, capture_active, grids, windows);
         }
     });
-    let can_auto_direct = manager.active_campaign_id().is_some()
+    let can_auto_direct = studio.deepseek_director_enabled
+        && manager.active_campaign_id().is_some()
         && studio.mode == ReplayMode::Idle
         && studio.video_render.is_none()
         && studio.video_encoding.is_none();
     if ui
         .add_enabled(
             can_auto_direct,
-            egui::Button::new("DeepSeek 整理 + 自动导演并导出"),
+            egui::Button::new("DeepSeek 导演并导出"),
         )
-        .on_hover_text("从所选发布范围的现有聊天重建回放，生成确定性镜头轨迹，并立即开始导出 MP4。DeepSeek 仅生成制作提要。")
+        .on_hover_text("从所选发布范围的聊天重建回放，等待 DeepSeek 返回润色台词和逐句镜头方案，验证并应用后再导出 MP4。")
         .clicked()
     {
         build_from_history(studio, manager, camera, grids);
-        if let (Some(replay), Ok(base_camera)) = (studio.replay.as_mut(), camera.single()) {
-            let speaker_positions = standees
-                .iter()
-                .map(|(transform, standee)| (standee.user_id, transform.translation))
-                .collect::<HashMap<_, _>>();
-            replay.camera = automatic_camera_track(
-                base_camera,
-                &replay.dialogue,
-                replay.duration_ms,
-                &speaker_positions,
-            );
-        }
-        let summary_queued = studio.replay.as_ref().is_some_and(|replay| {
-            queue_replay_summary(
+        let director_queued = studio.replay.as_ref().is_some_and(|replay| {
+            queue_replay_director(
                 replay,
                 deepseek_sender,
                 deepseek_manager,
                 &studio.deepseek_custom_prompt,
+                standees,
             )
             .is_ok()
         });
-        if summary_queued {
+        if director_queued {
+            studio.director_response_hash = None;
+            studio.director_request_pending = true;
+            studio.auto_export_after_director = true;
+            studio.status =
+                "已发送 DeepSeek 导演请求；收到并应用有效方案后自动开始导出".to_owned();
             let _ = deepseek_manager.persist();
+        } else {
+            studio.director_request_pending = false;
+            studio.auto_export_after_director = false;
+            studio.status = "无法发送 DeepSeek 导演请求，请检查 API 连接".to_owned();
         }
-        start_video_export(studio, capture_active, grids, windows);
     }
-    ui.small("一键模式会自动完成：读取可见聊天 → 请求事实性制作提要 → 编排平滑镜头 → 逐帧渲染 → 生成角色语音 → FFmpeg 输出 MP4。");
+    ui.small("一键模式会自动完成：读取可见聊天 → DeepSeek 润色逐句台词并选择镜头 → 本地验证和生成平滑轨迹 → 逐帧渲染 → FFmpeg 输出 MP4。");
     ui.small("导出时会隐藏编辑器界面，逐帧渲染台词层，再用 FFmpeg 编码 H.264/AAC 视频。按 Esc 可取消逐帧渲染。");
 
     ui.collapsing(
@@ -1718,8 +1865,10 @@ fn start_recording(
         studio.audience.clone(),
         scene,
     );
-    if let Ok(transform) = camera.single() {
-        replay.camera.push(camera_keyframe(0, transform));
+    if studio.record_camera_enabled {
+        if let Ok(transform) = camera.single() {
+            replay.camera.push(camera_keyframe(0, transform));
+        }
     }
     studio.message_counts = manager
         .messages
@@ -1729,9 +1878,16 @@ fn start_recording(
     studio.record_elapsed_ms = 0;
     studio.camera_sample_accumulator = 0.0;
     studio.playback_ms = 0;
+    studio.director_request_pending = false;
+    studio.director_response_hash = None;
+    studio.auto_export_after_director = false;
     studio.replay = Some(replay);
     studio.mode = ReplayMode::Recording;
-    studio.status = "开始录制；只会收录所选发布范围可见的消息".to_owned();
+    studio.status = if studio.record_camera_enabled {
+        "开始录制场景、可见消息和 DM 自由镜头".to_owned()
+    } else {
+        "开始录制场景和可见消息；DM 镜头采集保持关闭".to_owned()
+    };
 }
 
 fn stop_recording(studio: &mut ReplayStudio) {
@@ -1808,6 +1964,9 @@ fn build_from_history(
         ));
     }
     studio.playback_ms = 0;
+    studio.director_request_pending = false;
+    studio.director_response_hash = None;
+    studio.auto_export_after_director = false;
     studio.replay = Some(replay);
     studio.status = format!(
         "已从现有聊天生成 {0} 条连续对话；切换间隔约 0.27 秒",
@@ -1815,7 +1974,7 @@ fn build_from_history(
     );
 }
 
-fn replay_summary_key(replay: &ReplayFile) -> String {
+fn replay_director_key(replay: &ReplayFile) -> String {
     let audience = match &replay.audience {
         ReplayAudience::Public => "public".to_owned(),
         ReplayAudience::Party(id) => format!("party:{id}"),
@@ -1823,7 +1982,7 @@ fn replay_summary_key(replay: &ReplayFile) -> String {
         ReplayAudience::Gm => "gm".to_owned(),
     };
     format!(
-        "replay:{}:{audience}",
+        "replay-director:{}:{audience}",
         replay.campaign_id
     )
 }
@@ -1835,36 +1994,52 @@ fn replay_summary_block<'a>(
     let message_count = replay.dialogue.len();
     manager
         .summaries
-        .get(&replay_summary_key(replay))?
+        .get(&replay_director_key(replay))?
         .blocks
         .iter()
         .find(|block| block.message_count == message_count)
 }
 
-fn queue_replay_summary(
+fn queue_replay_director(
     replay: &ReplayFile,
     sender: Option<&DeepseekIOSender>,
     manager: &mut DeepseekManager,
     custom_prompt: &str,
+    standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
 ) -> Result<(), String> {
     if replay.dialogue.is_empty() {
         return Err("回放中没有可整理的台词".to_owned());
     }
     let sender = sender.ok_or_else(|| "DeepSeek 连接尚未就绪，请稍后重试".to_owned())?;
-    let summary_key = replay_summary_key(replay);
+    let summary_key = replay_director_key(replay);
     let message_count = replay.dialogue.len();
     if let Some(block) = replay_summary_block(replay, manager) {
         if block.pending {
             return Err("这版台词正在整理，请等待当前请求完成".to_owned());
         }
     }
-    let text = replay
+    let visible_standees = standees
+        .iter()
+        .map(|(_, standee)| standee.user_id)
+        .collect::<std::collections::HashSet<_>>();
+    let dialogue = replay
         .dialogue
         .iter()
-        .map(|line| format!("{}：{}", line.name, line.text.trim()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let request = serde_json::to_string(&DeepseekRequest::Summary {
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::json!({
+                "index": index,
+                "speaker_id": line.sender_id.to_string(),
+                "name": line.name,
+                "role": line.role,
+                "text": line.text.trim(),
+                "has_character_model": visible_standees.contains(&line.sender_id),
+            })
+        })
+        .collect::<Vec<_>>();
+    let text = serde_json::to_string(&serde_json::json!({ "dialogue": dialogue }))
+        .map_err(|err| err.to_string())?;
+    let request = serde_json::to_string(&DeepseekRequest::Director {
         target_id: summary_key.clone(),
         message_count,
         text,
@@ -1889,6 +2064,140 @@ fn queue_replay_summary(
     Ok(())
 }
 
+fn apply_ready_director_plan(
+    studio: &mut ReplayStudio,
+    manager: &DeepseekManager,
+    camera: &Query<&Transform, With<VoxelViewportCamera>>,
+    standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
+) -> Result<bool, String> {
+    if !studio.director_request_pending {
+        return Ok(false);
+    }
+    let Some(replay) = studio.replay.as_ref() else {
+        studio.director_request_pending = false;
+        return Ok(false);
+    };
+    let Some(block) = replay_summary_block(replay, manager) else {
+        return Ok(false);
+    };
+    if block.pending {
+        return Ok(false);
+    }
+    if let Some(error) = &block.error {
+        studio.director_request_pending = false;
+        studio.auto_export_after_director = false;
+        return Err(error.clone());
+    }
+    let raw = block.latest.trim();
+    if raw.is_empty() {
+        return Ok(false);
+    }
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    let response_hash = hasher.finish();
+    if studio.director_response_hash == Some(response_hash) {
+        return Ok(false);
+    }
+    studio.director_response_hash = Some(response_hash);
+    studio.director_request_pending = false;
+
+    let plan = parse_director_plan(raw)?;
+    let replay = studio
+        .replay
+        .as_mut()
+        .ok_or_else(|| "回放在应用导演方案前已被移除".to_owned())?;
+    if plan.dialogue.len() != replay.dialogue.len() {
+        studio.auto_export_after_director = false;
+        return Err(format!(
+            "方案包含 {} 句，但回放需要 {} 句",
+            plan.dialogue.len(),
+            replay.dialogue.len()
+        ));
+    }
+    let mut cues = plan.dialogue;
+    cues.sort_by_key(|cue| cue.index);
+    if cues
+        .iter()
+        .enumerate()
+        .any(|(expected, cue)| cue.index != expected)
+    {
+        studio.auto_export_after_director = false;
+        return Err("方案必须恰好包含每个原始台词 index，且不能重复".to_owned());
+    }
+    for (line, cue) in replay.dialogue.iter_mut().zip(&cues) {
+        let text = cue.text.trim();
+        if text.is_empty() {
+            studio.auto_export_after_director = false;
+            return Err(format!(
+                "第 {} 句润色结果为空",
+                cue.index
+            ));
+        }
+        if text.chars().count() > 500 {
+            studio.auto_export_after_director = false;
+            return Err(format!(
+                "第 {} 句超过 500 字",
+                cue.index
+            ));
+        }
+        line.text = text.to_owned();
+        line.duration_ms = dialogue_duration_ms(text);
+    }
+    let mut timeline_ms = 350_u64;
+    for line in &mut replay.dialogue {
+        line.time_ms = timeline_ms;
+        timeline_ms = line
+            .time_ms
+            .saturating_add(line.duration_ms)
+            .saturating_add(HISTORY_DIALOGUE_GAP_MS);
+    }
+    replay.duration_ms = replay
+        .dialogue
+        .last()
+        .map(|line| line.time_ms.saturating_add(line.duration_ms))
+        .unwrap_or(5_000);
+
+    let base = camera
+        .single()
+        .ok()
+        .cloned()
+        .or_else(|| replay.camera.first().map(frame_transform))
+        .ok_or_else(|| "找不到可用的导演基础镜头".to_owned())?;
+    let speaker_positions = standees
+        .iter()
+        .map(|(transform, standee)| (standee.user_id, transform.translation))
+        .collect::<HashMap<_, _>>();
+    replay.camera = director_camera_track(
+        &base,
+        &replay.dialogue,
+        &cues,
+        replay.duration_ms,
+        &speaker_positions,
+    );
+    studio.playback_ms = 0;
+    studio.status = format!(
+        "已应用 DeepSeek 导演方案：{} 句润色台词、{} 个镜头帧",
+        replay.dialogue.len(),
+        replay.camera.len()
+    );
+    Ok(true)
+}
+
+fn parse_director_plan(raw: &str) -> Result<DirectorPlan, String> {
+    let trimmed = raw.trim();
+    let json = if trimmed.starts_with("```") {
+        trimmed
+            .strip_prefix("```json")
+            .or_else(|| trimmed.strip_prefix("```"))
+            .and_then(|body| body.strip_suffix("```"))
+            .unwrap_or(trimmed)
+            .trim()
+    } else {
+        trimmed
+    };
+    serde_json::from_str(json).map_err(|err| format!("无法解析导演 JSON：{err}"))
+}
+
 fn new_replay(
     manager: &NapcatMessageManager,
     campaign_id: String,
@@ -1911,6 +2220,7 @@ fn new_replay(
         scene,
         camera: Vec::new(),
         dialogue: Vec::new(),
+        master_speech_speed: default_master_speech_speed(),
         speaker_voice_settings: HashMap::new(),
     }
 }
@@ -1958,11 +2268,12 @@ fn start_video_export(
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
 ) {
-    let Some((duration_ms, dialogue, speaker_voice_settings)) =
+    let Some((duration_ms, dialogue, master_speech_speed, speaker_voice_settings)) =
         studio.replay.as_ref().map(|replay| {
             (
                 replay.duration_ms,
                 replay.dialogue.clone(),
+                replay.master_speech_speed,
                 replay.speaker_voice_settings.clone(),
             )
         })
@@ -2045,6 +2356,7 @@ fn start_video_export(
         music_volume: studio.music_volume,
         speech_enabled: studio.speech_enabled,
         speech_volume: studio.speech_volume,
+        master_speech_speed,
         speaker_voice_settings,
         dialogue,
         total_frames,
@@ -2052,12 +2364,15 @@ fn start_video_export(
         capture_pending: false,
         pending_seconds: 0.0,
         warmup_frames: VIDEO_CAPTURE_WARMUP_FRAMES,
+        monitor_music_started: false,
+        monitor_music_entity: None,
         failure: None,
         original_window_title,
         original_window_resizable,
     });
-    studio.status =
-        format!("正在逐帧渲染 {total_frames} 帧；截图阶段静音，全部帧完成后自动合成音乐和角色语音");
+    studio.status = format!(
+        "正在逐帧渲染 {total_frames} 帧；当前同步监听音乐和角色语音，完成后生成干净的 MP4 音轨"
+    );
 }
 
 fn video_frame_count(duration_ms: u64, fps: u32) -> u64 {
@@ -2175,6 +2490,7 @@ fn encode_video_frames(
     music_volume: f32,
     speech_enabled: bool,
     speech_volume: f32,
+    master_speech_speed: f32,
     dialogue: &[ReplayDialogue],
     speaker_voice_settings: &HashMap<u64, SpeakerVoiceSettings>,
 ) -> Result<(), String> {
@@ -2195,6 +2511,7 @@ fn encode_video_frames(
             frames_path,
             duration_ms,
             speech_volume,
+            master_speech_speed,
             dialogue,
             speaker_voice_settings,
         )?;
@@ -2329,6 +2646,7 @@ struct SpeechSynthesisJob {
     onnx_speaker_id: i32,
     pitch: i32,
     speech_rate: i32,
+    onnx_speed: f32,
 }
 
 fn write_narration_track(
@@ -2336,6 +2654,7 @@ fn write_narration_track(
     working_directory: &Path,
     duration_ms: u64,
     volume: f32,
+    master_speech_speed: f32,
     dialogue: &[ReplayDialogue],
     speaker_settings: &HashMap<u64, SpeakerVoiceSettings>,
 ) -> Result<(), String> {
@@ -2361,6 +2680,11 @@ fn write_narration_track(
                 .get(&line.sender_id)
                 .cloned()
                 .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
+            let fitted_rate = fitted_speech_rate(
+                settings.speech_rate,
+                &line.text,
+                line.duration_ms,
+            );
             SpeechSynthesisJob {
                 text: line.text.clone(),
                 output_path: working_directory
@@ -2372,11 +2696,8 @@ fn write_narration_track(
                 voice_slot: line.sender_id,
                 onnx_speaker_id: onnx_speaker_id(&settings, line.sender_id),
                 pitch: settings.pitch,
-                speech_rate: ssml_rate_percent(fitted_speech_rate(
-                    settings.speech_rate,
-                    &line.text,
-                    line.duration_ms,
-                )),
+                speech_rate: combined_ssml_rate(fitted_rate, master_speech_speed),
+                onnx_speed: combined_onnx_speed(fitted_rate, master_speech_speed),
             }
         })
         .collect::<Vec<_>>();
@@ -2483,6 +2804,26 @@ fn fitted_speech_rate(base_rate: i32, text: &str, duration_ms: u64) -> i32 {
 
 fn ssml_rate_percent(relative_rate: i32) -> i32 { (100 + relative_rate).clamp(70, 280) }
 
+fn default_master_speech_speed() -> f32 { 1.30 }
+
+fn normalized_master_speech_speed(speed: f32) -> f32 {
+    if speed.is_finite() {
+        speed.clamp(0.80, 1.40)
+    } else {
+        default_master_speech_speed()
+    }
+}
+
+fn combined_ssml_rate(relative_rate: i32, master_speed: f32) -> i32 {
+    ((ssml_rate_percent(relative_rate) as f32 * normalized_master_speech_speed(master_speed))
+        .round() as i32)
+        .clamp(70, 280)
+}
+
+fn combined_onnx_speed(relative_rate: i32, master_speed: f32) -> f32 {
+    (onnx_speed(relative_rate) * normalized_master_speech_speed(master_speed)).clamp(0.85, 1.45)
+}
+
 fn default_speaker_voice_settings(sender_id: u64) -> SpeakerVoiceSettings {
     let (pitch, speech_rate) = speaker_voice_profile(sender_id);
     SpeakerVoiceSettings {
@@ -2511,6 +2852,7 @@ fn replay_voice_signature(replay: &ReplayFile, global_volume: f32) -> u64 {
     let mut hasher = DefaultHasher::new();
     replay.created_at_unix_ms.hash(&mut hasher);
     global_volume.to_bits().hash(&mut hasher);
+    replay.master_speech_speed.to_bits().hash(&mut hasher);
     for line in &replay.dialogue {
         line.sender_id.hash(&mut hasher);
         line.duration_ms.hash(&mut hasher);
@@ -2553,7 +2895,7 @@ fn synthesize_speech_batch(
                 &tts,
                 &job.text,
                 job.onnx_speaker_id,
-                onnx_speed(job.speech_rate - 100),
+                job.onnx_speed,
             )?;
             fs::write(&job.output_path, wav)
                 .map_err(|err| format!("无法保存 ONNX 角色语音：{err}"))?;
@@ -2840,6 +3182,7 @@ fn camera_keyframe(time_ms: u64, transform: &Transform) -> ReplayCameraKeyframe 
     }
 }
 
+#[cfg(test)]
 fn automatic_camera_track(
     base: &Transform,
     dialogue: &[ReplayDialogue],
@@ -2898,6 +3241,149 @@ fn automatic_camera_track(
     frames
 }
 
+fn director_camera_track(
+    base: &Transform,
+    dialogue: &[ReplayDialogue],
+    cues: &[DirectorCue],
+    duration_ms: u64,
+    speaker_positions: &HashMap<u64, Vec3>,
+) -> Vec<ReplayCameraKeyframe> {
+    let mut frames = vec![camera_keyframe(0, base)];
+    let mut current = base.clone();
+    for (index, (line, cue)) in dialogue.iter().zip(cues).enumerate() {
+        frames.push(camera_keyframe(line.time_ms, &current));
+        let line_end = line.time_ms.saturating_add(line.duration_ms);
+        let arrival_ms = line
+            .time_ms
+            .saturating_add((line.duration_ms / 4).clamp(180, 650))
+            .min(line_end);
+        let (arrival, settled) = if let Some(target) = speaker_positions.get(&line.sender_id) {
+            let arrival = director_speaker_shot(
+                base,
+                *target,
+                line.sender_id,
+                index,
+                cue.shot,
+                cue.motion,
+                0.0,
+            );
+            let settled = director_speaker_shot(
+                base,
+                *target,
+                line.sender_id,
+                index,
+                cue.shot,
+                cue.motion,
+                1.0,
+            );
+            (arrival, settled)
+        } else {
+            let arrival = fallback_camera_drift(&current, line.sender_id, index);
+            let settled = director_environment_motion(
+                &arrival,
+                cue.motion,
+                line.sender_id,
+                index,
+            );
+            (arrival, settled)
+        };
+        frames.push(camera_keyframe(arrival_ms, &arrival));
+        frames.push(camera_keyframe(line_end, &settled));
+        current = settled;
+    }
+    if frames
+        .last()
+        .is_some_and(|frame| frame.time_ms < duration_ms)
+    {
+        frames.push(camera_keyframe(duration_ms, &current));
+    }
+    frames.sort_by_key(|frame| frame.time_ms);
+    frames.dedup_by(|right, left| {
+        if right.time_ms == left.time_ms {
+            *left = right.clone();
+            true
+        } else {
+            false
+        }
+    });
+    frames
+}
+
+fn director_speaker_shot(
+    base: &Transform,
+    target: Vec3,
+    sender_id: u64,
+    index: usize,
+    shot: DirectorShot,
+    motion: DirectorMotion,
+    progress: f32,
+) -> Transform {
+    let seed = cinematic_seed(sender_id, index);
+    let angle = seed * std::f32::consts::TAU;
+    let mut approach = base.translation - target;
+    approach.y = 0.0;
+    let approach = approach
+        .try_normalize()
+        .unwrap_or_else(|| Vec3::new(angle.cos(), 0.0, angle.sin()));
+    let base_distance = match shot {
+        DirectorShot::SpeakerClose => 3.0,
+        DirectorShot::SpeakerMedium => 5.0,
+        DirectorShot::SpeakerWide => 8.0,
+        DirectorShot::Establishing => 12.0,
+        DirectorShot::Environment => 10.0,
+    };
+    let orbit = match motion {
+        DirectorMotion::OrbitLeft => -0.18 * progress,
+        DirectorMotion::OrbitRight => 0.18 * progress,
+        _ => 0.0,
+    };
+    let approach = Quat::from_rotation_y(orbit) * approach;
+    let lateral = Vec3::new(-approach.z, 0.0, approach.x);
+    let distance_delta = match motion {
+        DirectorMotion::DollyIn => -0.9 * progress,
+        DirectorMotion::DollyOut => 1.1 * progress,
+        _ => 0.0,
+    };
+    let lateral_delta = match motion {
+        DirectorMotion::DriftLeft => -0.8 * progress,
+        DirectorMotion::DriftRight => 0.8 * progress,
+        _ => 0.0,
+    };
+    let height = match shot {
+        DirectorShot::SpeakerClose => 1.25,
+        DirectorShot::SpeakerMedium => 1.55,
+        DirectorShot::SpeakerWide => 2.2,
+        DirectorShot::Establishing | DirectorShot::Environment => 3.4,
+    };
+    let position = target
+        + approach * (base_distance + distance_delta)
+        + lateral * lateral_delta
+        + Vec3::Y * height;
+    Transform::from_translation(position).looking_at(target + Vec3::Y * 0.35, Vec3::Y)
+}
+
+fn director_environment_motion(
+    current: &Transform,
+    motion: DirectorMotion,
+    sender_id: u64,
+    index: usize,
+) -> Transform {
+    let right = current.rotation * Vec3::X;
+    let forward = current.rotation * Vec3::NEG_Z;
+    let offset = match motion {
+        DirectorMotion::Static => Vec3::ZERO,
+        DirectorMotion::DollyIn => forward * 0.8,
+        DirectorMotion::DollyOut => -forward * 0.8,
+        DirectorMotion::OrbitLeft | DirectorMotion::DriftLeft => -right * 0.9 + forward * 0.2,
+        DirectorMotion::OrbitRight | DirectorMotion::DriftRight => right * 0.9 + forward * 0.2,
+    };
+    let fallback = fallback_camera_drift(current, sender_id, index);
+    let position = current.translation + offset;
+    let focus = fallback.translation + fallback.rotation * Vec3::NEG_Z * 18.0;
+    Transform::from_translation(position).looking_at(focus, Vec3::Y)
+}
+
+#[cfg(test)]
 fn speaker_camera_shot(
     base: &Transform,
     target: Vec3,
@@ -3589,6 +4075,31 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_director_shot_focuses_the_selected_speaker() {
+        let base = Transform::from_xyz(2.0, 3.0, 4.0);
+        let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
+        let cues = [DirectorCue {
+            index: 0,
+            text: "打开舱门。".to_owned(),
+            shot: DirectorShot::SpeakerClose,
+            motion: DirectorMotion::DollyIn,
+        }];
+        let target = Vec3::new(8.0, 1.0, -3.0);
+        let frames = director_camera_track(
+            &base,
+            &dialogue,
+            &cues,
+            3_050,
+            &HashMap::from([(1, target)]),
+        );
+        let shot = frame_transform(frames.last().unwrap());
+        let forward = shot.rotation * Vec3::NEG_Z;
+        let to_speaker = (target + Vec3::Y * 0.35 - shot.translation).normalize();
+        assert!(forward.dot(to_speaker) > 0.99);
+        assert!(shot.translation.distance(target) < 4.0);
+    }
+
+    #[test]
     fn dialogue_duration_is_readable_and_bounded() {
         assert_eq!(
             dialogue_duration_ms("短句"),
@@ -3669,6 +4180,23 @@ mod tests {
         assert!(fitted_speech_rate(18, &"很长的中文台词".repeat(8), 4_875) > 18);
         assert!((onnx_speed(18) - 1.09).abs() < 0.001);
         assert_eq!(onnx_speed(180), 1.45);
+        assert_eq!(default_master_speech_speed(), 1.30);
+        assert_eq!(combined_ssml_rate(18, 1.30), 153);
+        assert!((combined_onnx_speed(18, 1.30) - 1.417).abs() < 0.001);
+        assert_eq!(
+            normalized_master_speech_speed(f32::NAN),
+            1.30
+        );
+    }
+
+    #[test]
+    fn director_plan_parses_strict_json_and_markdown_fallback() {
+        let json = r#"{"dialogue":[{"index":0,"text":"打开舱门。","shot":"speaker_close","motion":"dolly_in"}]}"#;
+        let direct = parse_director_plan(json).unwrap();
+        let fenced = parse_director_plan(&format!("```json\n{json}\n```")).unwrap();
+        assert_eq!(direct.dialogue.len(), 1);
+        assert_eq!(fenced.dialogue[0].text, "打开舱门。");
+        assert!(parse_director_plan(r#"{"dialogue":[{"index":0}]}"#).is_err());
     }
 
     #[test]
@@ -3732,6 +4260,8 @@ mod tests {
         let old_json = r#"{"format_version":1,"title":"test","campaign_id":"c","created_at_unix_ms":1,"duration_ms":0,"audience":{"scope":"public"},"scene":{"voxels":[]},"camera":[],"dialogue":[]}"#;
         let mut replay: ReplayFile = serde_json::from_str(old_json).unwrap();
         assert!(replay.speaker_voice_settings.is_empty());
+        assert_eq!(replay.master_speech_speed, 1.30);
+        replay.master_speech_speed = 1.15;
         replay
             .speaker_voice_settings
             .insert(42, SpeakerVoiceSettings {
@@ -3753,6 +4283,7 @@ mod tests {
         assert_eq!(settings.onnx_speaker_id, Some(17));
         assert_eq!(settings.speech_rate, 12);
         assert_eq!(settings.volume, 0.75);
+        assert_eq!(restored.master_speech_speed, 1.15);
     }
 
     #[test]
@@ -3815,6 +4346,7 @@ mod tests {
             directory.path(),
             2_835,
             0.90,
+            default_master_speech_speed(),
             &[first_line, second_line],
             &HashMap::new(),
         )
@@ -3855,6 +4387,7 @@ mod tests {
             0.35,
             true,
             0.90,
+            default_master_speech_speed(),
             &[dialogue],
             &HashMap::new(),
         )

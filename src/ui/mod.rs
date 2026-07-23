@@ -14871,7 +14871,10 @@ mod tests {
             let DeepseekRequest::Summary {
                 target_id, text, ..
             } = serde_json::from_str::<DeepseekRequest>(&text)
-                .expect("summary request should deserialize");
+                .expect("summary request should deserialize")
+            else {
+                continue;
+            };
             request_texts.insert(target_id, text);
         }
 
