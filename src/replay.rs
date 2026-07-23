@@ -961,8 +961,32 @@ fn is_short_utterance(text: &str) -> bool {
     units > 0 && units <= SHORT_UTTERANCE_MAX_UNITS
 }
 
+fn protect_repeated_short_phrase(text: &str) -> String {
+    let mut characters = text.chars().collect::<Vec<_>>();
+    let ending = characters
+        .last()
+        .copied()
+        .filter(|character| matches!(character, '。' | '！' | '？' | '.' | '!' | '?'));
+    if ending.is_some() {
+        characters.pop();
+    }
+    let half = characters.len() / 2;
+    if characters.len() >= 4
+        && characters.len() <= SHORT_UTTERANCE_MAX_UNITS
+        && characters.len() % 2 == 0
+        && characters.iter().all(|character| is_cjk_character(*character))
+        && characters[..half] == characters[half..]
+    {
+        characters.insert(half, '，');
+    }
+    if let Some(ending) = ending {
+        characters.push(ending);
+    }
+    characters.into_iter().collect()
+}
+
 fn emotivoice_model_text(text: &str) -> String {
-    let mut normalized = normalize_tts_text(text);
+    let mut normalized = protect_repeated_short_phrase(&normalize_tts_text(text));
     if is_short_utterance(&normalized)
         && !normalized.chars().next_back().is_some_and(|character| {
             matches!(
@@ -4681,11 +4705,23 @@ mod tests {
         assert!((configured_speed - combined_onnx_speed(18, 1.30)).abs() < f32::EPSILON);
         assert_eq!(
             emotivoice_model_text("可以可以"),
-            "可以可以。"
+            "可以，可以。"
         );
         assert_eq!(
             emotivoice_model_text("可以吗？"),
             "可以吗？"
+        );
+        assert_eq!(
+            emotivoice_model_text("侦测魔法"),
+            "侦测魔法。"
+        );
+        assert_eq!(
+            emotivoice_model_text("不要不要！"),
+            "不要，不要！"
+        );
+        assert_eq!(
+            emotivoice_model_text("好好"),
+            "好好。"
         );
         assert!(
             (effective_emotivoice_speed("可以可以", configured_speed) - 1.10).abs() < f32::EPSILON
