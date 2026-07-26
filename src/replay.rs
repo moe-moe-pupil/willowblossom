@@ -835,18 +835,16 @@ fn preview_replay_speech(
     mut speech: ResMut<PreviewSpeechController>,
     mut audio_sources: ResMut<Assets<AudioSource>>,
 ) {
+    let generate_all_missing =
+        studio.mode == ReplayMode::Playing || studio.video_render.is_some();
     let pending_generation_line_ids = studio
         .replay
         .as_ref()
-        .map(|replay| {
-            speech
-                .pending_generation_lines
-                .iter()
-                .filter_map(|(replay_id, line_id)| {
-                    (*replay_id == replay.created_at_unix_ms).then_some(*line_id)
-                })
-                .collect::<HashSet<_>>()
-        })
+        .map(|replay| replay_speech_generation_line_ids(
+            replay,
+            &speech.pending_generation_lines,
+            generate_all_missing,
+        ))
         .unwrap_or_default();
     let mut generation_request_consumed = false;
     if studio.speech_enabled
@@ -2328,11 +2326,11 @@ fn replay_controls(
         } else if generation_active && failed > 0 && processed == total {
             format!("语音预生成完成：成功 {ready}/{total}，失败 {failed}")
         } else if generation_active && failed > 0 {
-            format!("正在生成新消息语音：成功 {ready}/{total}，失败 {failed}")
+            format!("正在生成角色语音：成功 {ready}/{total}，失败 {failed}")
         } else if ready == total {
             format!("语音缓存已就绪：{ready}/{total}")
         } else if generation_active {
-            format!("正在生成新消息语音：{ready}/{total}")
+            format!("正在生成角色语音：{ready}/{total}")
         } else {
             format!("语音缓存已就绪 {ready}/{total}；等待新消息")
         };
@@ -2341,7 +2339,7 @@ fn replay_controls(
                 .desired_width(ui.available_width())
                 .text(text),
         );
-        ui.small("收到新的录制消息时会生成对应的角色语音；点击播放只读取已有缓存，不会启动生成。预览与 MP4 导出共用缓存。");
+        ui.small("收到新的录制消息时会生成对应语音；点击播放或导出时会自动补齐所有缺失的角色语音。预览与 MP4 导出共用缓存。");
     }
     ui.small("整体语速默认 1.10×，调整语速或单个角色音色时不会改变时间轴。六个字以内的极短台词会自动使用较自然的短句语速和首尾保护，避免吞字，不改变角色音色或音调。需要改变字幕、间隔和镜头时长时，请使用“整体台词停留”。预览与导出共用同一条时间线和 Spark-TTS 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
@@ -5778,6 +5776,23 @@ fn replay_speech_preparation_indices(replay: &ReplayFile, playback_ms: u64) -> V
         .collect()
 }
 
+fn replay_speech_generation_line_ids(
+    replay: &ReplayFile,
+    pending: &HashSet<(u64, u64)>,
+    generate_all_missing: bool,
+) -> HashSet<u64> {
+    replay
+        .dialogue
+        .iter()
+        .filter(|line| {
+            line.included
+                && (generate_all_missing
+                    || pending.contains(&(replay.created_at_unix_ms, line.line_id)))
+        })
+        .map(|line| line.line_id)
+        .collect()
+}
+
 fn speech_generation_requested(
     line_id: u64,
     cue: (u64, usize),
@@ -7152,6 +7167,27 @@ mod tests {
             &HashSet::new(),
             &HashSet::from([cue]),
         ));
+    }
+
+    #[test]
+    fn playback_authorizes_every_missing_included_line() {
+        let mut replay = test_replay(vec![
+            positioned_dialogue(10, 0, 0, [0, 0, 0]),
+            positioned_dialogue(20, 0, 1_000, [1, 0, 0]),
+            positioned_dialogue(30, 0, 2_000, [2, 0, 0]),
+        ]);
+        replay.created_at_unix_ms = 7;
+        replay.dialogue[2].included = false;
+        let pending = HashSet::from([(7, 20), (999, 30)]);
+
+        assert_eq!(
+            replay_speech_generation_line_ids(&replay, &pending, false),
+            HashSet::from([20]),
+        );
+        assert_eq!(
+            replay_speech_generation_line_ids(&replay, &pending, true),
+            HashSet::from([10, 20]),
+        );
     }
 
     #[test]
