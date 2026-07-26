@@ -1,6 +1,6 @@
 #import bevy_pbr::{
     pbr_types,
-    pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
+    pbr_functions::alpha_discard,
     pbr_fragment::pbr_input_from_standard_material,
     decal::clustered::apply_decals,
 }
@@ -13,8 +13,25 @@
 #else
 #import bevy_pbr::{
     forward_io::{VertexOutput, FragmentOutput},
+    pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing},
     pbr_types::STANDARD_MATERIAL_FLAGS_UNLIT_BIT,
 }
+#endif
+
+#ifdef VISIBILITY_RANGE_DITHER
+#import bevy_pbr::pbr_functions::visibility_range_dither;
+#endif
+
+#ifdef MESHLET_MESH_MATERIAL_PASS
+#import bevy_pbr::meshlet_visibility_buffer_resolve::resolve_vertex_output
+#endif
+
+#ifdef OIT_ENABLED
+#import bevy_core_pipeline::oit::oit_draw
+#endif
+
+#ifdef FORWARD_DECAL
+#import bevy_pbr::decal::forward::get_forward_decal_info
 #endif
 
 struct VoxelOcclusionFadeSettings {
@@ -29,33 +46,28 @@ fn hash_pixel(pixel: vec2<f32>) -> f32 {
     return fract(sin(dot(pixel, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 
-fn dissolve_camera_blocker(in: VertexOutput) {
-    let active = fade_settings.camera_and_active.w;
-    if active < 0.5 {
+fn dissolve_replay_camera_blocker(in: VertexOutput) {
+    if fade_settings.camera_and_active.w < 0.5 {
         return;
     }
 
     let camera = fade_settings.camera_and_active.xyz;
     let focus = fade_settings.focus_and_radius.xyz;
-    let corridor = focus - camera;
-    let corridor_length_squared = dot(corridor, corridor);
-    if corridor_length_squared < 0.0001 {
+    let camera_to_focus = focus - camera;
+    let camera_to_focus_length_squared = dot(camera_to_focus, camera_to_focus);
+    if camera_to_focus_length_squared < 0.0001 {
         return;
     }
 
-    let projection = dot(in.world_position.xyz - camera, corridor) / corridor_length_squared;
+    let projection =
+        dot(in.world_position.xyz - camera, camera_to_focus) / camera_to_focus_length_squared;
     if projection <= 0.0 || projection >= 1.0 {
         return;
     }
 
-    let closest = camera + corridor * projection;
+    let closest = camera + camera_to_focus * projection;
     let distance_from_view = distance(in.world_position.xyz, closest);
-
-    // This is a perspective cone around the focused player's screen silhouette,
-    // not a fixed-width tunnel through the scene. A fragment halfway to the
-    // player must be within half the player's world-space radius to be a blocker.
-    let focus_radius = fade_settings.focus_and_radius.w;
-    let blocker_radius = focus_radius * projection;
+    let blocker_radius = fade_settings.focus_and_radius.w * projection;
     let silhouette_overlap =
         1.0 - smoothstep(blocker_radius * 0.72, blocker_radius, distance_from_view);
     let between_camera_and_player = smoothstep(0.015, 0.04, projection)
@@ -69,10 +81,31 @@ fn dissolve_camera_blocker(in: VertexOutput) {
 
 @fragment
 fn fragment(
-    in: VertexOutput,
+#ifdef MESHLET_MESH_MATERIAL_PASS
+    @builtin(position) frag_coord: vec4<f32>,
+#else
+    vertex_output: VertexOutput,
     @builtin(front_facing) is_front: bool,
+#endif
 ) -> FragmentOutput {
-    dissolve_camera_blocker(in);
+#ifdef MESHLET_MESH_MATERIAL_PASS
+    let vertex_output = resolve_vertex_output(frag_coord);
+    let is_front = true;
+#endif
+
+    var in = vertex_output;
+
+#ifdef VISIBILITY_RANGE_DITHER
+    visibility_range_dither(in.position, in.visibility_range_dither);
+#endif
+
+#ifdef FORWARD_DECAL
+    let forward_decal_info = get_forward_decal_info(in);
+    in.world_position = forward_decal_info.world_position;
+    in.uv = forward_decal_info.uv;
+#endif
+
+    dissolve_replay_camera_blocker(in);
 
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     pbr_input.material.base_color =
@@ -89,6 +122,19 @@ fn fragment(
         out.color = pbr_input.material.base_color;
     }
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+#endif
+
+#ifdef OIT_ENABLED
+    let alpha_mode =
+        pbr_input.material.flags & pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_RESERVED_BITS;
+    if alpha_mode != pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_OPAQUE {
+        oit_draw(in.position, out.color);
+        discard;
+    }
+#endif
+
+#ifdef FORWARD_DECAL
+    out.color.a = min(forward_decal_info.alpha, out.color.a);
 #endif
 
     return out;

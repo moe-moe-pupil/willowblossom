@@ -130,6 +130,9 @@ const DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 3.0;
 
 pub struct ReplayPlugin;
 
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ReplayCameraApplied;
+
 impl Plugin for ReplayPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ReplayStudio>()
@@ -154,6 +157,7 @@ impl Plugin for ReplayPlugin {
                     apply_replay_camera,
                 )
                     .chain()
+                    .in_set(ReplayCameraApplied)
                     .before(TransformSystems::Propagate),
             )
             .add_systems(

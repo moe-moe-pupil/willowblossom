@@ -749,6 +749,12 @@ struct VoxelAutoDoor {
 
 #[derive(Resource)]
 struct VoxelMaterials {
+    handles: [Handle<StandardMaterial>; VOXEL_MATERIAL_COUNT],
+    planet_ocean: Handle<StandardMaterial>,
+}
+
+#[derive(Resource)]
+struct VoxelReplayFadeMaterials {
     handles: [Handle<VoxelFadeMaterial>; VOXEL_MATERIAL_COUNT],
     planet_ocean: Handle<VoxelFadeMaterial>,
 }
@@ -1557,8 +1563,10 @@ impl Plugin for TrpgVoxelPlugin {
                 .chain(),
         )
         .add_systems(
-            Update,
-            sync_voxel_occlusion_fade.after(animate_voxel_materials),
+            PostUpdate,
+            sync_voxel_occlusion_fade
+                .after(crate::replay::ReplayCameraApplied)
+                .before(TransformSystems::Propagate),
         )
         .add_systems(
             EguiPrimaryContextPass,
@@ -1989,7 +1997,8 @@ fn voxel_editor_shortcuts(
 fn setup_voxel_materials(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut materials: ResMut<Assets<VoxelFadeMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut fade_materials: ResMut<Assets<VoxelFadeMaterial>>,
 ) {
     let paths = [
         "textures/voxel_grass.png",
@@ -2026,6 +2035,7 @@ fn setup_voxel_materials(
             });
         })
         .load("textures/voxel_space_hifi.png");
+    let mut fade_handles = std::array::from_fn(|_| Handle::default());
     let handles = std::array::from_fn(|index| {
         let mut material = if index < textures.len() {
             StandardMaterial {
@@ -2107,18 +2117,25 @@ fn setup_voxel_materials(
             },
             _ => {},
         }
-        materials.add(ExtendedMaterial {
-            base: material,
+        fade_handles[index] = fade_materials.add(ExtendedMaterial {
+            base: material.clone(),
             extension: VoxelOcclusionFadeExtension::new(),
-        })
+        });
+        materials.add(material)
     });
-    let planet_ocean = materials.add(ExtendedMaterial {
-        base: opaque_planet_ocean_material(textures[3].clone()),
+    let planet_ocean_material = opaque_planet_ocean_material(textures[3].clone());
+    let fade_planet_ocean = fade_materials.add(ExtendedMaterial {
+        base: planet_ocean_material.clone(),
         extension: VoxelOcclusionFadeExtension::new(),
     });
+    let planet_ocean = materials.add(planet_ocean_material);
     commands.insert_resource(VoxelMaterials {
         handles,
         planet_ocean,
+    });
+    commands.insert_resource(VoxelReplayFadeMaterials {
+        handles: fade_handles,
+        planet_ocean: fade_planet_ocean,
     });
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.48, 0.56, 0.68),
@@ -5036,7 +5053,7 @@ fn sorted_planet_cells(planet: &VoxelOrbitalPlanet) -> Vec<(IVec3, u8)> {
 fn planet_material_handle(
     materials: &VoxelMaterials,
     material_id: u8,
-) -> Handle<VoxelFadeMaterial> {
+) -> Handle<StandardMaterial> {
     if material_id == 4 {
         materials.planet_ocean.clone()
     } else {
@@ -5670,7 +5687,9 @@ fn append_voxel_faces(
 fn animate_voxel_materials(
     time: Res<Time>,
     voxel_materials: Res<VoxelMaterials>,
-    mut materials: ResMut<Assets<VoxelFadeMaterial>>,
+    fade_materials: Res<VoxelReplayFadeMaterials>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut fade_assets: ResMut<Assets<VoxelFadeMaterial>>,
 ) {
     let seconds = time.elapsed_secs();
     let water_uv = Affine2::from_translation(Vec2::new(
@@ -5679,10 +5698,23 @@ fn animate_voxel_materials(
     ));
     for handle in [&voxel_materials.handles[3], &voxel_materials.planet_ocean] {
         if let Some(mut water) = materials.get_mut(handle) {
+            water.uv_transform = water_uv;
+        }
+    }
+    for handle in [&fade_materials.handles[3], &fade_materials.planet_ocean] {
+        if let Some(mut water) = fade_assets.get_mut(handle) {
             water.base.uv_transform = water_uv;
         }
     }
     if let Some(mut lava) = materials.get_mut(&voxel_materials.handles[4]) {
+        lava.uv_transform = Affine2::from_translation(Vec2::new(
+            seconds * -0.018,
+            seconds * 0.027,
+        ));
+        let pulse = 4.5 + (seconds * 2.4).sin() * 1.2;
+        lava.emissive = voxel_emissive(pulse, pulse * 0.11, 0.015);
+    }
+    if let Some(mut lava) = fade_assets.get_mut(&fade_materials.handles[4]) {
         lava.base.uv_transform = Affine2::from_translation(Vec2::new(
             seconds * -0.018,
             seconds * 0.027,
@@ -5693,26 +5725,88 @@ fn animate_voxel_materials(
 }
 
 fn sync_voxel_occlusion_fade(
+    mut commands: Commands,
     fade: Res<VoxelReplayOcclusionFade>,
     voxel_materials: Res<VoxelMaterials>,
+    fade_materials: Res<VoxelReplayFadeMaterials>,
     mut materials: ResMut<Assets<VoxelFadeMaterial>>,
+    normal_entities: Query<
+        (Entity, &MeshMaterial3d<StandardMaterial>),
+        Without<MeshMaterial3d<VoxelFadeMaterial>>,
+    >,
+    faded_entities: Query<
+        (Entity, &MeshMaterial3d<VoxelFadeMaterial>),
+        Without<MeshMaterial3d<StandardMaterial>>,
+    >,
 ) {
-    if !fade.is_changed() {
-        return;
-    }
     let settings = VoxelOcclusionFadeUniform {
         camera_and_active: fade.camera.extend(f32::from(fade.active)),
         focus_and_radius: fade.focus.extend(VOXEL_OCCLUSION_FOCUS_RADIUS),
     };
-    for handle in voxel_materials
+    for handle in fade_materials
         .handles
         .iter()
-        .chain(std::iter::once(&voxel_materials.planet_ocean))
+        .chain(std::iter::once(&fade_materials.planet_ocean))
     {
         if let Some(mut material) = materials.get_mut(handle) {
             material.extension.settings = settings;
         }
     }
+    if fade.active {
+        for (entity, material) in &normal_entities {
+            if let Some(fade_handle) =
+                replay_fade_handle(material, &voxel_materials, &fade_materials)
+            {
+                commands
+                    .entity(entity)
+                    .remove::<MeshMaterial3d<StandardMaterial>>()
+                    .insert(MeshMaterial3d(fade_handle));
+            }
+        }
+    } else {
+        for (entity, material) in &faded_entities {
+            if let Some(normal_handle) =
+                normal_voxel_handle(material, &voxel_materials, &fade_materials)
+            {
+                commands
+                    .entity(entity)
+                    .remove::<MeshMaterial3d<VoxelFadeMaterial>>()
+                    .insert(MeshMaterial3d(normal_handle));
+            }
+        }
+    }
+}
+
+fn replay_fade_handle(
+    material: &MeshMaterial3d<StandardMaterial>,
+    voxel_materials: &VoxelMaterials,
+    fade_materials: &VoxelReplayFadeMaterials,
+) -> Option<Handle<VoxelFadeMaterial>> {
+    voxel_materials
+        .handles
+        .iter()
+        .zip(&fade_materials.handles)
+        .find_map(|(normal, fade)| (material.0 == *normal).then(|| fade.clone()))
+        .or_else(|| {
+            (material.0 == voxel_materials.planet_ocean)
+                .then(|| fade_materials.planet_ocean.clone())
+        })
+}
+
+fn normal_voxel_handle(
+    material: &MeshMaterial3d<VoxelFadeMaterial>,
+    voxel_materials: &VoxelMaterials,
+    fade_materials: &VoxelReplayFadeMaterials,
+) -> Option<Handle<StandardMaterial>> {
+    fade_materials
+        .handles
+        .iter()
+        .zip(&voxel_materials.handles)
+        .find_map(|(fade, normal)| (material.0 == *fade).then(|| normal.clone()))
+        .or_else(|| {
+            (material.0 == fade_materials.planet_ocean)
+                .then(|| voxel_materials.planet_ocean.clone())
+        })
 }
 
 fn handle_editor_requests(
@@ -9502,10 +9596,18 @@ mod tests {
     }
 
     #[test]
-    fn replay_focus_updates_every_shared_voxel_fade_material() {
+    fn replay_fade_materials_never_touch_the_normal_dm_view() {
         let mut app = App::new();
-        app.init_resource::<Assets<VoxelFadeMaterial>>();
-        let (handles, planet_ocean) = {
+        app.init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<VoxelFadeMaterial>>();
+        let (normal_handles, normal_planet_ocean) = {
+            let mut assets = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
+            let handles =
+                std::array::from_fn(|_| assets.add(StandardMaterial::default()));
+            let planet_ocean = assets.add(StandardMaterial::default());
+            (handles, planet_ocean)
+        };
+        let (fade_handles, fade_planet_ocean) = {
             let mut assets = app.world_mut().resource_mut::<Assets<VoxelFadeMaterial>>();
             let handles = std::array::from_fn(|_| {
                 assets.add(ExtendedMaterial {
@@ -9520,20 +9622,56 @@ mod tests {
             (handles, planet_ocean)
         };
         app.insert_resource(VoxelMaterials {
-            handles: handles.clone(),
-            planet_ocean: planet_ocean.clone(),
+            handles: normal_handles.clone(),
+            planet_ocean: normal_planet_ocean,
+        })
+        .insert_resource(VoxelReplayFadeMaterials {
+            handles: fade_handles.clone(),
+            planet_ocean: fade_planet_ocean.clone(),
         })
         .insert_resource(VoxelReplayOcclusionFade {
-            active: true,
+            active: false,
             camera: Vec3::new(1.0, 2.0, 3.0),
             focus: Vec3::new(4.0, 5.0, 6.0),
         })
         .add_systems(Update, sync_voxel_occlusion_fade);
+        let voxel = app
+            .world_mut()
+            .spawn(MeshMaterial3d(normal_handles[0].clone()))
+            .id();
 
         app.update();
+        assert!(app
+            .world()
+            .entity(voxel)
+            .contains::<MeshMaterial3d<StandardMaterial>>());
+        assert!(!app
+            .world()
+            .entity(voxel)
+            .contains::<MeshMaterial3d<VoxelFadeMaterial>>());
+
+        app.world_mut()
+            .resource_mut::<VoxelReplayOcclusionFade>()
+            .active = true;
+        app.update();
+        assert!(!app
+            .world()
+            .entity(voxel)
+            .contains::<MeshMaterial3d<StandardMaterial>>());
+        assert_eq!(
+            app.world()
+                .entity(voxel)
+                .get::<MeshMaterial3d<VoxelFadeMaterial>>()
+                .unwrap()
+                .0,
+            fade_handles[0]
+        );
 
         let assets = app.world().resource::<Assets<VoxelFadeMaterial>>();
-        for handle in handles.iter().chain(std::iter::once(&planet_ocean)) {
+        for handle in fade_handles
+            .iter()
+            .chain(std::iter::once(&fade_planet_ocean))
+        {
             let settings = assets.get(handle).unwrap().extension.settings;
             assert_eq!(settings.camera_and_active, Vec4::new(1.0, 2.0, 3.0, 1.0));
             assert_eq!(
@@ -9541,6 +9679,19 @@ mod tests {
                 Vec4::new(4.0, 5.0, 6.0, VOXEL_OCCLUSION_FOCUS_RADIUS)
             );
         }
+
+        app.world_mut()
+            .resource_mut::<VoxelReplayOcclusionFade>()
+            .active = false;
+        app.update();
+        assert!(app
+            .world()
+            .entity(voxel)
+            .contains::<MeshMaterial3d<StandardMaterial>>());
+        assert!(!app
+            .world()
+            .entity(voxel)
+            .contains::<MeshMaterial3d<VoxelFadeMaterial>>());
     }
 
     #[test]
