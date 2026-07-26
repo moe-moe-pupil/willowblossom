@@ -151,6 +151,20 @@ geometry, while a stable new id preserves subsequent user resizing.
 Version nested and standalone ids independently because each has separate
 persisted `Resize` state.
 
+If a nested window must follow a movable parent, avoid combining
+`current_pos(...)` and `WindowDrag::Anywhere` on every frame. Drag-anywhere
+makes the whole child surface compete with its resize-edge hit targets. Compare
+the saved child position with the desired parent-relative position:
+
+- When the parent-relative position changed, apply `current_pos(...)` for that
+  frame and use `WindowDrag::Anywhere` so egui accepts the forced movement.
+- On normal frames, omit `current_pos(...)` and use `WindowDrag::TitleBar` so
+  the body and edges remain dedicated to content and resizing.
+
+Version the nested window id once when replacing an always-drag-anywhere
+workaround, because its persisted interaction/geometry state belongs to the old
+behavior.
+
 For fixed-size item catalogs, cap the window and omit `num_columns`; call `end_row()` at the intended boundary and cap cell widths. Version the window and grid ids once if their persisted layout already contains the oversized width:
 
 ```rust
@@ -187,7 +201,9 @@ After patching:
    viewport instead of increasing every frame.
 7. For nested windows, send pointer press/move/release events to a resize edge
    in a regression test and assert the outer width changes. Run the child with
-   the same parent constraint, `current_pos`, and drag-area mode as production.
+   the real parent window, parent/child sublayer relationship, parent
+   constraint, conditional `current_pos`, and drag-area modes used in
+   production.
 
 ## Rules
 

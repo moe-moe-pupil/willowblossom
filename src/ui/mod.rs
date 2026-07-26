@@ -1575,12 +1575,6 @@ fn chat_window(
         .min_size(window_min_size)
         .max_size(max_window_size)
         .resizable(true);
-    if grouped {
-        // egui 0.35's TitleBar drag path restores its saved absolute position after
-        // `current_pos`; Anywhere keeps child windows movable while allowing the
-        // discussion-group-relative position below to take effect every frame.
-        window = window.drag_area(egui::WindowDrag::Anywhere);
-    }
     if let Some(group_name) = current_group {
         let offset_key = (
             group_name.to_owned(),
@@ -1590,12 +1584,14 @@ fn chat_window(
             .get(&offset_key)
             .map(|offset| group_member_position(constraint_rect, *offset))
             .unwrap_or_else(|| group_member_default_pos(constraint_rect, target_id));
-        window = window
-            .current_pos(desired_position)
-            .default_pos(group_member_default_pos(
-                constraint_rect,
-                target_id,
-            ));
+        window = window.default_pos(desired_position);
+        if group_member_window_needs_position(ctx, window_id, desired_position) {
+            window = window
+                .current_pos(desired_position)
+                .drag_area(egui::WindowDrag::Anywhere);
+        } else {
+            window = window.drag_area(egui::WindowDrag::TitleBar);
+        }
     }
     let show_character_button = !is_group_chat_target(manager, target_id);
     let trpg_membership_group = focused_trpg_group_name
@@ -2022,12 +2018,12 @@ fn standalone_chat_window_id(id: Id, target_id: &str) -> Id {
 fn chat_group_window_id(group_name: &str) -> Id { Id::new((group_name, "chat_group_window_v2")) }
 
 fn group_member_chat_window_id(group_name: &str, target_id: &str) -> Id {
-    // v4 discards v3 geometry that reused the larger standalone-chat default
-    // and could leave a nested member window pinned to its parent's width.
+    // v5 discards v4 interaction state from the drag-anywhere/current-pos
+    // workaround, which competed with the nested window's resize edges.
     Id::new((
         group_name,
         target_id,
-        "group_member_chat_window_v4",
+        "group_member_chat_window_v5",
     ))
 }
 
@@ -2104,6 +2100,14 @@ fn group_member_position(parent_rect: Rect, offset: Vec2) -> Pos2 { parent_rect.
 
 fn group_member_offset(parent_rect: Rect, member_rect: Rect) -> Vec2 {
     member_rect.min - parent_rect.min
+}
+
+fn group_member_window_needs_position(ctx: &Context, window_id: Id, position: Pos2) -> bool {
+    ctx.memory(|memory| {
+        memory
+            .area_rect(window_id)
+            .is_none_or(|rect| rect.min.distance(position) > 0.5)
+    })
 }
 
 fn chat_window_default_size(grouped: bool) -> Vec2 {
@@ -14735,11 +14739,19 @@ mod tests {
         let constraint_rect = group_member_constraint_rect(parent_rect);
         let window_id = group_member_chat_window_id("测试讨论组", "测试成员");
         let position = constraint_rect.min + egui::vec2(20.0, 20.0);
-        let show_window = |ctx: &Context| {
-            egui::Window::new("成员")
+        let show_windows = |ctx: &Context| {
+            let parent_id = chat_group_window_id("测试讨论组");
+            egui::Window::new("讨论组")
+                .id(parent_id)
+                .current_pos(parent_rect.min)
+                .fixed_size(parent_rect.size())
+                .show(ctx, |ui| {
+                    ui.allocate_exact_size(ui.available_size(), Sense::hover());
+                });
+            let mut child_window = egui::Window::new("成员")
                 .id(window_id)
                 .constrain_to(constraint_rect)
-                .current_pos(position)
+                .default_pos(position)
                 .default_size(chat_window_default_size(true))
                 .min_size(CHAT_WINDOW_MIN_SIZE)
                 .max_size(chat_window_max_size(
@@ -14747,9 +14759,15 @@ mod tests {
                     CHAT_WINDOW_MIN_SIZE,
                     true,
                 ))
-                .resizable(true)
-                .drag_area(egui::WindowDrag::Anywhere)
-                .show(ctx, |ui| {
+                .resizable(true);
+            if group_member_window_needs_position(ctx, window_id, position) {
+                child_window = child_window
+                    .current_pos(position)
+                    .drag_area(egui::WindowDrag::Anywhere);
+            } else {
+                child_window = child_window.drag_area(egui::WindowDrag::TitleBar);
+            }
+            let child_rect = child_window.show(ctx, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         let _ = ui.button("角色");
                         let _ = ui.button("查看玩家视角");
@@ -14762,7 +14780,12 @@ mod tests {
                 })
                 .unwrap()
                 .response
-                .rect
+                .rect;
+            ctx.set_sublayer(
+                egui::LayerId::new(egui::Order::Middle, parent_id),
+                egui::LayerId::new(egui::Order::Middle, window_id),
+            );
+            child_rect
         };
         let run_frame = |ctx: &Context, events: Vec<egui::Event>| {
             ctx.begin_pass(egui::RawInput {
@@ -14770,7 +14793,7 @@ mod tests {
                 events,
                 ..Default::default()
             });
-            let rect = show_window(ctx);
+            let rect = show_windows(ctx);
             let _ = ctx.end_pass();
             rect
         };
@@ -14846,11 +14869,17 @@ mod tests {
             );
             collapsing.set_open(false);
             collapsing.store(ctx);
-            egui::Window::new("成员")
+            let mut window = egui::Window::new("成员")
                 .id(window_id)
-                .drag_area(egui::WindowDrag::Anywhere)
-                .current_pos(position)
-                .show(ctx, |_| {});
+                .default_pos(position);
+            if group_member_window_needs_position(ctx, window_id, position) {
+                window = window
+                    .current_pos(position)
+                    .drag_area(egui::WindowDrag::Anywhere);
+            } else {
+                window = window.drag_area(egui::WindowDrag::TitleBar);
+            }
+            window.show(ctx, |_| {});
         };
 
         ctx.begin_pass(egui::RawInput {
