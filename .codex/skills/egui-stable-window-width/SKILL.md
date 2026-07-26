@@ -91,6 +91,51 @@ ui.horizontal(|ui| {
 });
 ```
 
+For user-resizable chat windows, do not replace runaway growth with a small
+hard-coded maximum width. Bound the width to the actual containing rectangle,
+keep any product-specific height cap separate, and make dense toolbars wrap:
+
+```rust
+let constraint_rect = if nested {
+    parent_chat_rect
+} else {
+    ctx.content_rect()
+};
+let min_size = egui::vec2(260.0, 260.0);
+let max_size = egui::vec2(
+    constraint_rect.width().max(min_size.x),
+    720.0_f32.min(constraint_rect.height()).max(min_size.y),
+);
+
+egui::Window::new(title)
+    .id(window_id)
+    .constrain_to(constraint_rect)
+    .default_size(egui::vec2(360.0, 520.0))
+    .min_size(min_size)
+    .max_size(max_size)
+    .resizable(true)
+    .show(ctx, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            // Dense chat controls.
+        });
+
+        // Width-filling content is safe after the outer window is bounded.
+        let width = ui.available_width();
+        ui.add(egui::TextEdit::multiline(input).desired_width(width));
+    });
+```
+
+Apply this contract consistently to every variant of the same surface:
+standalone/private chats, group chats, child chats nested in a discussion
+group, imported/legacy chat windows, and send windows. A nested child should
+use its parent group's usable rectangle; a standalone window should use the
+viewport or the app's central-panel rectangle.
+
+If an older version used a non-wrapping toolbar or saved an invalid size,
+version that window's persistent id once (for example, `_v2` to `_v3`). Do not
+change the id every release: the one-time change intentionally discards stale
+geometry, while a stable new id preserves subsequent user resizing.
+
 For fixed-size item catalogs, cap the window and omit `num_columns`; call `end_row()` at the intended boundary and cap cell widths. Version the window and grid ids once if their persisted layout already contains the oversized width:
 
 ```rust
@@ -119,6 +164,12 @@ After patching:
 2. Open the affected window and manually resize it narrower.
 3. Interact with the text fields, especially long URLs and multiline skill descriptions.
 4. Close and reopen the window. If it still reopens at the old 100% width, clear persisted egui memory or temporarily change the window `.id(...)` once to discard the stored oversized rect.
+5. For chat windows, test standalone/private, discussion-group, nested member,
+   legacy chat, and send-window variants. Verify both widening toward the
+   containing rectangle and narrowing until the configured minimum.
+6. Add a multi-frame egui regression test with width-filling content. Record
+   the outer width over several frames and assert it stabilizes below the
+   viewport instead of increasing every frame.
 
 ## Rules
 
@@ -130,3 +181,8 @@ After patching:
 - Avoid `desired_width(ui.available_width())` unless the parent has already been capped.
 - Clamp widths with realistic minimum and maximum values near the widget that requests size.
 - Use `horizontal_wrapped` or separate rows for dense control groups that do not need to stay on one line.
+- For a user-resizable window, use the containing rectangle as the maximum
+  width instead of an arbitrary small constant that blocks deliberate widening.
+- Treat viewport bounding and content wrapping as complementary: the bound
+  stops runaway growth, while wrapping removes minimum-width pressure and
+  permits deliberate shrinking.

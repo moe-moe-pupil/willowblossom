@@ -1414,7 +1414,7 @@ fn chat_window(
     let player_visible_options = player_visible_preview_options(manager, target_id, messages);
     let response = window.show(ctx, |ui| {
         if current_group.is_some() || show_character_button || trpg_membership_group.is_some() {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if let Some(group_name) = trpg_membership_group.as_deref() {
                     if ui
                         .checkbox(
@@ -1786,10 +1786,12 @@ fn window_received_focus(ctx: &Context, response: &Response) -> bool {
 }
 
 fn standalone_chat_window_id(id: Id, target_id: &str) -> Id {
+    // v3 discards v2 resize memory whose minimum content width may have been
+    // inflated by the old non-wrapping private-chat toolbar.
     Id::new((
         id,
         target_id,
-        "standalone_chat_window_v2",
+        "standalone_chat_window_v3",
     ))
 }
 
@@ -2579,6 +2581,12 @@ fn legacy_team_chat_windows(
         )))
         .default_size(entry.default_size)
         .min_width(300.0)
+        .max_size(chat_window_max_size(
+            ctx.content_rect(),
+            egui::vec2(300.0, 16.0),
+            false,
+        ))
+        .resizable(true)
         .open(&mut window_open);
         if let Some(default_pos) = entry.default_pos {
             window = window.default_pos(default_pos);
@@ -2789,7 +2797,13 @@ fn legacy_send_pane_windows(
             entry.pane_key.as_str(),
         )))
         .default_size(Vec2::new(360.0, 180.0))
-        .min_width(280.0);
+        .min_width(280.0)
+        .max_size(chat_window_max_size(
+            ctx.content_rect(),
+            egui::vec2(280.0, 16.0),
+            false,
+        ))
+        .resizable(true);
         if entry.closable {
             window = window.open(&mut window_open);
         }
@@ -14430,6 +14444,52 @@ mod tests {
 
         assert!(widths[1..].windows(2).all(|pair| pair[0] == pair[1]));
         assert!(widths.last().copied().unwrap() < screen_rect.width());
+    }
+
+    #[test]
+    fn wrapped_private_chat_toolbar_keeps_the_requested_width() {
+        let ctx = Context::default();
+        let screen_rect =
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let mut widths = Vec::new();
+
+        for _ in 0..6 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            });
+            let response = egui::Window::new("私聊")
+                .id(Id::new("wrapped_private_chat_toolbar_test"))
+                .default_size(CHAT_WINDOW_SIZE)
+                .min_size(CHAT_WINDOW_MIN_SIZE)
+                .max_size(chat_window_max_size(
+                    screen_rect,
+                    CHAT_WINDOW_MIN_SIZE,
+                    false,
+                ))
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for label in [
+                            "角色",
+                            "查看玩家视角",
+                            "按玩家可见",
+                            "设置轮次",
+                            "当前",
+                        ] {
+                            let _ = ui.button(label);
+                        }
+                    });
+                    let body_size = egui::vec2(ui.available_width(), 180.0);
+                    ui.allocate_exact_size(body_size, Sense::hover());
+                })
+                .unwrap();
+            widths.push(response.response.rect.width());
+            let _ = ctx.end_pass();
+        }
+
+        assert!(widths[1..].windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(widths.last().copied().unwrap() < 500.0);
     }
 
     #[test]
