@@ -118,6 +118,7 @@ const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-rep
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const BACKGROUND_MUSIC_PATH: &str = "assets/audio/jrpg2-piano.mp3";
 const SPARK_TTS_RUNTIME_DIR: &str = ".data/willowblossom/tts/spark";
+const SPARK_TTS_SPEECH_CACHE_VERSION: u32 = 1;
 const SHORT_UTTERANCE_MAX_UNITS: usize = 6;
 const SHORT_UTTERANCE_SPEED_CAP: f32 = 1.10;
 const SHORT_UTTERANCE_HEAD_PAD_MS: u64 = 80;
@@ -785,7 +786,10 @@ fn preview_replay_speech(
 ) {
     if studio.speech_enabled
         && onnx_tts_is_available()
-        && matches!(studio.mode, ReplayMode::Playing | ReplayMode::Paused)
+        && matches!(
+            studio.mode,
+            ReplayMode::Idle | ReplayMode::Playing | ReplayMode::Paused
+        )
     {
         if let Some(replay) = studio.replay.as_ref() {
             let current_index = active_dialogue_index(&replay.dialogue, studio.playback_ms)
@@ -881,33 +885,21 @@ impl PreviewSpeechController {
     ) -> Result<(), String> {
         let signature = replay_voice_signature(replay, global_volume);
         if self.prepared_signature != Some(signature) {
-            if self.onnx_worker.is_none() {
-                self.onnx_worker = Some(start_onnx_preview_worker()?);
-            }
             self.prepared_signature = Some(signature);
             self.onnx_cache.clear();
             self.onnx_queued.clear();
             self.active_cue = None;
             self.onnx_failed = false;
-            self.onnx_worker
-                .as_ref()
-                .expect("ONNX worker was initialized")
-                .latest_signature
-                .store(signature, Ordering::Release);
+            if let Some(worker) = self.onnx_worker.as_ref() {
+                worker.latest_signature.store(signature, Ordering::Release);
+            }
         }
-        let worker = self
-            .onnx_worker
-            .as_ref()
-            .expect("ONNX worker was initialized");
         for &index in requested_indices {
             let Some(line) = replay.dialogue.get(index) else {
                 continue;
             };
             let cue = (replay.created_at_unix_ms, index);
-            if !line.included
-                || self.onnx_cache.contains_key(&cue)
-                || !self.onnx_queued.insert(cue)
-            {
+            if !line.included || self.onnx_cache.contains_key(&cue) {
                 continue;
             }
             let settings = replay
@@ -915,22 +907,45 @@ impl PreviewSpeechController {
                 .get(&line.sender_id)
                 .cloned()
                 .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
+            let text = speech_text_for_line(line);
+            let speaker =
+                resolved_emotivoice_speaker(settings.voice_name.as_deref(), line.sender_id);
+            let emotion =
+                resolved_emotivoice_emotion(settings.emotion.as_deref()).to_owned();
+            let speed = combined_onnx_speed(
+                settings.speech_rate,
+                replay.master_speech_speed,
+            );
+            let volume = (global_volume * settings.volume).max(0.0);
+            if let Some(wav) = read_speech_cache(&text, &speaker, &emotion, speed) {
+                self.onnx_cache.insert(cue, (wav, volume));
+                continue;
+            }
+            if !self.onnx_queued.insert(cue) {
+                continue;
+            }
+            if self.onnx_worker.is_none() {
+                self.onnx_worker = Some(start_onnx_preview_worker()?);
+                self.onnx_worker
+                    .as_ref()
+                    .expect("ONNX worker was initialized")
+                    .latest_signature
+                    .store(signature, Ordering::Release);
+            }
+            let worker = self
+                .onnx_worker
+                .as_ref()
+                .expect("ONNX worker was initialized");
             worker
                 .requests
                 .send(OnnxPreviewRequest {
                     signature,
                     cue,
-                    text: speech_text_for_line(line),
-                    speaker: resolved_emotivoice_speaker(
-                        settings.voice_name.as_deref(),
-                        line.sender_id,
-                    ),
-                    emotion: resolved_emotivoice_emotion(settings.emotion.as_deref()).to_owned(),
-                    speed: combined_onnx_speed(
-                        settings.speech_rate,
-                        replay.master_speech_speed,
-                    ),
-                    volume: (global_volume * settings.volume).max(0.0),
+                    text,
+                    speaker,
+                    emotion,
+                    speed,
+                    volume,
                 })
                 .map_err(|err| format!("Spark-TTS preview worker stopped: {err}"))?;
         }
@@ -975,6 +990,62 @@ fn emotivoice_source_path() -> PathBuf { emotivoice_root().join("Spark-TTS") }
 fn emotivoice_model_path() -> PathBuf { emotivoice_root().join("Spark-TTS-0.5B") }
 
 fn emotivoice_voice_bank_path() -> PathBuf { emotivoice_root().join("voice-bank") }
+
+fn emotivoice_speech_cache_path(
+    text: &str,
+    speaker: &str,
+    emotion: &str,
+    speed: f32,
+) -> PathBuf {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for part in [
+        SPARK_TTS_SPEECH_CACHE_VERSION.to_le_bytes().as_slice(),
+        emotivoice_model_text(text).as_bytes(),
+        speaker.as_bytes(),
+        emotion.as_bytes(),
+        speed.to_bits().to_le_bytes().as_slice(),
+    ] {
+        for byte in (part.len() as u64).to_le_bytes().iter().chain(part) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    emotivoice_root()
+        .join("speech-cache")
+        .join(format!("{hash:016x}.wav"))
+}
+
+fn read_speech_cache(text: &str, speaker: &str, emotion: &str, speed: f32) -> Option<Vec<u8>> {
+    let path = emotivoice_speech_cache_path(text, speaker, emotion, speed);
+    let bytes = fs::read(&path).ok()?;
+    if bytes.len() >= 44
+        && &bytes[0..4] == b"RIFF"
+        && &bytes[8..12] == b"WAVE"
+    {
+        Some(bytes)
+    } else {
+        let _ = fs::remove_file(path);
+        None
+    }
+}
+
+fn cache_speech(
+    text: &str,
+    speaker: &str,
+    emotion: &str,
+    speed: f32,
+    wav: &[u8],
+) {
+    let path = emotivoice_speech_cache_path(text, speaker, emotion, speed);
+    let Some(parent) = path.parent() else { return };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(mut temporary) = tempfile::NamedTempFile::new_in(parent) else { return };
+    if temporary.write_all(wav).is_ok() && temporary.flush().is_ok() {
+        let _ = temporary.persist_noclobber(path);
+    }
+}
 
 fn emotivoice_worker_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1257,12 +1328,20 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                     continue;
                 }
                 let wav = tts.as_mut().map_err(|err| err.clone()).and_then(|tts| {
-                    tts.synthesize(
+                    let wav = tts.synthesize(
                         &request.text,
                         &request.speaker,
                         &request.emotion,
                         request.speed,
-                    )
+                    )?;
+                    cache_speech(
+                        &request.text,
+                        &request.speaker,
+                        &request.emotion,
+                        request.speed,
+                        &wav,
+                    );
+                    Ok(wav)
                 });
                 if request.signature != worker_signature.load(Ordering::Acquire) {
                     continue;
@@ -3779,15 +3858,33 @@ fn synthesize_speech_batch(
         return Ok(());
     }
     let _ = working_directory;
-    let mut tts = create_onnx_tts()?;
+    let mut tts = None;
     for job in jobs {
         let max_samples = job.duration_ms.saturating_mul(32_000) / 1_000;
-        let wav = tts.synthesize(
-            &job.text,
-            &job.speaker,
-            &job.emotion,
-            job.onnx_speed,
-        )?;
+        let wav = if let Some(wav) =
+            read_speech_cache(&job.text, &job.speaker, &job.emotion, job.onnx_speed)
+        {
+            wav
+        } else {
+            let tts = match tts.as_mut() {
+                Some(tts) => tts,
+                None => tts.insert(create_onnx_tts()?),
+            };
+            let wav = tts.synthesize(
+                &job.text,
+                &job.speaker,
+                &job.emotion,
+                job.onnx_speed,
+            )?;
+            cache_speech(
+                &job.text,
+                &job.speaker,
+                &job.emotion,
+                job.onnx_speed,
+                &wav,
+            );
+            wav
+        };
         fs::write(&job.output_path, wav)
             .map_err(|err| format!("无法保存 Spark-TTS 角色语音：{err}"))?;
         let samples = read_pcm16_mono_wav(Path::new(&job.output_path))?;
@@ -6240,6 +6337,62 @@ mod tests {
         let studio = ReplayStudio::default();
         assert_eq!(studio.music_volume, 0.65);
         assert_eq!(studio.speech_volume, 1.25);
+    }
+
+    #[test]
+    fn speech_cache_reuses_only_matching_voice_inputs() {
+        let original = emotivoice_speech_cache_path("你好", "spark-m01", "普通", 1.3);
+        assert_eq!(
+            original,
+            emotivoice_speech_cache_path("你好", "spark-m01", "普通", 1.3)
+        );
+        assert_ne!(
+            original,
+            emotivoice_speech_cache_path("再见", "spark-m01", "普通", 1.3)
+        );
+        assert_ne!(
+            original,
+            emotivoice_speech_cache_path("你好", "spark-f01", "普通", 1.3)
+        );
+        assert_ne!(
+            original,
+            emotivoice_speech_cache_path("你好", "spark-m01", "普通", 1.5)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the installed Spark-TTS Chinese runtime"]
+    fn speech_cache_benchmark_avoids_repeat_gpu_synthesis() {
+        let text = "这是角色语音持久缓存性能测试。";
+        let speaker = "spark-m01";
+        let emotion = "普通";
+        let speed = 1.3;
+        let cache_path = emotivoice_speech_cache_path(text, speaker, emotion, speed);
+        let _ = fs::remove_file(&cache_path);
+        let directory = tempfile::tempdir().unwrap();
+        let job = |name: &str| SpeechSynthesisJob {
+            text: text.to_owned(),
+            output_path: directory.path().join(name).to_string_lossy().into_owned(),
+            speaker: speaker.to_owned(),
+            emotion: emotion.to_owned(),
+            onnx_speed: speed,
+            duration_ms: 20_000,
+        };
+
+        let cold_started = std::time::Instant::now();
+        synthesize_speech_batch(directory.path(), &[job("cold.wav")]).unwrap();
+        let cold = cold_started.elapsed();
+        let warm_started = std::time::Instant::now();
+        synthesize_speech_batch(directory.path(), &[job("warm.wav")]).unwrap();
+        let warm = warm_started.elapsed();
+
+        eprintln!("Spark-TTS cold={cold:?}, cache-hit={warm:?}");
+        assert!(warm < cold);
+        assert_eq!(
+            fs::read(directory.path().join("cold.wav")).unwrap(),
+            fs::read(directory.path().join("warm.wav")).unwrap()
+        );
+        let _ = fs::remove_file(cache_path);
     }
 
     #[test]
