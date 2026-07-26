@@ -1660,7 +1660,11 @@ fn replay_studio_ui(
             )
             .show(ctx, |ui| {
                 if ui.button("🎬 回放").clicked() {
-                    studio.panel_open = !studio.panel_open;
+                    studio.panel_open = true;
+                    ui::raise_and_expand_window(
+                        ui.ctx(),
+                        egui::Id::new("trpg-replay-studio"),
+                    );
                 }
             });
     }
@@ -2054,6 +2058,10 @@ fn replay_controls(
         }
         if ui.button("角色语音设置…").clicked() {
             studio.speech_settings_open = true;
+            ui::raise_and_expand_window(
+                ui.ctx(),
+                egui::Id::new("replay-speaker-voice-settings"),
+            );
         }
     });
     if let Some(replay) = studio.replay.as_ref() {

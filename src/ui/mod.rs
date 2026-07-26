@@ -1192,6 +1192,7 @@ fn file_menu_button(
 
         if ui.button("TRPG设置").clicked() {
             *trpg_group_settings_open = true;
+            raise_and_expand_window(ui.ctx(), Id::new("trpg_group_settings_window"));
             ui.close();
         }
     });
@@ -1207,10 +1208,12 @@ fn tools_menu_button(
 
         if ui.button("战斗轮").clicked() {
             battle_round_state.open_panel();
+            raise_and_expand_window(ui.ctx(), Id::new("战斗轮"));
             ui.close();
         }
         if ui.button("规则引擎").clicked() {
             rule_engine_state.open_panel();
+            raise_and_expand_window(ui.ctx(), Id::new("规则引擎"));
             ui.close();
         }
     });
@@ -1259,6 +1262,7 @@ fn pool_menu_button(
             if ui.button(label).clicked() {
                 state.pool_window_tab = tab;
                 state.pool_window_open = true;
+                raise_and_expand_window(ui.ctx(), Id::new("pool_management_window"));
                 ui.close();
             }
         }
@@ -1652,6 +1656,10 @@ fn chat_window(
                 if show_character_button {
                     if ui.button("角色").clicked() {
                         quick_character_targets.insert(target_id.to_owned());
+                        raise_and_expand_window(
+                            ui.ctx(),
+                            Id::new(("quick_character_window", target_id)),
+                        );
                     }
                     let can_view_player =
                         target_id.parse::<u64>().is_ok() && player_view_request.is_some();
@@ -2089,8 +2097,7 @@ fn group_member_chat_window_id(group_name: &str, target_id: &str) -> Id {
     ))
 }
 
-fn focus_standalone_chat_window(ctx: &Context, target_id: &str) {
-    let window_id = standalone_chat_window_id(Id::new(target_id), target_id);
+pub(crate) fn raise_and_expand_window(ctx: &Context, window_id: Id) {
     let mut collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
         ctx,
         window_id.with("collapsing"),
@@ -2103,6 +2110,13 @@ fn focus_standalone_chat_window(ctx: &Context, target_id: &str) {
         window_id,
     ));
     ctx.request_repaint();
+}
+
+fn focus_standalone_chat_window(ctx: &Context, target_id: &str) {
+    raise_and_expand_window(
+        ctx,
+        standalone_chat_window_id(Id::new(target_id), target_id),
+    );
 }
 
 fn mark_target_read(
@@ -2863,6 +2877,14 @@ fn legacy_team_chat_window_entries(
     entries
 }
 
+fn legacy_team_chat_window_id(group_name: &str, team_id: &str) -> Id {
+    Id::new(("legacy_team_chat_window", group_name, team_id))
+}
+
+fn legacy_send_pane_window_id(group_name: &str, pane_key: &str) -> Id {
+    Id::new(("legacy_send_pane_window", group_name, pane_key))
+}
+
 fn legacy_team_chat_windows(
     ctx: &Context,
     manager: &NapcatMessageManager,
@@ -2889,11 +2911,10 @@ fn legacy_team_chat_windows(
             "旧频道聊天：{} / {}",
             entry.group_name, entry.title
         ))
-        .id(Id::new((
-            "legacy_team_chat_window",
-            entry.group_name.as_str(),
-            entry.team_id.as_str(),
-        )))
+        .id(legacy_team_chat_window_id(
+            &entry.group_name,
+            &entry.team_id,
+        ))
         .default_size(entry.default_size)
         .min_width(300.0)
         .max_size(chat_window_max_size(
@@ -3106,11 +3127,10 @@ fn legacy_send_pane_windows(
             "旧发送窗：{} / {}",
             entry.group_name, entry.title
         ))
-        .id(Id::new((
-            "legacy_send_pane_window",
-            entry.group_name.as_str(),
-            entry.pane_key.as_str(),
-        )))
+        .id(legacy_send_pane_window_id(
+            &entry.group_name,
+            &entry.pane_key,
+        ))
         .default_size(Vec2::new(360.0, 180.0))
         .min_width(280.0)
         .max_size(chat_window_max_size(
@@ -4338,6 +4358,7 @@ fn chat_list_panel(
                 if ui.button("打开工作区").clicked() {
                     trpg_group_settings.open = true;
                     trpg_group_settings.focused_group_name = Some(group_name.clone());
+                    raise_and_expand_window(ctx, Id::new("trpg_group_settings_window"));
                 }
             });
             ui.add_space(4.0);
@@ -11897,15 +11918,16 @@ fn legacy_group_surfaces_ui(
                     let window_key = (group_name.to_owned(), team.id.clone());
                     let window_open = state.open_legacy_team_chat_windows.contains(&window_key);
                     let button_text =
-                        if window_open { "独立聊天窗已开" } else { "打开独立聊天窗" };
-                    let response = ui.add_enabled(
-                        !window_open,
-                        egui::Button::new(button_text),
-                    );
+                        if window_open { "置顶独立聊天窗" } else { "打开独立聊天窗" };
+                    let response = ui.button(button_text);
                     let clicked = response.clicked();
                     response.on_hover_text("打开为独立旧频道聊天窗");
                     if clicked {
                         state.open_legacy_team_chat_windows.insert(window_key);
+                        raise_and_expand_window(
+                            ui.ctx(),
+                            legacy_team_chat_window_id(group_name, &team.id),
+                        );
                     }
                     if ui.button("转为小队").clicked() {
                         action = Some(LegacyGroupSurfaceAction::Promote(
@@ -12239,11 +12261,8 @@ fn legacy_group_surfaces_ui(
                         let window_open =
                             fixed_open || state.open_legacy_send_pane_windows.contains(&window_key);
                         let button_text =
-                            if window_open { "独立窗已开" } else { "打开独立窗" };
-                        let response = ui.add_enabled(
-                            !fixed_open,
-                            egui::Button::new(button_text),
-                        );
+                            if window_open { "置顶独立窗" } else { "打开独立窗" };
+                        let response = ui.button(button_text);
                         let clicked = response.clicked();
                         response.on_hover_text(if fixed_open {
                             "这个旧发送窗会自动保持独立窗口"
@@ -12252,6 +12271,10 @@ fn legacy_group_surfaces_ui(
                         });
                         if clicked {
                             state.open_legacy_send_pane_windows.insert(window_key);
+                            raise_and_expand_window(
+                                ui.ctx(),
+                                legacy_send_pane_window_id(group_name, &pane.key),
+                            );
                         }
                         if pane.closable && ui.button("删除发送窗").clicked() {
                             action = Some(
@@ -15108,6 +15131,32 @@ mod tests {
             ctx.memory(|memory| memory.area_rect(window_id).unwrap().min),
             egui::pos2(310.0, 260.0)
         );
+    }
+
+    #[test]
+    fn opening_a_window_expands_and_raises_it() {
+        let ctx = Context::default();
+        let window_id = Id::new("raise_and_expand_window_test");
+        let layer_id = egui::LayerId::new(egui::Order::Middle, window_id);
+        ctx.begin_pass(Default::default());
+        let mut collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
+            &ctx,
+            window_id.with("collapsing"),
+            true,
+        );
+        collapsing.set_open(false);
+        collapsing.store(&ctx);
+
+        raise_and_expand_window(&ctx, window_id);
+
+        assert!(egui::collapsing_header::CollapsingState::load(
+            &ctx,
+            window_id.with("collapsing")
+        )
+        .unwrap()
+        .is_open());
+        assert_eq!(ctx.top_layer_id(), Some(layer_id));
+        let _ = ctx.end_pass();
     }
 
     #[test]
