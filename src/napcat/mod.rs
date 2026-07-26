@@ -5800,7 +5800,8 @@ fn message_system(
             let incoming_user_id = json.data.user_id;
             manager.annotate_incoming_message_access(&target_id, &mut json);
 
-            let auto_forward = auto_forward_request(&manager, &json, &target_id);
+            let auto_forward = auto_forward_request(&manager, &json, &target_id)
+                .or_else(|| party_channel_auto_forward_request(&manager, &json, &target_id));
             let character_creation_response = if is_incoming_message
                 && matches!(
                     json.data.message_type,
@@ -8175,6 +8176,44 @@ fn auto_forward_request(
     })
 }
 
+fn party_channel_auto_forward_request(
+    manager: &NapcatMessageManager,
+    message: &NapcatMessage,
+    target_id: &str,
+) -> Option<AutoForwardRequest> {
+    if !matches!(
+        message.data.message_type,
+        NapcatMessageType::Private
+    ) || message.data.user_id == message.data.self_id
+    {
+        return None;
+    }
+
+    let text = party_channel_text(message)?;
+    let group = manager.group_for_player_target(target_id)?;
+    let party_id = group.party_id_for_player(target_id)?;
+    let party = group.parties.get(party_id)?;
+    let recipients = party
+        .players
+        .iter()
+        .filter(|member_id| member_id.as_str() != target_id)
+        .filter(|member_id| manager.chat_target_kind(member_id) == ChatTargetExportKind::Private)
+        .filter_map(|member_id| member_id.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+
+    if recipients.is_empty() {
+        return None;
+    }
+
+    Some(AutoForwardRequest {
+        recipients,
+        text: format!(
+            "{}: {}",
+            message.data.sender.nickname, text
+        ),
+    })
+}
+
 fn auto_forward_sender_access<'a>(
     manager: &'a NapcatMessageManager,
     target_id: &str,
@@ -8221,6 +8260,33 @@ fn quoted_auto_forward_text(message: &NapcatMessage) -> Option<String> {
 
 fn is_auto_forward_quote(character: char) -> bool {
     matches!(character, '"' | '“' | '”' | '＂')
+}
+
+fn party_channel_text(message: &NapcatMessage) -> Option<String> {
+    let mut text = String::new();
+    for chain in &message.data.message {
+        if let NapcatMessageChainType::Text { data } = &chain.variant {
+            text.push_str(&data.text);
+        }
+    }
+
+    let mut indexed_chars = text.char_indices();
+    let (_, start_bracket) = indexed_chars.next()?;
+    let (end_bracket_index, end_bracket) = indexed_chars.next_back()?;
+    let brackets_match = matches!(
+        (start_bracket, end_bracket),
+        ('[', ']') | ('【', '】')
+    );
+    if !brackets_match {
+        return None;
+    }
+
+    let inner = text[start_bracket.len_utf8()..end_bracket_index].trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_owned())
+    }
 }
 
 #[cfg(test)]
@@ -11777,6 +11843,104 @@ mod tests {
         .expect("private message should parse");
 
         assert_eq!(quoted_auto_forward_text(&message), None);
+    }
+
+    #[test]
+    fn detects_party_channel_text_with_ascii_and_full_width_brackets() {
+        assert_eq!(
+            party_channel_text(&test_private_message_from(
+                2,
+                "[hello party]"
+            )),
+            Some("hello party".to_owned())
+        );
+        assert_eq!(
+            party_channel_text(&test_private_message_from(
+                2,
+                "【你好，小队】"
+            )),
+            Some("你好，小队".to_owned())
+        );
+    }
+
+    #[test]
+    fn party_channel_text_requires_exact_matching_boundaries() {
+        for text in [
+            "I would say [hi]",
+            "[hi],",
+            " [hi]",
+            "[hi] ",
+            "[hi】",
+            "【hi]",
+            "[]",
+            "【 】",
+        ] {
+            assert_eq!(
+                party_channel_text(&test_private_message_from(2, text)),
+                None,
+                "{text:?} must not activate the party channel"
+            );
+        }
+    }
+
+    #[test]
+    fn party_channel_auto_forward_only_targets_same_party() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3, 4, 5] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message_from(user_id, "hello"),
+            ]);
+        }
+        let mut group = TrpgGroup {
+            players: vec![
+                "2".to_owned(),
+                "3".to_owned(),
+                "4".to_owned(),
+                "5".to_owned(),
+            ],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("red"));
+        group.set_player_party("4", Some("blue"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        let request = party_channel_auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "[red-only clue]"),
+            "2",
+        )
+        .expect("same-party recipient should be available");
+
+        assert_eq!(request.recipients, vec![3]);
+        assert!(!request.recipients.contains(&4));
+        assert!(!request.recipients.contains(&5));
+        assert_eq!(request.text, "user-2: red-only clue");
+    }
+
+    #[test]
+    fn party_channel_auto_forward_requires_party_assignment() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message_from(user_id, "hello"),
+            ]);
+        }
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
+
+        assert!(party_channel_auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "[public message]"),
+            "2",
+        )
+        .is_none());
     }
 
     #[test]
