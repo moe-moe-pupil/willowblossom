@@ -149,7 +149,9 @@ impl Plugin for ReplayPlugin {
                     snapshot_new_replay_messages,
                     record_replay.after(snapshot_new_replay_messages),
                     advance_replay,
-                    preview_replay_speech.after(advance_replay),
+                    preview_replay_speech
+                        .after(advance_replay)
+                        .after(record_replay),
                     render_video_frames,
                     poll_video_encoding,
                 ),
@@ -562,6 +564,8 @@ struct PreviewSpeechController {
     onnx_queued: HashSet<(u64, usize)>,
     onnx_attempts: HashMap<(u64, usize), u8>,
     onnx_failures: HashMap<(u64, usize), String>,
+    pending_generation_lines: HashSet<(u64, u64)>,
+    generation_cues: HashSet<(u64, usize)>,
     onnx_worker: Option<OnnxPreviewWorker>,
     audio_entity: Option<Entity>,
 }
@@ -635,6 +639,7 @@ fn record_replay(
     camera: Query<&Transform, With<VoxelViewportCamera>>,
     standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     mut studio: ResMut<ReplayStudio>,
+    mut speech: ResMut<PreviewSpeechController>,
 ) {
     if studio.mode != ReplayMode::Recording {
         return;
@@ -712,6 +717,10 @@ fn record_replay(
     let record_camera_enabled = studio.record_camera_enabled;
     if let Some(replay) = studio.replay.as_mut() {
         let captured_any = !captured.is_empty();
+        let captured_messages = captured
+            .iter()
+            .map(|line| (line.sender_id, line.source_time, line.text.clone()))
+            .collect::<HashSet<_>>();
         replay.dialogue.extend(captured);
         deduplicate_broadcast_dialogue(&mut replay.dialogue, &manager);
         assign_replay_line_ids(&mut replay.dialogue);
@@ -738,6 +747,21 @@ fn record_replay(
                     &obstacles,
                 );
             }
+        }
+        if captured_any {
+            speech.pending_generation_lines.extend(
+                replay
+                    .dialogue
+                    .iter()
+                    .filter(|line| {
+                        captured_messages.contains(&(
+                            line.sender_id,
+                            line.source_time,
+                            line.text.clone(),
+                        ))
+                    })
+                    .map(|line| (replay.created_at_unix_ms, line.line_id)),
+            );
         }
     }
 }
@@ -802,18 +826,51 @@ fn preview_replay_speech(
     mut speech: ResMut<PreviewSpeechController>,
     mut audio_sources: ResMut<Assets<AudioSource>>,
 ) {
+    let pending_generation_line_ids = studio
+        .replay
+        .as_ref()
+        .map(|replay| {
+            speech
+                .pending_generation_lines
+                .iter()
+                .filter_map(|(replay_id, line_id)| {
+                    (*replay_id == replay.created_at_unix_ms).then_some(*line_id)
+                })
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut generation_request_consumed = false;
     if studio.speech_enabled
         && onnx_tts_is_available()
     {
         if let Some(replay) = studio.replay.as_ref() {
             let requested = replay_speech_preparation_indices(replay, studio.playback_ms);
-            if let Err(err) =
-                speech.prepare_onnx_replay(replay, studio.speech_volume, &requested)
+            match speech.prepare_onnx_replay(
+                replay,
+                studio.speech_volume,
+                &requested,
+                &pending_generation_line_ids,
+            )
             {
-                studio.status = format!("角色语音预览失败：{err}");
-                eprintln!("failed to prepare Spark-TTS preview speech: {err}");
+                Ok(()) => generation_request_consumed = true,
+                Err(err) => {
+                    studio.status = format!("角色语音预览失败：{err}");
+                    eprintln!("failed to prepare Spark-TTS preview speech: {err}");
+                },
             }
         }
+    } else {
+        generation_request_consumed = true;
+    }
+    if generation_request_consumed {
+        let current_replay_id = studio
+            .replay
+            .as_ref()
+            .map(|replay| replay.created_at_unix_ms);
+        speech.pending_generation_lines.retain(|(replay_id, line_id)| {
+            Some(*replay_id) != current_replay_id
+                || !pending_generation_line_ids.contains(line_id)
+        });
     }
     let active = ((studio.mode == ReplayMode::Playing || studio.video_render.is_some())
         && studio.speech_enabled)
@@ -839,6 +896,7 @@ fn preview_replay_speech(
         match result.wav {
             Ok(wav) => {
                 newly_ready_current |= Some(result.cue) == cue;
+                speech.generation_cues.remove(&result.cue);
                 speech.onnx_failures.remove(&result.cue);
                 speech.onnx_cache.insert(result.cue, (wav, result.volume));
             },
@@ -847,6 +905,7 @@ fn preview_replay_speech(
                 let attempts = speech.onnx_attempts.entry(result.cue).or_default();
                 *attempts = attempts.saturating_add(1);
                 if *attempts >= 2 {
+                    speech.generation_cues.remove(&result.cue);
                     speech.onnx_failures.insert(result.cue, err.clone());
                     studio.status = format!("一条角色语音生成失败，其他台词将继续：{err}");
                 } else {
@@ -889,6 +948,7 @@ impl PreviewSpeechController {
         replay: &ReplayFile,
         global_volume: f32,
         requested_indices: &[usize],
+        generation_line_ids: &HashSet<u64>,
     ) -> Result<(), String> {
         let signature = replay_voice_signature(replay, global_volume);
         if self.prepared_signature != Some(signature) {
@@ -897,6 +957,7 @@ impl PreviewSpeechController {
             self.onnx_queued.clear();
             self.onnx_attempts.clear();
             self.onnx_failures.clear();
+            self.generation_cues.clear();
             self.active_cue = None;
             if let Some(worker) = self.onnx_worker.as_ref() {
                 worker.latest_signature.store(signature, Ordering::Release);
@@ -932,6 +993,14 @@ impl PreviewSpeechController {
                 self.onnx_cache.insert(cue, (wav, volume));
                 continue;
             }
+            if !speech_generation_requested(
+                line.line_id,
+                cue,
+                generation_line_ids,
+                &self.generation_cues,
+            ) {
+                continue;
+            }
             if self.onnx_queued.contains(&cue) {
                 continue;
             }
@@ -943,6 +1012,7 @@ impl PreviewSpeechController {
                     .latest_signature
                     .store(signature, Ordering::Release);
             }
+            self.generation_cues.insert(cue);
             let send_result = self
                 .onnx_worker
                 .as_ref()
@@ -970,7 +1040,9 @@ impl PreviewSpeechController {
 
     fn onnx_cue_finished(&self, signature: u64, cue: (u64, usize)) -> bool {
         self.prepared_signature == Some(signature)
-            && (self.onnx_cache.contains_key(&cue) || self.onnx_failures.contains_key(&cue))
+            && (self.onnx_cache.contains_key(&cue)
+                || self.onnx_failures.contains_key(&cue)
+                || !self.onnx_queued.contains(&cue))
     }
 
     fn preparation_progress(
@@ -2208,6 +2280,11 @@ fn replay_controls(
     if let Some(replay) = studio.replay.as_ref() {
         let (ready, failed, total) =
             speech.preparation_progress(replay, studio.speech_volume);
+        let generation_active = !speech.generation_cues.is_empty()
+            || speech
+                .pending_generation_lines
+                .iter()
+                .any(|(replay_id, _)| *replay_id == replay.created_at_unix_ms);
         let processed = ready.saturating_add(failed);
         let progress = if total == 0 {
             1.0
@@ -2218,21 +2295,23 @@ fn replay_controls(
             format!("语音预生成已暂停：{ready}/{total}")
         } else if !onnx_tts_is_available() {
             format!("语音预生成不可用：{ready}/{total}")
-        } else if failed > 0 && processed == total {
+        } else if generation_active && failed > 0 && processed == total {
             format!("语音预生成完成：成功 {ready}/{total}，失败 {failed}")
-        } else if failed > 0 {
-            format!("正在持续预生成：成功 {ready}/{total}，失败 {failed}")
+        } else if generation_active && failed > 0 {
+            format!("正在生成新消息语音：成功 {ready}/{total}，失败 {failed}")
         } else if ready == total {
-            format!("语音预生成完成：{ready}/{total}")
+            format!("语音缓存已就绪：{ready}/{total}")
+        } else if generation_active {
+            format!("正在生成新消息语音：{ready}/{total}")
         } else {
-            format!("正在持续预生成角色语音：{ready}/{total}")
+            format!("语音缓存已就绪 {ready}/{total}；等待新消息")
         };
         ui.add(
             egui::ProgressBar::new(progress)
                 .desired_width(ui.available_width())
                 .text(text),
         );
-        ui.small("回放录制、编辑和等待期间都会持续生成全部台词；预览与 MP4 导出共用缓存。");
+        ui.small("收到新的录制消息时会生成对应的角色语音；点击播放只读取已有缓存，不会启动生成。预览与 MP4 导出共用缓存。");
     }
     ui.small("整体语速默认 1.10×，调整语速或单个角色音色时不会改变时间轴。六个字以内的极短台词会自动使用较自然的短句语速和首尾保护，避免吞字，不改变角色音色或音调。需要改变字幕、间隔和镜头时长时，请使用“整体台词停留”。预览与导出共用同一条时间线和 Spark-TTS 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
@@ -5669,6 +5748,15 @@ fn replay_speech_preparation_indices(replay: &ReplayFile, playback_ms: u64) -> V
         .collect()
 }
 
+fn speech_generation_requested(
+    line_id: u64,
+    cue: (u64, usize),
+    generation_line_ids: &HashSet<u64>,
+    generation_cues: &HashSet<(u64, usize)>,
+) -> bool {
+    generation_line_ids.contains(&line_id) || generation_cues.contains(&cue)
+}
+
 fn replay_dialogue_is_ready_for_display(
     studio: &ReplayStudio,
     speech: &PreviewSpeechController,
@@ -6954,7 +7042,7 @@ mod tests {
     }
 
     #[test]
-    fn continuous_speech_preparation_prioritizes_current_and_queues_every_line() {
+    fn speech_preparation_prioritizes_current_and_queues_every_line() {
         let replay_json = r#"{"format_version":2,"title":"test","campaign_id":"c","created_at_unix_ms":1,"duration_ms":3000,"audience":{"scope":"public"},"scene":{"voxels":[]},"camera":[],"dialogue":[]}"#;
         let mut replay: ReplayFile = serde_json::from_str(replay_json).unwrap();
         replay.dialogue = vec![
@@ -6983,6 +7071,56 @@ mod tests {
         assert!(speech.onnx_cue_finished(
             replay_voice_signature(&replay, 1.0),
             (replay.created_at_unix_ms, 2),
+        ));
+    }
+
+    #[test]
+    fn uncached_unqueued_speech_does_not_block_playback() {
+        let replay_json = r#"{"format_version":2,"title":"test","campaign_id":"c","created_at_unix_ms":1,"duration_ms":1000,"audience":{"scope":"public"},"scene":{"voxels":[]},"camera":[],"dialogue":[]}"#;
+        let mut replay: ReplayFile = serde_json::from_str(replay_json).unwrap();
+        replay.dialogue.push(test_dialogue(
+            0,
+            1_000,
+            DialogueSide::Right,
+        ));
+        let signature = replay_voice_signature(&replay, 1.0);
+        let mut speech = PreviewSpeechController::default();
+        speech.prepared_signature = Some(signature);
+
+        assert!(speech.onnx_cue_finished(
+            signature,
+            (replay.created_at_unix_ms, 0),
+        ));
+
+        speech
+            .onnx_queued
+            .insert((replay.created_at_unix_ms, 0));
+        assert!(!speech.onnx_cue_finished(
+            signature,
+            (replay.created_at_unix_ms, 0),
+        ));
+    }
+
+    #[test]
+    fn only_new_message_or_retry_cues_authorize_speech_generation() {
+        let cue = (7, 2);
+        assert!(!speech_generation_requested(
+            3,
+            cue,
+            &HashSet::new(),
+            &HashSet::new(),
+        ));
+        assert!(speech_generation_requested(
+            3,
+            cue,
+            &HashSet::from([3]),
+            &HashSet::new(),
+        ));
+        assert!(speech_generation_requested(
+            3,
+            cue,
+            &HashSet::new(),
+            &HashSet::from([cue]),
         ));
     }
 
