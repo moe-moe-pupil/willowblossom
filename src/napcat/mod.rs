@@ -147,13 +147,6 @@ struct NapcatGroupInfoRequests {
     pending_group_ids: HashSet<String>,
 }
 
-#[derive(Resource)]
-struct NapcatHistoryRequests {
-    next_request_id: u64,
-    requested_targets: HashSet<String>,
-    pending: HashMap<u64, String>,
-}
-
 pub struct NapcatPlugin;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -206,7 +199,7 @@ pub enum NapcatMessageChainType {
     Unsupported,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum NapcatMessageType {
     Private,
@@ -5365,7 +5358,6 @@ impl Plugin for NapcatPlugin {
                 Update,
                 request_missing_group_info_system,
             )
-            .add_systems(Update, request_missing_history_system)
             .add_systems(Update, send_result_system);
     }
 }
@@ -5392,11 +5384,6 @@ fn setup(mut commands: Commands) {
     commands.insert_resource(NapcatGroupInfoRequests {
         next_request_id: 2_000_000,
         pending_group_ids: HashSet::default(),
-    });
-    commands.insert_resource(NapcatHistoryRequests {
-        next_request_id: 3_000_000,
-        requested_targets: HashSet::default(),
-        pending: HashMap::default(),
     });
 
     let message_manager = NapcatMessageManager {
@@ -5688,16 +5675,11 @@ fn send_result_system(
     receiver: Res<NapcatSendResultReceiver>,
     mut send_manager: ResMut<NapcatSendManager>,
     mut automatic_replies: ResMut<NapcatAutomaticReplyRequests>,
-    mut history_requests: ResMut<NapcatHistoryRequests>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
 ) {
     let mut manager_changed = false;
     while let Ok(result) = receiver.0.try_recv() {
-        if let Some(request_key) = history_requests.pending.remove(&result.request_id) {
-            if result.error.is_some() {
-                history_requests.requested_targets.remove(&request_key);
-            }
-        } else if let Some(changed) = apply_automatic_private_reply_result(
+        if let Some(changed) = apply_automatic_private_reply_result(
             &result,
             &mut automatic_replies,
             &mut manager,
@@ -5765,179 +5747,6 @@ struct NapcatActionResponseData {
     group_id: Option<Value>,
     #[serde(default)]
     group_name: Option<String>,
-    #[serde(default)]
-    messages: Option<Vec<NapcatMessage>>,
-}
-
-const NAPCAT_HISTORY_SYNC_COUNT: usize = 100;
-const NAPCAT_HISTORY_ECHO_PREFIX: &str = "history:";
-
-fn request_missing_history_system(
-    sender: Option<Res<NapcatIOSender>>,
-    mut history_requests: ResMut<NapcatHistoryRequests>,
-    manager: Res<Persistent<NapcatMessageManager>>,
-) {
-    let Some(sender) = sender.as_deref() else {
-        return;
-    };
-
-    for entry in manager.chat_target_export_entries() {
-        let Some((action, kind)) = (match entry.kind {
-            ChatTargetExportKind::Private => Some(("get_friend_msg_history", "private")),
-            ChatTargetExportKind::Group => Some(("get_group_msg_history", "group")),
-            ChatTargetExportKind::Unknown => None,
-        }) else {
-            continue;
-        };
-        let request_key = format!("{kind}:{}", entry.target_id);
-        if history_requests.requested_targets.contains(&request_key) {
-            continue;
-        }
-        let Ok(target_id) = entry.target_id.parse::<u64>() else {
-            continue;
-        };
-        let request_id = history_requests.next_request_id;
-        history_requests.next_request_id += 1;
-        let echo = format!("{NAPCAT_HISTORY_ECHO_PREFIX}{request_key}");
-        let mut params = json!({
-            "count": NAPCAT_HISTORY_SYNC_COUNT,
-            "reverse_order": false,
-            "disable_get_url": false,
-            "parse_mult_msg": true,
-            "quick_reply": false,
-            "reverseOrder": false
-        });
-        params
-            .as_object_mut()
-            .expect("history params are an object")
-            .insert(
-                if kind == "private" { "user_id" } else { "group_id" }.to_owned(),
-                target_id.into(),
-            );
-        let message = Message::Text(
-            json!({
-                "action": action,
-                "params": params,
-                "echo": echo
-            })
-            .to_string()
-            .into(),
-        );
-        match sender.0.try_send(NapcatOutboundMessage {
-            request_id,
-            target_id: entry.target_id,
-            message,
-        }) {
-            Ok(()) => {
-                history_requests
-                    .requested_targets
-                    .insert(request_key.clone());
-                history_requests.pending.insert(request_id, request_key);
-            },
-            Err(err) => eprintln!("failed to queue NapCat history sync: {err}"),
-        }
-    }
-}
-
-fn apply_history_response(
-    response: &NapcatActionResponse,
-    manager: &mut NapcatMessageManager,
-) -> bool {
-    let Some(history_target) = response
-        .echo
-        .as_deref()
-        .and_then(|echo| echo.strip_prefix(NAPCAT_HISTORY_ECHO_PREFIX))
-    else {
-        return false;
-    };
-    let Some((kind, target_id)) = history_target.split_once(':') else {
-        return false;
-    };
-    let expected_kind = match kind {
-        "private" => ChatTargetExportKind::Private,
-        "group" => ChatTargetExportKind::Group,
-        _ => return false,
-    };
-    let Some(messages) = response
-        .data
-        .as_ref()
-        .and_then(|data| data.messages.as_ref())
-    else {
-        return false;
-    };
-
-    merge_history_messages(
-        manager,
-        target_id,
-        expected_kind,
-        messages,
-    )
-}
-
-fn merge_history_messages(
-    manager: &mut NapcatMessageManager,
-    target_id: &str,
-    expected_kind: ChatTargetExportKind,
-    history: &[NapcatMessage],
-) -> bool {
-    let newest_stored_time = manager
-        .messages
-        .get(target_id)
-        .into_iter()
-        .flatten()
-        .map(|message| message.data.time)
-        .max()
-        .unwrap_or_default();
-    let parsed_target_id = target_id.parse::<u64>().ok();
-    let mut additions = Vec::new();
-
-    for mut message in history.iter().cloned() {
-        let actual_kind = match message.data.message_type {
-            NapcatMessageType::Private => ChatTargetExportKind::Private,
-            NapcatMessageType::Group => ChatTargetExportKind::Group,
-        };
-        if actual_kind != expected_kind || message.data.time < newest_stored_time {
-            continue;
-        }
-        if expected_kind == ChatTargetExportKind::Private
-            && message.data.user_id == message.data.self_id
-            && message.data.target_id.is_none()
-        {
-            message.data.target_id = parsed_target_id;
-        }
-        if expected_kind == ChatTargetExportKind::Group && message.data.group_id.is_none() {
-            message.data.group_id = parsed_target_id;
-        }
-        let duplicate = manager
-            .messages
-            .get(target_id)
-            .into_iter()
-            .flatten()
-            .chain(additions.iter())
-            .any(|stored| {
-                stored.data.time == message.data.time
-                    && stored.data.user_id == message.data.user_id
-                    && stored.data.message_type == message.data.message_type
-                    && message_text(stored) == message_text(&message)
-            });
-        if duplicate {
-            continue;
-        }
-        cache_message_images(&mut message);
-        manager.annotate_incoming_message_access(target_id, &mut message);
-        additions.push(message);
-    }
-
-    if additions.is_empty() {
-        return false;
-    }
-    let messages = manager.messages.entry(target_id.to_owned()).or_default();
-    messages.extend(additions);
-    messages.sort_by_key(|message| message.data.time);
-    manager
-        .chat_target_kinds
-        .insert(target_id.to_owned(), expected_kind);
-    true
 }
 
 fn request_missing_group_info_system(
@@ -6175,15 +5984,13 @@ fn message_system(
         } else {
             let response_res = serde_json::from_str::<NapcatActionResponse>(&msg.to_string());
             if let Ok(response) = response_res {
-                let changed = apply_history_response(&response, &mut manager)
-                    || apply_group_info_response(
-                        &response,
-                        &mut manager,
-                        &mut group_info_requests,
-                    );
-                if changed {
+                if apply_group_info_response(
+                    &response,
+                    &mut manager,
+                    &mut group_info_requests,
+                ) {
                     if let Err(err) = manager.persist() {
-                        eprintln!("failed to persist NapCat response data: {err}");
+                        eprintln!("failed to persist NapCat group info: {err}");
                     }
                 }
             } else {
@@ -13015,56 +12822,6 @@ mod tests {
         let payload = serde_json::from_str::<Value>(message.to_text().unwrap()).unwrap();
         assert_eq!(echo, "group-info:99");
         assert_eq!(payload["echo"], "group-info:99");
-    }
-
-    #[test]
-    fn history_sync_backfills_new_private_dialogue_without_repeating_stored_lines() {
-        let mut manager = empty_manager();
-        let target_id = "2383680235";
-        let mut stored = test_private_message_from(2383680235, "我也是普通船员");
-        stored.data.time = 100;
-        manager.messages.insert(target_id.to_owned(), vec![
-            stored.clone()
-        ]);
-
-        let mut player_reply = test_private_message_from(
-            2383680235,
-            "那我先什么都不干，先观察一下萌萌要干啥",
-        );
-        player_reply.data.time = 110;
-        let mut gm_reply = test_private_message_from(
-            3432505351,
-            "萌萌从休眠舱中离开，开始四处探索，陌陌则默默跟着",
-        );
-        gm_reply.data.time = 120;
-        gm_reply.data.self_id = 3432505351;
-        gm_reply.data.target_id = None;
-
-        assert!(merge_history_messages(
-            &mut manager,
-            target_id,
-            ChatTargetExportKind::Private,
-            &[stored, player_reply, gm_reply],
-        ));
-
-        let messages = &manager.messages[target_id];
-        assert_eq!(messages.len(), 3);
-        assert_eq!(
-            messages.iter().map(message_text).collect::<Vec<_>>(),
-            vec![
-                "我也是普通船员",
-                "那我先什么都不干，先观察一下萌萌要干啥",
-                "萌萌从休眠舱中离开，开始四处探索，陌陌则默默跟着",
-            ]
-        );
-        assert_eq!(
-            messages[2].data.target_id,
-            Some(2383680235)
-        );
-        assert_eq!(
-            messages[2].data.visibility,
-            Visibility::Player(2383680235)
-        );
     }
 
     #[test]
