@@ -119,6 +119,8 @@ const SHORT_UTTERANCE_HEAD_PAD_MS: u64 = 80;
 const SHORT_UTTERANCE_TAIL_PAD_MS: u64 = 180;
 const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
 const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
+const REPLAY_PLAYING_STATUS: &str = "正在回放；停止后会恢复当前体素场景";
+const REPLAY_SPEECH_PREPARING_STATUS: &str = "正在准备当前台词语音；语音就绪后字幕与声音会同时开始";
 
 pub struct ReplayPlugin;
 
@@ -579,10 +581,20 @@ fn advance_replay(
     };
     let delta_ms = (time.delta_secs() * studio.playback_speed * 1_000.0).round() as u64;
     let proposed_ms = studio.playback_ms.saturating_add(delta_ms).min(duration_ms);
+    let mut waiting_for_speech = false;
     if studio.speech_enabled && onnx_tts_is_available() && !speech.onnx_failed {
         if let Some(replay) = studio.replay.as_ref() {
             let current = active_dialogue_index(&replay.dialogue, studio.playback_ms);
             let proposed = active_dialogue_index(&replay.dialogue, proposed_ms);
+            if let Some(index) = current {
+                let signature = replay_voice_signature(replay, studio.speech_volume);
+                if !speech.onnx_cue_ready(
+                    signature,
+                    (replay.created_at_unix_ms, index),
+                ) {
+                    waiting_for_speech = true;
+                }
+            }
             if proposed != current {
                 if let Some(index) = proposed {
                     let signature = replay_voice_signature(replay, studio.speech_volume);
@@ -590,21 +602,18 @@ fn advance_replay(
                         signature,
                         (replay.created_at_unix_ms, index),
                     ) {
-                        return;
-                    }
-                }
-            } else if studio.playback_ms == 0 {
-                if let Some(index) = proposed {
-                    let signature = replay_voice_signature(replay, studio.speech_volume);
-                    if !speech.onnx_cue_ready(
-                        signature,
-                        (replay.created_at_unix_ms, index),
-                    ) {
-                        return;
+                        waiting_for_speech = true;
                     }
                 }
             }
         }
+    }
+    if waiting_for_speech {
+        studio.status = REPLAY_SPEECH_PREPARING_STATUS.to_owned();
+        return;
+    }
+    if studio.status == REPLAY_SPEECH_PREPARING_STATUS {
+        studio.status = REPLAY_PLAYING_STATUS.to_owned();
     }
     studio.playback_ms = proposed_ms;
     if studio.playback_ms >= duration_ms {
@@ -1324,6 +1333,7 @@ fn replay_studio_ui(
     deepseek_sender: Option<Res<DeepseekIOSender>>,
     mut deepseek_manager: ResMut<Persistent<DeepseekManager>>,
     mut studio: ResMut<ReplayStudio>,
+    speech: Res<PreviewSpeechController>,
     camera: Query<&Transform, With<VoxelViewportCamera>>,
     standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
@@ -1381,13 +1391,18 @@ fn replay_studio_ui(
         studio.mode,
         ReplayMode::Playing | ReplayMode::Paused
     ) {
-        if let Some(dialogue) = studio
-            .replay
-            .as_ref()
-            .and_then(|replay| active_dialogue(&replay.dialogue, studio.playback_ms))
-            .cloned()
-        {
-            dialogue_overlay(ctx, &dialogue, &mut avatar_textures);
+        if let Some((index, dialogue)) = studio.replay.as_ref().and_then(|replay| {
+            active_dialogue_index(&replay.dialogue, studio.playback_ms)
+                .map(|index| (index, replay.dialogue[index].clone()))
+        }) {
+            if replay_dialogue_is_ready_for_display(
+                &studio,
+                &speech,
+                index,
+                onnx_tts_is_available(),
+            ) {
+                dialogue_overlay(ctx, &dialogue, &mut avatar_textures);
+            }
         }
     }
 }
@@ -1694,19 +1709,16 @@ fn replay_controls(
         if let Some(replay) = studio.replay.as_mut() {
             ui.add_enabled_ui(studio.speech_enabled, |ui| {
                 ui.label("整体语速");
-                let changed = ui
-                    .add(
-                        egui::DragValue::new(&mut replay.master_speech_speed)
-                            .speed(0.05)
-                            .range(0.10..=f32::INFINITY)
-                            .fixed_decimals(2)
-                            .suffix("×"),
-                    )
-                    .on_hover_text("同时调整所有角色在播放预览和 MP4 导出中的语速；没有上限。")
-                    .changed();
-                if changed {
-                    extend_replay_for_speech(replay);
-                }
+                ui.add(
+                    egui::DragValue::new(&mut replay.master_speech_speed)
+                        .speed(0.05)
+                        .range(0.10..=f32::INFINITY)
+                        .fixed_decimals(2)
+                        .suffix("×"),
+                )
+                .on_hover_text(
+                    "只调整所有角色在播放预览和 MP4 导出中的语速，不改变时间轴；没有上限。",
+                );
             });
         }
         if let Some(replay) = studio.replay.as_mut() {
@@ -1725,7 +1737,6 @@ fn replay_controls(
             if changed {
                 let new_duration = replay.master_dialogue_duration;
                 retime_replay(replay, previous_duration, new_duration);
-                extend_replay_for_speech(replay);
                 studio.playback_ms = studio.playback_ms.min(replay.duration_ms);
             }
         }
@@ -1733,7 +1744,7 @@ fn replay_controls(
             studio.speech_settings_open = true;
         }
     });
-    ui.small("整体语速默认 1.30×；长台词不会自动加速，而会自动延长字幕和镜头时间，确保角色保持固定语速。六个字以内的极短台词会自动使用较自然的短句语速和首尾保护，避免吞字，不改变角色音色或音调。整体台词停留默认 1.00×，可无上限延长字幕、间隔和对应镜头。预览与导出共用同一条时间线和 Spark-TTS 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
+    ui.small("整体语速默认 1.30×，调整语速或单个角色音色时不会改变时间轴。六个字以内的极短台词会自动使用较自然的短句语速和首尾保护，避免吞字，不改变角色音色或音调。需要改变字幕、间隔和镜头时长时，请使用“整体台词停留”。预览与导出共用同一条时间线和 Spark-TTS 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -2005,9 +2016,6 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         });
     studio.speech_settings_open = open;
     if settings_changed {
-        if let Some(replay) = studio.replay.as_mut() {
-            extend_replay_for_speech(replay);
-        }
         studio.status = "角色语音设置已更新，将用于下一句预览和视频导出".to_owned();
     }
 }
@@ -2426,9 +2434,6 @@ fn start_playback(
     studio: &mut ReplayStudio,
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
 ) {
-    if let Some(replay) = studio.replay.as_mut() {
-        extend_replay_for_speech(replay);
-    }
     let Some(scene) = studio.replay.as_ref().map(|replay| replay.scene.clone()) else {
         return;
     };
@@ -2438,7 +2443,7 @@ fn start_playback(
     }
     studio.playback_ms = 0;
     studio.mode = ReplayMode::Playing;
-    studio.status = "正在回放；停止后会恢复当前体素场景".to_owned();
+    studio.status = REPLAY_PLAYING_STATUS.to_owned();
 }
 
 fn stop_playback(studio: &mut ReplayStudio, grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>) {
@@ -2462,9 +2467,6 @@ fn start_video_export(
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
 ) {
-    if let Some(replay) = studio.replay.as_mut() {
-        extend_replay_for_speech(replay);
-    }
     let Some((duration_ms, dialogue, master_speech_speed, speaker_voice_settings)) =
         studio.replay.as_ref().map(|replay| {
             (
@@ -4313,14 +4315,38 @@ fn is_cjk_character(character: char) -> bool {
     )
 }
 
-fn active_dialogue(dialogue: &[ReplayDialogue], time_ms: u64) -> Option<&ReplayDialogue> {
-    active_dialogue_index(dialogue, time_ms).map(|index| &dialogue[index])
-}
-
 fn active_dialogue_index(dialogue: &[ReplayDialogue], time_ms: u64) -> Option<usize> {
     dialogue.iter().rposition(|line| {
         time_ms >= line.time_ms && time_ms < line.time_ms.saturating_add(line.duration_ms)
     })
+}
+
+fn replay_dialogue_is_ready_for_display(
+    studio: &ReplayStudio,
+    speech: &PreviewSpeechController,
+    dialogue_index: usize,
+    tts_available: bool,
+) -> bool {
+    if studio.mode != ReplayMode::Playing
+        || !studio.speech_enabled
+        || !tts_available
+        || speech.onnx_failed
+    {
+        return true;
+    }
+    let Some(replay) = studio.replay.as_ref() else {
+        return false;
+    };
+    if dialogue_index >= replay.dialogue.len() {
+        return false;
+    }
+    speech.onnx_cue_ready(
+        replay_voice_signature(replay, studio.speech_volume),
+        (
+            replay.created_at_unix_ms,
+            dialogue_index,
+        ),
+    )
 }
 
 fn dialogue_overlay(
@@ -5170,6 +5196,42 @@ mod tests {
             active_dialogue_index(&dialogue, 1_100),
             Some(1)
         );
+    }
+
+    #[test]
+    fn playing_dialogue_waits_for_its_speech_before_display() {
+        let replay_json = r#"{"format_version":1,"title":"test","campaign_id":"c","created_at_unix_ms":1,"duration_ms":1000,"audience":{"scope":"public"},"scene":{"voxels":[]},"camera":[],"dialogue":[]}"#;
+        let mut replay: ReplayFile = serde_json::from_str(replay_json).unwrap();
+        replay.dialogue.push(test_dialogue(
+            0,
+            1_000,
+            DialogueSide::Right,
+        ));
+        let mut studio = ReplayStudio::default();
+        studio.mode = ReplayMode::Playing;
+        studio.replay = Some(replay);
+        let mut speech = PreviewSpeechController::default();
+
+        assert!(!replay_dialogue_is_ready_for_display(
+            &studio, &speech, 0, true
+        ));
+
+        let replay = studio.replay.as_ref().unwrap();
+        let signature = replay_voice_signature(replay, studio.speech_volume);
+        speech.prepared_signature = Some(signature);
+        speech.onnx_cache.insert(
+            (replay.created_at_unix_ms, 0),
+            (vec![1], 1.0),
+        );
+        assert!(replay_dialogue_is_ready_for_display(
+            &studio, &speech, 0, true
+        ));
+
+        speech.onnx_cache.clear();
+        studio.mode = ReplayMode::Paused;
+        assert!(replay_dialogue_is_ready_for_display(
+            &studio, &speech, 0, true
+        ));
     }
 
     #[test]
