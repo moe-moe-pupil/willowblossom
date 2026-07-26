@@ -12751,29 +12751,6 @@ fn trpg_group_settings_window(
                                                     }
                                                 },
                                             );
-
-                                            if let Ok(user_id) = target_id.parse::<u64>() {
-                                                let mut is_gm =
-                                                    snapshot.gm_users.contains(&user_id);
-                                                let gm_changed =
-                                                    ui.checkbox(&mut is_gm, "GM").changed();
-                                                ui.label("?").on_hover_text(
-                                                    "GM 可查看和管理全部隐私范围；频道归属仍由左侧小队下拉框决定",
-                                                );
-                                                if gm_changed {
-                                                    if let Some(group) =
-                                                        manager.trpg_groups.get_mut(&group_name)
-                                                    {
-                                                        if is_gm {
-                                                            changed |=
-                                                                group.gm_users.insert(user_id);
-                                                        } else {
-                                                            changed |=
-                                                                group.gm_users.remove(&user_id);
-                                                        }
-                                                    }
-                                                }
-                                            }
                                         });
 
                                         if selected_party != before_party {
