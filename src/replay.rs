@@ -100,6 +100,7 @@ use crate::{
         TrpgVoxelGrid,
         VoxelPlayerStandee,
         VoxelViewportCamera,
+        VOXEL_SIZE,
     },
 };
 
@@ -551,11 +552,13 @@ fn record_replay(
         }
         if captured_any && !record_camera_enabled {
             if let Ok(base) = camera.single() {
+                let obstacles = ReplayCameraObstacles::from_scene(&replay.scene);
                 replay.camera = turn_based_camera_track(
                     base,
                     &replay.dialogue,
                     replay.duration_ms,
                     &speaker_positions,
+                    &obstacles,
                 );
             }
         }
@@ -2125,11 +2128,13 @@ fn build_from_history(
     replay.duration_ms = retime_dialogue_turns(&mut replay.dialogue);
     extend_replay_for_speech(&mut replay);
     if let Ok(transform) = camera.single() {
+        let obstacles = ReplayCameraObstacles::from_scene(&replay.scene);
         replay.camera = turn_based_camera_track(
             transform,
             &replay.dialogue,
             replay.duration_ms,
             &speaker_positions,
+            &obstacles,
         );
     }
     studio.playback_ms = 0;
@@ -2356,12 +2361,14 @@ fn apply_ready_director_plan(
         .or_else(|| replay.camera.first().map(frame_transform))
         .ok_or_else(|| "找不到可用的导演基础镜头".to_owned())?;
     let speaker_positions = standee_positions(standees);
+    let obstacles = ReplayCameraObstacles::from_scene(&replay.scene);
     replay.camera = director_camera_track(
         &base,
         &replay.dialogue,
         &cues,
         replay.duration_ms,
         &speaker_positions,
+        &obstacles,
     );
     studio.playback_ms = 0;
     studio.status = format!(
@@ -3522,6 +3529,7 @@ fn turn_based_camera_track(
     dialogue: &[ReplayDialogue],
     duration_ms: u64,
     speaker_positions: &HashMap<u64, Vec3>,
+    obstacles: &ReplayCameraObstacles,
 ) -> Vec<ReplayCameraKeyframe> {
     let rig = DirectedCameraRig::for_dialogue(base, dialogue, speaker_positions);
     let mut frames = Vec::with_capacity(dialogue.len().saturating_mul(3).saturating_add(2));
@@ -3533,6 +3541,7 @@ fn turn_based_camera_track(
                 *target,
                 DirectorShot::SpeakerMedium,
                 0.0,
+                obstacles,
             )
         })
         .unwrap_or_else(|| base.clone());
@@ -3544,6 +3553,7 @@ fn turn_based_camera_track(
                 *target,
                 DirectorShot::SpeakerMedium,
                 0.0,
+                obstacles,
             );
             let settled = focused;
             if line.time_ms > 0 {
@@ -3581,6 +3591,7 @@ fn director_camera_track(
     cues: &[DirectorCue],
     duration_ms: u64,
     speaker_positions: &HashMap<u64, Vec3>,
+    obstacles: &ReplayCameraObstacles,
 ) -> Vec<ReplayCameraKeyframe> {
     let rig = DirectedCameraRig::for_dialogue(base, dialogue, speaker_positions);
     let mut current = base.clone();
@@ -3591,6 +3602,7 @@ fn director_camera_track(
                 resolved_speaker_shot(cue.shot),
                 cue.motion,
                 0.0,
+                obstacles,
             );
         }
     }
@@ -3599,9 +3611,11 @@ fn director_camera_track(
         let line_end = line.time_ms.saturating_add(line.duration_ms);
         let (arrival, settled) = if let Some(target) = speaker_positions.get(&line.sender_id) {
             let speaker_shot = resolved_speaker_shot(cue.shot);
-            let desired_arrival = rig.director_shot(*target, speaker_shot, cue.motion, 0.0);
+            let desired_arrival =
+                rig.director_shot(*target, speaker_shot, cue.motion, 0.0, obstacles);
             let arrival = desired_arrival;
-            let desired_settled = rig.director_shot(*target, speaker_shot, cue.motion, 1.0);
+            let desired_settled =
+                rig.director_shot(*target, speaker_shot, cue.motion, 1.0, obstacles);
             let settle_limit = (line.duration_ms as f32 / 1_000.0 * 0.12).clamp(0.2, 0.65);
             let settled = limit_camera_travel_toward(
                 &arrival,
@@ -3659,6 +3673,67 @@ fn limit_camera_travel_toward(
     let offset = desired.translation - current.translation;
     let translation = current.translation + offset.clamp_length_max(max_distance.max(0.0));
     Transform::from_translation(translation).looking_at(focus, Vec3::Y)
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReplayCameraObstacles {
+    occupied: HashSet<IVec3>,
+}
+
+impl ReplayCameraObstacles {
+    fn from_scene(scene: &ReplayScene) -> Self {
+        Self {
+            occupied: scene
+                .voxels
+                .iter()
+                .filter(|voxel| voxel.material != 0)
+                .map(|voxel| IVec3::from_array(voxel.position))
+                .collect(),
+        }
+    }
+
+    fn view_is_clear(&self, camera: Vec3, target: Vec3) -> bool {
+        self.camera_is_clear(camera) && self.segment_is_clear(camera, target)
+    }
+
+    fn camera_is_clear(&self, camera: Vec3) -> bool {
+        let clearance = VOXEL_SIZE * 0.45;
+        [
+            Vec3::ZERO,
+            Vec3::X * clearance,
+            Vec3::NEG_X * clearance,
+            Vec3::Y * clearance,
+            Vec3::NEG_Y * clearance,
+            Vec3::Z * clearance,
+            Vec3::NEG_Z * clearance,
+        ]
+        .into_iter()
+        .all(|offset| !self.contains_world_point(camera + offset))
+    }
+
+    fn segment_is_clear(&self, from: Vec3, to: Vec3) -> bool {
+        let offset = to - from;
+        let distance = offset.length();
+        if distance <= f32::EPSILON {
+            return !self.contains_world_point(from);
+        }
+        let direction = offset / distance;
+        let step = VOXEL_SIZE * 0.2;
+        let end = (distance - VOXEL_SIZE * 0.1).max(0.0);
+        let mut travelled = 0.0;
+        while travelled <= end {
+            if self.contains_world_point(from + direction * travelled) {
+                return false;
+            }
+            travelled += step;
+        }
+        true
+    }
+
+    fn contains_world_point(&self, point: Vec3) -> bool {
+        self.occupied
+            .contains(&(point / VOXEL_SIZE).floor().as_ivec3())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3724,7 +3799,13 @@ impl DirectedCameraRig {
         }
     }
 
-    fn speaker_shot(&self, target: Vec3, shot: DirectorShot, distance_delta: f32) -> Transform {
+    fn speaker_shot(
+        &self,
+        target: Vec3,
+        shot: DirectorShot,
+        distance_delta: f32,
+        obstacles: &ReplayCameraObstacles,
+    ) -> Transform {
         let base_distance = match shot {
             DirectorShot::SpeakerClose => 3.0,
             DirectorShot::SpeakerMedium => 5.0,
@@ -3738,15 +3819,12 @@ impl DirectedCameraRig {
             DirectorShot::SpeakerWide => 2.1,
             DirectorShot::Establishing | DirectorShot::Environment => 3.2,
         };
-        let mut static_position =
-            target + self.camera_side * base_distance + Vec3::Y * height;
-        let static_side = self.signed_side(static_position);
-        if static_side < Self::LINE_MARGIN {
-            static_position += self.camera_side * (Self::LINE_MARGIN - static_side);
-        }
+        let static_position = self.visible_position(target, base_distance, height, obstacles);
         let dolly_axis = (static_position - target).normalize();
         let desired_position = static_position + dolly_axis * distance_delta;
-        let position = if self.signed_side(desired_position) < Self::LINE_MARGIN {
+        let position = if self.signed_side(desired_position) < Self::LINE_MARGIN
+            || !obstacles.view_is_clear(desired_position, target)
+        {
             static_position
         } else {
             desired_position
@@ -3760,17 +3838,69 @@ impl DirectedCameraRig {
         shot: DirectorShot,
         motion: DirectorMotion,
         progress: f32,
+        obstacles: &ReplayCameraObstacles,
     ) -> Transform {
         let distance_delta = match motion {
             DirectorMotion::DollyIn => -0.35 * progress,
             DirectorMotion::DollyOut => 0.35 * progress,
             DirectorMotion::Static | DirectorMotion::DriftLeft | DirectorMotion::DriftRight => 0.0,
         };
-        self.speaker_shot(target, shot, distance_delta)
+        self.speaker_shot(target, shot, distance_delta, obstacles)
     }
 
     fn signed_side(&self, position: Vec3) -> f32 {
         horizontal(position - self.axis_origin).dot(self.camera_side)
+    }
+
+    fn visible_position(
+        &self,
+        target: Vec3,
+        base_distance: f32,
+        height: f32,
+        obstacles: &ReplayCameraObstacles,
+    ) -> Vec3 {
+        const YAW_OFFSETS_DEGREES: [f32; 9] = [
+            0.0, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0,
+        ];
+        const DISTANCE_SCALES: [f32; 10] =
+            [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.12];
+        const HEIGHT_SCALES: [f32; 3] = [1.0, 0.75, 1.25];
+
+        let mut best = None::<(f32, Vec3)>;
+        for yaw_degrees in YAW_OFFSETS_DEGREES {
+            let direction =
+                Quat::from_rotation_y(yaw_degrees.to_radians()) * self.camera_side;
+            for distance_scale in DISTANCE_SCALES {
+                for height_scale in HEIGHT_SCALES {
+                    let mut candidate = target
+                        + direction * (base_distance * distance_scale)
+                        + Vec3::Y * (height * height_scale);
+                    let signed_side = self.signed_side(candidate);
+                    if signed_side < Self::LINE_MARGIN {
+                        candidate += self.camera_side * (Self::LINE_MARGIN - signed_side);
+                    }
+                    if !obstacles.view_is_clear(candidate, target) {
+                        continue;
+                    }
+                    let score = distance_scale * 10.0
+                        - yaw_degrees.abs() * 0.05
+                        - (height_scale - 1.0).abs() * 0.5;
+                    if best.is_none_or(|(best_score, _)| score > best_score) {
+                        best = Some((score, candidate));
+                    }
+                }
+            }
+        }
+        best.map(|(_, position)| position)
+            .unwrap_or_else(|| {
+                let mut fallback =
+                    target + self.camera_side * (VOXEL_SIZE * 2.0) + Vec3::Y * VOXEL_SIZE;
+                let signed_side = self.signed_side(fallback);
+                if signed_side < Self::LINE_MARGIN {
+                    fallback += self.camera_side * (Self::LINE_MARGIN - signed_side);
+                }
+                fallback
+            })
     }
 }
 
@@ -4565,11 +4695,13 @@ mod tests {
             (1, Vec3::new(-8.0, 1.0, 2.0)),
             (2, Vec3::new(9.0, 1.0, -3.0)),
         ]);
+        let obstacles = ReplayCameraObstacles::default();
         let frames = turn_based_camera_track(
             &base,
             &dialogue,
             5_430,
             &speaker_positions,
+            &obstacles,
         );
         assert!(
             frames
@@ -4656,12 +4788,14 @@ mod tests {
             motion: DirectorMotion::DollyIn,
         }];
         let target = Vec3::new(8.0, 1.0, -3.0);
+        let obstacles = ReplayCameraObstacles::default();
         let frames = director_camera_track(
             &base,
             &dialogue,
             &cues,
             3_050,
             &HashMap::from([(1, target)]),
+            &obstacles,
         );
         let shot = frame_transform(frames.last().unwrap());
         let forward = shot.rotation * Vec3::NEG_Z;
@@ -4699,12 +4833,14 @@ mod tests {
             },
         ];
         let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &speaker_positions);
+        let obstacles = ReplayCameraObstacles::default();
         let frames = director_camera_track(
             &base,
             &dialogue,
             &cues,
             6_020,
             &speaker_positions,
+            &obstacles,
         );
 
         assert!(frames
@@ -4714,23 +4850,61 @@ mod tests {
     }
 
     #[test]
+    fn directed_camera_pulls_in_front_of_a_wall_and_keeps_the_speaker_visible() {
+        let target = Vec3::new(0.125, 1.125, 0.125);
+        let base = Transform::from_xyz(0.125, 3.0, 5.125);
+        let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
+        let positions = HashMap::from([(1, target)]);
+        let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
+        let scene = ReplayScene {
+            voxels: (-20..=20)
+                .flat_map(|x| {
+                    (-4..=20).map(move |y| ReplayVoxel {
+                        position: [x, y, 8],
+                        material: 1,
+                    })
+                })
+                .collect(),
+        };
+        let obstacles = ReplayCameraObstacles::from_scene(&scene);
+
+        let shot = rig.director_shot(
+            target,
+            DirectorShot::SpeakerMedium,
+            DirectorMotion::Static,
+            0.0,
+            &obstacles,
+        );
+        let forward = shot.rotation * Vec3::NEG_Z;
+        let to_speaker = (target - shot.translation).normalize();
+
+        assert!(shot.translation.z < 8.0 * VOXEL_SIZE);
+        assert!(obstacles.view_is_clear(shot.translation, target));
+        assert!(forward.dot(to_speaker) > 0.999);
+        assert!(rig.signed_side(shot.translation) >= DirectedCameraRig::LINE_MARGIN);
+    }
+
+    #[test]
     fn directed_dolly_moves_along_the_locked_camera_axis_and_keeps_focus() {
         let base = Transform::from_xyz(0.0, 4.0, 10.0);
         let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
         let target = Vec3::new(2.0, 1.0, -1.0);
         let positions = HashMap::from([(1, target)]);
         let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
+        let obstacles = ReplayCameraObstacles::default();
         let arrival = rig.director_shot(
             target,
             DirectorShot::SpeakerMedium,
             DirectorMotion::DollyIn,
             0.0,
+            &obstacles,
         );
         let desired = rig.director_shot(
             target,
             DirectorShot::SpeakerMedium,
             DirectorMotion::DollyIn,
             1.0,
+            &obstacles,
         );
         let settled = limit_camera_travel_toward(&arrival, &desired, 0.2, target);
         let movement = settled.translation - arrival.translation;
@@ -4755,18 +4929,21 @@ mod tests {
             (2, Vec3::new(6.0, 1.0, 0.0)),
         ]);
         let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
+        let obstacles = ReplayCameraObstacles::default();
         let off_axis_target = Vec3::new(0.0, 1.0, -10.0);
         let arrival = rig.director_shot(
             off_axis_target,
             DirectorShot::SpeakerMedium,
             DirectorMotion::DollyIn,
             0.0,
+            &obstacles,
         );
         let settled = rig.director_shot(
             off_axis_target,
             DirectorShot::SpeakerMedium,
             DirectorMotion::DollyIn,
             1.0,
+            &obstacles,
         );
 
         assert!(arrival.translation.abs_diff_eq(settled.translation, f32::EPSILON));

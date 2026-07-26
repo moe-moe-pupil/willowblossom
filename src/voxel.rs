@@ -108,7 +108,7 @@ use crate::{
     },
 };
 
-const VOXEL_SIZE: f32 = 0.25;
+pub(crate) const VOXEL_SIZE: f32 = 0.25;
 /// Horizontal physics-body chunk radius around the DM and every player camera.
 const VOXEL_PHYSICS_CHUNK_LOAD_RADIUS: i32 = 8;
 const VOXEL_DM_GIZMO_RENDER_LAYER: usize = 1;
