@@ -178,7 +178,7 @@ const PLANET_SCIENCE_LAB_CENTER: IVec2 = IVec2::new(-45, 20);
 const PLANET_SCIENCE_LAB_FLOOR_Y: i32 = 485;
 const VOXEL_MINIMAP_RESOLUTION: usize = 64;
 const VOXEL_OCCLUSION_FADE_SHADER: &str = "shaders/voxel_occlusion_fade.wgsl";
-const VOXEL_OCCLUSION_FADE_RADIUS: f32 = 0.8;
+const VOXEL_OCCLUSION_FOCUS_RADIUS: f32 = PLAYER_STANDEE_HEIGHT;
 
 pub struct TrpgVoxelPlugin;
 
@@ -215,7 +215,7 @@ impl VoxelOcclusionFadeExtension {
     fn new() -> Self {
         Self {
             settings: VoxelOcclusionFadeUniform {
-                focus_and_radius: Vec4::new(0.0, 0.0, 0.0, VOXEL_OCCLUSION_FADE_RADIUS),
+                focus_and_radius: Vec4::new(0.0, 0.0, 0.0, VOXEL_OCCLUSION_FOCUS_RADIUS),
                 ..default()
             },
         }
@@ -5702,7 +5702,7 @@ fn sync_voxel_occlusion_fade(
     }
     let settings = VoxelOcclusionFadeUniform {
         camera_and_active: fade.camera.extend(f32::from(fade.active)),
-        focus_and_radius: fade.focus.extend(VOXEL_OCCLUSION_FADE_RADIUS),
+        focus_and_radius: fade.focus.extend(VOXEL_OCCLUSION_FOCUS_RADIUS),
     };
     for handle in voxel_materials
         .handles
@@ -9538,7 +9538,7 @@ mod tests {
             assert_eq!(settings.camera_and_active, Vec4::new(1.0, 2.0, 3.0, 1.0));
             assert_eq!(
                 settings.focus_and_radius,
-                Vec4::new(4.0, 5.0, 6.0, VOXEL_OCCLUSION_FADE_RADIUS)
+                Vec4::new(4.0, 5.0, 6.0, VOXEL_OCCLUSION_FOCUS_RADIUS)
             );
         }
     }

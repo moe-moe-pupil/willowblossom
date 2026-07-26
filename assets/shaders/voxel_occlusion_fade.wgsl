@@ -44,17 +44,23 @@ fn dissolve_camera_blocker(in: VertexOutput) {
     }
 
     let projection = dot(in.world_position.xyz - camera, corridor) / corridor_length_squared;
-    if projection <= 0.03 || projection >= 0.97 {
+    if projection <= 0.0 || projection >= 1.0 {
         return;
     }
 
     let closest = camera + corridor * projection;
     let distance_from_view = distance(in.world_position.xyz, closest);
-    let radius = fade_settings.focus_and_radius.w;
-    let corridor_fade = 1.0 - smoothstep(radius * 0.62, radius, distance_from_view);
-    let end_fade = smoothstep(0.03, 0.10, projection)
-        * (1.0 - smoothstep(0.88, 0.97, projection));
-    let dissolve = corridor_fade * end_fade * 0.94;
+
+    // This is a perspective cone around the focused player's screen silhouette,
+    // not a fixed-width tunnel through the scene. A fragment halfway to the
+    // player must be within half the player's world-space radius to be a blocker.
+    let focus_radius = fade_settings.focus_and_radius.w;
+    let blocker_radius = focus_radius * projection;
+    let silhouette_overlap =
+        1.0 - smoothstep(blocker_radius * 0.72, blocker_radius, distance_from_view);
+    let between_camera_and_player = smoothstep(0.015, 0.04, projection)
+        * (1.0 - smoothstep(0.985, 0.998, projection));
+    let dissolve = silhouette_overlap * between_camera_and_player * 0.94;
 
     if hash_pixel(floor(in.position.xy)) < dissolve {
         discard;
