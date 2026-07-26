@@ -786,27 +786,9 @@ fn preview_replay_speech(
 ) {
     if studio.speech_enabled
         && onnx_tts_is_available()
-        && matches!(
-            studio.mode,
-            ReplayMode::Idle | ReplayMode::Playing | ReplayMode::Paused
-        )
     {
         if let Some(replay) = studio.replay.as_ref() {
-            let current_index = active_dialogue_index(&replay.dialogue, studio.playback_ms)
-                .or_else(|| {
-                    replay.dialogue.iter().position(|line| {
-                        line.included && line.time_ms >= studio.playback_ms
-                    })
-                });
-            let requested = current_index
-                .into_iter()
-                .chain(current_index.and_then(|index| {
-                    replay.dialogue[index.saturating_add(1)..]
-                        .iter()
-                        .position(|line| line.included)
-                        .map(|offset| index + offset + 1)
-                }))
-                .collect::<Vec<_>>();
+            let requested = replay_speech_preparation_indices(replay, studio.playback_ms);
             if let Err(err) =
                 speech.prepare_onnx_replay(replay, studio.speech_volume, &requested)
             {
@@ -954,6 +936,25 @@ impl PreviewSpeechController {
 
     fn onnx_cue_ready(&self, signature: u64, cue: (u64, usize)) -> bool {
         self.prepared_signature == Some(signature) && self.onnx_cache.contains_key(&cue)
+    }
+
+    fn preparation_progress(&self, replay: &ReplayFile, global_volume: f32) -> (usize, usize) {
+        let total = replay.dialogue.iter().filter(|line| line.included).count();
+        if self.prepared_signature != Some(replay_voice_signature(replay, global_volume)) {
+            return (0, total);
+        }
+        let ready = replay
+            .dialogue
+            .iter()
+            .enumerate()
+            .filter(|(index, line)| {
+                line.included
+                    && self
+                        .onnx_cache
+                        .contains_key(&(replay.created_at_unix_ms, *index))
+            })
+            .count();
+        (ready, total)
     }
 }
 
@@ -1681,6 +1682,7 @@ fn replay_studio_ui(
                     deepseek_sender.as_deref(),
                     &mut deepseek_manager,
                     &mut studio,
+                    &speech,
                     &camera,
                     &standees,
                     &mut grids,
@@ -1721,6 +1723,7 @@ fn replay_controls(
     deepseek_sender: Option<&DeepseekIOSender>,
     deepseek_manager: &mut Persistent<DeepseekManager>,
     studio: &mut ReplayStudio,
+    speech: &PreviewSpeechController,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
@@ -2053,6 +2056,31 @@ fn replay_controls(
             studio.speech_settings_open = true;
         }
     });
+    if let Some(replay) = studio.replay.as_ref() {
+        let (ready, total) = speech.preparation_progress(replay, studio.speech_volume);
+        let progress = if total == 0 {
+            1.0
+        } else {
+            ready as f32 / total as f32
+        };
+        let text = if !studio.speech_enabled {
+            format!("语音预生成已暂停：{ready}/{total}")
+        } else if !onnx_tts_is_available() {
+            format!("语音预生成不可用：{ready}/{total}")
+        } else if speech.onnx_failed {
+            format!("语音预生成失败：{ready}/{total}")
+        } else if ready == total {
+            format!("语音预生成完成：{ready}/{total}")
+        } else {
+            format!("正在持续预生成角色语音：{ready}/{total}")
+        };
+        ui.add(
+            egui::ProgressBar::new(progress)
+                .desired_width(ui.available_width())
+                .text(text),
+        );
+        ui.small("回放录制、编辑和等待期间都会持续生成全部台词；预览与 MP4 导出共用缓存。");
+    }
     ui.small("整体语速默认 1.30×，调整语速或单个角色音色时不会改变时间轴。六个字以内的极短台词会自动使用较自然的短句语速和首尾保护，避免吞字，不改变角色音色或音调。需要改变字幕、间隔和镜头时长时，请使用“整体台词停留”。预览与导出共用同一条时间线和 Spark-TTS 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
@@ -5274,6 +5302,27 @@ fn active_dialogue_index(dialogue: &[ReplayDialogue], time_ms: u64) -> Option<us
     })
 }
 
+fn replay_speech_preparation_indices(replay: &ReplayFile, playback_ms: u64) -> Vec<usize> {
+    let priority = active_dialogue_index(&replay.dialogue, playback_ms).or_else(|| {
+        replay
+            .dialogue
+            .iter()
+            .position(|line| line.included && line.time_ms >= playback_ms)
+    });
+    priority
+        .into_iter()
+        .chain(
+            replay
+                .dialogue
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    (line.included && Some(index) != priority).then_some(index)
+                }),
+        )
+        .collect()
+}
+
 fn replay_dialogue_is_ready_for_display(
     studio: &ReplayStudio,
     speech: &PreviewSpeechController,
@@ -6439,6 +6488,31 @@ mod tests {
             active_dialogue_index(&dialogue, 1_100),
             Some(1)
         );
+    }
+
+    #[test]
+    fn continuous_speech_preparation_prioritizes_current_and_queues_every_line() {
+        let replay_json = r#"{"format_version":2,"title":"test","campaign_id":"c","created_at_unix_ms":1,"duration_ms":3000,"audience":{"scope":"public"},"scene":{"voxels":[]},"camera":[],"dialogue":[]}"#;
+        let mut replay: ReplayFile = serde_json::from_str(replay_json).unwrap();
+        replay.dialogue = vec![
+            test_dialogue(0, 900, DialogueSide::Left),
+            test_dialogue(1_000, 900, DialogueSide::Right),
+            test_dialogue(2_000, 900, DialogueSide::Left),
+        ];
+        replay.dialogue[1].included = false;
+
+        assert_eq!(
+            replay_speech_preparation_indices(&replay, 2_100),
+            vec![2, 0]
+        );
+
+        let mut speech = PreviewSpeechController::default();
+        speech.prepared_signature = Some(replay_voice_signature(&replay, 1.0));
+        speech.onnx_cache.insert(
+            (replay.created_at_unix_ms, 0),
+            (vec![1], 1.0),
+        );
+        assert_eq!(speech.preparation_progress(&replay, 1.0), (1, 2));
     }
 
     #[test]
