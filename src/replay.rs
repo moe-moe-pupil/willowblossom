@@ -4452,9 +4452,31 @@ fn compile_area_block_timeline(replay: &mut ReplayFile) -> u64 {
         .enumerate()
         .map(|(index, line_id)| (line_id, index))
         .collect::<HashMap<_, _>>();
+    let mut gm_boundaries = replay
+        .dialogue
+        .iter()
+        .filter(|line| {
+            line.included
+                && line.side == DialogueSide::Left
+                && order.contains_key(&line.line_id)
+        })
+        .map(|line| (line.source_time, line.line_id))
+        .collect::<Vec<_>>();
+    gm_boundaries.sort_unstable();
     replay.dialogue.sort_by_key(|line| {
+        // Area order is allowed to rearrange players only between GM lines. A GM
+        // prompt remains ahead of every later reply, regardless of either area.
+        let source_order = (line.source_time, line.line_id);
+        let gm_epoch = gm_boundaries.partition_point(|boundary| *boundary < source_order);
+        let is_gm_boundary = line.side == DialogueSide::Left
+            && gm_boundaries
+                .get(gm_epoch)
+                .is_some_and(|boundary| *boundary == source_order);
         (
             !line.included,
+            !order.contains_key(&line.line_id),
+            gm_epoch,
+            is_gm_boundary,
             order.get(&line.line_id).copied().unwrap_or(usize::MAX),
             line.source_time,
             line.line_id,
@@ -5917,6 +5939,43 @@ mod tests {
                 .map(|line| line.source_time)
                 .collect::<Vec<_>>(),
             vec![1_200, 1_208, 1_205, 1_210]
+        );
+    }
+
+    #[test]
+    fn gm_lines_are_chronological_boundaries_between_area_groups() {
+        let mut lines = vec![
+            positioned_dialogue(1, 1, 90, [30, 0, 0]),
+            positioned_dialogue(2, 1, 100, [0, 0, 0]),
+            positioned_dialogue(3, 1, 110, [0, 0, 0]),
+        ];
+        lines[0].area = "later block".to_owned();
+        lines[1].area = "later block".to_owned();
+        lines[1].side = DialogueSide::Left;
+        lines[2].area = "first block".to_owned();
+        let mut replay = test_replay(lines);
+        replay.area_blocks = vec![
+            ReplayAreaBlock {
+                id: 1,
+                area: "first block".to_owned(),
+                line_ids: vec![3],
+            },
+            ReplayAreaBlock {
+                id: 2,
+                area: "later block".to_owned(),
+                line_ids: vec![1, 2],
+            },
+        ];
+
+        replay.duration_ms = compile_area_block_timeline(&mut replay);
+
+        assert_eq!(
+            replay
+                .dialogue
+                .iter()
+                .map(|line| line.source_time)
+                .collect::<Vec<_>>(),
+            vec![90, 100, 110]
         );
     }
 
