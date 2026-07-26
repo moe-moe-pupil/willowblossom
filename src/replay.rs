@@ -680,6 +680,7 @@ fn record_replay(
     if let Some(replay) = studio.replay.as_mut() {
         let captured_any = !captured.is_empty();
         replay.dialogue.extend(captured);
+        deduplicate_gm_broadcast_dialogue(&mut replay.dialogue, &manager);
         assign_replay_line_ids(&mut replay.dialogue);
         auto_group_replay_areas(replay);
         rebuild_area_blocks(replay);
@@ -2372,6 +2373,7 @@ fn build_from_history(
             replay.dialogue.push(dialogue);
         }
     }
+    deduplicate_gm_broadcast_dialogue(&mut replay.dialogue, manager);
     assign_replay_line_ids(&mut replay.dialogue);
     auto_group_replay_areas(&mut replay);
     rebuild_area_blocks(&mut replay);
@@ -4727,20 +4729,20 @@ fn dialogue_from_message(
     if text.is_empty() {
         return None;
     }
-    let is_gm = manager.is_gm_user(message.sender_id);
-    let character = manager
-        .player_characters
-        .get(&message.sender_id.to_string())
-        .or_else(|| {
-            if is_gm {
-                None
-            } else {
+    let is_gm = replay_sender_is_gm(message.sender_id, manager);
+    let character = if is_gm {
+        None
+    } else {
+        manager
+            .player_characters
+            .get(&message.sender_id.to_string())
+            .or_else(|| {
                 message
                     .character_id
                     .as_ref()
                     .and_then(|character_id| manager.player_characters.get(character_id))
-            }
-        });
+            })
+    };
     let (name, role, avatar) = dialogue_identity(message, character);
     let avatar = resolve_character_image_source(manager, &avatar);
     let side = speaker_side(is_gm);
@@ -4798,9 +4800,32 @@ fn estimated_replay_snapshot(
 }
 
 fn normalize_dialogue_sides(replay: &mut ReplayFile, manager: &NapcatMessageManager) {
+    deduplicate_gm_broadcast_dialogue(&mut replay.dialogue, manager);
     for dialogue in &mut replay.dialogue {
-        dialogue.side = speaker_side(manager.is_gm_user(dialogue.sender_id));
+        dialogue.side = speaker_side(replay_sender_is_gm(dialogue.sender_id, manager));
     }
+}
+
+fn replay_sender_is_gm(sender_id: u64, manager: &NapcatMessageManager) -> bool {
+    // Locally authored messages use zero until NapCat has supplied the bot's QQ id.
+    sender_id == 0 || manager.is_gm_user(sender_id)
+}
+
+fn deduplicate_gm_broadcast_dialogue(
+    dialogue: &mut Vec<ReplayDialogue>,
+    manager: &NapcatMessageManager,
+) {
+    let mut seen = HashSet::<(u64, u64, String)>::new();
+    dialogue.retain(|line| {
+        if line.source_time == 0 || !replay_sender_is_gm(line.sender_id, manager) {
+            return true;
+        }
+        seen.insert((
+            line.sender_id,
+            line.source_time,
+            line.text.trim().to_owned(),
+        ))
+    });
 }
 
 fn resolve_character_image_source(manager: &NapcatMessageManager, source: &str) -> String {
@@ -6042,6 +6067,43 @@ mod tests {
     fn dm_is_composed_left_and_player_right() {
         assert_eq!(speaker_side(true), DialogueSide::Left);
         assert_eq!(speaker_side(false), DialogueSide::Right);
+    }
+
+    #[test]
+    fn local_discussion_group_broadcast_is_one_avatarless_gm_line_on_the_left() {
+        let mut manager: NapcatMessageManager =
+            serde_json::from_str(r#"{"messages":{}}"#).unwrap();
+        manager.player_characters.insert("7".to_owned(), PlayerCharacter {
+            name: "陌陌".to_owned(),
+            image: "momo.png".to_owned(),
+            ..Default::default()
+        });
+        let message = CampaignMessage {
+            campaign_id: "campaign".to_owned(),
+            sender_id: 0,
+            sender_name: "GM".to_owned(),
+            source: crate::napcat::MessageSource::Gui,
+            character_id: Some("7".to_owned()),
+            party_id: None,
+            visibility: Visibility::Player(7),
+            text: "冷冻舱紧急解除了休眠".to_owned(),
+            time: 1_200,
+        };
+        let snapshot = ReplayMessageSnapshot {
+            turn_index: 0,
+            position_cells: [0, 0, 0],
+        };
+
+        let line = dialogue_from_message(&message, &manager, 350, &snapshot, false).unwrap();
+
+        assert_eq!(line.side, DialogueSide::Left);
+        assert_eq!(line.name, "GM");
+        assert!(line.role.is_empty());
+        assert!(line.avatar.is_empty());
+
+        let mut dialogue = vec![line.clone(), line];
+        deduplicate_gm_broadcast_dialogue(&mut dialogue, &manager);
+        assert_eq!(dialogue.len(), 1);
     }
 
     #[test]
