@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sys
 import traceback
 from contextlib import redirect_stdout
@@ -72,7 +73,11 @@ try:
         generator.load_state_dict(generator_checkpoint["generator"])
         generator.eval()
 
-        tokenizer = AutoTokenizer.from_pretrained(config.bert_path, local_files_only=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.bert_path,
+            local_files_only=True,
+            use_fast=False,
+        )
         with open(config.token_list_path, encoding="utf-8") as stream:
             token2id = {token.strip(): index for index, token in enumerate(stream)}
         with open(config.speaker2id_path, encoding="utf-8") as stream:
@@ -91,7 +96,7 @@ except Exception as error:
 
 
 def style_embedding(text):
-    encoded = tokenizer([text], return_tensors="pt")
+    encoded = tokenizer(text, return_tensors="pt")
     with torch.no_grad():
         result = style_encoder(
             input_ids=encoded["input_ids"],
@@ -113,7 +118,13 @@ for line in sys.stdin:
         if speaker_name not in speaker2id:
             raise ValueError(f"未知 EmotiVoice 说话人：{speaker_name}")
 
-        phonemes = g2p_cn(text).split()
+        # EmotiVoice's bundled frontend crashes when pypinyin returns an empty
+        # token for punctuation. Replay speech is Chinese-first, so keep only
+        # Chinese characters and numbers and let whitespace mark pauses.
+        phonetic_text = re.sub(r"[^\u3400-\u9fff0-9]+", " ", text).strip()
+        if not phonetic_text:
+            raise ValueError("台词中没有 EmotiVoice 可朗读的中文文字")
+        phonemes = g2p_cn(phonetic_text).split()
         sequence = torch.tensor(
             [[token2id[phoneme] for phoneme in phonemes]],
             dtype=torch.long,
