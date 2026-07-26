@@ -1330,16 +1330,16 @@ fn chat_window(
 ) {
     let mut window_open = true;
     let mut leave_group = false;
+    let grouped = current_group.is_some();
     let constraint_rect =
-        if current_group.is_some() { group_member_constraint_rect(rect) } else { rect };
+        if grouped { group_member_constraint_rect(rect) } else { rect };
     let window_min_size = egui::vec2(
         CHAT_WINDOW_MIN_SIZE.x.min(constraint_rect.width().max(1.0)),
         CHAT_WINDOW_MIN_SIZE
             .y
             .min(constraint_rect.height().max(1.0)),
     );
-    let max_window_size =
-        chat_window_max_size(constraint_rect, window_min_size, current_group.is_some());
+    let max_window_size = chat_window_max_size(constraint_rect, window_min_size, grouped);
     let window_id = current_group
         .map(|group_name| group_member_chat_window_id(group_name, target_id))
         .unwrap_or_else(|| standalone_chat_window_id(id, target_id));
@@ -1347,11 +1347,11 @@ fn chat_window(
         .open(&mut window_open)
         .id(window_id)
         .constrain_to(constraint_rect)
-        .default_size(CHAT_WINDOW_SIZE)
+        .default_size(chat_window_default_size(grouped))
         .min_size(window_min_size)
         .max_size(max_window_size)
         .resizable(true);
-    if current_group.is_some() {
+    if grouped {
         // egui 0.35's TitleBar drag path restores its saved absolute position after
         // `current_pos`; Anywhere keeps child windows movable while allowing the
         // discussion-group-relative position below to take effect every frame.
@@ -1798,12 +1798,12 @@ fn standalone_chat_window_id(id: Id, target_id: &str) -> Id {
 fn chat_group_window_id(group_name: &str) -> Id { Id::new((group_name, "chat_group_window_v2")) }
 
 fn group_member_chat_window_id(group_name: &str, target_id: &str) -> Id {
-    // v3 intentionally resets invalid v2 window geometry, including persisted
-    // zero-size member windows that cannot be grabbed or resized.
+    // v4 discards v3 geometry that reused the larger standalone-chat default
+    // and could leave a nested member window pinned to its parent's width.
     Id::new((
         group_name,
         target_id,
-        "group_member_chat_window_v3",
+        "group_member_chat_window_v4",
     ))
 }
 
@@ -1867,8 +1867,10 @@ fn group_member_default_pos(rect: Rect, target_id: &str) -> Pos2 {
     let mut hasher = DefaultHasher::new();
     target_id.hash(&mut hasher);
     let hash = hasher.finish();
-    let x_slots = ((rect.width() - CHAT_WINDOW_SIZE.x).max(0.0) / 36.0).floor() as u64 + 1;
-    let y_slots = ((rect.height() - CHAT_WINDOW_SIZE.y).max(0.0) / 36.0).floor() as u64 + 1;
+    let x_slots =
+        ((rect.width() - GROUP_MEMBER_CHAT_SIZE.x).max(0.0) / 36.0).floor() as u64 + 1;
+    let y_slots =
+        ((rect.height() - GROUP_MEMBER_CHAT_SIZE.y).max(0.0) / 36.0).floor() as u64 + 1;
     let x = rect.left() + 12.0 + (hash % x_slots) as f32 * 36.0;
     let y = rect.top() + 12.0 + ((hash / 17) % y_slots) as f32 * 36.0;
     egui::pos2(x, y)
@@ -1878,6 +1880,14 @@ fn group_member_position(parent_rect: Rect, offset: Vec2) -> Pos2 { parent_rect.
 
 fn group_member_offset(parent_rect: Rect, member_rect: Rect) -> Vec2 {
     member_rect.min - parent_rect.min
+}
+
+fn chat_window_default_size(grouped: bool) -> Vec2 {
+    if grouped {
+        GROUP_MEMBER_CHAT_SIZE
+    } else {
+        CHAT_WINDOW_SIZE
+    }
 }
 
 fn chat_window_max_size(constraint_rect: Rect, min_size: Vec2, grouped: bool) -> Vec2 {
@@ -14516,6 +14526,97 @@ mod tests {
 
         assert!(widths[1..].windows(2).all(|pair| pair[0] == pair[1]));
         assert!(widths.last().copied().unwrap() < 500.0);
+    }
+
+    #[test]
+    fn nested_group_chat_window_can_be_resized_with_the_pointer() {
+        let ctx = Context::default();
+        let screen_rect =
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let parent_rect = Rect::from_min_size(
+            egui::pos2(80.0, 60.0),
+            egui::vec2(900.0, 760.0),
+        );
+        let constraint_rect = group_member_constraint_rect(parent_rect);
+        let window_id = group_member_chat_window_id("测试讨论组", "测试成员");
+        let position = constraint_rect.min + egui::vec2(20.0, 20.0);
+        let show_window = |ctx: &Context| {
+            egui::Window::new("成员")
+                .id(window_id)
+                .constrain_to(constraint_rect)
+                .current_pos(position)
+                .default_size(chat_window_default_size(true))
+                .min_size(CHAT_WINDOW_MIN_SIZE)
+                .max_size(chat_window_max_size(
+                    constraint_rect,
+                    CHAT_WINDOW_MIN_SIZE,
+                    true,
+                ))
+                .resizable(true)
+                .drag_area(egui::WindowDrag::Anywhere)
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let _ = ui.button("角色");
+                        let _ = ui.button("查看玩家视角");
+                        let _ = ui.button("按玩家可见");
+                    });
+                    ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 220.0),
+                        Sense::hover(),
+                    );
+                })
+                .unwrap()
+                .response
+                .rect
+        };
+        let run_frame = |ctx: &Context, events: Vec<egui::Event>| {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events,
+                ..Default::default()
+            });
+            let rect = show_window(ctx);
+            let _ = ctx.end_pass();
+            rect
+        };
+
+        let _ = run_frame(&ctx, Vec::new());
+        let rect = run_frame(&ctx, Vec::new());
+        let resize_start = rect.right_center();
+        let _ = run_frame(
+            &ctx,
+            vec![egui::Event::PointerMoved(resize_start)],
+        );
+        let _ = run_frame(
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: resize_start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        let resize_end = resize_start + egui::vec2(140.0, 0.0);
+        let _ = run_frame(
+            &ctx,
+            vec![egui::Event::PointerMoved(resize_end)],
+        );
+        let rect = run_frame(&ctx, Vec::new());
+        let resized_width = rect.width();
+        let _ = run_frame(
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: resize_end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+
+        assert!(
+            resized_width >= GROUP_MEMBER_CHAT_SIZE.x + 100.0,
+            "nested member width stayed at {resized_width}"
+        );
     }
 
     #[test]

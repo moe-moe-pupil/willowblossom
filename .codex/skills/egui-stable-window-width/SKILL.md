@@ -131,10 +131,25 @@ group, imported/legacy chat windows, and send windows. A nested child should
 use its parent group's usable rectangle; a standalone window should use the
 viewport or the app's central-panel rectangle.
 
+Give nested and standalone variants separate default sizes. If the parent
+discussion group starts near the standalone chat width, reusing the standalone
+default can clamp the nested child to the parent's maximum on its first frame,
+leaving no visible room to widen it:
+
+```rust
+let default_size = if nested {
+    egui::vec2(320.0, 420.0)
+} else {
+    egui::vec2(360.0, 520.0)
+};
+```
+
 If an older version used a non-wrapping toolbar or saved an invalid size,
 version that window's persistent id once (for example, `_v2` to `_v3`). Do not
 change the id every release: the one-time change intentionally discards stale
 geometry, while a stable new id preserves subsequent user resizing.
+Version nested and standalone ids independently because each has separate
+persisted `Resize` state.
 
 For fixed-size item catalogs, cap the window and omit `num_columns`; call `end_row()` at the intended boundary and cap cell widths. Version the window and grid ids once if their persisted layout already contains the oversized width:
 
@@ -170,6 +185,9 @@ After patching:
 6. Add a multi-frame egui regression test with width-filling content. Record
    the outer width over several frames and assert it stabilizes below the
    viewport instead of increasing every frame.
+7. For nested windows, send pointer press/move/release events to a resize edge
+   in a regression test and assert the outer width changes. Run the child with
+   the same parent constraint, `current_pos`, and drag-area mode as production.
 
 ## Rules
 
