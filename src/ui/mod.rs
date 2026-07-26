@@ -2068,24 +2068,24 @@ fn window_received_focus(ctx: &Context, response: &Response) -> bool {
 }
 
 fn standalone_chat_window_id(id: Id, target_id: &str) -> Id {
-    // v3 discards v2 resize memory whose minimum content width may have been
-    // inflated by the old non-wrapping private-chat toolbar.
+    // v4 discards resize memory whose height may have been inflated by the old
+    // chat body feeding its requested height back into the resizable window.
     Id::new((
         id,
         target_id,
-        "standalone_chat_window_v3",
+        "standalone_chat_window_v4",
     ))
 }
 
 fn chat_group_window_id(group_name: &str) -> Id { Id::new((group_name, "chat_group_window_v2")) }
 
 fn group_member_chat_window_id(group_name: &str, target_id: &str) -> Id {
-    // v6 discards width saved while message rows requested their width plus
-    // horizontal item spacing and expanded the nested window every frame.
+    // v7 also discards height saved while the old chat body fed its requested
+    // height back into the nested resizable window.
     Id::new((
         group_name,
         target_id,
-        "group_member_chat_window_v6",
+        "group_member_chat_window_v7",
     ))
 }
 
@@ -2216,14 +2216,31 @@ fn chat_body_ui(
     messages: &Vec<NapcatMessage>,
     napcat_sender: Option<&NapcatIOSender>,
     target_id: &str,
-    chat_input_msgs: &mut Local<HashMap<String, String>>,
+    chat_input_msgs: &mut HashMap<String, String>,
     targets: Vec<NapcatSendTarget>,
-    ime: &mut ResMut<ImeManager>,
-    chat_scroll_states: &mut Local<HashMap<String, ChatScrollState>>,
-    image_textures: &mut Local<HashMap<String, TextureHandle>>,
+    ime: &mut ImeManager,
+    chat_scroll_states: &mut HashMap<String, ChatScrollState>,
+    image_textures: &mut HashMap<String, TextureHandle>,
     desired_height: Option<f32>,
 ) {
-    ui.vertical(|ui| {
+    let available_size = ui.available_size();
+    let viewport_height = desired_height
+        .unwrap_or(available_size.y)
+        .min(available_size.y)
+        .max(0.0);
+    let viewport_size = egui::vec2(available_size.x, viewport_height);
+    let (viewport_rect, _) = ui.allocate_exact_size(viewport_size, Sense::hover());
+    let mut viewport_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt((target_id, "chat_body_viewport"))
+            .max_rect(viewport_rect)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+
+    // Keep the message pane and composer inside one already-allocated viewport.
+    // Transient composer rows such as "发送中..." can then consume or overflow
+    // this local region without increasing the parent window on every frame.
+    viewport_ui.vertical(|ui| {
         if !chat_input_msgs.contains_key(target_id) {
             chat_input_msgs.insert(target_id.to_owned(), String::new());
         }
@@ -3163,7 +3180,7 @@ fn message_row_ui(
     ui: &mut Ui,
     message: &NapcatMessage,
     row_width: f32,
-    image_textures: &mut Local<HashMap<String, TextureHandle>>,
+    image_textures: &mut HashMap<String, TextureHandle>,
 ) {
     let is_self = message.data.self_id == message.data.user_id;
     let max_message_width = if row_width < 120.0 {
@@ -3203,7 +3220,7 @@ fn message_bubble_layout(
 fn message_text_ui(
     ui: &mut Ui,
     message: &NapcatMessage,
-    image_textures: &mut Local<HashMap<String, TextureHandle>>,
+    image_textures: &mut HashMap<String, TextureHandle>,
 ) {
     ui.label(&message.data.sender.nickname);
     for chain in &message.data.message {
@@ -3227,7 +3244,7 @@ fn message_text_ui(
 fn message_image_ui(
     ui: &mut Ui,
     data: &ImageData,
-    image_textures: &mut Local<HashMap<String, TextureHandle>>,
+    image_textures: &mut HashMap<String, TextureHandle>,
 ) {
     let Some(path) = cached_image_path(data.local_path.trim()) else {
         ui.label("[图片]");
@@ -14743,6 +14760,76 @@ mod tests {
 
         assert!(widths[1..].windows(2).all(|pair| pair[0] == pair[1]));
         assert!(widths.last().copied().unwrap() < screen_rect.width());
+    }
+
+    #[test]
+    fn sent_message_does_not_expand_the_chat_window_height_each_frame() {
+        let ctx = Context::default();
+        let screen_rect =
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let target_id = "42";
+        let mut input_msgs = HashMap::from([(
+            target_id.to_owned(),
+            "发送后的消息".to_owned(),
+        )]);
+        let mut scroll_states = HashMap::new();
+        let mut image_textures = HashMap::new();
+        let mut ime = ImeManager::default();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let napcat_sender = NapcatIOSender(sender);
+        let targets = vec![NapcatSendTarget::Private(42)];
+        ime.queue_text_send(
+            target_id,
+            "发送后的消息",
+            &napcat_sender,
+            targets.clone(),
+        )
+        .unwrap();
+        let messages = vec![test_private_message(42)];
+        let mut heights = Vec::new();
+
+        for _ in 0..8 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            });
+            let response = egui::Window::new("发送后的聊天")
+                .id(Id::new("stable_sent_message_height_test"))
+                .default_size(CHAT_WINDOW_SIZE)
+                .min_size(CHAT_WINDOW_MIN_SIZE)
+                .max_size(chat_window_max_size(
+                    screen_rect,
+                    CHAT_WINDOW_MIN_SIZE,
+                    false,
+                ))
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    chat_body_ui(
+                        ui,
+                        &ctx,
+                        &messages,
+                        Some(&napcat_sender),
+                        target_id,
+                        &mut input_msgs,
+                        targets.clone(),
+                        &mut ime,
+                        &mut scroll_states,
+                        &mut image_textures,
+                        None,
+                    );
+                })
+                .unwrap();
+            heights.push(response.response.rect.height());
+            let _ = ctx.end_pass();
+        }
+
+        assert!(
+            heights[2..]
+                .windows(2)
+                .all(|pair| (pair[0] - pair[1]).abs() < 0.1),
+            "chat heights kept changing after send: {heights:?}"
+        );
+        assert!(heights.last().copied().unwrap() < CHAT_WINDOW_MAX_HEIGHT);
     }
 
     #[test]
