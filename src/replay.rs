@@ -127,7 +127,9 @@ const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
 const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
 const REPLAY_PLAYING_STATUS: &str = "正在回放；停止后会恢复当前体素场景";
 const REPLAY_SPEECH_PREPARING_STATUS: &str = "正在准备当前台词语音；语音就绪后字幕与声音会同时开始";
-const DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 1.5;
+const DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 1.5;
+const MIN_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 0.5;
+const MAX_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 4.0;
 
 pub struct ReplayPlugin;
 
@@ -335,6 +337,8 @@ struct ReplayFile {
     audience: ReplayAudience,
     scene: ReplayScene,
     camera: Vec<ReplayCameraKeyframe>,
+    #[serde(default = "default_directed_camera_distance_scale")]
+    camera_distance_scale: f32,
     dialogue: Vec<ReplayDialogue>,
     #[serde(default)]
     area_blocks: Vec<ReplayAreaBlock>,
@@ -488,6 +492,7 @@ pub(crate) struct ReplayStudio {
     record_elapsed_ms: u64,
     playback_ms: u64,
     playback_speed: f32,
+    camera_distance_scale: f32,
     record_camera_enabled: bool,
     deepseek_director_enabled: bool,
     director_response_hash: Option<u64>,
@@ -587,6 +592,7 @@ impl Default for ReplayStudio {
             record_elapsed_ms: 0,
             playback_ms: 0,
             playback_speed: 1.0,
+            camera_distance_scale: default_directed_camera_distance_scale(),
             record_camera_enabled: false,
             deepseek_director_enabled: false,
             director_response_hash: None,
@@ -718,6 +724,7 @@ fn record_replay(
                     &replay.dialogue,
                     replay.duration_ms,
                     &speaker_positions,
+                    replay.camera_distance_scale,
                     &obstacles,
                 );
             }
@@ -1840,6 +1847,41 @@ fn replay_controls(
         "录制 DM 自由镜头（默认关闭，点击后才采集）",
     )
     .on_hover_text("关闭时只记录场景和台词，不持续采集你的镜头移动。");
+    let mut requested_camera_distance = studio.camera_distance_scale;
+    let camera_distance_changed = ui
+        .horizontal(|ui| {
+            ui.label("自动导演镜头距离");
+            ui.add(
+                egui::DragValue::new(&mut requested_camera_distance)
+                    .speed(0.05)
+                    .range(
+                        MIN_DIRECTED_CAMERA_DISTANCE_SCALE
+                            ..=MAX_DIRECTED_CAMERA_DISTANCE_SCALE,
+                    )
+                    .fixed_decimals(2)
+                    .suffix("×"),
+            )
+            .on_hover_text("调整自动生成和 DeepSeek 导演镜头与当前说话玩家之间的距离。")
+            .changed()
+        })
+        .inner;
+    if camera_distance_changed {
+        studio.camera_distance_scale =
+            normalized_directed_camera_distance_scale(requested_camera_distance);
+        let camera_distance_scale = studio.camera_distance_scale;
+        if let Some(replay) = studio.replay.as_mut() {
+            let speaker_positions = standee_positions(standees);
+            rescale_replay_camera_distance(
+                replay,
+                camera_distance_scale,
+                &speaker_positions,
+            );
+        }
+        studio.status = format!(
+            "自动导演镜头距离已设为 {:.2}×",
+            studio.camera_distance_scale
+        );
+    }
 
     ui.horizontal(|ui| match studio.mode {
         ReplayMode::Recording => {
@@ -2256,6 +2298,7 @@ fn replay_controls(
                         stop_playback(studio, grids);
                         studio.playback_ms = 0;
                         studio.audience = replay.audience.clone();
+                        studio.camera_distance_scale = replay.camera_distance_scale;
                         studio.status = format!("已载入项目：{}", replay.title);
                         studio.replay = Some(replay);
                     },
@@ -2440,6 +2483,7 @@ fn start_recording(
         campaign_id,
         studio.audience.clone(),
         scene,
+        studio.camera_distance_scale,
     );
     if studio.record_camera_enabled {
         if let Ok(transform) = camera.single() {
@@ -2505,6 +2549,7 @@ fn build_from_history(
         campaign_id.clone(),
         studio.audience.clone(),
         scene,
+        studio.camera_distance_scale,
     );
     let speaker_positions = standee_positions(standees);
     let mut visible = manager
@@ -2572,6 +2617,7 @@ fn build_from_history(
             &replay.dialogue,
             replay.duration_ms,
             &speaker_positions,
+            replay.camera_distance_scale,
             &obstacles,
         );
     }
@@ -2808,6 +2854,7 @@ fn apply_ready_director_plan(
         &cues,
         replay.duration_ms,
         &speaker_positions,
+        replay.camera_distance_scale,
         &obstacles,
     );
     studio.playback_ms = 0;
@@ -2839,6 +2886,7 @@ fn new_replay(
     campaign_id: String,
     audience: ReplayAudience,
     scene: ReplayScene,
+    camera_distance_scale: f32,
 ) -> ReplayFile {
     let title = manager
         .current_trpg_group
@@ -2855,6 +2903,7 @@ fn new_replay(
         audience,
         scene,
         camera: Vec::new(),
+        camera_distance_scale: normalized_directed_camera_distance_scale(camera_distance_scale),
         dialogue: Vec::new(),
         area_blocks: Vec::new(),
         area_radius_cells: default_area_radius_cells(),
@@ -3161,6 +3210,7 @@ fn replay_dialogue_editor(
                         &playable,
                         replay.duration_ms,
                         &positions,
+                        replay.camera_distance_scale,
                         &ReplayCameraObstacles::from_scene(&replay.scene),
                     );
                 }
@@ -3854,6 +3904,21 @@ fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
 
 fn default_master_speech_speed() -> f32 { 1.10 }
 
+fn default_directed_camera_distance_scale() -> f32 {
+    DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE
+}
+
+fn normalized_directed_camera_distance_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(
+            MIN_DIRECTED_CAMERA_DISTANCE_SCALE,
+            MAX_DIRECTED_CAMERA_DISTANCE_SCALE,
+        )
+    } else {
+        default_directed_camera_distance_scale()
+    }
+}
+
 fn normalized_master_speech_speed(speed: f32) -> f32 {
     if speed.is_finite() && speed > 0.0 {
         speed.max(0.10)
@@ -4524,6 +4589,44 @@ fn replay_speaker_positions(dialogue: &[ReplayDialogue]) -> HashMap<u64, Vec3> {
         .collect()
 }
 
+fn replay_camera_focus_at(
+    dialogue: &[ReplayDialogue],
+    time_ms: u64,
+    speaker_positions: &HashMap<u64, Vec3>,
+) -> Option<Vec3> {
+    dialogue
+        .iter()
+        .rev()
+        .find(|line| line.included && line.time_ms <= time_ms)
+        .or_else(|| dialogue.iter().find(|line| line.included))
+        .and_then(|line| replay_dialogue_position(line, speaker_positions))
+}
+
+fn rescale_replay_camera_distance(
+    replay: &mut ReplayFile,
+    requested_scale: f32,
+    speaker_positions: &HashMap<u64, Vec3>,
+) {
+    let previous_scale =
+        normalized_directed_camera_distance_scale(replay.camera_distance_scale);
+    let requested_scale = normalized_directed_camera_distance_scale(requested_scale);
+    let ratio = requested_scale / previous_scale;
+    if (ratio - 1.0).abs() > f32::EPSILON {
+        for frame in &mut replay.camera {
+            let Some(focus) =
+                replay_camera_focus_at(&replay.dialogue, frame.time_ms, speaker_positions)
+            else {
+                continue;
+            };
+            let mut transform = frame_transform(frame);
+            transform.translation = focus + (transform.translation - focus) * ratio;
+            transform = transform.looking_at(focus, Vec3::Y);
+            *frame = camera_keyframe(frame.time_ms, &transform);
+        }
+    }
+    replay.camera_distance_scale = requested_scale;
+}
+
 fn replay_dialogue_position(
     line: &ReplayDialogue,
     speaker_positions: &HashMap<u64, Vec3>,
@@ -4538,9 +4641,15 @@ fn turn_based_camera_track(
     dialogue: &[ReplayDialogue],
     duration_ms: u64,
     speaker_positions: &HashMap<u64, Vec3>,
+    camera_distance_scale: f32,
     obstacles: &ReplayCameraObstacles,
 ) -> Vec<ReplayCameraKeyframe> {
-    let rig = DirectedCameraRig::for_dialogue(base, dialogue, speaker_positions);
+    let rig = DirectedCameraRig::for_dialogue(
+        base,
+        dialogue,
+        speaker_positions,
+        camera_distance_scale,
+    );
     let mut frames = Vec::with_capacity(dialogue.len().saturating_mul(3).saturating_add(2));
     let mut current = dialogue
         .first()
@@ -4600,9 +4709,15 @@ fn director_camera_track(
     cues: &[DirectorCue],
     duration_ms: u64,
     speaker_positions: &HashMap<u64, Vec3>,
+    camera_distance_scale: f32,
     obstacles: &ReplayCameraObstacles,
 ) -> Vec<ReplayCameraKeyframe> {
-    let rig = DirectedCameraRig::for_dialogue(base, dialogue, speaker_positions);
+    let rig = DirectedCameraRig::for_dialogue(
+        base,
+        dialogue,
+        speaker_positions,
+        camera_distance_scale,
+    );
     let mut current = base.clone();
     if let (Some(line), Some(cue)) = (dialogue.first(), cues.first()) {
         if let Some(target) = replay_dialogue_position(line, speaker_positions) {
@@ -4748,6 +4863,7 @@ impl ReplayCameraObstacles {
 struct DirectedCameraRig {
     axis_origin: Vec3,
     camera_side: Vec3,
+    distance_scale: f32,
 }
 
 impl DirectedCameraRig {
@@ -4757,6 +4873,7 @@ impl DirectedCameraRig {
         base: &Transform,
         dialogue: &[ReplayDialogue],
         speaker_positions: &HashMap<u64, Vec3>,
+        distance_scale: f32,
     ) -> Self {
         let first = dialogue
             .iter()
@@ -4801,6 +4918,7 @@ impl DirectedCameraRig {
         Self {
             axis_origin,
             camera_side,
+            distance_scale: normalized_directed_camera_distance_scale(distance_scale),
         }
     }
 
@@ -4817,17 +4935,17 @@ impl DirectedCameraRig {
             DirectorShot::SpeakerWide => 8.0,
             DirectorShot::Establishing => 12.0,
             DirectorShot::Environment => 10.0,
-        } * DIRECTED_CAMERA_DISTANCE_SCALE;
+        } * self.distance_scale;
         let height = match shot {
             DirectorShot::SpeakerClose => 1.1,
             DirectorShot::SpeakerMedium => 1.5,
             DirectorShot::SpeakerWide => 2.1,
             DirectorShot::Establishing | DirectorShot::Environment => 3.2,
-        } * DIRECTED_CAMERA_DISTANCE_SCALE;
+        } * self.distance_scale;
         let static_position = self.visible_position(target, base_distance, height, obstacles);
         let dolly_axis = (static_position - target).normalize();
         let desired_position =
-            static_position + dolly_axis * (distance_delta * DIRECTED_CAMERA_DISTANCE_SCALE);
+            static_position + dolly_axis * (distance_delta * self.distance_scale);
         let position = if self.signed_side(desired_position) < Self::LINE_MARGIN
             || !obstacles.camera_is_clear(desired_position)
         {
@@ -5662,6 +5780,8 @@ fn import_replay(path: &str) -> Result<ReplayFile, String> {
     let path = normalized_path(path)?;
     let bytes = fs::read(path).map_err(|err| err.to_string())?;
     let mut replay: ReplayFile = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
+    replay.camera_distance_scale =
+        normalized_directed_camera_distance_scale(replay.camera_distance_scale);
     if !matches!(
         replay.format_version,
         LEGACY_REPLAY_FORMAT_VERSION | REPLAY_FORMAT_VERSION
@@ -5869,6 +5989,7 @@ mod tests {
             &[line],
             1_000,
             &HashMap::from([(1, Vec3::new(-100.0, 0.0, 0.0))]),
+            default_directed_camera_distance_scale(),
             &ReplayCameraObstacles::default(),
         );
         let shot = frame_transform(
@@ -6025,6 +6146,7 @@ mod tests {
             &dialogue,
             5_430,
             &speaker_positions,
+            default_directed_camera_distance_scale(),
             &obstacles,
         );
         assert!(
@@ -6119,6 +6241,7 @@ mod tests {
             &cues,
             3_050,
             &HashMap::from([(1, target)]),
+            default_directed_camera_distance_scale(),
             &obstacles,
         );
         let shot = frame_transform(frames.last().unwrap());
@@ -6156,7 +6279,12 @@ mod tests {
                 motion: DirectorMotion::DriftRight,
             },
         ];
-        let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &speaker_positions);
+        let rig = DirectedCameraRig::for_dialogue(
+            &base,
+            &dialogue,
+            &speaker_positions,
+            default_directed_camera_distance_scale(),
+        );
         let obstacles = ReplayCameraObstacles::default();
         let frames = director_camera_track(
             &base,
@@ -6164,6 +6292,7 @@ mod tests {
             &cues,
             6_020,
             &speaker_positions,
+            default_directed_camera_distance_scale(),
             &obstacles,
         );
 
@@ -6179,7 +6308,12 @@ mod tests {
         let base = Transform::from_xyz(0.125, 3.0, 5.125);
         let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
         let positions = HashMap::from([(1, target)]);
-        let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
+        let rig = DirectedCameraRig::for_dialogue(
+            &base,
+            &dialogue,
+            &positions,
+            default_directed_camera_distance_scale(),
+        );
         let scene = ReplayScene {
             voxels: (-20..=20)
                 .flat_map(|x| {
@@ -6215,7 +6349,12 @@ mod tests {
         let base = Transform::from_xyz(2.0, 2.5, 6.0);
         let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
         let positions = HashMap::from([(1, target)]);
-        let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
+        let rig = DirectedCameraRig::for_dialogue(
+            &base,
+            &dialogue,
+            &positions,
+            default_directed_camera_distance_scale(),
+        );
 
         let shot = rig.director_shot(
             target,
@@ -6230,12 +6369,47 @@ mod tests {
     }
 
     #[test]
+    fn gm_distance_control_rescales_existing_shots_and_keeps_focus() {
+        let target = Vec3::new(2.0, 1.0, -1.0);
+        let line = test_dialogue(350, 2_700, DialogueSide::Right);
+        let mut replay = test_replay(vec![line]);
+        let original =
+            Transform::from_xyz(2.0, 3.25, 6.5).looking_at(target, Vec3::Y);
+        replay.camera = vec![camera_keyframe(350, &original)];
+
+        rescale_replay_camera_distance(
+            &mut replay,
+            3.0,
+            &HashMap::from([(1, target)]),
+        );
+
+        let adjusted = frame_transform(&replay.camera[0]);
+        assert!(
+            (adjusted.translation.distance(target)
+                - original.translation.distance(target) * 2.0)
+                .abs()
+                < 0.001
+        );
+        assert!(
+            (adjusted.rotation * Vec3::NEG_Z)
+                .dot((target - adjusted.translation).normalize())
+                > 0.999
+        );
+        assert_eq!(replay.camera_distance_scale, 3.0);
+    }
+
+    #[test]
     fn directed_dolly_moves_along_the_locked_camera_axis_and_keeps_focus() {
         let base = Transform::from_xyz(0.0, 4.0, 10.0);
         let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
         let target = Vec3::new(2.0, 1.0, -1.0);
         let positions = HashMap::from([(1, target)]);
-        let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
+        let rig = DirectedCameraRig::for_dialogue(
+            &base,
+            &dialogue,
+            &positions,
+            default_directed_camera_distance_scale(),
+        );
         let obstacles = ReplayCameraObstacles::default();
         let arrival = rig.director_shot(
             target,
@@ -6273,7 +6447,12 @@ mod tests {
             (1, Vec3::new(-6.0, 1.0, 0.0)),
             (2, Vec3::new(6.0, 1.0, 0.0)),
         ]);
-        let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
+        let rig = DirectedCameraRig::for_dialogue(
+            &base,
+            &dialogue,
+            &positions,
+            default_directed_camera_distance_scale(),
+        );
         let obstacles = ReplayCameraObstacles::default();
         // Keep the speaker far enough onto the forbidden side that the scaled
         // shot must still clamp to the scene line.
@@ -6798,8 +6977,13 @@ mod tests {
         assert!(replay.speaker_voice_settings.is_empty());
         assert_eq!(replay.master_speech_speed, 1.10);
         assert_eq!(replay.master_dialogue_duration, 1.0);
+        assert_eq!(
+            replay.camera_distance_scale,
+            default_directed_camera_distance_scale()
+        );
         replay.master_speech_speed = 1.15;
         replay.master_dialogue_duration = 2.75;
+        replay.camera_distance_scale = 2.25;
         replay
             .speaker_voice_settings
             .insert(42, SpeakerVoiceSettings {
@@ -6828,6 +7012,7 @@ mod tests {
         assert_eq!(settings.volume, 0.75);
         assert_eq!(restored.master_speech_speed, 1.15);
         assert_eq!(restored.master_dialogue_duration, 2.75);
+        assert_eq!(restored.camera_distance_scale, 2.25);
     }
 
     #[test]
@@ -7006,6 +7191,7 @@ mod tests {
             audience: ReplayAudience::Public,
             scene: ReplayScene::default(),
             camera: Vec::new(),
+            camera_distance_scale: default_directed_camera_distance_scale(),
             dialogue,
             area_blocks: Vec::new(),
             area_radius_cells: DEFAULT_AREA_RADIUS_CELLS,
