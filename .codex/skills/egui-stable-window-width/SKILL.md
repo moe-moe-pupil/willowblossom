@@ -165,6 +165,35 @@ Version the nested window id once when replacing an always-drag-anywhere
 workaround, because its persisted interaction/geometry state belongs to the old
 behavior.
 
+For left/right-aligned chat bubbles, do not build a row by setting its width
+and then adding both a spacer widget and a bubble widget:
+
+```rust
+// Wrong: horizontal layout inserts item spacing between these children,
+// so measured width becomes row_width + item_spacing.x.
+ui.horizontal(|ui| {
+    ui.set_width(row_width);
+    ui.add_space(margin_width);
+    ui.vertical(|ui| bubble_ui(ui));
+});
+```
+
+That extra item spacing feeds the measured width back into `Resize`, growing
+the window by a few pixels every frame. Align the bubble through the row layout
+instead, with no spacer child:
+
+```rust
+let alignment = if is_self { egui::Align::RIGHT } else { egui::Align::LEFT };
+ui.with_layout(egui::Layout::top_down(alignment), |ui| {
+    ui.set_width(row_width);
+    ui.vertical(|ui| {
+        ui.set_width(bubble_width);
+        ui.set_max_width(bubble_width);
+        bubble_ui(ui);
+    });
+});
+```
+
 For fixed-size item catalogs, cap the window and omit `num_columns`; call `end_row()` at the intended boundary and cap cell widths. Version the window and grid ids once if their persisted layout already contains the oversized width:
 
 ```rust
@@ -220,3 +249,5 @@ After patching:
 - Treat viewport bounding and content wrapping as complementary: the bound
   stops runaway growth, while wrapping removes minimum-width pressure and
   permits deliberate shrinking.
+- In a width-filling horizontal row, include `item_spacing.x` when calculating
+  child widths, or prefer alignment layouts that do not need spacer widgets.

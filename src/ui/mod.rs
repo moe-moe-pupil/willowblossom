@@ -2018,12 +2018,12 @@ fn standalone_chat_window_id(id: Id, target_id: &str) -> Id {
 fn chat_group_window_id(group_name: &str) -> Id { Id::new((group_name, "chat_group_window_v2")) }
 
 fn group_member_chat_window_id(group_name: &str, target_id: &str) -> Id {
-    // v5 discards v4 interaction state from the drag-anywhere/current-pos
-    // workaround, which competed with the nested window's resize edges.
+    // v6 discards width saved while message rows requested their width plus
+    // horizontal item spacing and expanded the nested window every frame.
     Id::new((
         group_name,
         target_id,
-        "group_member_chat_window_v5",
+        "group_member_chat_window_v6",
     ))
 }
 
@@ -3109,30 +3109,32 @@ fn message_row_ui(
     } else {
         (row_width * 0.72).clamp(120.0, row_width)
     };
-    let margin_width = (row_width - max_message_width).max(0.0);
+    let alignment = if is_self {
+        egui::Align::RIGHT
+    } else {
+        egui::Align::LEFT
+    };
+    message_bubble_layout(ui, row_width, max_message_width, alignment, |ui| {
+        message_text_ui(ui, message, image_textures);
+    });
+}
 
-    ui.horizontal_top(|ui| {
+fn message_bubble_layout(
+    ui: &mut Ui,
+    row_width: f32,
+    bubble_width: f32,
+    alignment: egui::Align,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    ui.with_layout(egui::Layout::top_down(alignment), |ui| {
         ui.set_width(row_width);
-        if is_self {
-            ui.add_space(margin_width);
-            ui.vertical(|ui| {
-                ui.set_width(max_message_width);
-                ui.set_max_width(max_message_width);
-                ui.with_layout(
-                    egui::Layout::top_down(egui::Align::RIGHT),
-                    |ui| {
-                        message_text_ui(ui, message, image_textures);
-                    },
-                );
+        ui.vertical(|ui| {
+            ui.set_width(bubble_width);
+            ui.set_max_width(bubble_width);
+            ui.with_layout(egui::Layout::top_down(alignment), |ui| {
+                add_contents(ui);
             });
-        } else {
-            ui.vertical(|ui| {
-                ui.set_width(max_message_width);
-                ui.set_max_width(max_message_width);
-                message_text_ui(ui, message, image_textures);
-            });
-            ui.add_space(margin_width);
-        }
+        });
     });
 }
 
@@ -14679,6 +14681,64 @@ mod tests {
 
         assert!(widths[1..].windows(2).all(|pair| pair[0] == pair[1]));
         assert!(widths.last().copied().unwrap() < screen_rect.width());
+    }
+
+    #[test]
+    fn aligned_message_rows_do_not_expand_the_chat_window() {
+        let ctx = Context::default();
+        let screen_rect =
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let mut widths = Vec::new();
+
+        for _ in 0..8 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            });
+            let response = egui::Window::new("成员消息")
+                .id(Id::new("stable_message_rows_test"))
+                .default_size(GROUP_MEMBER_CHAT_SIZE)
+                .min_size(CHAT_WINDOW_MIN_SIZE)
+                .max_size(chat_window_max_size(
+                    screen_rect,
+                    CHAT_WINDOW_MIN_SIZE,
+                    true,
+                ))
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    let row_width = ui.available_width();
+                    let bubble_width = row_width * 0.72;
+                    message_bubble_layout(
+                        ui,
+                        row_width,
+                        bubble_width,
+                        egui::Align::RIGHT,
+                        |ui| {
+                            ui.label("右侧消息会在气泡宽度内换行，不应推动窗口变宽。");
+                        },
+                    );
+                    message_bubble_layout(
+                        ui,
+                        row_width,
+                        bubble_width,
+                        egui::Align::LEFT,
+                        |ui| {
+                            ui.label("左侧消息也不应额外加入水平间距。");
+                        },
+                    );
+                    let mut input = String::new();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut input)
+                            .desired_width(ui.available_width()),
+                    );
+                })
+                .unwrap();
+            widths.push(response.response.rect.width());
+            let _ = ctx.end_pass();
+        }
+
+        assert!(widths[1..].windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(widths.last().copied().unwrap() < 500.0);
     }
 
     #[test]
