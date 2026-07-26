@@ -116,7 +116,8 @@ const MAX_DIALOGUE_MS: u64 = 9_750;
 const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
-const BACKGROUND_MUSIC_PATH: &str = "assets/audio/jrpg2-piano.mp3";
+const BACKGROUND_MUSIC_DIRECTORY: &str = "assets/audio";
+const BACKGROUND_MUSIC_EXTENSIONS: &[&str] = &["mp3", "wav", "ogg", "flac", "m4a", "aac"];
 const SPARK_TTS_RUNTIME_DIR: &str = ".data/willowblossom/tts/spark";
 const SPARK_TTS_SPEECH_CACHE_VERSION: u32 = 1;
 const SHORT_UTTERANCE_MAX_UNITS: usize = 6;
@@ -505,6 +506,8 @@ pub(crate) struct ReplayStudio {
     video_fps: u32,
     music_enabled: bool,
     music_volume: f32,
+    music_file: Option<PathBuf>,
+    music_files: Vec<PathBuf>,
     speech_enabled: bool,
     speech_volume: f32,
     speech_settings_open: bool,
@@ -523,7 +526,7 @@ struct VideoRenderJob {
     output_path: PathBuf,
     fps: u32,
     duration_ms: u64,
-    music_enabled: bool,
+    music_file: Option<PathBuf>,
     music_volume: f32,
     speech_enabled: bool,
     speech_volume: f32,
@@ -585,6 +588,8 @@ struct OnnxPreviewResult {
 
 impl Default for ReplayStudio {
     fn default() -> Self {
+        let music_files = discover_background_music();
+        let music_file = music_files.first().cloned();
         Self {
             mode: ReplayMode::Idle,
             replay: None,
@@ -603,8 +608,10 @@ impl Default for ReplayStudio {
             pre_playback_scene: None,
             video_path: DEFAULT_VIDEO_PATH.to_owned(),
             video_fps: 15,
-            music_enabled: true,
+            music_enabled: music_file.is_some(),
             music_volume: 0.65,
+            music_file,
+            music_files,
             speech_enabled: true,
             speech_volume: 1.25,
             speech_settings_open: false,
@@ -1463,9 +1470,10 @@ fn render_video_frames(
     }
     if !job.monitor_music_started {
         job.monitor_music_started = true;
-        if job.music_enabled {
+        if let Some(music_file) = job.music_file.as_deref() {
             let monitor_path = job.frames.path().join("render-monitor-music.wav");
-            match write_jrpg_soundtrack(
+            match write_background_music_track(
+                music_file,
                 &monitor_path,
                 job.duration_ms,
                 job.music_volume,
@@ -1572,7 +1580,7 @@ fn finish_video_capture(
     let output_path = job.output_path.clone();
     let fps = job.fps;
     let duration_ms = job.duration_ms;
-    let music_enabled = job.music_enabled;
+    let music_file = job.music_file;
     let music_volume = job.music_volume;
     let speech_enabled = job.speech_enabled;
     let speech_volume = job.speech_volume;
@@ -1586,7 +1594,7 @@ fn finish_video_capture(
             &output_path,
             fps,
             duration_ms,
-            music_enabled,
+            music_file.as_deref(),
             music_volume,
             speech_enabled,
             speech_volume,
@@ -2094,17 +2102,53 @@ fn replay_controls(
         }
     });
     ui.horizontal(|ui| {
-        ui.checkbox(
-            &mut studio.music_enabled,
-            "CC0 二次元 JRPG 钢琴音乐",
-        );
+        let music_available = studio.music_file.as_ref().is_some_and(|path| path.is_file());
+        ui.add_enabled_ui(music_available, |ui| {
+            ui.checkbox(&mut studio.music_enabled, "本地 BGM");
+        });
         ui.add_enabled(
-            studio.music_enabled,
+            studio.music_enabled && music_available,
             egui::Slider::new(&mut studio.music_volume, 0.05..=1.50)
                 .text("音量")
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
     });
+    ui.horizontal(|ui| {
+        ui.label("曲目");
+        ui.add_enabled_ui(!studio.music_files.is_empty(), |ui| {
+            egui::ComboBox::from_id_salt("replay-background-music")
+                .selected_text(
+                    studio
+                        .music_file
+                        .as_deref()
+                        .and_then(Path::file_name)
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "未选择".to_owned()),
+                )
+                .show_ui(ui, |ui| {
+                    for path in &studio.music_files {
+                        let label = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        ui.selectable_value(&mut studio.music_file, Some(path.clone()), label);
+                    }
+                });
+        });
+        if ui.button("重新扫描").clicked() {
+            refresh_background_music(studio);
+        }
+        if ui.button("打开文件夹").clicked() {
+            studio.status = match open_background_music_directory() {
+                Ok(()) => format!("已打开 {}", background_music_directory().display()),
+                Err(err) => err,
+            };
+        }
+    });
+    if studio.music_files.is_empty() {
+        ui.small("BGM 文件夹为空；加入音乐后点击“重新扫描”。");
+    }
+    ui.small("从 assets/audio 加载 MP3、WAV、OGG、FLAC、M4A 或 AAC；音乐只在本地读取，不由 AI 生成。");
     ui.horizontal(|ui| {
         ui.checkbox(
             &mut studio.speech_enabled,
@@ -3276,6 +3320,15 @@ fn start_video_export(
         studio.status = err;
         return;
     }
+    let music_file = if studio.music_enabled {
+        let Some(path) = studio.music_file.as_ref().filter(|path| path.is_file()) else {
+            studio.status = "请选择 assets/audio 中的本地 BGM，或关闭 BGM".to_owned();
+            return;
+        };
+        Some(path.clone())
+    } else {
+        None
+    };
     if studio.speech_enabled && !dialogue.is_empty() {
         if let Err(err) = check_speech_synthesizer() {
             studio.status = err;
@@ -3336,7 +3389,7 @@ fn start_video_export(
         output_path,
         fps,
         duration_ms,
-        music_enabled: studio.music_enabled,
+        music_file,
         music_volume: studio.music_volume,
         speech_enabled: studio.speech_enabled,
         speech_volume: studio.speech_volume,
@@ -3384,6 +3437,87 @@ fn normalized_video_path(path: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn background_music_directory() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(BACKGROUND_MUSIC_DIRECTORY)
+}
+
+fn discover_background_music() -> Vec<PathBuf> {
+    discover_background_music_in(&background_music_directory())
+}
+
+fn discover_background_music_in(directory: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    BACKGROUND_MUSIC_EXTENSIONS
+                        .iter()
+                        .any(|supported| extension.eq_ignore_ascii_case(supported))
+                })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_cached_key(|path| {
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase()
+    });
+    files
+}
+
+fn refresh_background_music(studio: &mut ReplayStudio) {
+    let had_selection = studio.music_file.is_some();
+    studio.music_files = discover_background_music();
+    if studio
+        .music_file
+        .as_ref()
+        .is_none_or(|selected| !studio.music_files.contains(selected))
+    {
+        studio.music_file = studio.music_files.first().cloned();
+    }
+    if studio.music_file.is_none() {
+        studio.music_enabled = false;
+    } else if !had_selection {
+        studio.music_enabled = true;
+    }
+    studio.status = if studio.music_files.is_empty() {
+        format!(
+            "BGM 文件夹为空：{}",
+            background_music_directory().display()
+        )
+    } else {
+        format!("已找到 {} 首本地 BGM", studio.music_files.len())
+    };
+}
+
+fn open_background_music_directory() -> Result<(), String> {
+    let directory = background_music_directory();
+    fs::create_dir_all(&directory).map_err(|err| format!("无法创建 BGM 文件夹：{err}"))?;
+    open_directory(&directory).map_err(|err| format!("无法打开 BGM 文件夹：{err}"))
+}
+
+#[cfg(windows)]
+fn open_directory(path: &Path) -> std::io::Result<()> {
+    Command::new("explorer").arg(path).spawn().map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn open_directory(path: &Path) -> std::io::Result<()> {
+    Command::new("open").arg(path).spawn().map(|_| ())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_directory(path: &Path) -> std::io::Result<()> {
+    Command::new("xdg-open").arg(path).spawn().map(|_| ())
+}
+
 fn check_ffmpeg() -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
     command.arg("-version");
@@ -3412,7 +3546,7 @@ fn encode_video_frames(
     output_path: &Path,
     fps: u32,
     duration_ms: u64,
-    music_enabled: bool,
+    music_file: Option<&Path>,
     music_volume: f32,
     speech_enabled: bool,
     speech_volume: f32,
@@ -3421,10 +3555,11 @@ fn encode_video_frames(
     speaker_voice_settings: &HashMap<u64, SpeakerVoiceSettings>,
 ) -> Result<(), String> {
     let frame_pattern = frames_path.join("frame_%06d.png");
-    let soundtrack_path = frames_path.join("jrpg2-piano-soundtrack.wav");
+    let soundtrack_path = frames_path.join("background-music.wav");
     let narration_path = frames_path.join("character-narration.wav");
-    if music_enabled {
-        write_jrpg_soundtrack(
+    if let Some(music_file) = music_file {
+        write_background_music_track(
+            music_file,
             &soundtrack_path,
             duration_ms,
             music_volume,
@@ -3447,7 +3582,7 @@ fn encode_video_frames(
     command.args(ffmpeg_arguments(fps));
     command.arg(frame_pattern);
     let mut next_input = 1;
-    let music_input = if music_enabled {
+    let music_input = if music_file.is_some() {
         command.arg("-i").arg(&soundtrack_path);
         let input = next_input;
         next_input += 1;
@@ -3494,7 +3629,7 @@ fn encode_video_frames(
         },
         (None, None) => {},
     }
-    if music_enabled || speech_enabled {
+    if music_file.is_some() || speech_enabled {
         command.args(["-c:a", "aac", "-b:a", "160k", "-shortest"]);
     }
     command.arg(&temporary_output);
@@ -3503,7 +3638,7 @@ fn encode_video_frames(
         .output()
         .map_err(|err| format!("无法启动 FFmpeg：{err}"))?;
     if output.status.success() {
-        if music_enabled || speech_enabled {
+        if music_file.is_some() || speech_enabled {
             if let Err(err) = verify_audio_signal(&temporary_output) {
                 let _ = fs::remove_file(&temporary_output);
                 return Err(err);
@@ -4098,13 +4233,14 @@ fn read_pcm16_mono_wav(path: &Path) -> Result<Vec<i16>, String> {
         .collect())
 }
 
-fn write_jrpg_soundtrack(path: &Path, duration_ms: u64, volume: f32) -> Result<(), String> {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(BACKGROUND_MUSIC_PATH);
+fn write_background_music_track(
+    source: &Path,
+    path: &Path,
+    duration_ms: u64,
+    volume: f32,
+) -> Result<(), String> {
     if !source.is_file() {
-        return Err(format!(
-            "缺少 CC0 JRPG 背景音乐：{}",
-            source.display()
-        ));
+        return Err(format!("找不到本地 BGM：{}", source.display()));
     }
     let duration_seconds = (duration_ms.max(50) as f64 / 1_000.0).max(0.05);
     let fade_seconds = (duration_seconds * 0.15).clamp(0.05, 2.0);
@@ -4141,12 +4277,12 @@ fn write_jrpg_soundtrack(path: &Path, duration_ms: u64, volume: f32) -> Result<(
     hide_command_window(&mut command);
     let output = command
         .output()
-        .map_err(|err| format!("无法启动 FFmpeg 处理 JRPG 背景音乐：{err}"))?;
+        .map_err(|err| format!("无法启动 FFmpeg 处理本地 BGM：{err}"))?;
     if output.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "无法生成 JRPG 背景音乐：{}",
+            "无法处理本地 BGM：{}",
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
@@ -7032,15 +7168,35 @@ mod tests {
     }
 
     #[test]
-    fn cc0_jrpg_music_is_a_non_silent_stereo_wav() {
+    fn local_bgm_is_a_non_silent_stereo_wav() {
         let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.wav");
+        write_test_bgm(&source);
         let path = directory.path().join("music.wav");
-        write_jrpg_soundtrack(&path, 250, 0.35).unwrap();
+        write_background_music_track(&source, &path, 250, 0.35).unwrap();
         let bytes = fs::read(path).unwrap();
         assert_eq!(&bytes[0..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"WAVE");
         assert_eq!(&bytes[22..24], &2_u16.to_le_bytes());
         assert!(bytes[44..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn bgm_folder_loads_supported_music_only_in_name_order() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("z.MP3"), b"music").unwrap();
+        fs::write(directory.path().join("A.ogg"), b"music").unwrap();
+        fs::write(directory.path().join("notes.txt"), b"not music").unwrap();
+
+        let files = discover_background_music_in(directory.path());
+        assert_eq!(
+            files
+                .iter()
+                .filter_map(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["A.ogg", "z.MP3"]
+        );
     }
 
     #[test]
@@ -7105,6 +7261,8 @@ mod tests {
                 .unwrap();
         }
         let output = directory.path().join("speech-music-test.mp4");
+        let music = directory.path().join("music.wav");
+        write_test_bgm(&music);
         let mut dialogue = test_dialogue(0, 900, DialogueSide::Right);
         dialogue.text = "你好，这是角色语音。".to_owned();
         encode_video_frames(
@@ -7112,7 +7270,7 @@ mod tests {
             &output,
             10,
             1_000,
-            true,
+            Some(&music),
             0.35,
             true,
             0.90,
@@ -7140,6 +7298,24 @@ mod tests {
             String::from_utf8_lossy(&probe.stdout).trim(),
             "aac"
         );
+    }
+
+    fn write_test_bgm(path: &Path) {
+        let samples = (0..8_000)
+            .flat_map(|index| {
+                let sample = if index % 32 < 16 {
+                    8_000_i16
+                } else {
+                    -8_000_i16
+                };
+                [sample, sample]
+            })
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut writer = BufWriter::new(fs::File::create(path).unwrap());
+        write_wav_header(&mut writer, 32_000, 2, 16, samples.len() as u32).unwrap();
+        writer.write_all(&samples).unwrap();
+        writer.flush().unwrap();
     }
 
     fn test_dialogue(time_ms: u64, duration_ms: u64, side: DialogueSide) -> ReplayDialogue {
