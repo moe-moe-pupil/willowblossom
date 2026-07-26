@@ -8400,7 +8400,8 @@ fn party_channel_auto_forward_request(
     }
 
     let forwarded_text = if party.anonymous {
-        channel_message.text
+        let party_name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
+        format!("{party_name}(匿名): {}", channel_message.text)
     } else {
         let party_name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
         let channel_name = if party_name.ends_with("频道") {
@@ -12333,7 +12334,7 @@ mod tests {
         };
 
         assert_eq!(anonymous_request.recipients, vec![3]);
-        assert_eq!(anonymous_request.text, "anonymous clue");
+        assert_eq!(anonymous_request.text, "人类(匿名): anonymous clue");
 
         {
             let group = manager.trpg_groups.get_mut("table").unwrap();
