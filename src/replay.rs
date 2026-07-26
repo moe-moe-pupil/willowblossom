@@ -119,7 +119,7 @@ const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const BACKGROUND_MUSIC_DIRECTORY: &str = "assets/audio";
 const BACKGROUND_MUSIC_EXTENSIONS: &[&str] = &["mp3", "wav", "ogg", "flac", "m4a", "aac"];
 const SPARK_TTS_RUNTIME_DIR: &str = ".data/willowblossom/tts/spark";
-const SPARK_TTS_SPEECH_CACHE_VERSION: u32 = 1;
+const SPARK_TTS_SPEECH_CACHE_VERSION: u32 = 2;
 const SHORT_UTTERANCE_MAX_UNITS: usize = 6;
 const SHORT_UTTERANCE_SPEED_CAP: f32 = 1.10;
 const SHORT_UTTERANCE_HEAD_PAD_MS: u64 = 80;
@@ -770,6 +770,8 @@ fn advance_replay(
     time: Res<Time>,
     speech: Res<PreviewSpeechController>,
     mut studio: ResMut<ReplayStudio>,
+    audio_sinks: Query<&AudioSink>,
+    audio_players: Query<(), With<AudioPlayer>>,
 ) {
     if studio.mode != ReplayMode::Playing {
         return;
@@ -781,17 +783,20 @@ fn advance_replay(
     let delta_ms = (time.delta_secs() * studio.playback_speed * 1_000.0).round() as u64;
     let proposed_ms = studio.playback_ms.saturating_add(delta_ms).min(duration_ms);
     let mut waiting_for_speech = false;
+    let mut waiting_for_audio = false;
     if studio.speech_enabled && onnx_tts_is_available() {
         if let Some(replay) = studio.replay.as_ref() {
             let current = active_dialogue_index(&replay.dialogue, studio.playback_ms);
             let proposed = active_dialogue_index(&replay.dialogue, proposed_ms);
             if let Some(index) = current {
                 let signature = replay_voice_signature(replay, studio.speech_volume);
-                if !speech.onnx_cue_finished(
-                    signature,
-                    (replay.created_at_unix_ms, index),
-                ) {
+                let cue = (replay.created_at_unix_ms, index);
+                if !speech.onnx_cue_finished(signature, cue) {
                     waiting_for_speech = true;
+                } else if proposed != current
+                    && speech.cue_audio_is_pending(cue, &audio_sinks, &audio_players)
+                {
+                    waiting_for_audio = true;
                 }
             }
             if proposed != current {
@@ -809,6 +814,10 @@ fn advance_replay(
     }
     if waiting_for_speech {
         studio.status = REPLAY_SPEECH_PREPARING_STATUS.to_owned();
+        return;
+    }
+    if waiting_for_audio {
+        studio.status = REPLAY_PLAYING_STATUS.to_owned();
         return;
     }
     if studio.status == REPLAY_SPEECH_PREPARING_STATUS {
@@ -1043,6 +1052,27 @@ impl PreviewSpeechController {
             && (self.onnx_cache.contains_key(&cue)
                 || self.onnx_failures.contains_key(&cue)
                 || !self.onnx_queued.contains(&cue))
+    }
+
+    fn cue_audio_is_pending(
+        &self,
+        cue: (u64, usize),
+        audio_sinks: &Query<&AudioSink>,
+        audio_players: &Query<(), With<AudioPlayer>>,
+    ) -> bool {
+        if !self.onnx_cache.contains_key(&cue) {
+            return false;
+        }
+        if self.active_cue != Some(cue) {
+            return true;
+        }
+        let Some(entity) = self.audio_entity else {
+            return true;
+        };
+        if let Ok(sink) = audio_sinks.get(entity) {
+            return !sink.empty();
+        }
+        audio_players.get(entity).is_ok()
     }
 
     fn preparation_progress(
