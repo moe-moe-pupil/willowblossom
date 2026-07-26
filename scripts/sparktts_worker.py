@@ -21,8 +21,16 @@ import numpy as np
 import torch
 
 
-def emit(payload: dict) -> None:
-    print(json.dumps(payload, ensure_ascii=False), flush=True)
+def emit(payload: dict) -> bool:
+    """Write one protocol message, returning false when the parent is gone."""
+    try:
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+        return True
+    except OSError:
+        # Windows reports a closed anonymous pipe as EINVAL (22), rather than
+        # BrokenPipeError. The Rust parent has gone, so the worker should exit
+        # quietly instead of trying to report the same error through that pipe.
+        return False
 
 
 def seed_for(profile_id: str, text: str) -> None:
@@ -71,7 +79,8 @@ def main() -> int:
     with contextlib.redirect_stdout(sys.stderr):
         model = SparkTTS(str(model_dir), device=device)
 
-    emit({"ready": True, "device": device, "profile_count": len(profiles)})
+    if not emit({"ready": True, "device": device, "profile_count": len(profiles)}):
+        return 0
 
     for raw_line in sys.stdin:
         try:
@@ -102,9 +111,11 @@ def main() -> int:
                     top_p=0.95,
                 )
             write_pcm16(output_path, audio, sample_rate)
-            emit({"ok": True, "output_path": str(output_path)})
+            if not emit({"ok": True, "output_path": str(output_path)}):
+                return 0
         except Exception as error:
-            emit({"ok": False, "error": str(error)})
+            if not emit({"ok": False, "error": str(error)}):
+                return 0
 
     return 0
 

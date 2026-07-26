@@ -549,8 +549,9 @@ struct PreviewSpeechController {
     prepared_signature: Option<u64>,
     onnx_cache: HashMap<(u64, usize), (Vec<u8>, f32)>,
     onnx_queued: HashSet<(u64, usize)>,
+    onnx_attempts: HashMap<(u64, usize), u8>,
+    onnx_failures: HashMap<(u64, usize), String>,
     onnx_worker: Option<OnnxPreviewWorker>,
-    onnx_failed: bool,
     audio_entity: Option<Entity>,
 }
 
@@ -739,13 +740,13 @@ fn advance_replay(
     let delta_ms = (time.delta_secs() * studio.playback_speed * 1_000.0).round() as u64;
     let proposed_ms = studio.playback_ms.saturating_add(delta_ms).min(duration_ms);
     let mut waiting_for_speech = false;
-    if studio.speech_enabled && onnx_tts_is_available() && !speech.onnx_failed {
+    if studio.speech_enabled && onnx_tts_is_available() {
         if let Some(replay) = studio.replay.as_ref() {
             let current = active_dialogue_index(&replay.dialogue, studio.playback_ms);
             let proposed = active_dialogue_index(&replay.dialogue, proposed_ms);
             if let Some(index) = current {
                 let signature = replay_voice_signature(replay, studio.speech_volume);
-                if !speech.onnx_cue_ready(
+                if !speech.onnx_cue_finished(
                     signature,
                     (replay.created_at_unix_ms, index),
                 ) {
@@ -755,7 +756,7 @@ fn advance_replay(
             if proposed != current {
                 if let Some(index) = proposed {
                     let signature = replay_voice_signature(replay, studio.speech_volume);
-                    if !speech.onnx_cue_ready(
+                    if !speech.onnx_cue_finished(
                         signature,
                         (replay.created_at_unix_ms, index),
                     ) {
@@ -792,7 +793,6 @@ fn preview_replay_speech(
             if let Err(err) =
                 speech.prepare_onnx_replay(replay, studio.speech_volume, &requested)
             {
-                speech.onnx_failed = true;
                 studio.status = format!("角色语音预览失败：{err}");
                 eprintln!("failed to prepare Spark-TTS preview speech: {err}");
             }
@@ -822,11 +822,19 @@ fn preview_replay_speech(
         match result.wav {
             Ok(wav) => {
                 newly_ready_current |= Some(result.cue) == cue;
+                speech.onnx_failures.remove(&result.cue);
                 speech.onnx_cache.insert(result.cue, (wav, result.volume));
             },
             Err(err) => {
-                speech.onnx_failed = true;
-                studio.status = format!("角色语音预览失败：{err}");
+                speech.onnx_queued.remove(&result.cue);
+                let attempts = speech.onnx_attempts.entry(result.cue).or_default();
+                *attempts = attempts.saturating_add(1);
+                if *attempts >= 2 {
+                    speech.onnx_failures.insert(result.cue, err.clone());
+                    studio.status = format!("一条角色语音生成失败，其他台词将继续：{err}");
+                } else {
+                    studio.status = format!("角色语音通道中断，正在自动重试：{err}");
+                }
                 eprintln!("failed to synthesize Spark-TTS preview speech: {err}");
             },
         }
@@ -870,8 +878,9 @@ impl PreviewSpeechController {
             self.prepared_signature = Some(signature);
             self.onnx_cache.clear();
             self.onnx_queued.clear();
+            self.onnx_attempts.clear();
+            self.onnx_failures.clear();
             self.active_cue = None;
-            self.onnx_failed = false;
             if let Some(worker) = self.onnx_worker.as_ref() {
                 worker.latest_signature.store(signature, Ordering::Release);
             }
@@ -881,7 +890,10 @@ impl PreviewSpeechController {
                 continue;
             };
             let cue = (replay.created_at_unix_ms, index);
-            if !line.included || self.onnx_cache.contains_key(&cue) {
+            if !line.included
+                || self.onnx_cache.contains_key(&cue)
+                || self.onnx_failures.contains_key(&cue)
+            {
                 continue;
             }
             let settings = replay
@@ -903,7 +915,7 @@ impl PreviewSpeechController {
                 self.onnx_cache.insert(cue, (wav, volume));
                 continue;
             }
-            if !self.onnx_queued.insert(cue) {
+            if self.onnx_queued.contains(&cue) {
                 continue;
             }
             if self.onnx_worker.is_none() {
@@ -914,11 +926,10 @@ impl PreviewSpeechController {
                     .latest_signature
                     .store(signature, Ordering::Release);
             }
-            let worker = self
+            let send_result = self
                 .onnx_worker
                 .as_ref()
-                .expect("ONNX worker was initialized");
-            worker
+                .expect("ONNX worker was initialized")
                 .requests
                 .send(OnnxPreviewRequest {
                     signature,
@@ -928,20 +939,31 @@ impl PreviewSpeechController {
                     emotion,
                     speed,
                     volume,
-                })
-                .map_err(|err| format!("Spark-TTS preview worker stopped: {err}"))?;
+                });
+            if let Err(err) = send_result {
+                // Dropping the disconnected sender lets the next frame create
+                // a fresh worker instead of permanently repeating send errors.
+                self.onnx_worker = None;
+                return Err(format!("Spark-TTS preview worker stopped: {err}"));
+            }
+            self.onnx_queued.insert(cue);
         }
         Ok(())
     }
 
-    fn onnx_cue_ready(&self, signature: u64, cue: (u64, usize)) -> bool {
-        self.prepared_signature == Some(signature) && self.onnx_cache.contains_key(&cue)
+    fn onnx_cue_finished(&self, signature: u64, cue: (u64, usize)) -> bool {
+        self.prepared_signature == Some(signature)
+            && (self.onnx_cache.contains_key(&cue) || self.onnx_failures.contains_key(&cue))
     }
 
-    fn preparation_progress(&self, replay: &ReplayFile, global_volume: f32) -> (usize, usize) {
+    fn preparation_progress(
+        &self,
+        replay: &ReplayFile,
+        global_volume: f32,
+    ) -> (usize, usize, usize) {
         let total = replay.dialogue.iter().filter(|line| line.included).count();
         if self.prepared_signature != Some(replay_voice_signature(replay, global_volume)) {
-            return (0, total);
+            return (0, 0, total);
         }
         let ready = replay
             .dialogue
@@ -954,7 +976,18 @@ impl PreviewSpeechController {
                         .contains_key(&(replay.created_at_unix_ms, *index))
             })
             .count();
-        (ready, total)
+        let failed = replay
+            .dialogue
+            .iter()
+            .enumerate()
+            .filter(|(index, line)| {
+                line.included
+                    && self
+                        .onnx_failures
+                        .contains_key(&(replay.created_at_unix_ms, *index))
+            })
+            .count();
+        (ready, failed, total)
     }
 }
 
@@ -1344,6 +1377,14 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                     );
                     Ok(wav)
                 });
+                if wav
+                    .as_ref()
+                    .is_err_and(|err| spark_tts_worker_connection_error(err))
+                {
+                    // A dead Python pipe cannot recover. Drop it now so the
+                    // controller's automatic retry gets a fresh process.
+                    tts = create_onnx_tts();
+                }
                 if request.signature != worker_signature.load(Ordering::Acquire) {
                     continue;
                 }
@@ -1612,6 +1653,17 @@ fn apply_replay_camera(
             }
         }
     }
+}
+
+fn spark_tts_worker_connection_error(error: &str) -> bool {
+    [
+        "发送 Spark-TTS 台词失败",
+        "读取 Spark-TTS 结果失败",
+        "Spark-TTS 返回了无效结果",
+        "模型加载完成前退出",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 
 fn replay_focus_position(
@@ -2065,18 +2117,22 @@ fn replay_controls(
         }
     });
     if let Some(replay) = studio.replay.as_ref() {
-        let (ready, total) = speech.preparation_progress(replay, studio.speech_volume);
+        let (ready, failed, total) =
+            speech.preparation_progress(replay, studio.speech_volume);
+        let processed = ready.saturating_add(failed);
         let progress = if total == 0 {
             1.0
         } else {
-            ready as f32 / total as f32
+            processed as f32 / total as f32
         };
         let text = if !studio.speech_enabled {
             format!("语音预生成已暂停：{ready}/{total}")
         } else if !onnx_tts_is_available() {
             format!("语音预生成不可用：{ready}/{total}")
-        } else if speech.onnx_failed {
-            format!("语音预生成失败：{ready}/{total}")
+        } else if failed > 0 && processed == total {
+            format!("语音预生成完成：成功 {ready}/{total}，失败 {failed}")
+        } else if failed > 0 {
+            format!("正在持续预生成：成功 {ready}/{total}，失败 {failed}")
         } else if ready == total {
             format!("语音预生成完成：{ready}/{total}")
         } else {
@@ -5340,7 +5396,6 @@ fn replay_dialogue_is_ready_for_display(
     if studio.mode != ReplayMode::Playing
         || !studio.speech_enabled
         || !tts_available
-        || speech.onnx_failed
     {
         return true;
     }
@@ -5350,7 +5405,7 @@ fn replay_dialogue_is_ready_for_display(
     if dialogue_index >= replay.dialogue.len() {
         return false;
     }
-    speech.onnx_cue_ready(
+    speech.onnx_cue_finished(
         replay_voice_signature(replay, studio.speech_volume),
         (
             replay.created_at_unix_ms,
@@ -6520,7 +6575,15 @@ mod tests {
             (replay.created_at_unix_ms, 0),
             (vec![1], 1.0),
         );
-        assert_eq!(speech.preparation_progress(&replay, 1.0), (1, 2));
+        assert_eq!(speech.preparation_progress(&replay, 1.0), (1, 0, 2));
+        speech
+            .onnx_failures
+            .insert((replay.created_at_unix_ms, 2), "test failure".to_owned());
+        assert_eq!(speech.preparation_progress(&replay, 1.0), (1, 1, 2));
+        assert!(speech.onnx_cue_finished(
+            replay_voice_signature(&replay, 1.0),
+            (replay.created_at_unix_ms, 2),
+        ));
     }
 
     #[test]
