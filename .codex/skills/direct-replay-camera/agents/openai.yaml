@@ -1,0 +1,4 @@
+interface:
+  display_name: "Directed Replay Camera"
+  short_description: "Stable cinematic replay camera direction"
+  default_prompt: "Use $direct-replay-camera to implement or review a stable replay camera with clear focus and continuity."

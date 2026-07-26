@@ -3523,38 +3523,29 @@ fn turn_based_camera_track(
     duration_ms: u64,
     speaker_positions: &HashMap<u64, Vec3>,
 ) -> Vec<ReplayCameraKeyframe> {
+    let rig = DirectedCameraRig::for_dialogue(base, dialogue, speaker_positions);
     let mut frames = Vec::with_capacity(dialogue.len().saturating_mul(3).saturating_add(2));
     let mut current = dialogue
         .first()
         .and_then(|line| speaker_positions.get(&line.sender_id))
         .map(|target| {
-            speaker_camera_shot(
-                base,
+            rig.speaker_shot(
                 *target,
-                dialogue[0].sender_id,
-                0,
+                DirectorShot::SpeakerMedium,
                 0.0,
             )
         })
         .unwrap_or_else(|| base.clone());
     frames.push(camera_keyframe(0, &current));
-    for (index, line) in dialogue.iter().enumerate() {
+    for line in dialogue {
         let line_end = line.time_ms.saturating_add(line.duration_ms);
         if let Some(target) = speaker_positions.get(&line.sender_id) {
-            let focused = speaker_camera_shot(
-                base,
+            let focused = rig.speaker_shot(
                 *target,
-                line.sender_id,
-                index,
+                DirectorShot::SpeakerMedium,
                 0.0,
             );
-            let settled = speaker_camera_shot(
-                base,
-                *target,
-                line.sender_id,
-                index,
-                1.0,
-            );
+            let settled = focused;
             if line.time_ms > 0 {
                 frames.push(camera_keyframe(
                     line.time_ms.saturating_sub(1),
@@ -3591,14 +3582,12 @@ fn director_camera_track(
     duration_ms: u64,
     speaker_positions: &HashMap<u64, Vec3>,
 ) -> Vec<ReplayCameraKeyframe> {
+    let rig = DirectedCameraRig::for_dialogue(base, dialogue, speaker_positions);
     let mut current = base.clone();
     if let (Some(line), Some(cue)) = (dialogue.first(), cues.first()) {
         if let Some(target) = speaker_positions.get(&line.sender_id) {
-            current = director_speaker_shot(
-                base,
+            current = rig.director_shot(
                 *target,
-                line.sender_id,
-                0,
                 resolved_speaker_shot(cue.shot),
                 cue.motion,
                 0.0,
@@ -3606,31 +3595,20 @@ fn director_camera_track(
         }
     }
     let mut frames = vec![camera_keyframe(0, &current)];
-    for (index, (line, cue)) in dialogue.iter().zip(cues).enumerate() {
+    for (line, cue) in dialogue.iter().zip(cues) {
         let line_end = line.time_ms.saturating_add(line.duration_ms);
         let (arrival, settled) = if let Some(target) = speaker_positions.get(&line.sender_id) {
             let speaker_shot = resolved_speaker_shot(cue.shot);
-            let desired_arrival = director_speaker_shot(
-                base,
-                *target,
-                line.sender_id,
-                index,
-                speaker_shot,
-                cue.motion,
-                0.0,
-            );
+            let desired_arrival = rig.director_shot(*target, speaker_shot, cue.motion, 0.0);
             let arrival = desired_arrival;
-            let desired_settled = director_speaker_shot(
-                &arrival,
-                *target,
-                line.sender_id,
-                index,
-                speaker_shot,
-                cue.motion,
-                1.0,
-            );
+            let desired_settled = rig.director_shot(*target, speaker_shot, cue.motion, 1.0);
             let settle_limit = (line.duration_ms as f32 / 1_000.0 * 0.12).clamp(0.2, 0.65);
-            let settled = limit_camera_travel(&arrival, &desired_settled, settle_limit);
+            let settled = limit_camera_travel_toward(
+                &arrival,
+                &desired_settled,
+                settle_limit,
+                *target,
+            );
             (arrival, settled)
         } else {
             continue;
@@ -3672,96 +3650,131 @@ fn resolved_speaker_shot(shot: DirectorShot) -> DirectorShot {
     }
 }
 
-fn director_speaker_shot(
-    base: &Transform,
-    target: Vec3,
-    sender_id: u64,
-    index: usize,
-    shot: DirectorShot,
-    motion: DirectorMotion,
-    progress: f32,
+fn limit_camera_travel_toward(
+    current: &Transform,
+    desired: &Transform,
+    max_distance: f32,
+    focus: Vec3,
 ) -> Transform {
-    let seed = cinematic_seed(sender_id, index);
-    let angle = seed * std::f32::consts::TAU;
-    let mut approach = base.translation - target;
-    approach.y = 0.0;
-    let approach = approach
-        .try_normalize()
-        .unwrap_or_else(|| Vec3::new(angle.cos(), 0.0, angle.sin()));
-    let base_distance = match shot {
-        DirectorShot::SpeakerClose => 3.0,
-        DirectorShot::SpeakerMedium => 5.0,
-        DirectorShot::SpeakerWide => 8.0,
-        DirectorShot::Establishing => 12.0,
-        DirectorShot::Environment => 10.0,
-    };
-    let lateral = Vec3::new(-approach.z, 0.0, approach.x);
-    let distance_delta = match motion {
-        DirectorMotion::DollyIn => -0.35 * progress,
-        DirectorMotion::DollyOut => 0.35 * progress,
-        _ => 0.0,
-    };
-    let lateral_delta = match motion {
-        DirectorMotion::DriftLeft => -0.30 * progress,
-        DirectorMotion::DriftRight => 0.30 * progress,
-        _ => 0.0,
-    };
-    let height = match shot {
-        DirectorShot::SpeakerClose => 1.25,
-        DirectorShot::SpeakerMedium => 1.55,
-        DirectorShot::SpeakerWide => 2.2,
-        DirectorShot::Establishing | DirectorShot::Environment => 3.4,
-    };
-    let position = target
-        + approach * (base_distance + distance_delta)
-        + lateral * lateral_delta
-        + Vec3::Y * height;
-    Transform::from_translation(position).looking_at(target + Vec3::Y * 0.35, Vec3::Y)
+    let offset = desired.translation - current.translation;
+    let translation = current.translation + offset.clamp_length_max(max_distance.max(0.0));
+    Transform::from_translation(translation).looking_at(focus, Vec3::Y)
 }
 
-fn limit_camera_travel(current: &Transform, desired: &Transform, max_distance: f32) -> Transform {
-    let offset = desired.translation - current.translation;
-    Transform {
-        translation: current.translation + offset.clamp_length_max(max_distance.max(0.0)),
-        rotation: desired.rotation,
-        scale: desired.scale,
+#[derive(Debug, Clone, Copy)]
+struct DirectedCameraRig {
+    axis_origin: Vec3,
+    camera_side: Vec3,
+}
+
+impl DirectedCameraRig {
+    const LINE_MARGIN: f32 = 0.25;
+
+    fn for_dialogue(
+        base: &Transform,
+        dialogue: &[ReplayDialogue],
+        speaker_positions: &HashMap<u64, Vec3>,
+    ) -> Self {
+        let first = dialogue
+            .iter()
+            .find_map(|line| speaker_positions.get(&line.sender_id).copied());
+        let second = first.and_then(|first_position| {
+            dialogue.iter().find_map(|line| {
+                speaker_positions
+                    .get(&line.sender_id)
+                    .copied()
+                    .filter(|position| {
+                        horizontal(*position - first_position).length_squared() > 0.01
+                    })
+            })
+        });
+        let (axis_origin, mut camera_side) = match (first, second) {
+            (Some(first), Some(second)) => {
+                let axis = horizontal(second - first)
+                    .try_normalize()
+                    .unwrap_or(Vec3::X);
+                (
+                    (first + second) * 0.5,
+                    Vec3::new(-axis.z, 0.0, axis.x),
+                )
+            },
+            (Some(target), None) => {
+                let side = horizontal(base.translation - target)
+                    .try_normalize()
+                    .unwrap_or_else(|| horizontal(base.rotation * Vec3::Z).normalize_or_zero());
+                (target, side)
+            },
+            (None, None) => (
+                Vec3::ZERO,
+                horizontal(base.rotation * Vec3::Z)
+                    .try_normalize()
+                    .unwrap_or(Vec3::Z),
+            ),
+            (None, Some(_)) => unreachable!("a second speaker requires a first speaker"),
+        };
+        if camera_side.length_squared() <= f32::EPSILON {
+            camera_side = Vec3::Z;
+        }
+        if horizontal(base.translation - axis_origin).dot(camera_side) < 0.0 {
+            camera_side = -camera_side;
+        }
+        Self {
+            axis_origin,
+            camera_side,
+        }
+    }
+
+    fn speaker_shot(&self, target: Vec3, shot: DirectorShot, distance_delta: f32) -> Transform {
+        let base_distance = match shot {
+            DirectorShot::SpeakerClose => 3.0,
+            DirectorShot::SpeakerMedium => 5.0,
+            DirectorShot::SpeakerWide => 8.0,
+            DirectorShot::Establishing => 12.0,
+            DirectorShot::Environment => 10.0,
+        };
+        let height = match shot {
+            DirectorShot::SpeakerClose => 1.1,
+            DirectorShot::SpeakerMedium => 1.5,
+            DirectorShot::SpeakerWide => 2.1,
+            DirectorShot::Establishing | DirectorShot::Environment => 3.2,
+        };
+        let mut static_position =
+            target + self.camera_side * base_distance + Vec3::Y * height;
+        let static_side = self.signed_side(static_position);
+        if static_side < Self::LINE_MARGIN {
+            static_position += self.camera_side * (Self::LINE_MARGIN - static_side);
+        }
+        let dolly_axis = (static_position - target).normalize();
+        let desired_position = static_position + dolly_axis * distance_delta;
+        let position = if self.signed_side(desired_position) < Self::LINE_MARGIN {
+            static_position
+        } else {
+            desired_position
+        };
+        Transform::from_translation(position).looking_at(target, Vec3::Y)
+    }
+
+    fn director_shot(
+        &self,
+        target: Vec3,
+        shot: DirectorShot,
+        motion: DirectorMotion,
+        progress: f32,
+    ) -> Transform {
+        let distance_delta = match motion {
+            DirectorMotion::DollyIn => -0.35 * progress,
+            DirectorMotion::DollyOut => 0.35 * progress,
+            DirectorMotion::Static | DirectorMotion::DriftLeft | DirectorMotion::DriftRight => 0.0,
+        };
+        self.speaker_shot(target, shot, distance_delta)
+    }
+
+    fn signed_side(&self, position: Vec3) -> f32 {
+        horizontal(position - self.axis_origin).dot(self.camera_side)
     }
 }
 
-fn speaker_camera_shot(
-    base: &Transform,
-    target: Vec3,
-    sender_id: u64,
-    index: usize,
-    settle: f32,
-) -> Transform {
-    let seed = cinematic_seed(sender_id, index);
-    let angle = seed * std::f32::consts::TAU;
-    let mut approach = base.translation - target;
-    approach.y = 0.0;
-    let approach = approach
-        .try_normalize()
-        .unwrap_or_else(|| Vec3::new(angle.cos(), 0.0, angle.sin()));
-    let lateral = Vec3::new(-approach.z, 0.0, approach.x);
-    let distance = 5.2 + cinematic_seed(sender_id.rotate_left(11), index) * 1.8 - settle * 0.25;
-    let shoulder = (cinematic_seed(sender_id.rotate_left(23), index) - 0.5) * 1.2;
-    let height = 1.15 + cinematic_seed(sender_id.rotate_left(37), index) * 0.75;
-    let position =
-        target + approach * distance + lateral * (shoulder + settle * 0.12) + Vec3::Y * height;
-    Transform::from_translation(position).looking_at(target + Vec3::Y * 0.25, Vec3::Y)
-}
-
-fn cinematic_seed(sender_id: u64, index: usize) -> f32 {
-    let mut value = sender_id
-        .wrapping_add((index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
-        .wrapping_add(0xa076_1d64_78bd_642f);
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^= value >> 31;
-    (value as u32) as f32 / u32::MAX as f32
-}
+fn horizontal(vector: Vec3) -> Vec3 { Vec3::new(vector.x, 0.0, vector.z) }
 
 fn interpolated_camera(frames: &[ReplayCameraKeyframe], time_ms: u64) -> Option<Transform> {
     let first = frames.first()?;
@@ -3775,7 +3788,8 @@ fn interpolated_camera(frames: &[ReplayCameraKeyframe], time_ms: u64) -> Option<
     let left = &frames[next_index - 1];
     let right = &frames[next_index];
     let span = right.time_ms.saturating_sub(left.time_ms).max(1);
-    let t = time_ms.saturating_sub(left.time_ms) as f32 / span as f32;
+    let linear_t = time_ms.saturating_sub(left.time_ms) as f32 / span as f32;
+    let t = linear_t * linear_t * (3.0 - 2.0 * linear_t);
     let left_rotation = Quat::from_array(left.rotation).normalize();
     let right_rotation = Quat::from_array(right.rotation).normalize();
     Some(Transform {
@@ -4530,6 +4544,10 @@ mod tests {
             5.0
         );
         assert_eq!(
+            interpolated_camera(&frames, 250).unwrap().translation.x,
+            1.5625
+        );
+        assert_eq!(
             interpolated_camera(&frames, 2_000).unwrap().translation.x,
             10.0
         );
@@ -4565,7 +4583,7 @@ mod tests {
                 .unwrap();
             let shot = frame_transform(frame);
             let forward = shot.rotation * Vec3::NEG_Z;
-            let to_speaker = (target + Vec3::Y * 0.25 - shot.translation).normalize();
+            let to_speaker = (target - shot.translation).normalize();
             assert!(forward.dot(to_speaker) > 0.99);
         }
     }
@@ -4647,9 +4665,112 @@ mod tests {
         );
         let shot = frame_transform(frames.last().unwrap());
         let forward = shot.rotation * Vec3::NEG_Z;
-        let to_speaker = (target + Vec3::Y * 0.35 - shot.translation).normalize();
+        let to_speaker = (target - shot.translation).normalize();
         assert!(forward.dot(to_speaker) > 0.99);
         assert!(frames.iter().any(|frame| frame.time_ms == 350));
+    }
+
+    #[test]
+    fn directed_camera_stays_on_one_side_of_the_scene_axis() {
+        let base = Transform::from_xyz(0.0, 6.0, 12.0);
+        let mut dialogue = [
+            test_dialogue(350, 2_700, DialogueSide::Left),
+            test_dialogue(3_320, 2_700, DialogueSide::Right),
+        ];
+        dialogue[1].sender_id = 2;
+        let speaker_positions = HashMap::from([
+            (1, Vec3::new(-6.0, 1.0, 0.0)),
+            (2, Vec3::new(6.0, 1.0, 0.0)),
+        ]);
+        let cues = [
+            DirectorCue {
+                index: 0,
+                text: "左侧发言。".to_owned(),
+                speech_text: "左侧发言。".to_owned(),
+                shot: DirectorShot::SpeakerMedium,
+                motion: DirectorMotion::DollyIn,
+            },
+            DirectorCue {
+                index: 1,
+                text: "右侧发言。".to_owned(),
+                speech_text: "右侧发言。".to_owned(),
+                shot: DirectorShot::SpeakerClose,
+                motion: DirectorMotion::DriftRight,
+            },
+        ];
+        let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &speaker_positions);
+        let frames = director_camera_track(
+            &base,
+            &dialogue,
+            &cues,
+            6_020,
+            &speaker_positions,
+        );
+
+        assert!(frames
+            .iter()
+            .map(frame_transform)
+            .all(|frame| rig.signed_side(frame.translation) >= DirectedCameraRig::LINE_MARGIN));
+    }
+
+    #[test]
+    fn directed_dolly_moves_along_the_locked_camera_axis_and_keeps_focus() {
+        let base = Transform::from_xyz(0.0, 4.0, 10.0);
+        let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
+        let target = Vec3::new(2.0, 1.0, -1.0);
+        let positions = HashMap::from([(1, target)]);
+        let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
+        let arrival = rig.director_shot(
+            target,
+            DirectorShot::SpeakerMedium,
+            DirectorMotion::DollyIn,
+            0.0,
+        );
+        let desired = rig.director_shot(
+            target,
+            DirectorShot::SpeakerMedium,
+            DirectorMotion::DollyIn,
+            1.0,
+        );
+        let settled = limit_camera_travel_toward(&arrival, &desired, 0.2, target);
+        let movement = settled.translation - arrival.translation;
+        let forward = settled.rotation * Vec3::NEG_Z;
+        let to_speaker = (target - settled.translation).normalize();
+
+        assert!(movement.normalize().dot(*arrival.forward()) > 0.999);
+        assert!(settled.translation.distance(target) < arrival.translation.distance(target));
+        assert!(forward.dot(to_speaker) > 0.999);
+    }
+
+    #[test]
+    fn directed_dolly_becomes_static_when_the_line_margin_would_distort_it() {
+        let base = Transform::from_xyz(0.0, 6.0, 12.0);
+        let mut dialogue = [
+            test_dialogue(350, 2_700, DialogueSide::Left),
+            test_dialogue(3_320, 2_700, DialogueSide::Right),
+        ];
+        dialogue[1].sender_id = 2;
+        let positions = HashMap::from([
+            (1, Vec3::new(-6.0, 1.0, 0.0)),
+            (2, Vec3::new(6.0, 1.0, 0.0)),
+        ]);
+        let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
+        let off_axis_target = Vec3::new(0.0, 1.0, -10.0);
+        let arrival = rig.director_shot(
+            off_axis_target,
+            DirectorShot::SpeakerMedium,
+            DirectorMotion::DollyIn,
+            0.0,
+        );
+        let settled = rig.director_shot(
+            off_axis_target,
+            DirectorShot::SpeakerMedium,
+            DirectorMotion::DollyIn,
+            1.0,
+        );
+
+        assert!(arrival.translation.abs_diff_eq(settled.translation, f32::EPSILON));
+        assert!(rig.signed_side(settled.translation) >= DirectedCameraRig::LINE_MARGIN);
     }
 
     #[test]
