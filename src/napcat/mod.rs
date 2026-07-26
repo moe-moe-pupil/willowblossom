@@ -8205,11 +8205,21 @@ fn party_channel_auto_forward_request(
         return None;
     }
 
+    let party_name = if party.name.trim().is_empty() {
+        party_id
+    } else {
+        party.name.trim()
+    };
+    let channel_name = if party_name.ends_with("频道") {
+        party_name.to_owned()
+    } else {
+        format!("{party_name}频道")
+    };
     Some(AutoForwardRequest {
         recipients,
         text: format!(
-            "{}: {}",
-            message.data.sender.nickname, text
+            "【{}】{}: {}",
+            channel_name, message.data.sender.nickname, text
         ),
     })
 }
@@ -11902,6 +11912,7 @@ mod tests {
         };
         group.ensure_party("red");
         group.ensure_party("blue");
+        group.parties.get_mut("red").unwrap().name = "人类".to_owned();
         group.set_player_party("2", Some("red"));
         group.set_player_party("3", Some("red"));
         group.set_player_party("4", Some("blue"));
@@ -11910,7 +11921,7 @@ mod tests {
 
         let request = party_channel_auto_forward_request(
             &manager,
-            &test_private_message_from(2, "[red-only clue]"),
+            &test_private_message_from(2, "【red-only clue】"),
             "2",
         )
         .expect("same-party recipient should be available");
@@ -11918,7 +11929,7 @@ mod tests {
         assert_eq!(request.recipients, vec![3]);
         assert!(!request.recipients.contains(&4));
         assert!(!request.recipients.contains(&5));
-        assert_eq!(request.text, "user-2: red-only clue");
+        assert_eq!(request.text, "【人类频道】user-2: red-only clue");
     }
 
     #[test]
