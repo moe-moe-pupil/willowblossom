@@ -72,8 +72,7 @@ use crate::voxel::{
 
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
 const CHAT_WINDOW_MIN_SIZE: Vec2 = Vec2::new(260.0, 260.0);
-const CHAT_WINDOW_MAX_SIZE: Vec2 = Vec2::new(720.0, 720.0);
-const GROUP_CHAT_MAX_WIDTH: f32 = 520.0;
+const CHAT_WINDOW_MAX_HEIGHT: f32 = 720.0;
 const GROUP_CHAT_MAX_HEIGHT: f32 = 720.0;
 const GROUP_CHAT_MIN_HEIGHT: f32 = 140.0;
 const GROUP_CHAT_SEPARATOR_HEIGHT: f32 = 10.0;
@@ -83,7 +82,7 @@ const GROUP_BROADCAST_INPUT_ROWS: usize = 3;
 const GROUP_MEMBER_WINDOW_SIDE_GAP: f32 = 14.0;
 const GROUP_MEMBER_WINDOW_TOP_GAP: f32 = 58.0;
 const GROUP_MEMBER_WINDOW_BOTTOM_GAP: f32 = GROUP_BROADCAST_INPUT_HEIGHT + 7.0;
-const GROUP_MEMBER_WINDOW_MAX_SIZE: Vec2 = Vec2::new(520.0, 620.0);
+const GROUP_MEMBER_WINDOW_MAX_HEIGHT: f32 = 620.0;
 const CHAT_AUTO_SCROLL_THRESHOLD: f32 = 48.0;
 const CHAT_IMAGE_MAX_SIZE: Vec2 = Vec2::new(220.0, 220.0);
 const CHARACTER_WINDOW_DEFAULT_WIDTH: f32 = 360.0;
@@ -1339,29 +1338,8 @@ fn chat_window(
             .y
             .min(constraint_rect.height().max(1.0)),
     );
-    let max_window_size = if current_group.is_some() {
-        egui::vec2(
-            GROUP_MEMBER_WINDOW_MAX_SIZE
-                .x
-                .min(constraint_rect.width())
-                .max(window_min_size.x),
-            GROUP_MEMBER_WINDOW_MAX_SIZE
-                .y
-                .min(constraint_rect.height())
-                .max(window_min_size.y),
-        )
-    } else {
-        egui::vec2(
-            CHAT_WINDOW_MAX_SIZE
-                .x
-                .min(constraint_rect.width())
-                .max(window_min_size.x),
-            CHAT_WINDOW_MAX_SIZE
-                .y
-                .min(constraint_rect.height())
-                .max(window_min_size.y),
-        )
-    };
+    let max_window_size =
+        chat_window_max_size(constraint_rect, window_min_size, current_group.is_some());
     let window_id = current_group
         .map(|group_name| group_member_chat_window_id(group_name, target_id))
         .unwrap_or_else(|| standalone_chat_window_id(id, target_id));
@@ -1372,7 +1350,7 @@ fn chat_window(
         .default_size(CHAT_WINDOW_SIZE)
         .min_size(window_min_size)
         .max_size(max_window_size)
-        .max_height(GROUP_CHAT_MAX_HEIGHT);
+        .resizable(true);
     if current_group.is_some() {
         // egui 0.35's TitleBar drag path restores its saved absolute position after
         // `current_pos`; Anywhere keeps child windows movable while allowing the
@@ -1898,6 +1876,20 @@ fn group_member_position(parent_rect: Rect, offset: Vec2) -> Pos2 { parent_rect.
 
 fn group_member_offset(parent_rect: Rect, member_rect: Rect) -> Vec2 {
     member_rect.min - parent_rect.min
+}
+
+fn chat_window_max_size(constraint_rect: Rect, min_size: Vec2, grouped: bool) -> Vec2 {
+    let max_height = if grouped {
+        GROUP_MEMBER_WINDOW_MAX_HEIGHT
+    } else {
+        CHAT_WINDOW_MAX_HEIGHT
+    };
+    egui::vec2(
+        constraint_rect.width().max(min_size.x),
+        max_height
+            .min(constraint_rect.height())
+            .max(min_size.y),
+    )
 }
 
 fn group_member_leave_button(ctx: &Context, window_id: Id, window_rect: Rect) -> bool {
@@ -3123,9 +3115,7 @@ fn group_chat_inner_size(member_count: usize, max_rect: Rect) -> Vec2 {
 
 fn group_chat_max_size(max_rect: Rect) -> Vec2 {
     egui::vec2(
-        GROUP_CHAT_MAX_WIDTH
-            .min(max_rect.width())
-            .max(CHAT_WINDOW_MIN_SIZE.x),
+        max_rect.width().max(CHAT_WINDOW_MIN_SIZE.x),
         GROUP_CHAT_MAX_HEIGHT
             .min(max_rect.height())
             .max(CHAT_WINDOW_MIN_SIZE.y),
@@ -14144,6 +14134,7 @@ pub fn ui_system(
                     .default_size(group_size)
                     .min_size(CHAT_WINDOW_MIN_SIZE)
                     .max_size(group_max_size)
+                    .resizable(true)
                     .show(ctx, |ui| {
                         group_drop_area_ui(ui, &k, &v.members);
                         group_broadcast_input_ui(
@@ -14388,6 +14379,58 @@ fn append_local_sent_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_windows_can_use_the_full_available_width() {
+        let available_rect =
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+
+        assert_eq!(
+            chat_window_max_size(available_rect, CHAT_WINDOW_MIN_SIZE, false).x,
+            1_280.0
+        );
+        assert_eq!(
+            chat_window_max_size(available_rect, CHAT_WINDOW_MIN_SIZE, true).x,
+            1_280.0
+        );
+        assert_eq!(group_chat_max_size(available_rect).x, 1_280.0);
+    }
+
+    #[test]
+    fn width_filling_group_content_does_not_expand_each_frame() {
+        let ctx = Context::default();
+        let screen_rect =
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let mut widths = Vec::new();
+
+        for _ in 0..6 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            });
+            let response = egui::Window::new("讨论组")
+                .id(Id::new("stable_group_width_test"))
+                .default_size(egui::vec2(360.0, 520.0))
+                .min_size(CHAT_WINDOW_MIN_SIZE)
+                .max_size(group_chat_max_size(screen_rect))
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    let body_size = egui::vec2(ui.available_width(), 180.0);
+                    ui.allocate_exact_size(body_size, Sense::hover());
+                    let mut input = String::new();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut input)
+                            .desired_width(ui.available_width()),
+                    );
+                })
+                .unwrap();
+            widths.push(response.response.rect.width());
+            let _ = ctx.end_pass();
+        }
+
+        assert!(widths[1..].windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(widths.last().copied().unwrap() < screen_rect.width());
+    }
 
     #[test]
     fn group_member_position_follows_parent_and_preserves_offset() {
