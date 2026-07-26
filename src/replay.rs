@@ -532,6 +532,7 @@ struct PreviewSpeechController {
     active_cue: Option<(u64, usize)>,
     prepared_signature: Option<u64>,
     onnx_cache: HashMap<(u64, usize), (Vec<u8>, f32)>,
+    onnx_queued: HashSet<(u64, usize)>,
     onnx_worker: Option<OnnxPreviewWorker>,
     onnx_failed: bool,
     audio_entity: Option<Entity>,
@@ -762,14 +763,35 @@ fn advance_replay(
 
 fn preview_replay_speech(
     mut commands: Commands,
-    studio: Res<ReplayStudio>,
+    mut studio: ResMut<ReplayStudio>,
     mut speech: ResMut<PreviewSpeechController>,
     mut audio_sources: ResMut<Assets<AudioSource>>,
 ) {
-    if studio.speech_enabled && onnx_tts_is_available() {
+    if studio.speech_enabled
+        && onnx_tts_is_available()
+        && matches!(studio.mode, ReplayMode::Playing | ReplayMode::Paused)
+    {
         if let Some(replay) = studio.replay.as_ref() {
-            if let Err(err) = speech.prepare_onnx_replay(replay, studio.speech_volume) {
+            let current_index = active_dialogue_index(&replay.dialogue, studio.playback_ms)
+                .or_else(|| {
+                    replay.dialogue.iter().position(|line| {
+                        line.included && line.time_ms >= studio.playback_ms
+                    })
+                });
+            let requested = current_index
+                .into_iter()
+                .chain(current_index.and_then(|index| {
+                    replay.dialogue[index.saturating_add(1)..]
+                        .iter()
+                        .position(|line| line.included)
+                        .map(|offset| index + offset + 1)
+                }))
+                .collect::<Vec<_>>();
+            if let Err(err) =
+                speech.prepare_onnx_replay(replay, studio.speech_volume, &requested)
+            {
                 speech.onnx_failed = true;
+                studio.status = format!("角色语音预览失败：{err}");
                 eprintln!("failed to prepare Spark-TTS preview speech: {err}");
             }
         }
@@ -779,16 +801,12 @@ fn preview_replay_speech(
         .then(|| {
             studio.replay.as_ref().and_then(|replay| {
                 active_dialogue_index(&replay.dialogue, studio.playback_ms).map(|index| {
-                    (
-                        replay.created_at_unix_ms,
-                        index,
-                        &replay.dialogue[index],
-                    )
+                    (replay.created_at_unix_ms, index)
                 })
             })
         })
         .flatten();
-    let cue = active.map(|(replay_id, index, _)| (replay_id, index));
+    let cue = active;
     let results = speech
         .onnx_worker
         .as_ref()
@@ -806,6 +824,7 @@ fn preview_replay_speech(
             },
             Err(err) => {
                 speech.onnx_failed = true;
+                studio.status = format!("角色语音预览失败：{err}");
                 eprintln!("failed to synthesize Spark-TTS preview speech: {err}");
             },
         }
@@ -821,8 +840,7 @@ fn preview_replay_speech(
         }
         speech.active_cue = cue;
     }
-    let Some((_, _, _line)) = active else { return };
-    let active_cue = cue.expect("active dialogue has a cue");
+    let Some(active_cue) = active else { return };
     if let Some((wav, volume)) = speech.onnx_cache.get(&active_cue).cloned() {
         let source = audio_sources.add(AudioSource {
             bytes: Arc::from(wav),
@@ -843,24 +861,37 @@ impl PreviewSpeechController {
         &mut self,
         replay: &ReplayFile,
         global_volume: f32,
+        requested_indices: &[usize],
     ) -> Result<(), String> {
         let signature = replay_voice_signature(replay, global_volume);
-        if self.prepared_signature == Some(signature) {
-            return Ok(());
+        if self.prepared_signature != Some(signature) {
+            if self.onnx_worker.is_none() {
+                self.onnx_worker = Some(start_onnx_preview_worker()?);
+            }
+            self.prepared_signature = Some(signature);
+            self.onnx_cache.clear();
+            self.onnx_queued.clear();
+            self.active_cue = None;
+            self.onnx_failed = false;
+            self.onnx_worker
+                .as_ref()
+                .expect("ONNX worker was initialized")
+                .latest_signature
+                .store(signature, Ordering::Release);
         }
-        if self.onnx_worker.is_none() {
-            self.onnx_worker = Some(start_onnx_preview_worker()?);
-        }
-        self.prepared_signature = Some(signature);
-        self.onnx_cache.clear();
-        self.active_cue = None;
         let worker = self
             .onnx_worker
             .as_ref()
             .expect("ONNX worker was initialized");
-        worker.latest_signature.store(signature, Ordering::Release);
-        for (index, line) in replay.dialogue.iter().enumerate() {
-            if !line.included {
+        for &index in requested_indices {
+            let Some(line) = replay.dialogue.get(index) else {
+                continue;
+            };
+            let cue = (replay.created_at_unix_ms, index);
+            if !line.included
+                || self.onnx_cache.contains_key(&cue)
+                || !self.onnx_queued.insert(cue)
+            {
                 continue;
             }
             let settings = replay
@@ -872,7 +903,7 @@ impl PreviewSpeechController {
                 .requests
                 .send(OnnxPreviewRequest {
                     signature,
-                    cue: (replay.created_at_unix_ms, index),
+                    cue,
                     text: speech_text_for_line(line),
                     speaker: resolved_emotivoice_speaker(
                         settings.voice_name.as_deref(),
@@ -5374,6 +5405,7 @@ fn import_replay(path: &str) -> Result<ReplayFile, String> {
     }
     assign_replay_line_ids(&mut replay.dialogue);
     if replay.format_version == LEGACY_REPLAY_FORMAT_VERSION {
+        let legacy_duration_ms = replay.duration_ms.max(1);
         for line in &mut replay.dialogue {
             line.area = "旧时间线".to_owned();
             line.included = true;
@@ -5388,6 +5420,13 @@ fn import_replay(path: &str) -> Result<ReplayFile, String> {
                 line_ids: replay.dialogue.iter().map(|line| line.line_id).collect(),
             }]
         };
+        let compact_duration_ms = compile_area_block_timeline(&mut replay);
+        for frame in &mut replay.camera {
+            frame.time_ms = ((frame.time_ms as u128 * compact_duration_ms as u128)
+                / legacy_duration_ms as u128) as u64;
+        }
+        replay.duration_ms = compact_duration_ms;
+        extend_replay_for_speech(&mut replay);
         replay.format_version = REPLAY_FORMAT_VERSION;
     }
     Ok(replay)
@@ -6242,6 +6281,35 @@ mod tests {
             speech_text_for_line(&dialogue),
             "诶艾领域有一个方案。"
         );
+    }
+
+    #[test]
+    fn legacy_import_compacts_real_world_chat_gaps() {
+        let replay_json = r#"{"format_version":1,"title":"legacy","campaign_id":"c","created_at_unix_ms":1,"duration_ms":61351511400,"audience":{"scope":"public"},"scene":{"voxels":[]},"camera":[{"time_ms":0,"translation":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0]},{"time_ms":61351511400,"translation":[1.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0]}],"dialogue":[]}"#;
+        let mut legacy: ReplayFile = serde_json::from_str(replay_json).unwrap();
+        legacy.dialogue.push(test_dialogue(
+            0,
+            2_400,
+            DialogueSide::Left,
+        ));
+        legacy.dialogue.push(test_dialogue(
+            61_351_509_000,
+            2_400,
+            DialogueSide::Right,
+        ));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.willow-replay.json");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let imported = import_replay(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(imported.format_version, REPLAY_FORMAT_VERSION);
+        assert!(imported.duration_ms < 30_000);
+        assert!(imported.dialogue[1].time_ms < 15_000);
+        assert!(imported
+            .camera
+            .iter()
+            .all(|frame| frame.time_ms <= imported.duration_ms));
     }
 
     #[test]

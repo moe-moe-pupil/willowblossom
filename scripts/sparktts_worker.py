@@ -38,6 +38,14 @@ def seed_for(profile_id: str, text: str) -> None:
 def write_pcm16(path: Path, audio: np.ndarray, sample_rate: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if samples.size == 0:
+        raise ValueError("Spark-TTS returned empty audio")
+    peak = float(np.max(np.abs(samples)))
+    if not np.isfinite(peak) or peak < 0.005:
+        raise ValueError(
+            f"Spark-TTS returned silent audio (peak={peak:.6f}); "
+            "the generated voice was not saved"
+        )
     samples = np.clip(samples, -1.0, 1.0)
     pcm = (samples * 32767.0).astype("<i2")
     with wave.open(str(path), "wb") as output:
@@ -77,13 +85,18 @@ def main() -> int:
             if profile is None:
                 raise ValueError(f"unknown Spark-TTS profile: {profile_id}")
 
-            reference_path = bank_dir / profile["reference_wav"]
             seed_for(profile_id, text)
             with torch.inference_mode(), contextlib.redirect_stdout(sys.stderr):
+                # Voice-cloning inference from these generated references can
+                # regress into a 60-second near-zero waveform with some
+                # Spark-TTS/Transformers combinations. The profile's seeded
+                # controllable voice is the same path used to build the audible
+                # voice bank and remains deterministic for each character.
                 audio = model.inference(
                     text,
-                    prompt_speech_path=str(reference_path),
-                    prompt_text=profile["reference_text"],
+                    gender=profile["gender"],
+                    pitch=profile["pitch"],
+                    speed=profile["speed"],
                     temperature=0.65,
                     top_k=50,
                     top_p=0.95,
