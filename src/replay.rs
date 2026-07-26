@@ -2145,7 +2145,7 @@ fn replay_controls(
         );
         ui.small("回放录制、编辑和等待期间都会持续生成全部台词；预览与 MP4 导出共用缓存。");
     }
-    ui.small("整体语速默认 1.30×，调整语速或单个角色音色时不会改变时间轴。六个字以内的极短台词会自动使用较自然的短句语速和首尾保护，避免吞字，不改变角色音色或音调。需要改变字幕、间隔和镜头时长时，请使用“整体台词停留”。预览与导出共用同一条时间线和 Spark-TTS 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
+    ui.small("整体语速默认 1.10×，调整语速或单个角色音色时不会改变时间轴。六个字以内的极短台词会自动使用较自然的短句语速和首尾保护，避免吞字，不改变角色音色或音调。需要改变字幕、间隔和镜头时长时，请使用“整体台词停留”。预览与导出共用同一条时间线和 Spark-TTS 中文语音。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
             "预计渲染 {} 帧，视频时长 {}",
@@ -3852,7 +3852,7 @@ fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
     true
 }
 
-fn default_master_speech_speed() -> f32 { 1.30 }
+fn default_master_speech_speed() -> f32 { 1.10 }
 
 fn normalized_master_speech_speed(speed: f32) -> f32 {
     if speed.is_finite() && speed > 0.0 {
@@ -6413,7 +6413,7 @@ mod tests {
         );
         assert!((onnx_speed(18) - 1.09).abs() < 0.001);
         assert_eq!(onnx_speed(180), 1.45);
-        assert_eq!(default_master_speech_speed(), 1.30);
+        assert_eq!(default_master_speech_speed(), 1.10);
         assert!((combined_onnx_speed(18, 1.30) - 1.417).abs() < 0.001);
         assert!((combined_onnx_speed(18, 3.0) - 3.27).abs() < 0.001);
         assert_eq!(
@@ -6430,7 +6430,7 @@ mod tests {
         );
         assert_eq!(
             normalized_master_speech_speed(f32::NAN),
-            1.30
+            1.10
         );
         assert_eq!(default_master_dialogue_duration(), 1.0);
         assert_eq!(
@@ -6737,7 +6737,7 @@ mod tests {
         let old_json = r#"{"format_version":1,"title":"test","campaign_id":"c","created_at_unix_ms":1,"duration_ms":0,"audience":{"scope":"public"},"scene":{"voxels":[]},"camera":[],"dialogue":[]}"#;
         let mut replay: ReplayFile = serde_json::from_str(old_json).unwrap();
         assert!(replay.speaker_voice_settings.is_empty());
-        assert_eq!(replay.master_speech_speed, 1.30);
+        assert_eq!(replay.master_speech_speed, 1.10);
         assert_eq!(replay.master_dialogue_duration, 1.0);
         replay.master_speech_speed = 1.15;
         replay.master_dialogue_duration = 2.75;
