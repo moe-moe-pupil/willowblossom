@@ -3256,6 +3256,7 @@ fn message_text_ui(
                 message_image_ui(ui, data, image_textures);
             },
             NapcatMessageChainType::Source(_) => {},
+            NapcatMessageChainType::ForwardedReplay { .. } => {},
             NapcatMessageChainType::Unsupported => {},
         }
     }
@@ -3350,6 +3351,7 @@ pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&
                 NapcatMessageChainType::Image { .. } => {
                     len += 12;
                 },
+                NapcatMessageChainType::ForwardedReplay { .. } => {},
                 NapcatMessageChainType::Unsupported => {},
             };
         }

@@ -139,6 +139,7 @@ struct NapcatAutomaticReplyRequests {
 struct PendingAutomaticPrivateReply {
     recipient_id: u64,
     text: String,
+    forwarded: Option<ForwardedAttribution>,
 }
 
 #[derive(Resource)]
@@ -159,6 +160,15 @@ pub struct NapcatMessage {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TextData {
     pub text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ForwardedReplayData {
+    pub sender_id: u64,
+    pub sender_name: String,
+    pub text: String,
+    #[serde(default)]
+    pub source_time: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -191,6 +201,9 @@ pub enum NapcatMessageChainType {
     Source(Source),
     Text {
         data: TextData,
+    },
+    ForwardedReplay {
+        data: ForwardedReplayData,
     },
     Image {
         data: ImageData,
@@ -251,6 +264,7 @@ pub struct CampaignMessage {
     pub visibility: Visibility,
     pub text: String,
     pub time: u64,
+    pub forwarded: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -4150,7 +4164,24 @@ impl NapcatMessageManager {
         target_id: &str,
         message: &NapcatMessage,
     ) -> CampaignMessage {
-        let text = message_text(message);
+        let forwarded = self.replay_forwarded_attribution(message);
+        let text = forwarded
+            .as_ref()
+            .map(|forwarded| forwarded.text.clone())
+            .unwrap_or_else(|| message_text(message));
+        let sender_id = forwarded
+            .as_ref()
+            .map(|forwarded| forwarded.sender_id)
+            .unwrap_or(message.data.user_id);
+        let sender_name = forwarded
+            .as_ref()
+            .map(|forwarded| forwarded.sender_name.clone())
+            .unwrap_or_else(|| message.data.sender.nickname.clone());
+        let source_time = forwarded
+            .as_ref()
+            .map(|forwarded| forwarded.source_time)
+            .filter(|source_time| *source_time != 0)
+            .unwrap_or(message.data.time);
         let message_group = self.group_for_message_target(target_id, message);
         let campaign_id = if message.data.campaign_id.trim().is_empty() {
             message_group
@@ -4173,22 +4204,24 @@ impl NapcatMessageManager {
                 } else {
                     message.data.user_id
                 };
+                let access_player_id = if forwarded.is_some() { sender_id } else { peer_id };
                 let access = message_group
-                    .map(|group| group.player_access(peer_id))
+                    .map(|group| group.player_access(access_player_id))
                     .unwrap_or(PlayerAccess {
-                        player_id: peer_id,
+                        player_id: access_player_id,
                         ..Default::default()
                     });
                 CampaignMessage {
                     campaign_id,
-                    sender_id: message.data.user_id,
-                    sender_name: message.data.sender.nickname.clone(),
+                    sender_id,
+                    sender_name,
                     source: MessageSource::Friend { user_id: peer_id },
                     character_id: access.character_id,
                     party_id: access.party_id,
                     visibility: Visibility::Player(peer_id),
                     text,
-                    time: message.data.time,
+                    time: source_time,
+                    forwarded: forwarded.is_some(),
                 }
             },
             NapcatMessageType::Group => {
@@ -4219,9 +4252,9 @@ impl NapcatMessageManager {
                     // Legacy messages predate persisted access metadata, so derive from the same
                     // configured target mapping used at ingest. New messages are saved annotated.
                     let access = message_group
-                        .map(|group| group.player_access(message.data.user_id))
+                        .map(|group| group.player_access(sender_id))
                         .unwrap_or(PlayerAccess {
-                            player_id: message.data.user_id,
+                            player_id: sender_id,
                             ..Default::default()
                         });
                     let visibility = access
@@ -4237,20 +4270,41 @@ impl NapcatMessageManager {
                 };
                 CampaignMessage {
                     campaign_id,
-                    sender_id: message.data.user_id,
-                    sender_name: message.data.sender.nickname.clone(),
+                    sender_id,
+                    sender_name,
                     source: MessageSource::Group {
                         group_id,
-                        user_id: message.data.user_id,
+                        user_id: sender_id,
                     },
                     character_id,
                     party_id,
                     visibility,
                     text,
-                    time: message.data.time,
+                    time: source_time,
+                    forwarded: forwarded.is_some(),
                 }
             },
         }
+    }
+
+    pub fn replay_message_sender_id(&self, message: &NapcatMessage) -> u64 {
+        self.replay_forwarded_attribution(message)
+            .map(|forwarded| forwarded.sender_id)
+            .unwrap_or(message.data.user_id)
+    }
+
+    fn replay_forwarded_attribution(
+        &self,
+        message: &NapcatMessage,
+    ) -> Option<ForwardedAttribution> {
+        forwarded_replay_data(message)
+            .map(|forwarded| ForwardedAttribution {
+                sender_id: forwarded.sender_id,
+                sender_name: forwarded.sender_name.clone(),
+                text: forwarded.text.clone(),
+                source_time: forwarded.source_time,
+            })
+            .or_else(|| infer_legacy_forwarded_attribution(self, message))
     }
 
     pub fn sync_skill_pool_from_completed_characters(&mut self) -> bool {
@@ -5717,11 +5771,12 @@ fn apply_automatic_private_reply_result(
         );
         return Some(false);
     }
-    Some(append_local_private_text_response(
+    Some(append_local_private_text_response_with_forwarded_attribution(
         manager,
         &expected_target_id,
         pending.recipient_id,
         &pending.text,
+        pending.forwarded,
     ))
 }
 
@@ -5973,11 +6028,12 @@ fn message_system(
 
             if let (Some(sender), Some(auto_forward)) = (sender.as_deref(), auto_forward) {
                 for user_id in auto_forward.recipients {
-                    queue_private_text_response(
+                    queue_private_text_response_with_forwarded_attribution(
                         sender,
                         &mut automatic_replies,
                         user_id,
                         auto_forward.text.clone(),
+                        auto_forward.forwarded.clone(),
                     );
                 }
             }
@@ -6060,6 +6116,22 @@ fn queue_private_text_response(
     user_id: u64,
     text: String,
 ) -> bool {
+    queue_private_text_response_with_forwarded_attribution(
+        sender,
+        automatic_replies,
+        user_id,
+        text,
+        None,
+    )
+}
+
+fn queue_private_text_response_with_forwarded_attribution(
+    sender: &NapcatIOSender,
+    automatic_replies: &mut NapcatAutomaticReplyRequests,
+    user_id: u64,
+    text: String,
+    forwarded: Option<ForwardedAttribution>,
+) -> bool {
     let request_id = automatic_replies.next_request_id;
     automatic_replies.next_request_id += 1;
     let message = Message::Text(
@@ -6094,6 +6166,7 @@ fn queue_private_text_response(
             PendingAutomaticPrivateReply {
                 recipient_id: user_id,
                 text,
+                forwarded,
             },
         );
         true
@@ -6105,6 +6178,22 @@ fn append_local_private_text_response(
     target_id: &str,
     recipient_id: u64,
     text: &str,
+) -> bool {
+    append_local_private_text_response_with_forwarded_attribution(
+        manager,
+        target_id,
+        recipient_id,
+        text,
+        None,
+    )
+}
+
+fn append_local_private_text_response_with_forwarded_attribution(
+    manager: &mut NapcatMessageManager,
+    target_id: &str,
+    recipient_id: u64,
+    text: &str,
+    forwarded: Option<ForwardedAttribution>,
 ) -> bool {
     let self_id = manager
         .messages
@@ -6123,17 +6212,30 @@ fn append_local_private_text_response(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
+    let mut message_segments = vec![NapcatMessageChain {
+        variant: NapcatMessageChainType::Text {
+            data: TextData {
+                text: text.to_owned(),
+            },
+        },
+    }];
+    if let Some(forwarded) = forwarded {
+        message_segments.push(NapcatMessageChain {
+            variant: NapcatMessageChainType::ForwardedReplay {
+                data: ForwardedReplayData {
+                    sender_id: forwarded.sender_id,
+                    sender_name: forwarded.sender_name,
+                    text: forwarded.text,
+                    source_time: forwarded.source_time,
+                },
+            },
+        });
+    }
     let mut message = NapcatMessage {
         data: NapcatMessageData {
             time,
             message_type: NapcatMessageType::Private,
-            message: vec![NapcatMessageChain {
-                variant: NapcatMessageChainType::Text {
-                    data: TextData {
-                        text: text.to_owned(),
-                    },
-                },
-            }],
+            message: message_segments,
             self_id,
             user_id: self_id,
             group_id: None,
@@ -8261,11 +8363,74 @@ fn message_text(message: &NapcatMessage) -> String {
         .filter_map(|chain| match &chain.variant {
             NapcatMessageChainType::Text { data } => Some(data.text.as_str()),
             NapcatMessageChainType::Source(_) => None,
+            NapcatMessageChainType::ForwardedReplay { .. } => None,
             NapcatMessageChainType::Image { .. } => None,
             NapcatMessageChainType::Unsupported => None,
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn forwarded_replay_data(message: &NapcatMessage) -> Option<&ForwardedReplayData> {
+    message.data.message.iter().find_map(|chain| {
+        let NapcatMessageChainType::ForwardedReplay { data } = &chain.variant else {
+            return None;
+        };
+        Some(data)
+    })
+}
+
+fn infer_legacy_forwarded_attribution(
+    manager: &NapcatMessageManager,
+    message: &NapcatMessage,
+) -> Option<ForwardedAttribution> {
+    if !matches!(message.data.message_type, NapcatMessageType::Private)
+        || message.data.user_id != message.data.self_id
+    {
+        return None;
+    }
+    let text = message_text(message);
+    let (sender_label, forwarded_text) = text.split_once(": ")?;
+    let sender_name = sender_label
+        .rsplit_once('】')
+        .map(|(_, name)| name)
+        .unwrap_or(sender_label)
+        .trim();
+    let forwarded_text = forwarded_text.trim();
+    if sender_name.is_empty()
+        || forwarded_text.is_empty()
+        || sender_name.contains("匿名")
+    {
+        return None;
+    }
+
+    let matching_sender_ids = manager
+        .messages
+        .values()
+        .flatten()
+        .filter(|candidate| candidate.data.user_id != candidate.data.self_id)
+        .filter(|candidate| candidate.data.sender.nickname.trim() == sender_name)
+        .filter(|candidate| {
+            candidate.data.time <= message.data.time
+                && message.data.time.saturating_sub(candidate.data.time) <= 300
+        })
+        .filter(|candidate| {
+            quoted_auto_forward_text(candidate).as_deref() == Some(forwarded_text)
+                || parsed_party_channel_text(candidate)
+                    .is_some_and(|parsed| parsed.text.trim() == forwarded_text)
+        })
+        .map(|candidate| candidate.data.user_id)
+        .collect::<HashSet<_>>();
+    if matching_sender_ids.len() != 1 {
+        return None;
+    }
+    let sender_id = matching_sender_ids.into_iter().next()?;
+    Some(ForwardedAttribution {
+        sender_id,
+        sender_name: sender_name.to_owned(),
+        text: forwarded_text.to_owned(),
+        source_time: message.data.time,
+    })
 }
 
 fn message_image_reference(message: &NapcatMessage) -> Option<String> {
@@ -8288,6 +8453,15 @@ fn message_image_reference(message: &NapcatMessage) -> Option<String> {
 struct AutoForwardRequest {
     recipients: Vec<u64>,
     text: String,
+    forwarded: Option<ForwardedAttribution>,
+}
+
+#[derive(Debug, Clone)]
+struct ForwardedAttribution {
+    sender_id: u64,
+    sender_name: String,
+    text: String,
+    source_time: u64,
 }
 
 enum PartyChannelAutoForward {
@@ -8348,6 +8522,12 @@ fn auto_forward_request(
             "{}: {}",
             message.data.sender.nickname, text
         ),
+        forwarded: Some(ForwardedAttribution {
+            sender_id: message.data.user_id,
+            sender_name: message.data.sender.nickname.clone(),
+            text,
+            source_time: message.data.time,
+        }),
     })
 }
 
@@ -8429,6 +8609,12 @@ fn party_channel_auto_forward_request(
         AutoForwardRequest {
             recipients,
             text: forwarded_text,
+            forwarded: (!party.anonymous).then(|| ForwardedAttribution {
+                sender_id: message.data.user_id,
+                sender_name: message.data.sender.nickname.clone(),
+                text: channel_message.text,
+                source_time: message.data.time,
+            }),
         },
     ))
 }
@@ -12180,6 +12366,61 @@ mod tests {
             quoted_auto_forward_text(&message),
             Some("hello players".to_owned())
         );
+    }
+
+    #[test]
+    fn forwarded_private_reply_preserves_original_speaker_for_replay() {
+        let mut manager = empty_manager();
+
+        assert!(append_local_private_text_response_with_forwarded_attribution(
+            &mut manager,
+            "3",
+            3,
+            "moemoe: hello",
+            Some(ForwardedAttribution {
+                sender_id: 2,
+                sender_name: "moemoe".to_owned(),
+                text: "hello".to_owned(),
+                source_time: 100,
+            }),
+        ));
+
+        let stored = &manager.messages["3"][0];
+        assert_eq!(message_text(stored), "moemoe: hello");
+        assert_eq!(manager.replay_message_sender_id(stored), 2);
+        let persisted = serde_json::to_string(stored).unwrap();
+        let restored: NapcatMessage = serde_json::from_str(&persisted).unwrap();
+        let replay_message = manager.campaign_message_for_target("3", &restored);
+        assert_eq!(replay_message.sender_id, 2);
+        assert_eq!(replay_message.sender_name, "moemoe");
+        assert_eq!(replay_message.text, "hello");
+        assert_eq!(replay_message.time, 100);
+        assert!(replay_message.forwarded);
+        assert_eq!(replay_message.visibility, Visibility::Player(3));
+    }
+
+    #[test]
+    fn legacy_forwarded_reply_is_inferred_from_its_original_message() {
+        let mut manager = empty_manager();
+        let mut original = test_private_message_from(2, "“hello”");
+        original.data.sender.nickname = "moemoe".to_owned();
+        original.data.time = 100;
+        manager.messages.insert("2".to_owned(), vec![original]);
+        assert!(append_local_private_text_response(
+            &mut manager,
+            "3",
+            3,
+            "moemoe: hello",
+        ));
+        manager.messages.get_mut("3").unwrap()[0].data.time = 101;
+
+        let stored = &manager.messages["3"][0];
+        let replay_message = manager.campaign_message_for_target("3", stored);
+
+        assert_eq!(replay_message.sender_id, 2);
+        assert_eq!(replay_message.sender_name, "moemoe");
+        assert_eq!(replay_message.text, "hello");
+        assert!(replay_message.forwarded);
     }
 
     #[test]

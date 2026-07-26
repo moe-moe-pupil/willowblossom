@@ -245,13 +245,14 @@ fn snapshot_new_replay_messages(
             .unwrap_or_default()
             .min(messages.len());
         for (index, message) in messages.iter().enumerate().skip(seen) {
-            if let Some(position_cells) = positions.get(&message.data.user_id).copied() {
+            let sender_id = manager.replay_message_sender_id(message);
+            if let Some(position_cells) = positions.get(&sender_id).copied() {
                 additions.push((
                     target.clone(),
                     index,
                     ReplayMessageSnapshot {
                         turn_index: player_turns
-                            .get(&message.data.user_id)
+                            .get(&sender_id)
                             .copied()
                             .unwrap_or(world_turn),
                         position_cells,
@@ -403,6 +404,8 @@ struct ReplayDialogue {
     snapshot_recorded: bool,
     #[serde(default)]
     metadata_estimated: bool,
+    #[serde(default)]
+    forwarded: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -710,7 +713,7 @@ fn record_replay(
     if let Some(replay) = studio.replay.as_mut() {
         let captured_any = !captured.is_empty();
         replay.dialogue.extend(captured);
-        deduplicate_gm_broadcast_dialogue(&mut replay.dialogue, &manager);
+        deduplicate_broadcast_dialogue(&mut replay.dialogue, &manager);
         assign_replay_line_ids(&mut replay.dialogue);
         auto_group_replay_areas(replay);
         rebuild_area_blocks(replay);
@@ -2648,7 +2651,7 @@ fn build_from_history(
             replay.dialogue.push(dialogue);
         }
     }
-    deduplicate_gm_broadcast_dialogue(&mut replay.dialogue, manager);
+    deduplicate_broadcast_dialogue(&mut replay.dialogue, manager);
     assign_replay_line_ids(&mut replay.dialogue);
     auto_group_replay_areas(&mut replay);
     rebuild_area_blocks(&mut replay);
@@ -5246,6 +5249,7 @@ fn dialogue_from_message(
         included: true,
         snapshot_recorded: true,
         metadata_estimated,
+        forwarded: message.forwarded,
     })
 }
 
@@ -5280,7 +5284,7 @@ fn estimated_replay_snapshot(
 }
 
 fn normalize_dialogue_sides(replay: &mut ReplayFile, manager: &NapcatMessageManager) {
-    deduplicate_gm_broadcast_dialogue(&mut replay.dialogue, manager);
+    deduplicate_broadcast_dialogue(&mut replay.dialogue, manager);
     for dialogue in &mut replay.dialogue {
         dialogue.side = speaker_side(replay_sender_is_gm(dialogue.sender_id, manager));
     }
@@ -5291,13 +5295,15 @@ fn replay_sender_is_gm(sender_id: u64, manager: &NapcatMessageManager) -> bool {
     sender_id == 0 || manager.is_gm_user(sender_id)
 }
 
-fn deduplicate_gm_broadcast_dialogue(
+fn deduplicate_broadcast_dialogue(
     dialogue: &mut Vec<ReplayDialogue>,
     manager: &NapcatMessageManager,
 ) {
     let mut seen = HashSet::<(u64, u64, String)>::new();
     dialogue.retain(|line| {
-        if line.source_time == 0 || !replay_sender_is_gm(line.sender_id, manager) {
+        if line.source_time == 0
+            || (!line.forwarded && !replay_sender_is_gm(line.sender_id, manager))
+        {
             return true;
         }
         seen.insert((
@@ -6099,6 +6105,7 @@ mod tests {
             visibility: Visibility::Public,
             text: "old line".to_owned(),
             time: 1_200,
+            forwarded: false,
         };
         let snapshot = estimated_replay_snapshot(
             &message,
@@ -6686,6 +6693,7 @@ mod tests {
             visibility: Visibility::Player(7),
             text: "冷冻舱紧急解除了休眠".to_owned(),
             time: 1_200,
+            forwarded: false,
         };
         let snapshot = ReplayMessageSnapshot {
             turn_index: 0,
@@ -6700,8 +6708,26 @@ mod tests {
         assert!(line.avatar.is_empty());
 
         let mut dialogue = vec![line.clone(), line];
-        deduplicate_gm_broadcast_dialogue(&mut dialogue, &manager);
+        deduplicate_broadcast_dialogue(&mut dialogue, &manager);
         assert_eq!(dialogue.len(), 1);
+    }
+
+    #[test]
+    fn forwarded_broadcast_is_one_original_player_line() {
+        let manager: NapcatMessageManager =
+            serde_json::from_str(r#"{"messages":{}}"#).unwrap();
+        let mut line = test_dialogue(1_200, 600, DialogueSide::Right);
+        line.sender_id = 7;
+        line.text = "hello".to_owned();
+        line.source_time = 1_200;
+        line.forwarded = true;
+
+        let mut dialogue = vec![line.clone(), line];
+        deduplicate_broadcast_dialogue(&mut dialogue, &manager);
+
+        assert_eq!(dialogue.len(), 1);
+        assert_eq!(dialogue[0].sender_id, 7);
+        assert_eq!(dialogue[0].side, DialogueSide::Right);
     }
 
     #[test]
@@ -7339,6 +7365,7 @@ mod tests {
             included: true,
             snapshot_recorded: false,
             metadata_estimated: false,
+            forwarded: false,
         }
     }
 
