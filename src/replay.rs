@@ -380,6 +380,8 @@ struct ReplayDialogue {
     included: bool,
     #[serde(default)]
     snapshot_recorded: bool,
+    #[serde(default)]
+    metadata_estimated: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -647,15 +649,20 @@ fn record_replay(
         for (index, message) in messages.iter().enumerate().skip(seen) {
             let campaign_message = manager.campaign_message_for_target(&target_id, message);
             if audience.can_read(&campaign_message, &manager) {
+                let persisted_snapshot = manager
+                    .replay_snapshots
+                    .get(&target_id)
+                    .and_then(|snapshots| snapshots.get(index))
+                    .and_then(Option::as_ref);
+                let estimated_snapshot = persisted_snapshot.is_none().then(|| {
+                    estimated_replay_snapshot(&campaign_message, &manager, &speaker_positions)
+                });
                 if let Some(dialogue) = dialogue_from_message(
                     &campaign_message,
                     &manager,
                     next_turn_ms,
-                    manager
-                        .replay_snapshots
-                        .get(&target_id)
-                        .and_then(|snapshots| snapshots.get(index))
-                        .and_then(Option::as_ref),
+                    persisted_snapshot.unwrap_or_else(|| estimated_snapshot.as_ref().unwrap()),
+                    persisted_snapshot.is_none(),
                 ) {
                     next_turn_ms = dialogue
                         .time_ms
@@ -2307,15 +2314,26 @@ fn build_from_history(
         .filter(|(message, _)| !message.text.trim().is_empty())
         .collect::<Vec<_>>();
     visible.sort_by_key(|(message, _)| message.time);
-    let unsnapshotted_count = visible
+    let estimated_count = visible
         .iter()
         .filter(|(_, snapshot)| snapshot.is_none())
         .count();
     let mut timeline_ms: u64 = 350;
     for (message, snapshot) in &visible {
-        if let Some(dialogue) =
-            dialogue_from_message(message, manager, timeline_ms, snapshot.as_ref())
-        {
+        let estimated_snapshot;
+        let (snapshot, metadata_estimated) = if let Some(snapshot) = snapshot.as_ref() {
+            (snapshot, false)
+        } else {
+            estimated_snapshot = estimated_replay_snapshot(message, manager, &speaker_positions);
+            (&estimated_snapshot, true)
+        };
+        if let Some(dialogue) = dialogue_from_message(
+            message,
+            manager,
+            timeline_ms,
+            snapshot,
+            metadata_estimated,
+        ) {
             timeline_ms = dialogue
                 .time_ms
                 .saturating_add(dialogue.duration_ms)
@@ -2345,7 +2363,7 @@ fn build_from_history(
     let dialogue_count = replay.dialogue.len();
     studio.replay = Some(replay);
     studio.status = format!(
-        "已生成 {dialogue_count} 句区域回放台词；已排除 {unsnapshotted_count} 句没有历史回合位置的旧消息"
+        "已生成 {dialogue_count} 句区域回放台词；其中 {estimated_count} 句旧消息使用当前立牌位置或原点估算，可由 DM 编辑"
     );
 }
 
@@ -2725,6 +2743,12 @@ fn replay_dialogue_editor(
                                     "{} · 原始时间 {} · ID {}",
                                     line.name, line.source_time, line.line_id
                                 ));
+                                if line.metadata_estimated {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(220, 150, 55),
+                                        "旧消息：回合/位置为估算",
+                                    );
+                                }
                             });
                             let text_changed = ui
                                 .add(
@@ -2739,9 +2763,10 @@ fn replay_dialogue_editor(
                             }
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("回合");
-                                changed |= ui
+                                let turn_changed = ui
                                     .add(egui::DragValue::new(&mut line.turn_index))
                                     .changed();
+                                changed |= turn_changed;
                                 ui.label("区域");
                                 changed |= ui
                                     .add(
@@ -2749,12 +2774,18 @@ fn replay_dialogue_editor(
                                             .desired_width(90.0),
                                     )
                                     .changed();
+                                let mut position_changed = false;
                                 for (axis, value) in ["X", "Y", "Z"]
                                     .into_iter()
                                     .zip(&mut line.position_cells)
                                 {
                                     ui.label(axis);
-                                    changed |= ui.add(egui::DragValue::new(value)).changed();
+                                    position_changed |=
+                                        ui.add(egui::DragValue::new(value)).changed();
+                                }
+                                if turn_changed || position_changed {
+                                    line.metadata_estimated = false;
+                                    changed = true;
                                 }
                                 if !block_options.is_empty() {
                                     let mut selected_block =
@@ -4658,10 +4689,10 @@ fn dialogue_from_message(
     message: &CampaignMessage,
     manager: &NapcatMessageManager,
     time_ms: u64,
-    snapshot: Option<&ReplayMessageSnapshot>,
+    snapshot: &ReplayMessageSnapshot,
+    metadata_estimated: bool,
 ) -> Option<ReplayDialogue> {
     let text = message.text.trim();
-    let snapshot = snapshot?;
     if text.is_empty() {
         return None;
     }
@@ -4701,7 +4732,38 @@ fn dialogue_from_message(
         area: String::new(),
         included: true,
         snapshot_recorded: true,
+        metadata_estimated,
     })
+}
+
+fn estimated_replay_snapshot(
+    message: &CampaignMessage,
+    manager: &NapcatMessageManager,
+    speaker_positions: &HashMap<u64, Vec3>,
+) -> ReplayMessageSnapshot {
+    let turn_index = manager
+        .current_group()
+        .map(|group| {
+            group
+                .player_turns
+                .get(&message.sender_id.to_string())
+                .map(|turn| turn.turns_passed)
+                .unwrap_or(group.world_turn)
+        })
+        .unwrap_or_default();
+    let position_cells = speaker_positions
+        .get(&message.sender_id)
+        .map(|position| {
+            (*position / VOXEL_SIZE)
+                .round()
+                .as_ivec3()
+                .to_array()
+        })
+        .unwrap_or([0, 0, 0]);
+    ReplayMessageSnapshot {
+        turn_index,
+        position_cells,
+    }
 }
 
 fn normalize_dialogue_sides(replay: &mut ReplayFile, manager: &NapcatMessageManager) {
@@ -5455,6 +5517,35 @@ mod tests {
 
         assert_eq!(replay.dialogue[0].area, replay.dialogue[1].area);
         assert_ne!(replay.dialogue[0].area, replay.dialogue[2].area);
+    }
+
+    #[test]
+    fn legacy_history_uses_an_editable_estimated_position() {
+        let manager: NapcatMessageManager =
+            serde_json::from_str(r#"{"messages":{}}"#).unwrap();
+        let message = CampaignMessage {
+            campaign_id: "campaign".to_owned(),
+            sender_id: 7,
+            sender_name: "player".to_owned(),
+            source: crate::napcat::MessageSource::Gui,
+            character_id: None,
+            party_id: None,
+            visibility: Visibility::Public,
+            text: "old line".to_owned(),
+            time: 1_200,
+        };
+        let snapshot = estimated_replay_snapshot(
+            &message,
+            &manager,
+            &HashMap::from([(7, Vec3::new(2.0, 3.0, -1.0))]),
+        );
+        let dialogue =
+            dialogue_from_message(&message, &manager, 350, &snapshot, true).unwrap();
+
+        assert_eq!(dialogue.position_cells, [8, 12, -4]);
+        assert!(dialogue.included);
+        assert!(dialogue.snapshot_recorded);
+        assert!(dialogue.metadata_estimated);
     }
 
     #[test]
@@ -6368,6 +6459,7 @@ mod tests {
             area: String::new(),
             included: true,
             snapshot_recorded: false,
+            metadata_estimated: false,
         }
     }
 
