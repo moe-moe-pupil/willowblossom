@@ -169,6 +169,7 @@ const PLANET_CLOUD_ALTITUDE: f32 = 3.5;
 const PLANET_CLOUD_PUFF_COUNT: usize = 24;
 const PLANET_SCIENCE_LAB_CENTER: IVec2 = IVec2::new(-45, 20);
 const PLANET_SCIENCE_LAB_FLOOR_Y: i32 = 485;
+const VOXEL_MINIMAP_RESOLUTION: usize = 64;
 
 pub struct TrpgVoxelPlugin;
 
@@ -190,6 +191,73 @@ impl Connector for TrpgVoxelConnector {
 
 #[derive(Component)]
 pub struct TrpgVoxelGrid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VoxelMinimapTile {
+    pub(crate) top_cell: IVec3,
+    pub(crate) material: u8,
+    pub(crate) voxel_count: u32,
+}
+
+#[derive(Resource, Default)]
+pub(crate) struct VoxelMinimapSnapshot {
+    pub(crate) min: IVec2,
+    pub(crate) max: IVec2,
+    pub(crate) resolution: usize,
+    pub(crate) tiles: Vec<Option<VoxelMinimapTile>>,
+}
+
+impl VoxelMinimapSnapshot {
+    pub(crate) fn is_empty(&self) -> bool { self.tiles.is_empty() }
+
+    pub(crate) fn tile(&self, x: usize, z: usize) -> Option<VoxelMinimapTile> {
+        (x < self.resolution && z < self.resolution)
+            .then(|| self.tiles[z * self.resolution + x])
+            .flatten()
+    }
+
+    pub(crate) fn nearest_cell(&self, x: usize, z: usize) -> Option<IVec3> {
+        if let Some(tile) = self.tile(x, z) {
+            return Some(tile.top_cell);
+        }
+        for radius in 1..self.resolution {
+            let min_x = x.saturating_sub(radius);
+            let max_x = (x + radius).min(self.resolution.saturating_sub(1));
+            let min_z = z.saturating_sub(radius);
+            let max_z = (z + radius).min(self.resolution.saturating_sub(1));
+            for tile_x in min_x..=max_x {
+                for tile_z in [min_z, max_z] {
+                    if let Some(tile) = self.tile(tile_x, tile_z) {
+                        return Some(tile.top_cell);
+                    }
+                }
+            }
+            for tile_z in min_z.saturating_add(1)..max_z {
+                for tile_x in [min_x, max_x] {
+                    if let Some(tile) = self.tile(tile_x, tile_z) {
+                        return Some(tile.top_cell);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn world_fraction(&self, position: Vec3) -> Vec2 {
+        let cell = position / VOXEL_SIZE;
+        let span = (self.max - self.min).max(IVec2::ONE).as_vec2();
+        (Vec2::new(cell.x, cell.z) - self.min.as_vec2()) / span
+    }
+
+    pub(crate) fn tile_indices(&self, fraction: Vec2) -> (usize, usize) {
+        let last = self.resolution.saturating_sub(1) as f32;
+        let clamped = fraction.clamp(Vec2::ZERO, Vec2::ONE) * last;
+        (
+            clamped.x.round() as usize,
+            clamped.y.round() as usize,
+        )
+    }
+}
 
 #[derive(Component)]
 pub(crate) struct VoxelViewportCamera;
@@ -487,6 +555,7 @@ pub(crate) enum VoxelTeleportDestination {
     CombatSpaceship,
     PlanetScienceLab,
     PlayerStandee(u64),
+    MapCell(IVec3),
 }
 
 impl VoxelTeleportDestination {
@@ -506,6 +575,7 @@ impl VoxelTeleportDestination {
             Self::CombatSpaceship => "战斗舰",
             Self::PlanetScienceLab => "行星科研站",
             Self::PlayerStandee(_) => "玩家立牌",
+            Self::MapCell(_) => "地图位置",
         }
     }
 
@@ -539,6 +609,7 @@ impl VoxelTeleportDestination {
                     + floor_offset
             },
             Self::PlayerStandee(_) => return None,
+            Self::MapCell(cell) => cell.as_vec3() * VOXEL_SIZE + floor_offset,
         })
     }
 }
@@ -1367,6 +1438,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPhysicsChunkLoader>()
         .init_resource::<VoxelGeometryDirtyChunks>()
         .init_resource::<VoxelScenePersistenceState>()
+        .init_resource::<VoxelMinimapSnapshot>()
         .insert_resource(player_camera_store)
         .insert_resource(inventory_store)
         .insert_resource(toolbar_settings_store)
@@ -1406,6 +1478,7 @@ impl Plugin for TrpgVoxelPlugin {
                     rebuild_voxel_orbital_planet,
                     apply_voxel_physics_action,
                     process_voxel_scene_history,
+                    refresh_voxel_minimap_snapshot,
                 )
                     .chain(),
                 (
@@ -6169,6 +6242,68 @@ fn voxel_cells(grid: &Grid<u8>) -> Vec<(IVec3, u8)> {
         .collect()
 }
 
+fn voxel_minimap_snapshot_from_cells(
+    cells: &[(IVec3, u8)],
+    resolution: usize,
+) -> VoxelMinimapSnapshot {
+    let resolution = resolution.max(1);
+    let Some((first_cell, _)) = cells.first() else {
+        return VoxelMinimapSnapshot::default();
+    };
+    let (mut min, mut max) = (first_cell.xz(), first_cell.xz());
+    for (cell, _) in &cells[1..] {
+        min = min.min(cell.xz());
+        max = max.max(cell.xz());
+    }
+
+    let span = (max - min).max(IVec2::ONE);
+    let last = resolution.saturating_sub(1) as i64;
+    let tile_axis = |value: i32, axis_min: i32, axis_span: i32| {
+        (((value - axis_min) as i64 * last) / i64::from(axis_span)) as usize
+    };
+    let mut snapshot = VoxelMinimapSnapshot {
+        min,
+        max,
+        resolution,
+        tiles: vec![None; resolution * resolution],
+    };
+    for (cell, material) in cells {
+        let x = tile_axis(cell.x, min.x, span.x);
+        let z = tile_axis(cell.z, min.y, span.y);
+        let tile = &mut snapshot.tiles[z * resolution + x];
+        match tile {
+            Some(tile) => {
+                tile.voxel_count = tile.voxel_count.saturating_add(1);
+                if cell.y > tile.top_cell.y {
+                    tile.top_cell = *cell;
+                    tile.material = *material;
+                }
+            },
+            None => {
+                *tile = Some(VoxelMinimapTile {
+                    top_cell: *cell,
+                    material: *material,
+                    voxel_count: 1,
+                });
+            },
+        }
+    }
+    snapshot
+}
+
+fn refresh_voxel_minimap_snapshot(
+    grids: Query<&Grid<u8>, (With<TrpgVoxelGrid>, Changed<Grid<u8>>)>,
+    mut snapshot: ResMut<VoxelMinimapSnapshot>,
+) {
+    let Ok(grid) = grids.single() else {
+        return;
+    };
+    *snapshot = voxel_minimap_snapshot_from_cells(
+        &voxel_cells(grid),
+        VOXEL_MINIMAP_RESOLUTION,
+    );
+}
+
 fn apply_voxel_physics_action(
     mut editor: ResMut<VoxelEditorState>,
     cameras: Query<&GlobalTransform, With<VoxelViewportCamera>>,
@@ -8517,6 +8652,36 @@ mod tests {
                     ) * VOXEL_SIZE
                     + Vec3::Y * 0.5
             )
+        );
+    }
+
+    #[test]
+    fn minimap_keeps_the_highest_voxel_in_each_top_down_tile() {
+        let low = IVec3::new(-4, 2, 9);
+        let high = IVec3::new(-4, 7, 9);
+        let other = IVec3::new(12, 1, -3);
+
+        let snapshot = voxel_minimap_snapshot_from_cells(
+            &[(low, 2), (high, 8), (other, 6)],
+            8,
+        );
+        let fraction = snapshot.world_fraction(high.as_vec3() * VOXEL_SIZE);
+        let (x, z) = snapshot.tile_indices(fraction);
+        let tile = snapshot.tile(x, z).unwrap();
+
+        assert_eq!(tile.top_cell, high);
+        assert_eq!(tile.material, 8);
+        assert_eq!(tile.voxel_count, 2);
+        assert_eq!(snapshot.nearest_cell(x, z), Some(high));
+    }
+
+    #[test]
+    fn map_teleport_uses_the_canonical_voxel_scale() {
+        let cell = IVec3::new(8, 12, -20);
+
+        assert_eq!(
+            VoxelTeleportDestination::MapCell(cell).player_position(),
+            Some(cell.as_vec3() * VOXEL_SIZE + Vec3::Y * 0.5)
         );
     }
 

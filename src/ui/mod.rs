@@ -64,6 +64,7 @@ use crate::voxel::{
     VoxelEditMode,
     VoxelEditorState,
     VoxelLightTool,
+    VoxelMinimapSnapshot,
     VoxelPlayerStandee,
     VoxelPossessionState,
     VoxelTeleportDestination,
@@ -917,12 +918,235 @@ pub struct UiSystemLocals<'w, 's> {
     chat_list_player_visible_filter: Local<'s, Option<String>>,
     voxel_editor: ResMut<'w, VoxelEditorState>,
     voxel_possession: ResMut<'w, VoxelPossessionState>,
+    voxel_minimap: Res<'w, VoxelMinimapSnapshot>,
+    keyboard: Res<'w, ButtonInput<KeyCode>>,
+    voxel_map_ui: Local<'s, VoxelMapUiState>,
     battle_store: Option<ResMut<'w, Persistent<BattleRoundStore>>>,
     player_standees: Query<
         'w,
         's,
         (&'static VoxelPlayerStandee, &'static bevy::prelude::Visibility),
     >,
+}
+
+#[derive(Default)]
+struct VoxelMapUiState {
+    full_map_open: bool,
+    context_cell: Option<IVec3>,
+    context_player: Option<u64>,
+}
+
+fn voxel_map_material_color(material: u8) -> egui::Color32 {
+    voxel_material_choices()
+        .into_iter()
+        .find(|(candidate, ..)| *candidate == material)
+        .map(|(_, _, color)| color)
+        .unwrap_or(egui::Color32::from_gray(90))
+}
+
+fn voxel_map_ui(
+    ui: &mut Ui,
+    size: Vec2,
+    snapshot: &VoxelMinimapSnapshot,
+    scene_positions: Option<&SceneCharacterPositions>,
+    manager: &NapcatMessageManager,
+    state: &mut VoxelMapUiState,
+    editor: &mut VoxelEditorState,
+) {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4, egui::Color32::from_rgb(11, 17, 24));
+    painter.rect_stroke(
+        rect,
+        4,
+        Stroke::new(1.0, egui::Color32::from_gray(90)),
+        egui::StrokeKind::Inside,
+    );
+    if snapshot.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "还没有可显示的体素",
+            egui::FontId::proportional(14.0),
+            egui::Color32::LIGHT_GRAY,
+        );
+        return;
+    }
+
+    let resolution = snapshot.resolution.max(1);
+    let tile_size = rect.size() / resolution as f32;
+    for z in 0..resolution {
+        for x in 0..resolution {
+            let Some(tile) = snapshot.tile(x, z) else {
+                continue;
+            };
+            let screen_z = resolution - 1 - z;
+            let tile_min = rect.min
+                + egui::vec2(
+                    x as f32 * tile_size.x,
+                    screen_z as f32 * tile_size.y,
+                );
+            let density = (tile.voxel_count as f32).ln_1p().min(6.0) / 6.0;
+            let color = voxel_map_material_color(tile.material)
+                .gamma_multiply(0.55 + density * 0.45);
+            painter.rect_filled(
+                Rect::from_min_size(tile_min, tile_size + egui::vec2(0.5, 0.5)),
+                0,
+                color,
+            );
+        }
+    }
+    for step in 1..4 {
+        let fraction = step as f32 / 4.0;
+        let x = egui::lerp(rect.x_range(), fraction);
+        let y = egui::lerp(rect.y_range(), fraction);
+        let grid_stroke = Stroke::new(0.5, egui::Color32::from_white_alpha(35));
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            grid_stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            grid_stroke,
+        );
+    }
+
+    let mut player_points = Vec::new();
+    if let Some(scene_positions) = scene_positions {
+        for (target_id, world_position) in &scene_positions.positions {
+            let fraction = snapshot.world_fraction(*world_position);
+            let on_map = fraction.cmpge(bevy::prelude::Vec2::ZERO).all()
+                && fraction.cmple(bevy::prelude::Vec2::ONE).all();
+            let clamped = fraction.clamp(
+                bevy::prelude::Vec2::ZERO,
+                bevy::prelude::Vec2::ONE,
+            );
+            let point = egui::pos2(
+                egui::lerp(rect.x_range(), clamped.x),
+                egui::lerp(rect.y_range(), 1.0 - clamped.y),
+            );
+            let user_id = target_id.parse::<u64>().ok();
+            let name = target_display_name(manager, target_id);
+            player_points.push((user_id, name.clone(), point));
+            let marker_color = if on_map {
+                egui::Color32::from_rgb(255, 214, 64)
+            } else {
+                egui::Color32::from_rgb(255, 126, 48)
+            };
+            painter.circle_filled(point, 5.5, marker_color);
+            painter.circle_stroke(
+                point,
+                6.5,
+                Stroke::new(1.5, egui::Color32::BLACK),
+            );
+            if size.x >= 400.0 {
+                painter.text(
+                    point + egui::vec2(8.0, -7.0),
+                    egui::Align2::LEFT_CENTER,
+                    if on_map { name } else { format!("{name}（地图外）") },
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+    }
+
+    if response.secondary_clicked() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            let fraction = bevy::prelude::Vec2::new(
+                ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+                (1.0 - (pointer.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
+            );
+            let (x, z) = snapshot.tile_indices(fraction);
+            state.context_cell = snapshot.nearest_cell(x, z);
+            state.context_player = player_points
+                .iter()
+                .filter_map(|(user_id, _, point)| {
+                    user_id.map(|user_id| (user_id, point.distance(pointer)))
+                })
+                .filter(|(_, distance)| *distance <= 12.0)
+                .min_by(|left, right| left.1.total_cmp(&right.1))
+                .map(|(user_id, _)| user_id);
+        }
+    }
+    response.context_menu(|ui| {
+        ui.strong("地图操作");
+        if let Some(user_id) = state.context_player {
+            let target_id = user_id.to_string();
+            if ui
+                .button(format!("传送到 {}", target_display_name(manager, &target_id)))
+                .clicked()
+            {
+                editor.request_teleport(VoxelTeleportDestination::PlayerStandee(user_id));
+                ui.close();
+            }
+        }
+        if let Some(cell) = state.context_cell {
+            if ui.button("传送到这里").clicked() {
+                editor.request_teleport(VoxelTeleportDestination::MapCell(cell));
+                ui.close();
+            }
+            ui.small(format!("体素坐标：{}, {}, {}", cell.x, cell.y, cell.z));
+        }
+    });
+}
+
+fn dm_voxel_map_windows(
+    ctx: &Context,
+    snapshot: &VoxelMinimapSnapshot,
+    scene_positions: Option<&SceneCharacterPositions>,
+    manager: &NapcatMessageManager,
+    state: &mut VoxelMapUiState,
+    editor: &mut VoxelEditorState,
+) {
+    // This desktop egui layer is never part of the player capture-camera render targets.
+    egui::Window::new("DM 小地图")
+        .id(Id::new("dm_voxel_minimap"))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-286.0, 38.0))
+        .fixed_size(egui::vec2(224.0, 252.0))
+        .resizable(false)
+        .collapsible(true)
+        .show(ctx, |ui| {
+            voxel_map_ui(
+                ui,
+                egui::vec2(208.0, 208.0),
+                snapshot,
+                scene_positions,
+                manager,
+                state,
+                editor,
+            );
+            ui.small("右键地图传送 · M 打开大地图");
+        });
+
+    if !state.full_map_open {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("DM 体素地图")
+        .id(Id::new("dm_voxel_full_map"))
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .default_size(egui::vec2(720.0, 760.0))
+        .min_size(egui::vec2(420.0, 460.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("全体玩家与体素俯视图");
+                ui.separator();
+                ui.small("北（+Z）朝上");
+            });
+            let side = ui.available_width().min(ui.available_height() - 26.0).max(320.0);
+            voxel_map_ui(
+                ui,
+                Vec2::splat(side),
+                snapshot,
+                scene_positions,
+                manager,
+                state,
+                editor,
+            );
+        });
+    state.full_map_open = open;
 }
 
 pub struct CircleImageButton {
@@ -13087,6 +13311,9 @@ pub fn ui_system(
         &mut locals.chat_player_visible_previews;
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
+    let map_toggle_requested = locals.keyboard.just_pressed(KeyCode::KeyM);
+    let voxel_minimap: &VoxelMinimapSnapshot = &locals.voxel_minimap;
+    let voxel_map_ui_state: &mut VoxelMapUiState = &mut locals.voxel_map_ui;
     let voxel_editor: &mut VoxelEditorState = &mut locals.voxel_editor;
     let voxel_possession: &mut VoxelPossessionState = &mut locals.voxel_possession;
     let battle_store = &mut locals.battle_store;
@@ -13095,6 +13322,9 @@ pub fn ui_system(
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
+    if map_toggle_requested && !ctx.memory(|memory| memory.focused().is_some()) {
+        voxel_map_ui_state.full_map_open = !voxel_map_ui_state.full_map_open;
+    }
     if manager.migrate_chat_window_state()
         || manager.sync_chat_targets()
         || manager.sync_skill_pool_from_completed_characters()
@@ -14297,6 +14527,15 @@ pub fn ui_system(
                 );
             }
         });
+
+    dm_voxel_map_windows(
+        ctx,
+        voxel_minimap,
+        scene_positions.as_deref(),
+        &manager,
+        voxel_map_ui_state,
+        voxel_editor,
+    );
 
     let should_persist_ui_memory = ctx.input(|input| {
         input.pointer.any_released()
