@@ -10179,18 +10179,21 @@ mod tests {
         let red_access = PlayerAccess {
             player_id: 2,
             party_id: Some("red".to_owned()),
+            party_ids: vec!["red".to_owned()],
             character_id: None,
             is_gm: false,
         };
         let blue_access = PlayerAccess {
             player_id: 3,
             party_id: Some("blue".to_owned()),
+            party_ids: vec!["blue".to_owned()],
             character_id: None,
             is_gm: false,
         };
         let gm_access = PlayerAccess {
             player_id: 9,
             party_id: None,
+            party_ids: Vec::new(),
             character_id: None,
             is_gm: true,
         };
@@ -10253,18 +10256,21 @@ mod tests {
         let red_access = PlayerAccess {
             player_id: 2,
             party_id: Some("red".to_owned()),
+            party_ids: vec!["red".to_owned()],
             character_id: None,
             is_gm: false,
         };
         let blue_access = PlayerAccess {
             player_id: 3,
             party_id: Some("blue".to_owned()),
+            party_ids: vec!["blue".to_owned()],
             character_id: None,
             is_gm: false,
         };
         let gm_access = PlayerAccess {
             player_id: 9,
             party_id: None,
+            party_ids: Vec::new(),
             character_id: None,
             is_gm: true,
         };

@@ -258,6 +258,7 @@ pub struct PlayerAccess {
     pub player_id: u64,
     pub character_id: Option<String>,
     pub party_id: Option<String>,
+    pub party_ids: Vec<String>,
     pub is_gm: bool,
 }
 
@@ -269,7 +270,13 @@ impl PlayerAccess {
 
         match visibility {
             Visibility::Public => true,
-            Visibility::Party(party_id) => self.party_id.as_deref() == Some(party_id.as_str()),
+            Visibility::Party(party_id) => {
+                self.party_id.as_deref() == Some(party_id.as_str())
+                    || self
+                        .party_ids
+                        .iter()
+                        .any(|visible_id| visible_id == party_id)
+            },
             Visibility::Player(player_id) => self.player_id == *player_id,
             Visibility::Gm | Visibility::System => false,
         }
@@ -1901,37 +1908,17 @@ impl TrpgGroup {
             party.players.dedup();
         }
 
-        let mut party_ids = self.parties.keys().cloned().collect::<Vec<_>>();
-        party_ids.sort();
-        let mut inferred_assignments = Vec::new();
-        for party_id in party_ids {
-            let Some(party) = self.parties.get(&party_id) else {
-                continue;
-            };
-            for target_id in &party.players {
-                inferred_assignments.push((target_id.clone(), party_id.clone()));
-            }
-        }
-        for (target_id, party_id) in inferred_assignments {
-            self.player_parties.entry(target_id).or_insert(party_id);
-        }
-
         let existing_party_ids = self.parties.keys().cloned().collect::<HashSet<_>>();
         self.player_parties.retain(|target_id, party_id| {
             valid_players.contains(target_id) && existing_party_ids.contains(party_id)
         });
 
-        for party in self.parties.values_mut() {
-            party.players.clear();
-        }
-
-        let mut assignments = self
+        let legacy_assignments = self
             .player_parties
             .iter()
             .map(|(target_id, party_id)| (target_id.clone(), party_id.clone()))
             .collect::<Vec<_>>();
-        assignments.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-        for (target_id, party_id) in assignments {
+        for (target_id, party_id) in legacy_assignments {
             let Some(party) = self.parties.get_mut(&party_id) else {
                 continue;
             };
@@ -1942,6 +1929,19 @@ impl TrpgGroup {
         for party in self.parties.values_mut() {
             party.players.sort();
             party.players.dedup();
+        }
+
+        let mut party_ids = self.parties.keys().cloned().collect::<Vec<_>>();
+        party_ids.sort();
+        for party_id in party_ids {
+            let Some(party) = self.parties.get(&party_id) else {
+                continue;
+            };
+            for target_id in &party.players {
+                self.player_parties
+                    .entry(target_id.clone())
+                    .or_insert_with(|| party_id.clone());
+            }
         }
 
         self.parties != before_parties || self.player_parties != before_player_parties
@@ -1974,8 +1974,6 @@ impl TrpgGroup {
         let before_player_parties = self.player_parties.clone();
 
         self.parties.remove(party_id);
-        self.player_parties
-            .retain(|_, assigned| assigned != party_id);
         self.sync_parties();
 
         self.parties != before_parties || self.player_parties != before_player_parties
@@ -2001,15 +1999,13 @@ impl TrpgGroup {
             .get(from_party_id)
             .map(|party| party.players.clone())
             .unwrap_or_default();
-        for target_id in source_players {
-            if self.players.iter().any(|player_id| player_id == &target_id) {
-                self.player_parties
-                    .insert(target_id, to_party_id.to_owned());
-            }
-        }
-        for assigned in self.player_parties.values_mut() {
-            if assigned == from_party_id {
-                *assigned = to_party_id.to_owned();
+        if let Some(target_party) = self.parties.get_mut(to_party_id) {
+            for target_id in source_players {
+                if self.players.iter().any(|player_id| player_id == &target_id)
+                    && !target_party.players.contains(&target_id)
+                {
+                    target_party.players.push(target_id);
+                }
             }
         }
         self.parties.remove(from_party_id);
@@ -2061,7 +2057,71 @@ impl TrpgGroup {
     }
 
     pub fn party_id_for_player(&self, target_id: &str) -> Option<&str> {
-        self.player_parties.get(target_id).map(String::as_str)
+        self.player_parties
+            .get(target_id)
+            .map(String::as_str)
+            .or_else(|| self.party_ids_for_player(target_id).into_iter().next())
+    }
+
+    pub fn party_ids_for_player(&self, target_id: &str) -> Vec<&str> {
+        let mut party_ids = self
+            .parties
+            .iter()
+            .filter_map(|(party_id, party)| {
+                party
+                    .players
+                    .iter()
+                    .any(|player_id| player_id == target_id)
+                    .then_some(party_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        party_ids.sort();
+        party_ids
+    }
+
+    pub fn player_in_party(&self, target_id: &str, party_id: &str) -> bool {
+        self.parties
+            .get(party_id)
+            .is_some_and(|party| party.players.iter().any(|player_id| player_id == target_id))
+    }
+
+    pub fn set_player_party_membership(
+        &mut self,
+        target_id: &str,
+        party_id: &str,
+        assigned: bool,
+    ) -> bool {
+        if !self.players.iter().any(|player_id| player_id == target_id) {
+            return false;
+        }
+        let party_id = party_id.trim();
+        if party_id.is_empty() {
+            return false;
+        }
+
+        let before_parties = self.parties.clone();
+        let before_player_parties = self.player_parties.clone();
+        if assigned {
+            let party = self
+                .parties
+                .entry(party_id.to_owned())
+                .or_insert_with(|| TrpgParty {
+                    name: party_id.to_owned(),
+                    players: Vec::new(),
+                    anonymous: false,
+                });
+            if !party.players.iter().any(|player_id| player_id == target_id) {
+                party.players.push(target_id.to_owned());
+            }
+        } else if let Some(party) = self.parties.get_mut(party_id) {
+            party.players.retain(|player_id| player_id != target_id);
+            if self.player_parties.get(target_id).map(String::as_str) == Some(party_id) {
+                self.player_parties.remove(target_id);
+            }
+        }
+        self.sync_parties();
+
+        self.parties != before_parties || self.player_parties != before_player_parties
     }
 
     pub fn legacy_team(&self, team_id: &str) -> Option<&TrpgLegacyTeam> {
@@ -2432,11 +2492,6 @@ impl TrpgGroup {
         }
 
         for member_id in members {
-            for party in self.parties.values_mut() {
-                party.players.retain(|player_id| player_id != &member_id);
-            }
-            self.player_parties
-                .insert(member_id.clone(), party_name.to_owned());
             if let Some(party) = self.parties.get_mut(party_name) {
                 if !party
                     .players
@@ -2499,10 +2554,16 @@ impl TrpgGroup {
     pub fn player_access(&self, player_id: u64) -> PlayerAccess {
         let target_id = player_id.to_string();
         let is_player = self.players.iter().any(|member_id| member_id == &target_id);
+        let party_ids = self
+            .party_ids_for_player(&target_id)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         PlayerAccess {
             player_id,
             character_id: is_player.then_some(target_id.clone()),
-            party_id: self.party_id_for_player(&target_id).map(str::to_owned),
+            party_id: party_ids.first().cloned(),
+            party_ids,
             is_gm: self.gm_users.contains(&player_id),
         }
     }
@@ -5824,8 +5885,15 @@ fn message_system(
             let incoming_user_id = json.data.user_id;
             manager.annotate_incoming_message_access(&target_id, &mut json);
 
-            let auto_forward = auto_forward_request(&manager, &json, &target_id)
-                .or_else(|| party_channel_auto_forward_request(&manager, &json, &target_id));
+            let party_channel_forward =
+                party_channel_auto_forward_request(&manager, &json, &target_id);
+            let (party_auto_forward, party_channel_guidance) = match party_channel_forward {
+                Some(PartyChannelAutoForward::Forward(request)) => (Some(request), None),
+                Some(PartyChannelAutoForward::Guidance(guidance)) => (None, Some(guidance)),
+                None => (None, None),
+            };
+            let auto_forward =
+                auto_forward_request(&manager, &json, &target_id).or(party_auto_forward);
             let character_creation_response = if is_incoming_message
                 && matches!(
                     json.data.message_type,
@@ -5838,6 +5906,7 @@ fn message_system(
                     scene_character_positions.as_deref(),
                 )
                 .or_else(|| handle_character_creation_message(&mut manager, &json, &target_id))
+                .or(party_channel_guidance)
             } else {
                 None
             };
@@ -6435,6 +6504,9 @@ fn handle_private_player_command(
         "冷却" => Some(format_private_character_cooldowns(
             manager, target_id,
         )),
+        "频道" => Some(format_private_channels(
+            manager, target_id,
+        )),
         "频道人员" => Some(format_private_channel_members(
             manager, target_id,
         )),
@@ -6456,6 +6528,7 @@ fn format_private_help() -> String {
         "【.侦测魔法】或【.detect magic】侦测附近的施法痕迹（需要INT 20）",
         "【.已兑换】查看技能与兑换内容",
         "【.冷却】查看技能冷却",
+        "【.频道】查看自己所属的全部频道",
         "【.频道人员】查看当前可见频道成员",
         "【.指南】查看当前TRPG组指南",
         "【.观察】或【.gc】请求玩家观察画面",
@@ -7054,6 +7127,11 @@ fn format_private_channel_members(manager: &NapcatMessageManager, target_id: &st
         };
     };
 
+    let party_ids = group.party_ids_for_player(target_id);
+    if party_ids.len() > 1 {
+        return "你属于多个频道。输入【.频道】查看全部频道；频道成员不能跨频道合并显示。"
+            .to_owned();
+    }
     let access = target_id
         .parse::<u64>()
         .map(|player_id| group.player_access(player_id))
@@ -7087,6 +7165,34 @@ fn format_private_channel_members(manager: &NapcatMessageManager, target_id: &st
     }
 }
 
+fn format_private_channels(manager: &NapcatMessageManager, target_id: &str) -> String {
+    let Some(group) = manager.group_for_player_target(target_id) else {
+        return if manager.trpg_groups.is_empty() {
+            "当前没有TRPG组。".to_owned()
+        } else {
+            "你还没有加入当前TRPG组。".to_owned()
+        };
+    };
+
+    let channel_names = group
+        .party_ids_for_player(target_id)
+        .into_iter()
+        .filter_map(|party_id| {
+            let party = group.parties.get(party_id)?;
+            let name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
+            Some(if party.anonymous { format!("{name}（匿名）") } else { name.to_owned() })
+        })
+        .collect::<Vec<_>>();
+    if channel_names.is_empty() {
+        "你当前不属于任何频道。".to_owned()
+    } else {
+        format!(
+            "你所在的频道：{}\n多频道发送格式：[频道名: 内容]，例如[狂妄号:你好]。",
+            channel_names.join("、")
+        )
+    }
+}
+
 fn format_private_group_guide(manager: &NapcatMessageManager, target_id: &str) -> String {
     let Some(group) = manager.group_for_player_target(target_id) else {
         return if manager.trpg_groups.is_empty() {
@@ -7105,16 +7211,33 @@ fn format_private_group_guide(manager: &NapcatMessageManager, target_id: &str) -
 }
 
 fn same_channel_member(group: &TrpgGroup, access: &PlayerAccess, target_id: &str) -> bool {
-    group.party_id_for_player(target_id) == access.party_id.as_deref()
+    let target_party_ids = group.party_ids_for_player(target_id);
+    if target_party_ids.is_empty() {
+        access.party_ids.is_empty() && access.party_id.is_none()
+    } else {
+        target_party_ids.iter().any(|party_id| {
+            access.party_id.as_deref() == Some(*party_id)
+                || access
+                    .party_ids
+                    .iter()
+                    .any(|access_party_id| access_party_id == party_id)
+        })
+    }
 }
 
 fn visible_channel_member(group: &TrpgGroup, access: &PlayerAccess, target_id: &str) -> bool {
     if target_id == access.player_id.to_string() {
         return true;
     }
-    match group.party_id_for_player(target_id) {
-        Some(party_id) => access.can_read(&Visibility::Party(party_id.to_owned())),
-        None => access.can_read(&Visibility::Public),
+    let party_ids = group.party_ids_for_player(target_id);
+    if party_ids.is_empty() {
+        access.can_read(&Visibility::Public)
+    } else {
+        party_ids.iter().any(|party_id| {
+            access.can_read(&Visibility::Party(
+                (*party_id).to_owned(),
+            ))
+        })
     }
 }
 
@@ -8156,6 +8279,11 @@ struct AutoForwardRequest {
     text: String,
 }
 
+enum PartyChannelAutoForward {
+    Forward(AutoForwardRequest),
+    Guidance(String),
+}
+
 fn auto_forward_request(
     manager: &NapcatMessageManager,
     message: &NapcatMessage,
@@ -8216,7 +8344,7 @@ fn party_channel_auto_forward_request(
     manager: &NapcatMessageManager,
     message: &NapcatMessage,
     target_id: &str,
-) -> Option<AutoForwardRequest> {
+) -> Option<PartyChannelAutoForward> {
     if !matches!(
         message.data.message_type,
         NapcatMessageType::Private
@@ -8225,9 +8353,39 @@ fn party_channel_auto_forward_request(
         return None;
     }
 
-    let text = party_channel_text(message)?;
+    let channel_message = parsed_party_channel_text(message)?;
     let group = manager.group_for_player_target(target_id)?;
-    let party_id = group.party_id_for_player(target_id)?;
+    let party_ids = group.party_ids_for_player(target_id);
+    let party_id = if let Some(requested_channel) = channel_message.channel_name.as_deref() {
+        let matching_ids = party_ids
+            .iter()
+            .copied()
+            .filter(|party_id| {
+                let Some(party) = group.parties.get(*party_id) else {
+                    return false;
+                };
+                *party_id == requested_channel || party.name.trim() == requested_channel
+            })
+            .collect::<Vec<_>>();
+        if matching_ids.len() != 1 {
+            return Some(PartyChannelAutoForward::Guidance(
+                "没有找到唯一匹配的所属频道。输入【.频道】查看频道，并使用[频道名: 内容]发送。"
+                    .to_owned(),
+            ));
+        }
+        matching_ids[0]
+    } else {
+        match party_ids.as_slice() {
+            [] => return None,
+            [party_id] => *party_id,
+            _ => {
+                return Some(PartyChannelAutoForward::Guidance(
+                    "你属于多个频道，请使用[频道名: 内容]发送，例如[狂妄号:你好]。输入【.频道】查看全部频道。"
+                        .to_owned(),
+                ));
+            },
+        }
+    };
     let party = group.parties.get(party_id)?;
     let recipients = party
         .players
@@ -8242,7 +8400,7 @@ fn party_channel_auto_forward_request(
     }
 
     let forwarded_text = if party.anonymous {
-        text
+        channel_message.text
     } else {
         let party_name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
         let channel_name = if party_name.ends_with("频道") {
@@ -8252,13 +8410,15 @@ fn party_channel_auto_forward_request(
         };
         format!(
             "【{}】{}: {}",
-            channel_name, message.data.sender.nickname, text
+            channel_name, message.data.sender.nickname, channel_message.text
         )
     };
-    Some(AutoForwardRequest {
-        recipients,
-        text: forwarded_text,
-    })
+    Some(PartyChannelAutoForward::Forward(
+        AutoForwardRequest {
+            recipients,
+            text: forwarded_text,
+        },
+    ))
 }
 
 fn auto_forward_sender_access<'a>(
@@ -8334,6 +8494,38 @@ fn party_channel_text(message: &NapcatMessage) -> Option<String> {
     } else {
         Some(inner.to_owned())
     }
+}
+
+struct ParsedPartyChannelText {
+    channel_name: Option<String>,
+    text: String,
+}
+
+fn parsed_party_channel_text(message: &NapcatMessage) -> Option<ParsedPartyChannelText> {
+    let text = party_channel_text(message)?;
+    let separator_index = text.find([':', '：']);
+    let Some(separator_index) = separator_index else {
+        return Some(ParsedPartyChannelText {
+            channel_name: None,
+            text,
+        });
+    };
+
+    let channel_name = text[..separator_index].trim();
+    let message_text = text[separator_index..]
+        .chars()
+        .next()
+        .map(char::len_utf8)
+        .and_then(|separator_len| text.get(separator_index + separator_len..))?
+        .trim();
+    if channel_name.is_empty() || message_text.is_empty() {
+        return None;
+    }
+
+    Some(ParsedPartyChannelText {
+        channel_name: Some(channel_name.to_owned()),
+        text: message_text.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -8605,6 +8797,35 @@ mod tests {
         assert!(!group
             .player_access(3)
             .can_read(&Visibility::Party("red".to_owned())));
+    }
+
+    #[test]
+    fn trpg_group_player_can_join_multiple_parties() {
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("red"));
+        group.set_player_party("4", Some("blue"));
+
+        assert!(group.set_player_party_membership("2", "blue", true));
+        assert_eq!(group.party_ids_for_player("2"), vec![
+            "blue", "red"
+        ]);
+        assert!(group.player_in_party("2", "red"));
+        assert!(group.player_in_party("2", "blue"));
+        let access = group.player_access(2);
+        assert!(access.can_read(&Visibility::Party("red".to_owned())));
+        assert!(access.can_read(&Visibility::Party("blue".to_owned())));
+
+        assert!(group.set_player_party_membership("2", "red", false));
+        assert_eq!(group.party_ids_for_player("2"), vec![
+            "blue"
+        ]);
+        assert!(!group.player_in_party("2", "red"));
     }
 
     #[test]
@@ -11612,6 +11833,36 @@ mod tests {
     }
 
     #[test]
+    fn private_channels_command_lists_every_membership() {
+        let mut manager = empty_manager();
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("human");
+        group.ensure_party("ship");
+        group.parties.get_mut("human").unwrap().name = "人类".to_owned();
+        group.parties.get_mut("ship").unwrap().name = "狂妄号".to_owned();
+        group.parties.get_mut("human").unwrap().anonymous = true;
+        group.set_player_party("2", Some("human"));
+        group.set_player_party_membership("2", "ship", true);
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".频道"),
+            "2",
+        )
+        .unwrap();
+
+        assert!(response.contains("人类（匿名）"));
+        assert!(response.contains("狂妄号"));
+        assert!(response.contains("[频道名: 内容]"));
+        assert!(response.contains("[狂妄号:你好]"));
+    }
+
+    #[test]
     fn private_channel_members_command_keeps_gm_in_assigned_party() {
         let mut manager = empty_manager();
         for (target_id, nickname) in [("2", "晨星"), ("3", "白露"), ("4", "夜航"), ("5", "远山")]
@@ -11977,6 +12228,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_named_party_channel_text_with_both_colon_styles() {
+        let ascii = parsed_party_channel_text(&test_private_message_from(
+            2,
+            "[狂妄号: hello]",
+        ))
+        .unwrap();
+        assert_eq!(
+            ascii.channel_name.as_deref(),
+            Some("狂妄号")
+        );
+        assert_eq!(ascii.text, "hello");
+
+        let full_width = parsed_party_channel_text(&test_private_message_from(
+            2,
+            "【狂妄号：你好】",
+        ))
+        .unwrap();
+        assert_eq!(
+            full_width.channel_name.as_deref(),
+            Some("狂妄号")
+        );
+        assert_eq!(full_width.text, "你好");
+    }
+
+    #[test]
     fn party_channel_text_requires_exact_matching_boundaries() {
         for text in [
             "I would say [hi]",
@@ -12022,12 +12298,13 @@ mod tests {
         manager.trpg_groups.insert("table".to_owned(), group);
         manager.current_trpg_group = Some("table".to_owned());
 
-        let request = party_channel_auto_forward_request(
+        let Some(PartyChannelAutoForward::Forward(request)) = party_channel_auto_forward_request(
             &manager,
             &test_private_message_from(2, "【red-only clue】"),
             "2",
-        )
-        .expect("same-party recipient should be available");
+        ) else {
+            panic!("same-party recipient should be available");
+        };
 
         assert_eq!(request.recipients, vec![3]);
         assert!(!request.recipients.contains(&4));
@@ -12045,15 +12322,47 @@ mod tests {
             .get_mut("red")
             .unwrap()
             .anonymous = true;
-        let anonymous_request = party_channel_auto_forward_request(
-            &manager,
-            &test_private_message_from(2, "[anonymous clue]"),
-            "2",
-        )
-        .expect("anonymous same-party recipient should be available");
+        let Some(PartyChannelAutoForward::Forward(anonymous_request)) =
+            party_channel_auto_forward_request(
+                &manager,
+                &test_private_message_from(2, "[anonymous clue]"),
+                "2",
+            )
+        else {
+            panic!("anonymous same-party recipient should be available");
+        };
 
         assert_eq!(anonymous_request.recipients, vec![3]);
         assert_eq!(anonymous_request.text, "anonymous clue");
+
+        {
+            let group = manager.trpg_groups.get_mut("table").unwrap();
+            group.parties.get_mut("blue").unwrap().name = "狂妄号".to_owned();
+            assert!(group.set_player_party_membership("2", "blue", true));
+        }
+        let Some(PartyChannelAutoForward::Guidance(guidance)) = party_channel_auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "[ambiguous clue]"),
+            "2",
+        ) else {
+            panic!("unnamed multi-channel message should return guidance");
+        };
+        assert!(guidance.contains("[频道名: 内容]"));
+
+        let Some(PartyChannelAutoForward::Forward(blue_request)) =
+            party_channel_auto_forward_request(
+                &manager,
+                &test_private_message_from(2, "[狂妄号:你好]"),
+                "2",
+            )
+        else {
+            panic!("named channel message should resolve the selected channel");
+        };
+        assert_eq!(blue_request.recipients, vec![4]);
+        assert_eq!(
+            blue_request.text,
+            "【狂妄号频道】user-2: 你好"
+        );
     }
 
     #[test]

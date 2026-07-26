@@ -2308,7 +2308,7 @@ fn group_broadcast_scope_ui(
                 .keys()
                 .filter(|party_id| {
                     members.iter().any(|member_id| {
-                        group.party_id_for_player(member_id) == Some(party_id.as_str())
+                        group.player_in_party(member_id, party_id)
                     })
                 })
                 .cloned()
@@ -2388,10 +2388,8 @@ fn group_broadcast_targets(
     private_targets_for_member_ids(
         manager,
         members.iter().filter(|member_id| match requested_party {
-            Some(party_id) => {
-                current_group.and_then(|group| group.party_id_for_player(member_id))
-                    == Some(party_id)
-            },
+            Some(party_id) => current_group
+                .is_some_and(|group| group.player_in_party(member_id, party_id)),
             None => true,
         }),
     )
@@ -12941,53 +12939,34 @@ fn trpg_group_settings_window(
                                 } else {
                                     for target_id in &snapshot.players {
                                         let display_name = target_display_name(manager, target_id);
-                                        let mut selected_party = snapshot
-                                            .party_id_for_player(target_id)
-                                            .unwrap_or_default()
-                                            .to_owned();
-                                        let before_party = selected_party.clone();
                                         ui.horizontal_wrapped(|ui| {
                                             ui.label(display_name);
-                                            egui::ComboBox::from_id_salt((
-                                                "party_assignment",
-                                                &group_name,
-                                                target_id,
-                                            ))
-                                            .selected_text(if selected_party.is_empty() {
-                                                "无小队"
-                                            } else {
-                                                selected_party.as_str()
-                                            })
-                                            .show_ui(
-                                                ui,
-                                                |ui| {
-                                                    ui.selectable_value(
-                                                        &mut selected_party,
-                                                        String::new(),
-                                                        "无小队",
-                                                    );
-                                                    for party_name in &party_names {
-                                                        ui.selectable_value(
-                                                            &mut selected_party,
-                                                            party_name.clone(),
-                                                            party_name,
+                                            let mut has_membership = false;
+                                            for party_name in &party_names {
+                                                let mut assigned = snapshot
+                                                    .player_in_party(target_id, party_name);
+                                                if ui
+                                                    .checkbox(&mut assigned, party_name)
+                                                    .changed()
+                                                {
+                                                    if let Some(group) = manager
+                                                        .trpg_groups
+                                                        .get_mut(&group_name)
+                                                    {
+                                                        changed |= group
+                                                            .set_player_party_membership(
+                                                                target_id,
+                                                                party_name,
+                                                                assigned,
                                                         );
                                                     }
-                                                },
-                                            );
-                                        });
-
-                                        if selected_party != before_party {
-                                            if let Some(group) =
-                                                manager.trpg_groups.get_mut(&group_name)
-                                            {
-                                                changed |= group.set_player_party(
-                                                    target_id,
-                                                    (!selected_party.is_empty())
-                                                        .then_some(selected_party.as_str()),
-                                                );
+                                                }
+                                                has_membership |= assigned;
                                             }
-                                        }
+                                            if !has_membership {
+                                                ui.small("无频道");
+                                            }
+                                        });
                                     }
                                 }
                             });
@@ -15523,6 +15502,7 @@ mod tests {
         group.set_player_party("2", Some("red"));
         group.set_player_party("3", Some("red"));
         group.set_player_party("4", Some("blue"));
+        group.set_player_party_membership("2", "blue", true);
         let members = vec!["2".to_owned(), "3".to_owned(), "4".to_owned()];
 
         let targets = group_broadcast_targets(
@@ -15535,6 +15515,17 @@ mod tests {
         assert_eq!(targets, vec![
             NapcatSendTarget::Private(2),
             NapcatSendTarget::Private(3),
+        ]);
+
+        let blue_targets = group_broadcast_targets(
+            Some(&group),
+            &members,
+            &manager,
+            &broadcast_party_scope("blue"),
+        );
+        assert_eq!(blue_targets, vec![
+            NapcatSendTarget::Private(2),
+            NapcatSendTarget::Private(4),
         ]);
     }
 
