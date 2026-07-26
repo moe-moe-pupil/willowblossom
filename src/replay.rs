@@ -100,6 +100,7 @@ use crate::{
         cached_or_local_voxel_standee_path,
         TrpgVoxelGrid,
         VoxelPlayerStandee,
+        VoxelReplayOcclusionFade,
         VoxelViewportCamera,
         VOXEL_SIZE,
     },
@@ -125,6 +126,7 @@ const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
 const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
 const REPLAY_PLAYING_STATUS: &str = "正在回放；停止后会恢复当前体素场景";
 const REPLAY_SPEECH_PREPARING_STATUS: &str = "正在准备当前台词语音；语音就绪后字幕与声音会同时开始";
+const DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 3.0;
 
 pub struct ReplayPlugin;
 
@@ -148,9 +150,10 @@ impl Plugin for ReplayPlugin {
             .add_systems(
                 PostUpdate,
                 (
-                    apply_replay_camera,
                     apply_replay_standee_positions,
+                    apply_replay_camera,
                 )
+                    .chain()
                     .before(TransformSystems::Propagate),
             )
             .add_systems(
@@ -1442,11 +1445,19 @@ fn poll_video_encoding(mut studio: ResMut<ReplayStudio>) {
 
 fn apply_replay_camera(
     studio: Res<ReplayStudio>,
+    mut fade: Option<ResMut<VoxelReplayOcclusionFade>>,
     mut camera: Query<
         &mut Transform,
         (With<VoxelViewportCamera>, Without<VoxelPlayerStandee>),
     >,
+    standees: Query<
+        (&Transform, &VoxelPlayerStandee),
+        (With<VoxelPlayerStandee>, Without<VoxelViewportCamera>),
+    >,
 ) {
+    if let Some(fade) = fade.as_mut() {
+        fade.active = false;
+    }
     if !matches!(
         studio.mode,
         ReplayMode::Playing | ReplayMode::Paused
@@ -1459,7 +1470,36 @@ fn apply_replay_camera(
     };
     if let Ok(mut camera) = camera.single_mut() {
         *camera = transform;
+        if let Some(focus) = replay_focus_position(replay, studio.playback_ms, &standees) {
+            if let Some(fade) = fade.as_mut() {
+                fade.active = true;
+                fade.camera = transform.translation;
+                fade.focus = focus;
+            }
+        }
     }
+}
+
+fn replay_focus_position(
+    replay: &ReplayFile,
+    playback_ms: u64,
+    standees: &Query<
+        (&Transform, &VoxelPlayerStandee),
+        (With<VoxelPlayerStandee>, Without<VoxelViewportCamera>),
+    >,
+) -> Option<Vec3> {
+    let speaker_id = replay
+        .dialogue
+        .iter()
+        .rev()
+        .find(|line| line.included && line.time_ms <= playback_ms)
+        .or_else(|| replay.dialogue.iter().find(|line| line.included))?
+        .sender_id;
+    standees
+        .iter()
+        .find_map(|(transform, standee)| {
+            (standee.user_id == speaker_id).then_some(transform.translation)
+        })
 }
 
 fn replay_studio_ui(
@@ -4373,10 +4413,6 @@ impl ReplayCameraObstacles {
         }
     }
 
-    fn view_is_clear(&self, camera: Vec3, target: Vec3) -> bool {
-        self.camera_is_clear(camera) && self.segment_is_clear(camera, target)
-    }
-
     fn camera_is_clear(&self, camera: Vec3) -> bool {
         let clearance = VOXEL_SIZE * 0.45;
         [
@@ -4392,6 +4428,7 @@ impl ReplayCameraObstacles {
         .all(|offset| !self.contains_world_point(camera + offset))
     }
 
+    #[cfg(test)]
     fn segment_is_clear(&self, from: Vec3, to: Vec3) -> bool {
         let offset = to - from;
         let distance = offset.length();
@@ -4490,18 +4527,19 @@ impl DirectedCameraRig {
             DirectorShot::SpeakerWide => 8.0,
             DirectorShot::Establishing => 12.0,
             DirectorShot::Environment => 10.0,
-        };
+        } * DIRECTED_CAMERA_DISTANCE_SCALE;
         let height = match shot {
             DirectorShot::SpeakerClose => 1.1,
             DirectorShot::SpeakerMedium => 1.5,
             DirectorShot::SpeakerWide => 2.1,
             DirectorShot::Establishing | DirectorShot::Environment => 3.2,
-        };
+        } * DIRECTED_CAMERA_DISTANCE_SCALE;
         let static_position = self.visible_position(target, base_distance, height, obstacles);
         let dolly_axis = (static_position - target).normalize();
-        let desired_position = static_position + dolly_axis * distance_delta;
+        let desired_position =
+            static_position + dolly_axis * (distance_delta * DIRECTED_CAMERA_DISTANCE_SCALE);
         let position = if self.signed_side(desired_position) < Self::LINE_MARGIN
-            || !obstacles.view_is_clear(desired_position, target)
+            || !obstacles.camera_is_clear(desired_position)
         {
             static_position
         } else {
@@ -4557,7 +4595,7 @@ impl DirectedCameraRig {
                     if signed_side < Self::LINE_MARGIN {
                         candidate += self.camera_side * (Self::LINE_MARGIN - signed_side);
                     }
-                    if !obstacles.view_is_clear(candidate, target) {
+                    if !obstacles.camera_is_clear(candidate) {
                         continue;
                     }
                     let score = distance_scale * 10.0
@@ -5698,7 +5736,7 @@ mod tests {
     }
 
     #[test]
-    fn directed_camera_pulls_in_front_of_a_wall_and_keeps_the_speaker_visible() {
+    fn directed_camera_keeps_full_distance_when_a_wall_can_be_dissolved() {
         let target = Vec3::new(0.125, 1.125, 0.125);
         let base = Transform::from_xyz(0.125, 3.0, 5.125);
         let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
@@ -5726,10 +5764,31 @@ mod tests {
         let forward = shot.rotation * Vec3::NEG_Z;
         let to_speaker = (target - shot.translation).normalize();
 
-        assert!(shot.translation.z < 8.0 * VOXEL_SIZE);
-        assert!(obstacles.view_is_clear(shot.translation, target));
+        assert!(shot.translation.z > 14.0);
+        assert!(obstacles.camera_is_clear(shot.translation));
+        assert!(!obstacles.segment_is_clear(shot.translation, target));
         assert!(forward.dot(to_speaker) > 0.999);
         assert!(rig.signed_side(shot.translation) >= DirectedCameraRig::LINE_MARGIN);
+    }
+
+    #[test]
+    fn directed_camera_speaker_shots_are_three_times_farther_away() {
+        let target = Vec3::new(2.0, 1.0, -1.0);
+        let base = Transform::from_xyz(2.0, 2.5, 6.0);
+        let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
+        let positions = HashMap::from([(1, target)]);
+        let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
+
+        let shot = rig.director_shot(
+            target,
+            DirectorShot::SpeakerMedium,
+            DirectorMotion::Static,
+            0.0,
+            &ReplayCameraObstacles::default(),
+        );
+
+        assert!((horizontal(shot.translation - target).length() - 15.0).abs() < 0.001);
+        assert!((shot.translation.y - target.y - 4.5).abs() < 0.001);
     }
 
     #[test]
@@ -5778,7 +5837,9 @@ mod tests {
         ]);
         let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
         let obstacles = ReplayCameraObstacles::default();
-        let off_axis_target = Vec3::new(0.0, 1.0, -10.0);
+        // Keep the speaker far enough onto the forbidden side that even the
+        // three-times-farther shot must clamp to the scene line.
+        let off_axis_target = Vec3::new(0.0, 1.0, -30.0);
         let arrival = rig.director_shot(
             off_axis_target,
             DirectorShot::SpeakerMedium,

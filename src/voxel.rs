@@ -47,10 +47,16 @@ use bevy::{
         PrimitiveTopology,
     },
     prelude::*,
+    pbr::{
+        ExtendedMaterial,
+        MaterialExtension,
+    },
     render::{
         render_resource::{
+            AsBindGroup,
             Extent3d,
             Face,
+            ShaderType,
             TextureDimension,
             TextureFormat,
             TextureUsages,
@@ -60,6 +66,7 @@ use bevy::{
             ScreenshotCaptured,
         },
     },
+    shader::ShaderRef,
     window::{
         CursorGrabMode,
         CursorOptions,
@@ -170,10 +177,50 @@ const PLANET_CLOUD_PUFF_COUNT: usize = 24;
 const PLANET_SCIENCE_LAB_CENTER: IVec2 = IVec2::new(-45, 20);
 const PLANET_SCIENCE_LAB_FLOOR_Y: i32 = 485;
 const VOXEL_MINIMAP_RESOLUTION: usize = 64;
+const VOXEL_OCCLUSION_FADE_SHADER: &str = "shaders/voxel_occlusion_fade.wgsl";
+const VOXEL_OCCLUSION_FADE_RADIUS: f32 = 0.8;
 
 pub struct TrpgVoxelPlugin;
 
 pub struct TrpgVoxelConnector;
+
+type VoxelFadeMaterial = ExtendedMaterial<StandardMaterial, VoxelOcclusionFadeExtension>;
+
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub(crate) struct VoxelReplayOcclusionFade {
+    pub(crate) active: bool,
+    pub(crate) camera: Vec3,
+    pub(crate) focus: Vec3,
+}
+
+#[derive(ShaderType, Reflect, Debug, Clone, Copy, Default)]
+struct VoxelOcclusionFadeUniform {
+    camera_and_active: Vec4,
+    focus_and_radius: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+struct VoxelOcclusionFadeExtension {
+    #[uniform(100)]
+    settings: VoxelOcclusionFadeUniform,
+}
+
+impl MaterialExtension for VoxelOcclusionFadeExtension {
+    fn fragment_shader() -> ShaderRef { VOXEL_OCCLUSION_FADE_SHADER.into() }
+
+    fn deferred_fragment_shader() -> ShaderRef { VOXEL_OCCLUSION_FADE_SHADER.into() }
+}
+
+impl VoxelOcclusionFadeExtension {
+    fn new() -> Self {
+        Self {
+            settings: VoxelOcclusionFadeUniform {
+                focus_and_radius: Vec4::new(0.0, 0.0, 0.0, VOXEL_OCCLUSION_FADE_RADIUS),
+                ..default()
+            },
+        }
+    }
+}
 
 fn voxel_emissive(red: f32, green: f32, blue: f32) -> LinearRgba {
     LinearRgba::rgb(
@@ -702,8 +749,8 @@ struct VoxelAutoDoor {
 
 #[derive(Resource)]
 struct VoxelMaterials {
-    handles: [Handle<StandardMaterial>; VOXEL_MATERIAL_COUNT],
-    planet_ocean: Handle<StandardMaterial>,
+    handles: [Handle<VoxelFadeMaterial>; VOXEL_MATERIAL_COUNT],
+    planet_ocean: Handle<VoxelFadeMaterial>,
 }
 
 #[derive(Resource, Default)]
@@ -1420,6 +1467,7 @@ impl Plugin for TrpgVoxelPlugin {
             VoxelPlugin::<u8>::default(),
             ConnectivityPlugin::<TrpgVoxelConnector>::default(),
             VoxelRadianceCascadePlugin,
+            MaterialPlugin::<VoxelFadeMaterial>::default(),
         ))
         // Player observation is a prepared screenshot, so one inexpensive physics substep is
         // sufficient and avoids repeating the solver when explosions create many fragments.
@@ -1439,6 +1487,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelGeometryDirtyChunks>()
         .init_resource::<VoxelScenePersistenceState>()
         .init_resource::<VoxelMinimapSnapshot>()
+        .init_resource::<VoxelReplayOcclusionFade>()
         .insert_resource(player_camera_store)
         .insert_resource(inventory_store)
         .insert_resource(toolbar_settings_store)
@@ -1506,6 +1555,10 @@ impl Plugin for TrpgVoxelPlugin {
                     .chain(),
             )
                 .chain(),
+        )
+        .add_systems(
+            Update,
+            sync_voxel_occlusion_fade.after(animate_voxel_materials),
         )
         .add_systems(
             EguiPrimaryContextPass,
@@ -1936,7 +1989,7 @@ fn voxel_editor_shortcuts(
 fn setup_voxel_materials(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<VoxelFadeMaterial>>,
 ) {
     let paths = [
         "textures/voxel_grass.png",
@@ -2054,11 +2107,15 @@ fn setup_voxel_materials(
             },
             _ => {},
         }
-        materials.add(material)
+        materials.add(ExtendedMaterial {
+            base: material,
+            extension: VoxelOcclusionFadeExtension::new(),
+        })
     });
-    let planet_ocean = materials.add(opaque_planet_ocean_material(
-        textures[3].clone(),
-    ));
+    let planet_ocean = materials.add(ExtendedMaterial {
+        base: opaque_planet_ocean_material(textures[3].clone()),
+        extension: VoxelOcclusionFadeExtension::new(),
+    });
     commands.insert_resource(VoxelMaterials {
         handles,
         planet_ocean,
@@ -4976,7 +5033,10 @@ fn sorted_planet_cells(planet: &VoxelOrbitalPlanet) -> Vec<(IVec3, u8)> {
     cells
 }
 
-fn planet_material_handle(materials: &VoxelMaterials, material_id: u8) -> Handle<StandardMaterial> {
+fn planet_material_handle(
+    materials: &VoxelMaterials,
+    material_id: u8,
+) -> Handle<VoxelFadeMaterial> {
     if material_id == 4 {
         materials.planet_ocean.clone()
     } else {
@@ -5610,7 +5670,7 @@ fn append_voxel_faces(
 fn animate_voxel_materials(
     time: Res<Time>,
     voxel_materials: Res<VoxelMaterials>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<VoxelFadeMaterial>>,
 ) {
     let seconds = time.elapsed_secs();
     let water_uv = Affine2::from_translation(Vec2::new(
@@ -5619,16 +5679,39 @@ fn animate_voxel_materials(
     ));
     for handle in [&voxel_materials.handles[3], &voxel_materials.planet_ocean] {
         if let Some(mut water) = materials.get_mut(handle) {
-            water.uv_transform = water_uv;
+            water.base.uv_transform = water_uv;
         }
     }
     if let Some(mut lava) = materials.get_mut(&voxel_materials.handles[4]) {
-        lava.uv_transform = Affine2::from_translation(Vec2::new(
+        lava.base.uv_transform = Affine2::from_translation(Vec2::new(
             seconds * -0.018,
             seconds * 0.027,
         ));
         let pulse = 4.5 + (seconds * 2.4).sin() * 1.2;
-        lava.emissive = voxel_emissive(pulse, pulse * 0.11, 0.015);
+        lava.base.emissive = voxel_emissive(pulse, pulse * 0.11, 0.015);
+    }
+}
+
+fn sync_voxel_occlusion_fade(
+    fade: Res<VoxelReplayOcclusionFade>,
+    voxel_materials: Res<VoxelMaterials>,
+    mut materials: ResMut<Assets<VoxelFadeMaterial>>,
+) {
+    if !fade.is_changed() {
+        return;
+    }
+    let settings = VoxelOcclusionFadeUniform {
+        camera_and_active: fade.camera.extend(f32::from(fade.active)),
+        focus_and_radius: fade.focus.extend(VOXEL_OCCLUSION_FADE_RADIUS),
+    };
+    for handle in voxel_materials
+        .handles
+        .iter()
+        .chain(std::iter::once(&voxel_materials.planet_ocean))
+    {
+        if let Some(mut material) = materials.get_mut(handle) {
+            material.extension.settings = settings;
+        }
     }
 }
 
@@ -9416,6 +9499,48 @@ mod tests {
         assert!((emissive.red - 1.5).abs() < f32::EPSILON);
         assert!((emissive.green - 0.6).abs() < f32::EPSILON);
         assert!((emissive.blue - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn replay_focus_updates_every_shared_voxel_fade_material() {
+        let mut app = App::new();
+        app.init_resource::<Assets<VoxelFadeMaterial>>();
+        let (handles, planet_ocean) = {
+            let mut assets = app.world_mut().resource_mut::<Assets<VoxelFadeMaterial>>();
+            let handles = std::array::from_fn(|_| {
+                assets.add(ExtendedMaterial {
+                    base: StandardMaterial::default(),
+                    extension: VoxelOcclusionFadeExtension::new(),
+                })
+            });
+            let planet_ocean = assets.add(ExtendedMaterial {
+                base: StandardMaterial::default(),
+                extension: VoxelOcclusionFadeExtension::new(),
+            });
+            (handles, planet_ocean)
+        };
+        app.insert_resource(VoxelMaterials {
+            handles: handles.clone(),
+            planet_ocean: planet_ocean.clone(),
+        })
+        .insert_resource(VoxelReplayOcclusionFade {
+            active: true,
+            camera: Vec3::new(1.0, 2.0, 3.0),
+            focus: Vec3::new(4.0, 5.0, 6.0),
+        })
+        .add_systems(Update, sync_voxel_occlusion_fade);
+
+        app.update();
+
+        let assets = app.world().resource::<Assets<VoxelFadeMaterial>>();
+        for handle in handles.iter().chain(std::iter::once(&planet_ocean)) {
+            let settings = assets.get(handle).unwrap().extension.settings;
+            assert_eq!(settings.camera_and_active, Vec4::new(1.0, 2.0, 3.0, 1.0));
+            assert_eq!(
+                settings.focus_and_radius,
+                Vec4::new(4.0, 5.0, 6.0, VOXEL_OCCLUSION_FADE_RADIUS)
+            );
+        }
     }
 
     #[test]
