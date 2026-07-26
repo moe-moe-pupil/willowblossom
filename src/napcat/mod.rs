@@ -253,6 +253,12 @@ pub struct CampaignMessage {
     pub time: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayMessageSnapshot {
+    pub turn_index: u32,
+    pub position_cells: [i32; 3],
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayerAccess {
     pub player_id: u64,
@@ -2713,6 +2719,10 @@ fn legacy_party_name(name: &str, id: &str, fallback: &str) -> String {
 #[derive(Resource, Serialize, Deserialize)]
 pub struct NapcatMessageManager {
     pub messages: HashMap<String, Vec<NapcatMessage>>,
+    /// Message-index-aligned replay metadata. Missing entries are legacy messages whose
+    /// historical position must not be guessed.
+    #[serde(default)]
+    pub replay_snapshots: HashMap<String, Vec<Option<ReplayMessageSnapshot>>>,
     #[serde(default)]
     pub chat_targets: HashMap<String, ChatTargetMetadata>,
     #[serde(default)]
@@ -5378,6 +5388,7 @@ fn setup(mut commands: Commands) {
 
     let message_manager = NapcatMessageManager {
         messages: HashMap::default(),
+        replay_snapshots: HashMap::default(),
         chat_targets: HashMap::default(),
         chat_target_kinds: HashMap::default(),
         player_characters: HashMap::default(),
@@ -8536,6 +8547,7 @@ mod tests {
     fn empty_manager() -> NapcatMessageManager {
         NapcatMessageManager {
             messages: HashMap::default(),
+            replay_snapshots: HashMap::default(),
             chat_targets: HashMap::default(),
             chat_target_kinds: HashMap::default(),
             player_characters: HashMap::default(),

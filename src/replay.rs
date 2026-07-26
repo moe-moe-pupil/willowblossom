@@ -92,6 +92,7 @@ use crate::{
         NapcatMessageManager,
         PlayerAccess,
         PlayerCharacter,
+        ReplayMessageSnapshot,
         Visibility,
     },
     ui,
@@ -104,7 +105,10 @@ use crate::{
     },
 };
 
-const REPLAY_FORMAT_VERSION: u32 = 1;
+const REPLAY_FORMAT_VERSION: u32 = 2;
+const LEGACY_REPLAY_FORMAT_VERSION: u32 = 1;
+const DEFAULT_AREA_RADIUS_CELLS: u32 = 12;
+const AREA_BLOCK_TURN_LIMIT: usize = 3;
 const CAMERA_SAMPLE_SECONDS: f32 = 0.1;
 const MIN_DIALOGUE_MS: u64 = 2_700;
 const MAX_DIALOGUE_MS: u64 = 9_750;
@@ -129,10 +133,12 @@ impl Plugin for ReplayPlugin {
         app.init_resource::<ReplayStudio>()
             .init_resource::<ReplayVideoCaptureActive>()
             .init_resource::<PreviewSpeechController>()
+            .init_resource::<ReplaySnapshotTracker>()
             .add_systems(
                 Update,
                 (
-                    record_replay,
+                    snapshot_new_replay_messages,
+                    record_replay.after(snapshot_new_replay_messages),
                     advance_replay,
                     preview_replay_speech.after(advance_replay),
                     render_video_frames,
@@ -141,7 +147,11 @@ impl Plugin for ReplayPlugin {
             )
             .add_systems(
                 PostUpdate,
-                apply_replay_camera.before(TransformSystems::Propagate),
+                (
+                    apply_replay_camera,
+                    apply_replay_standee_positions,
+                )
+                    .before(TransformSystems::Propagate),
             )
             .add_systems(
                 EguiPrimaryContextPass,
@@ -153,8 +163,94 @@ impl Plugin for ReplayPlugin {
 #[derive(Resource, Default)]
 pub(crate) struct ReplayVideoCaptureActive(pub bool);
 
+#[derive(Resource, Default)]
+struct ReplaySnapshotTracker {
+    initialized: bool,
+    message_counts: HashMap<String, usize>,
+}
+
 pub(crate) fn replay_video_capture_inactive(active: Res<ReplayVideoCaptureActive>) -> bool {
     !active.0
+}
+
+fn snapshot_new_replay_messages(
+    mut manager: ResMut<Persistent<NapcatMessageManager>>,
+    standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
+    mut tracker: ResMut<ReplaySnapshotTracker>,
+) {
+    if !tracker.initialized {
+        tracker.message_counts = manager
+            .messages
+            .iter()
+            .map(|(target, messages)| (target.clone(), messages.len()))
+            .collect();
+        tracker.initialized = true;
+        return;
+    }
+
+    let positions = standees
+        .iter()
+        .map(|(transform, standee)| {
+            (
+                standee.user_id,
+                (transform.translation / VOXEL_SIZE)
+                    .round()
+                    .as_ivec3()
+                    .to_array(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let (world_turn, player_turns) = manager
+        .current_group()
+        .map(|group| {
+            (
+                group.world_turn,
+                group
+                    .player_turns
+                    .iter()
+                    .filter_map(|(id, turn)| id.parse::<u64>().ok().map(|id| (id, turn.turns_passed)))
+                    .collect::<HashMap<_, _>>(),
+            )
+        })
+        .unwrap_or_default();
+
+    let mut additions = Vec::new();
+    for (target, messages) in &manager.messages {
+        let seen = tracker
+            .message_counts
+            .get(target)
+            .copied()
+            .unwrap_or_default()
+            .min(messages.len());
+        for (index, message) in messages.iter().enumerate().skip(seen) {
+            if let Some(position_cells) = positions.get(&message.data.user_id).copied() {
+                additions.push((
+                    target.clone(),
+                    index,
+                    ReplayMessageSnapshot {
+                        turn_index: player_turns
+                            .get(&message.data.user_id)
+                            .copied()
+                            .unwrap_or(world_turn),
+                        position_cells,
+                    },
+                ));
+            }
+        }
+        tracker.message_counts.insert(target.clone(), messages.len());
+    }
+
+    if additions.is_empty() {
+        return;
+    }
+    for (target, index, snapshot) in additions {
+        let snapshots = manager.replay_snapshots.entry(target).or_default();
+        if snapshots.len() <= index {
+            snapshots.resize(index + 1, None);
+        }
+        snapshots[index] = Some(snapshot);
+    }
+    let _ = manager.persist();
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,6 +259,7 @@ enum ReplayAudience {
     Public,
     Party(String),
     Player(u64),
+    All,
     Gm,
 }
 
@@ -176,6 +273,7 @@ impl ReplayAudience {
             Self::Public => "公开".to_owned(),
             Self::Party(id) => format!("队伍：{id}"),
             Self::Player(id) => format!("玩家：{id}"),
+            Self::All => "全部 / All".to_owned(),
             Self::Gm => "GM（包含私密内容）".to_owned(),
         }
     }
@@ -203,11 +301,7 @@ impl ReplayAudience {
                     || matches!(visibility, Visibility::Party(id) if id == party_id)
             },
             Self::Player(_) => player_access.is_some_and(|access| access.can_read(visibility)),
-            Self::Gm => PlayerAccess {
-                is_gm: true,
-                ..Default::default()
-            }
-            .can_read(visibility),
+            Self::All | Self::Gm => true,
         }
     }
 }
@@ -223,6 +317,10 @@ struct ReplayFile {
     scene: ReplayScene,
     camera: Vec<ReplayCameraKeyframe>,
     dialogue: Vec<ReplayDialogue>,
+    #[serde(default)]
+    area_blocks: Vec<ReplayAreaBlock>,
+    #[serde(default = "default_area_radius_cells")]
+    area_radius_cells: u32,
     #[serde(default = "default_master_speech_speed")]
     master_speech_speed: f32,
     #[serde(default = "default_master_dialogue_duration")]
@@ -265,7 +363,32 @@ struct ReplayDialogue {
     visibility: Visibility,
     #[serde(default)]
     side: DialogueSide,
+    #[serde(default)]
+    line_id: u64,
+    #[serde(default)]
+    source_time: u64,
+    #[serde(default)]
+    turn_index: u32,
+    #[serde(default)]
+    position_cells: [i32; 3],
+    #[serde(default)]
+    area: String,
+    #[serde(default = "default_true")]
+    included: bool,
+    #[serde(default)]
+    snapshot_recorded: bool,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ReplayAreaBlock {
+    id: u64,
+    area: String,
+    line_ids: Vec<u64>,
+}
+
+const fn default_area_radius_cells() -> u32 { DEFAULT_AREA_RADIUS_CELLS }
+
+const fn default_true() -> bool { true }
 
 #[derive(Debug, Clone, Deserialize)]
 struct DirectorPlan {
@@ -518,13 +641,18 @@ fn record_replay(
             .get(&target_id)
             .copied()
             .unwrap_or_default();
-        for message in messages.iter().skip(seen) {
+        for (index, message) in messages.iter().enumerate().skip(seen) {
             let campaign_message = manager.campaign_message_for_target(&target_id, message);
             if audience.can_read(&campaign_message, &manager) {
                 if let Some(dialogue) = dialogue_from_message(
                     &campaign_message,
                     &manager,
                     next_turn_ms,
+                    manager
+                        .replay_snapshots
+                        .get(&target_id)
+                        .and_then(|snapshots| snapshots.get(index))
+                        .and_then(Option::as_ref),
                 ) {
                     next_turn_ms = dialogue
                         .time_ms
@@ -541,9 +669,10 @@ fn record_replay(
     if let Some(replay) = studio.replay.as_mut() {
         let captured_any = !captured.is_empty();
         replay.dialogue.extend(captured);
-        retain_dialogue_with_standees(&mut replay.dialogue, &speaker_positions);
-        spatially_order_dialogue_turns(&mut replay.dialogue, &speaker_positions);
-        let dialogue_end = retime_dialogue_turns(&mut replay.dialogue);
+        assign_replay_line_ids(&mut replay.dialogue);
+        auto_group_replay_areas(replay);
+        rebuild_area_blocks(replay);
+        let dialogue_end = compile_area_block_timeline(replay);
         replay.duration_ms = if record_camera_enabled {
             record_elapsed_ms.max(dialogue_end)
         } else {
@@ -721,6 +850,9 @@ impl PreviewSpeechController {
             .expect("ONNX worker was initialized");
         worker.latest_signature.store(signature, Ordering::Release);
         for (index, line) in replay.dialogue.iter().enumerate() {
+            if !line.included {
+                continue;
+            }
             let settings = replay
                 .speaker_voice_settings
                 .get(&line.sender_id)
@@ -1310,7 +1442,10 @@ fn poll_video_encoding(mut studio: ResMut<ReplayStudio>) {
 
 fn apply_replay_camera(
     studio: Res<ReplayStudio>,
-    mut camera: Query<&mut Transform, With<VoxelViewportCamera>>,
+    mut camera: Query<
+        &mut Transform,
+        (With<VoxelViewportCamera>, Without<VoxelPlayerStandee>),
+    >,
 ) {
     if !matches!(
         studio.mode,
@@ -1457,15 +1592,15 @@ fn replay_controls(
                 }
                 ui.selectable_value(
                     &mut studio.audience,
-                    ReplayAudience::Gm,
-                    "GM（包含私密内容）",
+                    ReplayAudience::All,
+                    "全部 / All（GM 可见的全部内容）",
                 );
             });
     });
-    if studio.audience == ReplayAudience::Gm {
+    if matches!(studio.audience, ReplayAudience::All | ReplayAudience::Gm) {
         ui.colored_label(
             egui::Color32::from_rgb(210, 90, 70),
-            "GM 回放可能包含私聊、隐藏队伍和系统内容，请勿公开发布。",
+            "“全部”可能包含私聊、隐藏队伍、GM 和系统内容，也可能发送给 DeepSeek；请勿公开发布。",
         );
     }
     ui.checkbox(
@@ -1519,6 +1654,7 @@ fn replay_controls(
             replay.scene.voxels.len(),
         ));
     }
+    replay_dialogue_editor(ui, studio, camera);
 
     if !matches!(studio.mode, ReplayMode::Recording) && studio.replay.is_some() {
         let duration = studio.replay.as_ref().unwrap().duration_ms.max(1);
@@ -1585,7 +1721,7 @@ fn replay_controls(
                 && studio
                     .replay
                     .as_ref()
-                    .is_some_and(|replay| !replay.dialogue.is_empty()),
+                    .is_some_and(|replay| replay.dialogue.iter().any(|line| line.included)),
             egui::Button::new("生成并应用导演方案"),
         )
         .clicked()
@@ -2112,17 +2248,34 @@ fn build_from_history(
         .flat_map(|(target, messages)| {
             messages
                 .iter()
-                .map(|message| manager.campaign_message_for_target(target, message))
+                .enumerate()
+                .map(|(index, message)| {
+                    (
+                        manager.campaign_message_for_target(target, message),
+                        manager
+                            .replay_snapshots
+                            .get(target)
+                            .and_then(|snapshots| snapshots.get(index))
+                            .and_then(Option::as_ref)
+                            .copied(),
+                    )
+                })
                 .collect::<Vec<_>>()
         })
-        .filter(|message| message.campaign_id == campaign_id)
-        .filter(|message| studio.audience.can_read(message, manager))
-        .filter(|message| !message.text.trim().is_empty())
+        .filter(|(message, _)| message.campaign_id == campaign_id)
+        .filter(|(message, _)| studio.audience.can_read(message, manager))
+        .filter(|(message, _)| !message.text.trim().is_empty())
         .collect::<Vec<_>>();
-    visible.sort_by_key(|message| message.time);
+    visible.sort_by_key(|(message, _)| message.time);
+    let unsnapshotted_count = visible
+        .iter()
+        .filter(|(_, snapshot)| snapshot.is_none())
+        .count();
     let mut timeline_ms: u64 = 350;
-    for message in &visible {
-        if let Some(dialogue) = dialogue_from_message(message, manager, timeline_ms) {
+    for (message, snapshot) in &visible {
+        if let Some(dialogue) =
+            dialogue_from_message(message, manager, timeline_ms, snapshot.as_ref())
+        {
             timeline_ms = dialogue
                 .time_ms
                 .saturating_add(dialogue.duration_ms)
@@ -2130,10 +2283,10 @@ fn build_from_history(
             replay.dialogue.push(dialogue);
         }
     }
-    let ignored_count =
-        retain_dialogue_with_standees(&mut replay.dialogue, &speaker_positions);
-    spatially_order_dialogue_turns(&mut replay.dialogue, &speaker_positions);
-    replay.duration_ms = retime_dialogue_turns(&mut replay.dialogue);
+    assign_replay_line_ids(&mut replay.dialogue);
+    auto_group_replay_areas(&mut replay);
+    rebuild_area_blocks(&mut replay);
+    replay.duration_ms = compile_area_block_timeline(&mut replay);
     extend_replay_for_speech(&mut replay);
     if let Ok(transform) = camera.single() {
         let obstacles = ReplayCameraObstacles::from_scene(&replay.scene);
@@ -2152,7 +2305,7 @@ fn build_from_history(
     let dialogue_count = replay.dialogue.len();
     studio.replay = Some(replay);
     studio.status = format!(
-        "已生成 {dialogue_count} 个玩家回合；同轮按立牌距离就近切换，已忽略 {ignored_count} 句无场景立牌发言"
+        "已生成 {dialogue_count} 句区域回放台词；已排除 {unsnapshotted_count} 句没有历史回合位置的旧消息"
     );
 }
 
@@ -2161,6 +2314,7 @@ fn replay_director_key(replay: &ReplayFile) -> String {
         ReplayAudience::Public => "public".to_owned(),
         ReplayAudience::Party(id) => format!("party:{id}"),
         ReplayAudience::Player(id) => format!("player:{id}"),
+        ReplayAudience::All => "all".to_owned(),
         ReplayAudience::Gm => "gm".to_owned(),
     };
     format!(
@@ -2173,7 +2327,7 @@ fn replay_summary_block<'a>(
     replay: &ReplayFile,
     manager: &'a DeepseekManager,
 ) -> Option<&'a DeepseekSummaryBlock> {
-    let message_count = replay.dialogue.len();
+    let message_count = replay.dialogue.iter().filter(|line| line.included).count();
     manager
         .summaries
         .get(&replay_director_key(replay))?
@@ -2189,12 +2343,12 @@ fn queue_replay_director(
     custom_prompt: &str,
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
 ) -> Result<(), String> {
-    if replay.dialogue.is_empty() {
+    if !replay.dialogue.iter().any(|line| line.included) {
         return Err("回放中没有可整理的台词".to_owned());
     }
     let sender = sender.ok_or_else(|| "DeepSeek 连接尚未就绪，请稍后重试".to_owned())?;
     let summary_key = replay_director_key(replay);
-    let message_count = replay.dialogue.len();
+    let message_count = replay.dialogue.iter().filter(|line| line.included).count();
     if let Some(block) = replay_summary_block(replay, manager) {
         if block.pending {
             return Err("这版台词正在整理，请等待当前请求完成".to_owned());
@@ -2207,7 +2361,7 @@ fn queue_replay_director(
     let missing_standee_count = replay
         .dialogue
         .iter()
-        .filter(|line| !visible_standees.contains(&line.sender_id))
+        .filter(|line| line.included && !visible_standees.contains(&line.sender_id))
         .count();
     if missing_standee_count > 0 {
         return Err(format!(
@@ -2217,6 +2371,7 @@ fn queue_replay_director(
     let dialogue = replay
         .dialogue
         .iter()
+        .filter(|line| line.included)
         .enumerate()
         .map(|(index, line)| {
             serde_json::json!({
@@ -2298,12 +2453,13 @@ fn apply_ready_director_plan(
         .replay
         .as_mut()
         .ok_or_else(|| "回放在应用导演方案前已被移除".to_owned())?;
-    if plan.dialogue.len() != replay.dialogue.len() {
+    let playable_count = replay.dialogue.iter().filter(|line| line.included).count();
+    if plan.dialogue.len() != playable_count {
         studio.auto_export_after_director = false;
         return Err(format!(
             "方案包含 {} 句，但回放需要 {} 句",
             plan.dialogue.len(),
-            replay.dialogue.len()
+            playable_count
         ));
     }
     let mut cues = plan.dialogue;
@@ -2316,7 +2472,12 @@ fn apply_ready_director_plan(
         studio.auto_export_after_director = false;
         return Err("方案必须恰好包含每个原始台词 index，且不能重复".to_owned());
     }
-    for (line, cue) in replay.dialogue.iter_mut().zip(&cues) {
+    for (line, cue) in replay
+        .dialogue
+        .iter_mut()
+        .filter(|line| line.included)
+        .zip(&cues)
+    {
         let text = cue.text.trim();
         if text.is_empty() {
             studio.auto_export_after_director = false;
@@ -2347,19 +2508,7 @@ fn apply_ready_director_plan(
         });
         line.duration_ms = scaled_dialogue_duration_ms(text, replay.master_dialogue_duration);
     }
-    let mut timeline_ms = 350_u64;
-    for line in &mut replay.dialogue {
-        line.time_ms = timeline_ms;
-        timeline_ms = line
-            .time_ms
-            .saturating_add(line.duration_ms)
-            .saturating_add(HISTORY_DIALOGUE_GAP_MS);
-    }
-    replay.duration_ms = replay
-        .dialogue
-        .last()
-        .map(|line| line.time_ms.saturating_add(line.duration_ms))
-        .unwrap_or(5_000);
+    replay.duration_ms = compile_area_block_timeline(replay);
     extend_replay_for_speech(replay);
 
     let base = camera
@@ -2370,9 +2519,15 @@ fn apply_ready_director_plan(
         .ok_or_else(|| "找不到可用的导演基础镜头".to_owned())?;
     let speaker_positions = standee_positions(standees);
     let obstacles = ReplayCameraObstacles::from_scene(&replay.scene);
+    let playable = replay
+        .dialogue
+        .iter()
+        .filter(|line| line.included && line.time_ms != u64::MAX)
+        .cloned()
+        .collect::<Vec<_>>();
     replay.camera = director_camera_track(
         &base,
-        &replay.dialogue,
+        &playable,
         &cues,
         replay.duration_ms,
         &speaker_positions,
@@ -2381,7 +2536,7 @@ fn apply_ready_director_plan(
     studio.playback_ms = 0;
     studio.status = format!(
         "已应用 DeepSeek 导演方案：{} 句润色台词、{} 个镜头帧",
-        replay.dialogue.len(),
+        playable.len(),
         replay.camera.len()
     );
     Ok(true)
@@ -2424,6 +2579,8 @@ fn new_replay(
         scene,
         camera: Vec::new(),
         dialogue: Vec::new(),
+        area_blocks: Vec::new(),
+        area_radius_cells: default_area_radius_cells(),
         master_speech_speed: default_master_speech_speed(),
         master_dialogue_duration: default_master_dialogue_duration(),
         speaker_voice_settings: HashMap::new(),
@@ -2444,6 +2601,289 @@ fn start_playback(
     studio.playback_ms = 0;
     studio.mode = ReplayMode::Playing;
     studio.status = REPLAY_PLAYING_STATUS.to_owned();
+}
+
+fn replay_dialogue_editor(
+    ui: &mut egui::Ui,
+    studio: &mut ReplayStudio,
+    camera: &Query<&Transform, With<VoxelViewportCamera>>,
+) {
+    if studio.replay.is_none() || matches!(studio.mode, ReplayMode::Recording) {
+        return;
+    }
+
+    ui.separator();
+    ui.collapsing("区域与台词编辑", |ui| {
+        let mut changed = false;
+        let mut rebuild_blocks_requested = false;
+        let mut recluster_requested = false;
+        let mut block_move = None;
+        let mut block_split = None;
+        let mut block_merge = None;
+        let mut block_renames = Vec::new();
+        {
+            let replay = studio.replay.as_mut().expect("checked above");
+            let block_options = replay
+                .area_blocks
+                .iter()
+                .map(|block| (block.id, block.area.clone()))
+                .collect::<Vec<_>>();
+            let line_blocks = replay
+                .area_blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .line_ids
+                        .iter()
+                        .map(move |line_id| (*line_id, block.id))
+                })
+                .collect::<HashMap<_, _>>();
+            let mut line_reassignments = Vec::new();
+            ui.horizontal(|ui| {
+                ui.label("自动同区距离");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut replay.area_radius_cells)
+                            .range(1..=10_000)
+                            .suffix(" 格"),
+                    )
+                    .changed();
+                if ui.button("重新自动分区").clicked() {
+                    recluster_requested = true;
+                }
+                if ui.button("重建三回合区块").clicked() {
+                    rebuild_blocks_requested = true;
+                }
+            });
+            ui.small("按 XZ 水平距离自动分区；重新分区会覆盖区域名和手动区块顺序。");
+            ui.horizontal(|ui| {
+                if ui.button("全选").clicked() {
+                    for line in &mut replay.dialogue {
+                        line.included = true;
+                    }
+                    rebuild_blocks_requested = true;
+                    changed = true;
+                }
+                if ui.button("全部取消").clicked() {
+                    for line in &mut replay.dialogue {
+                        line.included = false;
+                    }
+                    rebuild_blocks_requested = true;
+                    changed = true;
+                }
+            });
+
+            egui::ScrollArea::vertical()
+                .id_salt("replay-dialogue-editor")
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for line in &mut replay.dialogue {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                changed |= ui.checkbox(&mut line.included, "使用").changed();
+                                ui.label(format!(
+                                    "{} · 原始时间 {} · ID {}",
+                                    line.name, line.source_time, line.line_id
+                                ));
+                            });
+                            let text_changed = ui
+                                .add(
+                                    egui::TextEdit::multiline(&mut line.text)
+                                        .desired_rows(2)
+                                        .desired_width(ui.available_width()),
+                                )
+                                .changed();
+                            if text_changed {
+                                line.speech_text = None;
+                                changed = true;
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("回合");
+                                changed |= ui
+                                    .add(egui::DragValue::new(&mut line.turn_index))
+                                    .changed();
+                                ui.label("区域");
+                                changed |= ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut line.area)
+                                            .desired_width(90.0),
+                                    )
+                                    .changed();
+                                for (axis, value) in ["X", "Y", "Z"]
+                                    .into_iter()
+                                    .zip(&mut line.position_cells)
+                                {
+                                    ui.label(axis);
+                                    changed |= ui.add(egui::DragValue::new(value)).changed();
+                                }
+                                if !block_options.is_empty() {
+                                    let mut selected_block =
+                                        line_blocks.get(&line.line_id).copied().unwrap_or_default();
+                                    egui::ComboBox::from_id_salt(("replay-line-block", line.line_id))
+                                        .selected_text(
+                                            block_options
+                                                .iter()
+                                                .find(|(id, _)| *id == selected_block)
+                                                .map(|(_, area)| area.as_str())
+                                                .unwrap_or("未分配"),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (block_id, area) in &block_options {
+                                                ui.selectable_value(
+                                                    &mut selected_block,
+                                                    *block_id,
+                                                    area,
+                                                );
+                                            }
+                                        });
+                                    if line_blocks.get(&line.line_id).copied()
+                                        != Some(selected_block)
+                                    {
+                                        line_reassignments
+                                            .push((line.line_id, selected_block));
+                                    }
+                                }
+                            });
+                        });
+                    }
+                });
+            for (line_id, target_block) in line_reassignments {
+                for block in &mut replay.area_blocks {
+                    block.line_ids.retain(|candidate| *candidate != line_id);
+                }
+                if let Some(block) = replay
+                    .area_blocks
+                    .iter_mut()
+                    .find(|block| block.id == target_block)
+                {
+                    block.line_ids.push(line_id);
+                    if let Some(line) = replay
+                        .dialogue
+                        .iter_mut()
+                        .find(|line| line.line_id == line_id)
+                    {
+                        line.area = block.area.clone();
+                    }
+                }
+                changed = true;
+            }
+
+            ui.label("播放区块（每块最多三个不同回合）");
+            for index in 0..replay.area_blocks.len() {
+                let block_count = replay.area_blocks.len();
+                let block = &mut replay.area_blocks[index];
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}.", index + 1));
+                    let area_changed = ui
+                        .add(egui::TextEdit::singleline(&mut block.area).desired_width(100.0))
+                        .changed();
+                    if area_changed {
+                        block_renames.push((block.id, block.area.clone()));
+                        changed = true;
+                    }
+                    ui.label(format!("{} 句", block.line_ids.len()));
+                    if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
+                        block_move = Some((index, index - 1));
+                    }
+                    if ui
+                        .add_enabled(
+                            index + 1 < block_count,
+                            egui::Button::new("↓"),
+                        )
+                        .clicked()
+                    {
+                        block_move = Some((index, index + 1));
+                    }
+                    if ui
+                        .add_enabled(block.line_ids.len() > 1, egui::Button::new("拆分"))
+                        .clicked()
+                    {
+                        block_split = Some(index);
+                    }
+                    if ui
+                        .add_enabled(index + 1 < block_count, egui::Button::new("与下块合并"))
+                        .clicked()
+                    {
+                        block_merge = Some(index);
+                    }
+                });
+            }
+            for (block_id, area) in block_renames {
+                if let Some(block) = replay.area_blocks.iter().find(|block| block.id == block_id) {
+                    let line_ids = block.line_ids.iter().copied().collect::<HashSet<_>>();
+                    for line in &mut replay.dialogue {
+                        if line_ids.contains(&line.line_id) {
+                            line.area = area.clone();
+                        }
+                    }
+                }
+            }
+            if let Some((from, to)) = block_move {
+                replay.area_blocks.swap(from, to);
+                changed = true;
+            }
+            if let Some(index) = block_split {
+                let split_at = replay.area_blocks[index].line_ids.len() / 2;
+                let line_ids = replay.area_blocks[index].line_ids.split_off(split_at);
+                let next_id = replay
+                    .area_blocks
+                    .iter()
+                    .map(|block| block.id)
+                    .max()
+                    .unwrap_or_default()
+                    .saturating_add(1);
+                let area = replay.area_blocks[index].area.clone();
+                replay.area_blocks.insert(
+                    index + 1,
+                    ReplayAreaBlock {
+                        id: next_id,
+                        area,
+                        line_ids,
+                    },
+                );
+                changed = true;
+            }
+            if let Some(index) = block_merge {
+                let next = replay.area_blocks.remove(index + 1);
+                replay.area_blocks[index].line_ids.extend(next.line_ids);
+                changed = true;
+            }
+            if recluster_requested {
+                auto_group_replay_areas(replay);
+                rebuild_blocks_requested = true;
+            }
+            if rebuild_blocks_requested {
+                rebuild_area_blocks(replay);
+            }
+            if changed || rebuild_blocks_requested {
+                replay.duration_ms = compile_area_block_timeline(replay);
+                extend_replay_for_speech(replay);
+                let playable = replay
+                    .dialogue
+                    .iter()
+                    .filter(|line| line.included && line.time_ms != u64::MAX)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Ok(base) = camera.single() {
+                    let positions = replay_speaker_positions(&playable);
+                    replay.camera = turn_based_camera_track(
+                        base,
+                        &playable,
+                        replay.duration_ms,
+                        &positions,
+                        &ReplayCameraObstacles::from_scene(&replay.scene),
+                    );
+                }
+            }
+        }
+        if changed || rebuild_blocks_requested {
+            studio.playback_ms = 0;
+            studio.director_response_hash = None;
+            studio.director_request_pending = false;
+            studio.auto_export_after_director = false;
+            studio.status = "已应用 DM 的台词、回合、位置、区域或区块编辑".to_owned();
+        }
+    });
 }
 
 fn stop_playback(studio: &mut ReplayStudio, grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>) {
@@ -2471,7 +2911,12 @@ fn start_video_export(
         studio.replay.as_ref().map(|replay| {
             (
                 replay.duration_ms,
-                replay.dialogue.clone(),
+                replay
+                    .dialogue
+                    .iter()
+                    .filter(|line| line.included)
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 replay.master_speech_speed,
                 replay.speaker_voice_settings.clone(),
             )
@@ -3073,7 +3518,10 @@ fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
     let mut segments = Vec::with_capacity(replay.dialogue.len());
     let mut updated_lines = Vec::with_capacity(replay.dialogue.len());
 
-    for line in &replay.dialogue {
+    for (index, line) in replay.dialogue.iter().enumerate() {
+        if !line.included || line.time_ms == u64::MAX {
+            continue;
+        }
         let settings = replay
             .speaker_voice_settings
             .get(&line.sender_id)
@@ -3094,7 +3542,7 @@ fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
             new_start,
             new_end,
         ));
-        updated_lines.push((new_start, new_duration));
+        updated_lines.push((index, new_start, new_duration));
         accumulated_extension =
             accumulated_extension.saturating_add(new_duration.saturating_sub(line.duration_ms));
     }
@@ -3103,9 +3551,9 @@ fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
         return false;
     }
 
-    for (line, (new_start, new_duration)) in replay.dialogue.iter_mut().zip(updated_lines) {
-        line.time_ms = new_start;
-        line.duration_ms = new_duration;
+    for (index, new_start, new_duration) in updated_lines {
+        replay.dialogue[index].time_ms = new_start;
+        replay.dialogue[index].duration_ms = new_duration;
     }
     for frame in &mut replay.camera {
         frame.time_ms = stretched_replay_time(frame.time_ms, &segments);
@@ -3517,6 +3965,213 @@ fn retime_dialogue_turns(dialogue: &mut [ReplayDialogue]) -> u64 {
         .max(5_000)
 }
 
+fn assign_replay_line_ids(dialogue: &mut [ReplayDialogue]) {
+    let mut next_id = dialogue
+        .iter()
+        .map(|line| line.line_id)
+        .max()
+        .unwrap_or_default()
+        .saturating_add(1)
+        .max(1);
+    let mut seen = HashSet::new();
+    for line in dialogue {
+        if line.line_id == 0 || !seen.insert(line.line_id) {
+            line.line_id = next_id;
+            seen.insert(next_id);
+            next_id = next_id.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReplayStandeePlaybackState {
+    active: bool,
+    original_positions: HashMap<u64, Vec3>,
+}
+
+fn apply_replay_standee_positions(
+    studio: Res<ReplayStudio>,
+    mut standees: Query<
+        (&mut Transform, &VoxelPlayerStandee),
+        (With<VoxelPlayerStandee>, Without<VoxelViewportCamera>),
+    >,
+    mut state: Local<ReplayStandeePlaybackState>,
+) {
+    let active = matches!(studio.mode, ReplayMode::Playing | ReplayMode::Paused)
+        || studio.video_render.is_some();
+    if active && !state.active {
+        state.original_positions = standees
+            .iter()
+            .map(|(transform, standee)| (standee.user_id, transform.translation))
+            .collect();
+    }
+
+    if active {
+        if let Some(replay) = studio.replay.as_ref() {
+            let positions = replay
+                .dialogue
+                .iter()
+                .filter(|line| {
+                    line.included
+                        && line.snapshot_recorded
+                        && line.time_ms <= studio.playback_ms
+                })
+                .fold(HashMap::new(), |mut positions, line| {
+                    positions.insert(
+                        line.sender_id,
+                        IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE,
+                    );
+                    positions
+                });
+            for (mut transform, standee) in &mut standees {
+                if let Some(position) = positions.get(&standee.user_id) {
+                    transform.translation = *position;
+                }
+            }
+        }
+    } else if state.active {
+        for (mut transform, standee) in &mut standees {
+            if let Some(position) = state.original_positions.get(&standee.user_id) {
+                transform.translation = *position;
+            }
+        }
+        state.original_positions.clear();
+    }
+    state.active = active;
+}
+
+fn auto_group_replay_areas(replay: &mut ReplayFile) {
+    let radius_squared = replay.area_radius_cells.max(1).pow(2) as i64;
+    let mut remaining = replay
+        .dialogue
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.included && line.snapshot_recorded)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    remaining.sort_by_key(|index| {
+        let line = &replay.dialogue[*index];
+        (line.source_time, line.line_id)
+    });
+
+    let mut area_number = 1_u32;
+    while let Some(seed) = remaining.first().copied() {
+        remaining.remove(0);
+        let mut component = vec![seed];
+        let mut cursor = 0;
+        while cursor < component.len() {
+            let origin = replay.dialogue[component[cursor]].position_cells;
+            let mut index = 0;
+            while index < remaining.len() {
+                let candidate = replay.dialogue[remaining[index]].position_cells;
+                let dx = i64::from(origin[0]) - i64::from(candidate[0]);
+                let dz = i64::from(origin[2]) - i64::from(candidate[2]);
+                if dx * dx + dz * dz <= radius_squared {
+                    component.push(remaining.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            cursor += 1;
+        }
+        let area = format!("区域 {area_number}");
+        for index in component {
+            replay.dialogue[index].area = area.clone();
+        }
+        area_number = area_number.saturating_add(1);
+    }
+}
+
+fn rebuild_area_blocks(replay: &mut ReplayFile) {
+    let mut areas = HashMap::<String, Vec<&ReplayDialogue>>::new();
+    for line in replay
+        .dialogue
+        .iter()
+        .filter(|line| line.included && line.snapshot_recorded)
+    {
+        areas.entry(line.area.clone()).or_default().push(line);
+    }
+    let mut areas = areas.into_iter().collect::<Vec<_>>();
+    areas.sort_by_key(|(area, lines)| {
+        (
+            lines
+                .iter()
+                .map(|line| line.source_time)
+                .min()
+                .unwrap_or(u64::MAX),
+            area.clone(),
+        )
+    });
+
+    let mut blocks = Vec::new();
+    let mut next_block_id = 1_u64;
+    for (area, mut lines) in areas {
+        lines.sort_by_key(|line| (line.turn_index, line.source_time, line.line_id));
+        let mut current_turns = HashSet::new();
+        let mut current_ids = Vec::new();
+        for line in lines {
+            if !current_turns.contains(&line.turn_index)
+                && current_turns.len() >= AREA_BLOCK_TURN_LIMIT
+            {
+                blocks.push(ReplayAreaBlock {
+                    id: next_block_id,
+                    area: area.clone(),
+                    line_ids: std::mem::take(&mut current_ids),
+                });
+                next_block_id = next_block_id.saturating_add(1);
+                current_turns.clear();
+            }
+            current_turns.insert(line.turn_index);
+            current_ids.push(line.line_id);
+        }
+        if !current_ids.is_empty() {
+            blocks.push(ReplayAreaBlock {
+                id: next_block_id,
+                area,
+                line_ids: current_ids,
+            });
+            next_block_id = next_block_id.saturating_add(1);
+        }
+    }
+    replay.area_blocks = blocks;
+}
+
+fn compile_area_block_timeline(replay: &mut ReplayFile) -> u64 {
+    let order = replay
+        .area_blocks
+        .iter()
+        .flat_map(|block| block.line_ids.iter().copied())
+        .enumerate()
+        .map(|(index, line_id)| (line_id, index))
+        .collect::<HashMap<_, _>>();
+    replay.dialogue.sort_by_key(|line| {
+        (
+            !line.included,
+            order.get(&line.line_id).copied().unwrap_or(usize::MAX),
+            line.source_time,
+            line.line_id,
+        )
+    });
+
+    let mut timeline_ms = 350_u64;
+    for line in &mut replay.dialogue {
+        if !line.included || !order.contains_key(&line.line_id) {
+            line.time_ms = u64::MAX;
+            continue;
+        }
+        line.duration_ms =
+            scaled_dialogue_duration_ms(&line.text, replay.master_dialogue_duration);
+        line.time_ms = timeline_ms;
+        timeline_ms = line
+            .time_ms
+            .saturating_add(line.duration_ms)
+            .saturating_add(HISTORY_DIALOGUE_GAP_MS);
+    }
+    timeline_ms
+        .saturating_sub(HISTORY_DIALOGUE_GAP_MS)
+        .max(5_000)
+}
+
 fn standee_positions(
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
 ) -> HashMap<u64, Vec3> {
@@ -3524,6 +4179,28 @@ fn standee_positions(
         .iter()
         .map(|(transform, standee)| (standee.user_id, transform.translation))
         .collect()
+}
+
+fn replay_speaker_positions(dialogue: &[ReplayDialogue]) -> HashMap<u64, Vec3> {
+    dialogue
+        .iter()
+        .filter(|line| line.snapshot_recorded)
+        .map(|line| {
+            (
+                line.sender_id,
+                IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE,
+            )
+        })
+        .collect()
+}
+
+fn replay_dialogue_position(
+    line: &ReplayDialogue,
+    speaker_positions: &HashMap<u64, Vec3>,
+) -> Option<Vec3> {
+    line.snapshot_recorded
+        .then(|| IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE)
+        .or_else(|| speaker_positions.get(&line.sender_id).copied())
 }
 
 fn turn_based_camera_track(
@@ -3537,10 +4214,10 @@ fn turn_based_camera_track(
     let mut frames = Vec::with_capacity(dialogue.len().saturating_mul(3).saturating_add(2));
     let mut current = dialogue
         .first()
-        .and_then(|line| speaker_positions.get(&line.sender_id))
+        .and_then(|line| replay_dialogue_position(line, speaker_positions))
         .map(|target| {
             rig.speaker_shot(
-                *target,
+                target,
                 DirectorShot::SpeakerMedium,
                 0.0,
                 obstacles,
@@ -3550,9 +4227,9 @@ fn turn_based_camera_track(
     frames.push(camera_keyframe(0, &current));
     for line in dialogue {
         let line_end = line.time_ms.saturating_add(line.duration_ms);
-        if let Some(target) = speaker_positions.get(&line.sender_id) {
+        if let Some(target) = replay_dialogue_position(line, speaker_positions) {
             let focused = rig.speaker_shot(
-                *target,
+                target,
                 DirectorShot::SpeakerMedium,
                 0.0,
                 obstacles,
@@ -3598,9 +4275,9 @@ fn director_camera_track(
     let rig = DirectedCameraRig::for_dialogue(base, dialogue, speaker_positions);
     let mut current = base.clone();
     if let (Some(line), Some(cue)) = (dialogue.first(), cues.first()) {
-        if let Some(target) = speaker_positions.get(&line.sender_id) {
+        if let Some(target) = replay_dialogue_position(line, speaker_positions) {
             current = rig.director_shot(
-                *target,
+                target,
                 resolved_speaker_shot(cue.shot),
                 cue.motion,
                 0.0,
@@ -3611,19 +4288,21 @@ fn director_camera_track(
     let mut frames = vec![camera_keyframe(0, &current)];
     for (line, cue) in dialogue.iter().zip(cues) {
         let line_end = line.time_ms.saturating_add(line.duration_ms);
-        let (arrival, settled) = if let Some(target) = speaker_positions.get(&line.sender_id) {
+        let (arrival, settled) = if let Some(target) =
+            replay_dialogue_position(line, speaker_positions)
+        {
             let speaker_shot = resolved_speaker_shot(cue.shot);
             let desired_arrival =
-                rig.director_shot(*target, speaker_shot, cue.motion, 0.0, obstacles);
+                rig.director_shot(target, speaker_shot, cue.motion, 0.0, obstacles);
             let arrival = desired_arrival;
             let desired_settled =
-                rig.director_shot(*target, speaker_shot, cue.motion, 1.0, obstacles);
+                rig.director_shot(target, speaker_shot, cue.motion, 1.0, obstacles);
             let settle_limit = (line.duration_ms as f32 / 1_000.0 * 0.12).clamp(0.2, 0.65);
             let settled = limit_camera_travel_toward(
                 &arrival,
                 &desired_settled,
                 settle_limit,
-                *target,
+                target,
             );
             (arrival, settled)
         } else {
@@ -3754,13 +4433,10 @@ impl DirectedCameraRig {
     ) -> Self {
         let first = dialogue
             .iter()
-            .find_map(|line| speaker_positions.get(&line.sender_id).copied());
+            .find_map(|line| replay_dialogue_position(line, speaker_positions));
         let second = first.and_then(|first_position| {
             dialogue.iter().find_map(|line| {
-                speaker_positions
-                    .get(&line.sender_id)
-                    .copied()
-                    .filter(|position| {
+                replay_dialogue_position(line, speaker_positions).filter(|position| {
                         horizontal(*position - first_position).length_squared() > 0.01
                     })
             })
@@ -3944,8 +4620,10 @@ fn dialogue_from_message(
     message: &CampaignMessage,
     manager: &NapcatMessageManager,
     time_ms: u64,
+    snapshot: Option<&ReplayMessageSnapshot>,
 ) -> Option<ReplayDialogue> {
     let text = message.text.trim();
+    let snapshot = snapshot?;
     if text.is_empty() {
         return None;
     }
@@ -3978,6 +4656,13 @@ fn dialogue_from_message(
         avatar_data_url: None,
         visibility: message.visibility.clone(),
         side,
+        line_id: 0,
+        source_time: message.time,
+        turn_index: snapshot.turn_index,
+        position_cells: snapshot.position_cells,
+        area: String::new(),
+        included: true,
+        snapshot_recorded: true,
     })
 }
 
@@ -4574,12 +5259,36 @@ fn export_replay(replay: &ReplayFile, path: &str) -> Result<(), String> {
 fn import_replay(path: &str) -> Result<ReplayFile, String> {
     let path = normalized_path(path)?;
     let bytes = fs::read(path).map_err(|err| err.to_string())?;
-    let replay: ReplayFile = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
-    if replay.format_version != REPLAY_FORMAT_VERSION {
+    let mut replay: ReplayFile = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
+    if !matches!(
+        replay.format_version,
+        LEGACY_REPLAY_FORMAT_VERSION | REPLAY_FORMAT_VERSION
+    ) {
         return Err(format!(
-            "不支持的回放版本 {}（当前支持 {}）",
-            replay.format_version, REPLAY_FORMAT_VERSION
+            "不支持的回放版本 {}（当前支持 {} 和 {}）",
+            replay.format_version, LEGACY_REPLAY_FORMAT_VERSION, REPLAY_FORMAT_VERSION
         ));
+    }
+    if replay.audience == ReplayAudience::Gm {
+        replay.audience = ReplayAudience::All;
+    }
+    assign_replay_line_ids(&mut replay.dialogue);
+    if replay.format_version == LEGACY_REPLAY_FORMAT_VERSION {
+        for line in &mut replay.dialogue {
+            line.area = "旧时间线".to_owned();
+            line.included = true;
+            line.snapshot_recorded = false;
+        }
+        replay.area_blocks = if replay.dialogue.is_empty() {
+            Vec::new()
+        } else {
+            vec![ReplayAreaBlock {
+                id: 1,
+                area: "旧时间线".to_owned(),
+                line_ids: replay.dialogue.iter().map(|line| line.line_id).collect(),
+            }]
+        };
+        replay.format_version = REPLAY_FORMAT_VERSION;
     }
     Ok(replay)
 }
@@ -4679,6 +5388,119 @@ mod tests {
         assert!(!player.can_read_visibility(&Visibility::Player(8), Some(&access)));
         assert!(ReplayAudience::Gm.can_read_visibility(&Visibility::Gm, None));
         assert!(ReplayAudience::Gm.can_read_visibility(&Visibility::System, None));
+    }
+
+    #[test]
+    fn all_replay_includes_every_visibility_scope() {
+        for visibility in [
+            Visibility::Public,
+            Visibility::Party("split-a".to_owned()),
+            Visibility::Player(7),
+            Visibility::Gm,
+            Visibility::System,
+        ] {
+            assert!(ReplayAudience::All.can_read_visibility(&visibility, None));
+        }
+    }
+
+    #[test]
+    fn automatic_areas_use_horizontal_voxel_distance() {
+        let mut lines = vec![
+            positioned_dialogue(1, 1, 1_200, [0, 100, 0]),
+            positioned_dialogue(2, 1, 1_208, [12, -100, 0]),
+            positioned_dialogue(3, 1, 1_205, [30, 0, 0]),
+        ];
+        assign_replay_line_ids(&mut lines);
+        let mut replay = test_replay(lines);
+
+        auto_group_replay_areas(&mut replay);
+
+        assert_eq!(replay.dialogue[0].area, replay.dialogue[1].area);
+        assert_ne!(replay.dialogue[0].area, replay.dialogue[2].area);
+    }
+
+    #[test]
+    fn camera_uses_the_position_saved_on_each_line() {
+        let mut line = positioned_dialogue(1, 1, 1_200, [40, 4, -12]);
+        line.time_ms = 350;
+        line.duration_ms = 600;
+        let saved_position = IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE;
+        let frames = turn_based_camera_track(
+            &Transform::from_xyz(0.0, 3.0, 4.0),
+            &[line],
+            1_000,
+            &HashMap::from([(1, Vec3::new(-100.0, 0.0, 0.0))]),
+            &ReplayCameraObstacles::default(),
+        );
+        let shot = frame_transform(
+            frames
+                .iter()
+                .find(|frame| frame.time_ms == 350)
+                .unwrap(),
+        );
+        let forward = shot.rotation * Vec3::NEG_Z;
+        assert!(
+            forward.dot((saved_position - shot.translation).normalize()) > 0.99,
+            "camera must ignore the speaker's current standee position"
+        );
+    }
+
+    #[test]
+    fn area_blocks_cap_distinct_turns_at_three() {
+        let mut lines = (1..=4)
+            .map(|turn| {
+                let mut line = positioned_dialogue(turn as u64, 1, turn as u64, [0, 0, 0]);
+                line.turn_index = turn;
+                line.area = "area1".to_owned();
+                line
+            })
+            .collect::<Vec<_>>();
+        assign_replay_line_ids(&mut lines);
+        let mut replay = test_replay(lines);
+
+        rebuild_area_blocks(&mut replay);
+
+        assert_eq!(replay.area_blocks.len(), 2);
+        assert_eq!(replay.area_blocks[0].line_ids.len(), 3);
+        assert_eq!(replay.area_blocks[1].line_ids.len(), 1);
+    }
+
+    #[test]
+    fn dm_area_block_order_overrides_global_timestamps() {
+        let mut lines = vec![
+            positioned_dialogue(1, 1, 1_200, [0, 0, 0]),
+            positioned_dialogue(2, 2, 1_208, [1, 0, 0]),
+            positioned_dialogue(3, 1, 1_205, [30, 0, 0]),
+            positioned_dialogue(4, 2, 1_210, [30, 0, 0]),
+        ];
+        lines[0].area = "area1".to_owned();
+        lines[1].area = "area1".to_owned();
+        lines[2].area = "area2".to_owned();
+        lines[3].area = "area2".to_owned();
+        let mut replay = test_replay(lines);
+        replay.area_blocks = vec![
+            ReplayAreaBlock {
+                id: 1,
+                area: "area1".to_owned(),
+                line_ids: vec![1, 2],
+            },
+            ReplayAreaBlock {
+                id: 2,
+                area: "area2".to_owned(),
+                line_ids: vec![3, 4],
+            },
+        ];
+
+        replay.duration_ms = compile_area_block_timeline(&mut replay);
+
+        assert_eq!(
+            replay
+                .dialogue
+                .iter()
+                .map(|line| line.source_time)
+                .collect::<Vec<_>>(),
+            vec![1_200, 1_208, 1_205, 1_210]
+        );
     }
 
     #[test]
@@ -5233,7 +6055,6 @@ mod tests {
             &studio, &speech, 0, true
         ));
     }
-
     #[test]
     fn director_export_is_available_during_preview_and_reuses_an_applied_plan() {
         let mut studio = ReplayStudio::default();
@@ -5479,6 +6300,47 @@ mod tests {
             avatar_data_url: None,
             visibility: Visibility::Public,
             side,
+            line_id: 0,
+            source_time: time_ms,
+            turn_index: 0,
+            position_cells: [0, 0, 0],
+            area: String::new(),
+            included: true,
+            snapshot_recorded: false,
+        }
+    }
+
+    fn positioned_dialogue(
+        line_id: u64,
+        turn_index: u32,
+        source_time: u64,
+        position_cells: [i32; 3],
+    ) -> ReplayDialogue {
+        let mut line = test_dialogue(source_time, 600, DialogueSide::Right);
+        line.line_id = line_id;
+        line.turn_index = turn_index;
+        line.source_time = source_time;
+        line.position_cells = position_cells;
+        line.snapshot_recorded = true;
+        line
+    }
+
+    fn test_replay(dialogue: Vec<ReplayDialogue>) -> ReplayFile {
+        ReplayFile {
+            format_version: REPLAY_FORMAT_VERSION,
+            title: "test".to_owned(),
+            campaign_id: "campaign".to_owned(),
+            created_at_unix_ms: 1,
+            duration_ms: 0,
+            audience: ReplayAudience::Public,
+            scene: ReplayScene::default(),
+            camera: Vec::new(),
+            dialogue,
+            area_blocks: Vec::new(),
+            area_radius_cells: DEFAULT_AREA_RADIUS_CELLS,
+            master_speech_speed: default_master_speech_speed(),
+            master_dialogue_duration: default_master_dialogue_duration(),
+            speaker_voice_settings: HashMap::new(),
         }
     }
 }
