@@ -12550,11 +12550,14 @@ fn trpg_group_settings_window(
                                 } else {
                                     ui.label("小队管理");
                                     for party_name in &party_names {
-                                        let members = snapshot
+                                        let party_snapshot = snapshot
                                             .parties
-                                            .get(party_name)
+                                            .get(party_name);
+                                        let members = party_snapshot
                                             .map(|party| party.players.clone())
                                             .unwrap_or_default();
+                                        let mut anonymous = party_snapshot
+                                            .is_some_and(|party| party.anonymous);
                                         let member_label =
                                             if members.is_empty() {
                                                 "无成员".to_owned()
@@ -12593,6 +12596,24 @@ fn trpg_group_settings_window(
                                         ui.horizontal_wrapped(|ui| {
                                             ui.strong(party_name);
                                             ui.small(format!("成员：{member_label}"));
+                                            if ui
+                                                .checkbox(&mut anonymous, "匿名频道")
+                                                .on_hover_text(
+                                                    "玩家无法查询成员；转发内容不显示频道和发送者",
+                                                )
+                                                .changed()
+                                            {
+                                                if let Some(party) = manager
+                                                    .trpg_groups
+                                                    .get_mut(&group_name)
+                                                    .and_then(|group| {
+                                                        group.parties.get_mut(party_name)
+                                                    })
+                                                {
+                                                    party.anonymous = anonymous;
+                                                    changed = true;
+                                                }
+                                            }
                                             if merge_options.is_empty() {
                                                 ui.add_enabled(
                                                     false,

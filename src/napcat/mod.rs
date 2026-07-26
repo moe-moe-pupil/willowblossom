@@ -1396,10 +1396,16 @@ pub struct TrpgParty {
     pub name: String,
     #[serde(default)]
     pub players: Vec<String>,
+    #[serde(default)]
+    pub anonymous: bool,
 }
 
 impl PartialEq for TrpgParty {
-    fn eq(&self, other: &Self) -> bool { self.name == other.name && self.players == other.players }
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.players == other.players
+            && self.anonymous == other.anonymous
+    }
 }
 
 impl Eq for TrpgParty {}
@@ -1953,6 +1959,7 @@ impl TrpgGroup {
         self.parties.insert(party_id.to_owned(), TrpgParty {
             name: party_id.to_owned(),
             players: Vec::new(),
+            anonymous: false,
         });
         true
     }
@@ -2034,6 +2041,7 @@ impl TrpgGroup {
                 .or_insert_with(|| TrpgParty {
                     name: party_id.to_owned(),
                     players: Vec::new(),
+                    anonymous: false,
                 });
             self.player_parties.insert(
                 target_id.to_owned(),
@@ -2368,7 +2376,11 @@ impl TrpgGroup {
             return false;
         };
         let party_name = legacy_party_name(&team.name, &team.id, "旧频道");
-        self.promote_legacy_members_to_party(&party_name, &team.players)
+        self.promote_legacy_members_to_party(
+            &party_name,
+            &team.players,
+            team.anonymous_speakers,
+        )
     }
 
     pub fn promote_legacy_chat_area_to_party(&mut self, area_id: &str) -> bool {
@@ -2376,10 +2388,15 @@ impl TrpgGroup {
             return false;
         };
         let party_name = legacy_party_name(&area.name, &area.id, "虚拟讨论组");
-        self.promote_legacy_members_to_party(&party_name, &area.members)
+        self.promote_legacy_members_to_party(&party_name, &area.members, false)
     }
 
-    fn promote_legacy_members_to_party(&mut self, party_name: &str, members: &[String]) -> bool {
+    fn promote_legacy_members_to_party(
+        &mut self,
+        party_name: &str,
+        members: &[String],
+        anonymous: bool,
+    ) -> bool {
         let party_name = party_name.trim();
         if party_name.is_empty() {
             return false;
@@ -2405,7 +2422,14 @@ impl TrpgGroup {
             .or_insert_with(|| TrpgParty {
                 name: party_name.to_owned(),
                 players: Vec::new(),
+                anonymous,
             });
+        if anonymous {
+            self.parties
+                .get_mut(party_name)
+                .expect("promoted party should exist")
+                .anonymous = true;
+        }
 
         for member_id in members {
             for party in self.parties.values_mut() {
@@ -7034,6 +7058,14 @@ fn format_private_channel_members(manager: &NapcatMessageManager, target_id: &st
         .parse::<u64>()
         .map(|player_id| group.player_access(player_id))
         .unwrap_or_default();
+    if access
+        .party_id
+        .as_deref()
+        .and_then(|party_id| group.parties.get(party_id))
+        .is_some_and(|party| party.anonymous)
+    {
+        return "当前频道：匿名频道\n成员：不可查看".to_owned();
+    }
     let scope_name = access
         .party_id
         .as_deref()
@@ -8205,22 +8237,23 @@ fn party_channel_auto_forward_request(
         return None;
     }
 
-    let party_name = if party.name.trim().is_empty() {
-        party_id
+    let forwarded_text = if party.anonymous {
+        text
     } else {
-        party.name.trim()
-    };
-    let channel_name = if party_name.ends_with("频道") {
-        party_name.to_owned()
-    } else {
-        format!("{party_name}频道")
+        let party_name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
+        let channel_name = if party_name.ends_with("频道") {
+            party_name.to_owned()
+        } else {
+            format!("{party_name}频道")
+        };
+        format!(
+            "【{}】{}: {}",
+            channel_name, message.data.sender.nickname, text
+        )
     };
     Some(AutoForwardRequest {
         recipients,
-        text: format!(
-            "【{}】{}: {}",
-            channel_name, message.data.sender.nickname, text
-        ),
+        text: forwarded_text,
     })
 }
 
@@ -8638,6 +8671,7 @@ mod tests {
                 id: "1".to_owned(),
                 name: "红队频道".to_owned(),
                 players: vec!["10002".to_owned(), "10003".to_owned(), "99999".to_owned()],
+                anonymous_speakers: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -8663,6 +8697,7 @@ mod tests {
             "10002".to_owned(),
             "10003".to_owned()
         ]);
+        assert!(group.parties["红队频道"].anonymous);
         assert!(
             group.player_access(10002).can_read(&Visibility::Party(
                 "红队频道".to_owned()
@@ -11064,10 +11099,12 @@ mod tests {
                 ("red".to_owned(), TrpgParty {
                     name: "red".to_owned(),
                     players: vec!["2".to_owned(), "3".to_owned()],
+                    anonymous: false,
                 }),
                 ("blue".to_owned(), TrpgParty {
                     name: "blue".to_owned(),
                     players: vec!["4".to_owned()],
+                    anonymous: false,
                 }),
             ]),
             player_parties: HashMap::from([
@@ -11548,6 +11585,26 @@ mod tests {
         assert!(response.contains("晨星"));
         assert!(response.contains("白露"));
         assert!(!response.contains("夜航"));
+
+        manager
+            .trpg_groups
+            .get_mut("table")
+            .unwrap()
+            .parties
+            .get_mut("red")
+            .unwrap()
+            .anonymous = true;
+        let anonymous_response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".频道人员"),
+            "2",
+        )
+        .unwrap();
+
+        assert_eq!(
+            anonymous_response,
+            "当前频道：匿名频道\n成员：不可查看"
+        );
     }
 
     #[test]
@@ -11929,7 +11986,28 @@ mod tests {
         assert_eq!(request.recipients, vec![3]);
         assert!(!request.recipients.contains(&4));
         assert!(!request.recipients.contains(&5));
-        assert_eq!(request.text, "【人类频道】user-2: red-only clue");
+        assert_eq!(
+            request.text,
+            "【人类频道】user-2: red-only clue"
+        );
+
+        manager
+            .trpg_groups
+            .get_mut("table")
+            .unwrap()
+            .parties
+            .get_mut("red")
+            .unwrap()
+            .anonymous = true;
+        let anonymous_request = party_channel_auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "[anonymous clue]"),
+            "2",
+        )
+        .expect("anonymous same-party recipient should be available");
+
+        assert_eq!(anonymous_request.recipients, vec![3]);
+        assert_eq!(anonymous_request.text, "anonymous clue");
     }
 
     #[test]
