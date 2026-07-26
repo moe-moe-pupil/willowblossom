@@ -8481,6 +8481,9 @@ fn auto_forward_request(
     {
         return None;
     }
+    if !auto_forward_sender_is_alive(manager, target_id) {
+        return None;
+    }
 
     let text = quoted_auto_forward_text(message)?;
     let sender_access = auto_forward_sender_access(manager, target_id);
@@ -8541,6 +8544,9 @@ fn party_channel_auto_forward_request(
         NapcatMessageType::Private
     ) || message.data.user_id == message.data.self_id
     {
+        return None;
+    }
+    if !auto_forward_sender_is_alive(manager, target_id) {
         return None;
     }
 
@@ -8626,6 +8632,13 @@ fn auto_forward_sender_access<'a>(
     let group = manager.group_for_player_target(target_id)?;
     let player_id = target_id.parse::<u64>().ok()?;
     Some((group, group.player_access(player_id)))
+}
+
+fn auto_forward_sender_is_alive(manager: &NapcatMessageManager, target_id: &str) -> bool {
+    manager
+        .player_characters
+        .get(target_id)
+        .is_none_or(|character| character.hp > 0.0)
 }
 
 fn auto_forward_recipient_allowed(
@@ -12636,6 +12649,46 @@ mod tests {
         assert!(party_channel_auto_forward_request(
             &manager,
             &test_private_message_from(2, "[public message]"),
+            "2",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn defeated_character_cannot_auto_forward_messages() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message_from(user_id, "hello"),
+            ]);
+        }
+        manager.groups.insert("讨论组".to_owned(), ChatGroup {
+            members: vec!["2".to_owned(), "3".to_owned()],
+        });
+        let mut defeated = completed_character("阵亡者");
+        defeated.hp = 0.0;
+        manager.player_characters.insert("2".to_owned(), defeated);
+
+        assert!(auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "\"last words\""),
+            "2",
+        )
+        .is_none());
+
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("dead-space");
+        group.set_player_party("2", Some("dead-space"));
+        group.set_player_party("3", Some("dead-space"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        assert!(party_channel_auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "[last words]"),
             "2",
         )
         .is_none());
