@@ -1953,16 +1953,78 @@ fn chat_window(
 
         for (k, rect) in group_rects {
             if rect.contains(drop_pos) {
-                let Some(members) = manager.groups.get_mut(k).map(|group| &mut group.members)
-                else {
-                    continue;
-                };
-                if !members.contains(&target_id.to_owned()) {
-                    members.push(target_id.to_string());
+                if dock_chat_target_into_group(manager, k, target_id) {
                     manager.persist().ok();
                 }
+                break;
             }
         }
+    }
+}
+
+fn dock_chat_target_into_group(
+    manager: &mut NapcatMessageManager,
+    group_name: &str,
+    target_id: &str,
+) -> bool {
+    let Some(group) = manager.groups.get_mut(group_name) else {
+        return false;
+    };
+
+    dock_chat_target_state(group, &mut manager.open_chat_targets, target_id)
+}
+
+fn dock_chat_target_state(
+    group: &mut ChatGroup,
+    open_chat_targets: &mut HashSet<String>,
+    target_id: &str,
+) -> bool {
+    let mut changed = false;
+    if !group.members.iter().any(|member_id| member_id == target_id) {
+        group.members.push(target_id.to_owned());
+        changed = true;
+    }
+
+    // A docked chat is rendered as a child only when it is no longer also
+    // registered as a standalone window.
+    changed |= open_chat_targets.remove(target_id);
+    changed
+}
+
+#[cfg(test)]
+mod chat_group_docking_tests {
+    use super::*;
+
+    #[test]
+    fn docking_closes_standalone_window_and_adds_member() {
+        let mut group = ChatGroup {
+            members: Vec::new(),
+        };
+        let mut open_chat_targets = HashSet::from(["12345".to_owned()]);
+
+        assert!(dock_chat_target_state(
+            &mut group,
+            &mut open_chat_targets,
+            "12345"
+        ));
+        assert_eq!(group.members, vec!["12345".to_owned()]);
+        assert!(!open_chat_targets.contains("12345"));
+    }
+
+    #[test]
+    fn docking_repairs_already_grouped_chat_left_standalone() {
+        let mut group = ChatGroup {
+            members: vec!["12345".to_owned()],
+        };
+        let mut open_chat_targets = HashSet::from(["12345".to_owned()]);
+
+        assert!(dock_chat_target_state(
+            &mut group,
+            &mut open_chat_targets,
+            "12345"
+        ));
+        assert_eq!(group.members, vec!["12345".to_owned()]);
+        assert!(!open_chat_targets.contains("12345"));
     }
 }
 
