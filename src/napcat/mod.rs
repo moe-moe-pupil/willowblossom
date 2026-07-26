@@ -7074,7 +7074,7 @@ fn format_private_channel_members(manager: &NapcatMessageManager, target_id: &st
     let names = group
         .players
         .iter()
-        .filter(|member_id| visible_channel_member(group, &access, member_id))
+        .filter(|member_id| same_channel_member(group, &access, member_id))
         .map(|member_id| private_target_display_name(manager, member_id))
         .collect::<Vec<_>>();
     if names.is_empty() {
@@ -7102,6 +7102,10 @@ fn format_private_group_guide(manager: &NapcatMessageManager, target_id: &str) -
     } else {
         format!("团内引导：\n{guide}")
     }
+}
+
+fn same_channel_member(group: &TrpgGroup, access: &PlayerAccess, target_id: &str) -> bool {
+    group.party_id_for_player(target_id) == access.party_id.as_deref()
 }
 
 fn visible_channel_member(group: &TrpgGroup, access: &PlayerAccess, target_id: &str) -> bool {
@@ -11605,6 +11609,48 @@ mod tests {
             anonymous_response,
             "当前频道：匿名频道\n成员：不可查看"
         );
+    }
+
+    #[test]
+    fn private_channel_members_command_keeps_gm_in_assigned_party() {
+        let mut manager = empty_manager();
+        for (target_id, nickname) in [("2", "晨星"), ("3", "白露"), ("4", "夜航"), ("5", "远山")]
+        {
+            manager.player_characters.insert(
+                target_id.to_owned(),
+                completed_character(nickname),
+            );
+        }
+        let mut group = TrpgGroup {
+            players: vec![
+                "2".to_owned(),
+                "3".to_owned(),
+                "4".to_owned(),
+                "5".to_owned(),
+            ],
+            gm_users: HashSet::from([2]),
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("red"));
+        group.set_player_party("4", Some("blue"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".频道人员"),
+            "2",
+        )
+        .unwrap();
+
+        assert!(response.contains("小队「red」"));
+        assert!(response.contains("晨星"));
+        assert!(response.contains("白露"));
+        assert!(!response.contains("夜航"));
+        assert!(!response.contains("远山"));
     }
 
     #[test]
