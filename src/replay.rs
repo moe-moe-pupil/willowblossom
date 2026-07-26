@@ -126,7 +126,7 @@ const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
 const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
 const REPLAY_PLAYING_STATUS: &str = "正在回放；停止后会恢复当前体素场景";
 const REPLAY_SPEECH_PREPARING_STATUS: &str = "正在准备当前台词语音；语音就绪后字幕与声音会同时开始";
-const DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 3.0;
+const DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 1.5;
 
 pub struct ReplayPlugin;
 
@@ -178,6 +178,17 @@ struct ReplaySnapshotTracker {
 
 pub(crate) fn replay_video_capture_inactive(active: Res<ReplayVideoCaptureActive>) -> bool {
     !active.0
+}
+
+pub(crate) fn replay_mouse_interaction_inactive(studio: Res<ReplayStudio>) -> bool {
+    !replay_blocks_mouse_interaction(&studio)
+}
+
+fn replay_blocks_mouse_interaction(studio: &ReplayStudio) -> bool {
+    matches!(
+        studio.mode,
+        ReplayMode::Playing | ReplayMode::Paused
+    ) || studio.video_render.is_some()
 }
 
 fn snapshot_new_replay_messages(
@@ -469,7 +480,7 @@ impl Default for ReplayMode {
 }
 
 #[derive(Resource)]
-struct ReplayStudio {
+pub(crate) struct ReplayStudio {
     mode: ReplayMode,
     replay: Option<ReplayFile>,
     audience: ReplayAudience,
@@ -5923,7 +5934,7 @@ mod tests {
         let forward = shot.rotation * Vec3::NEG_Z;
         let to_speaker = (target - shot.translation).normalize();
 
-        assert!(shot.translation.z > 14.0);
+        assert!(shot.translation.z > 7.0);
         assert!(obstacles.camera_is_clear(shot.translation));
         assert!(!obstacles.segment_is_clear(shot.translation, target));
         assert!(forward.dot(to_speaker) > 0.999);
@@ -5931,7 +5942,7 @@ mod tests {
     }
 
     #[test]
-    fn directed_camera_speaker_shots_are_three_times_farther_away() {
+    fn directed_camera_speaker_shots_are_half_the_previous_distance() {
         let target = Vec3::new(2.0, 1.0, -1.0);
         let base = Transform::from_xyz(2.0, 2.5, 6.0);
         let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
@@ -5946,8 +5957,8 @@ mod tests {
             &ReplayCameraObstacles::default(),
         );
 
-        assert!((horizontal(shot.translation - target).length() - 15.0).abs() < 0.001);
-        assert!((shot.translation.y - target.y - 4.5).abs() < 0.001);
+        assert!((horizontal(shot.translation - target).length() - 7.5).abs() < 0.001);
+        assert!((shot.translation.y - target.y - 2.25).abs() < 0.001);
     }
 
     #[test]
@@ -5996,8 +6007,8 @@ mod tests {
         ]);
         let rig = DirectedCameraRig::for_dialogue(&base, &dialogue, &positions);
         let obstacles = ReplayCameraObstacles::default();
-        // Keep the speaker far enough onto the forbidden side that even the
-        // three-times-farther shot must clamp to the scene line.
+        // Keep the speaker far enough onto the forbidden side that the scaled
+        // shot must still clamp to the scene line.
         let off_axis_target = Vec3::new(0.0, 1.0, -30.0);
         let arrival = rig.director_shot(
             off_axis_target,
@@ -6312,6 +6323,22 @@ mod tests {
             &studio, &speech, 0, true
         ));
     }
+
+    #[test]
+    fn replay_preview_blocks_world_mouse_interaction() {
+        let mut studio = ReplayStudio::default();
+        assert!(!replay_blocks_mouse_interaction(&studio));
+
+        studio.mode = ReplayMode::Playing;
+        assert!(replay_blocks_mouse_interaction(&studio));
+
+        studio.mode = ReplayMode::Paused;
+        assert!(replay_blocks_mouse_interaction(&studio));
+
+        studio.mode = ReplayMode::Recording;
+        assert!(!replay_blocks_mouse_interaction(&studio));
+    }
+
     #[test]
     fn director_export_is_available_during_preview_and_reuses_an_applied_plan() {
         let mut studio = ReplayStudio::default();

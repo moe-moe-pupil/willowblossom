@@ -25,6 +25,7 @@ use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
     camera::{
+        primitives::Aabb,
         visibility::RenderLayers,
         RenderTarget,
     },
@@ -1522,13 +1523,17 @@ impl Plugin for TrpgVoxelPlugin {
                 (
                     voxel_editor_shortcuts,
                     handle_editor_requests,
-                    use_player_possession_tool,
-                    place_creative_light,
+                    use_player_possession_tool
+                        .run_if(crate::replay::replay_mouse_interaction_inactive),
+                    place_creative_light
+                        .run_if(crate::replay::replay_mouse_interaction_inactive),
                     sync_selected_voxel_light,
-                    edit_voxel_grid,
+                    edit_voxel_grid.run_if(crate::replay::replay_mouse_interaction_inactive),
                     despawn_unsupported_voxel_auto_doors,
-                    use_voxel_teleport_tool,
-                    drag_voxel_physics_body,
+                    use_voxel_teleport_tool
+                        .run_if(crate::replay::replay_mouse_interaction_inactive),
+                    drag_voxel_physics_body
+                        .run_if(crate::replay::replay_mouse_interaction_inactive),
                     make_selection_physical,
                     rebuild_voxel_orbital_planet,
                     apply_voxel_physics_action,
@@ -1545,7 +1550,8 @@ impl Plugin for TrpgVoxelPlugin {
                     sync_voxel_lighting,
                     apply_voxel_teleport,
                     control_first_person_player,
-                    control_voxel_camera,
+                    control_voxel_camera
+                        .run_if(crate::replay::replay_mouse_interaction_inactive),
                     sync_possessed_player_camera,
                     sync_voxel_player_cameras,
                     sync_voxel_player_standees,
@@ -2117,15 +2123,19 @@ fn setup_voxel_materials(
             },
             _ => {},
         }
+        let mut fade_material = material.clone();
+        fade_material.alpha_mode = AlphaMode::Blend;
         fade_handles[index] = fade_materials.add(ExtendedMaterial {
-            base: material.clone(),
+            base: fade_material,
             extension: VoxelOcclusionFadeExtension::new(),
         });
         materials.add(material)
     });
     let planet_ocean_material = opaque_planet_ocean_material(textures[3].clone());
+    let mut fade_planet_ocean_material = planet_ocean_material.clone();
+    fade_planet_ocean_material.alpha_mode = AlphaMode::Blend;
     let fade_planet_ocean = fade_materials.add(ExtendedMaterial {
-        base: planet_ocean_material.clone(),
+        base: fade_planet_ocean_material,
         extension: VoxelOcclusionFadeExtension::new(),
     });
     let planet_ocean = materials.add(planet_ocean_material);
@@ -5731,11 +5741,21 @@ fn sync_voxel_occlusion_fade(
     fade_materials: Res<VoxelReplayFadeMaterials>,
     mut materials: ResMut<Assets<VoxelFadeMaterial>>,
     normal_entities: Query<
-        (Entity, &MeshMaterial3d<StandardMaterial>),
+        (
+            Entity,
+            &MeshMaterial3d<StandardMaterial>,
+            &Aabb,
+            &GlobalTransform,
+        ),
         Without<MeshMaterial3d<VoxelFadeMaterial>>,
     >,
     faded_entities: Query<
-        (Entity, &MeshMaterial3d<VoxelFadeMaterial>),
+        (
+            Entity,
+            &MeshMaterial3d<VoxelFadeMaterial>,
+            &Aabb,
+            &GlobalTransform,
+        ),
         Without<MeshMaterial3d<StandardMaterial>>,
     >,
 ) {
@@ -5743,31 +5763,51 @@ fn sync_voxel_occlusion_fade(
         camera_and_active: fade.camera.extend(f32::from(fade.active)),
         focus_and_radius: fade.focus.extend(VOXEL_OCCLUSION_FOCUS_RADIUS),
     };
-    for handle in fade_materials
-        .handles
-        .iter()
-        .chain(std::iter::once(&fade_materials.planet_ocean))
-    {
+    for handle in fade_materials.handles.iter().chain(std::iter::once(
+        &fade_materials.planet_ocean,
+    )) {
         if let Some(mut material) = materials.get_mut(handle) {
             material.extension.settings = settings;
         }
     }
     if fade.active {
-        for (entity, material) in &normal_entities {
-            if let Some(fade_handle) =
-                replay_fade_handle(material, &voxel_materials, &fade_materials)
-            {
+        for (entity, material, aabb, transform) in &normal_entities {
+            if !replay_sightline_intersects_aabb(fade.camera, fade.focus, aabb, transform) {
+                continue;
+            }
+            if let Some(fade_handle) = replay_fade_handle(
+                material,
+                &voxel_materials,
+                &fade_materials,
+            ) {
                 commands
                     .entity(entity)
                     .remove::<MeshMaterial3d<StandardMaterial>>()
                     .insert(MeshMaterial3d(fade_handle));
             }
         }
+        for (entity, material, aabb, transform) in &faded_entities {
+            if replay_sightline_intersects_aabb(fade.camera, fade.focus, aabb, transform) {
+                continue;
+            }
+            if let Some(normal_handle) = normal_voxel_handle(
+                material,
+                &voxel_materials,
+                &fade_materials,
+            ) {
+                commands
+                    .entity(entity)
+                    .remove::<MeshMaterial3d<VoxelFadeMaterial>>()
+                    .insert(MeshMaterial3d(normal_handle));
+            }
+        }
     } else {
-        for (entity, material) in &faded_entities {
-            if let Some(normal_handle) =
-                normal_voxel_handle(material, &voxel_materials, &fade_materials)
-            {
+        for (entity, material, ..) in &faded_entities {
+            if let Some(normal_handle) = normal_voxel_handle(
+                material,
+                &voxel_materials,
+                &fade_materials,
+            ) {
                 commands
                     .entity(entity)
                     .remove::<MeshMaterial3d<VoxelFadeMaterial>>()
@@ -5775,6 +5815,54 @@ fn sync_voxel_occlusion_fade(
             }
         }
     }
+}
+
+fn replay_sightline_intersects_aabb(
+    camera: Vec3,
+    focus: Vec3,
+    aabb: &Aabb,
+    transform: &GlobalTransform,
+) -> bool {
+    let local_center = Vec3::from(aabb.center);
+    let local_half_extents = Vec3::from(aabb.half_extents);
+    let mut world_min = Vec3::splat(f32::INFINITY);
+    let mut world_max = Vec3::splat(f32::NEG_INFINITY);
+    for x in [-1.0, 1.0] {
+        for y in [-1.0, 1.0] {
+            for z in [-1.0, 1.0] {
+                let local_corner = local_center + local_half_extents * Vec3::new(x, y, z);
+                let world_corner = transform.transform_point(local_corner);
+                world_min = world_min.min(world_corner);
+                world_max = world_max.max(world_corner);
+            }
+        }
+    }
+    segment_intersects_bounds(camera, focus, world_min, world_max)
+}
+
+fn segment_intersects_bounds(camera: Vec3, focus: Vec3, min: Vec3, max: Vec3) -> bool {
+    let direction = focus - camera;
+    let mut near = 0.0_f32;
+    let mut far = 1.0_f32;
+    for axis in 0..3 {
+        let origin = camera[axis];
+        let delta = direction[axis];
+        if delta.abs() <= f32::EPSILON {
+            if origin < min[axis] || origin > max[axis] {
+                return false;
+            }
+            continue;
+        }
+        let inverse = delta.recip();
+        let first = (min[axis] - origin) * inverse;
+        let second = (max[axis] - origin) * inverse;
+        near = near.max(first.min(second));
+        far = far.min(first.max(second));
+        if near > far {
+            return false;
+        }
+    }
+    true
 }
 
 fn replay_fade_handle(
@@ -9637,7 +9725,19 @@ mod tests {
         .add_systems(Update, sync_voxel_occlusion_fade);
         let voxel = app
             .world_mut()
-            .spawn(MeshMaterial3d(normal_handles[0].clone()))
+            .spawn((
+                MeshMaterial3d(normal_handles[0].clone()),
+                Aabb::from_min_max(Vec3::splat(-0.25), Vec3::splat(0.25)),
+                GlobalTransform::from_translation(Vec3::new(2.5, 3.5, 4.5)),
+            ))
+            .id();
+        let off_axis_voxel = app
+            .world_mut()
+            .spawn((
+                MeshMaterial3d(normal_handles[1].clone()),
+                Aabb::from_min_max(Vec3::splat(-0.25), Vec3::splat(0.25)),
+                GlobalTransform::from_translation(Vec3::new(20.0, 3.5, 4.5)),
+            ))
             .id();
 
         app.update();
@@ -9666,6 +9766,14 @@ mod tests {
                 .0,
             fade_handles[0]
         );
+        assert!(app
+            .world()
+            .entity(off_axis_voxel)
+            .contains::<MeshMaterial3d<StandardMaterial>>());
+        assert!(!app
+            .world()
+            .entity(off_axis_voxel)
+            .contains::<MeshMaterial3d<VoxelFadeMaterial>>());
 
         let assets = app.world().resource::<Assets<VoxelFadeMaterial>>();
         for handle in fade_handles
@@ -9673,10 +9781,18 @@ mod tests {
             .chain(std::iter::once(&fade_planet_ocean))
         {
             let settings = assets.get(handle).unwrap().extension.settings;
-            assert_eq!(settings.camera_and_active, Vec4::new(1.0, 2.0, 3.0, 1.0));
+            assert_eq!(
+                settings.camera_and_active,
+                Vec4::new(1.0, 2.0, 3.0, 1.0)
+            );
             assert_eq!(
                 settings.focus_and_radius,
-                Vec4::new(4.0, 5.0, 6.0, VOXEL_OCCLUSION_FOCUS_RADIUS)
+                Vec4::new(
+                    4.0,
+                    5.0,
+                    6.0,
+                    VOXEL_OCCLUSION_FOCUS_RADIUS
+                )
             );
         }
 
@@ -9692,6 +9808,26 @@ mod tests {
             .world()
             .entity(voxel)
             .contains::<MeshMaterial3d<VoxelFadeMaterial>>());
+    }
+
+    #[test]
+    fn replay_fade_uses_the_whole_mesh_only_when_it_blocks_the_sightline() {
+        let bounds = Aabb::from_min_max(Vec3::splat(-1.0), Vec3::splat(1.0));
+        let blocking_transform = GlobalTransform::from_translation(Vec3::new(0.0, 0.0, 5.0));
+        let off_axis_transform = GlobalTransform::from_translation(Vec3::new(4.0, 0.0, 5.0));
+
+        assert!(replay_sightline_intersects_aabb(
+            Vec3::ZERO,
+            Vec3::Z * 10.0,
+            &bounds,
+            &blocking_transform,
+        ));
+        assert!(!replay_sightline_intersects_aabb(
+            Vec3::ZERO,
+            Vec3::Z * 10.0,
+            &bounds,
+            &off_axis_transform,
+        ));
     }
 
     #[test]
