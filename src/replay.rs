@@ -103,6 +103,8 @@ use crate::{
         cached_or_local_voxel_standee_path,
         TrpgVoxelGrid,
         VoxelPlayerStandee,
+        VoxelPlayerStandeeSynced,
+        VoxelPossessionState,
         VoxelReplayOcclusionFade,
         VoxelViewportCamera,
         DEFAULT_VOXEL_OCCLUSION_CAST_END_HEIGHT_CELLS,
@@ -145,6 +147,10 @@ const DEFAULT_CAMERA_TRANSITION_CURVE: f32 = 2.0;
 const MIN_CAMERA_TRANSITION_CURVE: f32 = 1.0;
 const MAX_CAMERA_TRANSITION_CURVE: f32 = 4.0;
 const FOCUS_TRANSITION_MS: u64 = 900;
+const PLAYER_MOVEMENT_SAMPLE_SECONDS: f32 = 0.1;
+const DEFAULT_PLAYER_MOVEMENT_CURVE: f32 = 0.75;
+const MIN_PLAYER_MOVEMENT_CURVE: f32 = 0.0;
+const MAX_PLAYER_MOVEMENT_CURVE: f32 = 1.0;
 
 pub struct ReplayPlugin;
 
@@ -175,7 +181,9 @@ impl Plugin for ReplayPlugin {
                 Update,
                 (
                     snapshot_new_replay_messages,
-                    record_replay.after(snapshot_new_replay_messages),
+                    record_replay
+                        .after(snapshot_new_replay_messages)
+                        .after(VoxelPlayerStandeeSynced),
                     advance_replay,
                     preview_replay_speech
                         .after(advance_replay)
@@ -374,6 +382,10 @@ struct ReplayFile {
     camera_distance_scale: f32,
     #[serde(default = "default_camera_transition_curve")]
     camera_transition_curve: f32,
+    #[serde(default = "default_player_movement_curve")]
+    player_movement_curve: f32,
+    #[serde(default)]
+    player_movements: Vec<ReplayPlayerMovement>,
     dialogue: Vec<ReplayDialogue>,
     #[serde(default)]
     area_blocks: Vec<ReplayAreaBlock>,
@@ -403,6 +415,18 @@ struct ReplayCameraKeyframe {
     time_ms: u64,
     translation: [f32; 3],
     rotation: [f32; 4],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplayPlayerMovement {
+    user_id: u64,
+    keyframes: Vec<ReplayPlayerMovementKeyframe>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ReplayPlayerMovementKeyframe {
+    time_ms: u64,
+    position_cells: [f32; 3],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,12 +571,16 @@ pub(crate) struct ReplayStudio {
     playback_speed: f32,
     camera_distance_scale: f32,
     camera_transition_curve: f32,
+    player_movement_curve: f32,
     record_camera_enabled: bool,
     deepseek_director_enabled: bool,
     director_response_hash: Option<u64>,
     director_request_pending: bool,
     auto_export_after_director: bool,
     camera_sample_accumulator: f32,
+    player_movement_sample_accumulator: f32,
+    recorded_possession_user_id: Option<u64>,
+    recorded_player_movement_index: Option<usize>,
     message_counts: HashMap<String, usize>,
     pre_playback_scene: Option<ReplayScene>,
     video_path: String,
@@ -656,12 +684,16 @@ impl Default for ReplayStudio {
             playback_speed: 1.0,
             camera_distance_scale: default_directed_camera_distance_scale(),
             camera_transition_curve: default_camera_transition_curve(),
+            player_movement_curve: default_player_movement_curve(),
             record_camera_enabled: false,
             deepseek_director_enabled: false,
             director_response_hash: None,
             director_request_pending: false,
             auto_export_after_director: false,
             camera_sample_accumulator: 0.0,
+            player_movement_sample_accumulator: 0.0,
+            recorded_possession_user_id: None,
+            recorded_player_movement_index: None,
             message_counts: HashMap::new(),
             pre_playback_scene: None,
             video_path: DEFAULT_VIDEO_PATH.to_owned(),
@@ -689,6 +721,7 @@ impl Default for ReplayStudio {
 fn record_replay(
     time: Res<Time>,
     manager: Res<Persistent<NapcatMessageManager>>,
+    possession: Res<VoxelPossessionState>,
     camera: Query<&Transform, With<VoxelViewportCamera>>,
     standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     mut studio: ResMut<ReplayStudio>,
@@ -702,6 +735,13 @@ fn record_replay(
     studio.record_elapsed_ms = studio
         .record_elapsed_ms
         .saturating_add((delta_seconds * 1_000.0).round() as u64);
+    let speaker_positions = standee_positions(&standees);
+    record_possessed_player_movement(
+        &mut studio,
+        possession.active_user_id,
+        &speaker_positions,
+        delta_seconds,
+    );
     if studio.record_camera_enabled {
         studio.camera_sample_accumulator += delta_seconds;
     }
@@ -718,7 +758,6 @@ fn record_replay(
     }
 
     let audience = studio.audience.clone();
-    let speaker_positions = standee_positions(&standees);
     let mut next_turn_ms = studio
         .replay
         .as_ref()
@@ -790,14 +829,11 @@ fn record_replay(
         auto_group_replay_areas(replay);
         rebuild_area_blocks(replay);
         let dialogue_end = compile_area_block_timeline(replay);
-        replay.duration_ms = if record_camera_enabled {
+        replay.duration_ms = if record_camera_enabled || !replay.player_movements.is_empty() {
             record_elapsed_ms.max(dialogue_end)
         } else {
             dialogue_end
         };
-        if !record_camera_enabled {
-            extend_replay_for_speech(replay);
-        }
         if captured_any && !record_camera_enabled {
             if let Ok(base) = camera.single() {
                 let obstacles = ReplayCameraObstacles::from_scene(&replay.scene);
@@ -826,6 +862,80 @@ fn record_replay(
                     .map(|line| (replay.created_at_unix_ms, line.line_id)),
             );
         }
+    }
+}
+
+fn record_possessed_player_movement(
+    studio: &mut ReplayStudio,
+    active_user_id: Option<u64>,
+    player_positions: &HashMap<u64, Vec3>,
+    delta_seconds: f32,
+) {
+    let possession_changed = studio.recorded_possession_user_id != active_user_id;
+    if possession_changed {
+        if let (Some(previous_user_id), Some(index)) = (
+            studio.recorded_possession_user_id,
+            studio.recorded_player_movement_index,
+        ) {
+            if let (Some(position), Some(replay)) = (
+                player_positions.get(&previous_user_id).copied(),
+                studio.replay.as_mut(),
+            ) {
+                if let Some(movement) = replay.player_movements.get_mut(index) {
+                    push_player_movement_keyframe(
+                        movement,
+                        studio.record_elapsed_ms,
+                        position,
+                    );
+                }
+            }
+        }
+        studio.recorded_possession_user_id = active_user_id;
+        studio.recorded_player_movement_index = None;
+        studio.player_movement_sample_accumulator = 0.0;
+    } else if active_user_id.is_some() {
+        studio.player_movement_sample_accumulator += delta_seconds;
+    }
+
+    let sample_due = possession_changed
+        || studio.player_movement_sample_accumulator >= PLAYER_MOVEMENT_SAMPLE_SECONDS;
+    let Some(user_id) = active_user_id.filter(|_| sample_due) else { return };
+    let Some(position) = player_positions.get(&user_id).copied() else { return };
+    studio.player_movement_sample_accumulator %= PLAYER_MOVEMENT_SAMPLE_SECONDS;
+
+    let Some(replay) = studio.replay.as_mut() else { return };
+    let index = studio.recorded_player_movement_index.unwrap_or_else(|| {
+        replay.player_movements.push(ReplayPlayerMovement {
+            user_id,
+            keyframes: Vec::new(),
+        });
+        replay.player_movements.len() - 1
+    });
+    studio.recorded_player_movement_index = Some(index);
+    push_player_movement_keyframe(
+        &mut replay.player_movements[index],
+        studio.record_elapsed_ms,
+        position,
+    );
+}
+
+fn push_player_movement_keyframe(
+    movement: &mut ReplayPlayerMovement,
+    time_ms: u64,
+    position: Vec3,
+) {
+    let keyframe = ReplayPlayerMovementKeyframe {
+        time_ms,
+        position_cells: (position / VOXEL_SIZE).to_array(),
+    };
+    if let Some(last) = movement
+        .keyframes
+        .last_mut()
+        .filter(|last| last.time_ms == time_ms)
+    {
+        *last = keyframe;
+    } else {
+        movement.keyframes.push(keyframe);
     }
 }
 
@@ -2098,6 +2208,33 @@ fn replay_controls(
             studio.camera_transition_curve
         );
     }
+    let mut requested_player_movement_curve = studio.player_movement_curve;
+    let player_movement_curve_changed = ui
+        .horizontal(|ui| {
+            ui.label("玩家移动平滑曲线");
+            ui.add(
+                egui::Slider::new(
+                    &mut requested_player_movement_curve,
+                    MIN_PLAYER_MOVEMENT_CURVE..=MAX_PLAYER_MOVEMENT_CURVE,
+                )
+                .step_by(0.05)
+                .fixed_decimals(2),
+            )
+            .on_hover_text("0 为逐点直线移动；1 为最平滑的轨迹曲线。")
+            .changed()
+        })
+        .inner;
+    if player_movement_curve_changed {
+        studio.player_movement_curve =
+            normalized_player_movement_curve(requested_player_movement_curve);
+        if let Some(replay) = studio.replay.as_mut() {
+            replay.player_movement_curve = studio.player_movement_curve;
+        }
+        studio.status = format!(
+            "玩家移动平滑曲线已设为 {:.2}",
+            studio.player_movement_curve
+        );
+    }
     ui.add(
         egui::Slider::new(
             occlusion_cast_width_cells,
@@ -2722,6 +2859,7 @@ fn replay_controls(
                         studio.audience = replay.audience.clone();
                         studio.camera_distance_scale = replay.camera_distance_scale;
                         studio.camera_transition_curve = replay.camera_transition_curve;
+                        studio.player_movement_curve = replay.player_movement_curve;
                         studio.status = format!("已载入项目：{}", replay.title);
                         studio.replay = Some(replay);
                     },
@@ -3037,6 +3175,7 @@ fn start_recording(
         scene,
         studio.camera_distance_scale,
         studio.camera_transition_curve,
+        studio.player_movement_curve,
     );
     if studio.record_camera_enabled {
         if let Ok(transform) = camera.single() {
@@ -3050,6 +3189,9 @@ fn start_recording(
         .collect();
     studio.record_elapsed_ms = 0;
     studio.camera_sample_accumulator = 0.0;
+    studio.player_movement_sample_accumulator = 0.0;
+    studio.recorded_possession_user_id = None;
+    studio.recorded_player_movement_index = None;
     studio.playback_ms = 0;
     studio.director_request_pending = false;
     studio.director_response_hash = None;
@@ -3057,9 +3199,9 @@ fn start_recording(
     studio.replay = Some(replay);
     studio.mode = ReplayMode::Recording;
     studio.status = if studio.record_camera_enabled {
-        "开始录制场景、可见消息和 DM 自由镜头".to_owned()
+        "开始录制场景、可见消息、DM 自由镜头和接管玩家移动".to_owned()
     } else {
-        "开始录制场景和可见消息；DM 镜头采集保持关闭".to_owned()
+        "开始录制场景、可见消息和接管玩家移动；DM 镜头采集保持关闭".to_owned()
     };
 }
 
@@ -3070,7 +3212,8 @@ fn stop_recording(studio: &mut ReplayStudio) {
             .last()
             .map(|line| line.time_ms.saturating_add(line.duration_ms))
             .unwrap_or(5_000);
-        replay.duration_ms = if studio.record_camera_enabled {
+        replay.duration_ms = if studio.record_camera_enabled || !replay.player_movements.is_empty()
+        {
             studio.record_elapsed_ms.max(dialogue_end)
         } else {
             dialogue_end
@@ -3105,6 +3248,7 @@ fn build_from_history(
         scene,
         studio.camera_distance_scale,
         studio.camera_transition_curve,
+        studio.player_movement_curve,
     );
     let speaker_positions = standee_positions(standees);
     let mut visible = manager
@@ -3547,6 +3691,7 @@ fn new_replay(
     scene: ReplayScene,
     camera_distance_scale: f32,
     camera_transition_curve: f32,
+    player_movement_curve: f32,
 ) -> ReplayFile {
     let title = manager
         .current_trpg_group
@@ -3565,6 +3710,8 @@ fn new_replay(
         camera: Vec::new(),
         camera_distance_scale: normalized_directed_camera_distance_scale(camera_distance_scale),
         camera_transition_curve: normalized_camera_transition_curve(camera_transition_curve),
+        player_movement_curve: normalized_player_movement_curve(player_movement_curve),
+        player_movements: Vec::new(),
         dialogue: Vec::new(),
         area_blocks: Vec::new(),
         area_radius_cells: default_area_radius_cells(),
@@ -4740,6 +4887,11 @@ fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
     for frame in &mut replay.camera {
         frame.time_ms = stretched_replay_time(frame.time_ms, &segments);
     }
+    for movement in &mut replay.player_movements {
+        for frame in &mut movement.keyframes {
+            frame.time_ms = stretched_replay_time(frame.time_ms, &segments);
+        }
+    }
     replay.duration_ms = stretched_replay_time(replay.duration_ms, &segments);
     true
 }
@@ -4749,6 +4901,8 @@ fn default_master_speech_speed() -> f32 { 1.10 }
 fn default_directed_camera_distance_scale() -> f32 { DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE }
 
 fn default_camera_transition_curve() -> f32 { DEFAULT_CAMERA_TRANSITION_CURVE }
+
+fn default_player_movement_curve() -> f32 { DEFAULT_PLAYER_MOVEMENT_CURVE }
 
 fn normalized_directed_camera_distance_scale(scale: f32) -> f32 {
     if scale.is_finite() {
@@ -4769,6 +4923,17 @@ fn normalized_camera_transition_curve(curve: f32) -> f32 {
         )
     } else {
         default_camera_transition_curve()
+    }
+}
+
+fn normalized_player_movement_curve(curve: f32) -> f32 {
+    if curve.is_finite() {
+        curve.clamp(
+            MIN_PLAYER_MOVEMENT_CURVE,
+            MAX_PLAYER_MOVEMENT_CURVE,
+        )
+    } else {
+        default_player_movement_curve()
     }
 }
 
@@ -4812,6 +4977,11 @@ fn retime_replay(replay: &mut ReplayFile, previous: f32, requested: f32) {
     }
     for frame in &mut replay.camera {
         frame.time_ms = scaled_millis(frame.time_ms, ratio);
+    }
+    for movement in &mut replay.player_movements {
+        for frame in &mut movement.keyframes {
+            frame.time_ms = scaled_millis(frame.time_ms, ratio);
+        }
     }
     replay.duration_ms = scaled_millis(replay.duration_ms, ratio).max(1);
 }
@@ -5271,8 +5441,15 @@ fn apply_replay_standee_positions(
                     positions
                 });
             for (mut transform, standee) in &mut standees {
-                if let Some(position) = positions.get(&standee.user_id) {
-                    transform.translation = *position;
+                if let Some(position) = interpolated_player_position(
+                    &replay.player_movements,
+                    standee.user_id,
+                    studio.playback_ms,
+                    replay.player_movement_curve,
+                )
+                .or_else(|| positions.get(&standee.user_id).copied())
+                {
+                    transform.translation = position;
                 }
                 if let Some(rotation) = camera_position.and_then(|camera_position| {
                     replay_standee_facing_rotation(transform.translation, camera_position)
@@ -6070,6 +6247,61 @@ fn camera_easing_t(linear_t: f32, transition_curve: f32) -> f32 {
     }
 }
 
+fn interpolated_player_position(
+    movements: &[ReplayPlayerMovement],
+    user_id: u64,
+    time_ms: u64,
+    curve: f32,
+) -> Option<Vec3> {
+    let movement = movements.iter().rev().find(|movement| {
+        movement.user_id == user_id
+            && movement
+                .keyframes
+                .first()
+                .is_some_and(|frame| frame.time_ms <= time_ms)
+    })?;
+    interpolated_player_movement(&movement.keyframes, time_ms, curve)
+}
+
+fn interpolated_player_movement(
+    frames: &[ReplayPlayerMovementKeyframe],
+    time_ms: u64,
+    curve: f32,
+) -> Option<Vec3> {
+    let first = frames.first()?;
+    let next_index = frames.partition_point(|frame| frame.time_ms <= time_ms);
+    if next_index == 0 {
+        return Some(Vec3::from_array(first.position_cells) * VOXEL_SIZE);
+    }
+    if next_index >= frames.len() {
+        return Some(Vec3::from_array(frames.last()?.position_cells) * VOXEL_SIZE);
+    }
+    let left_index = next_index - 1;
+    let right_index = next_index;
+    let left = &frames[left_index];
+    let right = &frames[right_index];
+    let span = right.time_ms.saturating_sub(left.time_ms).max(1);
+    let t = time_ms.saturating_sub(left.time_ms) as f32 / span as f32;
+    let p0 = Vec3::from_array(frames[left_index.saturating_sub(1)].position_cells);
+    let p1 = Vec3::from_array(left.position_cells);
+    let p2 = Vec3::from_array(right.position_cells);
+    let p3 = Vec3::from_array(frames.get(right_index + 1).unwrap_or(right).position_cells);
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let curved = (0.5
+        * (2.0 * p1
+            + (-p0 + p2) * t
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3))
+        .clamp(p1.min(p2), p1.max(p2));
+    let linear = p1.lerp(p2, t);
+    let smoothed = linear.lerp(
+        curved,
+        normalized_player_movement_curve(curve),
+    );
+    Some(smoothed * VOXEL_SIZE)
+}
+
 fn frame_transform(frame: &ReplayCameraKeyframe) -> Transform {
     Transform {
         translation: Vec3::from_array(frame.translation),
@@ -6826,6 +7058,7 @@ fn import_replay(path: &str) -> Result<ReplayFile, String> {
         normalized_directed_camera_distance_scale(replay.camera_distance_scale);
     replay.camera_transition_curve =
         normalized_camera_transition_curve(replay.camera_transition_curve);
+    replay.player_movement_curve = normalized_player_movement_curve(replay.player_movement_curve);
     if !matches!(
         replay.format_version,
         LEGACY_REPLAY_FORMAT_VERSION | REPLAY_FORMAT_VERSION
@@ -6859,6 +7092,12 @@ fn import_replay(path: &str) -> Result<ReplayFile, String> {
         for frame in &mut replay.camera {
             frame.time_ms = ((frame.time_ms as u128 * compact_duration_ms as u128)
                 / legacy_duration_ms as u128) as u64;
+        }
+        for movement in &mut replay.player_movements {
+            for frame in &mut movement.keyframes {
+                frame.time_ms = ((frame.time_ms as u128 * compact_duration_ms as u128)
+                    / legacy_duration_ms as u128) as u64;
+            }
         }
         replay.duration_ms = compact_duration_ms;
         extend_replay_for_speech(&mut replay);
@@ -7286,6 +7525,91 @@ mod tests {
                 .translation
                 .x,
             2.5
+        );
+    }
+
+    #[test]
+    fn possessed_player_movement_is_sampled_in_voxel_cells_and_split_by_control_session() {
+        let mut studio = ReplayStudio::default();
+        studio.mode = ReplayMode::Recording;
+        studio.replay = Some(test_replay(Vec::new()));
+        let mut positions = HashMap::from([(42, Vec3::new(1.0, 2.0, 3.0))]);
+
+        record_possessed_player_movement(&mut studio, Some(42), &positions, 0.0);
+        studio.record_elapsed_ms = 100;
+        positions.insert(42, Vec3::new(1.5, 2.0, 3.0));
+        record_possessed_player_movement(
+            &mut studio,
+            Some(42),
+            &positions,
+            PLAYER_MOVEMENT_SAMPLE_SECONDS,
+        );
+        studio.record_elapsed_ms = 150;
+        record_possessed_player_movement(&mut studio, None, &positions, 0.05);
+        studio.record_elapsed_ms = 1_000;
+        positions.insert(42, Vec3::new(4.0, 2.0, 3.0));
+        record_possessed_player_movement(&mut studio, Some(42), &positions, 0.0);
+
+        let movements = &studio.replay.as_ref().unwrap().player_movements;
+        assert_eq!(movements.len(), 2);
+        assert_eq!(movements[0].user_id, 42);
+        assert_eq!(movements[0].keyframes.len(), 3);
+        assert_eq!(
+            movements[0].keyframes[0].position_cells,
+            [4.0, 8.0, 12.0]
+        );
+        assert_eq!(
+            movements[0].keyframes[1].position_cells,
+            [6.0, 8.0, 12.0]
+        );
+        assert_eq!(movements[1].keyframes[0].time_ms, 1_000);
+    }
+
+    #[test]
+    fn replay_player_movement_curves_between_samples_without_crossing_session_gaps() {
+        let movements = vec![
+            ReplayPlayerMovement {
+                user_id: 42,
+                keyframes: vec![
+                    ReplayPlayerMovementKeyframe {
+                        time_ms: 0,
+                        position_cells: [0.0, 0.0, 0.0],
+                    },
+                    ReplayPlayerMovementKeyframe {
+                        time_ms: 100,
+                        position_cells: [1.0, 0.0, 0.0],
+                    },
+                    ReplayPlayerMovementKeyframe {
+                        time_ms: 200,
+                        position_cells: [1.0, 0.0, 1.0],
+                    },
+                    ReplayPlayerMovementKeyframe {
+                        time_ms: 300,
+                        position_cells: [2.0, 0.0, 1.0],
+                    },
+                ],
+            },
+            ReplayPlayerMovement {
+                user_id: 42,
+                keyframes: vec![ReplayPlayerMovementKeyframe {
+                    time_ms: 1_000,
+                    position_cells: [10.0, 0.0, 0.0],
+                }],
+            },
+        ];
+
+        let linear = interpolated_player_position(&movements, 42, 125, 0.0).unwrap() / VOXEL_SIZE;
+        let curved = interpolated_player_position(&movements, 42, 125, 1.0).unwrap() / VOXEL_SIZE;
+        assert!((linear - Vec3::new(1.0, 0.0, 0.25)).length() < 0.0001);
+        assert!((curved - linear).length() > 0.01);
+        assert!(curved.z < linear.z);
+        assert_eq!(
+            interpolated_player_position(&movements, 42, 500, 1.0).unwrap(),
+            Vec3::new(2.0, 0.0, 1.0) * VOXEL_SIZE
+        );
+        assert_eq!(
+            interpolated_player_position(&movements, 42, 1_000, 1.0).unwrap(),
+            Vec3::new(10.0, 0.0, 0.0) * VOXEL_SIZE
         );
     }
 
@@ -8447,10 +8771,16 @@ mod tests {
             replay.camera_transition_curve,
             default_camera_transition_curve()
         );
+        assert_eq!(
+            replay.player_movement_curve,
+            default_player_movement_curve()
+        );
+        assert!(replay.player_movements.is_empty());
         replay.master_speech_speed = 1.15;
         replay.master_dialogue_duration = 2.75;
         replay.camera_distance_scale = 2.25;
         replay.camera_transition_curve = 3.25;
+        replay.player_movement_curve = 0.4;
         replay
             .speaker_voice_settings
             .insert(42, SpeakerVoiceSettings {
@@ -8481,6 +8811,7 @@ mod tests {
         assert_eq!(restored.master_dialogue_duration, 2.75);
         assert_eq!(restored.camera_distance_scale, 2.25);
         assert_eq!(restored.camera_transition_curve, 3.25);
+        assert_eq!(restored.player_movement_curve, 0.4);
     }
 
     #[test]
@@ -8727,6 +9058,8 @@ mod tests {
             camera: Vec::new(),
             camera_distance_scale: default_directed_camera_distance_scale(),
             camera_transition_curve: default_camera_transition_curve(),
+            player_movement_curve: default_player_movement_curve(),
+            player_movements: Vec::new(),
             dialogue,
             area_blocks: Vec::new(),
             area_radius_cells: DEFAULT_AREA_RADIUS_CELLS,

@@ -310,6 +310,9 @@ impl VoxelMinimapSnapshot {
 #[derive(Component)]
 pub(crate) struct VoxelViewportCamera;
 
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct VoxelPlayerStandeeSynced;
+
 #[derive(Component)]
 struct VoxelPlayerCaptureCamera {
     user_id: u64,
@@ -1553,7 +1556,7 @@ impl Plugin for TrpgVoxelPlugin {
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
                     sync_possessed_player_camera,
                     sync_voxel_player_cameras,
-                    sync_voxel_player_standees,
+                    sync_voxel_player_standees.in_set(VoxelPlayerStandeeSynced),
                     sync_voxel_scene_character_positions,
                     capture_voxel_player_view,
                     draw_voxel_target.run_if(crate::replay::replay_video_capture_inactive),
