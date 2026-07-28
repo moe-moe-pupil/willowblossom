@@ -1774,6 +1774,7 @@ fn apply_replay_camera(
 ) {
     if let Some(fade) = fade.as_mut() {
         fade.active = false;
+        fade.targets.clear();
     }
     if !matches!(
         studio.mode,
@@ -1787,14 +1788,25 @@ fn apply_replay_camera(
     };
     if let Ok(mut camera) = camera.single_mut() {
         *camera = transform;
-        if let Some(focus) = replay_focus_position(replay, studio.playback_ms, &standees) {
-            if let Some(fade) = fade.as_mut() {
-                fade.active = true;
-                fade.camera = transform.translation;
-                fade.focus = focus;
-            }
+        if let Some(fade) = fade.as_mut() {
+            set_replay_occlusion_targets(
+                fade,
+                transform.translation,
+                standees.iter().map(|(transform, _)| transform.translation),
+            );
         }
     }
+}
+
+fn set_replay_occlusion_targets(
+    fade: &mut VoxelReplayOcclusionFade,
+    camera: Vec3,
+    targets: impl IntoIterator<Item = Vec3>,
+) {
+    fade.camera = camera;
+    fade.targets.clear();
+    fade.targets.extend(targets);
+    fade.active = !fade.targets.is_empty();
 }
 
 fn tts_worker_connection_error(error: &str) -> bool {
@@ -1806,36 +1818,6 @@ fn tts_worker_connection_error(error: &str) -> bool {
     ]
     .iter()
     .any(|marker| error.contains(marker))
-}
-
-fn replay_focus_position(
-    replay: &ReplayFile,
-    playback_ms: u64,
-    standees: &Query<
-        (&Transform, &VoxelPlayerStandee),
-        (
-            With<VoxelPlayerStandee>,
-            Without<VoxelViewportCamera>,
-        ),
-    >,
-) -> Option<Vec3> {
-    let index = replay
-        .dialogue
-        .iter()
-        .rposition(|line| line.included && line.time_ms <= playback_ms)
-        .or_else(|| replay.dialogue.iter().position(|line| line.included))?;
-    let speaker_positions = standees
-        .iter()
-        .map(|(_, standee)| (standee.user_id, Vec3::ZERO))
-        .collect::<HashMap<_, _>>();
-    let speaker_id = replay_dialogue_focus_id(
-        &replay.dialogue,
-        index,
-        &speaker_positions,
-    )?;
-    standees.iter().find_map(|(transform, standee)| {
-        (standee.user_id == speaker_id).then_some(transform.translation)
-    })
 }
 
 fn replay_studio_ui(
@@ -6756,6 +6738,23 @@ fn format_time(time_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_occlusion_tracks_every_player_not_only_the_focused_speaker() {
+        let camera = Vec3::new(1.0, 2.0, 3.0);
+        let players = [
+            Vec3::new(4.0, 5.0, 6.0),
+            Vec3::new(-4.0, 5.0, 6.0),
+            Vec3::new(0.0, 1.0, 8.0),
+        ];
+        let mut fade = VoxelReplayOcclusionFade::default();
+
+        set_replay_occlusion_targets(&mut fade, camera, players);
+
+        assert!(fade.active);
+        assert_eq!(fade.camera, camera);
+        assert_eq!(fade.targets, players);
+    }
 
     #[test]
     fn public_replay_excludes_private_dialogue() {

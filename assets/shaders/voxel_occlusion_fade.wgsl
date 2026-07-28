@@ -35,12 +35,32 @@
 #endif
 
 struct VoxelOcclusionFadeSettings {
-    camera_and_active: vec4<f32>,
-    focus_and_radius: vec4<f32>,
+    camera_and_target_count: vec4<f32>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100)
 var<uniform> fade_settings: VoxelOcclusionFadeSettings;
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(101)
+var<storage, read> fade_targets: array<vec4<f32>>;
+
+fn inside_player_sightline(world_position: vec3<f32>, target: vec4<f32>) -> bool {
+    let camera = fade_settings.camera_and_target_count.xyz;
+    let sightline = target.xyz - camera;
+    let sightline_length_squared = dot(sightline, sightline);
+    if sightline_length_squared <= 0.000001 {
+        return false;
+    }
+
+    let progress = clamp(
+        dot(world_position - camera, sightline) / sightline_length_squared,
+        0.0,
+        1.0,
+    );
+    let closest_point = camera + sightline * progress;
+    let tunnel_radius = target.w * progress;
+    return distance(world_position, closest_point) <= tunnel_radius;
+}
 
 @fragment
 fn fragment(
@@ -69,8 +89,11 @@ fn fragment(
 #endif
 
     var pbr_input = pbr_input_from_standard_material(in, is_front);
-    if fade_settings.camera_and_active.w >= 0.5 {
-        pbr_input.material.base_color.a *= 0.2;
+    let target_count = u32(fade_settings.camera_and_target_count.w);
+    for (var target_index = 0u; target_index < target_count; target_index += 1u) {
+        if inside_player_sightline(in.world_position.xyz, fade_targets[target_index]) {
+            discard;
+        }
     }
     pbr_input.material.base_color =
         alpha_discard(pbr_input.material, pbr_input.material.base_color);
