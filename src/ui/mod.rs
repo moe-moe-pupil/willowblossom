@@ -14741,6 +14741,7 @@ fn append_local_sent_message(
         data: NapcatMessageData {
             time,
             message_type,
+            message_id: None,
             message: vec![NapcatMessageChain {
                 variant: NapcatMessageChainType::Text {
                     data: TextData {
@@ -15255,6 +15256,7 @@ mod tests {
             data: NapcatMessageData {
                 time: 1780132600,
                 message_type: NapcatMessageType::Private,
+                message_id: None,
                 message: vec![NapcatMessageChain {
                     variant: NapcatMessageChainType::Text {
                         data: TextData {
@@ -15285,6 +15287,7 @@ mod tests {
             data: NapcatMessageData {
                 time: 1780132600,
                 message_type: NapcatMessageType::Group,
+                message_id: None,
                 message: vec![NapcatMessageChain {
                     variant: NapcatMessageChainType::Text {
                         data: TextData {

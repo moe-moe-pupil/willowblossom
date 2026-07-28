@@ -1,17 +1,26 @@
 use std::{
     collections::{
         hash_map::DefaultHasher,
+        BTreeMap,
         HashMap,
         HashSet,
     },
-    fs,
+    fs::{
+        self,
+        OpenOptions,
+    },
     hash::{
         Hash,
         Hasher,
     },
+    io::Write,
     path::{
         Path,
         PathBuf,
+    },
+    sync::{
+        Arc,
+        Mutex,
     },
     thread,
     time::{
@@ -92,7 +101,16 @@ pub enum ConnectionState {
 }
 
 #[derive(Resource)]
-struct NapcatIOReceiver(CBReceiver<Message>);
+struct NapcatIOReceiver(CBReceiver<NapcatInboundEnvelope>);
+
+#[derive(Resource, Clone)]
+struct NapcatInboundJournal(Arc<Mutex<InboundMessageJournal>>);
+
+#[derive(Debug)]
+struct NapcatInboundEnvelope {
+    message: Message,
+    journal_id: Option<u64>,
+}
 
 #[derive(Resource)]
 struct NapcatSendResultReceiver(CBReceiver<NapcatSendResult>);
@@ -109,6 +127,130 @@ pub struct NapcatOutboundMessage {
 
 const NAPCAT_RESPONSE_ECHO_PREFIX: &str = "willowblossom:";
 const NAPCAT_ACTION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const NAPCAT_MESSAGES_PATH: &str = ".data/willowblossom/messages.toml";
+const NAPCAT_INBOUND_JOURNAL_PATH: &str = ".data/willowblossom/inbound_messages.jsonl";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InboundMessageJournalRecord {
+    Message { id: u64, payload: String },
+    Ack { id: u64 },
+}
+
+#[derive(Debug)]
+struct InboundMessageJournal {
+    path: PathBuf,
+    next_id: u64,
+    pending_ids: HashSet<u64>,
+}
+
+impl InboundMessageJournal {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            next_id: 1,
+            pending_ids: HashSet::new(),
+        }
+    }
+
+    fn load_pending(&mut self) -> Result<Vec<(u64, String)>, String> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.to_string()),
+        };
+        let complete_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or_default();
+        if complete_len < bytes.len() {
+            OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .and_then(|file| file.set_len(complete_len as u64))
+                .map_err(|err| err.to_string())?;
+        }
+
+        let mut pending = BTreeMap::new();
+        let mut highest_id = 0_u64;
+        for (line_index, line) in bytes[..complete_len]
+            .split(|byte| *byte == b'\n')
+            .enumerate()
+        {
+            if line.is_empty() {
+                continue;
+            }
+            let record = match serde_json::from_slice::<InboundMessageJournalRecord>(line) {
+                Ok(record) => record,
+                Err(err) => {
+                    eprintln!(
+                        "ignored invalid NapCat inbound journal line {}: {err}",
+                        line_index + 1
+                    );
+                    continue;
+                },
+            };
+            match record {
+                InboundMessageJournalRecord::Message { id, payload } => {
+                    highest_id = highest_id.max(id);
+                    pending.insert(id, payload);
+                },
+                InboundMessageJournalRecord::Ack { id } => {
+                    highest_id = highest_id.max(id);
+                    pending.remove(&id);
+                },
+            }
+        }
+        self.next_id = highest_id.saturating_add(1).max(1);
+        self.pending_ids = pending.keys().copied().collect();
+        if pending.is_empty() && complete_len > 0 {
+            self.clear()?;
+        }
+        Ok(pending.into_iter().collect())
+    }
+
+    fn append_message(&mut self, payload: String) -> Result<u64, String> {
+        let id = self.next_id;
+        self.append_record(&InboundMessageJournalRecord::Message { id, payload })?;
+        self.next_id = self.next_id.saturating_add(1).max(1);
+        self.pending_ids.insert(id);
+        Ok(id)
+    }
+
+    fn acknowledge(&mut self, id: u64) -> Result<(), String> {
+        self.append_record(&InboundMessageJournalRecord::Ack { id })?;
+        self.pending_ids.remove(&id);
+        if self.pending_ids.is_empty() {
+            self.clear()?;
+        }
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), String> {
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .map_err(|err| err.to_string())?;
+        file.sync_all().map_err(|err| err.to_string())
+    }
+
+    fn append_record(&self, record: &InboundMessageJournalRecord) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|err| err.to_string())?;
+        serde_json::to_writer(&mut file, record).map_err(|err| err.to_string())?;
+        file.write_all(b"\n").map_err(|err| err.to_string())?;
+        file.flush().map_err(|err| err.to_string())?;
+        file.sync_data().map_err(|err| err.to_string())
+    }
+}
 
 #[derive(Debug)]
 struct PendingNapcatRequest {
@@ -328,6 +470,8 @@ where
 pub struct NapcatMessageData {
     pub time: u64,
     pub message_type: NapcatMessageType,
+    #[serde(default)]
+    pub message_id: Option<i64>,
     #[serde(deserialize_with = "deserialize_message_chains")]
     pub message: Vec<NapcatMessageChain>,
     pub self_id: u64,
@@ -5235,6 +5379,7 @@ fn moonberry_chat_to_napcat_message(
         data: NapcatMessageData {
             time,
             message_type,
+            message_id: None,
             message: chains,
             self_id: 0,
             user_id: sender_id,
@@ -5417,17 +5562,37 @@ impl Plugin for NapcatPlugin {
 }
 
 fn setup(mut commands: Commands) {
-    let (client_to_game_sender, client_to_game_receiver) = unbounded::<Message>();
+    let (client_to_game_sender, client_to_game_receiver) = unbounded::<NapcatInboundEnvelope>();
     let (game_to_client_sender, game_to_client_receiver) = tokio::sync::mpsc::channel(100);
     let (send_result_sender, send_result_receiver) = unbounded::<NapcatSendResult>();
+    let inbound_journal = Arc::new(Mutex::new(InboundMessageJournal::new(
+        PathBuf::from(NAPCAT_INBOUND_JOURNAL_PATH),
+    )));
+    match inbound_journal
+        .lock()
+        .map_err(|err| err.to_string())
+        .and_then(|mut journal| journal.load_pending())
+    {
+        Ok(pending) => {
+            for (journal_id, payload) in pending {
+                let _ = client_to_game_sender.send(NapcatInboundEnvelope {
+                    message: Message::Text(payload.into()),
+                    journal_id: Some(journal_id),
+                });
+            }
+        },
+        Err(err) => eprintln!("failed to load NapCat inbound journal: {err}"),
+    }
     let napcat_io = NapcatIOReceiver(client_to_game_receiver.clone());
     let napcat_send_results = NapcatSendResultReceiver(send_result_receiver);
     spawn_napcat_connection(
         client_to_game_sender.clone(),
         game_to_client_receiver,
         send_result_sender,
+        inbound_journal.clone(),
     );
     commands.insert_resource(napcat_io);
+    commands.insert_resource(NapcatInboundJournal(inbound_journal));
     commands.insert_resource(napcat_send_results);
     commands.insert_resource(NapcatIOSender(game_to_client_sender));
     commands.insert_resource(NapcatSendManager::default());
@@ -5459,12 +5624,11 @@ fn setup(mut commands: Commands) {
         item_pool: Vec::new(),
         unit_pool: HashMap::default(),
     };
-    let config_dir = Path::new(".data").join("willowblossom");
     commands.insert_resource(
         Persistent::<NapcatMessageManager>::builder()
             .name("messages")
             .format(StorageFormat::Toml)
-            .path(config_dir.join("messages.toml"))
+            .path(NAPCAT_MESSAGES_PATH)
             .default(message_manager)
             .build()
             .expect("failed to init messages"),
@@ -5472,9 +5636,10 @@ fn setup(mut commands: Commands) {
 }
 
 fn spawn_napcat_connection(
-    client_to_game_sender: CBSender<Message>,
+    client_to_game_sender: CBSender<NapcatInboundEnvelope>,
     game_to_client_receiver: Receiver<NapcatOutboundMessage>,
     send_result_sender: CBSender<NapcatSendResult>,
+    inbound_journal: Arc<Mutex<InboundMessageJournal>>,
 ) {
     thread::Builder::new()
         .name("napcat-websocket".to_owned())
@@ -5487,15 +5652,17 @@ fn spawn_napcat_connection(
                 client_to_game_sender,
                 game_to_client_receiver,
                 send_result_sender,
+                inbound_journal,
             ));
         })
         .expect("failed to spawn NapCat websocket thread");
 }
 
 async fn run_napcat_connection(
-    client_to_game_sender: CBSender<Message>,
+    client_to_game_sender: CBSender<NapcatInboundEnvelope>,
     mut game_to_client_receiver: Receiver<NapcatOutboundMessage>,
     send_result_sender: CBSender<NapcatSendResult>,
+    inbound_journal: Arc<Mutex<InboundMessageJournal>>,
 ) {
     const NAPCAT_WS_URL: &str = "ws://localhost:3001";
 
@@ -5527,7 +5694,17 @@ async fn run_napcat_connection(
                                 ) {
                                     let _ = send_result_sender.send(result);
                                 }
-                                if client_to_game_sender.send(msg).is_err() {
+                                let journal_id = journal_inbound_chat_message(
+                                    &msg,
+                                    &inbound_journal,
+                                );
+                                if client_to_game_sender
+                                    .send(NapcatInboundEnvelope {
+                                        message: msg,
+                                        journal_id,
+                                    })
+                                    .is_err()
+                                {
                                     fail_pending_napcat_requests(
                                         &mut pending_requests,
                                         &send_result_sender,
@@ -5613,6 +5790,44 @@ async fn run_napcat_connection(
         );
 
         sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn journal_inbound_chat_message(
+    message: &Message,
+    journal: &Arc<Mutex<InboundMessageJournal>>,
+) -> Option<u64> {
+    let payload = message.to_text().ok()?;
+    let chat_message = serde_json::from_str::<NapcatMessage>(payload).ok()?;
+    let payload = match serde_json::to_string(&chat_message) {
+        Ok(payload) => payload,
+        Err(err) => {
+            eprintln!("failed to serialize inbound NapCat chat for journaling: {err}");
+            return None;
+        },
+    };
+    match journal
+        .lock()
+        .map_err(|err| err.to_string())
+        .and_then(|mut journal| journal.append_message(payload))
+    {
+        Ok(id) => Some(id),
+        Err(err) => {
+            eprintln!("failed to journal inbound NapCat chat message: {err}");
+            None
+        },
+    }
+}
+
+fn acknowledge_inbound_chat_message(journal: &NapcatInboundJournal, journal_id: Option<u64>) {
+    let Some(journal_id) = journal_id else { return };
+    if let Err(err) = journal
+        .0
+        .lock()
+        .map_err(|err| err.to_string())
+        .and_then(|mut journal| journal.acknowledge(journal_id))
+    {
+        eprintln!("failed to acknowledge persisted NapCat inbound message: {err}");
     }
 }
 
@@ -5925,6 +6140,7 @@ fn value_to_target_id(value: &Value) -> Option<String> {
 
 fn message_system(
     receiver: Res<NapcatIOReceiver>,
+    inbound_journal: Res<NapcatInboundJournal>,
     sender: Option<Res<NapcatIOSender>>,
     mut automatic_replies: ResMut<NapcatAutomaticReplyRequests>,
     mut group_info_requests: ResMut<NapcatGroupInfoRequests>,
@@ -5932,7 +6148,8 @@ fn message_system(
     scene_character_positions: Option<Res<SceneCharacterPositions>>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
 ) {
-    while let Ok(msg) = receiver.0.try_recv() {
+    while let Ok(envelope) = receiver.0.try_recv() {
+        let msg = envelope.message;
         let json_res = serde_json::from_str::<NapcatMessage>(&msg.to_string());
         if let Ok(mut json) = json_res {
             dbg!(&json);
@@ -5948,6 +6165,10 @@ fn message_system(
                 NapcatMessageType::Group => json.data.group_id.unwrap_or(json.data.user_id),
             };
             let target_id = target_id.to_string();
+            if napcat_message_is_already_stored(&manager, &target_id, &json) {
+                acknowledge_inbound_chat_message(&inbound_journal, envelope.journal_id);
+                continue;
+            }
             let is_new_target = !manager.messages.contains_key(&target_id);
             let is_incoming_message = json.data.user_id != json.data.self_id;
             let incoming_user_id = json.data.user_id;
@@ -6024,8 +6245,9 @@ fn message_system(
                 );
             }
 
-            if let Err(err) = manager.persist() {
-                eprintln!("failed to persist NapCat messages: {err}");
+            match persist_inbound_napcat_message(&manager) {
+                Ok(()) => acknowledge_inbound_chat_message(&inbound_journal, envelope.journal_id),
+                Err(err) => eprintln!("failed to durably persist NapCat messages: {err}"),
             }
 
             if let (Some(sender), Some(auto_forward)) = (sender.as_deref(), auto_forward) {
@@ -6060,6 +6282,31 @@ fn message_system(
             }
         }
     }
+}
+
+fn persist_inbound_napcat_message(
+    manager: &Persistent<NapcatMessageManager>,
+) -> Result<(), String> {
+    manager.persist().map_err(|err| err.to_string())?;
+    fs::File::open(NAPCAT_MESSAGES_PATH)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| err.to_string())
+}
+
+fn napcat_message_is_already_stored(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    message: &NapcatMessage,
+) -> bool {
+    let Some(message_id) = message.data.message_id.filter(|id| *id != 0) else {
+        return false;
+    };
+    manager.messages.get(target_id).is_some_and(|messages| {
+        messages.iter().any(|stored| {
+            stored.data.message_id == Some(message_id)
+                && stored.data.self_id == message.data.self_id
+        })
+    })
 }
 
 fn cache_message_images(message: &mut NapcatMessage) {
@@ -6237,6 +6484,7 @@ fn append_local_private_text_response_with_forwarded_attribution(
         data: NapcatMessageData {
             time,
             message_type: NapcatMessageType::Private,
+            message_id: None,
             message: message_segments,
             self_id,
             user_id: self_id,
@@ -8786,6 +9034,7 @@ mod tests {
             data: NapcatMessageData {
                 time: 1780132600,
                 message_type,
+                message_id: None,
                 message: vec![NapcatMessageChain {
                     variant: NapcatMessageChainType::Text {
                         data: TextData {
@@ -8816,6 +9065,7 @@ mod tests {
             data: NapcatMessageData {
                 time: 1780132600,
                 message_type: NapcatMessageType::Private,
+                message_id: None,
                 message: vec![NapcatMessageChain {
                     variant: NapcatMessageChainType::Image {
                         data: ImageData {
@@ -8844,6 +9094,62 @@ mod tests {
                 access_scope_resolved: false,
             },
         }
+    }
+
+    #[test]
+    fn inbound_journal_replays_only_messages_not_acknowledged_after_persist() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("inbound.jsonl");
+        let mut journal = InboundMessageJournal::new(path.clone());
+        assert!(journal.load_pending().unwrap().is_empty());
+
+        let first_id = journal.append_message("first".to_owned()).unwrap();
+        let second_id = journal.append_message("second".to_owned()).unwrap();
+        journal.acknowledge(first_id).unwrap();
+
+        let mut restarted = InboundMessageJournal::new(path);
+        assert_eq!(restarted.load_pending().unwrap(), vec![
+            (second_id, "second".to_owned())
+        ]);
+        let third_id = restarted.append_message("third".to_owned()).unwrap();
+        assert!(third_id > second_id);
+        restarted.acknowledge(second_id).unwrap();
+        restarted.acknowledge(third_id).unwrap();
+        assert_eq!(
+            fs::metadata(&restarted.path).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn replayed_journal_message_is_deduplicated_by_napcat_message_id() {
+        let mut manager = empty_manager();
+        let mut stored = test_private_message_from(42, "last message");
+        stored.data.message_id = Some(7001);
+        stored.data.self_id = 99;
+        manager
+            .messages
+            .insert("42".to_owned(), vec![stored.clone()]);
+
+        assert!(napcat_message_is_already_stored(
+            &manager, "42", &stored
+        ));
+
+        let mut different_account = stored.clone();
+        different_account.data.self_id = 100;
+        assert!(!napcat_message_is_already_stored(
+            &manager,
+            "42",
+            &different_account
+        ));
+
+        let mut legacy_without_id = stored;
+        legacy_without_id.data.message_id = None;
+        assert!(!napcat_message_is_already_stored(
+            &manager,
+            "42",
+            &legacy_without_id
+        ));
     }
 
     #[test]
