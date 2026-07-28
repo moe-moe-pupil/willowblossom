@@ -60,6 +60,7 @@ use serde::{
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::voxel::{
+    clear_campaign_possession_movement,
     VoxelCreativeItem,
     VoxelEditMode,
     VoxelEditorState,
@@ -67,6 +68,7 @@ use crate::voxel::{
     VoxelMinimapSnapshot,
     VoxelPlayerStandee,
     VoxelPossessionState,
+    VoxelPossessionMovementStore,
     VoxelTeleportDestination,
     MAX_VOXEL_BRUSH_RADIUS,
 };
@@ -738,6 +740,10 @@ use crate::{
         LEGACY_NEGATIVE_TIMEOUT_MS,
         NAPCAT_MANAGER_EXPORT_VERSION,
     },
+    replay::{
+        clear_campaign_replay_movement_history,
+        ReplayPlayerMovementHistory,
+    },
     rule_engine::{
         apply_skill_type_damage_default,
         legacy_moonberry_buff_machine_passive_buffs,
@@ -922,6 +928,8 @@ pub struct UiSystemLocals<'w, 's> {
     keyboard: Res<'w, ButtonInput<KeyCode>>,
     voxel_map_ui: Local<'s, VoxelMapUiState>,
     battle_store: Option<ResMut<'w, Persistent<BattleRoundStore>>>,
+    possession_movement_store: ResMut<'w, Persistent<VoxelPossessionMovementStore>>,
+    replay_movement_history: ResMut<'w, Persistent<ReplayPlayerMovementHistory>>,
     player_standees: Query<
         'w,
         's,
@@ -12415,6 +12423,8 @@ fn trpg_group_settings_window(
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
     scene_runtime: Option<&mut VoxelMapRuntimeState>,
     mut battle_store: Option<&mut Persistent<BattleRoundStore>>,
+    possession_movement_store: &mut Persistent<VoxelPossessionMovementStore>,
+    replay_movement_history: &mut Persistent<ReplayPlayerMovementHistory>,
     napcat_sender: Option<&NapcatIOSender>,
     ime: &mut ImeManager,
     chat_input_msgs: &mut Local<HashMap<String, String>>,
@@ -12671,7 +12681,7 @@ fn trpg_group_settings_window(
                                     if ui
                                         .button("确认清空测试进度")
                                         .on_hover_text(
-                                            "恢复玩家首轮前状态、轮次归零，并清空本活动聊天、DeepSeek总结和战斗轮；保留角色、团设和场景",
+                                            "恢复玩家首轮前状态、轮次归零，并清空本活动聊天、DeepSeek总结、战斗轮和玩家移动；保留角色、团设和场景",
                                         )
                                         .clicked()
                                     {
@@ -13299,13 +13309,19 @@ fn trpg_group_settings_window(
                     removed
                 })
                 .unwrap_or_default();
+            let removed_movements =
+                clear_campaign_possession_movement(possession_movement_store, &campaign_id);
+            possession_movement_store.persist().ok();
+            let removed_replay_movements =
+                clear_campaign_replay_movement_history(replay_movement_history, &campaign_id);
+            replay_movement_history.persist().ok();
             deepseek_manager.persist().ok();
             chat_input_msgs.retain(|target_id, _| !target_ids.contains(target_id));
             changed = true;
             state.group_reset_status.insert(
                 group_name,
                 format!(
-                    "测试进度已清空：恢复 {restored} 个玩家（缺少首轮前快照 {missing}），轮次{}，删除 {removed_messages} 条聊天、{removed_summaries} 个 DeepSeek 总结、{removed_battles} 个战斗轮；角色、团设和场景已保留",
+                    "测试进度已清空：恢复 {restored} 个玩家（缺少首轮前快照 {missing}），轮次{}，删除 {removed_messages} 条聊天、{removed_summaries} 个 DeepSeek 总结、{removed_battles} 个战斗轮、{removed_movements} 条移动状态、{removed_replay_movements} 条回放轨迹；角色、团设和场景已保留",
                     if turns_reset { "已归零" } else { "原本就是0" }
                 ),
             );
@@ -13445,6 +13461,8 @@ pub fn ui_system(
     let voxel_editor: &mut VoxelEditorState = &mut locals.voxel_editor;
     let voxel_possession: &mut VoxelPossessionState = &mut locals.voxel_possession;
     let battle_store = &mut locals.battle_store;
+    let possession_movement_store = &mut locals.possession_movement_store;
+    let replay_movement_history = &mut locals.replay_movement_history;
     let player_standees = &locals.player_standees;
 
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -13527,6 +13545,8 @@ pub fn ui_system(
         scene_store.as_deref_mut(),
         scene_runtime.as_deref_mut(),
         battle_store.as_deref_mut(),
+        possession_movement_store,
+        replay_movement_history,
         napcat_sender,
         &mut *ime,
         chat_input_msgs,

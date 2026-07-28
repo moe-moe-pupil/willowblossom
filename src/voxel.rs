@@ -378,7 +378,7 @@ struct PersistedVoxelPossessionMovement {
 }
 
 #[derive(Resource, Default, Serialize, Deserialize)]
-struct VoxelPossessionMovementStore {
+pub(crate) struct VoxelPossessionMovementStore {
     records: Vec<PersistedVoxelPossessionMovement>,
 }
 
@@ -8447,6 +8447,17 @@ fn upsert_possession_movement(
     }
 }
 
+pub(crate) fn clear_campaign_possession_movement(
+    store: &mut VoxelPossessionMovementStore,
+    campaign_id: &str,
+) -> usize {
+    let previous_len = store.records.len();
+    store
+        .records
+        .retain(|record| record.campaign_id != campaign_id);
+    previous_len - store.records.len()
+}
+
 fn clamp_horizontal_movement_step(
     previous: Vec3,
     current: Vec3,
@@ -11707,6 +11718,37 @@ mod tests {
         );
         assert!(possession_movement_record(&store, "campaign-a", 42, 8).is_none());
         assert!(possession_movement_record(&store, "campaign-b", 42, 7).is_none());
+    }
+
+    #[test]
+    fn clearing_test_progress_removes_only_matching_campaign_movement() {
+        let mut store = VoxelPossessionMovementStore {
+            records: vec![
+                PersistedVoxelPossessionMovement {
+                    campaign_id: "campaign-a".to_owned(),
+                    user_id: 1,
+                    turn: 2,
+                    movement_used: 3.0,
+                    completed: true,
+                    turn_start_position_cells: [1.0, 2.0, 3.0],
+                },
+                PersistedVoxelPossessionMovement {
+                    campaign_id: "campaign-b".to_owned(),
+                    user_id: 1,
+                    turn: 2,
+                    movement_used: 4.0,
+                    completed: true,
+                    turn_start_position_cells: [4.0, 5.0, 6.0],
+                },
+            ],
+        };
+
+        assert_eq!(
+            clear_campaign_possession_movement(&mut store, "campaign-a"),
+            1
+        );
+        assert_eq!(store.records.len(), 1);
+        assert_eq!(store.records[0].campaign_id, "campaign-b");
     }
 
     #[test]

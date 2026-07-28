@@ -222,10 +222,7 @@ impl Plugin for ReplayPlugin {
             )
             .add_systems(
                 EguiPrimaryContextPass,
-                (
-                    replay_studio_ui.after(ui::ui_system),
-                    replay_movement_timing_window.after(replay_studio_ui),
-                ),
+                replay_studio_ui.after(ui::ui_system),
             );
     }
 }
@@ -453,7 +450,7 @@ struct ReplayPlayerMovementKeyframe {
 }
 
 #[derive(Resource, Debug, Clone, Default, Serialize, Deserialize)]
-struct ReplayPlayerMovementHistory {
+pub(crate) struct ReplayPlayerMovementHistory {
     #[serde(default)]
     sessions: Vec<PersistedPlayerMovementSession>,
 }
@@ -477,6 +474,17 @@ struct PersistedPlayerMovementSession {
 struct PersistedPlayerMovementKeyframe {
     source_unix_ms: u64,
     position_cells: [f32; 3],
+}
+
+pub(crate) fn clear_campaign_replay_movement_history(
+    history: &mut ReplayPlayerMovementHistory,
+    campaign_id: &str,
+) -> usize {
+    let previous_len = history.sessions.len();
+    history
+        .sessions
+        .retain(|session| session.campaign_id != campaign_id);
+    previous_len - history.sessions.len()
 }
 
 #[derive(Resource, Default)]
@@ -2153,7 +2161,7 @@ fn replay_studio_ui(
     mut deepseek_manager: ResMut<Persistent<DeepseekManager>>,
     mut studio: ResMut<ReplayStudio>,
     mut voice_favorites: ResMut<Persistent<ReplayVoiceFavorites>>,
-    player_movement_history: Res<Persistent<ReplayPlayerMovementHistory>>,
+    mut player_movement_history: ResMut<Persistent<ReplayPlayerMovementHistory>>,
     speech: Res<PreviewSpeechController>,
     camera: Query<&Transform, With<VoxelViewportCamera>>,
     standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
@@ -2219,7 +2227,7 @@ fn replay_studio_ui(
                     &mut deepseek_manager,
                     &mut studio,
                     &voice_favorites,
-                    &player_movement_history,
+                    &mut player_movement_history,
                     &speech,
                     &camera,
                     &standees,
@@ -2288,7 +2296,7 @@ fn replay_controls(
     deepseek_manager: &mut Persistent<DeepseekManager>,
     studio: &mut ReplayStudio,
     voice_favorites: &ReplayVoiceFavorites,
-    player_movement_history: &ReplayPlayerMovementHistory,
+    player_movement_history: &mut Persistent<ReplayPlayerMovementHistory>,
     speech: &PreviewSpeechController,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
@@ -2542,7 +2550,7 @@ fn replay_controls(
         ));
     }
     replay_dialogue_editor(ui, studio, camera);
-
+    replay_movement_timing_editor(ui, studio, player_movement_history, camera);
     if !matches!(studio.mode, ReplayMode::Recording) && studio.replay.is_some() {
         let duration = studio.replay.as_ref().unwrap().duration_ms.max(1);
         ui.horizontal(|ui| {
@@ -4542,23 +4550,28 @@ fn replay_movement_timing_editor(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    if session_indices.is_empty() {
-        return;
-    }
-
     let mut changed = false;
-    ui.collapsing("玩家移动时序", |ui| {
-        ui.small("移动轨迹会持久绑定到所选台词；从该句开始播放并等待延迟后启动。重新“从现有聊天生成”仍会保留。");
+    let mut deleted_sessions = Vec::new();
+    ui.collapsing(format!("玩家移动数据与时序（{} 条）", session_indices.len()), |ui| {
+        ui.small("DM 可编辑轨迹帧、开始台词和延迟；重新“从现有聊天生成”仍会应用这些持久数据。坐标单位为体素格。");
+        if session_indices.is_empty() {
+            ui.label("当前回放没有已保存的玩家移动数据。");
+        }
         for (display_index, session_index) in session_indices.iter().copied().enumerate() {
             let session = &mut history.sessions[session_index];
             ui.group(|ui| {
-                ui.label(format!(
-                    "{}. 玩家 {} · 回合 {} · {} 帧",
-                    display_index + 1,
-                    session.user_id,
-                    session.turn_index,
-                    session.keyframes.len()
-                ));
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "{}. 玩家 {} · 回合 {} · {} 帧",
+                        display_index + 1,
+                        session.user_id,
+                        session.turn_index,
+                        session.keyframes.len()
+                    ));
+                    if ui.button("删除轨迹").clicked() {
+                        deleted_sessions.push(session_index);
+                    }
+                });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("开始于台词");
                     let mut selected = (
@@ -4607,9 +4620,60 @@ fn replay_movement_timing_editor(
                         )
                         .changed();
                 });
+                let first_source_unix_ms = session
+                    .keyframes
+                    .first()
+                    .map(|frame| frame.source_unix_ms)
+                    .unwrap_or_default();
+                ui.collapsing("轨迹帧", |ui| {
+                    let mut minimum_offset_ms = 0;
+                    for (frame_index, frame) in session.keyframes.iter_mut().enumerate() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.monospace(format!("#{}", frame_index + 1));
+                            let mut offset_ms =
+                                frame.source_unix_ms.saturating_sub(first_source_unix_ms);
+                            if frame_index == 0 {
+                                ui.label("+0 ms");
+                            } else {
+                                let response = ui.add(
+                                    egui::DragValue::new(&mut offset_ms)
+                                        .range(minimum_offset_ms..=600_000)
+                                        .speed(50)
+                                        .prefix("+")
+                                        .suffix(" ms"),
+                                );
+                                if response.changed() {
+                                    frame.source_unix_ms =
+                                        first_source_unix_ms.saturating_add(offset_ms);
+                                    changed = true;
+                                }
+                            }
+                            for (axis, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+                                ui.label(label);
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut frame.position_cells[axis],
+                                        )
+                                        .range(-1_000_000.0..=1_000_000.0)
+                                        .speed(0.25)
+                                        .fixed_decimals(2),
+                                    )
+                                    .changed();
+                            }
+                            minimum_offset_ms = offset_ms;
+                        });
+                    }
+                });
             });
         }
     });
+    deleted_sessions.sort_unstable();
+    deleted_sessions.dedup();
+    for session_index in deleted_sessions.into_iter().rev() {
+        history.sessions.remove(session_index);
+        changed = true;
+    }
 
     if !changed {
         return;
@@ -4652,26 +4716,7 @@ fn replay_movement_timing_editor(
         );
     }
     studio.playback_ms = 0;
-    studio.status = "已保存玩家移动的开始台词与延迟".to_owned();
-}
-
-fn replay_movement_timing_window(
-    mut contexts: EguiContexts,
-    mut studio: ResMut<ReplayStudio>,
-    mut history: ResMut<Persistent<ReplayPlayerMovementHistory>>,
-    camera: Query<&Transform, With<VoxelViewportCamera>>,
-) {
-    if !studio.panel_open || studio.replay.is_none() {
-        return;
-    }
-    let Ok(ctx) = contexts.ctx_mut() else { return };
-    egui::Window::new("玩家移动时序")
-        .id(egui::Id::new("trpg-replay-movement-timing"))
-        .default_width(520.0)
-        .resizable(true)
-        .show(ctx, |ui| {
-            replay_movement_timing_editor(ui, &mut studio, &mut history, &camera);
-        });
+    studio.status = "已保存玩家移动轨迹、开始台词与延迟".to_owned();
 }
 
 fn stop_playback(studio: &mut ReplayStudio, grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>) {
@@ -8658,6 +8703,31 @@ mod tests {
                 .map(|frame| frame.time_ms)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn clearing_test_progress_removes_only_matching_campaign_replay_movement() {
+        let mut history = ReplayPlayerMovementHistory {
+            sessions: vec![
+                PersistedPlayerMovementSession {
+                    campaign_id: "campaign-a".to_owned(),
+                    user_id: 42,
+                    ..default()
+                },
+                PersistedPlayerMovementSession {
+                    campaign_id: "campaign-b".to_owned(),
+                    user_id: 42,
+                    ..default()
+                },
+            ],
+        };
+
+        assert_eq!(
+            clear_campaign_replay_movement_history(&mut history, "campaign-a"),
+            1
+        );
+        assert_eq!(history.sessions.len(), 1);
+        assert_eq!(history.sessions[0].campaign_id, "campaign-b");
     }
 
     #[test]
