@@ -105,7 +105,6 @@ use crate::{
         VoxelPlayerStandee,
         VoxelReplayOcclusionFade,
         VoxelViewportCamera,
-        DEFAULT_VOXEL_OCCLUSION_OPACITY,
         VOXEL_SIZE,
     },
 };
@@ -1852,7 +1851,6 @@ fn replay_studio_ui(
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut capture_active: ResMut<ReplayVideoCaptureActive>,
-    mut occlusion_fade: Option<ResMut<VoxelReplayOcclusionFade>>,
     mut avatar_textures: Local<HashMap<String, egui::TextureHandle>>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else { return };
@@ -1898,7 +1896,6 @@ fn replay_studio_ui(
                     &mut grids,
                     &mut windows,
                     &mut capture_active,
-                    occlusion_fade.as_deref_mut(),
                 )
             });
         studio.panel_open = open;
@@ -1941,7 +1938,6 @@ fn replay_controls(
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
     capture_active: &mut ReplayVideoCaptureActive,
-    occlusion_fade: Option<&mut VoxelReplayOcclusionFade>,
 ) {
     ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
     ui.separator();
@@ -1991,20 +1987,6 @@ fn replay_controls(
         "录制 DM 自由镜头（默认关闭，点击后才采集）",
     )
     .on_hover_text("关闭时只记录场景和台词，不持续采集你的镜头移动。");
-    if let Some(fade) = occlusion_fade {
-        ui.horizontal(|ui| {
-            ui.label("穿墙透明度");
-            ui.add(
-                egui::Slider::new(&mut fade.opacity, 0.0..=1.0)
-                    .fixed_decimals(2)
-                    .show_value(true),
-            )
-            .on_hover_text("调整回放镜头前方遮挡墙面的可见度；地板不会被透明化。");
-            if ui.small_button("默认").clicked() {
-                fade.opacity = DEFAULT_VOXEL_OCCLUSION_OPACITY;
-            }
-        });
-    }
     let mut requested_camera_distance = studio.camera_distance_scale;
     let camera_distance_changed = ui
         .horizontal(|ui| {

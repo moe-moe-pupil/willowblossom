@@ -180,7 +180,6 @@ const PLANET_SCIENCE_LAB_FLOOR_Y: i32 = 485;
 const VOXEL_MINIMAP_RESOLUTION: usize = 64;
 const VOXEL_OCCLUSION_FADE_SHADER: &str = "shaders/voxel_occlusion_fade.wgsl";
 const VOXEL_OCCLUSION_FOCUS_RADIUS: f32 = PLAYER_STANDEE_HEIGHT;
-pub(crate) const DEFAULT_VOXEL_OCCLUSION_OPACITY: f32 = 0.2;
 
 pub struct TrpgVoxelPlugin;
 
@@ -188,28 +187,16 @@ pub struct TrpgVoxelConnector;
 
 type VoxelFadeMaterial = ExtendedMaterial<StandardMaterial, VoxelOcclusionFadeExtension>;
 
-#[derive(Resource, Debug, Clone, Copy)]
+#[derive(Resource, Debug, Clone, Copy, Default)]
 pub(crate) struct VoxelReplayOcclusionFade {
     pub(crate) active: bool,
     pub(crate) camera: Vec3,
     pub(crate) focus: Vec3,
-    pub(crate) opacity: f32,
-}
-
-impl Default for VoxelReplayOcclusionFade {
-    fn default() -> Self {
-        Self {
-            active: false,
-            camera: Vec3::ZERO,
-            focus: Vec3::ZERO,
-            opacity: DEFAULT_VOXEL_OCCLUSION_OPACITY,
-        }
-    }
 }
 
 #[derive(ShaderType, Reflect, Debug, Clone, Copy, Default)]
 struct VoxelOcclusionFadeUniform {
-    camera_and_opacity: Vec4,
+    camera_and_active: Vec4,
     focus_and_radius: Vec4,
 }
 
@@ -229,7 +216,6 @@ impl VoxelOcclusionFadeExtension {
     fn new() -> Self {
         Self {
             settings: VoxelOcclusionFadeUniform {
-                camera_and_opacity: Vec4::W,
                 focus_and_radius: Vec4::new(
                     0.0,
                     0.0,
@@ -239,13 +225,6 @@ impl VoxelOcclusionFadeExtension {
                 ..default()
             },
         }
-    }
-}
-
-fn voxel_fade_material(base: StandardMaterial) -> VoxelFadeMaterial {
-    ExtendedMaterial {
-        base,
-        extension: VoxelOcclusionFadeExtension::new(),
     }
 }
 
@@ -2149,12 +2128,21 @@ fn setup_voxel_materials(
             },
             _ => {},
         }
-        fade_handles[index] = fade_materials.add(voxel_fade_material(material.clone()));
+        let mut fade_material = material.clone();
+        fade_material.alpha_mode = AlphaMode::Blend;
+        fade_handles[index] = fade_materials.add(ExtendedMaterial {
+            base: fade_material,
+            extension: VoxelOcclusionFadeExtension::new(),
+        });
         materials.add(material)
     });
     let planet_ocean_material = opaque_planet_ocean_material(textures[3].clone());
-    let fade_planet_ocean =
-        fade_materials.add(voxel_fade_material(planet_ocean_material.clone()));
+    let mut fade_planet_ocean_material = planet_ocean_material.clone();
+    fade_planet_ocean_material.alpha_mode = AlphaMode::Blend;
+    let fade_planet_ocean = fade_materials.add(ExtendedMaterial {
+        base: fade_planet_ocean_material,
+        extension: VoxelOcclusionFadeExtension::new(),
+    });
     let planet_ocean = materials.add(planet_ocean_material);
     commands.insert_resource(VoxelMaterials {
         handles,
@@ -5774,11 +5762,7 @@ fn sync_voxel_occlusion_fade(
     >,
 ) {
     let settings = VoxelOcclusionFadeUniform {
-        camera_and_opacity: fade.camera.extend(if fade.active {
-            fade.opacity.clamp(0.0, 1.0)
-        } else {
-            1.0
-        }),
+        camera_and_active: fade.camera.extend(f32::from(fade.active)),
         focus_and_radius: fade.focus.extend(VOXEL_OCCLUSION_FOCUS_RADIUS),
     };
     for handle in fade_materials.handles.iter().chain(std::iter::once(
@@ -9734,7 +9718,6 @@ mod tests {
             active: false,
             camera: Vec3::new(1.0, 2.0, 3.0),
             focus: Vec3::new(4.0, 5.0, 6.0),
-            opacity: DEFAULT_VOXEL_OCCLUSION_OPACITY,
         })
         .add_systems(Update, sync_voxel_occlusion_fade);
         let voxel = app
@@ -9796,13 +9779,8 @@ mod tests {
         {
             let settings = assets.get(handle).unwrap().extension.settings;
             assert_eq!(
-                settings.camera_and_opacity,
-                Vec4::new(
-                    1.0,
-                    2.0,
-                    3.0,
-                    DEFAULT_VOXEL_OCCLUSION_OPACITY
-                )
+                settings.camera_and_active,
+                Vec4::new(1.0, 2.0, 3.0, 1.0)
             );
             assert_eq!(
                 settings.focus_and_radius,
@@ -9817,22 +9795,6 @@ mod tests {
 
         app.world_mut()
             .resource_mut::<VoxelReplayOcclusionFade>()
-            .opacity = 0.65;
-        app.update();
-        let assets = app.world().resource::<Assets<VoxelFadeMaterial>>();
-        assert_eq!(
-            assets
-                .get(&fade_handles[0])
-                .unwrap()
-                .extension
-                .settings
-                .camera_and_opacity
-                .w,
-            0.65
-        );
-
-        app.world_mut()
-            .resource_mut::<VoxelReplayOcclusionFade>()
             .active = false;
         app.update();
         assert!(app
@@ -9843,18 +9805,6 @@ mod tests {
             .world()
             .entity(voxel)
             .contains::<MeshMaterial3d<VoxelFadeMaterial>>());
-    }
-
-    #[test]
-    fn replay_fade_preserves_opaque_depth_mode_for_mixed_wall_and_floor_meshes() {
-        let opaque = voxel_fade_material(StandardMaterial::default());
-        assert!(matches!(opaque.base.alpha_mode, AlphaMode::Opaque));
-
-        let blended = voxel_fade_material(StandardMaterial {
-            alpha_mode: AlphaMode::Blend,
-            ..default()
-        });
-        assert!(matches!(blended.base.alpha_mode, AlphaMode::Blend));
     }
 
     #[test]
