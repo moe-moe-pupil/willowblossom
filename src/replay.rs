@@ -4625,7 +4625,9 @@ fn replay_movement_timing_editor(
                     .first()
                     .map(|frame| frame.source_unix_ms)
                     .unwrap_or_default();
-                ui.collapsing("轨迹帧", |ui| {
+                egui::CollapsingHeader::new("轨迹帧")
+                    .id_salt(("replay-movement-keyframes", session_index))
+                    .show(ui, |ui| {
                     let mut minimum_offset_ms = 0;
                     for (frame_index, frame) in session.keyframes.iter_mut().enumerate() {
                         ui.horizontal_wrapped(|ui| {
