@@ -36,6 +36,7 @@
 
 struct VoxelOcclusionFadeSettings {
     camera_and_target_count: vec4<f32>,
+    opacity: vec4<f32>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100)
@@ -90,9 +91,16 @@ fn fragment(
 
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     let target_count = u32(fade_settings.camera_and_target_count.w);
-    for (var target_index = 0u; target_index < target_count; target_index += 1u) {
-        if inside_player_sightline(in.world_position.xyz, fade_targets[target_index]) {
-            discard;
+    let is_horizontal_surface = abs(pbr_input.N.y) >= 0.75;
+    if !is_horizontal_surface {
+        for (var target_index = 0u; target_index < target_count; target_index += 1u) {
+            if inside_player_sightline(in.world_position.xyz, fade_targets[target_index]) {
+                if fade_settings.opacity.x <= 0.001 {
+                    discard;
+                }
+                pbr_input.material.base_color.a *= fade_settings.opacity.x;
+                break;
+            }
         }
     }
     pbr_input.material.base_color =

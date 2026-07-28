@@ -534,6 +534,7 @@ pub(crate) struct ReplayStudio {
     playback_ms: u64,
     playback_speed: f32,
     camera_distance_scale: f32,
+    occlusion_opacity: f32,
     record_camera_enabled: bool,
     deepseek_director_enabled: bool,
     director_response_hash: Option<u64>,
@@ -642,6 +643,7 @@ impl Default for ReplayStudio {
             playback_ms: 0,
             playback_speed: 1.0,
             camera_distance_scale: default_directed_camera_distance_scale(),
+            occlusion_opacity: 0.0,
             record_camera_enabled: false,
             deepseek_director_enabled: false,
             director_response_hash: None,
@@ -1775,6 +1777,7 @@ fn apply_replay_camera(
     if let Some(fade) = fade.as_mut() {
         fade.active = false;
         fade.targets.clear();
+        fade.opacity = studio.occlusion_opacity;
     }
     if !matches!(
         studio.mode,
@@ -2001,6 +2004,12 @@ fn replay_controls(
             studio.camera_distance_scale
         );
     }
+    ui.add(
+        egui::Slider::new(&mut studio.occlusion_opacity, 0.0..=1.0)
+            .text("穿墙遮挡不透明度")
+            .fixed_decimals(2),
+    )
+    .on_hover_text("仅调整挡住玩家的墙面；0 为完全看穿，1 为不透明。地板和天花板不会被穿透。");
 
     ui.horizontal(|ui| match studio.mode {
         ReplayMode::Recording => {

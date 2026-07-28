@@ -193,11 +193,13 @@ pub(crate) struct VoxelReplayOcclusionFade {
     pub(crate) active: bool,
     pub(crate) camera: Vec3,
     pub(crate) targets: Vec<Vec3>,
+    pub(crate) opacity: f32,
 }
 
 #[derive(ShaderType, Reflect, Debug, Clone, Copy, Default)]
 struct VoxelOcclusionFadeUniform {
     camera_and_target_count: Vec4,
+    opacity: Vec4,
 }
 
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
@@ -5764,6 +5766,12 @@ fn sync_voxel_occlusion_fade(
     let target_count = if fade.active { fade.targets.len() } else { 0 };
     let settings = VoxelOcclusionFadeUniform {
         camera_and_target_count: fade.camera.extend(target_count as f32),
+        opacity: Vec4::new(
+            fade.opacity.clamp(0.0, 1.0),
+            0.0,
+            0.0,
+            0.0,
+        ),
     };
     if let Some(mut buffer) = storage_buffers.get_mut(&fade_materials.targets) {
         let targets = if target_count == 0 {
@@ -9765,6 +9773,7 @@ mod tests {
             active: false,
             camera: Vec3::new(1.0, 2.0, 3.0),
             targets: vec![Vec3::new(4.0, 5.0, 6.0), Vec3::new(-4.0, 5.0, 6.0)],
+            opacity: 0.35,
         })
         .add_systems(Update, sync_voxel_occlusion_fade);
         let voxel = app
@@ -9858,6 +9867,10 @@ mod tests {
                 Vec4::new(1.0, 2.0, 3.0, 2.0)
             );
             assert_eq!(
+                settings.opacity,
+                Vec4::new(0.35, 0.0, 0.0, 0.0)
+            );
+            assert_eq!(
                 assets.get(handle).unwrap().extension.targets,
                 fade_targets
             );
@@ -9897,6 +9910,14 @@ mod tests {
             &bounds,
             &off_axis_transform,
         ));
+    }
+
+    #[test]
+    fn replay_fade_shader_preserves_floors_and_applies_dm_opacity() {
+        let shader = include_str!("../assets/shaders/voxel_occlusion_fade.wgsl");
+
+        assert!(shader.contains("abs(pbr_input.N.y) >= 0.75"));
+        assert!(shader.contains("base_color.a *= fade_settings.opacity.x"));
     }
 
     #[test]
