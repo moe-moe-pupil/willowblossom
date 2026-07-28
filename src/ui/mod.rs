@@ -101,6 +101,7 @@ const NAPCAT_CHAT_LIST_EXPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/exports/chat_list_export.json";
 const NAPCAT_UNIT_POOL_EXPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/exports/unit_pool_export.json";
+const CONTENT_POOL_BUNDLE_DEFAULT_PATH: &str = ".data/willowblossom/exports/content_pools.json";
 const NAPCAT_MOONBERRY_LEGACY_IMPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/imports/moonberry_legacy.json";
 const DEEPSEEK_SUMMARY_EXPORT_DEFAULT_PATH: &str =
@@ -681,6 +682,7 @@ use crate::{
         character_physical_damage_lifesteal,
         character_spell_range_multiplier,
         character_wounded_healing_dealt_modifier,
+        content_pool_generation_prompt,
         dying_target_healing_multiplier,
         grant_character_experience,
         is_scene_capture_command_text,
@@ -693,7 +695,6 @@ use crate::{
         record_character_damage_taken,
         record_character_healing_taken,
         reset_character_turn_totals,
-        seed_experience_test_pools,
         skill_rule_args,
         update_character_from_status,
         update_character_from_status_with_config,
@@ -818,14 +819,18 @@ pub(crate) struct TrpgGroupSettingsState {
     pool_window_tab: PoolWindowTab,
     new_group_name: String,
     new_random_pool_name: String,
+    new_random_pool_category: String,
     random_pool_award_target: String,
     random_pool_broadcast_scope: String,
     random_pool_batch_count: u32,
     random_pool_send_status: String,
     random_pool_group_filter: String,
     random_pool_tag_filter: String,
-    test_pool_seed_status: String,
+    random_pool_category_filter: String,
     new_unit_id: String,
+    unit_pool_category_filter: String,
+    skill_pool_category_filter: String,
+    item_pool_category_filter: String,
     unit_pool_source_target: String,
     focused_group_name: Option<String>,
     pending_character_delete: Option<String>,
@@ -853,6 +858,9 @@ pub(crate) struct TrpgGroupSettingsState {
     pc_export_path: String,
     chat_list_export_path: String,
     unit_pool_export_path: String,
+    content_pool_bundle_path: String,
+    content_pool_bundle_status: String,
+    content_pool_generation_prompt: String,
     moonberry_legacy_import_path: String,
     deepseek_summary_export_path: String,
     voxel_scene_export_path: String,
@@ -1372,6 +1380,16 @@ fn pool_management_window(
                 );
             });
             ui.separator();
+            if matches!(
+                state.pool_window_tab,
+                PoolWindowTab::Random
+                    | PoolWindowTab::Unit
+                    | PoolWindowTab::Skill
+                    | PoolWindowTab::Item
+            ) {
+                changed |= content_pool_bundle_ui(ui, manager, state);
+                ui.separator();
+            }
             egui::ScrollArea::vertical()
                 .id_salt("pool_management_scroll")
                 .show(ui, |ui| match state.pool_window_tab {
@@ -1416,6 +1434,93 @@ fn pool_management_window(
     if changed {
         manager.persist().ok();
     }
+}
+
+fn content_pool_bundle_ui(
+    ui: &mut Ui,
+    manager: &mut NapcatMessageManager,
+    state: &mut TrpgGroupSettingsState,
+) -> bool {
+    if state.content_pool_bundle_path.trim().is_empty() {
+        state.content_pool_bundle_path = CONTENT_POOL_BUNDLE_DEFAULT_PATH.to_owned();
+    }
+
+    let mut changed = false;
+    ui.collapsing(
+        "内容池导入 / 导出 / DeepSeek生成",
+        |ui| {
+            ui.small(
+                "同一JSON包包含单位、技能、物品和随机池；导入时按ID或“分类+名称”更新同名内容。",
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label("JSON路径");
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.content_pool_bundle_path)
+                        .desired_width(360.0),
+                );
+                if ui.button("导出全部内容池").clicked() {
+                    state.content_pool_bundle_status = match write_text_export(
+                        &state.content_pool_bundle_path,
+                        manager.to_content_pool_bundle_json(),
+                    ) {
+                        Ok(()) => format!(
+                            "已导出：{}",
+                            state.content_pool_bundle_path
+                        ),
+                        Err(err) => format!("导出失败：{err}"),
+                    };
+                }
+                if ui.button("导入内容池").clicked() {
+                    state.content_pool_bundle_status =
+                        match read_text_import(&state.content_pool_bundle_path)
+                            .and_then(|text| manager.merge_content_pool_bundle_json(&text))
+                        {
+                            Ok(summary) => {
+                                changed = true;
+                                format!(
+                                    "已导入：单位{}、技能{}、物品{}、随机池{}",
+                                    summary.units,
+                                    summary.skills,
+                                    summary.items,
+                                    summary.random_pools
+                                )
+                            },
+                            Err(err) => format!("导入失败：{err}"),
+                        };
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("生成DeepSeek提示词").clicked() {
+                    state.content_pool_generation_prompt = content_pool_generation_prompt();
+                    state.content_pool_bundle_status =
+                        "已生成提示词；交给DeepSeek后，将其纯JSON输出保存到上方路径再导入。"
+                            .to_owned();
+                }
+                if ui
+                    .add_enabled(
+                        !state.content_pool_generation_prompt.is_empty(),
+                        egui::Button::new("复制给DeepSeek"),
+                    )
+                    .clicked()
+                {
+                    ui.ctx()
+                        .copy_text(state.content_pool_generation_prompt.clone());
+                    state.content_pool_bundle_status = "提示词已复制。".to_owned();
+                }
+            });
+            if !state.content_pool_generation_prompt.is_empty() {
+                ui.add(
+                    egui::TextEdit::multiline(&mut state.content_pool_generation_prompt)
+                        .desired_rows(8)
+                        .desired_width(ui.available_width()),
+                );
+            }
+            if !state.content_pool_bundle_status.is_empty() {
+                ui.small(&state.content_pool_bundle_status);
+            }
+        },
+    );
+    changed
 }
 
 fn pool_target_list_ui(
@@ -8951,6 +9056,56 @@ fn format_buff_effect(effect: &BuffEffect) -> String {
 const RANDOM_POOL_FILTER_ALL: &str = "__all__";
 const RANDOM_POOL_FILTER_UNGROUPED: &str = "__ungrouped__";
 const RANDOM_POOL_FILTER_UNTAGGED: &str = "__untagged__";
+const POOL_CATEGORY_ALL: &str = "__all_categories__";
+const POOL_CATEGORY_UNCATEGORIZED: &str = "__uncategorized__";
+
+fn pool_category_options(categories: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut categories = categories
+        .into_iter()
+        .map(|category| category.trim().to_owned())
+        .filter(|category| !category.is_empty())
+        .collect::<Vec<_>>();
+    categories.sort();
+    categories.dedup();
+    categories
+}
+
+fn pool_category_matches(category: &str, filter: &str) -> bool {
+    filter.is_empty()
+        || filter == POOL_CATEGORY_ALL
+        || (filter == POOL_CATEGORY_UNCATEGORIZED && category.trim().is_empty())
+        || category.trim() == filter
+}
+
+fn pool_category_filter_ui(ui: &mut Ui, id: &str, filter: &mut String, categories: &[String]) {
+    if filter.is_empty() {
+        *filter = POOL_CATEGORY_ALL.to_owned();
+    }
+    let selected = if filter == POOL_CATEGORY_ALL {
+        "全部分类"
+    } else if filter == POOL_CATEGORY_UNCATEGORIZED {
+        "未分类"
+    } else {
+        filter.as_str()
+    };
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                filter,
+                POOL_CATEGORY_ALL.to_owned(),
+                "全部分类",
+            );
+            ui.selectable_value(
+                filter,
+                POOL_CATEGORY_UNCATEGORIZED.to_owned(),
+                "未分类",
+            );
+            for category in categories {
+                ui.selectable_value(filter, category.clone(), category);
+            }
+        });
+}
 
 fn random_pool_tag_tokens(tags: &str) -> Vec<String> {
     let mut tokens = tags
@@ -9014,7 +9169,14 @@ fn random_pool_matches_filters(pool: &RandomPool, group_filter: &str, tag_filter
 }
 
 fn random_pool_metadata_summary(pool: &RandomPool) -> String {
-    let mut parts = vec![random_pool_group_label(pool.legacy_group)];
+    let mut parts = vec![if pool.category.trim().is_empty() {
+        "未分类".to_owned()
+    } else {
+        format!("分类 {}", pool.category.trim())
+    }];
+    parts.push(random_pool_group_label(
+        pool.legacy_group,
+    ));
     let tags = random_pool_tag_tokens(&pool.tags);
     if !tags.is_empty() {
         parts.push(format!("标签 {}", tags.join(" ")));
@@ -9030,6 +9192,12 @@ fn random_pool_metadata_summary(pool: &RandomPool) -> String {
 
 fn random_pool_metadata_editor_ui(ui: &mut Ui, pool: &mut RandomPool) -> bool {
     let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("分类");
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut pool.category).desired_width(140.0))
+            .changed();
+    });
     ui.collapsing("月莓旧随机池元数据", |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label("旧ID");
@@ -9097,17 +9265,24 @@ fn random_pool_settings_ui(
     let mut changed = false;
 
     ui.heading("随机池");
-    changed |= experience_test_pool_seed_ui(ui, manager, state);
     ui.horizontal_wrapped(|ui| {
         ui.label("池名");
         ui.text_edit_singleline(&mut state.new_random_pool_name);
+        ui.label("分类");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.new_random_pool_category).desired_width(120.0),
+        );
         if ui.button("创建随机池").clicked() {
             let name = state.new_random_pool_name.trim();
             if !name.is_empty() {
+                let category = state.new_random_pool_category.trim().to_owned();
                 manager
                     .random_pools
                     .entry(name.to_owned())
-                    .or_insert_with(RandomPool::default);
+                    .or_insert_with(|| RandomPool {
+                        category,
+                        ..Default::default()
+                    });
                 state.new_random_pool_name.clear();
                 changed = true;
             }
@@ -9139,6 +9314,12 @@ fn random_pool_settings_ui(
     });
 
     let (group_filter_options, tag_filter_options) = random_pool_filter_options(manager);
+    let category_filter_options = pool_category_options(
+        manager
+            .random_pools
+            .values()
+            .map(|pool| pool.category.clone()),
+    );
     if state.random_pool_group_filter.is_empty() {
         state.random_pool_group_filter = RANDOM_POOL_FILTER_ALL.to_owned();
     }
@@ -9146,6 +9327,13 @@ fn random_pool_settings_ui(
         state.random_pool_tag_filter = RANDOM_POOL_FILTER_ALL.to_owned();
     }
     ui.horizontal_wrapped(|ui| {
+        ui.label("分类");
+        pool_category_filter_ui(
+            ui,
+            "random_pool_category_filter",
+            &mut state.random_pool_category_filter,
+            &category_filter_options,
+        );
         egui::ComboBox::from_label("旧分组筛选")
             .selected_text(
                 if state.random_pool_group_filter == RANDOM_POOL_FILTER_ALL {
@@ -9269,6 +9457,9 @@ fn random_pool_settings_ui(
                 pool,
                 &state.random_pool_group_filter,
                 &state.random_pool_tag_filter,
+            ) && pool_category_matches(
+                &pool.category,
+                &state.random_pool_category_filter,
             )
         })
         .map(|(pool_name, _)| pool_name.clone())
@@ -9936,7 +10127,6 @@ fn unit_pool_settings_ui(
     let mut changed = false;
 
     ui.heading("单位池");
-    changed |= experience_test_pool_seed_ui(ui, manager, state);
     ui.horizontal_wrapped(|ui| {
         ui.label("单位ID");
         ui.add(egui::TextEdit::singleline(&mut state.new_unit_id).desired_width(140.0));
@@ -9991,6 +10181,7 @@ fn unit_pool_settings_ui(
                 };
                 if let Some(character) = manager.player_characters.get(&source_id).cloned() {
                     let mut unit = UnitPoolEntry {
+                        category: state.unit_pool_draft.category.clone(),
                         label: target_display_name(manager, &source_id),
                         note: "从玩家角色复制".to_owned(),
                         legacy_member_id: None,
@@ -10009,10 +10200,35 @@ fn unit_pool_settings_ui(
         ui.small("还没有可复制的玩家角色。");
     }
 
-    let mut unit_ids = manager.unit_pool.keys().cloned().collect::<Vec<_>>();
+    let category_options =
+        pool_category_options(manager.unit_pool.values().map(|unit| unit.category.clone()));
+    ui.horizontal_wrapped(|ui| {
+        ui.label("分类筛选");
+        pool_category_filter_ui(
+            ui,
+            "unit_pool_category_filter",
+            &mut state.unit_pool_category_filter,
+            &category_options,
+        );
+    });
+    let mut unit_ids = manager
+        .unit_pool
+        .iter()
+        .filter(|(_, unit)| {
+            pool_category_matches(
+                &unit.category,
+                &state.unit_pool_category_filter,
+            )
+        })
+        .map(|(unit_id, _)| unit_id.clone())
+        .collect::<Vec<_>>();
     unit_ids.sort();
     if unit_ids.is_empty() {
-        ui.label("还没有单位模板。");
+        ui.label(if manager.unit_pool.is_empty() {
+            "还没有单位模板。"
+        } else {
+            "当前分类下没有单位模板。"
+        });
         return changed;
     }
 
@@ -10174,6 +10390,10 @@ fn unit_pool_entry_editor_ui(ui: &mut Ui, unit_id: &str, unit: &mut UnitPoolEntr
     let mut changed = false;
 
     ui.horizontal_wrapped(|ui| {
+        ui.label("分类");
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut unit.category).desired_width(120.0))
+            .changed();
         ui.label("显示名");
         changed |= ui
             .add(egui::TextEdit::singleline(&mut unit.label).desired_width(160.0))
@@ -10459,6 +10679,21 @@ fn skill_pool_settings_ui(
             changed |= manager.sync_skill_pool_from_completed_characters();
         }
     });
+    let category_options = pool_category_options(
+        manager
+            .skill_pool
+            .iter()
+            .map(|entry| entry.category.as_deref().unwrap_or_default().to_owned()),
+    );
+    ui.horizontal_wrapped(|ui| {
+        ui.label("分类筛选");
+        pool_category_filter_ui(
+            ui,
+            "skill_pool_category_filter",
+            &mut state.skill_pool_category_filter,
+            &category_options,
+        );
+    });
 
     if manager.skill_pool.is_empty() {
         ui.label("还没有技能。完成角色兑换后，技能会自动进入这里。");
@@ -10482,9 +10717,23 @@ fn skill_pool_settings_ui(
                         ui.strong("操作");
                         ui.end_row();
 
-                        for (index, entry) in manager.skill_pool.iter().enumerate() {
+                        for (index, entry) in
+                            manager
+                                .skill_pool
+                                .iter_mut()
+                                .enumerate()
+                                .filter(|(_, entry)| {
+                                    pool_category_matches(
+                                        entry.category.as_deref().unwrap_or_default(),
+                                        &state.skill_pool_category_filter,
+                                    )
+                                })
+                        {
                             ui.label(skill_pool_entry_name(entry));
-                            ui.small(skill_pool_entry_category_label(entry));
+                            let category = entry.category.get_or_insert_with(String::new);
+                            changed |= ui
+                                .add(egui::TextEdit::singleline(category).desired_width(100.0))
+                                .changed();
                             ui.small(skill_pool_entry_tags_label(entry));
                             ui.small(entry.source_character_name.as_deref().unwrap_or("手动"));
                             ui.label(format_character_number(entry.mp_cost));
@@ -10598,8 +10847,18 @@ fn item_pool_settings_ui(
 ) -> bool {
     let mut changed = false;
     ui.heading("物品池");
-    changed |= experience_test_pool_seed_ui(ui, manager, state);
     ui.small("物品池是GM模板库；发给玩家时会复制一份，装备后属性加成立即进入最终数值。");
+    let category_options =
+        pool_category_options(manager.item_pool.iter().map(|item| item.category.clone()));
+    ui.horizontal_wrapped(|ui| {
+        ui.label("分类筛选");
+        pool_category_filter_ui(
+            ui,
+            "item_pool_category_filter",
+            &mut state.item_pool_category_filter,
+            &category_options,
+        );
+    });
 
     if !player_targets.is_empty() {
         if !player_targets.contains(&state.item_pool_award_target) {
@@ -10623,7 +10882,17 @@ fn item_pool_settings_ui(
 
     let mut remove_index = None;
     let mut award_index = None;
-    for (index, item) in manager.item_pool.iter_mut().enumerate() {
+    for (index, item) in manager
+        .item_pool
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, item)| {
+            pool_category_matches(
+                &item.category,
+                &state.item_pool_category_filter,
+            )
+        })
+    {
         ui.push_id(("item_pool_entry", index), |ui| {
             ui.collapsing(
                 format!(
@@ -10684,35 +10953,13 @@ fn item_pool_settings_ui(
     changed
 }
 
-fn experience_test_pool_seed_ui(
-    ui: &mut Ui,
-    manager: &mut NapcatMessageManager,
-    state: &mut TrpgGroupSettingsState,
-) -> bool {
-    let mut changed = false;
-    ui.horizontal_wrapped(|ui| {
-        if ui.button("添加EXP测试数据").clicked() {
-            let summary = seed_experience_test_pools(manager);
-            state.test_pool_seed_status = format!(
-                "已添加：{}个单位、{}个物品、{}个随机池；已有同名测试数据保持不变",
-                summary.units_added, summary.items_added, summary.random_pools_added,
-            );
-            changed = summary.units_added > 0
-                || summary.items_added > 0
-                || summary.random_pools_added > 0;
-        }
-        if !state.test_pool_seed_status.is_empty() {
-            ui.small(&state.test_pool_seed_status);
-        } else {
-            ui.small("添加四种稀有度单位，以及测试装备、消耗品和加权掉落池");
-        }
-    });
-    changed
-}
-
 fn inventory_item_definition_ui(ui: &mut Ui, item: &mut InventoryItem) -> bool {
     let mut changed = false;
     ui.horizontal_wrapped(|ui| {
+        ui.label("分类");
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut item.category).desired_width(120.0))
+            .changed();
         ui.label("物品");
         changed |= ui
             .add(egui::TextEdit::singleline(&mut item.name).desired_width(150.0))
@@ -10855,15 +11102,6 @@ fn skill_pool_entry_name(entry: &SkillPoolEntry) -> String {
     } else {
         entry.name.trim().to_owned()
     }
-}
-
-fn skill_pool_entry_category_label(entry: &SkillPoolEntry) -> String {
-    entry
-        .category
-        .as_deref()
-        .filter(|category| !category.trim().is_empty())
-        .unwrap_or("-")
-        .to_owned()
 }
 
 fn skill_pool_entry_tags_label(entry: &SkillPoolEntry) -> String {
@@ -16871,6 +17109,7 @@ mod tests {
         manager
             .random_pools
             .insert("探索池".to_owned(), RandomPool {
+                category: "冒险".to_owned(),
                 legacy_pool_id: Some("random-a".to_owned()),
                 legacy_group: Some(2),
                 tags: "探索 战斗 探索".to_owned(),
@@ -16892,8 +17131,16 @@ mod tests {
         );
         assert_eq!(
             random_pool_metadata_summary(pool),
-            "旧团索引 2 · 标签 战斗 探索 · 创建 2024-01-02"
+            "分类 冒险 · 旧团索引 2 · 标签 战斗 探索 · 创建 2024-01-02"
         );
+        assert!(pool_category_matches(
+            &pool.category,
+            "冒险"
+        ));
+        assert!(!pool_category_matches(
+            &pool.category,
+            POOL_CATEGORY_UNCATEGORIZED
+        ));
         assert!(random_pool_matches_filters(
             pool,
             &random_pool_group_filter_value(Some(2)),

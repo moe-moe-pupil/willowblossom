@@ -9384,6 +9384,7 @@ mod tests {
     fn unit_template_participant_uses_template_stats_and_skills() {
         let mut manager = empty_manager();
         let unit = UnitPoolEntry {
+            category: String::new(),
             label: "史莱姆".to_owned(),
             note: String::new(),
             legacy_member_id: None,
@@ -9440,6 +9441,7 @@ mod tests {
             .player_characters
             .insert("caster".to_owned(), caster.clone());
         let unit = UnitPoolEntry {
+            category: String::new(),
             label: "史莱姆".to_owned(),
             note: String::new(),
             legacy_member_id: None,
@@ -9642,6 +9644,7 @@ mod tests {
             .player_characters
             .insert("source".to_owned(), source.clone());
         let unit = UnitPoolEntry {
+            category: String::new(),
             label: "史莱姆".to_owned(),
             note: String::new(),
             legacy_member_id: None,
@@ -9722,6 +9725,7 @@ mod tests {
     fn unit_instance_hp_buff_recomputes_from_base_without_stacking() {
         let mut manager = empty_manager();
         let unit = UnitPoolEntry {
+            category: String::new(),
             label: "史莱姆".to_owned(),
             note: String::new(),
             legacy_member_id: None,
@@ -9791,6 +9795,7 @@ mod tests {
                 ..Default::default()
             });
         manager.unit_pool.insert("slime".to_owned(), UnitPoolEntry {
+            category: String::new(),
             label: "史莱姆".to_owned(),
             note: String::new(),
             legacy_member_id: None,

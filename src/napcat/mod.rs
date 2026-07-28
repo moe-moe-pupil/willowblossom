@@ -85,7 +85,6 @@ use crate::{
         BuffTickAction,
         BuffValue,
         DamageType,
-        StatusKey as RuleStatusKey,
     },
     scene::{
         SceneCaptureRequest,
@@ -579,6 +578,9 @@ pub enum EquipmentSlot {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct InventoryItem {
+    /// GM-defined logical pool. Empty values are treated as uncategorized.
+    #[serde(default)]
+    pub category: String,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -645,6 +647,7 @@ pub enum CharacterHotbarSlot {
 impl Default for InventoryItem {
     fn default() -> Self {
         Self {
+            category: String::new(),
             name: String::new(),
             description: String::new(),
             icon: String::new(),
@@ -750,6 +753,9 @@ impl Default for RandomPoolCheckedResult {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct RandomPool {
+    /// GM-defined logical pool. Empty values are treated as uncategorized.
+    #[serde(default)]
+    pub category: String,
     #[serde(default)]
     pub entries: Vec<RandomPoolEntry>,
     #[serde(default)]
@@ -793,6 +799,9 @@ impl UnitRarity {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UnitPoolEntry {
+    /// GM-defined logical pool. Empty values are treated as uncategorized.
+    #[serde(default)]
+    pub category: String,
     #[serde(default)]
     pub label: String,
     #[serde(default)]
@@ -811,6 +820,7 @@ pub struct UnitPoolEntry {
 impl Default for UnitPoolEntry {
     fn default() -> Self {
         Self {
+            category: String::new(),
             label: "新单位".to_owned(),
             note: String::new(),
             legacy_member_id: None,
@@ -2979,238 +2989,6 @@ pub struct NapcatMessageManager {
     pub unit_pool: HashMap<String, UnitPoolEntry>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct TestPoolSeedSummary {
-    pub units_added: usize,
-    pub items_added: usize,
-    pub random_pools_added: usize,
-}
-
-fn experience_test_item(
-    name: &str,
-    description: &str,
-    quality: InventoryQuality,
-    equipment_slot: EquipmentSlot,
-    stack: u32,
-    max_stack: u32,
-    item_level: u32,
-    stat_effects: Vec<BuffEffect>,
-    skill: Option<InventoryItemSkill>,
-) -> InventoryItem {
-    InventoryItem {
-        name: name.to_owned(),
-        description: description.to_owned(),
-        quality,
-        equipment_slot,
-        stack,
-        max_stack,
-        item_level,
-        stat_effects,
-        skills: skill.into_iter().collect(),
-        ..Default::default()
-    }
-}
-
-fn experience_test_unit(
-    label: &str,
-    level: i32,
-    max_hp: f32,
-    base_damage: f32,
-    rarity: UnitRarity,
-) -> UnitPoolEntry {
-    UnitPoolEntry {
-        label: label.to_owned(),
-        note: "EXP、助攻与PvE动态等级测试单位".to_owned(),
-        rarity,
-        base_damage,
-        character: PlayerCharacter {
-            inited: true,
-            name: label.to_owned(),
-            nickname: label.to_owned(),
-            level,
-            hp: max_hp,
-            max_hp,
-            speed: 3.0 + level.max(1) as f32 * 0.1,
-            status: CharacterStatus {
-                str_: (base_damage / 2.0).round().max(1.0) as i32,
-                vit: (level / 2).max(1),
-                ..Default::default()
-            },
-            skill_names: vec!["测试攻击".to_owned()],
-            skill_notes: vec![format!("主动使用对目标造成{base_damage}点物理伤害")],
-            skill_mp_costs: vec![0.0],
-            skill_cooldown_turns: vec![0],
-            skill_metadata: vec![CharacterSkillMetadata::default()],
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-
-pub fn seed_experience_test_pools(manager: &mut NapcatMessageManager) -> TestPoolSeedSummary {
-    let test_items = vec![
-        experience_test_item(
-            "测试训练剑",
-            "测试装备属性与普通攻击；装备后力量+2。",
-            InventoryQuality::Uncommon,
-            EquipmentSlot::MainHand,
-            1,
-            1,
-            5,
-            vec![BuffEffect {
-                field: BuffField::Status(RuleStatusKey::Str),
-                value: BuffValue::Add(2.0),
-            }],
-            Some(InventoryItemSkill {
-                name: "训练斩击".to_owned(),
-                note: "主动使用对目标造成6点物理伤害".to_owned(),
-                cooldown_turns: 1,
-                ..Default::default()
-            }),
-        ),
-        experience_test_item(
-            "测试治疗药水",
-            "测试有效治疗助攻；使用后回复8点生命值并消耗1个。",
-            InventoryQuality::Common,
-            EquipmentSlot::None,
-            5,
-            20,
-            1,
-            Vec::new(),
-            Some(InventoryItemSkill {
-                name: "饮用测试药水".to_owned(),
-                note: "主动使用对目标回复8点生命值".to_owned(),
-                consume_item: true,
-                ..Default::default()
-            }),
-        ),
-        experience_test_item(
-            "测试奥术炸弹",
-            "测试消耗品伤害与击杀归属；造成12点魔法伤害。",
-            InventoryQuality::Rare,
-            EquipmentSlot::None,
-            3,
-            10,
-            8,
-            Vec::new(),
-            Some(InventoryItemSkill {
-                name: "投掷奥术炸弹".to_owned(),
-                note: "主动使用对目标造成12点魔法伤害".to_owned(),
-                cooldown_turns: 2,
-                consume_item: true,
-                ..Default::default()
-            }),
-        ),
-        experience_test_item(
-            "测试支援护符",
-            "测试支援角色装备属性；装备后智慧+2。",
-            InventoryQuality::Rare,
-            EquipmentSlot::Trinket,
-            1,
-            1,
-            10,
-            vec![BuffEffect {
-                field: BuffField::Status(RuleStatusKey::Wis),
-                value: BuffValue::Add(2.0),
-            }],
-            None,
-        ),
-    ];
-
-    let mut summary = TestPoolSeedSummary::default();
-    for (unit_id, unit) in [
-        (
-            "test-exp-slime",
-            experience_test_unit(
-                "测试史莱姆",
-                1,
-                30.0,
-                3.0,
-                UnitRarity::Normal,
-            ),
-        ),
-        (
-            "test-exp-wolf",
-            experience_test_unit(
-                "测试稀有狼",
-                5,
-                70.0,
-                7.0,
-                UnitRarity::Rare,
-            ),
-        ),
-        (
-            "test-exp-ogre",
-            experience_test_unit(
-                "测试精英食人魔",
-                10,
-                150.0,
-                13.0,
-                UnitRarity::Elite,
-            ),
-        ),
-        (
-            "test-exp-dragon",
-            experience_test_unit(
-                "测试稀有精英龙",
-                20,
-                320.0,
-                24.0,
-                UnitRarity::RareElite,
-            ),
-        ),
-    ] {
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            manager.unit_pool.entry(unit_id.to_owned())
-        {
-            entry.insert(unit);
-            summary.units_added += 1;
-        }
-    }
-
-    for item in &test_items {
-        if !manager
-            .item_pool
-            .iter()
-            .any(|existing| existing.name == item.name)
-        {
-            manager.item_pool.push(item.clone());
-            summary.items_added += 1;
-        }
-    }
-
-    if let std::collections::hash_map::Entry::Vacant(entry) =
-        manager.random_pools.entry("EXP测试掉落池".to_owned())
-    {
-        entry.insert(RandomPool {
-            entries: test_items
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| RandomPoolEntry {
-                    item,
-                    weight: [25.0, 45.0, 20.0, 10.0][index],
-                    enabled: true,
-                    result_text: [
-                        "掉落：测试训练剑",
-                        "掉落：测试治疗药水",
-                        "掉落：测试奥术炸弹",
-                        "掉落：测试支援护符",
-                    ][index]
-                        .to_owned(),
-                    min_count: 1,
-                    max_count: 1,
-                })
-                .collect(),
-            tags: "测试 EXP 战利品".to_owned(),
-            description: "EXP战斗测试用加权物品池；重复添加测试数据不会覆盖此池。".to_owned(),
-            ..Default::default()
-        });
-        summary.random_pools_added = 1;
-    }
-
-    summary
-}
-
 pub const NAPCAT_MANAGER_EXPORT_VERSION: u32 = 1;
 
 #[derive(Serialize)]
@@ -3283,6 +3061,134 @@ struct NapcatUnitPoolExport {
     version: u32,
     export_type: String,
     units: Vec<UnitPoolExportEntry>,
+}
+
+pub const CONTENT_POOL_BUNDLE_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RandomPoolExportEntry {
+    pub name: String,
+    pub pool: RandomPool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ContentPoolBundle {
+    version: u32,
+    export_type: String,
+    #[serde(default)]
+    units: Vec<UnitPoolExportEntry>,
+    #[serde(default)]
+    skills: Vec<SkillPoolEntry>,
+    #[serde(default)]
+    items: Vec<InventoryItem>,
+    #[serde(default)]
+    random_pools: Vec<RandomPoolExportEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentPoolImportSummary {
+    pub units: usize,
+    pub skills: usize,
+    pub items: usize,
+    pub random_pools: usize,
+}
+
+fn normalized_pool_category(category: &str) -> &str { category.trim() }
+
+fn merge_item_pool_entries(target: &mut Vec<InventoryItem>, imported: Vec<InventoryItem>) {
+    for item in imported {
+        let key = (
+            normalized_pool_category(&item.category).to_owned(),
+            item.name.trim().to_owned(),
+        );
+        if let Some(existing) = target.iter_mut().find(|existing| {
+            normalized_pool_category(&existing.category) == key.0 && existing.name.trim() == key.1
+        }) {
+            *existing = item;
+        } else {
+            target.push(item);
+        }
+    }
+}
+
+fn merge_skill_pool_entries(target: &mut Vec<SkillPoolEntry>, imported: Vec<SkillPoolEntry>) {
+    for skill in imported {
+        let category = skill.category.as_deref().unwrap_or_default().trim();
+        if let Some(existing) = target.iter_mut().find(|existing| {
+            existing.category.as_deref().unwrap_or_default().trim() == category
+                && existing.name.trim() == skill.name.trim()
+        }) {
+            *existing = skill;
+        } else {
+            target.push(skill);
+        }
+    }
+}
+
+pub fn content_pool_generation_prompt() -> String {
+    let example_item = InventoryItem {
+        category: "测试物品".to_owned(),
+        name: "示例治疗药水".to_owned(),
+        description: "回复生命值的测试消耗品。".to_owned(),
+        stack: 3,
+        max_stack: 20,
+        ..Default::default()
+    };
+    let example = ContentPoolBundle {
+        version: CONTENT_POOL_BUNDLE_VERSION,
+        export_type: "content_pools".to_owned(),
+        units: vec![UnitPoolExportEntry {
+            unit_id: "example-training-dummy".to_owned(),
+            unit: UnitPoolEntry {
+                category: "训练单位".to_owned(),
+                label: "示例训练假人".to_owned(),
+                rarity: UnitRarity::Normal,
+                base_damage: 4.0,
+                character: PlayerCharacter {
+                    inited: true,
+                    name: "示例训练假人".to_owned(),
+                    nickname: "示例训练假人".to_owned(),
+                    level: 5,
+                    hp: 60.0,
+                    max_hp: 60.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        }],
+        skills: vec![SkillPoolEntry {
+            name: "示例重击".to_owned(),
+            note: "主动使用对目标造成8点物理伤害".to_owned(),
+            category: Some("战斗技能".to_owned()),
+            ..Default::default()
+        }],
+        items: vec![example_item.clone()],
+        random_pools: vec![RandomPoolExportEntry {
+            name: "示例掉落池".to_owned(),
+            pool: RandomPool {
+                category: "测试掉落".to_owned(),
+                description: "用于验证导入与抽取。".to_owned(),
+                entries: vec![RandomPoolEntry {
+                    item: example_item,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        }],
+    };
+    let example_json = serde_json::to_string_pretty(&example).unwrap_or_else(|_| "{}".to_owned());
+    format!(
+        "你是 DeepSeek。请为 Willowblossom 生成一个包含随机化测试内容的 GM 内容池 JSON 包。\n\
+         只生成可测试的单位、技能、物品和随机池规则，不生成剧情、玩家决定、隐藏信息或场景结论。\n\
+         默认生成至少8个不同稀有度与等级的单位、12个不同品质/用途的物品、8个技能，以及至少3个有不同权重的随机池；内容应有变化但数值必须合理。\n\
+         只输出一个合法 JSON 对象，不要 Markdown 代码围栏或说明文字。\n\
+         必须保留 version={CONTENT_POOL_BUNDLE_VERSION} 和 export_type=\"content_pools\"。\n\
+         每个单位、技能、物品、随机池都填写 category；相同 category 表示同一个 GM 逻辑池，允许多个 category。\n\
+         单位 rarity 只能是 normal、rare、elite、rare_elite。base_damage 是未缩放的基础伤害；character.max_hp、hp、level 必须为正数。\n\
+         物品 quality 只能是 poor、common、uncommon、rare、epic、legendary；equipment_slot 使用 snake_case。\n\
+         随机池每个启用条目的 weight 必须大于 0，min_count 不得大于 max_count。\n\
+         可以增删数组元素，但不要改字段名。以下是由应用真实类型生成的完整可导入示例：\n{example_json}"
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3495,6 +3401,89 @@ impl NapcatMessageManager {
         let imported_count = imported.len();
         self.unit_pool.extend(imported);
         Ok(imported_count)
+    }
+
+    pub fn to_content_pool_bundle_json(&self) -> Result<String, String> {
+        let mut random_pools = self
+            .random_pools
+            .iter()
+            .map(|(name, pool)| RandomPoolExportEntry {
+                name: name.clone(),
+                pool: pool.clone(),
+            })
+            .collect::<Vec<_>>();
+        random_pools.sort_by(|left, right| left.name.cmp(&right.name));
+
+        serde_json::to_string_pretty(&ContentPoolBundle {
+            version: CONTENT_POOL_BUNDLE_VERSION,
+            export_type: "content_pools".to_owned(),
+            units: self.unit_pool_export_entries(),
+            skills: self.skill_pool.clone(),
+            items: self.item_pool.clone(),
+            random_pools,
+        })
+        .map_err(|err| err.to_string())
+    }
+
+    pub fn merge_content_pool_bundle_json(
+        &mut self,
+        text: &str,
+    ) -> Result<ContentPoolImportSummary, String> {
+        let bundle: ContentPoolBundle =
+            serde_json::from_str(text).map_err(|err| err.to_string())?;
+        if bundle.version != CONTENT_POOL_BUNDLE_VERSION {
+            return Err(format!(
+                "unsupported content pool bundle version {}; expected {}",
+                bundle.version, CONTENT_POOL_BUNDLE_VERSION
+            ));
+        }
+        if bundle.export_type != "content_pools" {
+            return Err(format!(
+                "unsupported content pool export type {}",
+                bundle.export_type
+            ));
+        }
+
+        let mut imported_units = HashMap::new();
+        for entry in bundle.units {
+            let unit_id = entry.unit_id.trim();
+            if unit_id.is_empty() {
+                return Err("content pool bundle contains an empty unit id".to_owned());
+            }
+            imported_units.insert(unit_id.to_owned(), entry.unit);
+        }
+
+        let mut imported_random_pools = HashMap::new();
+        for entry in bundle.random_pools {
+            let name = entry.name.trim();
+            if name.is_empty() {
+                return Err("content pool bundle contains an empty random pool name".to_owned());
+            }
+            imported_random_pools.insert(name.to_owned(), entry.pool);
+        }
+
+        for skill in &bundle.skills {
+            if skill.name.trim().is_empty() {
+                return Err("content pool bundle contains an unnamed skill".to_owned());
+            }
+        }
+        for item in &bundle.items {
+            if item.name.trim().is_empty() {
+                return Err("content pool bundle contains an unnamed item".to_owned());
+            }
+        }
+
+        let summary = ContentPoolImportSummary {
+            units: imported_units.len(),
+            skills: bundle.skills.len(),
+            items: bundle.items.len(),
+            random_pools: imported_random_pools.len(),
+        };
+        self.unit_pool.extend(imported_units);
+        merge_skill_pool_entries(&mut self.skill_pool, bundle.skills);
+        merge_item_pool_entries(&mut self.item_pool, bundle.items);
+        self.random_pools.extend(imported_random_pools);
+        Ok(summary)
     }
 
     pub fn unit_pool_ids_for_legacy_members(&self, members: &[String]) -> Vec<String> {
@@ -3885,6 +3874,7 @@ impl NapcatMessageManager {
                 }
             }
             self.unit_pool.insert(unit_id, UnitPoolEntry {
+                category: String::new(),
                 label,
                 note: note_parts.join("\n"),
                 legacy_member_id,
@@ -4018,6 +4008,7 @@ impl NapcatMessageManager {
                 });
             }
             let pool = RandomPool {
+                category: String::new(),
                 entries,
                 last_pick: None,
                 last_text_result: None,
@@ -11007,6 +10998,7 @@ mod tests {
         manager
             .unit_pool
             .insert("zombie".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "行尸".to_owned(),
                 note: "缓慢近战单位".to_owned(),
                 legacy_member_id: None,
@@ -11017,6 +11009,7 @@ mod tests {
         manager
             .unit_pool
             .insert("archer".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "弓手".to_owned(),
                 note: "远程单位".to_owned(),
                 legacy_member_id: None,
@@ -11059,6 +11052,7 @@ mod tests {
         manager
             .unit_pool
             .insert("direct".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "直接单位".to_owned(),
                 note: String::new(),
                 legacy_member_id: None,
@@ -11069,6 +11063,7 @@ mod tests {
         manager
             .unit_pool
             .insert("alias-b".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "别名B".to_owned(),
                 note: String::new(),
                 legacy_member_id: Some("20001".to_owned()),
@@ -11079,6 +11074,7 @@ mod tests {
         manager
             .unit_pool
             .insert("alias-a".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "别名A".to_owned(),
                 note: String::new(),
                 legacy_member_id: Some("20001".to_owned()),
@@ -11089,6 +11085,7 @@ mod tests {
         manager.unit_pool.insert(
             "moonberry-unit-30001".to_owned(),
             UnitPoolEntry {
+                category: String::new(),
                 label: "旧兼容单位".to_owned(),
                 note: String::new(),
                 legacy_member_id: None,
@@ -11118,6 +11115,7 @@ mod tests {
     fn unit_pool_export_json_merges_by_unit_id_without_chat_data() {
         let mut source = empty_manager();
         source.unit_pool.insert("archer".to_owned(), UnitPoolEntry {
+            category: String::new(),
             label: "新弓手".to_owned(),
             note: "导入版本".to_owned(),
             legacy_member_id: None,
@@ -11126,6 +11124,7 @@ mod tests {
             character: completed_character("新弓手"),
         });
         source.unit_pool.insert("zombie".to_owned(), UnitPoolEntry {
+            category: String::new(),
             label: "行尸".to_owned(),
             note: "缓慢近战单位".to_owned(),
             legacy_member_id: None,
@@ -11142,6 +11141,7 @@ mod tests {
         manager
             .unit_pool
             .insert("archer".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "旧弓手".to_owned(),
                 note: "本地旧版本".to_owned(),
                 legacy_member_id: None,
@@ -15358,58 +15358,90 @@ mod tests {
     }
 
     #[test]
-    fn experience_test_pool_seed_is_complete_and_idempotent() {
-        let mut manager = empty_manager();
+    fn content_pool_bundle_round_trips_all_categorized_pools() {
+        let mut source = empty_manager();
+        source.unit_pool.insert("wolf".to_owned(), UnitPoolEntry {
+            category: "森林".to_owned(),
+            label: "狼".to_owned(),
+            ..Default::default()
+        });
+        source.skill_pool.push(SkillPoolEntry {
+            name: "撕咬".to_owned(),
+            note: "造成伤害".to_owned(),
+            category: Some("野兽".to_owned()),
+            ..Default::default()
+        });
+        source.item_pool.push(InventoryItem {
+            category: "药剂".to_owned(),
+            name: "治疗药水".to_owned(),
+            ..Default::default()
+        });
+        source
+            .random_pools
+            .insert("森林掉落".to_owned(), RandomPool {
+                category: "森林".to_owned(),
+                ..Default::default()
+            });
 
-        let first = seed_experience_test_pools(&mut manager);
+        let json = source.to_content_pool_bundle_json().unwrap();
+        let mut target = empty_manager();
+        let summary = target.merge_content_pool_bundle_json(&json).unwrap();
 
-        assert_eq!(first, TestPoolSeedSummary {
-            units_added: 4,
-            items_added: 4,
-            random_pools_added: 1,
+        assert_eq!(summary, ContentPoolImportSummary {
+            units: 1,
+            skills: 1,
+            items: 1,
+            random_pools: 1,
         });
         assert_eq!(
-            manager.unit_pool["test-exp-slime"].rarity,
-            UnitRarity::Normal
+            target.unit_pool["wolf"].category,
+            "森林"
         );
         assert_eq!(
-            manager.unit_pool["test-exp-wolf"].rarity,
-            UnitRarity::Rare
+            target.skill_pool[0].category.as_deref(),
+            Some("野兽")
         );
+        assert_eq!(target.item_pool[0].category, "药剂");
         assert_eq!(
-            manager.unit_pool["test-exp-ogre"].rarity,
-            UnitRarity::Elite
+            target.random_pools["森林掉落"].category,
+            "森林"
         );
-        assert_eq!(
-            manager.unit_pool["test-exp-dragon"].rarity,
-            UnitRarity::RareElite
-        );
-        assert!(manager
-            .unit_pool
-            .values()
-            .all(|unit| unit.base_damage > 0.0 && !unit.character.skill_names.is_empty()));
-        assert_eq!(manager.item_pool.len(), 4);
-        let loot = &manager.random_pools["EXP测试掉落池"];
-        assert_eq!(loot.entries.len(), 4);
-        assert!(
-            (loot.entries.iter().map(|entry| entry.weight).sum::<f32>() - 100.0).abs()
-                < f32::EPSILON
-        );
+    }
 
-        manager
-            .unit_pool
-            .get_mut("test-exp-slime")
-            .unwrap()
-            .character
-            .max_hp = 999.0;
-        let second = seed_experience_test_pools(&mut manager);
+    #[test]
+    fn legacy_pool_entries_default_to_uncategorized() {
+        let unit: UnitPoolEntry =
+            serde_json::from_str(r#"{"label":"旧单位","character":{}}"#).unwrap();
+        let item: InventoryItem = serde_json::from_str(r#"{"name":"旧物品"}"#).unwrap();
+        let pool: RandomPool = serde_json::from_str(r#"{"entries":[]}"#).unwrap();
 
-        assert_eq!(second, TestPoolSeedSummary::default());
-        assert_eq!(
-            manager.unit_pool["test-exp-slime"].character.max_hp,
-            999.0
-        );
-        assert_eq!(manager.item_pool.len(), 4);
-        assert_eq!(manager.random_pools.len(), 1);
+        assert!(unit.category.is_empty());
+        assert!(item.category.is_empty());
+        assert!(pool.category.is_empty());
+    }
+
+    #[test]
+    fn content_pool_prompt_contains_import_contract() {
+        let prompt = content_pool_generation_prompt();
+        assert!(prompt.contains("\"export_type\": \"content_pools\""));
+        assert!(prompt.contains("\"category\""));
+        assert!(prompt.contains("只输出一个合法 JSON 对象"));
+        assert!(prompt.contains("你是 DeepSeek"));
+    }
+
+    #[test]
+    fn content_pool_bundle_rejects_wrong_version_without_mutating_pools() {
+        let mut manager = empty_manager();
+        let error = manager
+            .merge_content_pool_bundle_json(
+                r#"{"version":999,"export_type":"content_pools","units":[],"skills":[],"items":[],"random_pools":[]}"#,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("unsupported content pool bundle version"));
+        assert!(manager.unit_pool.is_empty());
+        assert!(manager.skill_pool.is_empty());
+        assert!(manager.item_pool.is_empty());
+        assert!(manager.random_pools.is_empty());
     }
 }
