@@ -5771,13 +5771,15 @@ fn apply_automatic_private_reply_result(
         );
         return Some(false);
     }
-    Some(append_local_private_text_response_with_forwarded_attribution(
-        manager,
-        &expected_target_id,
-        pending.recipient_id,
-        &pending.text,
-        pending.forwarded,
-    ))
+    Some(
+        append_local_private_text_response_with_forwarded_attribution(
+            manager,
+            &expected_target_id,
+            pending.recipient_id,
+            &pending.text,
+            pending.forwarded,
+        ),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -8384,8 +8386,10 @@ fn infer_legacy_forwarded_attribution(
     manager: &NapcatMessageManager,
     message: &NapcatMessage,
 ) -> Option<ForwardedAttribution> {
-    if !matches!(message.data.message_type, NapcatMessageType::Private)
-        || message.data.user_id != message.data.self_id
+    if !matches!(
+        message.data.message_type,
+        NapcatMessageType::Private
+    ) || message.data.user_id != message.data.self_id
     {
         return None;
     }
@@ -8397,10 +8401,7 @@ fn infer_legacy_forwarded_attribution(
         .unwrap_or(sender_label)
         .trim();
     let forwarded_text = forwarded_text.trim();
-    if sender_name.is_empty()
-        || forwarded_text.is_empty()
-        || sender_name.contains("匿名")
-    {
+    if sender_name.is_empty() || forwarded_text.is_empty() || sender_name.contains("匿名") {
         return None;
     }
 
@@ -8598,7 +8599,10 @@ fn party_channel_auto_forward_request(
 
     let forwarded_text = if party.anonymous {
         let party_name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
-        format!("{party_name}(匿名): {}", channel_message.text)
+        format!(
+            "{party_name}(匿名): {}",
+            channel_message.text
+        )
     } else {
         let party_name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
         let channel_name = if party_name.ends_with("频道") {
@@ -12385,22 +12389,27 @@ mod tests {
     fn forwarded_private_reply_preserves_original_speaker_for_replay() {
         let mut manager = empty_manager();
 
-        assert!(append_local_private_text_response_with_forwarded_attribution(
-            &mut manager,
-            "3",
-            3,
-            "moemoe: hello",
-            Some(ForwardedAttribution {
-                sender_id: 2,
-                sender_name: "moemoe".to_owned(),
-                text: "hello".to_owned(),
-                source_time: 100,
-            }),
-        ));
+        assert!(
+            append_local_private_text_response_with_forwarded_attribution(
+                &mut manager,
+                "3",
+                3,
+                "moemoe: hello",
+                Some(ForwardedAttribution {
+                    sender_id: 2,
+                    sender_name: "moemoe".to_owned(),
+                    text: "hello".to_owned(),
+                    source_time: 100,
+                }),
+            )
+        );
 
         let stored = &manager.messages["3"][0];
         assert_eq!(message_text(stored), "moemoe: hello");
-        assert_eq!(manager.replay_message_sender_id(stored), 2);
+        assert_eq!(
+            manager.replay_message_sender_id(stored),
+            2
+        );
         let persisted = serde_json::to_string(stored).unwrap();
         let restored: NapcatMessage = serde_json::from_str(&persisted).unwrap();
         let replay_message = manager.campaign_message_for_target("3", &restored);
@@ -12409,7 +12418,10 @@ mod tests {
         assert_eq!(replay_message.text, "hello");
         assert_eq!(replay_message.time, 100);
         assert!(replay_message.forwarded);
-        assert_eq!(replay_message.visibility, Visibility::Player(3));
+        assert_eq!(
+            replay_message.visibility,
+            Visibility::Player(3)
+        );
     }
 
     #[test]
@@ -12600,7 +12612,10 @@ mod tests {
         };
 
         assert_eq!(anonymous_request.recipients, vec![3]);
-        assert_eq!(anonymous_request.text, "人类(匿名): anonymous clue");
+        assert_eq!(
+            anonymous_request.text,
+            "人类(匿名): anonymous clue"
+        );
 
         {
             let group = manager.trpg_groups.get_mut("table").unwrap();
@@ -14618,9 +14633,10 @@ mod tests {
         assert!(group.reset_all_turns());
 
         assert_eq!(group.world_turn, 0);
-        assert!(group.player_turns.values().all(|turn| {
-            turn.turns_passed == 0 && !turn.acted && !turn.skipped
-        }));
+        assert!(group
+            .player_turns
+            .values()
+            .all(|turn| { turn.turns_passed == 0 && !turn.acted && !turn.skipped }));
         assert!(!group.reset_all_turns());
     }
 

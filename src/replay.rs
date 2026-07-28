@@ -232,7 +232,9 @@ fn snapshot_new_replay_messages(
                 group
                     .player_turns
                     .iter()
-                    .filter_map(|(id, turn)| id.parse::<u64>().ok().map(|id| (id, turn.turns_passed)))
+                    .filter_map(|(id, turn)| {
+                        id.parse::<u64>().ok().map(|id| (id, turn.turns_passed))
+                    })
                     .collect::<HashMap<_, _>>(),
             )
         })
@@ -253,16 +255,15 @@ fn snapshot_new_replay_messages(
                     target.clone(),
                     index,
                     ReplayMessageSnapshot {
-                        turn_index: player_turns
-                            .get(&sender_id)
-                            .copied()
-                            .unwrap_or(world_turn),
+                        turn_index: player_turns.get(&sender_id).copied().unwrap_or(world_turn),
                         position_cells,
                     },
                 ));
             }
         }
-        tracker.message_counts.insert(target.clone(), messages.len());
+        tracker
+            .message_counts
+            .insert(target.clone(), messages.len());
     }
 
     if additions.is_empty() {
@@ -379,6 +380,8 @@ struct ReplayDialogue {
     time_ms: u64,
     duration_ms: u64,
     sender_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_focus_id: Option<u64>,
     name: String,
     role: String,
     text: String,
@@ -694,7 +697,11 @@ fn record_replay(
                     .and_then(|snapshots| snapshots.get(index))
                     .and_then(Option::as_ref);
                 let estimated_snapshot = persisted_snapshot.is_none().then(|| {
-                    estimated_replay_snapshot(&campaign_message, &manager, &speaker_positions)
+                    estimated_replay_snapshot(
+                        &campaign_message,
+                        &manager,
+                        &speaker_positions,
+                    )
                 });
                 if let Some(dialogue) = dialogue_from_message(
                     &campaign_message,
@@ -719,7 +726,13 @@ fn record_replay(
         let captured_any = !captured.is_empty();
         let captured_messages = captured
             .iter()
-            .map(|line| (line.sender_id, line.source_time, line.text.clone()))
+            .map(|line| {
+                (
+                    line.sender_id,
+                    line.source_time,
+                    line.text.clone(),
+                )
+            })
             .collect::<HashSet<_>>();
         replay.dialogue.extend(captured);
         deduplicate_broadcast_dialogue(&mut replay.dialogue, &manager);
@@ -841,9 +854,7 @@ fn preview_replay_speech(
         .map(replay_speech_generation_line_ids)
         .unwrap_or_default();
     let mut generation_request_consumed = false;
-    if studio.speech_enabled
-        && onnx_tts_is_available()
-    {
+    if studio.speech_enabled && onnx_tts_is_available() {
         if let Some(replay) = studio.replay.as_ref() {
             let requested = replay_speech_preparation_indices(replay, studio.playback_ms);
             match speech.prepare_onnx_replay(
@@ -851,8 +862,7 @@ fn preview_replay_speech(
                 studio.speech_volume,
                 &requested,
                 &pending_generation_line_ids,
-            )
-            {
+            ) {
                 Ok(()) => generation_request_consumed = true,
                 Err(err) => {
                     studio.status = format!("角色语音预览失败：{err}");
@@ -868,18 +878,19 @@ fn preview_replay_speech(
             .replay
             .as_ref()
             .map(|replay| replay.created_at_unix_ms);
-        speech.pending_generation_lines.retain(|(replay_id, line_id)| {
-            Some(*replay_id) != current_replay_id
-                || !pending_generation_line_ids.contains(line_id)
-        });
+        speech
+            .pending_generation_lines
+            .retain(|(replay_id, line_id)| {
+                Some(*replay_id) != current_replay_id
+                    || !pending_generation_line_ids.contains(line_id)
+            });
     }
     let active = ((studio.mode == ReplayMode::Playing || studio.video_render.is_some())
         && studio.speech_enabled)
         .then(|| {
             studio.replay.as_ref().and_then(|replay| {
-                active_dialogue_index(&replay.dialogue, studio.playback_ms).map(|index| {
-                    (replay.created_at_unix_ms, index)
-                })
+                active_dialogue_index(&replay.dialogue, studio.playback_ms)
+                    .map(|index| (replay.created_at_unix_ms, index))
             })
         })
         .flatten();
@@ -981,10 +992,11 @@ impl PreviewSpeechController {
                 .cloned()
                 .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
             let text = speech_text_for_line(line);
-            let speaker =
-                resolved_emotivoice_speaker(settings.voice_name.as_deref(), line.sender_id);
-            let emotion =
-                resolved_emotivoice_emotion(settings.emotion.as_deref()).to_owned();
+            let speaker = resolved_emotivoice_speaker(
+                settings.voice_name.as_deref(),
+                line.sender_id,
+            );
+            let emotion = resolved_emotivoice_emotion(settings.emotion.as_deref()).to_owned();
             let speed = combined_onnx_speed(
                 settings.speech_rate,
                 replay.master_speech_speed,
@@ -1075,7 +1087,12 @@ impl PreviewSpeechController {
         global_volume: f32,
     ) -> (usize, usize, usize) {
         let total = replay.dialogue.iter().filter(|line| line.included).count();
-        if self.prepared_signature != Some(replay_voice_signature(replay, global_volume)) {
+        if self.prepared_signature
+            != Some(replay_voice_signature(
+                replay,
+                global_volume,
+            ))
+        {
             return (0, 0, total);
         }
         let ready = replay
@@ -1147,10 +1164,7 @@ fn emotivoice_speech_cache_path(text: &str, speaker: &str, emotion: &str, speed:
 fn read_speech_cache(text: &str, speaker: &str, emotion: &str, speed: f32) -> Option<Vec<u8>> {
     let path = emotivoice_speech_cache_path(text, speaker, emotion, speed);
     let bytes = fs::read(&path).ok()?;
-    if bytes.len() >= 44
-        && &bytes[0..4] == b"RIFF"
-        && &bytes[8..12] == b"WAVE"
-    {
+    if bytes.len() >= 44 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
         Some(bytes)
     } else {
         let _ = fs::remove_file(path);
@@ -1158,13 +1172,7 @@ fn read_speech_cache(text: &str, speaker: &str, emotion: &str, speed: f32) -> Op
     }
 }
 
-fn cache_speech(
-    text: &str,
-    speaker: &str,
-    emotion: &str,
-    speed: f32,
-    wav: &[u8],
-) {
+fn cache_speech(text: &str, speaker: &str, emotion: &str, speed: f32, wav: &[u8]) {
     let path = emotivoice_speech_cache_path(text, speaker, emotion, speed);
     let Some(parent) = path.parent() else { return };
     if fs::create_dir_all(parent).is_err() {
@@ -1373,10 +1381,12 @@ fn is_short_utterance(text: &str) -> bool {
 
 fn protect_repeated_short_phrase(text: &str) -> String {
     let mut characters = text.chars().collect::<Vec<_>>();
-    let ending = characters
-        .last()
-        .copied()
-        .filter(|character| matches!(character, '。' | '！' | '？' | '.' | '!' | '?'));
+    let ending = characters.last().copied().filter(|character| {
+        matches!(
+            character,
+            '。' | '！' | '？' | '.' | '!' | '?'
+        )
+    });
     if ending.is_some() {
         characters.pop();
     }
@@ -1384,7 +1394,9 @@ fn protect_repeated_short_phrase(text: &str) -> String {
     if characters.len() >= 4
         && characters.len() <= SHORT_UTTERANCE_MAX_UNITS
         && characters.len() % 2 == 0
-        && characters.iter().all(|character| is_cjk_character(*character))
+        && characters
+            .iter()
+            .all(|character| is_cjk_character(*character))
         && characters[..half] == characters[half..]
     {
         characters.insert(half, '，');
@@ -1711,11 +1723,17 @@ fn apply_replay_camera(
     mut fade: Option<ResMut<VoxelReplayOcclusionFade>>,
     mut camera: Query<
         &mut Transform,
-        (With<VoxelViewportCamera>, Without<VoxelPlayerStandee>),
+        (
+            With<VoxelViewportCamera>,
+            Without<VoxelPlayerStandee>,
+        ),
     >,
     standees: Query<
         (&Transform, &VoxelPlayerStandee),
-        (With<VoxelPlayerStandee>, Without<VoxelViewportCamera>),
+        (
+            With<VoxelPlayerStandee>,
+            Without<VoxelViewportCamera>,
+        ),
     >,
 ) {
     if let Some(fade) = fade.as_mut() {
@@ -1759,21 +1777,29 @@ fn replay_focus_position(
     playback_ms: u64,
     standees: &Query<
         (&Transform, &VoxelPlayerStandee),
-        (With<VoxelPlayerStandee>, Without<VoxelViewportCamera>),
+        (
+            With<VoxelPlayerStandee>,
+            Without<VoxelViewportCamera>,
+        ),
     >,
 ) -> Option<Vec3> {
-    let speaker_id = replay
+    let index = replay
         .dialogue
         .iter()
-        .rev()
-        .find(|line| line.included && line.time_ms <= playback_ms)
-        .or_else(|| replay.dialogue.iter().find(|line| line.included))?
-        .sender_id;
-    standees
+        .rposition(|line| line.included && line.time_ms <= playback_ms)
+        .or_else(|| replay.dialogue.iter().position(|line| line.included))?;
+    let speaker_positions = standees
         .iter()
-        .find_map(|(transform, standee)| {
-            (standee.user_id == speaker_id).then_some(transform.translation)
-        })
+        .map(|(_, standee)| (standee.user_id, Vec3::ZERO))
+        .collect::<HashMap<_, _>>();
+    let speaker_id = replay_dialogue_focus_id(
+        &replay.dialogue,
+        index,
+        &speaker_positions,
+    )?;
+    standees.iter().find_map(|(transform, standee)| {
+        (standee.user_id == speaker_id).then_some(transform.translation)
+    })
 }
 
 fn replay_studio_ui(
@@ -1917,7 +1943,10 @@ fn replay_controls(
                 );
             });
     });
-    if matches!(studio.audience, ReplayAudience::All | ReplayAudience::Gm) {
+    if matches!(
+        studio.audience,
+        ReplayAudience::All | ReplayAudience::Gm
+    ) {
         ui.colored_label(
             egui::Color32::from_rgb(210, 90, 70),
             "“全部”可能包含私聊、隐藏队伍、GM 和系统内容，也可能发送给 DeepSeek；请勿公开发布。",
@@ -1935,10 +1964,7 @@ fn replay_controls(
             ui.add(
                 egui::DragValue::new(&mut requested_camera_distance)
                     .speed(0.05)
-                    .range(
-                        MIN_DIRECTED_CAMERA_DISTANCE_SCALE
-                            ..=MAX_DIRECTED_CAMERA_DISTANCE_SCALE,
-                    )
+                    .range(MIN_DIRECTED_CAMERA_DISTANCE_SCALE..=MAX_DIRECTED_CAMERA_DISTANCE_SCALE)
                     .fixed_decimals(2)
                     .suffix("×"),
             )
@@ -2175,7 +2201,10 @@ fn replay_controls(
         }
     });
     ui.horizontal(|ui| {
-        let music_available = studio.music_file.as_ref().is_some_and(|path| path.is_file());
+        let music_available = studio
+            .music_file
+            .as_ref()
+            .is_some_and(|path| path.is_file());
         ui.add_enabled_ui(music_available, |ui| {
             ui.checkbox(&mut studio.music_enabled, "本地 BGM");
         });
@@ -2204,7 +2233,11 @@ fn replay_controls(
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_else(|| path.display().to_string());
-                        ui.selectable_value(&mut studio.music_file, Some(path.clone()), label);
+                        ui.selectable_value(
+                            &mut studio.music_file,
+                            Some(path.clone()),
+                            label,
+                        );
                     }
                 });
         });
@@ -2213,7 +2246,10 @@ fn replay_controls(
         }
         if ui.button("打开文件夹").clicked() {
             studio.status = match open_background_music_directory() {
-                Ok(()) => format!("已打开 {}", background_music_directory().display()),
+                Ok(()) => format!(
+                    "已打开 {}",
+                    background_music_directory().display()
+                ),
                 Err(err) => err,
             };
         }
@@ -2221,7 +2257,9 @@ fn replay_controls(
     if studio.music_files.is_empty() {
         ui.small("BGM 文件夹为空；加入音乐后点击“重新扫描”。");
     }
-    ui.small("从 assets/audio 加载 MP3、WAV、OGG、FLAC、M4A 或 AAC；音乐只在本地读取，不由 AI 生成。");
+    ui.small(
+        "从 assets/audio 加载 MP3、WAV、OGG、FLAC、M4A 或 AAC；音乐只在本地读取，不由 AI 生成。",
+    );
     ui.horizontal(|ui| {
         ui.checkbox(
             &mut studio.speech_enabled,
@@ -2276,19 +2314,14 @@ fn replay_controls(
         }
     });
     if let Some(replay) = studio.replay.as_ref() {
-        let (ready, failed, total) =
-            speech.preparation_progress(replay, studio.speech_volume);
+        let (ready, failed, total) = speech.preparation_progress(replay, studio.speech_volume);
         let generation_active = !speech.generation_cues.is_empty()
             || speech
                 .pending_generation_lines
                 .iter()
                 .any(|(replay_id, _)| *replay_id == replay.created_at_unix_ms);
         let processed = ready.saturating_add(failed);
-        let progress = if total == 0 {
-            1.0
-        } else {
-            processed as f32 / total as f32
-        };
+        let progress = if total == 0 { 1.0 } else { processed as f32 / total as f32 };
         let text = if !studio.speech_enabled {
             format!("语音预生成已暂停：{ready}/{total}")
         } else if !onnx_tts_is_available() {
@@ -2803,12 +2836,21 @@ fn queue_replay_director(
     }
     let visible_standees = standees
         .iter()
-        .map(|(_, standee)| standee.user_id)
-        .collect::<std::collections::HashSet<_>>();
+        .map(|(transform, standee)| (standee.user_id, transform.translation))
+        .collect::<HashMap<_, _>>();
     let missing_standee_count = replay
         .dialogue
         .iter()
-        .filter(|line| line.included && !visible_standees.contains(&line.sender_id))
+        .enumerate()
+        .filter(|(index, line)| {
+            line.included
+                && replay_dialogue_focus_id(
+                    &replay.dialogue,
+                    *index,
+                    &visible_standees,
+                )
+                .is_none()
+        })
         .count();
     if missing_standee_count > 0 {
         return Err(format!(
@@ -2821,13 +2863,18 @@ fn queue_replay_director(
         .filter(|line| line.included)
         .enumerate()
         .map(|(index, line)| {
+            let focus_id = replay_dialogue_focus_id(
+                &replay.dialogue,
+                index,
+                &visible_standees,
+            );
             serde_json::json!({
                 "index": index,
-                "speaker_id": line.sender_id.to_string(),
+                "speaker_id": focus_id.unwrap_or(line.sender_id).to_string(),
                 "name": line.name,
                 "role": line.role,
                 "text": line.text.trim(),
-                "has_character_model": true,
+                "has_character_model": focus_id.is_some(),
             })
         })
         .collect::<Vec<_>>();
@@ -3156,7 +3203,9 @@ fn replay_dialogue_editor(
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("回合");
                                 let turn_changed = ui
-                                    .add(egui::DragValue::new(&mut line.turn_index))
+                                    .add(egui::DragValue::new(
+                                        &mut line.turn_index,
+                                    ))
                                     .changed();
                                 changed |= turn_changed;
                                 ui.label("区域");
@@ -3167,9 +3216,8 @@ fn replay_dialogue_editor(
                                     )
                                     .changed();
                                 let mut position_changed = false;
-                                for (axis, value) in ["X", "Y", "Z"]
-                                    .into_iter()
-                                    .zip(&mut line.position_cells)
+                                for (axis, value) in
+                                    ["X", "Y", "Z"].into_iter().zip(&mut line.position_cells)
                                 {
                                     ui.label(axis);
                                     position_changed |=
@@ -3182,28 +3230,30 @@ fn replay_dialogue_editor(
                                 if !block_options.is_empty() {
                                     let mut selected_block =
                                         line_blocks.get(&line.line_id).copied().unwrap_or_default();
-                                    egui::ComboBox::from_id_salt(("replay-line-block", line.line_id))
-                                        .selected_text(
-                                            block_options
-                                                .iter()
-                                                .find(|(id, _)| *id == selected_block)
-                                                .map(|(_, area)| area.as_str())
-                                                .unwrap_or("未分配"),
-                                        )
-                                        .show_ui(ui, |ui| {
-                                            for (block_id, area) in &block_options {
-                                                ui.selectable_value(
-                                                    &mut selected_block,
-                                                    *block_id,
-                                                    area,
-                                                );
-                                            }
-                                        });
+                                    egui::ComboBox::from_id_salt((
+                                        "replay-line-block",
+                                        line.line_id,
+                                    ))
+                                    .selected_text(
+                                        block_options
+                                            .iter()
+                                            .find(|(id, _)| *id == selected_block)
+                                            .map(|(_, area)| area.as_str())
+                                            .unwrap_or("未分配"),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (block_id, area) in &block_options {
+                                            ui.selectable_value(
+                                                &mut selected_block,
+                                                *block_id,
+                                                area,
+                                            );
+                                        }
+                                    });
                                     if line_blocks.get(&line.line_id).copied()
                                         != Some(selected_block)
                                     {
-                                        line_reassignments
-                                            .push((line.line_id, selected_block));
+                                        line_reassignments.push((line.line_id, selected_block));
                                     }
                                 }
                             });
@@ -3258,13 +3308,19 @@ fn replay_dialogue_editor(
                         block_move = Some((index, index + 1));
                     }
                     if ui
-                        .add_enabled(block.line_ids.len() > 1, egui::Button::new("拆分"))
+                        .add_enabled(
+                            block.line_ids.len() > 1,
+                            egui::Button::new("拆分"),
+                        )
                         .clicked()
                     {
                         block_split = Some(index);
                     }
                     if ui
-                        .add_enabled(index + 1 < block_count, egui::Button::new("与下块合并"))
+                        .add_enabled(
+                            index + 1 < block_count,
+                            egui::Button::new("与下块合并"),
+                        )
                         .clicked()
                     {
                         block_merge = Some(index);
@@ -3296,14 +3352,11 @@ fn replay_dialogue_editor(
                     .unwrap_or_default()
                     .saturating_add(1);
                 let area = replay.area_blocks[index].area.clone();
-                replay.area_blocks.insert(
-                    index + 1,
-                    ReplayAreaBlock {
-                        id: next_id,
-                        area,
-                        line_ids,
-                    },
-                );
+                replay.area_blocks.insert(index + 1, ReplayAreaBlock {
+                    id: next_id,
+                    area,
+                    line_ids,
+                });
                 changed = true;
             }
             if let Some(index) = block_merge {
@@ -3573,7 +3626,10 @@ fn refresh_background_music(studio: &mut ReplayStudio) {
             background_music_directory().display()
         )
     } else {
-        format!("已找到 {} 首本地 BGM", studio.music_files.len())
+        format!(
+            "已找到 {} 首本地 BGM",
+            studio.music_files.len()
+        )
     };
 }
 
@@ -3910,16 +3966,19 @@ fn write_narration_track(
         .map_err(|err| format!("完成角色语音轨道失败：{err}"))
 }
 
-const EMOTIVOICE_VOICE_PROFILES: [(&str, &str); 9] = [
+const EMOTIVOICE_VOICE_PROFILES: [(&str, &str); 11] = [
     ("9000", "男声 9000（推荐）"),
     ("984", "男声 984"),
     ("985", "男声 985"),
+    ("6671", "男声 6671"),
+    ("6670", "男声 6670"),
     ("65", "女声 65（推荐）"),
     ("92", "女声 92"),
     ("102", "女声 102"),
     ("225", "女声 225"),
     ("1088", "女声 1088"),
     ("1093", "女声 1093"),
+
 ];
 
 const EMOTIVOICE_EMOTIONS: [&str; 7] = ["普通", "开心", "悲伤", "生气", "惊讶", "厌恶", "恐惧"];
@@ -4095,9 +4154,7 @@ fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
 
 fn default_master_speech_speed() -> f32 { 1.10 }
 
-fn default_directed_camera_distance_scale() -> f32 {
-    DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE
-}
+fn default_directed_camera_distance_scale() -> f32 { DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE }
 
 fn normalized_directed_camera_distance_scale(scale: f32) -> f32 {
     if scale.is_finite() {
@@ -4209,9 +4266,12 @@ fn synthesize_speech_batch(
     let mut tts = None;
     for job in jobs {
         let max_samples = job.duration_ms.saturating_mul(32_000) / 1_000;
-        let wav = if let Some(wav) =
-            read_speech_cache(&job.text, &job.speaker, &job.emotion, job.onnx_speed)
-        {
+        let wav = if let Some(wav) = read_speech_cache(
+            &job.text,
+            &job.speaker,
+            &job.emotion,
+            job.onnx_speed,
+        ) {
             wav
         } else {
             let tts = match tts.as_mut() {
@@ -4296,7 +4356,10 @@ fn write_background_music_track(
     volume: f32,
 ) -> Result<(), String> {
     if !source.is_file() {
-        return Err(format!("找不到本地 BGM：{}", source.display()));
+        return Err(format!(
+            "找不到本地 BGM：{}",
+            source.display()
+        ));
     }
     let duration_seconds = (duration_ms.max(50) as f64 / 1_000.0).max(0.05);
     let fade_seconds = (duration_seconds * 0.15).clamp(0.05, 2.0);
@@ -4558,12 +4621,17 @@ fn apply_replay_standee_positions(
     studio: Res<ReplayStudio>,
     mut standees: Query<
         (&mut Transform, &VoxelPlayerStandee),
-        (With<VoxelPlayerStandee>, Without<VoxelViewportCamera>),
+        (
+            With<VoxelPlayerStandee>,
+            Without<VoxelViewportCamera>,
+        ),
     >,
     mut state: Local<ReplayStandeePlaybackState>,
 ) {
-    let active = matches!(studio.mode, ReplayMode::Playing | ReplayMode::Paused)
-        || studio.video_render.is_some();
+    let active = matches!(
+        studio.mode,
+        ReplayMode::Playing | ReplayMode::Paused
+    ) || studio.video_render.is_some();
     if active && !state.active {
         state.original_positions = standees
             .iter()
@@ -4577,9 +4645,7 @@ fn apply_replay_standee_positions(
                 .dialogue
                 .iter()
                 .filter(|line| {
-                    line.included
-                        && line.snapshot_recorded
-                        && line.time_ms <= studio.playback_ms
+                    line.included && line.snapshot_recorded && line.time_ms <= studio.playback_ms
                 })
                 .fold(HashMap::new(), |mut positions, line| {
                     positions.insert(
@@ -4671,7 +4737,13 @@ fn rebuild_area_blocks(replay: &mut ReplayFile) {
     let mut blocks = Vec::new();
     let mut next_block_id = 1_u64;
     for (area, mut lines) in areas {
-        lines.sort_by_key(|line| (line.turn_index, line.source_time, line.line_id));
+        lines.sort_by_key(|line| {
+            (
+                line.turn_index,
+                line.source_time,
+                line.line_id,
+            )
+        });
         let mut current_turns = HashSet::new();
         let mut current_ids = Vec::new();
         for line in lines {
@@ -4713,9 +4785,7 @@ fn compile_area_block_timeline(replay: &mut ReplayFile) -> u64 {
         .dialogue
         .iter()
         .filter(|line| {
-            line.included
-                && line.side == DialogueSide::Left
-                && order.contains_key(&line.line_id)
+            line.included && line.side == DialogueSide::Left && order.contains_key(&line.line_id)
         })
         .map(|line| (line.source_time, line.line_id))
         .collect::<Vec<_>>();
@@ -4746,8 +4816,10 @@ fn compile_area_block_timeline(replay: &mut ReplayFile) -> u64 {
             line.time_ms = u64::MAX;
             continue;
         }
-        line.duration_ms =
-            scaled_dialogue_duration_ms(&line.text, replay.master_dialogue_duration);
+        line.duration_ms = scaled_dialogue_duration_ms(
+            &line.text,
+            replay.master_dialogue_duration,
+        );
         line.time_ms = timeline_ms;
         timeline_ms = line
             .time_ms
@@ -4771,7 +4843,7 @@ fn standee_positions(
 fn replay_speaker_positions(dialogue: &[ReplayDialogue]) -> HashMap<u64, Vec3> {
     dialogue
         .iter()
-        .filter(|line| line.snapshot_recorded)
+        .filter(|line| line.snapshot_recorded && line.side == DialogueSide::Right)
         .map(|line| {
             (
                 line.sender_id,
@@ -4786,12 +4858,11 @@ fn replay_camera_focus_at(
     time_ms: u64,
     speaker_positions: &HashMap<u64, Vec3>,
 ) -> Option<Vec3> {
-    dialogue
+    let index = dialogue
         .iter()
-        .rev()
-        .find(|line| line.included && line.time_ms <= time_ms)
-        .or_else(|| dialogue.iter().find(|line| line.included))
-        .and_then(|line| replay_dialogue_position(line, speaker_positions))
+        .rposition(|line| line.included && line.time_ms <= time_ms)
+        .or_else(|| dialogue.iter().position(|line| line.included))?;
+    replay_dialogue_focus_position(dialogue, index, speaker_positions)
 }
 
 fn rescale_replay_camera_distance(
@@ -4799,15 +4870,16 @@ fn rescale_replay_camera_distance(
     requested_scale: f32,
     speaker_positions: &HashMap<u64, Vec3>,
 ) {
-    let previous_scale =
-        normalized_directed_camera_distance_scale(replay.camera_distance_scale);
+    let previous_scale = normalized_directed_camera_distance_scale(replay.camera_distance_scale);
     let requested_scale = normalized_directed_camera_distance_scale(requested_scale);
     let ratio = requested_scale / previous_scale;
     if (ratio - 1.0).abs() > f32::EPSILON {
         for frame in &mut replay.camera {
-            let Some(focus) =
-                replay_camera_focus_at(&replay.dialogue, frame.time_ms, speaker_positions)
-            else {
+            let Some(focus) = replay_camera_focus_at(
+                &replay.dialogue,
+                frame.time_ms,
+                speaker_positions,
+            ) else {
                 continue;
             };
             let mut transform = frame_transform(frame);
@@ -4823,9 +4895,57 @@ fn replay_dialogue_position(
     line: &ReplayDialogue,
     speaker_positions: &HashMap<u64, Vec3>,
 ) -> Option<Vec3> {
-    line.snapshot_recorded
-        .then(|| IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE)
-        .or_else(|| speaker_positions.get(&line.sender_id).copied())
+    let focus_id = line.camera_focus_id.unwrap_or(line.sender_id);
+    let current_position = speaker_positions.get(&focus_id).copied()?;
+    if line.camera_focus_id.is_none() && line.snapshot_recorded {
+        Some(IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE)
+    } else {
+        Some(current_position)
+    }
+}
+
+fn replay_dialogue_focus_id(
+    dialogue: &[ReplayDialogue],
+    index: usize,
+    speaker_positions: &HashMap<u64, Vec3>,
+) -> Option<u64> {
+    let line = dialogue.get(index)?;
+    let direct_id = line.camera_focus_id.unwrap_or(line.sender_id);
+    if speaker_positions.contains_key(&direct_id) {
+        return Some(direct_id);
+    }
+    if line.side != DialogueSide::Left {
+        return None;
+    }
+    dialogue[..index]
+        .iter()
+        .rfind(|candidate| candidate.included && candidate.side == DialogueSide::Right)
+        .and_then(|candidate| {
+            let id = candidate.camera_focus_id.unwrap_or(candidate.sender_id);
+            speaker_positions.contains_key(&id).then_some(id)
+        })
+        .or_else(|| {
+            dialogue[index.saturating_add(1)..]
+                .iter()
+                .find(|candidate| candidate.included && candidate.side == DialogueSide::Right)
+                .and_then(|candidate| {
+                    let id = candidate.camera_focus_id.unwrap_or(candidate.sender_id);
+                    speaker_positions.contains_key(&id).then_some(id)
+                })
+        })
+}
+
+fn replay_dialogue_focus_position(
+    dialogue: &[ReplayDialogue],
+    index: usize,
+    speaker_positions: &HashMap<u64, Vec3>,
+) -> Option<Vec3> {
+    let line = dialogue.get(index)?;
+    if let Some(position) = replay_dialogue_position(line, speaker_positions) {
+        return Some(position);
+    }
+    let focus_id = replay_dialogue_focus_id(dialogue, index, speaker_positions)?;
+    speaker_positions.get(&focus_id).copied()
 }
 
 fn turn_based_camera_track(
@@ -4843,9 +4963,9 @@ fn turn_based_camera_track(
         camera_distance_scale,
     );
     let mut frames = Vec::with_capacity(dialogue.len().saturating_mul(3).saturating_add(2));
-    let mut current = dialogue
-        .first()
-        .and_then(|line| replay_dialogue_position(line, speaker_positions))
+    let mut current = (!dialogue.is_empty())
+        .then(|| replay_dialogue_focus_position(dialogue, 0, speaker_positions))
+        .flatten()
         .map(|target| {
             rig.speaker_shot(
                 target,
@@ -4856,9 +4976,9 @@ fn turn_based_camera_track(
         })
         .unwrap_or_else(|| base.clone());
     frames.push(camera_keyframe(0, &current));
-    for line in dialogue {
+    for (index, line) in dialogue.iter().enumerate() {
         let line_end = line.time_ms.saturating_add(line.duration_ms);
-        if let Some(target) = replay_dialogue_position(line, speaker_positions) {
+        if let Some(target) = replay_dialogue_focus_position(dialogue, index, speaker_positions) {
             let focused = rig.speaker_shot(
                 target,
                 DirectorShot::SpeakerMedium,
@@ -4911,8 +5031,8 @@ fn director_camera_track(
         camera_distance_scale,
     );
     let mut current = base.clone();
-    if let (Some(line), Some(cue)) = (dialogue.first(), cues.first()) {
-        if let Some(target) = replay_dialogue_position(line, speaker_positions) {
+    if let (Some(_line), Some(cue)) = (dialogue.first(), cues.first()) {
+        if let Some(target) = replay_dialogue_focus_position(dialogue, 0, speaker_positions) {
             current = rig.director_shot(
                 target,
                 resolved_speaker_shot(cue.shot),
@@ -4923,17 +5043,27 @@ fn director_camera_track(
         }
     }
     let mut frames = vec![camera_keyframe(0, &current)];
-    for (line, cue) in dialogue.iter().zip(cues) {
+    for (index, (line, cue)) in dialogue.iter().zip(cues).enumerate() {
         let line_end = line.time_ms.saturating_add(line.duration_ms);
         let (arrival, settled) = if let Some(target) =
-            replay_dialogue_position(line, speaker_positions)
+            replay_dialogue_focus_position(dialogue, index, speaker_positions)
         {
             let speaker_shot = resolved_speaker_shot(cue.shot);
-            let desired_arrival =
-                rig.director_shot(target, speaker_shot, cue.motion, 0.0, obstacles);
+            let desired_arrival = rig.director_shot(
+                target,
+                speaker_shot,
+                cue.motion,
+                0.0,
+                obstacles,
+            );
             let arrival = desired_arrival;
-            let desired_settled =
-                rig.director_shot(target, speaker_shot, cue.motion, 1.0, obstacles);
+            let desired_settled = rig.director_shot(
+                target,
+                speaker_shot,
+                cue.motion,
+                1.0,
+                obstacles,
+            );
             let settle_limit = (line.duration_ms as f32 / 1_000.0 * 0.12).clamp(0.2, 0.65);
             let settled = limit_camera_travel_toward(
                 &arrival,
@@ -5067,14 +5197,14 @@ impl DirectedCameraRig {
         speaker_positions: &HashMap<u64, Vec3>,
         distance_scale: f32,
     ) -> Self {
-        let first = dialogue
-            .iter()
-            .find_map(|line| replay_dialogue_position(line, speaker_positions));
+        let first = dialogue.iter().enumerate().find_map(|(index, _)| {
+            replay_dialogue_focus_position(dialogue, index, speaker_positions)
+        });
         let second = first.and_then(|first_position| {
-            dialogue.iter().find_map(|line| {
-                replay_dialogue_position(line, speaker_positions).filter(|position| {
-                        horizontal(*position - first_position).length_squared() > 0.01
-                    })
+            dialogue.iter().enumerate().find_map(|(index, _)| {
+                replay_dialogue_focus_position(dialogue, index, speaker_positions).filter(
+                    |position| horizontal(*position - first_position).length_squared() > 0.01,
+                )
             })
         });
         let (axis_origin, mut camera_side) = match (first, second) {
@@ -5175,17 +5305,14 @@ impl DirectedCameraRig {
         height: f32,
         obstacles: &ReplayCameraObstacles,
     ) -> Vec3 {
-        const YAW_OFFSETS_DEGREES: [f32; 9] = [
-            0.0, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0,
-        ];
-        const DISTANCE_SCALES: [f32; 10] =
-            [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.12];
+        const YAW_OFFSETS_DEGREES: [f32; 9] =
+            [0.0, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0];
+        const DISTANCE_SCALES: [f32; 10] = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.12];
         const HEIGHT_SCALES: [f32; 3] = [1.0, 0.75, 1.25];
 
         let mut best = None::<(f32, Vec3)>;
         for yaw_degrees in YAW_OFFSETS_DEGREES {
-            let direction =
-                Quat::from_rotation_y(yaw_degrees.to_radians()) * self.camera_side;
+            let direction = Quat::from_rotation_y(yaw_degrees.to_radians()) * self.camera_side;
             for distance_scale in DISTANCE_SCALES {
                 for height_scale in HEIGHT_SCALES {
                     let mut candidate = target
@@ -5207,16 +5334,15 @@ impl DirectedCameraRig {
                 }
             }
         }
-        best.map(|(_, position)| position)
-            .unwrap_or_else(|| {
-                let mut fallback =
-                    target + self.camera_side * (VOXEL_SIZE * 2.0) + Vec3::Y * VOXEL_SIZE;
-                let signed_side = self.signed_side(fallback);
-                if signed_side < Self::LINE_MARGIN {
-                    fallback += self.camera_side * (Self::LINE_MARGIN - signed_side);
-                }
-                fallback
-            })
+        best.map(|(_, position)| position).unwrap_or_else(|| {
+            let mut fallback =
+                target + self.camera_side * (VOXEL_SIZE * 2.0) + Vec3::Y * VOXEL_SIZE;
+            let signed_side = self.signed_side(fallback);
+            if signed_side < Self::LINE_MARGIN {
+                fallback += self.camera_side * (Self::LINE_MARGIN - signed_side);
+            }
+            fallback
+        })
     }
 }
 
@@ -5282,10 +5408,20 @@ fn dialogue_from_message(
     let (name, role, avatar) = dialogue_identity(message, character);
     let avatar = resolve_character_image_source(manager, &avatar);
     let side = speaker_side(is_gm);
+    let camera_focus_id = is_gm
+        .then(|| match message.visibility {
+            Visibility::Player(player_id) => Some(player_id),
+            _ => message
+                .character_id
+                .as_deref()
+                .and_then(|character_id| character_id.parse().ok()),
+        })
+        .flatten();
     Some(ReplayDialogue {
         time_ms,
         duration_ms: dialogue_duration_ms(text),
         sender_id: message.sender_id,
+        camera_focus_id,
         name,
         role,
         text: text.to_owned(),
@@ -5323,12 +5459,7 @@ fn estimated_replay_snapshot(
         .unwrap_or_default();
     let position_cells = speaker_positions
         .get(&message.sender_id)
-        .map(|position| {
-            (*position / VOXEL_SIZE)
-                .round()
-                .as_ivec3()
-                .to_array()
-        })
+        .map(|position| (*position / VOXEL_SIZE).round().as_ivec3().to_array())
         .unwrap_or([0, 0, 0]);
     ReplayMessageSnapshot {
         turn_index,
@@ -5339,7 +5470,10 @@ fn estimated_replay_snapshot(
 fn normalize_dialogue_sides(replay: &mut ReplayFile, manager: &NapcatMessageManager) {
     deduplicate_broadcast_dialogue(&mut replay.dialogue, manager);
     for dialogue in &mut replay.dialogue {
-        dialogue.side = speaker_side(replay_sender_is_gm(dialogue.sender_id, manager));
+        dialogue.side = speaker_side(replay_sender_is_gm(
+            dialogue.sender_id,
+            manager,
+        ));
     }
 }
 
@@ -5746,10 +5880,7 @@ fn replay_dialogue_is_ready_for_display(
     dialogue_index: usize,
     tts_available: bool,
 ) -> bool {
-    if studio.mode != ReplayMode::Playing
-        || !studio.speech_enabled
-        || !tts_available
-    {
+    if studio.mode != ReplayMode::Playing || !studio.speech_enabled || !tts_available {
         return true;
     }
     let Some(replay) = studio.replay.as_ref() else {
@@ -6158,14 +6289,19 @@ mod tests {
 
         auto_group_replay_areas(&mut replay);
 
-        assert_eq!(replay.dialogue[0].area, replay.dialogue[1].area);
-        assert_ne!(replay.dialogue[0].area, replay.dialogue[2].area);
+        assert_eq!(
+            replay.dialogue[0].area,
+            replay.dialogue[1].area
+        );
+        assert_ne!(
+            replay.dialogue[0].area,
+            replay.dialogue[2].area
+        );
     }
 
     #[test]
     fn legacy_history_uses_an_editable_estimated_position() {
-        let manager: NapcatMessageManager =
-            serde_json::from_str(r#"{"messages":{}}"#).unwrap();
+        let manager: NapcatMessageManager = serde_json::from_str(r#"{"messages":{}}"#).unwrap();
         let message = CampaignMessage {
             campaign_id: "campaign".to_owned(),
             sender_id: 7,
@@ -6183,8 +6319,7 @@ mod tests {
             &manager,
             &HashMap::from([(7, Vec3::new(2.0, 3.0, -1.0))]),
         );
-        let dialogue =
-            dialogue_from_message(&message, &manager, 350, &snapshot, true).unwrap();
+        let dialogue = dialogue_from_message(&message, &manager, 350, &snapshot, true).unwrap();
 
         assert_eq!(dialogue.position_cells, [8, 12, -4]);
         assert!(dialogue.included);
@@ -6206,16 +6341,67 @@ mod tests {
             default_directed_camera_distance_scale(),
             &ReplayCameraObstacles::default(),
         );
-        let shot = frame_transform(
-            frames
-                .iter()
-                .find(|frame| frame.time_ms == 350)
-                .unwrap(),
-        );
+        let shot = frame_transform(frames.iter().find(|frame| frame.time_ms == 350).unwrap());
         let forward = shot.rotation * Vec3::NEG_Z;
         assert!(
             forward.dot((saved_position - shot.translation).normalize()) > 0.99,
             "camera must ignore the speaker's current standee position"
+        );
+    }
+
+    #[test]
+    fn gm_camera_line_focuses_on_the_addressed_player_standee() {
+        let target = Vec3::new(8.0, 1.0, -3.0);
+        let mut line = test_dialogue(350, 600, DialogueSide::Left);
+        line.sender_id = 0;
+        line.camera_focus_id = Some(7);
+        line.snapshot_recorded = true;
+        line.position_cells = [0, 0, 0];
+        let frames = turn_based_camera_track(
+            &Transform::from_xyz(0.0, 3.0, 4.0),
+            &[line],
+            1_000,
+            &HashMap::from([(7, target)]),
+            default_directed_camera_distance_scale(),
+            &ReplayCameraObstacles::default(),
+        );
+
+        let shot = frame_transform(frames.iter().find(|frame| frame.time_ms == 350).unwrap());
+        let forward = shot.rotation * Vec3::NEG_Z;
+        assert!(
+            forward.dot((target - shot.translation).normalize()) > 0.99,
+            "GM dialogue must frame the addressed player, not the GM origin"
+        );
+    }
+
+    #[test]
+    fn legacy_gm_camera_line_focuses_on_the_previous_player() {
+        let target = Vec3::new(8.0, 1.0, -3.0);
+        let mut player_line = test_dialogue(350, 600, DialogueSide::Right);
+        player_line.sender_id = 7;
+        player_line.snapshot_recorded = true;
+        player_line.position_cells = [32, 4, -12];
+        let mut gm_line = test_dialogue(1_000, 600, DialogueSide::Left);
+        gm_line.sender_id = 0;
+        gm_line.snapshot_recorded = true;
+        gm_line.position_cells = [0, 0, 0];
+        let dialogue = [player_line, gm_line];
+        let speaker_positions = replay_speaker_positions(&dialogue);
+        let frames = turn_based_camera_track(
+            &Transform::from_xyz(0.0, 3.0, 4.0),
+            &dialogue,
+            1_700,
+            &speaker_positions,
+            default_directed_camera_distance_scale(),
+            &ReplayCameraObstacles::default(),
+        );
+
+        let shot =
+            frame_transform(frames.iter().find(|frame| frame.time_ms == 1_000).unwrap());
+        let forward = shot.rotation * Vec3::NEG_Z;
+        assert!(
+            forward.dot((target - shot.translation).normalize()) > 0.99,
+            "legacy GM dialogue must inherit the nearest player's standee"
         );
     }
 
@@ -6363,11 +6549,9 @@ mod tests {
             default_directed_camera_distance_scale(),
             &obstacles,
         );
-        assert!(
-            frames
-                .windows(2)
-                .all(|pair| pair[0].time_ms < pair[1].time_ms)
-        );
+        assert!(frames
+            .windows(2)
+            .all(|pair| pair[0].time_ms < pair[1].time_ms));
         for (arrival_ms, target) in [(350, speaker_positions[&1]), (3_030, speaker_positions[&2])] {
             let frame = frames
                 .iter()
@@ -6587,8 +6771,7 @@ mod tests {
         let target = Vec3::new(2.0, 1.0, -1.0);
         let line = test_dialogue(350, 2_700, DialogueSide::Right);
         let mut replay = test_replay(vec![line]);
-        let original =
-            Transform::from_xyz(2.0, 3.25, 6.5).looking_at(target, Vec3::Y);
+        let original = Transform::from_xyz(2.0, 3.25, 6.5).looking_at(target, Vec3::Y);
         replay.camera = vec![camera_keyframe(350, &original)];
 
         rescale_replay_camera_distance(
@@ -6599,14 +6782,12 @@ mod tests {
 
         let adjusted = frame_transform(&replay.camera[0]);
         assert!(
-            (adjusted.translation.distance(target)
-                - original.translation.distance(target) * 2.0)
+            (adjusted.translation.distance(target) - original.translation.distance(target) * 2.0)
                 .abs()
                 < 0.001
         );
         assert!(
-            (adjusted.rotation * Vec3::NEG_Z)
-                .dot((target - adjusted.translation).normalize())
+            (adjusted.rotation * Vec3::NEG_Z).dot((target - adjusted.translation).normalize())
                 > 0.999
         );
         assert_eq!(replay.camera_distance_scale, 3.0);
@@ -6686,7 +6867,9 @@ mod tests {
             &obstacles,
         );
 
-        assert!(arrival.translation.abs_diff_eq(settled.translation, f32::EPSILON));
+        assert!(arrival
+            .translation
+            .abs_diff_eq(settled.translation, f32::EPSILON));
         assert!(rig.signed_side(settled.translation) >= DirectedCameraRig::LINE_MARGIN);
     }
 
@@ -6747,13 +6930,14 @@ mod tests {
 
     #[test]
     fn local_discussion_group_broadcast_is_one_avatarless_gm_line_on_the_left() {
-        let mut manager: NapcatMessageManager =
-            serde_json::from_str(r#"{"messages":{}}"#).unwrap();
-        manager.player_characters.insert("7".to_owned(), PlayerCharacter {
-            name: "陌陌".to_owned(),
-            image: "momo.png".to_owned(),
-            ..Default::default()
-        });
+        let mut manager: NapcatMessageManager = serde_json::from_str(r#"{"messages":{}}"#).unwrap();
+        manager
+            .player_characters
+            .insert("7".to_owned(), PlayerCharacter {
+                name: "陌陌".to_owned(),
+                image: "momo.png".to_owned(),
+                ..Default::default()
+            });
         let message = CampaignMessage {
             campaign_id: "campaign".to_owned(),
             sender_id: 0,
@@ -6771,9 +6955,13 @@ mod tests {
             position_cells: [0, 0, 0],
         };
 
-        let line = dialogue_from_message(&message, &manager, 350, &snapshot, false).unwrap();
+        let line = dialogue_from_message(
+            &message, &manager, 350, &snapshot, false,
+        )
+        .unwrap();
 
         assert_eq!(line.side, DialogueSide::Left);
+        assert_eq!(line.camera_focus_id, Some(7));
         assert_eq!(line.name, "GM");
         assert!(line.role.is_empty());
         assert!(line.avatar.is_empty());
@@ -6785,8 +6973,7 @@ mod tests {
 
     #[test]
     fn forwarded_broadcast_is_one_original_player_line() {
-        let manager: NapcatMessageManager =
-            serde_json::from_str(r#"{"messages":{}}"#).unwrap();
+        let manager: NapcatMessageManager = serde_json::from_str(r#"{"messages":{}}"#).unwrap();
         let mut line = test_dialogue(1_200, 600, DialogueSide::Right);
         line.sender_id = 7;
         line.text = "hello".to_owned();
@@ -6850,10 +7037,7 @@ mod tests {
             emotivoice_model_text("不要不要！"),
             "不要，不要！"
         );
-        assert_eq!(
-            emotivoice_model_text("好好"),
-            "好好。"
-        );
+        assert_eq!(emotivoice_model_text("好好"), "好好。");
         assert!(
             (effective_emotivoice_speed("可以可以", configured_speed) - 1.10).abs() < f32::EPSILON
         );
@@ -7046,11 +7230,18 @@ mod tests {
             (replay.created_at_unix_ms, 0),
             (vec![1], 1.0),
         );
-        assert_eq!(speech.preparation_progress(&replay, 1.0), (1, 0, 2));
-        speech
-            .onnx_failures
-            .insert((replay.created_at_unix_ms, 2), "test failure".to_owned());
-        assert_eq!(speech.preparation_progress(&replay, 1.0), (1, 1, 2));
+        assert_eq!(
+            speech.preparation_progress(&replay, 1.0),
+            (1, 0, 2)
+        );
+        speech.onnx_failures.insert(
+            (replay.created_at_unix_ms, 2),
+            "test failure".to_owned(),
+        );
+        assert_eq!(
+            speech.preparation_progress(&replay, 1.0),
+            (1, 1, 2)
+        );
         assert!(speech.onnx_cue_finished(
             replay_voice_signature(&replay, 1.0),
             (replay.created_at_unix_ms, 2),
@@ -7075,9 +7266,7 @@ mod tests {
             (replay.created_at_unix_ms, 0),
         ));
 
-        speech
-            .onnx_queued
-            .insert((replay.created_at_unix_ms, 0));
+        speech.onnx_queued.insert((replay.created_at_unix_ms, 0));
         assert!(!speech.onnx_cue_finished(
             signature,
             (replay.created_at_unix_ms, 0),
@@ -7161,7 +7350,9 @@ mod tests {
     #[test]
     fn replay_preview_blocks_world_mouse_interaction() {
         let mut studio = ReplayStudio::default();
-        assert!(!replay_blocks_mouse_interaction(&studio));
+        assert!(!replay_blocks_mouse_interaction(
+            &studio
+        ));
 
         studio.mode = ReplayMode::Playing;
         assert!(replay_blocks_mouse_interaction(&studio));
@@ -7170,7 +7361,9 @@ mod tests {
         assert!(replay_blocks_mouse_interaction(&studio));
 
         studio.mode = ReplayMode::Recording;
-        assert!(!replay_blocks_mouse_interaction(&studio));
+        assert!(!replay_blocks_mouse_interaction(
+            &studio
+        ));
     }
 
     #[test]
@@ -7227,10 +7420,17 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("legacy.willow-replay.json");
-        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
         let imported = import_replay(path.to_str().unwrap()).unwrap();
 
-        assert_eq!(imported.format_version, REPLAY_FORMAT_VERSION);
+        assert_eq!(
+            imported.format_version,
+            REPLAY_FORMAT_VERSION
+        );
         assert!(imported.duration_ms < 30_000);
         assert!(imported.dialogue[1].time_ms < 15_000);
         assert!(imported
@@ -7243,7 +7443,9 @@ mod tests {
     fn speaker_voice_profiles_use_fixed_emotivoice_speakers() {
         let profiles = (0..8).map(speaker_voice_profile).collect::<Vec<_>>();
         assert!(profiles.iter().all(|(pitch, _)| *pitch == 0));
-        assert_eq!(EMOTIVOICE_VOICE_PROFILES.len(), 9);
+        assert_eq!(EMOTIVOICE_VOICE_PROFILES.len(), 11);
+        assert_eq!(EMOTIVOICE_VOICE_PROFILES[3].0, "6671");
+        assert_eq!(EMOTIVOICE_VOICE_PROFILES[4].0, "6670");
         assert_eq!(
             default_emotivoice_speaker(0),
             "9000"
@@ -7357,7 +7559,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("z.MP3"), b"music").unwrap();
         fs::write(directory.path().join("A.ogg"), b"music").unwrap();
-        fs::write(directory.path().join("notes.txt"), b"not music").unwrap();
+        fs::write(
+            directory.path().join("notes.txt"),
+            b"not music",
+        )
+        .unwrap();
 
         let files = discover_background_music_in(directory.path());
         assert_eq!(
@@ -7474,17 +7680,20 @@ mod tests {
     fn write_test_bgm(path: &Path) {
         let samples = (0..8_000)
             .flat_map(|index| {
-                let sample = if index % 32 < 16 {
-                    8_000_i16
-                } else {
-                    -8_000_i16
-                };
+                let sample = if index % 32 < 16 { 8_000_i16 } else { -8_000_i16 };
                 [sample, sample]
             })
             .flat_map(i16::to_le_bytes)
             .collect::<Vec<_>>();
         let mut writer = BufWriter::new(fs::File::create(path).unwrap());
-        write_wav_header(&mut writer, 32_000, 2, 16, samples.len() as u32).unwrap();
+        write_wav_header(
+            &mut writer,
+            32_000,
+            2,
+            16,
+            samples.len() as u32,
+        )
+        .unwrap();
         writer.write_all(&samples).unwrap();
         writer.flush().unwrap();
     }
@@ -7494,6 +7703,7 @@ mod tests {
             time_ms,
             duration_ms,
             sender_id: 1,
+            camera_focus_id: None,
             name: "测试".to_owned(),
             role: String::new(),
             text: "台词".to_owned(),

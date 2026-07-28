@@ -47,11 +47,11 @@ use bevy::{
         Indices,
         PrimitiveTopology,
     },
-    prelude::*,
     pbr::{
         ExtendedMaterial,
         MaterialExtension,
     },
+    prelude::*,
     render::{
         render_resource::{
             AsBindGroup,
@@ -216,7 +216,12 @@ impl VoxelOcclusionFadeExtension {
     fn new() -> Self {
         Self {
             settings: VoxelOcclusionFadeUniform {
-                focus_and_radius: Vec4::new(0.0, 0.0, 0.0, VOXEL_OCCLUSION_FOCUS_RADIUS),
+                focus_and_radius: Vec4::new(
+                    0.0,
+                    0.0,
+                    0.0,
+                    VOXEL_OCCLUSION_FOCUS_RADIUS,
+                ),
                 ..default()
             },
         }
@@ -5060,10 +5065,7 @@ fn sorted_planet_cells(planet: &VoxelOrbitalPlanet) -> Vec<(IVec3, u8)> {
     cells
 }
 
-fn planet_material_handle(
-    materials: &VoxelMaterials,
-    material_id: u8,
-) -> Handle<StandardMaterial> {
+fn planet_material_handle(materials: &VoxelMaterials, material_id: u8) -> Handle<StandardMaterial> {
     if material_id == 4 {
         materials.planet_ocean.clone()
     } else {
@@ -7573,10 +7575,7 @@ fn apply_voxel_teleport(
             Without<VoxelPlayerStandee>,
         ),
     >,
-    standees: Query<
-        (&VoxelPlayerStandee, &GlobalTransform),
-        Without<VoxelFirstPersonPlayer>,
-    >,
+    standees: Query<(&VoxelPlayerStandee, &GlobalTransform), Without<VoxelFirstPersonPlayer>>,
 ) {
     let Some(destination) = editor.teleport_requested.take() else { return };
     if possession.active_user_id.is_some() {
@@ -8926,10 +8925,7 @@ mod tests {
         let high = IVec3::new(-4, 7, 9);
         let other = IVec3::new(12, 1, -3);
 
-        let snapshot = voxel_minimap_snapshot_from_cells(
-            &[(low, 2), (high, 8), (other, 6)],
-            8,
-        );
+        let snapshot = voxel_minimap_snapshot_from_cells(&[(low, 2), (high, 8), (other, 6)], 8);
         let fraction = snapshot.world_fraction(high.as_vec3() * VOXEL_SIZE);
         let (x, z) = snapshot.tile_indices(fraction);
         let tile = snapshot.tile(x, z).unwrap();
@@ -8986,7 +8982,9 @@ mod tests {
         let user_id = 1_670_426_821;
         let standee_eye_position = Vec3::new(12.0, 3.0, -8.0);
         let mut editor = VoxelEditorState::default();
-        editor.request_teleport(VoxelTeleportDestination::PlayerStandee(user_id));
+        editor.request_teleport(VoxelTeleportDestination::PlayerStandee(
+            user_id,
+        ));
         let mut app = App::new();
         app.insert_resource(editor)
             .init_resource::<VoxelPossessionState>()
@@ -9690,8 +9688,7 @@ mod tests {
             .init_resource::<Assets<VoxelFadeMaterial>>();
         let (normal_handles, normal_planet_ocean) = {
             let mut assets = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
-            let handles =
-                std::array::from_fn(|_| assets.add(StandardMaterial::default()));
+            let handles = std::array::from_fn(|_| assets.add(StandardMaterial::default()));
             let planet_ocean = assets.add(StandardMaterial::default());
             (handles, planet_ocean)
         };
@@ -10740,6 +10737,7 @@ mod tests {
         let mut editor = VoxelEditorState::default();
         editor.first_person_enabled = true;
         editor.first_person_flying = true;
+        editor.first_person_cursor_released = false;
 
         let mut app = App::new();
         app.insert_resource(Time::<()>::default())

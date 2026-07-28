@@ -925,7 +925,10 @@ pub struct UiSystemLocals<'w, 's> {
     player_standees: Query<
         'w,
         's,
-        (&'static VoxelPlayerStandee, &'static bevy::prelude::Visibility),
+        (
+            &'static VoxelPlayerStandee,
+            &'static bevy::prelude::Visibility,
+        ),
     >,
 }
 
@@ -955,7 +958,11 @@ fn voxel_map_ui(
 ) {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 4, egui::Color32::from_rgb(11, 17, 24));
+    painter.rect_filled(
+        rect,
+        4,
+        egui::Color32::from_rgb(11, 17, 24),
+    );
     painter.rect_stroke(
         rect,
         4,
@@ -987,10 +994,13 @@ fn voxel_map_ui(
                     screen_z as f32 * tile_size.y,
                 );
             let density = (tile.voxel_count as f32).ln_1p().min(6.0) / 6.0;
-            let color = voxel_map_material_color(tile.material)
-                .gamma_multiply(0.55 + density * 0.45);
+            let color =
+                voxel_map_material_color(tile.material).gamma_multiply(0.55 + density * 0.45);
             painter.rect_filled(
-                Rect::from_min_size(tile_min, tile_size + egui::vec2(0.5, 0.5)),
+                Rect::from_min_size(
+                    tile_min,
+                    tile_size + egui::vec2(0.5, 0.5),
+                ),
                 0,
                 color,
             );
@@ -1074,10 +1084,15 @@ fn voxel_map_ui(
         if let Some(user_id) = state.context_player {
             let target_id = user_id.to_string();
             if ui
-                .button(format!("传送到 {}", target_display_name(manager, &target_id)))
+                .button(format!(
+                    "传送到 {}",
+                    target_display_name(manager, &target_id)
+                ))
                 .clicked()
             {
-                editor.request_teleport(VoxelTeleportDestination::PlayerStandee(user_id));
+                editor.request_teleport(VoxelTeleportDestination::PlayerStandee(
+                    user_id,
+                ));
                 ui.close();
             }
         }
@@ -1086,7 +1101,10 @@ fn voxel_map_ui(
                 editor.request_teleport(VoxelTeleportDestination::MapCell(cell));
                 ui.close();
             }
-            ui.small(format!("体素坐标：{}, {}, {}", cell.x, cell.y, cell.z));
+            ui.small(format!(
+                "体素坐标：{}, {}, {}",
+                cell.x, cell.y, cell.z
+            ));
         }
     });
 }
@@ -1102,7 +1120,10 @@ fn dm_voxel_map_windows(
     // This desktop egui layer is never part of the player capture-camera render targets.
     egui::Window::new("DM 小地图")
         .id(Id::new("dm_voxel_minimap"))
-        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-286.0, 38.0))
+        .anchor(
+            egui::Align2::RIGHT_TOP,
+            egui::vec2(-286.0, 38.0),
+        )
         .fixed_size(egui::vec2(224.0, 252.0))
         .resizable(false)
         .collapsible(true)
@@ -1135,7 +1156,10 @@ fn dm_voxel_map_windows(
                 ui.separator();
                 ui.small("北（+Z）朝上");
             });
-            let side = ui.available_width().min(ui.available_height() - 26.0).max(320.0);
+            let side = ui
+                .available_width()
+                .min(ui.available_height() - 26.0)
+                .max(320.0);
             voxel_map_ui(
                 ui,
                 Vec2::splat(side),
@@ -1192,7 +1216,10 @@ fn file_menu_button(
 
         if ui.button("TRPG设置").clicked() {
             *trpg_group_settings_open = true;
-            raise_and_expand_window(ui.ctx(), Id::new("trpg_group_settings_window"));
+            raise_and_expand_window(
+                ui.ctx(),
+                Id::new("trpg_group_settings_window"),
+            );
             ui.close();
         }
     });
@@ -1262,7 +1289,10 @@ fn pool_menu_button(
             if ui.button(label).clicked() {
                 state.pool_window_tab = tab;
                 state.pool_window_open = true;
-                raise_and_expand_window(ui.ctx(), Id::new("pool_management_window"));
+                raise_and_expand_window(
+                    ui.ctx(),
+                    Id::new("pool_management_window"),
+                );
                 ui.close();
             }
         }
@@ -1559,15 +1589,18 @@ fn chat_window(
     let mut window_open = true;
     let mut leave_group = false;
     let grouped = current_group.is_some();
-    let constraint_rect =
-        if grouped { group_member_constraint_rect(rect) } else { rect };
+    let constraint_rect = if grouped { group_member_constraint_rect(rect) } else { rect };
     let window_min_size = egui::vec2(
         CHAT_WINDOW_MIN_SIZE.x.min(constraint_rect.width().max(1.0)),
         CHAT_WINDOW_MIN_SIZE
             .y
             .min(constraint_rect.height().max(1.0)),
     );
-    let max_window_size = chat_window_max_size(constraint_rect, window_min_size, grouped);
+    let max_window_size = chat_window_max_size(
+        constraint_rect,
+        window_min_size,
+        grouped,
+    );
     let window_id = current_group
         .map(|group_name| group_member_chat_window_id(group_name, target_id))
         .unwrap_or_else(|| standalone_chat_window_id(id, target_id));
@@ -1979,7 +2012,11 @@ fn dock_chat_target_into_group(
         return false;
     };
 
-    dock_chat_target_state(group, &mut manager.open_chat_targets, target_id)
+    dock_chat_target_state(
+        group,
+        &mut manager.open_chat_targets,
+        target_id,
+    )
 }
 
 fn dock_chat_target_state(
@@ -2163,10 +2200,8 @@ fn group_member_default_pos(rect: Rect, target_id: &str) -> Pos2 {
     let mut hasher = DefaultHasher::new();
     target_id.hash(&mut hasher);
     let hash = hasher.finish();
-    let x_slots =
-        ((rect.width() - GROUP_MEMBER_CHAT_SIZE.x).max(0.0) / 36.0).floor() as u64 + 1;
-    let y_slots =
-        ((rect.height() - GROUP_MEMBER_CHAT_SIZE.y).max(0.0) / 36.0).floor() as u64 + 1;
+    let x_slots = ((rect.width() - GROUP_MEMBER_CHAT_SIZE.x).max(0.0) / 36.0).floor() as u64 + 1;
+    let y_slots = ((rect.height() - GROUP_MEMBER_CHAT_SIZE.y).max(0.0) / 36.0).floor() as u64 + 1;
     let x = rect.left() + 12.0 + (hash % x_slots) as f32 * 36.0;
     let y = rect.top() + 12.0 + ((hash / 17) % y_slots) as f32 * 36.0;
     egui::pos2(x, y)
@@ -2195,16 +2230,10 @@ fn chat_window_default_size(grouped: bool) -> Vec2 {
 }
 
 fn chat_window_max_size(constraint_rect: Rect, min_size: Vec2, grouped: bool) -> Vec2 {
-    let max_height = if grouped {
-        GROUP_MEMBER_WINDOW_MAX_HEIGHT
-    } else {
-        CHAT_WINDOW_MAX_HEIGHT
-    };
+    let max_height = if grouped { GROUP_MEMBER_WINDOW_MAX_HEIGHT } else { CHAT_WINDOW_MAX_HEIGHT };
     egui::vec2(
         constraint_rect.width().max(min_size.x),
-        max_height
-            .min(constraint_rect.height())
-            .max(min_size.y),
+        max_height.min(constraint_rect.height()).max(min_size.y),
     )
 }
 
@@ -2248,7 +2277,9 @@ fn chat_body_ui(
         egui::UiBuilder::new()
             .id_salt((target_id, "chat_body_viewport"))
             .max_rect(viewport_rect)
-            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            .layout(egui::Layout::top_down(
+                egui::Align::LEFT,
+            )),
     );
 
     // Keep the message pane and composer inside one already-allocated viewport.
@@ -2404,9 +2435,9 @@ fn group_broadcast_scope_ui(
                 .parties
                 .keys()
                 .filter(|party_id| {
-                    members.iter().any(|member_id| {
-                        group.player_in_party(member_id, party_id)
-                    })
+                    members
+                        .iter()
+                        .any(|member_id| group.player_in_party(member_id, party_id))
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -2485,8 +2516,9 @@ fn group_broadcast_targets(
     private_targets_for_member_ids(
         manager,
         members.iter().filter(|member_id| match requested_party {
-            Some(party_id) => current_group
-                .is_some_and(|group| group.player_in_party(member_id, party_id)),
+            Some(party_id) => {
+                current_group.is_some_and(|group| group.player_in_party(member_id, party_id))
+            },
             None => true,
         }),
     )
@@ -2878,11 +2910,19 @@ fn legacy_team_chat_window_entries(
 }
 
 fn legacy_team_chat_window_id(group_name: &str, team_id: &str) -> Id {
-    Id::new(("legacy_team_chat_window", group_name, team_id))
+    Id::new((
+        "legacy_team_chat_window",
+        group_name,
+        team_id,
+    ))
 }
 
 fn legacy_send_pane_window_id(group_name: &str, pane_key: &str) -> Id {
-    Id::new(("legacy_send_pane_window", group_name, pane_key))
+    Id::new((
+        "legacy_send_pane_window",
+        group_name,
+        pane_key,
+    ))
 }
 
 fn legacy_team_chat_windows(
@@ -3208,14 +3248,16 @@ fn message_row_ui(
     } else {
         (row_width * 0.72).clamp(120.0, row_width)
     };
-    let alignment = if is_self {
-        egui::Align::RIGHT
-    } else {
-        egui::Align::LEFT
-    };
-    message_bubble_layout(ui, row_width, max_message_width, alignment, |ui| {
-        message_text_ui(ui, message, image_textures);
-    });
+    let alignment = if is_self { egui::Align::RIGHT } else { egui::Align::LEFT };
+    message_bubble_layout(
+        ui,
+        row_width,
+        max_message_width,
+        alignment,
+        |ui| {
+            message_text_ui(ui, message, image_textures);
+        },
+    );
 }
 
 fn message_bubble_layout(
@@ -3225,16 +3267,22 @@ fn message_bubble_layout(
     alignment: egui::Align,
     add_contents: impl FnOnce(&mut Ui),
 ) {
-    ui.with_layout(egui::Layout::top_down(alignment), |ui| {
-        ui.set_width(row_width);
-        ui.vertical(|ui| {
-            ui.set_width(bubble_width);
-            ui.set_max_width(bubble_width);
-            ui.with_layout(egui::Layout::top_down(alignment), |ui| {
-                add_contents(ui);
+    ui.with_layout(
+        egui::Layout::top_down(alignment),
+        |ui| {
+            ui.set_width(row_width);
+            ui.vertical(|ui| {
+                ui.set_width(bubble_width);
+                ui.set_max_width(bubble_width);
+                ui.with_layout(
+                    egui::Layout::top_down(alignment),
+                    |ui| {
+                        add_contents(ui);
+                    },
+                );
             });
-        });
-    });
+        },
+    );
 }
 
 fn message_text_ui(
@@ -4360,7 +4408,10 @@ fn chat_list_panel(
                 if ui.button("打开工作区").clicked() {
                     trpg_group_settings.open = true;
                     trpg_group_settings.focused_group_name = Some(group_name.clone());
-                    raise_and_expand_window(ctx, Id::new("trpg_group_settings_window"));
+                    raise_and_expand_window(
+                        ctx,
+                        Id::new("trpg_group_settings_window"),
+                    );
                 }
             });
             ui.add_space(4.0);
@@ -8220,16 +8271,12 @@ fn restore_group_initial_player_stats(
 
 fn summary_key_matches_campaign_or_legacy(summary_key: &str, campaign_id: &str) -> bool {
     if let Some((summary_campaign_id, scope_key)) = parse_campaign_summary_key(summary_key) {
-        return summary_campaign_id == campaign_id
-            || parse_group_summary_key(scope_key).is_some();
+        return summary_campaign_id == campaign_id || parse_group_summary_key(scope_key).is_some();
     }
     true
 }
 
-fn clear_campaign_chat_messages(
-    manager: &mut NapcatMessageManager,
-    campaign_id: &str,
-) -> usize {
+fn clear_campaign_chat_messages(manager: &mut NapcatMessageManager, campaign_id: &str) -> usize {
     let removal_indexes = manager
         .messages
         .iter()
@@ -8272,13 +8319,13 @@ fn clear_campaign_summaries(
     deepseek_manager: &mut DeepseekManager,
     campaign_id: &str,
 ) -> usize {
-    manager.summarized_message_counts.retain(|summary_key, _| {
-        !summary_key_matches_campaign_or_legacy(summary_key, campaign_id)
-    });
+    manager
+        .summarized_message_counts
+        .retain(|summary_key, _| !summary_key_matches_campaign_or_legacy(summary_key, campaign_id));
     let previous_len = deepseek_manager.summaries.len();
-    deepseek_manager.summaries.retain(|summary_key, _| {
-        !summary_key_matches_campaign_or_legacy(summary_key, campaign_id)
-    });
+    deepseek_manager
+        .summaries
+        .retain(|summary_key, _| !summary_key_matches_campaign_or_legacy(summary_key, campaign_id));
     deepseek_manager.last_post_text.clear();
     previous_len.saturating_sub(deepseek_manager.summaries.len())
 }
@@ -8294,7 +8341,7 @@ fn clear_campaign_battle_rounds(
         .filter_map(|(encounter_id, encounter)| {
             (encounter.trpg_campaign_id.as_deref() == Some(campaign_id)
                 || encounter.trpg_group.as_deref() == Some(group_name))
-                .then_some(encounter_id.clone())
+            .then_some(encounter_id.clone())
         })
         .collect::<HashSet<_>>();
     battle_store
@@ -13182,10 +13229,7 @@ fn trpg_group_settings_window(
         );
     }
     if let Some(group_name) = turn_zero_reset {
-        let captured = capture_missing_group_initial_player_states(
-            manager.as_mut(),
-            &group_name,
-        );
+        let captured = capture_missing_group_initial_player_states(manager.as_mut(), &group_name);
         let reset = manager
             .trpg_groups
             .get_mut(&group_name)
@@ -13210,8 +13254,7 @@ fn trpg_group_settings_window(
         state.group_reset_status.insert(
             group_name,
             if restored == 0 {
-                "没有可恢复的首轮前状态；旧跑团请先确认一次“轮次全部归零”以建立基线"
-                    .to_owned()
+                "没有可恢复的首轮前状态；旧跑团请先确认一次“轮次全部归零”以建立基线".to_owned()
             } else if missing == 0 {
                 format!("已恢复 {restored} 个玩家的首轮前状态")
             } else {
@@ -13241,8 +13284,7 @@ fn trpg_group_settings_window(
                 .trpg_groups
                 .get_mut(&group_name)
                 .is_some_and(TrpgGroup::reset_all_turns);
-            let removed_messages =
-                clear_campaign_chat_messages(manager.as_mut(), &campaign_id);
+            let removed_messages = clear_campaign_chat_messages(manager.as_mut(), &campaign_id);
             let removed_summaries = clear_campaign_summaries(
                 manager.as_mut(),
                 deepseek_manager.as_mut(),
@@ -13251,11 +13293,8 @@ fn trpg_group_settings_window(
             let removed_battles = battle_store
                 .as_deref_mut()
                 .map(|battle_store| {
-                    let removed = clear_campaign_battle_rounds(
-                        battle_store,
-                        &group_name,
-                        &campaign_id,
-                    );
+                    let removed =
+                        clear_campaign_battle_rounds(battle_store, &group_name, &campaign_id);
                     battle_store.persist().ok();
                     removed
                 })
@@ -14737,25 +14776,36 @@ mod tests {
 
     #[test]
     fn chat_windows_can_use_the_full_available_width() {
-        let available_rect =
-            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let available_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
 
         assert_eq!(
-            chat_window_max_size(available_rect, CHAT_WINDOW_MIN_SIZE, false).x,
+            chat_window_max_size(
+                available_rect,
+                CHAT_WINDOW_MIN_SIZE,
+                false
+            )
+            .x,
             1_280.0
         );
         assert_eq!(
-            chat_window_max_size(available_rect, CHAT_WINDOW_MIN_SIZE, true).x,
+            chat_window_max_size(
+                available_rect,
+                CHAT_WINDOW_MIN_SIZE,
+                true
+            )
+            .x,
             1_280.0
         );
-        assert_eq!(group_chat_max_size(available_rect).x, 1_280.0);
+        assert_eq!(
+            group_chat_max_size(available_rect).x,
+            1_280.0
+        );
     }
 
     #[test]
     fn width_filling_group_content_does_not_expand_each_frame() {
         let ctx = Context::default();
-        let screen_rect =
-            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
         let mut widths = Vec::new();
 
         for _ in 0..6 {
@@ -14774,8 +14824,7 @@ mod tests {
                     ui.allocate_exact_size(body_size, Sense::hover());
                     let mut input = String::new();
                     ui.add(
-                        egui::TextEdit::multiline(&mut input)
-                            .desired_width(ui.available_width()),
+                        egui::TextEdit::multiline(&mut input).desired_width(ui.available_width()),
                     );
                 })
                 .unwrap();
@@ -14790,8 +14839,7 @@ mod tests {
     #[test]
     fn sent_message_does_not_expand_the_chat_window_height_each_frame() {
         let ctx = Context::default();
-        let screen_rect =
-            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
         let target_id = "42";
         let mut input_msgs = HashMap::from([(
             target_id.to_owned(),
@@ -14819,7 +14867,9 @@ mod tests {
                 ..Default::default()
             });
             let response = egui::Window::new("发送后的聊天")
-                .id(Id::new("stable_sent_message_height_test"))
+                .id(Id::new(
+                    "stable_sent_message_height_test",
+                ))
                 .default_size(CHAT_WINDOW_SIZE)
                 .min_size(CHAT_WINDOW_MIN_SIZE)
                 .max_size(chat_window_max_size(
@@ -14860,8 +14910,7 @@ mod tests {
     #[test]
     fn aligned_message_rows_do_not_expand_the_chat_window() {
         let ctx = Context::default();
-        let screen_rect =
-            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
         let mut widths = Vec::new();
 
         for _ in 0..8 {
@@ -14902,8 +14951,7 @@ mod tests {
                     );
                     let mut input = String::new();
                     ui.add(
-                        egui::TextEdit::multiline(&mut input)
-                            .desired_width(ui.available_width()),
+                        egui::TextEdit::multiline(&mut input).desired_width(ui.available_width()),
                     );
                 })
                 .unwrap();
@@ -14918,8 +14966,7 @@ mod tests {
     #[test]
     fn wrapped_private_chat_toolbar_keeps_the_requested_width() {
         let ctx = Context::default();
-        let screen_rect =
-            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
         let mut widths = Vec::new();
 
         for _ in 0..6 {
@@ -14928,7 +14975,9 @@ mod tests {
                 ..Default::default()
             });
             let response = egui::Window::new("私聊")
-                .id(Id::new("wrapped_private_chat_toolbar_test"))
+                .id(Id::new(
+                    "wrapped_private_chat_toolbar_test",
+                ))
                 .default_size(CHAT_WINDOW_SIZE)
                 .min_size(CHAT_WINDOW_MIN_SIZE)
                 .max_size(chat_window_max_size(
@@ -14939,13 +14988,8 @@ mod tests {
                 .resizable(true)
                 .show(&ctx, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        for label in [
-                            "角色",
-                            "查看玩家视角",
-                            "按玩家可见",
-                            "设置轮次",
-                            "当前",
-                        ] {
+                        for label in ["角色", "查看玩家视角", "按玩家可见", "设置轮次", "当前"]
+                        {
                             let _ = ui.button(label);
                         }
                     });
@@ -14964,8 +15008,7 @@ mod tests {
     #[test]
     fn nested_group_chat_window_can_be_resized_with_the_pointer() {
         let ctx = Context::default();
-        let screen_rect =
-            Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
         let parent_rect = Rect::from_min_size(
             egui::pos2(80.0, 60.0),
             egui::vec2(900.0, 760.0),
@@ -15001,7 +15044,8 @@ mod tests {
             } else {
                 child_window = child_window.drag_area(egui::WindowDrag::TitleBar);
             }
-            let child_rect = child_window.show(ctx, |ui| {
+            let child_rect = child_window
+                .show(ctx, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         let _ = ui.button("角色");
                         let _ = ui.button("查看玩家视角");
@@ -15035,35 +15079,27 @@ mod tests {
         let _ = run_frame(&ctx, Vec::new());
         let rect = run_frame(&ctx, Vec::new());
         let resize_start = rect.right_center();
-        let _ = run_frame(
-            &ctx,
-            vec![egui::Event::PointerMoved(resize_start)],
-        );
-        let _ = run_frame(
-            &ctx,
-            vec![egui::Event::PointerButton {
-                pos: resize_start,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::default(),
-            }],
-        );
+        let _ = run_frame(&ctx, vec![egui::Event::PointerMoved(
+            resize_start,
+        )]);
+        let _ = run_frame(&ctx, vec![egui::Event::PointerButton {
+            pos: resize_start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }]);
         let resize_end = resize_start + egui::vec2(140.0, 0.0);
-        let _ = run_frame(
-            &ctx,
-            vec![egui::Event::PointerMoved(resize_end)],
-        );
+        let _ = run_frame(&ctx, vec![egui::Event::PointerMoved(
+            resize_end,
+        )]);
         let rect = run_frame(&ctx, Vec::new());
         let resized_width = rect.width();
-        let _ = run_frame(
-            &ctx,
-            vec![egui::Event::PointerButton {
-                pos: resize_end,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            }],
-        );
+        let _ = run_frame(&ctx, vec![egui::Event::PointerButton {
+            pos: resize_end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }]);
 
         assert!(
             resized_width >= GROUP_MEMBER_CHAT_SIZE.x + 100.0,
@@ -15151,12 +15187,11 @@ mod tests {
 
         raise_and_expand_window(&ctx, window_id);
 
-        assert!(egui::collapsing_header::CollapsingState::load(
-            &ctx,
-            window_id.with("collapsing")
-        )
-        .unwrap()
-        .is_open());
+        assert!(
+            egui::collapsing_header::CollapsingState::load(&ctx, window_id.with("collapsing"))
+                .unwrap()
+                .is_open()
+        );
         assert_eq!(ctx.top_layer_id(), Some(layer_id));
         let _ = ctx.end_pass();
     }
@@ -15300,15 +15335,15 @@ mod tests {
         let mut other_message = test_private_message(2);
         other_message.data.campaign_id = "campaign-b".to_owned();
         other_message.data.access_scope_resolved = true;
-        manager
-            .messages
-            .insert("2".to_owned(), vec![campaign_message, other_message]);
+        manager.messages.insert("2".to_owned(), vec![
+            campaign_message,
+            other_message,
+        ]);
         manager.read_message_counts.insert("2".to_owned(), 2);
 
         let campaign_summary_key = SummaryScope::Private.summary_key("campaign-a", "2");
         let other_summary_key = SummaryScope::Private.summary_key("campaign-b", "2");
-        let other_group_summary_key =
-            SummaryScope::GroupPublic.summary_key("campaign-b", "99");
+        let other_group_summary_key = SummaryScope::GroupPublic.summary_key("campaign-b", "99");
         manager
             .summarized_message_counts
             .insert(campaign_summary_key.clone(), 1);
@@ -15316,18 +15351,21 @@ mod tests {
             .summarized_message_counts
             .insert(other_summary_key.clone(), 1);
         let mut deepseek_manager = DeepseekManager::default();
-        deepseek_manager
-            .summaries
-            .insert(campaign_summary_key.clone(), Default::default());
-        deepseek_manager
-            .summaries
-            .insert(other_summary_key.clone(), Default::default());
+        deepseek_manager.summaries.insert(
+            campaign_summary_key.clone(),
+            Default::default(),
+        );
+        deepseek_manager.summaries.insert(
+            other_summary_key.clone(),
+            Default::default(),
+        );
         manager
             .summarized_message_counts
             .insert(other_group_summary_key.clone(), 1);
-        deepseek_manager
-            .summaries
-            .insert(other_group_summary_key.clone(), Default::default());
+        deepseek_manager.summaries.insert(
+            other_group_summary_key.clone(),
+            Default::default(),
+        );
         for legacy_key in [
             "group:99:public",
             "276168175",
@@ -15336,9 +15374,10 @@ mod tests {
             manager
                 .summarized_message_counts
                 .insert(legacy_key.to_owned(), 1);
-            deepseek_manager
-                .summaries
-                .insert(legacy_key.to_owned(), Default::default());
+            deepseek_manager.summaries.insert(
+                legacy_key.to_owned(),
+                Default::default(),
+            );
         }
         deepseek_manager.last_post_text = "old response".to_owned();
 
@@ -15371,12 +15410,19 @@ mod tests {
             5
         );
         assert_eq!(
-            clear_campaign_battle_rounds(&mut battle_store, "party-a", "campaign-a"),
+            clear_campaign_battle_rounds(
+                &mut battle_store,
+                "party-a",
+                "campaign-a"
+            ),
             1
         );
 
         assert_eq!(manager.messages["2"].len(), 1);
-        assert_eq!(manager.messages["2"][0].data.campaign_id, "campaign-b");
+        assert_eq!(
+            manager.messages["2"][0].data.campaign_id,
+            "campaign-b"
+        );
         assert_eq!(manager.read_message_counts["2"], 1);
         assert!(!manager
             .summarized_message_counts
