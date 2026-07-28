@@ -367,6 +367,21 @@ struct VoxelPlayerCameraStore {
     cameras: Vec<PersistedVoxelPlayerCamera>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedVoxelPossessionMovement {
+    campaign_id: String,
+    user_id: u64,
+    turn: u32,
+    movement_used: f32,
+    completed: bool,
+    turn_start_position_cells: [f32; 3],
+}
+
+#[derive(Resource, Default, Serialize, Deserialize)]
+struct VoxelPossessionMovementStore {
+    records: Vec<PersistedVoxelPossessionMovement>,
+}
+
 #[derive(Resource, Default)]
 struct VoxelPlayerCameraEditor {
     selected_user_id: Option<u64>,
@@ -697,6 +712,8 @@ pub(crate) struct VoxelPossessionState {
     pub player_inventory_open: bool,
     pub movement_used: f32,
     pub movement_limit: f32,
+    movement_completed: bool,
+    movement_happened: bool,
     movement_turn: u32,
     turn_start_position: Option<Vec3>,
     last_player_position: Option<Vec3>,
@@ -704,6 +721,7 @@ pub(crate) struct VoxelPossessionState {
     movement_limit_bypassed: bool,
     movement_bypass_confirmation_pending: bool,
     persist_elapsed: f32,
+    movement_persist_elapsed: f32,
 }
 
 impl Default for VoxelPossessionState {
@@ -715,6 +733,8 @@ impl Default for VoxelPossessionState {
             player_inventory_open: false,
             movement_used: 0.0,
             movement_limit: 0.0,
+            movement_completed: false,
+            movement_happened: false,
             movement_turn: 0,
             turn_start_position: None,
             last_player_position: None,
@@ -722,6 +742,7 @@ impl Default for VoxelPossessionState {
             movement_limit_bypassed: false,
             movement_bypass_confirmation_pending: false,
             persist_elapsed: 0.0,
+            movement_persist_elapsed: 0.0,
         }
     }
 }
@@ -740,6 +761,8 @@ impl VoxelPossessionState {
     pub(crate) fn movement_remaining(&self) -> f32 {
         (self.movement_limit - self.movement_used).max(0.0)
     }
+
+    pub(crate) fn movement_is_completed(&self) -> bool { self.movement_completed }
 
     fn reset_turn_overrides(&mut self) {
         self.player_inventory_open = false;
@@ -1444,6 +1467,17 @@ impl Plugin for TrpgVoxelPlugin {
             .default(VoxelPlayerCameraStore::default())
             .build()
             .expect("failed to initialize voxel player camera store");
+        let possession_movement_store = Persistent::<VoxelPossessionMovementStore>::builder()
+            .name("voxel_possession_movement")
+            .format(StorageFormat::Toml)
+            .path(
+                Path::new(".data")
+                    .join("willowblossom")
+                    .join("voxel_possession_movement.toml"),
+            )
+            .default(VoxelPossessionMovementStore::default())
+            .build()
+            .expect("failed to initialize voxel possession movement store");
         let inventory_store = Persistent::<VoxelInventoryStore>::builder()
             .name("voxel_creative_inventory")
             .format(StorageFormat::Toml)
@@ -1509,6 +1543,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelMinimapSnapshot>()
         .init_resource::<VoxelReplayOcclusionFade>()
         .insert_resource(player_camera_store)
+        .insert_resource(possession_movement_store)
         .insert_resource(inventory_store)
         .insert_resource(toolbar_settings_store)
         .insert_resource(scene_store)
@@ -3883,7 +3918,13 @@ fn voxel_player_camera_panel(
                     possession.movement_used,
                     possession.movement_limit,
                     possession.movement_remaining(),
-                    if possession.movement_limit_bypassed { "（已允许超限）" } else { "" },
+                    if possession.movement_completed {
+                        "（已完成并锁定；可由 GM 撤销）"
+                    } else if possession.movement_limit_bypassed {
+                        "（已允许超限）"
+                    } else {
+                        ""
+                    },
                 ));
                 ui.horizontal_wrapped(|ui| {
                     if ui
@@ -8051,6 +8092,7 @@ fn control_first_person_player(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    mut movement_store: Option<ResMut<Persistent<VoxelPossessionMovementStore>>>,
     mut editor: ResMut<VoxelEditorState>,
     mut possession: ResMut<VoxelPossessionState>,
     mut players: Query<
@@ -8082,9 +8124,35 @@ fn control_first_person_player(
     };
 
     if possession.active_user_id != possession.applied_user_id {
+        if let Some(previous_user_id) = possession.applied_user_id {
+            if possession.movement_happened {
+                if let (Some(campaign_id), Some(store)) = (
+                    possession_campaign_id(manager.as_deref(), previous_user_id),
+                    movement_store.as_mut(),
+                ) {
+                    upsert_possession_movement(
+                        store,
+                        &campaign_id,
+                        previous_user_id,
+                        possession.movement_turn,
+                        possession.movement_used,
+                        true,
+                        possession
+                            .turn_start_position
+                            .unwrap_or(transform.translation),
+                    );
+                    if let Err(err) = store.persist() {
+                        eprintln!("failed to persist completed possession movement: {err}");
+                    }
+                }
+            }
+        }
         possession.applied_user_id = possession.active_user_id;
         possession.movement_used = 0.0;
+        possession.movement_completed = false;
+        possession.movement_happened = false;
         possession.persist_elapsed = 0.0;
+        possession.movement_persist_elapsed = 0.0;
         possession.reset_turn_overrides();
         if let Some(user_id) = possession.active_user_id {
             if let Some((camera_transform, _)) = capture_cameras
@@ -8103,9 +8171,28 @@ fn control_first_person_player(
             possession.last_player_position = Some(transform.translation);
             possession.movement_turn = possession_world_turn(manager.as_deref(), user_id);
             possession.movement_limit = possession_final_movement(manager.as_deref(), user_id);
+            if let (Some(campaign_id), Some(store)) = (
+                possession_campaign_id(manager.as_deref(), user_id),
+                movement_store.as_deref(),
+            ) {
+                if let Some(record) = possession_movement_record(
+                    store,
+                    &campaign_id,
+                    user_id,
+                    possession.movement_turn,
+                ) {
+                    possession.movement_used =
+                        restored_possession_movement_used(record, possession.movement_limit);
+                    possession.movement_completed = record.completed;
+                    possession.turn_start_position =
+                        Some(Vec3::from_array(record.turn_start_position_cells) * VOXEL_SIZE);
+                }
+            }
         } else {
             possession.turn_start_position = None;
             possession.last_player_position = None;
+            possession.movement_completed = false;
+            possession.movement_happened = false;
             editor.first_person_flying = true;
         }
     }
@@ -8116,6 +8203,8 @@ fn control_first_person_player(
         if possession.movement_turn != world_turn {
             possession.movement_turn = world_turn;
             possession.movement_used = 0.0;
+            possession.movement_completed = false;
+            possession.movement_happened = false;
             possession.turn_start_position = Some(transform.translation);
             possession.last_player_position = Some(transform.translation);
             possession.reset_turn_overrides();
@@ -8130,10 +8219,31 @@ fn control_first_person_player(
                 transform.translation = turn_start;
                 velocity.0 = Vec3::ZERO;
                 possession.movement_used = 0.0;
+                possession.movement_completed = false;
+                possession.movement_happened = false;
                 possession.last_player_position = Some(turn_start);
+                if let (Some(campaign_id), Some(store)) = (
+                    possession_campaign_id(manager.as_deref(), user_id),
+                    movement_store.as_mut(),
+                ) {
+                    upsert_possession_movement(
+                        store,
+                        &campaign_id,
+                        user_id,
+                        possession.movement_turn,
+                        0.0,
+                        false,
+                        turn_start,
+                    );
+                    if let Err(err) = store.persist() {
+                        eprintln!("failed to persist reset possession movement: {err}");
+                    }
+                }
             }
             possession.reset_movement_requested = false;
         } else if let Some(previous) = possession.last_player_position {
+            possession.movement_happened |=
+                previous.distance_squared(transform.translation) > f32::EPSILON;
             let (clamped, movement_used, exhausted) = resolve_horizontal_movement_step(
                 previous,
                 transform.translation,
@@ -8149,6 +8259,29 @@ fn control_first_person_player(
             }
         }
         possession.last_player_position = Some(transform.translation);
+        if let (Some(campaign_id), Some(store)) = (
+            possession_campaign_id(manager.as_deref(), user_id),
+            movement_store.as_mut(),
+        ) {
+            upsert_possession_movement(
+                store,
+                &campaign_id,
+                user_id,
+                possession.movement_turn,
+                possession.movement_used,
+                possession.movement_completed || possession.movement_happened,
+                possession
+                    .turn_start_position
+                    .unwrap_or(transform.translation),
+            );
+            possession.movement_persist_elapsed += time.delta_secs();
+            if possession.movement_persist_elapsed >= 0.5 {
+                possession.movement_persist_elapsed = 0.0;
+                if let Err(err) = store.persist() {
+                    eprintln!("failed to persist possession movement: {err}");
+                }
+            }
+        }
     }
 
     if !editor.first_person_enabled {
@@ -8221,7 +8354,10 @@ fn control_first_person_player(
     let grounded = ground_hits
         .iter()
         .any(|hit| (-hit.normal2).angle_between(Vec3::Y).abs() <= 55.0_f32.to_radians());
-    if grounded && keyboard.just_pressed(KeyCode::Space) {
+    if grounded
+        && keyboard.just_pressed(KeyCode::Space)
+        && (!possession.movement_completed || possession.movement_limit_bypassed)
+    {
         velocity.y = FIRST_PERSON_JUMP_SPEED;
     }
 }
@@ -8242,6 +8378,73 @@ fn possession_world_turn(manager: Option<&Persistent<NapcatMessageManager>>, use
         })
         .max()
         .unwrap_or_default()
+}
+
+fn possession_campaign_id(
+    manager: Option<&Persistent<NapcatMessageManager>>,
+    user_id: u64,
+) -> Option<String> {
+    let manager = manager?;
+    let group = manager.current_group()?;
+    group
+        .players
+        .iter()
+        .any(|target_id| target_id == &user_id.to_string())
+        .then(|| group.campaign_id.clone())
+}
+
+fn possession_movement_record<'a>(
+    store: &'a VoxelPossessionMovementStore,
+    campaign_id: &str,
+    user_id: u64,
+    turn: u32,
+) -> Option<&'a PersistedVoxelPossessionMovement> {
+    store.records.iter().find(|record| {
+        record.campaign_id == campaign_id && record.user_id == user_id && record.turn == turn
+    })
+}
+
+fn restored_possession_movement_used(
+    record: &PersistedVoxelPossessionMovement,
+    movement_limit: f32,
+) -> f32 {
+    if record.completed {
+        movement_limit.max(0.0)
+    } else {
+        record.movement_used.clamp(0.0, movement_limit.max(0.0))
+    }
+}
+
+fn upsert_possession_movement(
+    store: &mut VoxelPossessionMovementStore,
+    campaign_id: &str,
+    user_id: u64,
+    turn: u32,
+    movement_used: f32,
+    completed: bool,
+    turn_start_position: Vec3,
+) {
+    let record = PersistedVoxelPossessionMovement {
+        campaign_id: campaign_id.to_owned(),
+        user_id,
+        turn,
+        movement_used: movement_used.max(0.0),
+        completed,
+        turn_start_position_cells: (turn_start_position / VOXEL_SIZE).to_array(),
+    };
+    if let Some(existing) = store.records.iter_mut().find(|existing| {
+        existing.campaign_id == campaign_id && existing.user_id == user_id && existing.turn == turn
+    }) {
+        *existing = record;
+        return;
+    }
+    store.records.push(record);
+    const MAX_POSSESSION_MOVEMENT_RECORDS: usize = 4_096;
+    if store.records.len() > MAX_POSSESSION_MOVEMENT_RECORDS {
+        store
+            .records
+            .drain(..store.records.len() - MAX_POSSESSION_MOVEMENT_RECORDS);
+    }
 }
 
 fn clamp_horizontal_movement_step(
@@ -11477,6 +11680,33 @@ mod tests {
         assert_eq!(clamped.y, current.y);
         assert!((used - 7.0).abs() < 0.0001);
         assert!(exhausted);
+    }
+
+    #[test]
+    fn completed_possession_movement_is_persisted_per_campaign_player_and_turn() {
+        let mut store = VoxelPossessionMovementStore::default();
+        let turn_start = Vec3::new(1.0, 2.0, 3.0);
+
+        upsert_possession_movement(
+            &mut store,
+            "campaign-a",
+            42,
+            7,
+            3.5,
+            true,
+            turn_start,
+        );
+
+        let record = possession_movement_record(&store, "campaign-a", 42, 7).unwrap();
+        assert_eq!(record.movement_used, 3.5);
+        assert!(record.completed);
+        assert_eq!(restored_possession_movement_used(record, 12.0), 12.0);
+        assert_eq!(
+            Vec3::from_array(record.turn_start_position_cells) * VOXEL_SIZE,
+            turn_start
+        );
+        assert!(possession_movement_record(&store, "campaign-a", 42, 8).is_none());
+        assert!(possession_movement_record(&store, "campaign-b", 42, 7).is_none());
     }
 
     #[test]
