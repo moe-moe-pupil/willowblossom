@@ -54,7 +54,11 @@ fn apply_camera_blocker_opacity(in: VertexOutput) {
 
     // Voxel chunks contain walls and floors in the same mesh. Only dissolve
     // near-vertical faces so a blocking wall can never take its floor with it.
-    if abs(normalize(in.world_normal).y) >= 0.7 {
+    let face_normal = normalize(cross(
+        dpdx(in.world_position.xyz),
+        dpdy(in.world_position.xyz),
+    ));
+    if abs(face_normal.y) >= 0.7 {
         return;
     }
 
