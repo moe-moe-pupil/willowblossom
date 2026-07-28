@@ -105,6 +105,8 @@ use crate::{
         VoxelPlayerStandee,
         VoxelReplayOcclusionFade,
         VoxelViewportCamera,
+        DEFAULT_VOXEL_OCCLUSION_CAST_END_HEIGHT_CELLS,
+        DEFAULT_VOXEL_OCCLUSION_CAST_END_WIDTH_CELLS,
         DEFAULT_VOXEL_OCCLUSION_CAST_HEIGHT_CELLS,
         DEFAULT_VOXEL_OCCLUSION_CAST_WIDTH_CELLS,
         MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
@@ -1850,6 +1852,14 @@ fn replay_studio_ui(
         DEFAULT_VOXEL_OCCLUSION_CAST_HEIGHT_CELLS,
         |fade| fade.cast_height_cells,
     );
+    let mut occlusion_cast_end_width_cells = occlusion_fade.as_ref().map_or(
+        DEFAULT_VOXEL_OCCLUSION_CAST_END_WIDTH_CELLS,
+        |fade| fade.cast_end_width_cells,
+    );
+    let mut occlusion_cast_end_height_cells = occlusion_fade.as_ref().map_or(
+        DEFAULT_VOXEL_OCCLUSION_CAST_END_HEIGHT_CELLS,
+        |fade| fade.cast_end_height_cells,
+    );
     let mut occlusion_debug_gizmo =
         occlusion_fade.as_ref().is_some_and(|fade| fade.debug_gizmo);
 
@@ -1897,6 +1907,8 @@ fn replay_studio_ui(
                     &mut occlusion_opacity,
                     &mut occlusion_cast_width_cells,
                     &mut occlusion_cast_height_cells,
+                    &mut occlusion_cast_end_width_cells,
+                    &mut occlusion_cast_end_height_cells,
                     &mut occlusion_debug_gizmo,
                 )
             });
@@ -1909,6 +1921,14 @@ fn replay_studio_ui(
             MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
         );
         fade.cast_height_cells = occlusion_cast_height_cells.clamp(
+            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+            MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+        );
+        fade.cast_end_width_cells = occlusion_cast_end_width_cells.clamp(
+            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+            MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+        );
+        fade.cast_end_height_cells = occlusion_cast_end_height_cells.clamp(
             MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
             MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
         );
@@ -1955,6 +1975,8 @@ fn replay_controls(
     occlusion_opacity: &mut f32,
     occlusion_cast_width_cells: &mut f32,
     occlusion_cast_height_cells: &mut f32,
+    occlusion_cast_end_width_cells: &mut f32,
+    occlusion_cast_end_height_cells: &mut f32,
     occlusion_debug_gizmo: &mut bool,
 ) {
     ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
@@ -2042,19 +2064,37 @@ fn replay_controls(
             occlusion_cast_width_cells,
             MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
         )
-        .text("剔除方盒宽度（体素）")
+        .text("镜头端宽度（体素）")
         .integer(),
     )
-    .on_hover_text("沿回放镜头到每名玩家扫掠此宽度的方盒。");
+    .on_hover_text("射线方盒在回放镜头位置的起始宽度。");
     ui.add(
         egui::Slider::new(
             occlusion_cast_height_cells,
             MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
         )
-        .text("剔除方盒高度（体素）")
+        .text("镜头端高度（体素）")
         .integer(),
     )
-    .on_hover_text("方盒高度独立于宽度；仅处理方盒触碰到的体素。");
+    .on_hover_text("射线方盒在回放镜头位置的起始高度。");
+    ui.add(
+        egui::Slider::new(
+            occlusion_cast_end_width_cells,
+            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+        )
+        .text("玩家端宽度（体素）")
+        .integer(),
+    )
+    .on_hover_text("方盒沿距离线性缩小，在玩家目标位置达到此宽度。");
+    ui.add(
+        egui::Slider::new(
+            occlusion_cast_end_height_cells,
+            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+        )
+        .text("玩家端高度（体素）")
+        .integer(),
+    )
+    .on_hover_text("方盒沿距离线性缩小，在玩家目标位置达到此高度。");
     ui.add(
         egui::Slider::new(occlusion_opacity, 0.0..=1.0)
             .text("方盒内体素不透明度")
@@ -6823,6 +6863,14 @@ mod tests {
         assert_eq!(
             fade.cast_height_cells,
             DEFAULT_VOXEL_OCCLUSION_CAST_HEIGHT_CELLS
+        );
+        assert_eq!(
+            fade.cast_end_width_cells,
+            DEFAULT_VOXEL_OCCLUSION_CAST_END_WIDTH_CELLS
+        );
+        assert_eq!(
+            fade.cast_end_height_cells,
+            DEFAULT_VOXEL_OCCLUSION_CAST_END_HEIGHT_CELLS
         );
     }
 

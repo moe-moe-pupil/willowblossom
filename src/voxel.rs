@@ -174,6 +174,8 @@ const PLANET_SCIENCE_LAB_FLOOR_Y: i32 = 485;
 const VOXEL_MINIMAP_RESOLUTION: usize = 64;
 pub(crate) const DEFAULT_VOXEL_OCCLUSION_CAST_WIDTH_CELLS: f32 = 2.0;
 pub(crate) const DEFAULT_VOXEL_OCCLUSION_CAST_HEIGHT_CELLS: f32 = 2.0;
+pub(crate) const DEFAULT_VOXEL_OCCLUSION_CAST_END_WIDTH_CELLS: f32 = 1.0;
+pub(crate) const DEFAULT_VOXEL_OCCLUSION_CAST_END_HEIGHT_CELLS: f32 = 2.0;
 pub(crate) const MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS: f32 = 1.0;
 pub(crate) const MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS: f32 = 16.0;
 
@@ -189,6 +191,8 @@ pub(crate) struct VoxelReplayOcclusionFade {
     pub(crate) opacity: f32,
     pub(crate) cast_width_cells: f32,
     pub(crate) cast_height_cells: f32,
+    pub(crate) cast_end_width_cells: f32,
+    pub(crate) cast_end_height_cells: f32,
     pub(crate) debug_gizmo: bool,
 }
 
@@ -201,6 +205,8 @@ impl Default for VoxelReplayOcclusionFade {
             opacity: 0.0,
             cast_width_cells: DEFAULT_VOXEL_OCCLUSION_CAST_WIDTH_CELLS,
             cast_height_cells: DEFAULT_VOXEL_OCCLUSION_CAST_HEIGHT_CELLS,
+            cast_end_width_cells: DEFAULT_VOXEL_OCCLUSION_CAST_END_WIDTH_CELLS,
+            cast_end_height_cells: DEFAULT_VOXEL_OCCLUSION_CAST_END_HEIGHT_CELLS,
             debug_gizmo: false,
         }
     }
@@ -5911,12 +5917,12 @@ fn voxel_is_touched_by_replay_cast(
         let right_radius = projected_voxel_half_extent(cell_half_axes, right);
         let up_radius = projected_voxel_half_extent(cell_half_axes, up);
         let along = offset.dot(forward);
+        let progress = (along / length).clamp(0.0, 1.0);
+        let cast_size = voxel_occlusion_cast_size_at(fade, progress);
         along >= -forward_radius
             && along <= length + forward_radius
-            && offset.dot(right).abs()
-                <= voxel_occlusion_cast_width(fade.cast_width_cells) * 0.5 + right_radius
-            && offset.dot(up).abs()
-                <= voxel_occlusion_cast_height(fade.cast_height_cells) * 0.5 + up_radius
+            && offset.dot(right).abs() <= cast_size.x * 0.5 + right_radius
+            && offset.dot(up).abs() <= cast_size.y * 0.5 + up_radius
     })
 }
 
@@ -5958,9 +5964,23 @@ fn voxel_occlusion_cast_height(height_cells: f32) -> f32 {
     ) * VOXEL_SIZE
 }
 
+fn voxel_occlusion_cast_size_at(fade: &VoxelReplayOcclusionFade, progress: f32) -> Vec2 {
+    let start = Vec2::new(
+        voxel_occlusion_cast_width(fade.cast_width_cells),
+        voxel_occlusion_cast_height(fade.cast_height_cells),
+    );
+    let end = Vec2::new(
+        voxel_occlusion_cast_width(fade.cast_end_width_cells),
+        voxel_occlusion_cast_height(fade.cast_end_height_cells),
+    );
+    start.lerp(end, progress.clamp(0.0, 1.0))
+}
+
 fn voxel_occlusion_cast_broadphase_half_extent(fade: &VoxelReplayOcclusionFade) -> f32 {
     voxel_occlusion_cast_width(fade.cast_width_cells)
         .max(voxel_occlusion_cast_height(fade.cast_height_cells))
+        .max(voxel_occlusion_cast_width(fade.cast_end_width_cells))
+        .max(voxel_occlusion_cast_height(fade.cast_end_height_cells))
         * 0.5
         + VOXEL_SIZE
 }
@@ -5972,21 +5992,21 @@ fn draw_voxel_occlusion_cast_gizmos(
     if !fade.active || !fade.debug_gizmo {
         return;
     }
-    let width = voxel_occlusion_cast_width(fade.cast_width_cells);
-    let height = voxel_occlusion_cast_height(fade.cast_height_cells);
+    let start_size = voxel_occlusion_cast_size_at(&fade, 0.0);
+    let end_size = voxel_occlusion_cast_size_at(&fade, 1.0);
     for target in &fade.targets {
-        let Some((forward, _, _, length)) = replay_cast_frame(fade.camera, *target) else {
+        let Some((_, right, up, _)) = replay_cast_frame(fade.camera, *target) else {
             continue;
         };
-        let up_hint = if forward.dot(Vec3::Y).abs() > 0.99 {
-            Vec3::Z
-        } else {
-            Vec3::Y
-        };
-        let transform = Transform::from_translation((fade.camera + *target) * 0.5)
-            .looking_at(*target, up_hint)
-            .with_scale(Vec3::new(width, height, length));
-        gizmos.cube(transform, Color::srgb(0.1, 0.95, 1.0));
+        let start_corners = replay_cast_corners(fade.camera, right, up, start_size);
+        let end_corners = replay_cast_corners(*target, right, up, end_size);
+        let color = Color::srgb(0.1, 0.95, 1.0);
+        for index in 0..4 {
+            let next = (index + 1) % 4;
+            gizmos.line(start_corners[index], start_corners[next], color);
+            gizmos.line(end_corners[index], end_corners[next], color);
+            gizmos.line(start_corners[index], end_corners[index], color);
+        }
         gizmos.line(fade.camera, *target, Color::srgb(1.0, 0.2, 0.8));
         gizmos.sphere(
             Isometry3d::from_translation(*target),
@@ -5994,6 +6014,17 @@ fn draw_voxel_occlusion_cast_gizmos(
             Color::srgb(1.0, 0.85, 0.1),
         );
     }
+}
+
+fn replay_cast_corners(center: Vec3, right: Vec3, up: Vec3, size: Vec2) -> [Vec3; 4] {
+    let right = right * size.x * 0.5;
+    let up = up * size.y * 0.5;
+    [
+        center - right - up,
+        center + right - up,
+        center + right + up,
+        center - right + up,
+    ]
 }
 
 fn replay_sightline_intersects_any_aabb(
@@ -9917,6 +9948,8 @@ mod tests {
             opacity: 0.35,
             cast_width_cells: 1.0,
             cast_height_cells: 1.0,
+            cast_end_width_cells: 1.0,
+            cast_end_height_cells: 1.0,
             debug_gizmo: false,
         })
         .add_systems(Update, sync_voxel_occlusion_fade);
@@ -10021,40 +10054,49 @@ mod tests {
     }
 
     #[test]
-    fn replay_box_cast_has_independent_width_and_height_and_finite_length() {
+    fn replay_box_cast_tapers_to_independent_target_width_and_height() {
         let fade = VoxelReplayOcclusionFade {
             active: true,
             camera: Vec3::ZERO,
             targets: vec![Vec3::Z * 10.0],
             opacity: 0.5,
-            cast_width_cells: 2.0,
-            cast_height_cells: 4.0,
+            cast_width_cells: 10.0,
+            cast_height_cells: 10.0,
+            cast_end_width_cells: 1.0,
+            cast_end_height_cells: 2.0,
             debug_gizmo: true,
         };
         let transform = GlobalTransform::IDENTITY;
 
-        assert_eq!(voxel_occlusion_cast_width(fade.cast_width_cells), VOXEL_SIZE * 2.0);
         assert_eq!(
-            voxel_occlusion_cast_height(fade.cast_height_cells),
-            VOXEL_SIZE * 4.0
+            voxel_occlusion_cast_size_at(&fade, 0.0),
+            Vec2::splat(VOXEL_SIZE * 10.0)
+        );
+        assert_eq!(
+            voxel_occlusion_cast_size_at(&fade, 1.0),
+            Vec2::new(VOXEL_SIZE, VOXEL_SIZE * 2.0)
+        );
+        assert_eq!(
+            voxel_occlusion_cast_size_at(&fade, 0.5),
+            Vec2::new(VOXEL_SIZE * 5.5, VOXEL_SIZE * 6.0)
         );
         assert!(voxel_is_touched_by_replay_cast(
-            Vec3::new(0.35, 0.0, 5.0),
+            Vec3::new(1.0, 0.0, 1.0),
             &transform,
             &fade,
         ));
         assert!(!voxel_is_touched_by_replay_cast(
-            Vec3::new(0.5, 0.0, 5.0),
+            Vec3::new(1.0, 0.0, 9.0),
             &transform,
             &fade,
         ));
         assert!(voxel_is_touched_by_replay_cast(
-            Vec3::new(0.0, 0.6, 5.0),
+            Vec3::new(0.0, 0.45, 9.0),
             &transform,
             &fade,
         ));
         assert!(!voxel_is_touched_by_replay_cast(
-            Vec3::new(0.0, 0.75, 5.0),
+            Vec3::new(0.0, 0.6, 9.0),
             &transform,
             &fade,
         ));
