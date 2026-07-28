@@ -214,6 +214,8 @@ impl MaterialExtension for VoxelOcclusionFadeExtension {
     fn fragment_shader() -> ShaderRef { VOXEL_OCCLUSION_FADE_SHADER.into() }
 
     fn deferred_fragment_shader() -> ShaderRef { VOXEL_OCCLUSION_FADE_SHADER.into() }
+
+    fn enable_prepass() -> bool { false }
 }
 
 impl VoxelOcclusionFadeExtension {
@@ -2128,19 +2130,15 @@ fn setup_voxel_materials(
             },
             _ => {},
         }
-        let mut fade_material = material.clone();
-        fade_material.alpha_mode = AlphaMode::Blend;
         fade_handles[index] = fade_materials.add(ExtendedMaterial {
-            base: fade_material,
+            base: material.clone(),
             extension: VoxelOcclusionFadeExtension::new(fade_targets.clone()),
         });
         materials.add(material)
     });
     let planet_ocean_material = opaque_planet_ocean_material(textures[3].clone());
-    let mut fade_planet_ocean_material = planet_ocean_material.clone();
-    fade_planet_ocean_material.alpha_mode = AlphaMode::Blend;
     let fade_planet_ocean = fade_materials.add(ExtendedMaterial {
-        base: fade_planet_ocean_material,
+        base: planet_ocean_material.clone(),
         extension: VoxelOcclusionFadeExtension::new(fade_targets.clone()),
     });
     let planet_ocean = materials.add(planet_ocean_material);
@@ -9962,7 +9960,8 @@ mod tests {
         assert!(shader.contains("abs(pbr_input.N.y) >= 0.75"));
         assert!(shader.contains("progress <= 0.0 || progress >= 1.0"));
         assert!(shader.contains("occluder_opacity < 0.999"));
-        assert!(shader.contains("base_color.a *= occluder_opacity"));
+        assert!(shader.contains("opacity_dither_threshold(in.position.xy)"));
+        assert!(!VoxelOcclusionFadeExtension::enable_prepass());
     }
 
     #[test]

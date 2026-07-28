@@ -62,6 +62,13 @@ fn inside_player_sightline(world_position: vec3<f32>, target: vec4<f32>) -> bool
     return distance(world_position, closest_point) <= tunnel_radius;
 }
 
+fn opacity_dither_threshold(fragment_position: vec2<f32>) -> f32 {
+    let pixel = floor(fragment_position);
+    return fract(
+        52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))),
+    );
+}
+
 @fragment
 fn fragment(
 #ifdef MESHLET_MESH_MATERIAL_PASS
@@ -95,10 +102,9 @@ fn fragment(
     if !is_horizontal_surface && occluder_opacity < 0.999 {
         for (var target_index = 0u; target_index < target_count; target_index += 1u) {
             if inside_player_sightline(in.world_position.xyz, fade_targets[target_index]) {
-                if occluder_opacity <= 0.001 {
+                if opacity_dither_threshold(in.position.xy) >= occluder_opacity {
                     discard;
                 }
-                pbr_input.material.base_color.a *= occluder_opacity;
                 break;
             }
         }
