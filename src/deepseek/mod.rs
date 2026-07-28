@@ -137,9 +137,9 @@ const DIRECTOR_SYSTEM_PROMPT: &str = r#"
 5. speech_text 只供中文 TTS 使用，不会显示在画面。它必须与 text 含义完全相同，但要把英文品牌、单词、缩写、阿拉伯数字和符号改成中国人自然说话时会使用的中文读法，不得机械地逐字母或逐数字念。整数按数值读，例如 10 读“十”、21 读“二十一”，不能读成“一零”或“二一”；英文品牌优先使用通行中文名或自然音译，例如 Steam 读“斯地母”，不能读成“艾丝踢伊诶艾姆”；AI 可读“诶艾”。例如 text 为“Steam上的AI有10个方案”时，speech_text 应为“斯地母上的诶艾有十个方案”。只有编号、电话号码、年份等语境明确要求逐位读时才逐位读。不得为了配音改写 text。
 6. has_character_model 必须为 true；必须使用 speaker_close、speaker_medium 或 speaker_wide，并从台词开始的第一刻到结束持续对准当前说话者的角色模型，不得选择环境镜头。
 7. 不得改变输入给定的回合顺序；镜头只在说话者切换时切换到下一个角色立牌。
-8. 镜头必须保持同一场景轴线和拍摄侧，不得跨越180度线。禁止环绕、快速摇镜、快速推拉、大范围横移或跨越场景飞行。
+8. 镜头必须保持同一场景轴线和拍摄侧，不得跨越180度线。禁止旋转镜头、环绕角色、摇镜、横移或跨越场景飞行。三人及以上时优先采用队伍正面中央的构图，避免从侧面拍摄造成角色互相遮挡。
 9. shot 只能是 speaker_close、speaker_medium、speaker_wide、establishing、environment。
-10. motion 只能是 static、dolly_in、dolly_out、drift_left、drift_right；优先 static，只在台词确有强调时使用缓慢 dolly_in 或 dolly_out，不得使用 drift_left 或 drift_right。
+10. motion 只能是 static、dolly_in、dolly_out、drift_left、drift_right；优先 static，只在台词确有强调时使用缓慢 dolly_in 或 dolly_out，不得使用 drift_left 或 drift_right。dolly 只表示沿镜头光轴平滑改变 translation，绝不表示改变 rotation；具体坐标、旋转、避障和插值全部由本地程序决定。
 11. 只返回严格 JSON，不要 Markdown、解释或代码围栏。
 
 返回格式：

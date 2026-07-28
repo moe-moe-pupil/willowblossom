@@ -126,7 +126,7 @@ const MIN_DIALOGUE_MS: u64 = 2_700;
 const MAX_DIALOGUE_MS: u64 = 9_750;
 const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
-const DIRECTOR_CACHE_FINGERPRINT_VERSION: &str = "deepseek-director-v1";
+const DIRECTOR_CACHE_FINGERPRINT_VERSION: &str = "deepseek-director-v2";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const BACKGROUND_MUSIC_DIRECTORY: &str = "assets/audio";
 const BACKGROUND_MUSIC_EXTENSIONS: &[&str] = &["mp3", "wav", "ogg", "flac", "m4a", "aac"];
@@ -644,7 +644,6 @@ pub(crate) struct ReplayStudio {
     camera_transition_curve: f32,
     player_movement_curve: f32,
     record_camera_enabled: bool,
-    deepseek_director_enabled: bool,
     director_response_hash: Option<u64>,
     director_request_pending: bool,
     auto_export_after_director: bool,
@@ -757,7 +756,6 @@ impl Default for ReplayStudio {
             camera_transition_curve: default_camera_transition_curve(),
             player_movement_curve: default_player_movement_curve(),
             record_camera_enabled: false,
-            deepseek_director_enabled: false,
             director_response_hash: None,
             director_request_pending: false,
             auto_export_after_director: false,
@@ -2602,11 +2600,7 @@ fn replay_controls(
 
     ui.separator();
     ui.heading("DeepSeek 视频导演");
-    ui.small("使用 deepseek-v4-pro 思考模式，润色当前发布范围内且场景中有立牌的玩家台词，并为每句选择镜头。回合内会从最早发言者开始，再按立牌距离依次访问最近玩家；镜头从台词第一刻起持续对准说话者。它还会生成只供 EmotiVoice 使用的中文谐音读法，画面字幕仍显示正常原文。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
-    ui.checkbox(
-        &mut studio.deepseek_director_enabled,
-        "允许 DeepSeek 润色台词并控制镜头",
-    );
+    ui.small("DeepSeek 可直接润色当前发布范围内且场景中有立牌的玩家台词，并为每句选择固定构图或缓慢推拉。三人及以上时，本地镜头会优先放在队伍正面的中央位置，避免从侧面拍摄时角色互相遮挡；镜头只平滑移动位置，不环绕角色。它还会生成只供 EmotiVoice 使用的中文谐音读法，画面字幕仍显示正常原文。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
     let visible_standees = standees
         .iter()
         .map(|(transform, standee)| (standee.user_id, transform.translation))
@@ -2706,11 +2700,10 @@ fn replay_controls(
     };
     if ui
         .add_enabled(
-            studio.deepseek_director_enabled
-                && studio
-                    .replay
-                    .as_ref()
-                    .is_some_and(|replay| replay.dialogue.iter().any(|line| line.included)),
+            studio
+                .replay
+                .as_ref()
+                .is_some_and(|replay| replay.dialogue.iter().any(|line| line.included)),
             egui::Button::new(director_button_text),
         )
         .clicked()
@@ -3109,8 +3102,7 @@ fn replay_controls(
 }
 
 fn can_start_director_export(studio: &ReplayStudio, has_active_campaign: bool) -> bool {
-    studio.deepseek_director_enabled
-        && studio.mode != ReplayMode::Recording
+    studio.mode != ReplayMode::Recording
         && studio.video_render.is_none()
         && studio.video_encoding.is_none()
         && !studio.director_request_pending
@@ -6718,10 +6710,12 @@ fn turn_based_camera_track(
             )
         })
         .unwrap_or_else(|| base.clone());
+    let mut current_focus = replay_dialogue_focus_id(dialogue, 0, speaker_positions);
     frames.push(camera_keyframe(0, &current));
     for (index, line) in dialogue.iter().enumerate() {
         let line_end = line.time_ms.saturating_add(line.duration_ms);
         if let Some(target) = replay_dialogue_focus_position(dialogue, index, speaker_positions) {
+            let focus = replay_dialogue_focus_id(dialogue, index, speaker_positions);
             let focused = rig.speaker_shot(
                 target,
                 DirectorShot::SpeakerMedium,
@@ -6732,13 +6726,19 @@ fn turn_based_camera_track(
             let transition_end = line
                 .time_ms
                 .saturating_add(line.duration_ms.min(FOCUS_TRANSITION_MS));
-            frames.push(camera_keyframe(line.time_ms, &current));
-            frames.push(camera_keyframe(
-                transition_end,
-                &focused,
-            ));
+            if focus == current_focus && camera_facing_is_unchanged(&current, &focused) {
+                frames.push(camera_keyframe(line.time_ms, &current));
+                frames.push(camera_keyframe(
+                    transition_end,
+                    &focused,
+                ));
+            } else {
+                frames.push(camera_keyframe(line.time_ms.saturating_sub(1), &current));
+                frames.push(camera_keyframe(line.time_ms, &focused));
+            }
             frames.push(camera_keyframe(line_end, &settled));
             current = settled;
+            current_focus = focus;
         }
     }
     if frames
@@ -6786,9 +6786,11 @@ fn director_camera_track(
             );
         }
     }
+    let mut current_focus = replay_dialogue_focus_id(dialogue, 0, speaker_positions);
     let mut frames = vec![camera_keyframe(0, &current)];
     for (index, (line, cue)) in dialogue.iter().zip(cues).enumerate() {
         let line_end = line.time_ms.saturating_add(line.duration_ms);
+        let focus = replay_dialogue_focus_id(dialogue, index, speaker_positions);
         let (arrival, settled) = if let Some(target) =
             replay_dialogue_focus_position(dialogue, index, speaker_positions)
         {
@@ -6822,13 +6824,19 @@ fn director_camera_track(
         let transition_end = line
             .time_ms
             .saturating_add(line.duration_ms.min(FOCUS_TRANSITION_MS));
-        frames.push(camera_keyframe(line.time_ms, &current));
-        frames.push(camera_keyframe(
-            transition_end,
-            &arrival,
-        ));
+        if focus == current_focus && camera_facing_is_unchanged(&current, &arrival) {
+            frames.push(camera_keyframe(line.time_ms, &current));
+            frames.push(camera_keyframe(
+                transition_end,
+                &arrival,
+            ));
+        } else {
+            frames.push(camera_keyframe(line.time_ms.saturating_sub(1), &current));
+            frames.push(camera_keyframe(line.time_ms, &arrival));
+        }
         frames.push(camera_keyframe(line_end, &settled));
         current = settled;
+        current_focus = focus;
     }
     if frames
         .last()
@@ -6855,6 +6863,10 @@ fn resolved_speaker_shot(shot: DirectorShot) -> DirectorShot {
         },
         DirectorShot::Establishing | DirectorShot::Environment => DirectorShot::SpeakerMedium,
     }
+}
+
+fn camera_facing_is_unchanged(left: &Transform, right: &Transform) -> bool {
+    left.rotation.dot(right.rotation).abs() >= 0.99999
 }
 
 fn limit_camera_travel_toward(
@@ -6931,6 +6943,7 @@ struct DirectedCameraRig {
     axis_origin: Vec3,
     camera_side: Vec3,
     distance_scale: f32,
+    subject_count: usize,
 }
 
 impl DirectedCameraRig {
@@ -6942,15 +6955,39 @@ impl DirectedCameraRig {
         speaker_positions: &HashMap<u64, Vec3>,
         distance_scale: f32,
     ) -> Self {
-        let first = dialogue.iter().enumerate().find_map(|(index, _)| {
-            replay_dialogue_focus_position(dialogue, index, speaker_positions)
-        });
-        let second = first.and_then(|first_position| {
-            dialogue.iter().enumerate().find_map(|(index, _)| {
-                replay_dialogue_focus_position(dialogue, index, speaker_positions).filter(
-                    |position| horizontal(*position - first_position).length_squared() > 0.01,
-                )
-            })
+        let mut subjects = Vec::<Vec3>::new();
+        for (index, line) in dialogue.iter().enumerate() {
+            if !line.included {
+                continue;
+            }
+            let Some(position) =
+                replay_dialogue_focus_position(dialogue, index, speaker_positions)
+            else {
+                continue;
+            };
+            if subjects
+                .iter()
+                .all(|subject| horizontal(*subject - position).length_squared() > 0.01)
+            {
+                subjects.push(position);
+            }
+        }
+        let mut composition_subjects = subjects.clone();
+        let mut scene_subjects = speaker_positions.iter().collect::<Vec<_>>();
+        scene_subjects.sort_by_key(|(speaker_id, _)| **speaker_id);
+        for (_, position) in scene_subjects {
+            if composition_subjects
+                .iter()
+                .all(|subject| horizontal(*subject - *position).length_squared() > 0.01)
+            {
+                composition_subjects.push(*position);
+            }
+        }
+        let first = composition_subjects.first().copied();
+        let second = composition_subjects.get(1).copied();
+        let composition_origin = (!composition_subjects.is_empty()).then(|| {
+            composition_subjects.iter().copied().sum::<Vec3>()
+                / composition_subjects.len() as f32
         });
         let (axis_origin, mut camera_side) = match (first, second) {
             (Some(first), Some(second)) => {
@@ -6958,7 +6995,7 @@ impl DirectedCameraRig {
                     .try_normalize()
                     .unwrap_or(Vec3::X);
                 (
-                    (first + second) * 0.5,
+                    composition_origin.unwrap_or((first + second) * 0.5),
                     Vec3::new(-axis.z, 0.0, axis.x),
                 )
             },
@@ -6986,6 +7023,7 @@ impl DirectedCameraRig {
             axis_origin,
             camera_side,
             distance_scale: normalized_directed_camera_distance_scale(distance_scale),
+            subject_count: composition_subjects.len(),
         }
     }
 
@@ -7009,7 +7047,13 @@ impl DirectedCameraRig {
             DirectorShot::SpeakerWide => 2.1,
             DirectorShot::Establishing | DirectorShot::Environment => 3.2,
         } * self.distance_scale;
-        let static_position = self.visible_position(target, base_distance, height, obstacles);
+        let camera_anchor = if self.subject_count >= 3 {
+            self.axis_origin
+        } else {
+            target
+        };
+        let static_position =
+            self.visible_position(camera_anchor, base_distance, height, obstacles);
         let dolly_axis = (static_position - target).normalize();
         let desired_position =
             static_position + dolly_axis * (distance_delta * self.distance_scale);
@@ -8885,7 +8929,39 @@ mod tests {
     }
 
     #[test]
-    fn turn_camera_smoothly_focuses_known_speakers() {
+    fn replay_system_keeps_the_standee_front_facing_the_replay_camera() {
+        let camera = Transform::from_xyz(5.0, 4.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y);
+        let mut replay = test_replay(Vec::new());
+        replay.duration_ms = 100;
+        replay.camera = vec![camera_keyframe(0, &camera)];
+        let mut studio = ReplayStudio::default();
+        studio.mode = ReplayMode::Paused;
+        studio.replay = Some(replay);
+        let mut app = App::new();
+        app.insert_resource(studio)
+            .add_systems(Update, apply_replay_standee_positions);
+        let standee = app
+            .world_mut()
+            .spawn((
+                Transform::from_xyz(-2.0, 1.0, 1.0),
+                VoxelPlayerStandee::replay_test(42),
+            ))
+            .id();
+
+        app.update();
+
+        let transform = app
+            .world()
+            .entity(standee)
+            .get::<Transform>()
+            .unwrap();
+        let toward_camera = horizontal(camera.translation - transform.translation).normalize();
+        assert!((transform.rotation * Vec3::NEG_Z).dot(toward_camera) > 0.9999);
+        assert!((transform.rotation * Vec3::Z).dot(toward_camera) < -0.9999);
+    }
+
+    #[test]
+    fn turn_camera_cuts_between_known_speakers() {
         let base = Transform::from_xyz(2.0, 3.0, 4.0);
         let mut dialogue = [
             test_dialogue(350, 2_400, DialogueSide::Left),
@@ -8910,7 +8986,7 @@ mod tests {
             .all(|pair| pair[0].time_ms < pair[1].time_ms));
         for (arrival_ms, target) in [
             (1_250, speaker_positions[&1]),
-            (3_930, speaker_positions[&2]),
+            (3_030, speaker_positions[&2]),
         ] {
             let frame = frames
                 .iter()
@@ -8921,20 +8997,13 @@ mod tests {
             let to_speaker = (target - shot.translation).normalize();
             assert!(forward.dot(to_speaker) > 0.99);
         }
-        let switch_start = frames.iter().find(|frame| frame.time_ms == 3_030).unwrap();
-        let switch_end = frames.iter().find(|frame| frame.time_ms == 3_930).unwrap();
-        let halfway = interpolated_camera(
-            &frames,
-            3_480,
-            default_camera_transition_curve(),
-        )
-        .unwrap()
-        .translation;
-        let start = Vec3::from_array(switch_start.translation);
-        let end = Vec3::from_array(switch_end.translation);
-        assert_ne!(start, end);
-        assert!(halfway.distance(start) > 0.01);
-        assert!(halfway.distance(end) > 0.01);
+        let before_cut = frames.iter().find(|frame| frame.time_ms == 3_029).unwrap();
+        let after_cut = frames.iter().find(|frame| frame.time_ms == 3_030).unwrap();
+        assert!(
+            Vec3::from_array(before_cut.translation)
+                .distance(Vec3::from_array(after_cut.translation))
+                > 1.0
+        );
     }
 
     #[test]
@@ -9106,6 +9175,104 @@ mod tests {
             .iter()
             .map(frame_transform)
             .all(|frame| rig.signed_side(frame.translation) >= DirectedCameraRig::LINE_MARGIN));
+    }
+
+    #[test]
+    fn three_person_shot_uses_the_green_dot_group_center_position() {
+        let base = Transform::from_xyz(0.0, 4.0, 12.0);
+        let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
+        let positions = HashMap::from([
+            (1, Vec3::new(-6.0, 1.0, 0.0)),
+            (2, Vec3::new(0.0, 1.0, 0.0)),
+            (3, Vec3::new(6.0, 1.0, 0.0)),
+        ]);
+        let rig = DirectedCameraRig::for_dialogue(
+            &base,
+            &dialogue,
+            &positions,
+            default_directed_camera_distance_scale(),
+        );
+
+        let shot = rig.director_shot(
+            positions[&3],
+            DirectorShot::SpeakerMedium,
+            DirectorMotion::Static,
+            0.0,
+            &ReplayCameraObstacles::default(),
+        );
+
+        assert_eq!(rig.subject_count, 3);
+        assert!(shot.translation.x.abs() < 0.001);
+        let directions = [positions[&1], positions[&2], positions[&3]]
+            .map(|subject| horizontal(subject - shot.translation).normalize());
+        assert!(directions[0].dot(directions[1]) < 0.99);
+        assert!(directions[1].dot(directions[2]) < 0.99);
+        assert!(
+            (shot.rotation * Vec3::NEG_Z)
+                .dot((positions[&3] - shot.translation).normalize())
+                > 0.999
+        );
+    }
+
+    #[test]
+    fn speaker_change_cuts_instead_of_sliding_or_rotating_between_subjects() {
+        let base = Transform::from_xyz(0.0, 4.0, 12.0);
+        let mut dialogue = [
+            test_dialogue(350, 2_700, DialogueSide::Right),
+            test_dialogue(3_320, 2_700, DialogueSide::Right),
+        ];
+        dialogue[1].sender_id = 2;
+        let positions = HashMap::from([
+            (1, Vec3::new(-6.0, 1.0, 0.0)),
+            (2, Vec3::new(6.0, 1.0, 0.0)),
+        ]);
+        let cues = [
+            DirectorCue {
+                index: 0,
+                text: "左侧发言。".to_owned(),
+                speech_text: "左侧发言。".to_owned(),
+                shot: DirectorShot::SpeakerMedium,
+                motion: DirectorMotion::Static,
+            },
+            DirectorCue {
+                index: 1,
+                text: "右侧发言。".to_owned(),
+                speech_text: "右侧发言。".to_owned(),
+                shot: DirectorShot::SpeakerMedium,
+                motion: DirectorMotion::Static,
+            },
+        ];
+        let frames = director_camera_track(
+            &base,
+            &dialogue,
+            &cues,
+            6_020,
+            &positions,
+            default_directed_camera_distance_scale(),
+            &ReplayCameraObstacles::default(),
+        );
+        let before = frames
+            .iter()
+            .find(|frame| frame.time_ms == dialogue[1].time_ms - 1)
+            .unwrap();
+        let after = frames
+            .iter()
+            .find(|frame| frame.time_ms == dialogue[1].time_ms)
+            .unwrap();
+
+        let before = frame_transform(before);
+        let after = frame_transform(after);
+        assert!(before.translation.distance(after.translation) > 1.0);
+        assert!(
+            (before.rotation * Vec3::NEG_Z)
+                .dot((positions[&1] - before.translation).normalize())
+                > 0.999
+        );
+        assert!(
+            (after.rotation * Vec3::NEG_Z)
+                .dot((positions[&2] - after.translation).normalize())
+                > 0.999
+        );
     }
 
     #[test]
@@ -9783,7 +9950,6 @@ mod tests {
     #[test]
     fn director_export_is_available_during_preview_and_reuses_an_applied_plan() {
         let mut studio = ReplayStudio::default();
-        studio.deepseek_director_enabled = true;
         studio.mode = ReplayMode::Paused;
         assert!(can_start_director_export(&studio, true));
 
