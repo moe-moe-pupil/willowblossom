@@ -514,6 +514,11 @@ struct ReplayDialogue {
     forwarded: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReplayDialogueDrag {
+    line_id: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ReplayAreaBlock {
     id: u64,
@@ -3895,6 +3900,168 @@ fn start_playback(
     studio.status = REPLAY_PLAYING_STATUS.to_owned();
 }
 
+fn append_dm_replay_dialogue(replay: &mut ReplayFile) -> u64 {
+    let line_id = replay
+        .dialogue
+        .iter()
+        .map(|line| line.line_id)
+        .max()
+        .unwrap_or_default()
+        .saturating_add(1);
+    let source_time = replay
+        .dialogue
+        .iter()
+        .map(|line| line.source_time)
+        .max()
+        .unwrap_or_else(|| unix_time_ms() / 1_000)
+        .saturating_add(1);
+    let last_block_line = replay
+        .area_blocks
+        .last()
+        .and_then(|block| block.line_ids.last())
+        .and_then(|last_id| replay.dialogue.iter().find(|line| line.line_id == *last_id))
+        .or_else(|| replay.dialogue.last());
+    let (camera_focus_id, turn_index, position_cells, area) = last_block_line
+        .map(|line| {
+            (
+                (line.side == DialogueSide::Right)
+                    .then_some(line.sender_id)
+                    .or(line.camera_focus_id),
+                line.turn_index,
+                line.position_cells,
+                line.area.clone(),
+            )
+        })
+        .unwrap_or((None, 0, [0; 3], "区域 1".to_owned()));
+    let visibility = match &replay.audience {
+        ReplayAudience::Public => Visibility::Public,
+        ReplayAudience::Party(id) => Visibility::Party(id.clone()),
+        ReplayAudience::Player(id) => Visibility::Player(*id),
+        ReplayAudience::All | ReplayAudience::Gm => Visibility::Gm,
+    };
+    replay.dialogue.push(ReplayDialogue {
+        time_ms: u64::MAX,
+        duration_ms: scaled_dialogue_duration_ms("", replay.master_dialogue_duration),
+        sender_id: 0,
+        camera_focus_id,
+        name: "DM".to_owned(),
+        role: "GM".to_owned(),
+        text: String::new(),
+        speech_text: None,
+        avatar: String::new(),
+        avatar_data_url: None,
+        visibility,
+        side: DialogueSide::Left,
+        line_id,
+        source_time,
+        turn_index,
+        position_cells,
+        area: area.clone(),
+        included: true,
+        snapshot_recorded: true,
+        metadata_estimated: false,
+        forwarded: false,
+    });
+
+    if let Some(block) = replay.area_blocks.last_mut() {
+        block.line_ids.push(line_id);
+    } else {
+        replay.area_blocks.push(ReplayAreaBlock {
+            id: 1,
+            area,
+            line_ids: vec![line_id],
+        });
+    }
+    line_id
+}
+
+fn delete_replay_dialogue(replay: &mut ReplayFile, line_id: u64) -> bool {
+    let previous_len = replay.dialogue.len();
+    replay.dialogue.retain(|line| line.line_id != line_id);
+    if replay.dialogue.len() == previous_len {
+        return false;
+    }
+    for block in &mut replay.area_blocks {
+        block.line_ids.retain(|candidate| *candidate != line_id);
+    }
+    replay
+        .area_blocks
+        .retain(|block| !block.line_ids.is_empty());
+    true
+}
+
+fn move_replay_dialogue(
+    replay: &mut ReplayFile,
+    dragged_line_id: u64,
+    target_line_id: u64,
+    insert_after: bool,
+) -> bool {
+    if dragged_line_id == target_line_id {
+        return false;
+    }
+    let Some(dragged_index) = replay
+        .dialogue
+        .iter()
+        .position(|line| line.line_id == dragged_line_id)
+    else {
+        return false;
+    };
+    if !replay
+        .dialogue
+        .iter()
+        .any(|line| line.line_id == target_line_id)
+    {
+        return false;
+    }
+
+    let target_block_id = replay
+        .area_blocks
+        .iter()
+        .find(|block| block.line_ids.contains(&target_line_id))
+        .map(|block| block.id);
+    for block in &mut replay.area_blocks {
+        block
+            .line_ids
+            .retain(|candidate| *candidate != dragged_line_id);
+    }
+    replay
+        .area_blocks
+        .retain(|block| !block.line_ids.is_empty());
+    if let Some(target_block_id) = target_block_id {
+        if let Some(block) = replay
+            .area_blocks
+            .iter_mut()
+            .find(|block| block.id == target_block_id)
+        {
+            if let Some(target_index) = block
+                .line_ids
+                .iter()
+                .position(|candidate| *candidate == target_line_id)
+            {
+                let insertion_index = target_index + usize::from(insert_after);
+                block.line_ids.insert(insertion_index, dragged_line_id);
+                if let Some(line) = replay
+                    .dialogue
+                    .iter_mut()
+                    .find(|line| line.line_id == dragged_line_id)
+                {
+                    line.area = block.area.clone();
+                }
+            }
+        }
+    }
+
+    let dragged = replay.dialogue.remove(dragged_index);
+    let target_index = replay
+        .dialogue
+        .iter()
+        .position(|line| line.line_id == target_line_id)
+        .expect("target line was checked before removal");
+    let insertion_index = target_index + usize::from(insert_after);
+    replay.dialogue.insert(insertion_index, dragged);
+    true
+}
+
 fn replay_dialogue_editor(
     ui: &mut egui::Ui,
     studio: &mut ReplayStudio,
@@ -3913,6 +4080,9 @@ fn replay_dialogue_editor(
         let mut block_split = None;
         let mut block_merge = None;
         let mut block_renames = Vec::new();
+        let mut dialogue_drop = None;
+        let mut dialogue_delete = None;
+        let mut dialogue_add_requested = false;
         {
             let replay = studio.replay.as_mut().expect("checked above");
             let block_options = replay
@@ -3963,15 +4133,29 @@ fn replay_dialogue_editor(
                     rebuild_blocks_requested = true;
                     changed = true;
                 }
+                if ui.button("新增 DM 台词").clicked() {
+                    dialogue_add_requested = true;
+                }
             });
+            ui.small("拖动台词左上角的手柄可排序；拖到卡片上半部/下半部会插到其前/后。删除只影响当前回放草稿。");
 
             egui::ScrollArea::vertical()
                 .id_salt("replay-dialogue-editor")
                 .max_height(320.0)
                 .show(ui, |ui| {
                     for line in &mut replay.dialogue {
-                        ui.group(|ui| {
+                        let target_line_id = line.line_id;
+                        let (drop_zone, dropped) = ui.dnd_drop_zone::<ReplayDialogueDrag, _>(
+                            egui::Frame::group(ui.style()),
+                            |ui| {
                             ui.horizontal(|ui| {
+                                ui.dnd_drag_source(
+                                    egui::Id::new(("replay-dialogue-drag", line.line_id)),
+                                    ReplayDialogueDrag {
+                                        line_id: line.line_id,
+                                    },
+                                    |ui| ui.label("⠿ 拖动"),
+                                );
                                 changed |= ui.checkbox(&mut line.included, "使用").changed();
                                 ui.label(format!(
                                     "{} · 原始时间 {} · ID {}",
@@ -3982,6 +4166,9 @@ fn replay_dialogue_editor(
                                         egui::Color32::from_rgb(220, 150, 55),
                                         "旧消息：回合/位置为估算",
                                     );
+                                }
+                                if ui.button("删除").clicked() {
+                                    dialogue_delete = Some(line.line_id);
                                 }
                             });
                             let text_changed = ui
@@ -4052,9 +4239,37 @@ fn replay_dialogue_editor(
                                     }
                                 }
                             });
-                        });
+                        },
+                        );
+                        if let Some(dragged) = dropped {
+                            if dragged.line_id != target_line_id {
+                                let insert_after = ui
+                                    .ctx()
+                                    .pointer_latest_pos()
+                                    .is_some_and(|pointer| {
+                                        pointer.y >= drop_zone.response.rect.center().y
+                                    });
+                                dialogue_drop =
+                                    Some((dragged.line_id, target_line_id, insert_after));
+                            }
+                        }
                     }
                 });
+            if dialogue_add_requested {
+                append_dm_replay_dialogue(replay);
+                changed = true;
+            }
+            if let Some(line_id) = dialogue_delete {
+                changed |= delete_replay_dialogue(replay, line_id);
+            }
+            if let Some((dragged_line_id, target_line_id, insert_after)) = dialogue_drop {
+                changed |= move_replay_dialogue(
+                    replay,
+                    dragged_line_id,
+                    target_line_id,
+                    insert_after,
+                );
+            }
             for (line_id, target_block) in line_reassignments {
                 for block in &mut replay.area_blocks {
                     block.line_ids.retain(|candidate| *candidate != line_id);
@@ -7631,6 +7846,105 @@ mod tests {
         assert_eq!(replay.area_blocks.len(), 2);
         assert_eq!(replay.area_blocks[0].line_ids.len(), 3);
         assert_eq!(replay.area_blocks[1].line_ids.len(), 1);
+    }
+
+    #[test]
+    fn dialogue_drag_moves_a_line_into_the_target_block() {
+        let mut lines = vec![
+            positioned_dialogue(1, 1, 1_200, [0, 0, 0]),
+            positioned_dialogue(2, 1, 1_201, [0, 0, 0]),
+            positioned_dialogue(3, 1, 1_202, [30, 0, 0]),
+        ];
+        lines[0].area = "区域 1".to_owned();
+        lines[1].area = "区域 1".to_owned();
+        lines[2].area = "区域 2".to_owned();
+        let mut replay = test_replay(lines);
+        replay.area_blocks = vec![
+            ReplayAreaBlock {
+                id: 1,
+                area: "区域 1".to_owned(),
+                line_ids: vec![1, 2],
+            },
+            ReplayAreaBlock {
+                id: 2,
+                area: "区域 2".to_owned(),
+                line_ids: vec![3],
+            },
+        ];
+
+        assert!(move_replay_dialogue(&mut replay, 1, 3, true));
+
+        assert_eq!(replay.area_blocks[0].line_ids, vec![2]);
+        assert_eq!(replay.area_blocks[1].line_ids, vec![3, 1]);
+        assert_eq!(
+            replay
+                .dialogue
+                .iter()
+                .map(|line| line.line_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+        assert_eq!(
+            replay
+                .dialogue
+                .iter()
+                .find(|line| line.line_id == 1)
+                .unwrap()
+                .area,
+            "区域 2"
+        );
+    }
+
+    #[test]
+    fn deleting_dialogue_removes_empty_area_blocks() {
+        let mut replay = test_replay(vec![
+            positioned_dialogue(1, 1, 1_200, [0, 0, 0]),
+            positioned_dialogue(2, 1, 1_201, [30, 0, 0]),
+        ]);
+        replay.area_blocks = vec![
+            ReplayAreaBlock {
+                id: 1,
+                area: "区域 1".to_owned(),
+                line_ids: vec![1],
+            },
+            ReplayAreaBlock {
+                id: 2,
+                area: "区域 2".to_owned(),
+                line_ids: vec![2],
+            },
+        ];
+
+        assert!(delete_replay_dialogue(&mut replay, 1));
+
+        assert_eq!(replay.dialogue.len(), 1);
+        assert_eq!(replay.area_blocks.len(), 1);
+        assert_eq!(replay.area_blocks[0].line_ids, vec![2]);
+    }
+
+    #[test]
+    fn new_dm_dialogue_inherits_the_replay_scope_and_last_block() {
+        let mut line = positioned_dialogue(4, 3, 1_200, [8, 4, -12]);
+        line.sender_id = 77;
+        line.area = "甲板".to_owned();
+        let mut replay = test_replay(vec![line]);
+        replay.audience = ReplayAudience::Party("split-a".to_owned());
+        replay.area_blocks = vec![ReplayAreaBlock {
+            id: 9,
+            area: "甲板".to_owned(),
+            line_ids: vec![4],
+        }];
+
+        let line_id = append_dm_replay_dialogue(&mut replay);
+        let added = replay.dialogue.last().unwrap();
+
+        assert_eq!(line_id, 5);
+        assert_eq!(added.name, "DM");
+        assert!(added.text.is_empty());
+        assert_eq!(added.visibility, Visibility::Party("split-a".to_owned()));
+        assert_eq!(added.camera_focus_id, Some(77));
+        assert_eq!(added.turn_index, 3);
+        assert_eq!(added.position_cells, [8, 4, -12]);
+        assert_eq!(replay.area_blocks[0].line_ids, vec![4, 5]);
     }
 
     #[test]
