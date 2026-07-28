@@ -85,6 +85,7 @@ use crate::{
         BuffTickAction,
         BuffValue,
         DamageType,
+        StatusKey as RuleStatusKey,
     },
     scene::{
         SceneCaptureRequest,
@@ -2976,6 +2977,238 @@ pub struct NapcatMessageManager {
     pub item_pool: Vec<InventoryItem>,
     #[serde(default)]
     pub unit_pool: HashMap<String, UnitPoolEntry>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TestPoolSeedSummary {
+    pub units_added: usize,
+    pub items_added: usize,
+    pub random_pools_added: usize,
+}
+
+fn experience_test_item(
+    name: &str,
+    description: &str,
+    quality: InventoryQuality,
+    equipment_slot: EquipmentSlot,
+    stack: u32,
+    max_stack: u32,
+    item_level: u32,
+    stat_effects: Vec<BuffEffect>,
+    skill: Option<InventoryItemSkill>,
+) -> InventoryItem {
+    InventoryItem {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        quality,
+        equipment_slot,
+        stack,
+        max_stack,
+        item_level,
+        stat_effects,
+        skills: skill.into_iter().collect(),
+        ..Default::default()
+    }
+}
+
+fn experience_test_unit(
+    label: &str,
+    level: i32,
+    max_hp: f32,
+    base_damage: f32,
+    rarity: UnitRarity,
+) -> UnitPoolEntry {
+    UnitPoolEntry {
+        label: label.to_owned(),
+        note: "EXP、助攻与PvE动态等级测试单位".to_owned(),
+        rarity,
+        base_damage,
+        character: PlayerCharacter {
+            inited: true,
+            name: label.to_owned(),
+            nickname: label.to_owned(),
+            level,
+            hp: max_hp,
+            max_hp,
+            speed: 3.0 + level.max(1) as f32 * 0.1,
+            status: CharacterStatus {
+                str_: (base_damage / 2.0).round().max(1.0) as i32,
+                vit: (level / 2).max(1),
+                ..Default::default()
+            },
+            skill_names: vec!["测试攻击".to_owned()],
+            skill_notes: vec![format!("主动使用对目标造成{base_damage}点物理伤害")],
+            skill_mp_costs: vec![0.0],
+            skill_cooldown_turns: vec![0],
+            skill_metadata: vec![CharacterSkillMetadata::default()],
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+pub fn seed_experience_test_pools(manager: &mut NapcatMessageManager) -> TestPoolSeedSummary {
+    let test_items = vec![
+        experience_test_item(
+            "测试训练剑",
+            "测试装备属性与普通攻击；装备后力量+2。",
+            InventoryQuality::Uncommon,
+            EquipmentSlot::MainHand,
+            1,
+            1,
+            5,
+            vec![BuffEffect {
+                field: BuffField::Status(RuleStatusKey::Str),
+                value: BuffValue::Add(2.0),
+            }],
+            Some(InventoryItemSkill {
+                name: "训练斩击".to_owned(),
+                note: "主动使用对目标造成6点物理伤害".to_owned(),
+                cooldown_turns: 1,
+                ..Default::default()
+            }),
+        ),
+        experience_test_item(
+            "测试治疗药水",
+            "测试有效治疗助攻；使用后回复8点生命值并消耗1个。",
+            InventoryQuality::Common,
+            EquipmentSlot::None,
+            5,
+            20,
+            1,
+            Vec::new(),
+            Some(InventoryItemSkill {
+                name: "饮用测试药水".to_owned(),
+                note: "主动使用对目标回复8点生命值".to_owned(),
+                consume_item: true,
+                ..Default::default()
+            }),
+        ),
+        experience_test_item(
+            "测试奥术炸弹",
+            "测试消耗品伤害与击杀归属；造成12点魔法伤害。",
+            InventoryQuality::Rare,
+            EquipmentSlot::None,
+            3,
+            10,
+            8,
+            Vec::new(),
+            Some(InventoryItemSkill {
+                name: "投掷奥术炸弹".to_owned(),
+                note: "主动使用对目标造成12点魔法伤害".to_owned(),
+                cooldown_turns: 2,
+                consume_item: true,
+                ..Default::default()
+            }),
+        ),
+        experience_test_item(
+            "测试支援护符",
+            "测试支援角色装备属性；装备后智慧+2。",
+            InventoryQuality::Rare,
+            EquipmentSlot::Trinket,
+            1,
+            1,
+            10,
+            vec![BuffEffect {
+                field: BuffField::Status(RuleStatusKey::Wis),
+                value: BuffValue::Add(2.0),
+            }],
+            None,
+        ),
+    ];
+
+    let mut summary = TestPoolSeedSummary::default();
+    for (unit_id, unit) in [
+        (
+            "test-exp-slime",
+            experience_test_unit(
+                "测试史莱姆",
+                1,
+                30.0,
+                3.0,
+                UnitRarity::Normal,
+            ),
+        ),
+        (
+            "test-exp-wolf",
+            experience_test_unit(
+                "测试稀有狼",
+                5,
+                70.0,
+                7.0,
+                UnitRarity::Rare,
+            ),
+        ),
+        (
+            "test-exp-ogre",
+            experience_test_unit(
+                "测试精英食人魔",
+                10,
+                150.0,
+                13.0,
+                UnitRarity::Elite,
+            ),
+        ),
+        (
+            "test-exp-dragon",
+            experience_test_unit(
+                "测试稀有精英龙",
+                20,
+                320.0,
+                24.0,
+                UnitRarity::RareElite,
+            ),
+        ),
+    ] {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            manager.unit_pool.entry(unit_id.to_owned())
+        {
+            entry.insert(unit);
+            summary.units_added += 1;
+        }
+    }
+
+    for item in &test_items {
+        if !manager
+            .item_pool
+            .iter()
+            .any(|existing| existing.name == item.name)
+        {
+            manager.item_pool.push(item.clone());
+            summary.items_added += 1;
+        }
+    }
+
+    if let std::collections::hash_map::Entry::Vacant(entry) =
+        manager.random_pools.entry("EXP测试掉落池".to_owned())
+    {
+        entry.insert(RandomPool {
+            entries: test_items
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| RandomPoolEntry {
+                    item,
+                    weight: [25.0, 45.0, 20.0, 10.0][index],
+                    enabled: true,
+                    result_text: [
+                        "掉落：测试训练剑",
+                        "掉落：测试治疗药水",
+                        "掉落：测试奥术炸弹",
+                        "掉落：测试支援护符",
+                    ][index]
+                        .to_owned(),
+                    min_count: 1,
+                    max_count: 1,
+                })
+                .collect(),
+            tags: "测试 EXP 战利品".to_owned(),
+            description: "EXP战斗测试用加权物品池；重复添加测试数据不会覆盖此池。".to_owned(),
+            ..Default::default()
+        });
+        summary.random_pools_added = 1;
+    }
+
+    summary
 }
 
 pub const NAPCAT_MANAGER_EXPORT_VERSION: u32 = 1;
@@ -15122,5 +15355,61 @@ mod tests {
             inventory.hotbar[8],
             CharacterHotbarSlot::ReleaseControl
         );
+    }
+
+    #[test]
+    fn experience_test_pool_seed_is_complete_and_idempotent() {
+        let mut manager = empty_manager();
+
+        let first = seed_experience_test_pools(&mut manager);
+
+        assert_eq!(first, TestPoolSeedSummary {
+            units_added: 4,
+            items_added: 4,
+            random_pools_added: 1,
+        });
+        assert_eq!(
+            manager.unit_pool["test-exp-slime"].rarity,
+            UnitRarity::Normal
+        );
+        assert_eq!(
+            manager.unit_pool["test-exp-wolf"].rarity,
+            UnitRarity::Rare
+        );
+        assert_eq!(
+            manager.unit_pool["test-exp-ogre"].rarity,
+            UnitRarity::Elite
+        );
+        assert_eq!(
+            manager.unit_pool["test-exp-dragon"].rarity,
+            UnitRarity::RareElite
+        );
+        assert!(manager
+            .unit_pool
+            .values()
+            .all(|unit| unit.base_damage > 0.0 && !unit.character.skill_names.is_empty()));
+        assert_eq!(manager.item_pool.len(), 4);
+        let loot = &manager.random_pools["EXP测试掉落池"];
+        assert_eq!(loot.entries.len(), 4);
+        assert!(
+            (loot.entries.iter().map(|entry| entry.weight).sum::<f32>() - 100.0).abs()
+                < f32::EPSILON
+        );
+
+        manager
+            .unit_pool
+            .get_mut("test-exp-slime")
+            .unwrap()
+            .character
+            .max_hp = 999.0;
+        let second = seed_experience_test_pools(&mut manager);
+
+        assert_eq!(second, TestPoolSeedSummary::default());
+        assert_eq!(
+            manager.unit_pool["test-exp-slime"].character.max_hp,
+            999.0
+        );
+        assert_eq!(manager.item_pool.len(), 4);
+        assert_eq!(manager.random_pools.len(), 1);
     }
 }

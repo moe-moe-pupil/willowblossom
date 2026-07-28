@@ -693,6 +693,7 @@ use crate::{
         record_character_damage_taken,
         record_character_healing_taken,
         reset_character_turn_totals,
+        seed_experience_test_pools,
         skill_rule_args,
         update_character_from_status,
         update_character_from_status_with_config,
@@ -823,6 +824,7 @@ pub(crate) struct TrpgGroupSettingsState {
     random_pool_send_status: String,
     random_pool_group_filter: String,
     random_pool_tag_filter: String,
+    test_pool_seed_status: String,
     new_unit_id: String,
     unit_pool_source_target: String,
     focused_group_name: Option<String>,
@@ -9095,6 +9097,7 @@ fn random_pool_settings_ui(
     let mut changed = false;
 
     ui.heading("随机池");
+    changed |= experience_test_pool_seed_ui(ui, manager, state);
     ui.horizontal_wrapped(|ui| {
         ui.label("池名");
         ui.text_edit_singleline(&mut state.new_random_pool_name);
@@ -9933,6 +9936,7 @@ fn unit_pool_settings_ui(
     let mut changed = false;
 
     ui.heading("单位池");
+    changed |= experience_test_pool_seed_ui(ui, manager, state);
     ui.horizontal_wrapped(|ui| {
         ui.label("单位ID");
         ui.add(egui::TextEdit::singleline(&mut state.new_unit_id).desired_width(140.0));
@@ -10594,6 +10598,7 @@ fn item_pool_settings_ui(
 ) -> bool {
     let mut changed = false;
     ui.heading("物品池");
+    changed |= experience_test_pool_seed_ui(ui, manager, state);
     ui.small("物品池是GM模板库；发给玩家时会复制一份，装备后属性加成立即进入最终数值。");
 
     if !player_targets.is_empty() {
@@ -10674,6 +10679,32 @@ fn item_pool_settings_ui(
                 state.item_pool_draft = InventoryItem::default();
                 changed = true;
             }
+        }
+    });
+    changed
+}
+
+fn experience_test_pool_seed_ui(
+    ui: &mut Ui,
+    manager: &mut NapcatMessageManager,
+    state: &mut TrpgGroupSettingsState,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("添加EXP测试数据").clicked() {
+            let summary = seed_experience_test_pools(manager);
+            state.test_pool_seed_status = format!(
+                "已添加：{}个单位、{}个物品、{}个随机池；已有同名测试数据保持不变",
+                summary.units_added, summary.items_added, summary.random_pools_added,
+            );
+            changed = summary.units_added > 0
+                || summary.items_added > 0
+                || summary.random_pools_added > 0;
+        }
+        if !state.test_pool_seed_status.is_empty() {
+            ui.small(&state.test_pool_seed_status);
+        } else {
+            ui.small("添加四种稀有度单位，以及测试装备、消耗品和加权掉落池");
         }
     });
     changed
