@@ -875,6 +875,7 @@ pub(crate) struct CharacterEditState {
     gm_status_drafts: HashMap<String, CharacterStatus>,
     buff_drafts: HashMap<String, BuffDraft>,
     pending_character_reset: Option<String>,
+    pending_skill_delete: Option<(String, usize)>,
     quick_cast_skill_index: HashMap<String, usize>,
     pending_force_cast: Option<(String, usize)>,
     skill_pool_selected_index: HashMap<String, usize>,
@@ -6299,6 +6300,17 @@ fn character_skill_ui_id(target_id: &str, index: usize) -> egui::Id {
     egui::Id::new(("character_skill", target_id, index))
 }
 
+fn dangerous_button(ui: &mut Ui, label: &str) -> Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .color(egui::Color32::WHITE)
+                .strong(),
+        )
+        .fill(ui.visuals().error_fg_color),
+    )
+}
+
 fn character_skill_editor_ui(
     ui: &mut Ui,
     target_id: &str,
@@ -6349,7 +6361,7 @@ fn character_skill_editor_ui(
             |ui| {
                 ui.horizontal(|ui| {
                     let width =
-                        (ui.available_width() - 28.0).clamp(160.0, CHARACTER_FIELD_MAX_WIDTH);
+                        (ui.available_width() - 96.0).clamp(160.0, CHARACTER_FIELD_MAX_WIDTH);
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.label("技能名");
@@ -6414,9 +6426,28 @@ fn character_skill_editor_ui(
                             );
                         }
                     });
-                    if ui.button("-").on_hover_text("移除技能描述").clicked() {
-                        remove_index = Some(index);
-                    }
+                    ui.vertical(|ui| {
+                        let pending_delete = edit_state.pending_skill_delete.as_ref().is_some_and(
+                            |(pending_target, pending_index)| {
+                                pending_target == target_id && *pending_index == index
+                            },
+                        );
+                        if pending_delete {
+                            ui.colored_label(egui::Color32::RED, "确认删除？");
+                            if dangerous_button(ui, "确认删除").clicked() {
+                                remove_index = Some(index);
+                                edit_state.pending_skill_delete = None;
+                            }
+                            if ui.button("取消").clicked() {
+                                edit_state.pending_skill_delete = None;
+                            }
+                        } else if dangerous_button(ui, "删除技能")
+                            .on_hover_text("需要再次确认才会删除")
+                            .clicked()
+                        {
+                            edit_state.pending_skill_delete = Some((target_id.to_owned(), index));
+                        }
+                    });
                 });
                 if let Err(err) = &validation {
                     ui.colored_label(egui::Color32::RED, err);
