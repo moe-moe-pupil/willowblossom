@@ -6140,7 +6140,7 @@ fn character_editor_ui(
     );
     ui.separator();
     let (inventory_changed, equipment_changed) = character_inventory_editor_ui(
-        ui, target_id, character, edit_state, skill_pool, item_pool, false,
+        ui, target_id, character, edit_state, item_pool, false,
     );
     changed |= inventory_changed;
     if equipment_changed {
@@ -7405,7 +7405,6 @@ fn character_inventory_editor_ui(
     target_id: &str,
     character: &mut PlayerCharacter,
     edit_state: &mut CharacterEditState,
-    skill_pool: &[SkillPoolEntry],
     item_pool: &[InventoryItem],
     default_open: bool,
 ) -> (bool, bool) {
@@ -7502,7 +7501,7 @@ fn character_inventory_editor_ui(
 
             ui.collapsing("生存快捷栏", |ui| {
                 ui.small("GM可把背包物品或已批准的主动技能放进玩家的1-9快捷栏。");
-                let active_skills = character_active_hotbar_skills(character, skill_pool);
+                let active_skills = character_hotbar_skills(character);
                 let active_skill_indexes = active_skills
                     .iter()
                     .map(|(index, _)| *index)
@@ -7733,22 +7732,9 @@ fn normalize_character_hotbar(character: &mut PlayerCharacter) -> bool {
     changed
 }
 
-fn character_active_hotbar_skills(
-    character: &mut PlayerCharacter,
-    skill_pool: &[SkillPoolEntry],
-) -> Vec<(usize, String)> {
+fn character_hotbar_skills(character: &mut PlayerCharacter) -> Vec<(usize, String)> {
     quick_cast_skills(character)
         .into_iter()
-        .filter(|skill| {
-            quick_cast_effect(
-                &skill.note,
-                &skill.arg_values,
-                skill.skill_type.as_deref(),
-                skill.legacy_buff_machine_json.as_deref(),
-                skill_pool,
-            )
-            .is_some()
-        })
         .map(|skill| (skill.index, skill.name))
         .collect()
 }
@@ -14207,7 +14193,6 @@ pub fn ui_system(
                                             &target_id,
                                             character,
                                             character_edit_state,
-                                            &skill_pool_snapshot,
                                             &item_pool_snapshot,
                                             true,
                                         )
@@ -17591,6 +17576,23 @@ mod tests {
         assert_eq!(pending_gm_skill_count(&character), 1);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "已批准");
+    }
+
+    #[test]
+    fn hotbar_skills_include_approved_entries_without_parsed_effects() {
+        let mut character = PlayerCharacter {
+            skill_names: vec!["旋风斩".to_owned(), "待批准".to_owned()],
+            skill_notes: vec![String::new(), "主动使用对目标造成9点物理伤害".to_owned()],
+            skill_metadata: vec![CharacterSkillMetadata::default(), CharacterSkillMetadata {
+                st_approved: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let skills = character_hotbar_skills(&mut character);
+
+        assert_eq!(skills, vec![(0, "旋风斩".to_owned())]);
     }
 
     #[test]
