@@ -118,6 +118,7 @@ const MIN_DIALOGUE_MS: u64 = 2_700;
 const MAX_DIALOGUE_MS: u64 = 9_750;
 const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
+const DIRECTOR_CACHE_FINGERPRINT_VERSION: &str = "deepseek-director-v1";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const BACKGROUND_MUSIC_DIRECTORY: &str = "assets/audio";
 const BACKGROUND_MUSIC_EXTENSIONS: &[&str] = &["mp3", "wav", "ogg", "flac", "m4a", "aac"];
@@ -2191,6 +2192,24 @@ fn replay_controls(
             "{prompt_chars}/{DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS} 字；可影响措辞和镜头风格，不能扩大可见范围或新增剧情"
         ));
     }
+    let saved_director_available = studio
+        .replay
+        .as_ref()
+        .and_then(|replay| {
+            replay_director_request(
+                replay,
+                &studio.deepseek_custom_prompt,
+                standees,
+            )
+            .ok()
+            .map(|request| saved_director_block(replay, deepseek_manager, &request).is_some())
+        })
+        .unwrap_or(false);
+    let director_button_text = if saved_director_available {
+        "应用已保存的导演方案"
+    } else {
+        "生成并应用导演方案"
+    };
     if ui
         .add_enabled(
             studio.deepseek_director_enabled
@@ -2198,7 +2217,7 @@ fn replay_controls(
                     .replay
                     .as_ref()
                     .is_some_and(|replay| replay.dialogue.iter().any(|line| line.included)),
-            egui::Button::new("生成并应用导演方案"),
+            egui::Button::new(director_button_text),
         )
         .clicked()
     {
@@ -2216,12 +2235,19 @@ fn replay_controls(
                     standees,
                 )
             }) {
-            Ok(()) => {
+            Ok(source) => {
                 studio.director_request_pending = true;
-                if let Err(err) = deepseek_manager.persist() {
-                    format!("DeepSeek 请求已发送，但保存请求状态失败：{err}")
-                } else {
-                    "DeepSeek 正在润色台词并设计逐句镜头；返回后会自动应用".to_owned()
+                match source {
+                    DirectorPlanSource::Saved => {
+                        "已找到完全匹配的已保存 DeepSeek 导演方案，正在应用；未请求 API".to_owned()
+                    },
+                    DirectorPlanSource::Api => {
+                        if let Err(err) = deepseek_manager.persist() {
+                            format!("DeepSeek 请求已发送，但保存请求状态失败：{err}")
+                        } else {
+                            "DeepSeek 正在润色台词并设计逐句镜头；返回后会自动应用".to_owned()
+                        }
+                    },
                 }
             },
             Err(err) => {
@@ -2512,13 +2538,20 @@ fn replay_controls(
                 )
             });
         match director_result {
-            Ok(()) => {
+            Ok(source) => {
                 studio.director_response_hash = None;
                 studio.director_request_pending = true;
                 studio.auto_export_after_director = true;
-                studio.status =
-                    "已发送 DeepSeek 导演请求；收到并应用有效方案后自动开始导出".to_owned();
-                let _ = deepseek_manager.persist();
+                studio.status = match source {
+                    DirectorPlanSource::Saved => {
+                        "已找到完全匹配的已保存 DeepSeek 导演方案；正在应用后自动导出，未请求 API"
+                            .to_owned()
+                    },
+                    DirectorPlanSource::Api => {
+                        let _ = deepseek_manager.persist();
+                        "已发送 DeepSeek 导演请求；收到并应用有效方案后自动开始导出".to_owned()
+                    },
+                };
             },
             Err(err) => {
                 studio.director_request_pending = false;
@@ -3081,24 +3114,34 @@ fn replay_summary_block<'a>(
         .find(|block| block.message_count == message_count)
 }
 
-fn queue_replay_director(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectorPlanSource {
+    Saved,
+    Api,
+}
+
+struct ReplayDirectorRequest {
+    summary_key: String,
+    message_count: usize,
+    text: String,
+    custom_prompt: String,
+    fingerprint: String,
+}
+
+fn director_fingerprint_key(summary_key: &str, message_count: usize) -> String {
+    format!("{summary_key}:dialogue-count:{message_count}")
+}
+
+fn replay_director_request(
     replay: &ReplayFile,
-    sender: Option<&DeepseekIOSender>,
-    manager: &mut DeepseekManager,
     custom_prompt: &str,
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
-) -> Result<(), String> {
+) -> Result<ReplayDirectorRequest, String> {
     if !replay.dialogue.iter().any(|line| line.included) {
         return Err("回放中没有可整理的台词".to_owned());
     }
-    let sender = sender.ok_or_else(|| "DeepSeek 连接尚未就绪，请稍后重试".to_owned())?;
     let summary_key = replay_director_key(replay);
     let message_count = replay.dialogue.iter().filter(|line| line.included).count();
-    if let Some(block) = replay_summary_block(replay, manager) {
-        if block.pending {
-            return Err("这版台词正在整理，请等待当前请求完成".to_owned());
-        }
-    }
     let visible_standees = standees
         .iter()
         .map(|(transform, standee)| (standee.user_id, transform.translation))
@@ -3138,29 +3181,90 @@ fn queue_replay_director(
         .collect::<Vec<_>>();
     let text = serde_json::to_string(&serde_json::json!({ "dialogue": dialogue }))
         .map_err(|err| err.to_string())?;
-    let request = serde_json::to_string(&DeepseekRequest::Director {
-        target_id: summary_key.clone(),
+    let custom_prompt = custom_prompt
+        .chars()
+        .take(DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS)
+        .collect::<String>();
+    let fingerprint = blake3::hash(
+        format!("{DIRECTOR_CACHE_FINGERPRINT_VERSION}\n{summary_key}\n{custom_prompt}\n{text}")
+            .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
+    Ok(ReplayDirectorRequest {
+        summary_key,
         message_count,
         text,
-        custom_prompt: custom_prompt
-            .chars()
-            .take(DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS)
-            .collect(),
+        custom_prompt,
+        fingerprint,
+    })
+}
+
+fn saved_director_block<'a>(
+    replay: &ReplayFile,
+    manager: &'a DeepseekManager,
+    request: &ReplayDirectorRequest,
+) -> Option<&'a DeepseekSummaryBlock> {
+    let fingerprint_key = director_fingerprint_key(
+        &request.summary_key,
+        request.message_count,
+    );
+    if manager
+        .director_request_fingerprints
+        .get(&fingerprint_key)
+        .map(String::as_str)
+        != Some(request.fingerprint.as_str())
+    {
+        return None;
+    }
+    replay_summary_block(replay, manager)
+        .filter(|block| !block.pending && block.error.is_none() && !block.latest.trim().is_empty())
+}
+
+fn queue_replay_director(
+    replay: &ReplayFile,
+    sender: Option<&DeepseekIOSender>,
+    manager: &mut DeepseekManager,
+    custom_prompt: &str,
+    standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
+) -> Result<DirectorPlanSource, String> {
+    let director_request = replay_director_request(replay, custom_prompt, standees)?;
+    if saved_director_block(replay, manager, &director_request).is_some() {
+        return Ok(DirectorPlanSource::Saved);
+    }
+    if let Some(block) = replay_summary_block(replay, manager) {
+        if block.pending {
+            return Err("这版台词正在整理，请等待当前请求完成".to_owned());
+        }
+    }
+    let sender = sender.ok_or_else(|| "DeepSeek 连接尚未就绪，请稍后重试".to_owned())?;
+    let request = serde_json::to_string(&DeepseekRequest::Director {
+        target_id: director_request.summary_key.clone(),
+        message_count: director_request.message_count,
+        text: director_request.text,
+        custom_prompt: director_request.custom_prompt,
     })
     .map(Message::text)
     .map_err(|err| err.to_string())?;
     sender.0.try_send(request).map_err(|err| err.to_string())?;
+    manager.director_request_fingerprints.insert(
+        director_fingerprint_key(
+            &director_request.summary_key,
+            director_request.message_count,
+        ),
+        director_request.fingerprint,
+    );
     manager
         .summaries
-        .entry(summary_key)
+        .entry(director_request.summary_key)
         .or_default()
         .upsert_block(DeepseekSummaryBlock {
             latest: String::new(),
-            message_count,
+            message_count: director_request.message_count,
             pending: true,
             error: None,
         });
-    Ok(())
+    Ok(DirectorPlanSource::Api)
 }
 
 fn apply_ready_director_plan(
@@ -7878,6 +7982,49 @@ mod tests {
         assert!(!can_start_director_export(
             &studio, true
         ));
+    }
+
+    #[test]
+    fn matching_director_plan_survives_manager_serialization() {
+        let replay = test_replay(vec![test_dialogue(
+            0,
+            2_700,
+            DialogueSide::Right,
+        )]);
+        let summary_key = replay_director_key(&replay);
+        let request = ReplayDirectorRequest {
+            summary_key: summary_key.clone(),
+            message_count: 1,
+            text: "request text".to_owned(),
+            custom_prompt: "quiet cuts".to_owned(),
+            fingerprint: "matching-fingerprint".to_owned(),
+        };
+        let mut manager = DeepseekManager::default();
+        manager.director_request_fingerprints.insert(
+            director_fingerprint_key(&summary_key, 1),
+            request.fingerprint.clone(),
+        );
+        manager.summaries.insert(
+            summary_key,
+            crate::deepseek::DeepseekSummary {
+                blocks: vec![DeepseekSummaryBlock {
+                    latest: r#"{"dialogue":[]}"#.to_owned(),
+                    message_count: 1,
+                    pending: false,
+                    error: None,
+                }],
+            },
+        );
+
+        let serialized = serde_json::to_string(&manager).unwrap();
+        let restored: DeepseekManager = serde_json::from_str(&serialized).unwrap();
+
+        assert!(saved_director_block(&replay, &restored, &request).is_some());
+        let changed_request = ReplayDirectorRequest {
+            fingerprint: "changed-fingerprint".to_owned(),
+            ..request
+        };
+        assert!(saved_director_block(&replay, &restored, &changed_request).is_none());
     }
 
     #[test]

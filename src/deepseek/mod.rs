@@ -61,6 +61,8 @@ pub struct DeepseekManager {
     pub last_post_text: String,
     #[serde(default)]
     pub summaries: HashMap<String, DeepseekSummary>,
+    #[serde(default)]
+    pub director_request_fingerprints: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
