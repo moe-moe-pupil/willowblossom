@@ -63,6 +63,15 @@ pub struct DeepseekManager {
     pub summaries: HashMap<String, DeepseekSummary>,
     #[serde(default)]
     pub director_request_fingerprints: HashMap<String, String>,
+    #[serde(skip)]
+    pub content_pool_generation: DeepseekContentPoolGeneration,
+}
+
+#[derive(Debug, Default)]
+pub struct DeepseekContentPoolGeneration {
+    pub pending: bool,
+    pub latest: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -365,6 +374,15 @@ impl DeepseekManager {
         .map_err(|err| format!("无法合并 DeepSeek 导演方案：{err}"))
     }
 
+    fn post_content_pools(prompt: &str) -> Result<String, String> {
+        Self::post_chat_completion(
+            prompt,
+            "现在生成可直接导入的随机化测试内容。只返回JSON对象。",
+            16_000,
+            true,
+        )
+    }
+
     fn post_director_batch(
         dialogue: &[serde_json::Value],
         custom_prompt: &str,
@@ -451,6 +469,9 @@ pub enum DeepseekRequest {
         #[serde(default)]
         custom_prompt: String,
     },
+    ContentPools {
+        prompt: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -464,6 +485,12 @@ enum DeepseekResponse {
     Director {
         target_id: String,
         message_count: usize,
+        text: String,
+    },
+    ContentPools {
+        text: String,
+    },
+    ContentPoolsError {
         text: String,
     },
     Error {
@@ -643,6 +670,20 @@ async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> Comm
                                             .send(response.into())
                                             .expect("Could not send message");
                                     },
+                                    DeepseekRequest::ContentPools { prompt } => {
+                                        let response =
+                                            match DeepseekManager::post_content_pools(&prompt) {
+                                                Ok(text) => DeepseekResponse::ContentPools { text },
+                                                Err(text) => {
+                                                    DeepseekResponse::ContentPoolsError { text }
+                                                },
+                                            };
+                                        let response = serde_json::to_string(&response)
+                                            .expect("failed to serialize DeepSeek response");
+                                        client_to_game_sender
+                                            .send(response.into())
+                                            .expect("Could not send message");
+                                    },
                                 }
                             } else {
                                 eprintln!(
@@ -712,6 +753,18 @@ fn apply_deepseek_response(deepseek_manager: &mut DeepseekManager, text: &str) -
                 });
             true
         },
+        Ok(DeepseekResponse::ContentPools { text }) => {
+            deepseek_manager.content_pool_generation.pending = false;
+            deepseek_manager.content_pool_generation.latest = Some(text);
+            deepseek_manager.content_pool_generation.error = None;
+            true
+        },
+        Ok(DeepseekResponse::ContentPoolsError { text }) => {
+            deepseek_manager.content_pool_generation.pending = false;
+            deepseek_manager.content_pool_generation.latest = None;
+            deepseek_manager.content_pool_generation.error = Some(text);
+            true
+        },
         Ok(DeepseekResponse::Error {
             target_id,
             message_count,
@@ -746,6 +799,44 @@ fn invalid_deepseek_response_does_not_mutate_manager() {
     ));
 
     assert!(manager.summaries.is_empty());
+}
+
+#[test]
+fn content_pool_response_is_delivered_to_the_gm_ui_without_persistence() {
+    let mut manager = DeepseekManager::default();
+    manager.content_pool_generation.pending = true;
+
+    assert!(apply_deepseek_response(
+        &mut manager,
+        r#"{"type":"content_pools","text":"{\"version\":1}"}"#,
+    ));
+    assert!(!manager.content_pool_generation.pending);
+    assert_eq!(
+        manager.content_pool_generation.latest.as_deref(),
+        Some(r#"{"version":1}"#)
+    );
+    assert!(manager.content_pool_generation.error.is_none());
+
+    let persisted = serde_json::to_string(&manager).unwrap();
+    assert!(!persisted.contains("content_pool_generation"));
+    assert!(!persisted.contains(r#"{\"version\":1}"#));
+}
+
+#[test]
+fn content_pool_error_clears_pending_generation() {
+    let mut manager = DeepseekManager::default();
+    manager.content_pool_generation.pending = true;
+
+    assert!(apply_deepseek_response(
+        &mut manager,
+        r#"{"type":"content_pools_error","text":"rate limited"}"#,
+    ));
+    assert!(!manager.content_pool_generation.pending);
+    assert!(manager.content_pool_generation.latest.is_none());
+    assert_eq!(
+        manager.content_pool_generation.error.as_deref(),
+        Some("rate limited")
+    );
 }
 
 #[test]

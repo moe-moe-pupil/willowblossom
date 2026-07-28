@@ -860,7 +860,6 @@ pub(crate) struct TrpgGroupSettingsState {
     unit_pool_export_path: String,
     content_pool_bundle_path: String,
     content_pool_bundle_status: String,
-    content_pool_generation_prompt: String,
     moonberry_legacy_import_path: String,
     deepseek_summary_export_path: String,
     voxel_scene_export_path: String,
@@ -1327,6 +1326,8 @@ fn pool_management_window(
     manager: &mut Persistent<NapcatMessageManager>,
     state: &mut TrpgGroupSettingsState,
     napcat_sender: Option<&NapcatIOSender>,
+    deepseek_sender: Option<&DeepseekIOSender>,
+    deepseek_manager: &mut DeepseekManager,
     ime: &mut ImeManager,
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
 ) {
@@ -1387,7 +1388,13 @@ fn pool_management_window(
                     | PoolWindowTab::Skill
                     | PoolWindowTab::Item
             ) {
-                changed |= content_pool_bundle_ui(ui, manager, state);
+                changed |= content_pool_bundle_ui(
+                    ui,
+                    manager,
+                    state,
+                    deepseek_sender,
+                    deepseek_manager,
+                );
                 ui.separator();
             }
             egui::ScrollArea::vertical()
@@ -1440,12 +1447,47 @@ fn content_pool_bundle_ui(
     ui: &mut Ui,
     manager: &mut NapcatMessageManager,
     state: &mut TrpgGroupSettingsState,
+    deepseek_sender: Option<&DeepseekIOSender>,
+    deepseek_manager: &mut DeepseekManager,
 ) -> bool {
     if state.content_pool_bundle_path.trim().is_empty() {
         state.content_pool_bundle_path = CONTENT_POOL_BUNDLE_DEFAULT_PATH.to_owned();
     }
 
     let mut changed = false;
+    if let Some(text) = deepseek_manager.content_pool_generation.latest.take() {
+        match manager.merge_content_pool_bundle_json(&text) {
+            Ok(summary) => {
+                changed = true;
+                let archive_status = match write_text_export(
+                    &state.content_pool_bundle_path,
+                    Ok(text),
+                ) {
+                    Ok(()) => format!(
+                        "；JSON已保存至 {}",
+                        state.content_pool_bundle_path
+                    ),
+                    Err(err) => format!("；但JSON保存失败：{err}"),
+                };
+                state.content_pool_bundle_status = format!(
+                    "DeepSeek已生成并导入：单位{}、技能{}、物品{}、随机池{}{}",
+                    summary.units,
+                    summary.skills,
+                    summary.items,
+                    summary.random_pools,
+                    archive_status
+                );
+            },
+            Err(err) => {
+                state.content_pool_bundle_status =
+                    format!("DeepSeek返回内容未通过导入校验，未修改内容池：{err}");
+            },
+        }
+    }
+    if let Some(error) = deepseek_manager.content_pool_generation.error.take() {
+        state.content_pool_bundle_status = format!("DeepSeek生成失败：{error}");
+    }
+
     ui.collapsing(
         "内容池导入 / 导出 / DeepSeek生成",
         |ui| {
@@ -1490,30 +1532,51 @@ fn content_pool_bundle_ui(
                 }
             });
             ui.horizontal_wrapped(|ui| {
-                if ui.button("生成DeepSeek提示词").clicked() {
-                    state.content_pool_generation_prompt = content_pool_generation_prompt();
-                    state.content_pool_bundle_status =
-                        "已生成提示词；交给DeepSeek后，将其纯JSON输出保存到上方路径再导入。"
-                            .to_owned();
-                }
-                if ui
-                    .add_enabled(
-                        !state.content_pool_generation_prompt.is_empty(),
-                        egui::Button::new("复制给DeepSeek"),
-                    )
-                    .clicked()
-                {
-                    ui.ctx()
-                        .copy_text(state.content_pool_generation_prompt.clone());
-                    state.content_pool_bundle_status = "提示词已复制。".to_owned();
+                let ready =
+                    deepseek_sender.is_some() && !deepseek_manager.content_pool_generation.pending;
+                let response = ui.add_enabled(
+                    ready,
+                    egui::Button::new("DeepSeek随机生成并导入"),
+                );
+                let clicked = response.clicked();
+                response.on_hover_text(if deepseek_sender.is_none() {
+                    "DeepSeek后台未就绪"
+                } else if deepseek_manager.content_pool_generation.pending {
+                    "DeepSeek正在生成"
+                } else {
+                    "使用.env中的DEEPSEEK_API_KEY生成并校验单位、技能、物品和随机池"
+                });
+                if clicked {
+                    let request = DeepseekRequest::ContentPools {
+                        prompt: content_pool_generation_prompt(),
+                    };
+                    let send_result = serde_json::to_string(&request)
+                        .map(|request| Message::Text(request.into()))
+                        .map_err(|err| err.to_string())
+                        .and_then(|request| {
+                            deepseek_sender
+                                .expect("DeepSeek sender checked above")
+                                .0
+                                .try_send(request)
+                                .map_err(|err| err.to_string())
+                        });
+                    match send_result {
+                        Ok(()) => {
+                            deepseek_manager.content_pool_generation.pending = true;
+                            deepseek_manager.content_pool_generation.latest = None;
+                            deepseek_manager.content_pool_generation.error = None;
+                            state.content_pool_bundle_status =
+                                "DeepSeek正在生成随机内容，请稍候…".to_owned();
+                        },
+                        Err(err) => {
+                            state.content_pool_bundle_status =
+                                format!("DeepSeek请求发送失败：{err}");
+                        },
+                    }
                 }
             });
-            if !state.content_pool_generation_prompt.is_empty() {
-                ui.add(
-                    egui::TextEdit::multiline(&mut state.content_pool_generation_prompt)
-                        .desired_rows(8)
-                        .desired_width(ui.available_width()),
-                );
+            if deepseek_manager.content_pool_generation.pending {
+                ui.spinner();
             }
             if !state.content_pool_bundle_status.is_empty() {
                 ui.small(&state.content_pool_bundle_status);
@@ -14011,6 +14074,8 @@ pub fn ui_system(
         &mut manager,
         trpg_group_settings,
         napcat_sender,
+        deepseek_sender,
+        &mut deepseek_manager,
         &mut ime,
         scene_store.as_deref_mut(),
     );
