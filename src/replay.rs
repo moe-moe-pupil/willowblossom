@@ -141,6 +141,10 @@ const REPLAY_SPEECH_PREPARING_STATUS: &str = "正在准备当前台词语音；�
 const DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 1.5;
 const MIN_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 0.5;
 const MAX_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 4.0;
+const DEFAULT_CAMERA_TRANSITION_CURVE: f32 = 2.0;
+const MIN_CAMERA_TRANSITION_CURVE: f32 = 1.0;
+const MAX_CAMERA_TRANSITION_CURVE: f32 = 4.0;
+const FOCUS_TRANSITION_MS: u64 = 900;
 
 pub struct ReplayPlugin;
 
@@ -368,6 +372,8 @@ struct ReplayFile {
     camera: Vec<ReplayCameraKeyframe>,
     #[serde(default = "default_directed_camera_distance_scale")]
     camera_distance_scale: f32,
+    #[serde(default = "default_camera_transition_curve")]
+    camera_transition_curve: f32,
     dialogue: Vec<ReplayDialogue>,
     #[serde(default)]
     area_blocks: Vec<ReplayAreaBlock>,
@@ -540,6 +546,7 @@ pub(crate) struct ReplayStudio {
     playback_ms: u64,
     playback_speed: f32,
     camera_distance_scale: f32,
+    camera_transition_curve: f32,
     record_camera_enabled: bool,
     deepseek_director_enabled: bool,
     director_response_hash: Option<u64>,
@@ -648,6 +655,7 @@ impl Default for ReplayStudio {
             playback_ms: 0,
             playback_speed: 1.0,
             camera_distance_scale: default_directed_camera_distance_scale(),
+            camera_transition_curve: default_camera_transition_curve(),
             record_camera_enabled: false,
             deepseek_director_enabled: false,
             director_response_hash: None,
@@ -1789,7 +1797,11 @@ fn apply_replay_camera(
         return;
     }
     let Some(replay) = studio.replay.as_ref() else { return };
-    let Some(transform) = interpolated_camera(&replay.camera, studio.playback_ms) else {
+    let Some(transform) = interpolated_camera(
+        &replay.camera,
+        studio.playback_ms,
+        replay.camera_transition_curve,
+    ) else {
         return;
     };
     if let Ok(mut camera) = camera.single_mut() {
@@ -2057,6 +2069,33 @@ fn replay_controls(
         studio.status = format!(
             "自动导演镜头距离已设为 {:.2}×",
             studio.camera_distance_scale
+        );
+    }
+    let mut requested_transition_curve = studio.camera_transition_curve;
+    let transition_curve_changed = ui
+        .horizontal(|ui| {
+            ui.label("焦点切换缓动曲线");
+            ui.add(
+                egui::Slider::new(
+                    &mut requested_transition_curve,
+                    MIN_CAMERA_TRANSITION_CURVE..=MAX_CAMERA_TRANSITION_CURVE,
+                )
+                .step_by(0.1)
+                .fixed_decimals(1),
+            )
+            .on_hover_text("1.0 为匀速；数值越高，切换玩家时镜头起步和停下越柔和。")
+            .changed()
+        })
+        .inner;
+    if transition_curve_changed {
+        studio.camera_transition_curve =
+            normalized_camera_transition_curve(requested_transition_curve);
+        if let Some(replay) = studio.replay.as_mut() {
+            replay.camera_transition_curve = studio.camera_transition_curve;
+        }
+        studio.status = format!(
+            "焦点切换缓动曲线已设为 {:.1}",
+            studio.camera_transition_curve
         );
     }
     ui.add(
@@ -2682,6 +2721,7 @@ fn replay_controls(
                         studio.playback_ms = 0;
                         studio.audience = replay.audience.clone();
                         studio.camera_distance_scale = replay.camera_distance_scale;
+                        studio.camera_transition_curve = replay.camera_transition_curve;
                         studio.status = format!("已载入项目：{}", replay.title);
                         studio.replay = Some(replay);
                     },
@@ -2996,6 +3036,7 @@ fn start_recording(
         studio.audience.clone(),
         scene,
         studio.camera_distance_scale,
+        studio.camera_transition_curve,
     );
     if studio.record_camera_enabled {
         if let Ok(transform) = camera.single() {
@@ -3063,6 +3104,7 @@ fn build_from_history(
         studio.audience.clone(),
         scene,
         studio.camera_distance_scale,
+        studio.camera_transition_curve,
     );
     let speaker_positions = standee_positions(standees);
     let mut visible = manager
@@ -3504,6 +3546,7 @@ fn new_replay(
     audience: ReplayAudience,
     scene: ReplayScene,
     camera_distance_scale: f32,
+    camera_transition_curve: f32,
 ) -> ReplayFile {
     let title = manager
         .current_trpg_group
@@ -3521,6 +3564,7 @@ fn new_replay(
         scene,
         camera: Vec::new(),
         camera_distance_scale: normalized_directed_camera_distance_scale(camera_distance_scale),
+        camera_transition_curve: normalized_camera_transition_curve(camera_transition_curve),
         dialogue: Vec::new(),
         area_blocks: Vec::new(),
         area_radius_cells: default_area_radius_cells(),
@@ -4704,6 +4748,8 @@ fn default_master_speech_speed() -> f32 { 1.10 }
 
 fn default_directed_camera_distance_scale() -> f32 { DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE }
 
+fn default_camera_transition_curve() -> f32 { DEFAULT_CAMERA_TRANSITION_CURVE }
+
 fn normalized_directed_camera_distance_scale(scale: f32) -> f32 {
     if scale.is_finite() {
         scale.clamp(
@@ -4712,6 +4758,17 @@ fn normalized_directed_camera_distance_scale(scale: f32) -> f32 {
         )
     } else {
         default_directed_camera_distance_scale()
+    }
+}
+
+fn normalized_camera_transition_curve(curve: f32) -> f32 {
+    if curve.is_finite() {
+        curve.clamp(
+            MIN_CAMERA_TRANSITION_CURVE,
+            MAX_CAMERA_TRANSITION_CURVE,
+        )
+    } else {
+        default_camera_transition_curve()
     }
 }
 
@@ -5194,8 +5251,12 @@ fn apply_replay_standee_positions(
 
     if active {
         if let Some(replay) = studio.replay.as_ref() {
-            let camera_position = interpolated_camera(&replay.camera, studio.playback_ms)
-                .map(|transform| transform.translation);
+            let camera_position = interpolated_camera(
+                &replay.camera,
+                studio.playback_ms,
+                replay.camera_transition_curve,
+            )
+            .map(|transform| transform.translation);
             let positions = replay
                 .dialogue
                 .iter()
@@ -5607,13 +5668,14 @@ fn turn_based_camera_track(
                 obstacles,
             );
             let settled = focused;
-            if line.time_ms > 0 {
-                frames.push(camera_keyframe(
-                    line.time_ms.saturating_sub(1),
-                    &current,
-                ));
-            }
-            frames.push(camera_keyframe(line.time_ms, &focused));
+            let transition_end = line
+                .time_ms
+                .saturating_add(line.duration_ms.min(FOCUS_TRANSITION_MS));
+            frames.push(camera_keyframe(line.time_ms, &current));
+            frames.push(camera_keyframe(
+                transition_end,
+                &focused,
+            ));
             frames.push(camera_keyframe(line_end, &settled));
             current = settled;
         }
@@ -5696,13 +5758,14 @@ fn director_camera_track(
         } else {
             continue;
         };
-        if line.time_ms > 0 {
-            frames.push(camera_keyframe(
-                line.time_ms.saturating_sub(1),
-                &current,
-            ));
-        }
-        frames.push(camera_keyframe(line.time_ms, &arrival));
+        let transition_end = line
+            .time_ms
+            .saturating_add(line.duration_ms.min(FOCUS_TRANSITION_MS));
+        frames.push(camera_keyframe(line.time_ms, &current));
+        frames.push(camera_keyframe(
+            transition_end,
+            &arrival,
+        ));
         frames.push(camera_keyframe(line_end, &settled));
         current = settled;
     }
@@ -5969,7 +6032,11 @@ impl DirectedCameraRig {
 
 fn horizontal(vector: Vec3) -> Vec3 { Vec3::new(vector.x, 0.0, vector.z) }
 
-fn interpolated_camera(frames: &[ReplayCameraKeyframe], time_ms: u64) -> Option<Transform> {
+fn interpolated_camera(
+    frames: &[ReplayCameraKeyframe],
+    time_ms: u64,
+    transition_curve: f32,
+) -> Option<Transform> {
     let first = frames.first()?;
     let next_index = frames.partition_point(|frame| frame.time_ms <= time_ms);
     if next_index == 0 {
@@ -5982,7 +6049,7 @@ fn interpolated_camera(frames: &[ReplayCameraKeyframe], time_ms: u64) -> Option<
     let right = &frames[next_index];
     let span = right.time_ms.saturating_sub(left.time_ms).max(1);
     let linear_t = time_ms.saturating_sub(left.time_ms) as f32 / span as f32;
-    let t = linear_t * linear_t * (3.0 - 2.0 * linear_t);
+    let t = camera_easing_t(linear_t, transition_curve);
     let left_rotation = Quat::from_array(left.rotation).normalize();
     let right_rotation = Quat::from_array(right.rotation).normalize();
     Some(Transform {
@@ -5991,6 +6058,16 @@ fn interpolated_camera(frames: &[ReplayCameraKeyframe], time_ms: u64) -> Option<
         rotation: left_rotation.slerp(right_rotation, t),
         ..default()
     })
+}
+
+fn camera_easing_t(linear_t: f32, transition_curve: f32) -> f32 {
+    let linear_t = linear_t.clamp(0.0, 1.0);
+    let curve = normalized_camera_transition_curve(transition_curve);
+    if linear_t <= 0.5 {
+        0.5 * (linear_t * 2.0).powf(curve)
+    } else {
+        1.0 - 0.5 * ((1.0 - linear_t) * 2.0).powf(curve)
+    }
 }
 
 fn frame_transform(frame: &ReplayCameraKeyframe) -> Transform {
@@ -6747,6 +6824,8 @@ fn import_replay(path: &str) -> Result<ReplayFile, String> {
     let mut replay: ReplayFile = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
     replay.camera_distance_scale =
         normalized_directed_camera_distance_scale(replay.camera_distance_scale);
+    replay.camera_transition_curve =
+        normalized_camera_transition_curve(replay.camera_transition_curve);
     if !matches!(
         replay.format_version,
         LEGACY_REPLAY_FORMAT_VERSION | REPLAY_FORMAT_VERSION
@@ -7169,16 +7248,44 @@ mod tests {
             },
         ];
         assert_eq!(
-            interpolated_camera(&frames, 500).unwrap().translation.x,
+            interpolated_camera(
+                &frames,
+                500,
+                default_camera_transition_curve()
+            )
+            .unwrap()
+            .translation
+            .x,
             5.0
         );
         assert_eq!(
-            interpolated_camera(&frames, 250).unwrap().translation.x,
-            1.5625
+            interpolated_camera(
+                &frames,
+                250,
+                default_camera_transition_curve()
+            )
+            .unwrap()
+            .translation
+            .x,
+            1.25
         );
         assert_eq!(
-            interpolated_camera(&frames, 2_000).unwrap().translation.x,
+            interpolated_camera(
+                &frames,
+                2_000,
+                default_camera_transition_curve()
+            )
+            .unwrap()
+            .translation
+            .x,
             10.0
+        );
+        assert_eq!(
+            interpolated_camera(&frames, 250, 1.0)
+                .unwrap()
+                .translation
+                .x,
+            2.5
         );
     }
 
@@ -7200,7 +7307,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_camera_focuses_known_speakers_at_line_start() {
+    fn turn_camera_smoothly_focuses_known_speakers() {
         let base = Transform::from_xyz(2.0, 3.0, 4.0);
         let mut dialogue = [
             test_dialogue(350, 2_400, DialogueSide::Left),
@@ -7223,7 +7330,10 @@ mod tests {
         assert!(frames
             .windows(2)
             .all(|pair| pair[0].time_ms < pair[1].time_ms));
-        for (arrival_ms, target) in [(350, speaker_positions[&1]), (3_030, speaker_positions[&2])] {
+        for (arrival_ms, target) in [
+            (1_250, speaker_positions[&1]),
+            (3_930, speaker_positions[&2]),
+        ] {
             let frame = frames
                 .iter()
                 .find(|frame| frame.time_ms == arrival_ms)
@@ -7233,6 +7343,20 @@ mod tests {
             let to_speaker = (target - shot.translation).normalize();
             assert!(forward.dot(to_speaker) > 0.99);
         }
+        let switch_start = frames.iter().find(|frame| frame.time_ms == 3_030).unwrap();
+        let switch_end = frames.iter().find(|frame| frame.time_ms == 3_930).unwrap();
+        let halfway = interpolated_camera(
+            &frames,
+            3_480,
+            default_camera_transition_curve(),
+        )
+        .unwrap()
+        .translation;
+        let start = Vec3::from_array(switch_start.translation);
+        let end = Vec3::from_array(switch_end.translation);
+        assert_ne!(start, end);
+        assert!(halfway.distance(start) > 0.01);
+        assert!(halfway.distance(end) > 0.01);
     }
 
     #[test]
@@ -8319,9 +8443,14 @@ mod tests {
             replay.camera_distance_scale,
             default_directed_camera_distance_scale()
         );
+        assert_eq!(
+            replay.camera_transition_curve,
+            default_camera_transition_curve()
+        );
         replay.master_speech_speed = 1.15;
         replay.master_dialogue_duration = 2.75;
         replay.camera_distance_scale = 2.25;
+        replay.camera_transition_curve = 3.25;
         replay
             .speaker_voice_settings
             .insert(42, SpeakerVoiceSettings {
@@ -8351,6 +8480,7 @@ mod tests {
         assert_eq!(restored.master_speech_speed, 1.15);
         assert_eq!(restored.master_dialogue_duration, 2.75);
         assert_eq!(restored.camera_distance_scale, 2.25);
+        assert_eq!(restored.camera_transition_curve, 3.25);
     }
 
     #[test]
@@ -8596,6 +8726,7 @@ mod tests {
             scene: ReplayScene::default(),
             camera: Vec::new(),
             camera_distance_scale: default_directed_camera_distance_scale(),
+            camera_transition_curve: default_camera_transition_curve(),
             dialogue,
             area_blocks: Vec::new(),
             area_radius_cells: DEFAULT_AREA_RADIUS_CELLS,
