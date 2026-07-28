@@ -493,6 +493,8 @@ struct SpeakerVoiceSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct ReplayVoiceFavorite {
     name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_id: Option<u64>,
     settings: SpeakerVoiceSettings,
 }
 
@@ -1886,6 +1888,7 @@ fn replay_studio_ui(
                     deepseek_sender.as_deref(),
                     &mut deepseek_manager,
                     &mut studio,
+                    &voice_favorites,
                     &speech,
                     &camera,
                     &standees,
@@ -1927,6 +1930,7 @@ fn replay_controls(
     deepseek_sender: Option<&DeepseekIOSender>,
     deepseek_manager: &mut Persistent<DeepseekManager>,
     studio: &mut ReplayStudio,
+    voice_favorites: &ReplayVoiceFavorites,
     speech: &PreviewSpeechController,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
@@ -2045,7 +2049,14 @@ fn replay_controls(
                 start_recording(studio, manager, camera, grids);
             }
             if ui.button("从现有聊天生成").clicked() {
-                build_from_history(studio, manager, camera, standees, grids);
+                build_from_history(
+                    studio,
+                    manager,
+                    voice_favorites,
+                    camera,
+                    standees,
+                    grids,
+                );
             }
         },
     });
@@ -2148,7 +2159,14 @@ fn replay_controls(
                     );
                 }
                 if ui.button("从当前聊天重建回放").clicked() {
-                    build_from_history(studio, manager, camera, standees, grids);
+                    build_from_history(
+                        studio,
+                        manager,
+                        voice_favorites,
+                        camera,
+                        standees,
+                        grids,
+                    );
                 }
             });
             ui.small("排除只会取消这些台词的“使用”勾选，不会删除台词。重建会用当前聊天和场景替换现有回放编辑。");
@@ -2472,7 +2490,14 @@ fn replay_controls(
         ) {
             stop_playback(studio, grids);
         }
-        build_from_history(studio, manager, camera, standees, grids);
+        build_from_history(
+            studio,
+            manager,
+            voice_favorites,
+            camera,
+            standees,
+            grids,
+        );
         let director_result = studio
             .replay
             .as_ref()
@@ -2597,7 +2622,7 @@ fn speech_settings_window(
         .max_width(620.0)
         .show(ctx, |ui| {
             ui.label(format!(
-                "官方 EmotiVoice 音色目录共 {} 个音色。同一玩家始终使用同一说话人 ID；收藏会自动保存到本机。",
+                "官方 EmotiVoice 音色目录共 {} 个音色。同一玩家始终使用同一说话人 ID；收藏会保存到本机，并在从现有聊天生成时按 QQ 角色自动应用。",
                 emotivoice_voice_profiles().len()
             ));
             if installed_speakers.is_empty() {
@@ -2798,20 +2823,22 @@ fn speech_settings_window(
                                 };
                                 let favorite = ReplayVoiceFavorite {
                                     name: favorite_name.clone(),
+                                    sender_id: Some(*sender_id),
                                     settings: settings.clone(),
                                 };
-                                if let Some(existing) = voice_favorites
+                                if let Some(existing_index) = voice_favorites
                                     .favorites
-                                    .iter_mut()
-                                    .find(|item| item.name.eq_ignore_ascii_case(&favorite_name))
+                                    .iter()
+                                    .position(|item| item.name.eq_ignore_ascii_case(&favorite_name))
                                 {
-                                    *existing = favorite;
-                                } else {
-                                    voice_favorites.favorites.push(favorite);
+                                    voice_favorites.favorites.remove(existing_index);
                                 }
+                                voice_favorites.favorites.push(favorite);
                                 *draft = favorite_name;
                                 pending_status = Some(match voice_favorites.persist() {
-                                    Ok(()) => "语音收藏已保存，重新启动后仍会保留".to_owned(),
+                                    Ok(()) => {
+                                        "语音收藏已保存；从现有聊天生成时会自动应用".to_owned()
+                                    },
                                     Err(err) => format!("已添加语音收藏，但保存失败：{err}"),
                                 });
                             }
@@ -2900,6 +2927,7 @@ fn stop_recording(studio: &mut ReplayStudio) {
 fn build_from_history(
     studio: &mut ReplayStudio,
     manager: &NapcatMessageManager,
+    voice_favorites: &ReplayVoiceFavorites,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
@@ -2974,6 +3002,7 @@ fn build_from_history(
     }
     deduplicate_broadcast_dialogue(&mut replay.dialogue, manager);
     assign_replay_line_ids(&mut replay.dialogue);
+    let favorite_count = apply_favorite_voice_settings(&mut replay, voice_favorites);
     auto_group_replay_areas(&mut replay);
     rebuild_area_blocks(&mut replay);
     replay.duration_ms = compile_area_block_timeline(&mut replay);
@@ -2995,9 +3024,34 @@ fn build_from_history(
     studio.auto_export_after_director = false;
     let dialogue_count = replay.dialogue.len();
     studio.replay = Some(replay);
+    let favorite_status = if favorite_count == 0 {
+        String::new()
+    } else {
+        format!("；已自动应用 {favorite_count} 个角色的语音收藏")
+    };
     studio.status = format!(
-        "已生成 {dialogue_count} 句区域回放台词；其中 {estimated_count} 句旧消息使用当前立牌位置或原点估算，可由 DM 编辑"
+        "已生成 {dialogue_count} 句区域回放台词；其中 {estimated_count} 句旧消息使用当前立牌位置或原点估算，可由 DM 编辑{favorite_status}"
     );
+}
+
+fn apply_favorite_voice_settings(
+    replay: &mut ReplayFile,
+    voice_favorites: &ReplayVoiceFavorites,
+) -> usize {
+    let speaker_ids = replay
+        .dialogue
+        .iter()
+        .map(|line| line.sender_id)
+        .collect::<HashSet<_>>();
+    for favorite in &voice_favorites.favorites {
+        let Some(sender_id) = favorite.sender_id.filter(|id| speaker_ids.contains(id)) else {
+            continue;
+        };
+        replay
+            .speaker_voice_settings
+            .insert(sender_id, favorite.settings.clone());
+    }
+    replay.speaker_voice_settings.len()
 }
 
 fn replay_director_key(replay: &ReplayFile) -> String {
@@ -7882,6 +7936,7 @@ mod tests {
         let favorites = ReplayVoiceFavorites {
             favorites: vec![ReplayVoiceFavorite {
                 name: "反派低语".to_owned(),
+                sender_id: Some(42),
                 settings: SpeakerVoiceSettings {
                     voice_name: Some("8051".to_owned()),
                     emotion: Some("悲伤".to_owned()),
@@ -7895,6 +7950,57 @@ mod tests {
         let serialized = serde_json::to_string(&favorites).unwrap();
         let restored: ReplayVoiceFavorites = serde_json::from_str(&serialized).unwrap();
         assert_eq!(restored.favorites, favorites.favorites);
+
+        let legacy: ReplayVoiceFavorites = serde_json::from_str(
+            r#"{"favorites":[{"name":"旧收藏","settings":{"speech_rate":0,"volume":1.0}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.favorites[0].sender_id, None);
+    }
+
+    #[test]
+    fn generated_replay_applies_latest_favorite_for_each_speaker() {
+        let mut replay = test_replay(vec![
+            test_dialogue_for_speaker(42),
+            test_dialogue_for_speaker(7),
+        ]);
+        let earlier = test_voice_settings("9000", 10);
+        let latest = test_voice_settings("8051", 25);
+        let favorites = ReplayVoiceFavorites {
+            favorites: vec![
+                ReplayVoiceFavorite {
+                    name: "旧设置".to_owned(),
+                    sender_id: Some(42),
+                    settings: earlier,
+                },
+                ReplayVoiceFavorite {
+                    name: "未关联收藏".to_owned(),
+                    sender_id: None,
+                    settings: test_voice_settings("65", 0),
+                },
+                ReplayVoiceFavorite {
+                    name: "当前设置".to_owned(),
+                    sender_id: Some(42),
+                    settings: latest.clone(),
+                },
+                ReplayVoiceFavorite {
+                    name: "聊天中不存在".to_owned(),
+                    sender_id: Some(99),
+                    settings: test_voice_settings("65", 0),
+                },
+            ],
+        };
+
+        assert_eq!(
+            apply_favorite_voice_settings(&mut replay, &favorites),
+            1
+        );
+        assert_eq!(
+            replay.speaker_voice_settings.get(&42),
+            Some(&latest)
+        );
+        assert!(!replay.speaker_voice_settings.contains_key(&7));
+        assert!(!replay.speaker_voice_settings.contains_key(&99));
     }
 
     #[test]
@@ -8139,6 +8245,23 @@ mod tests {
             snapshot_recorded: false,
             metadata_estimated: false,
             forwarded: false,
+        }
+    }
+
+    fn test_dialogue_for_speaker(sender_id: u64) -> ReplayDialogue {
+        let mut dialogue = test_dialogue(0, 600, DialogueSide::Right);
+        dialogue.sender_id = sender_id;
+        dialogue
+    }
+
+    fn test_voice_settings(voice_name: &str, speech_rate: i32) -> SpeakerVoiceSettings {
+        SpeakerVoiceSettings {
+            voice_name: Some(voice_name.to_owned()),
+            emotion: Some("普通".to_owned()),
+            onnx_speaker_id: None,
+            pitch: 0,
+            speech_rate,
+            volume: 1.0,
         }
     }
 
