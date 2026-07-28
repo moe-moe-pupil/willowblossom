@@ -638,6 +638,7 @@ pub enum CharacterHotbarSlot {
     Empty,
     Item(usize),
     Skill(usize),
+    ReleaseControl,
 }
 
 impl Default for InventoryItem {
@@ -1380,7 +1381,11 @@ fn default_item_max_stack() -> u32 { 1 }
 
 fn default_bag_slots() -> usize { 16 }
 
-fn default_character_hotbar() -> Vec<CharacterHotbarSlot> { vec![CharacterHotbarSlot::Empty; 9] }
+fn default_character_hotbar() -> Vec<CharacterHotbarSlot> {
+    let mut hotbar = vec![CharacterHotbarSlot::Empty; 9];
+    hotbar[8] = CharacterHotbarSlot::ReleaseControl;
+    hotbar
+}
 
 fn default_random_pool_weight() -> f32 { 1.0 }
 
@@ -15050,7 +15055,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_character_inventory_defaults_to_nine_empty_hotbar_slots() {
+    fn character_inventory_defaults_release_control_to_the_last_hotbar_slot() {
         let inventory = serde_json::from_value::<CharacterInventory>(serde_json::json!({
             "bag_slots": 16,
             "gold": 4,
@@ -15063,6 +15068,11 @@ mod tests {
         assert!(inventory
             .hotbar
             .iter()
+            .take(8)
             .all(|slot| *slot == CharacterHotbarSlot::Empty));
+        assert_eq!(
+            inventory.hotbar[8],
+            CharacterHotbarSlot::ReleaseControl
+        );
     }
 }

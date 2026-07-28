@@ -2016,6 +2016,7 @@ fn persist_voxel_scene(
 fn voxel_editor_shortcuts(
     keyboard: Res<ButtonInput<KeyCode>>,
     egui_input: Res<EguiWantsInput>,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
     mut editor: ResMut<VoxelEditorState>,
     mut possession: ResMut<VoxelPossessionState>,
 ) {
@@ -2051,9 +2052,15 @@ fn voxel_editor_shortcuts(
         (KeyCode::Digit0, 9),
     ] {
         if keyboard.just_pressed(key) {
-            if possession.active_user_id.is_some() && slot < 9 {
-                possession.selected_hotbar_slot = slot;
-            } else if possession.active_user_id.is_none() {
+            if let Some(active_user_id) = possession.active_user_id {
+                if slot >= 9 {
+                    continue;
+                }
+                let character = manager
+                    .as_deref()
+                    .and_then(|manager| manager.player_characters.get(&active_user_id.to_string()));
+                activate_player_hotbar_slot(&mut possession, character, slot);
+            } else {
                 editor.select_hotbar_slot(slot);
             }
         }
@@ -2073,6 +2080,22 @@ fn voxel_editor_shortcuts(
         editor.redo_requested = true;
     } else {
         editor.undo_requested = true;
+    }
+}
+
+fn activate_player_hotbar_slot(
+    possession: &mut VoxelPossessionState,
+    character: Option<&PlayerCharacter>,
+    slot: usize,
+) {
+    if slot >= 9 {
+        return;
+    }
+    possession.selected_hotbar_slot = slot;
+    let releases_control = character.and_then(|character| character.inventory.hotbar.get(slot))
+        == Some(&CharacterHotbarSlot::ReleaseControl);
+    if releases_control {
+        possession.release();
     }
 }
 
@@ -4086,6 +4109,7 @@ fn voxel_player_hotbar_slot_label(
 ) -> String {
     match slot {
         CharacterHotbarSlot::Empty => "空".to_owned(),
+        CharacterHotbarSlot::ReleaseControl => "解除控制".to_owned(),
         CharacterHotbarSlot::Item(index) => character
             .inventory
             .items
@@ -8864,7 +8888,7 @@ fn selected_voxel_skill_targeting(
 ) -> Option<(String, VoxelSkillTargeting)> {
     let slot = *character.inventory.hotbar.get(slot_index)?;
     match slot {
-        CharacterHotbarSlot::Empty => None,
+        CharacterHotbarSlot::Empty | CharacterHotbarSlot::ReleaseControl => None,
         CharacterHotbarSlot::Skill(index) => {
             let name = character.skill_names.get(index)?.trim();
             let note = character
@@ -9363,6 +9387,18 @@ mod tests {
             Some(42)
         ));
         assert!(!possession_tool_can_target(false, None));
+    }
+
+    #[test]
+    fn release_control_hotbar_item_exits_player_possession() {
+        let character = PlayerCharacter::default();
+        let mut possession = VoxelPossessionState::default();
+        possession.possess(42);
+
+        activate_player_hotbar_slot(&mut possession, Some(&character), 8);
+
+        assert_eq!(possession.selected_hotbar_slot, 8);
+        assert_eq!(possession.active_user_id, None);
     }
 
     #[test]

@@ -7532,6 +7532,13 @@ fn character_inventory_editor_ui(
                                         "空",
                                     )
                                     .changed();
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut character.inventory.hotbar[slot_index],
+                                        CharacterHotbarSlot::ReleaseControl,
+                                        "工具 · 解除控制",
+                                    )
+                                    .changed();
                                 for item_index in 0..character.inventory.items.len() {
                                     let label =
                                         item_display_name(&character.inventory.items[item_index]);
@@ -7714,6 +7721,7 @@ fn normalize_character_hotbar(character: &mut PlayerCharacter) -> bool {
     for slot in &mut character.inventory.hotbar {
         let valid = match *slot {
             CharacterHotbarSlot::Empty => true,
+            CharacterHotbarSlot::ReleaseControl => true,
             CharacterHotbarSlot::Item(index) => index < item_count,
             CharacterHotbarSlot::Skill(index) => index < skill_count,
         };
@@ -7748,6 +7756,7 @@ fn character_active_hotbar_skills(
 fn character_hotbar_slot_label(slot: CharacterHotbarSlot, character: &PlayerCharacter) -> String {
     match slot {
         CharacterHotbarSlot::Empty => "空".to_owned(),
+        CharacterHotbarSlot::ReleaseControl => "工具 · 解除控制".to_owned(),
         CharacterHotbarSlot::Item(index) => character
             .inventory
             .items
@@ -7774,6 +7783,7 @@ fn character_hotbar_slot_short_label(
 ) -> String {
     let label = match slot {
         CharacterHotbarSlot::Empty => return "空".to_owned(),
+        CharacterHotbarSlot::ReleaseControl => return "解除控制".to_owned(),
         CharacterHotbarSlot::Item(index) => {
             character.inventory.items.get(index).map(item_display_name)
         },
@@ -14117,6 +14127,7 @@ pub fn ui_system(
                                 });
                         });
                 }
+                let mut release_control_requested = false;
                 egui::Area::new(egui::Id::new("voxel_player_hotbar"))
                     .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
                     .order(egui::Order::Foreground)
@@ -14151,6 +14162,9 @@ pub fn ui_system(
                                             );
                                             if response.on_hover_text(full_label).clicked() {
                                                 voxel_possession.selected_hotbar_slot = slot;
+                                                release_control_requested =
+                                                    *entry
+                                                        == CharacterHotbarSlot::ReleaseControl;
                                             }
                                         }
                                     });
@@ -14159,6 +14173,9 @@ pub fn ui_system(
                                 }
                             });
                     });
+                if release_control_requested {
+                    voxel_possession.release();
+                }
                 if voxel_possession.player_inventory_open {
                     let target_id = possessed_user_id.to_string();
                     let skill_pool_snapshot = manager.skill_pool.clone();
