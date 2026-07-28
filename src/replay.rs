@@ -2077,6 +2077,58 @@ fn replay_controls(
         &mut studio.deepseek_director_enabled,
         "允许 DeepSeek 润色台词并控制镜头",
     );
+    let visible_standees = standees
+        .iter()
+        .map(|(transform, standee)| (standee.user_id, transform.translation))
+        .collect::<HashMap<_, _>>();
+    let missing_director_lines = studio
+        .replay
+        .as_ref()
+        .map(|replay| missing_director_dialogue(replay, &visible_standees))
+        .unwrap_or_default();
+    if !missing_director_lines.is_empty() {
+        ui.group(|ui| {
+            ui.colored_label(
+                egui::Color32::from_rgb(210, 90, 70),
+                format!(
+                    "以下 {} 句找不到可用于导演镜头的说话者立牌：",
+                    missing_director_lines.len()
+                ),
+            );
+            for (_, description) in &missing_director_lines {
+                ui.label(format!("• {description}"));
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("快速修复：排除上述台词").clicked() {
+                    let missing_indices = missing_director_lines
+                        .iter()
+                        .map(|(index, _)| *index)
+                        .collect::<Vec<_>>();
+                    if let Some(replay) = studio.replay.as_mut() {
+                        for index in &missing_indices {
+                            if let Some(line) = replay.dialogue.get_mut(*index) {
+                                line.included = false;
+                            }
+                        }
+                        rebuild_area_blocks(replay);
+                        replay.duration_ms = compile_area_block_timeline(replay);
+                        extend_replay_for_speech(replay);
+                    }
+                    studio.director_request_pending = false;
+                    studio.director_response_hash = None;
+                    studio.auto_export_after_director = false;
+                    studio.status = format!(
+                        "已排除 {} 句缺少立牌的台词；原文仍保留，可在台词编辑中重新勾选",
+                        missing_indices.len()
+                    );
+                }
+                if ui.button("从当前聊天重建回放").clicked() {
+                    build_from_history(studio, manager, camera, standees, grids);
+                }
+            });
+            ui.small("排除只会取消这些台词的“使用”勾选，不会删除台词。重建会用当前聊天和场景替换现有回放编辑。");
+        });
+    }
     ui.label("自定义导演要求");
     let prompt_width = ui.available_width().clamp(220.0, 560.0);
     ui.add(
@@ -2396,26 +2448,33 @@ fn replay_controls(
             stop_playback(studio, grids);
         }
         build_from_history(studio, manager, camera, standees, grids);
-        let director_queued = studio.replay.as_ref().is_some_and(|replay| {
-            queue_replay_director(
-                replay,
-                deepseek_sender,
-                deepseek_manager,
-                &studio.deepseek_custom_prompt,
-                standees,
-            )
-            .is_ok()
-        });
-        if director_queued {
-            studio.director_response_hash = None;
-            studio.director_request_pending = true;
-            studio.auto_export_after_director = true;
-            studio.status = "已发送 DeepSeek 导演请求；收到并应用有效方案后自动开始导出".to_owned();
-            let _ = deepseek_manager.persist();
-        } else {
-            studio.director_request_pending = false;
-            studio.auto_export_after_director = false;
-            studio.status = "无法发送 DeepSeek 导演请求，请检查 API 连接".to_owned();
+        let director_result = studio
+            .replay
+            .as_ref()
+            .ok_or_else(|| "无法从当前聊天生成回放".to_owned())
+            .and_then(|replay| {
+                queue_replay_director(
+                    replay,
+                    deepseek_sender,
+                    deepseek_manager,
+                    &studio.deepseek_custom_prompt,
+                    standees,
+                )
+            });
+        match director_result {
+            Ok(()) => {
+                studio.director_response_hash = None;
+                studio.director_request_pending = true;
+                studio.auto_export_after_director = true;
+                studio.status =
+                    "已发送 DeepSeek 导演请求；收到并应用有效方案后自动开始导出".to_owned();
+                let _ = deepseek_manager.persist();
+            },
+            Err(err) => {
+                studio.director_request_pending = false;
+                studio.auto_export_after_director = false;
+                studio.status = format!("DeepSeek 导演请求失败：{err}");
+            },
         }
     }
     ui.small("一键模式会自动完成：读取可见聊天 → DeepSeek 润色逐句台词并选择镜头 → 本地验证和生成平滑轨迹 → 逐帧渲染 → FFmpeg 输出 MP4。");
@@ -2838,34 +2897,27 @@ fn queue_replay_director(
         .iter()
         .map(|(transform, standee)| (standee.user_id, transform.translation))
         .collect::<HashMap<_, _>>();
-    let missing_standee_count = replay
-        .dialogue
-        .iter()
-        .enumerate()
-        .filter(|(index, line)| {
-            line.included
-                && replay_dialogue_focus_id(
-                    &replay.dialogue,
-                    *index,
-                    &visible_standees,
-                )
-                .is_none()
-        })
-        .count();
-    if missing_standee_count > 0 {
+    let missing_lines = missing_director_dialogue(replay, &visible_standees);
+    if !missing_lines.is_empty() {
         return Err(format!(
-            "回放中有 {missing_standee_count} 句找不到说话者立牌；请重新从当前场景聊天生成回放"
+            "找不到说话者立牌：{}。请使用界面的快速修复，或从当前聊天重建回放",
+            missing_lines
+                .iter()
+                .map(|(_, description)| description.as_str())
+                .collect::<Vec<_>>()
+                .join("；")
         ));
     }
     let dialogue = replay
         .dialogue
         .iter()
-        .filter(|line| line.included)
         .enumerate()
-        .map(|(index, line)| {
+        .filter(|(_, line)| line.included)
+        .enumerate()
+        .map(|(index, (dialogue_index, line))| {
             let focus_id = replay_dialogue_focus_id(
                 &replay.dialogue,
-                index,
+                dialogue_index,
                 &visible_standees,
             );
             serde_json::json!({
@@ -4935,6 +4987,55 @@ fn replay_dialogue_focus_id(
         })
 }
 
+fn missing_director_dialogue(
+    replay: &ReplayFile,
+    speaker_positions: &HashMap<u64, Vec3>,
+) -> Vec<(usize, String)> {
+    replay
+        .dialogue
+        .iter()
+        .enumerate()
+        .filter(|(index, line)| {
+            line.included
+                && replay_dialogue_focus_id(
+                    &replay.dialogue,
+                    *index,
+                    speaker_positions,
+                )
+                .is_none()
+        })
+        .map(|(index, line)| {
+            (
+                index,
+                director_dialogue_issue_description(index, line),
+            )
+        })
+        .collect()
+}
+
+fn director_dialogue_issue_description(index: usize, line: &ReplayDialogue) -> String {
+    const PREVIEW_CHAR_LIMIT: usize = 48;
+
+    let normalized_text = line.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = normalized_text
+        .chars()
+        .take(PREVIEW_CHAR_LIMIT)
+        .collect::<String>();
+    if normalized_text.chars().count() > PREVIEW_CHAR_LIMIT {
+        preview.push('…');
+    }
+    if preview.is_empty() {
+        preview = "（空台词）".to_owned();
+    }
+    format!(
+        "第 {} 句 · {}（QQ {}）：{}",
+        index.saturating_add(1),
+        line.name,
+        line.sender_id,
+        preview
+    )
+}
+
 fn replay_dialogue_focus_position(
     dialogue: &[ReplayDialogue],
     index: usize,
@@ -6618,6 +6719,41 @@ mod tests {
         assert_eq!(ignored, 1);
         assert_eq!(dialogue.len(), 1);
         assert_eq!(dialogue[0].sender_id, 2);
+    }
+
+    #[test]
+    fn missing_director_dialogue_identifies_the_exact_line() {
+        let mut available = test_dialogue(0, 600, DialogueSide::Right);
+        available.sender_id = 7;
+        available.name = "林青".to_owned();
+        available.text = "我检查舱门。".to_owned();
+        let mut missing = test_dialogue(1_000, 600, DialogueSide::Right);
+        missing.sender_id = 8;
+        missing.name = "周遥".to_owned();
+        missing.text = "  这里没有我的立牌。\n请先处理。 ".to_owned();
+        let replay = test_replay(vec![available, missing]);
+
+        let issues = missing_director_dialogue(
+            &replay,
+            &HashMap::from([(7, Vec3::ZERO)]),
+        );
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].0, 1);
+        assert_eq!(
+            issues[0].1,
+            "第 2 句 · 周遥（QQ 8）：这里没有我的立牌。 请先处理。"
+        );
+    }
+
+    #[test]
+    fn missing_director_dialogue_ignores_unchecked_lines() {
+        let mut line = test_dialogue(0, 600, DialogueSide::Right);
+        line.sender_id = 8;
+        line.included = false;
+        let replay = test_replay(vec![line]);
+
+        assert!(missing_director_dialogue(&replay, &HashMap::new()).is_empty());
     }
 
     #[test]
