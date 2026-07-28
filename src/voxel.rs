@@ -90,12 +90,16 @@ use voxxelmaxx::prelude::*;
 use crate::{
     napcat::{
         CharacterHotbarSlot,
+        CharacterSkillMetadata,
         NapcatIOSender,
         NapcatMessageManager,
         NapcatOutboundMessage,
         PlayerCharacter,
     },
     rule_engine::{
+        parse_rule,
+        Action,
+        ActorRef,
         BuffField,
         BuffValue,
     },
@@ -722,6 +726,19 @@ pub(crate) struct VoxelPossessionState {
     movement_bypass_confirmation_pending: bool,
     persist_elapsed: f32,
     movement_persist_elapsed: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VoxelSkillTargeting {
+    Area { radius: f32 },
+    Person { range: f32 },
+}
+
+#[derive(Resource, Default)]
+pub(crate) struct VoxelTargetingPreview {
+    pub(crate) skill_name: String,
+    pub(crate) affected_user_ids: Vec<u64>,
+    pub(crate) show_affected_players: bool,
 }
 
 impl Default for VoxelPossessionState {
@@ -1529,6 +1546,7 @@ impl Plugin for TrpgVoxelPlugin {
         .insert_resource(Gravity::ZERO)
         .init_resource::<VoxelEditorState>()
         .init_resource::<VoxelPossessionState>()
+        .init_resource::<VoxelTargetingPreview>()
         .init_resource::<VoxelRadianceVolume>()
         .init_resource::<SceneCaptureRequests>()
         .init_resource::<SceneCharacterPositions>()
@@ -1615,6 +1633,12 @@ impl Plugin for TrpgVoxelPlugin {
                     .chain(),
             )
                 .chain(),
+        )
+        .add_systems(
+            Update,
+            draw_possessed_player_targeting
+                .after(VoxelPlayerStandeeSynced)
+                .run_if(crate::replay::replay_video_capture_inactive),
         )
         .add_systems(
             PostUpdate,
@@ -5338,8 +5362,10 @@ fn use_player_possession_tool(
     camera_store: ResMut<Persistent<VoxelPlayerCameraStore>>,
     egui_input: Res<EguiWantsInput>,
 ) {
-    if !editor.is_player_possession_tool_equipped()
-        || editor.creative_inventory_open
+    if !possession_tool_can_target(
+        editor.is_player_possession_tool_equipped(),
+        possession.active_user_id,
+    ) || editor.creative_inventory_open
         || !mouse.just_pressed(MouseButton::Right)
         || egui_input.wants_any_pointer_input()
     {
@@ -5391,6 +5417,10 @@ fn use_player_possession_tool(
             editor.physics_status = Some("没有瞄准玩家立绘".to_owned());
         },
     }
+}
+
+fn possession_tool_can_target(tool_equipped: bool, active_user_id: Option<u64>) -> bool {
+    tool_equipped && active_user_id.is_none()
 }
 
 fn ray_intersects_player_standee(
@@ -8828,6 +8858,257 @@ fn should_grab_first_person_cursor(
     window_focused && !inventory_open && !cursor_released
 }
 
+fn selected_voxel_skill_targeting(
+    character: &PlayerCharacter,
+    slot_index: usize,
+) -> Option<(String, VoxelSkillTargeting)> {
+    let slot = *character.inventory.hotbar.get(slot_index)?;
+    match slot {
+        CharacterHotbarSlot::Empty => None,
+        CharacterHotbarSlot::Skill(index) => {
+            let name = character.skill_names.get(index)?.trim();
+            let note = character
+                .skill_notes
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or_default();
+            let metadata = character
+                .skill_metadata
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
+            voxel_skill_targeting(note, &metadata)
+                .map(|targeting| (name.to_owned(), targeting))
+        },
+        CharacterHotbarSlot::Item(index) => {
+            let item = character.inventory.items.get(index)?;
+            item.skills
+                .iter()
+                .filter(|skill| skill.metadata.is_approved())
+                .find_map(|skill| {
+                    let targeting = voxel_skill_targeting(&skill.note, &skill.metadata)?;
+                    let name = if skill.name.trim().is_empty() {
+                        item.name.trim()
+                    } else {
+                        skill.name.trim()
+                    };
+                    Some((name.to_owned(), targeting))
+                })
+        },
+    }
+}
+
+fn voxel_skill_targeting(
+    note: &str,
+    metadata: &CharacterSkillMetadata,
+) -> Option<VoxelSkillTargeting> {
+    if !metadata.is_approved() {
+        return None;
+    }
+    let metadata_range = metadata
+        .range
+        .filter(|range| *range > 0)
+        .map(|range| range as f32);
+    let target_class = metadata.target_class.as_deref().map(str::trim);
+    if target_class == Some("无目标") {
+        return None;
+    }
+
+    let parsed_targets = parse_rule(note)
+        .ok()
+        .into_iter()
+        .flat_map(|ast| ast.actions)
+        .map(|action| match action {
+            Action::Heal { target, .. }
+            | Action::Damage { target, .. }
+            | Action::GrantBuff { target, .. } => target,
+        })
+        .collect::<Vec<_>>();
+    let parsed_area_radius = parsed_targets
+        .iter()
+        .filter_map(|target| target.area.and_then(|area| area.radius_meters))
+        .max_by(f32::total_cmp);
+    let parsed_as_area = parsed_targets.iter().any(|target| target.area.is_some());
+    let parsed_as_person = parsed_targets
+        .iter()
+        .any(|target| target.area.is_none() && !matches!(target.actor, ActorRef::SelfActor));
+
+    if target_class == Some("范围") || parsed_as_area {
+        return parsed_area_radius
+            .or(metadata_range)
+            .map(|radius| VoxelSkillTargeting::Area { radius });
+    }
+    if target_class == Some("单目标") || parsed_as_person {
+        return metadata_range.map(|range| VoxelSkillTargeting::Person { range });
+    }
+    None
+}
+
+fn targeting_ray_end_distance(range: f32, blocker_distances: impl IntoIterator<Item = f32>) -> f32 {
+    blocker_distances
+        .into_iter()
+        .filter(|distance| *distance <= range)
+        .reduce(f32::min)
+        .unwrap_or(range)
+}
+
+fn draw_possessed_player_targeting(
+    mut gizmos: Gizmos,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
+    grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
+    planets: Query<(&VoxelOrbitalPlanet, &GlobalTransform)>,
+    voxel_blockers: Query<
+        (),
+        Or<(
+            With<VoxelPhysicsBody>,
+            With<VoxelAutoDoor>,
+        )>,
+    >,
+    standees: Query<
+        (
+            &VoxelPlayerStandee,
+            &GlobalTransform,
+            &Visibility,
+        ),
+        Without<VoxelFirstPersonPlayer>,
+    >,
+    spatial_query: SpatialQuery,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    possession: Res<VoxelPossessionState>,
+    editor: Res<VoxelEditorState>,
+    mut preview: ResMut<VoxelTargetingPreview>,
+) {
+    preview.skill_name.clear();
+    preview.affected_user_ids.clear();
+    preview.show_affected_players = false;
+    let (Some(manager), Some(active_user_id)) = (manager, possession.active_user_id) else {
+        return;
+    };
+    let Some(character) = manager.player_characters.get(&active_user_id.to_string()) else {
+        return;
+    };
+    let Some((skill_name, targeting)) = selected_voxel_skill_targeting(
+        character,
+        possession.selected_hotbar_slot,
+    ) else {
+        return;
+    };
+    preview.skill_name = skill_name;
+
+    match targeting {
+        VoxelSkillTargeting::Area { radius } => {
+            preview.show_affected_players = true;
+            let Some(actor_position) = standees
+                .iter()
+                .find(|(standee, ..)| standee.user_id == active_user_id)
+                .map(|(_, transform, _)| transform.translation())
+                .or_else(|| {
+                    cameras
+                        .single()
+                        .ok()
+                        .map(|(_, transform)| transform.translation())
+                })
+            else {
+                return;
+            };
+            let ground_center = actor_position - Vec3::Y * FIRST_PERSON_EYE_OFFSET;
+            gizmos
+                .circle(
+                    Isometry3d::new(
+                        ground_center + Vec3::Y * (VOXEL_SIZE * 0.08),
+                        Quat::from_rotation_arc(Vec3::Z, Vec3::Y),
+                    ),
+                    radius,
+                    Color::srgba(1.0, 0.35, 0.08, 0.9),
+                )
+                .resolution(64);
+            for (standee, transform, visibility) in &standees {
+                if standee.user_id == active_user_id || *visibility == Visibility::Hidden {
+                    continue;
+                }
+                let target_position = transform.translation();
+                if actor_position.distance(target_position) > radius {
+                    continue;
+                }
+                preview.affected_user_ids.push(standee.user_id);
+                gizmos.sphere(
+                    Isometry3d::from_translation(target_position),
+                    VOXEL_SIZE * 0.7,
+                    Color::srgb(1.0, 0.75, 0.12),
+                );
+            }
+            preview.affected_user_ids.sort_unstable();
+        },
+        VoxelSkillTargeting::Person { range } => {
+            let (Ok(window), Ok((camera, camera_transform)), Ok(grid)) = (
+                windows.single(),
+                cameras.single(),
+                grids.single(),
+            ) else {
+                return;
+            };
+            let Some(ray) = viewport_ray(
+                window,
+                camera,
+                camera_transform,
+                &editor,
+            ) else {
+                return;
+            };
+            let grid_distance = raycast_grid(grid, ray)
+                .filter(|hit| hit.occupied.is_some())
+                .map(|hit| hit.distance);
+            let planet_distance = planets
+                .iter()
+                .filter_map(|(planet, transform)| {
+                    raycast_voxel_planet(planet, transform, ray).map(|hit| hit.distance)
+                })
+                .min_by(f32::total_cmp);
+            let body_distance = spatial_query
+                .cast_ray_predicate(
+                    ray.origin,
+                    ray.direction,
+                    range,
+                    true,
+                    &SpatialQueryFilter::default(),
+                    &|entity| voxel_blockers.contains(entity),
+                )
+                .map(|hit| hit.distance);
+            let player_hit = standees
+                .iter()
+                .filter(|(standee, _, visibility)| {
+                    standee.user_id != active_user_id && **visibility != Visibility::Hidden
+                })
+                .filter_map(|(standee, transform, _)| {
+                    ray_intersects_player_standee(ray, transform, standee.half_size)
+                        .filter(|distance| *distance <= range)
+                        .map(|distance| (standee.user_id, distance))
+                })
+                .min_by(|left, right| left.1.total_cmp(&right.1));
+            let end_distance = targeting_ray_end_distance(
+                range,
+                grid_distance
+                    .into_iter()
+                    .chain(planet_distance)
+                    .chain(body_distance)
+                    .chain(player_hit.map(|(_, distance)| distance)),
+            );
+            let end = ray.origin + *ray.direction * end_distance;
+            gizmos.line(
+                ray.origin,
+                end,
+                Color::srgb(0.1, 0.9, 1.0),
+            );
+            gizmos.sphere(
+                Isometry3d::from_translation(end),
+                VOXEL_SIZE * 0.18,
+                Color::srgb(0.1, 0.9, 1.0),
+            );
+        },
+    }
+}
+
 fn draw_voxel_target(
     mut gizmos: Gizmos,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -9073,6 +9354,73 @@ fn draw_voxel_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_possession_disables_the_gm_possession_tool() {
+        assert!(possession_tool_can_target(true, None));
+        assert!(!possession_tool_can_target(
+            true,
+            Some(42)
+        ));
+        assert!(!possession_tool_can_target(false, None));
+    }
+
+    #[test]
+    fn legacy_whirlwind_note_creates_a_five_meter_area_preview() {
+        assert_eq!(
+            voxel_skill_targeting(
+                "主动使用对周围5米内的目标造成4点物理伤害",
+                &CharacterSkillMetadata::default(),
+            ),
+            Some(VoxelSkillTargeting::Area { radius: 5.0 })
+        );
+    }
+
+    #[test]
+    fn selected_player_item_uses_its_targeting_skill() {
+        let mut character = PlayerCharacter::default();
+        character
+            .inventory
+            .items
+            .push(crate::napcat::InventoryItem {
+                name: "法杖".to_owned(),
+                skills: vec![crate::napcat::InventoryItemSkill {
+                    name: "射线".to_owned(),
+                    metadata: CharacterSkillMetadata {
+                        target_class: Some("单目标".to_owned()),
+                        range: Some(12),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        character.inventory.hotbar[0] = CharacterHotbarSlot::Item(0);
+
+        assert_eq!(
+            selected_voxel_skill_targeting(&character, 0),
+            Some((
+                "射线".to_owned(),
+                VoxelSkillTargeting::Person { range: 12.0 }
+            ))
+        );
+    }
+
+    #[test]
+    fn targeting_ray_stops_at_nearest_blocker_or_exact_skill_range() {
+        assert_eq!(
+            targeting_ray_end_distance(10.0, [7.0, 3.0, 12.0]),
+            3.0
+        );
+        assert_eq!(
+            targeting_ray_end_distance(10.0, [12.0, 15.0]),
+            10.0
+        );
+        assert_eq!(
+            targeting_ray_end_distance(10.0, []),
+            10.0
+        );
+    }
 
     fn test_grid() -> (App, Entity) {
         let mut app = App::new();

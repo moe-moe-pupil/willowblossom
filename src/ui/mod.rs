@@ -69,6 +69,7 @@ use crate::voxel::{
     VoxelPlayerStandee,
     VoxelPossessionMovementStore,
     VoxelPossessionState,
+    VoxelTargetingPreview,
     VoxelTeleportDestination,
     MAX_VOXEL_BRUSH_RADIUS,
 };
@@ -925,6 +926,7 @@ pub struct UiSystemLocals<'w, 's> {
     chat_list_player_visible_filter: Local<'s, Option<String>>,
     voxel_editor: ResMut<'w, VoxelEditorState>,
     voxel_possession: ResMut<'w, VoxelPossessionState>,
+    voxel_targeting_preview: Res<'w, VoxelTargetingPreview>,
     voxel_minimap: Res<'w, VoxelMinimapSnapshot>,
     keyboard: Res<'w, ButtonInput<KeyCode>>,
     voxel_map_ui: Local<'s, VoxelMapUiState>,
@@ -13526,6 +13528,7 @@ pub fn ui_system(
     let voxel_map_ui_state: &mut VoxelMapUiState = &mut locals.voxel_map_ui;
     let voxel_editor: &mut VoxelEditorState = &mut locals.voxel_editor;
     let voxel_possession: &mut VoxelPossessionState = &mut locals.voxel_possession;
+    let voxel_targeting_preview: &VoxelTargetingPreview = &locals.voxel_targeting_preview;
     let battle_store = &mut locals.battle_store;
     let possession_movement_store = &mut locals.possession_movement_store;
     let replay_movement_history = &mut locals.replay_movement_history;
@@ -14051,6 +14054,38 @@ pub fn ui_system(
 
             if let Some(possessed_user_id) = voxel_possession.active_user_id {
                 voxel_editor.creative_inventory_open = false;
+                if voxel_targeting_preview.show_affected_players {
+                    let affected_names = voxel_targeting_preview
+                        .affected_user_ids
+                        .iter()
+                        .map(|user_id| target_display_name(&manager, &user_id.to_string()))
+                        .collect::<Vec<_>>();
+                    let affected_names = if affected_names.is_empty() {
+                        "无".to_owned()
+                    } else {
+                        affected_names.join("、")
+                    };
+                    egui::Area::new(egui::Id::new("voxel_player_aoe_targets"))
+                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -72.0))
+                        .order(egui::Order::Foreground)
+                        .interactable(false)
+                        .show(ctx, |ui| {
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_black_alpha(220))
+                                .corner_radius(4)
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 205, 80),
+                                        format!(
+                                            "{} · 将影响：{}",
+                                            voxel_targeting_preview.skill_name,
+                                            affected_names
+                                        ),
+                                    );
+                                });
+                        });
+                }
                 egui::Area::new(egui::Id::new("voxel_player_hotbar"))
                     .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
                     .order(egui::Order::Foreground)
