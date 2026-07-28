@@ -307,7 +307,7 @@ enum ReplayAudience {
 }
 
 impl Default for ReplayAudience {
-    fn default() -> Self { Self::Public }
+    fn default() -> Self { Self::All }
 }
 
 impl ReplayAudience {
@@ -634,7 +634,7 @@ impl Default for ReplayStudio {
         Self {
             mode: ReplayMode::Idle,
             replay: None,
-            audience: ReplayAudience::Public,
+            audience: ReplayAudience::All,
             record_elapsed_ms: 0,
             playback_ms: 0,
             playback_speed: 1.0,
@@ -1977,15 +1977,6 @@ fn replay_controls(
                 );
             });
     });
-    if matches!(
-        studio.audience,
-        ReplayAudience::All | ReplayAudience::Gm
-    ) {
-        ui.colored_label(
-            egui::Color32::from_rgb(210, 90, 70),
-            "“全部”可能包含私聊、隐藏队伍、GM 和系统内容，也可能发送给 DeepSeek；请勿公开发布。",
-        );
-    }
     ui.checkbox(
         &mut studio.record_camera_enabled,
         "录制 DM 自由镜头（默认关闭，点击后才采集）",
@@ -7496,6 +7487,12 @@ mod tests {
             scaled_dialogue_duration_ms("短句", 2.0),
             MIN_DIALOGUE_MS * 2
         );
+    }
+
+    #[test]
+    fn replay_studio_defaults_to_all_audiences() {
+        let studio = ReplayStudio::default();
+        assert_eq!(studio.audience, ReplayAudience::All);
     }
 
     #[test]
