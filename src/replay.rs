@@ -5155,7 +5155,7 @@ fn replay_standee_facing_rotation(standee_position: Vec3, camera_position: Vec3)
     let direction = (camera_position - standee_position) * Vec3::new(1.0, 0.0, 1.0);
     let direction = direction.try_normalize()?;
     Some(Quat::from_rotation_y(
-        direction.x.atan2(direction.z),
+        (-direction.x).atan2(-direction.z),
     ))
 }
 
@@ -7072,11 +7072,13 @@ mod tests {
             Vec3::new(8.0, 20.0, -5.0),
         )
         .unwrap();
-        let portrait_normal = rotation * Vec3::Z;
+        let portrait_front = rotation * Vec3::NEG_Z;
+        let labeled_back = rotation * Vec3::Z;
         let expected = Vec3::new(6.0, 0.0, -8.0).normalize();
 
-        assert!(portrait_normal.dot(expected) > 0.9999);
-        assert!(portrait_normal.y.abs() < 0.0001);
+        assert!(portrait_front.dot(expected) > 0.9999);
+        assert!(labeled_back.dot(expected) < -0.9999);
+        assert!(portrait_front.y.abs() < 0.0001);
         assert!(replay_standee_facing_rotation(Vec3::ZERO, Vec3::new(0.0, 10.0, 0.0)).is_none());
     }
 

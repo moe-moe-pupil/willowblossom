@@ -39,6 +39,12 @@ For each generated keyframe:
 - Check the signed side of the scene axis and require it to remain unchanged.
 - For dolly-in, require the settled distance to be less than the arrival distance; reverse this for dolly-out.
 
+## Voxel Standee Orientation
+
+- Treat a voxel player standee's local `Vec3::NEG_Z` as its portrait front. Local `Vec3::Z` is the back-label side marked `背`.
+- To face a standee toward the replay camera, yaw it so `rotation * Vec3::NEG_Z` matches the horizontal standee-to-camera direction. Do not aim local `Vec3::Z` at the camera.
+- Test both sides: require the portrait front to have a high positive dot product with the camera direction and the labeled back to have a high negative dot product.
+
 ## AI Boundary
 
 Do not ask an LLM for world-space positions, rotations, random camera angles, or collision decisions. Validate every enum returned by the LLM and use safe deterministic defaults. A prompt is guidance, not a geometry constraint.
