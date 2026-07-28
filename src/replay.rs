@@ -406,6 +406,8 @@ struct ReplayFile {
     player_movement_curve: f32,
     #[serde(default)]
     player_movements: Vec<ReplayPlayerMovement>,
+    #[serde(default)]
+    player_movement_history_cursor_unix_ms: u64,
     dialogue: Vec<ReplayDialogue>,
     #[serde(default)]
     area_blocks: Vec<ReplayAreaBlock>,
@@ -1034,6 +1036,7 @@ fn record_possessed_player_movement(
     studio.player_movement_sample_accumulator %= PLAYER_MOVEMENT_SAMPLE_SECONDS;
 
     let Some(replay) = studio.replay.as_mut() else { return };
+    replay.player_movement_history_cursor_unix_ms = unix_time_ms();
     let index = studio.recorded_player_movement_index.unwrap_or_else(|| {
         replay.player_movements.push(ReplayPlayerMovement {
             user_id,
@@ -2235,7 +2238,7 @@ fn replay_controls(
     occlusion_debug_gizmo: &mut bool,
 ) {
     ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
-    ui.small("DM 使用玩家接管工具时会自动保存移动轨迹，无需先点击“开始录制”；从现有聊天生成时会按战役导入。");
+    ui.small("DM 使用玩家接管工具时会自动保存移动轨迹，无需先点击“开始录制”；回放生成后录到的新轨迹会在按“播放”时自动追加。");
     ui.separator();
     ui.horizontal(|ui| {
         ui.label("发布范围");
@@ -2483,7 +2486,17 @@ fn replay_controls(
                 ReplayMode::Playing | ReplayMode::Paused
             ) && ui.button("▶ 播放").clicked()
             {
+                let imported = studio
+                    .replay
+                    .as_mut()
+                    .map(|replay| {
+                        append_new_player_movements_from_history(replay, player_movement_history)
+                    })
+                    .unwrap_or_default();
                 start_playback(studio, grids);
+                if imported > 0 {
+                    studio.status = format!("正在回放（已载入 {imported} 段刚才控制玩家的移动）");
+                }
             }
             ui.add(
                 egui::Slider::new(&mut studio.playback_ms, 0..=duration)
@@ -3459,6 +3472,7 @@ fn build_from_history(
         &campaign_id,
         &replay.dialogue,
     );
+    replay.player_movement_history_cursor_unix_ms = unix_time_ms();
     if let Some(movement_end) = replay
         .player_movements
         .iter()
@@ -3875,6 +3889,7 @@ fn new_replay(
         camera_transition_curve: normalized_camera_transition_curve(camera_transition_curve),
         player_movement_curve: normalized_player_movement_curve(player_movement_curve),
         player_movements: Vec::new(),
+        player_movement_history_cursor_unix_ms: unix_time_ms(),
         dialogue: Vec::new(),
         area_blocks: Vec::new(),
         area_radius_cells: default_area_radius_cells(),
@@ -6091,6 +6106,129 @@ fn replay_player_movements_from_history(
         .collect()
 }
 
+fn append_new_player_movements_from_history(
+    replay: &mut ReplayFile,
+    history: &ReplayPlayerMovementHistory,
+) -> usize {
+    let cutoff_unix_ms = replay
+        .player_movement_history_cursor_unix_ms
+        .max(replay.created_at_unix_ms);
+    let visible_user_ids = replay
+        .dialogue
+        .iter()
+        .filter(|line| line.included)
+        .flat_map(|line| [Some(line.sender_id), line.camera_focus_id])
+        .flatten()
+        .collect::<HashSet<_>>();
+    let mut pending = history
+        .sessions
+        .iter()
+        .filter(|session| session.campaign_id == replay.campaign_id)
+        .filter(|session| visible_user_ids.contains(&session.user_id))
+        .filter_map(|session| {
+            let frames = session
+                .keyframes
+                .iter()
+                .filter(|frame| frame.source_unix_ms > cutoff_unix_ms)
+                .copied()
+                .collect::<Vec<_>>();
+            let first_source_unix_ms = frames.first()?.source_unix_ms;
+            Some((
+                first_source_unix_ms,
+                session.user_id,
+                frames,
+            ))
+        })
+        .collect::<Vec<_>>();
+    pending.sort_unstable_by_key(|(source_unix_ms, ..)| *source_unix_ms);
+    if pending.is_empty() {
+        return 0;
+    }
+
+    let mut timeline_cursor = replay.duration_ms;
+    let mut imported_through = cutoff_unix_ms;
+    let mut speaker_positions = replay_speaker_positions(&replay.dialogue);
+    let obstacles = ReplayCameraObstacles::from_scene(&replay.scene);
+    let imported_count = pending.len();
+    for (_, user_id, frames) in pending {
+        let first_source_unix_ms = frames[0].source_unix_ms;
+        let first_position = Vec3::from_array(frames[0].position_cells) * VOXEL_SIZE;
+        speaker_positions.insert(user_id, first_position);
+
+        let movement_start = if let Some(last_camera) = replay.camera.last() {
+            let current = frame_transform(last_camera);
+            if last_camera.time_ms < timeline_cursor {
+                replay.camera.push(camera_keyframe(
+                    timeline_cursor,
+                    &current,
+                ));
+            }
+            let rig = DirectedCameraRig::for_dialogue(
+                &current,
+                &replay.dialogue,
+                &speaker_positions,
+                replay.camera_distance_scale,
+            );
+            let focused = rig.speaker_shot(
+                first_position,
+                DirectorShot::SpeakerMedium,
+                0.0,
+                &obstacles,
+            );
+            let movement_start = timeline_cursor.saturating_add(FOCUS_TRANSITION_MS);
+            replay.camera.push(camera_keyframe(
+                movement_start,
+                &focused,
+            ));
+            movement_start
+        } else {
+            let base = Transform::from_translation(first_position + Vec3::new(0.0, 1.5, 5.0))
+                .looking_at(first_position, Vec3::Y);
+            let rig = DirectedCameraRig::for_dialogue(
+                &base,
+                &replay.dialogue,
+                &speaker_positions,
+                replay.camera_distance_scale,
+            );
+            let focused = rig.speaker_shot(
+                first_position,
+                DirectorShot::SpeakerMedium,
+                0.0,
+                &obstacles,
+            );
+            replay.camera.push(camera_keyframe(
+                timeline_cursor,
+                &focused,
+            ));
+            timeline_cursor
+        };
+
+        let keyframes = frames
+            .iter()
+            .map(|frame| ReplayPlayerMovementKeyframe {
+                time_ms: movement_start.saturating_add(frame.source_unix_ms - first_source_unix_ms),
+                position_cells: frame.position_cells,
+            })
+            .collect::<Vec<_>>();
+        imported_through = imported_through.max(
+            frames
+                .last()
+                .map(|frame| frame.source_unix_ms)
+                .unwrap_or(first_source_unix_ms),
+        );
+        timeline_cursor = keyframes
+            .last()
+            .map(|frame| frame.time_ms)
+            .unwrap_or(movement_start);
+        replay
+            .player_movements
+            .push(ReplayPlayerMovement { user_id, keyframes });
+    }
+    replay.duration_ms = replay.duration_ms.max(timeline_cursor);
+    replay.player_movement_history_cursor_unix_ms = imported_through;
+    imported_count
+}
+
 fn replay_time_for_source_unix_ms(anchors: &[(u64, u64)], source_unix_ms: u64) -> u64 {
     let Some(&(first_source_ms, first_replay_ms)) = anchors.first() else {
         return 0;
@@ -8218,6 +8356,88 @@ mod tests {
     }
 
     #[test]
+    fn play_imports_movement_recorded_after_replay_generation_without_duplicates() {
+        let mut dialogue = test_dialogue(0, 600, DialogueSide::Right);
+        dialogue.sender_id = 42;
+        let mut replay = test_replay(vec![dialogue]);
+        replay.created_at_unix_ms = 100_000;
+        replay.player_movement_history_cursor_unix_ms = 100_000;
+        replay.duration_ms = 3_000;
+        let camera = Transform::from_xyz(0.0, 2.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y);
+        replay.camera = vec![camera_keyframe(3_000, &camera)];
+        let mut history = ReplayPlayerMovementHistory {
+            sessions: vec![PersistedPlayerMovementSession {
+                campaign_id: "campaign".to_owned(),
+                user_id: 42,
+                keyframes: vec![
+                    PersistedPlayerMovementKeyframe {
+                        source_unix_ms: 100_100,
+                        position_cells: [0.0, 0.0, 0.0],
+                    },
+                    PersistedPlayerMovementKeyframe {
+                        source_unix_ms: 101_100,
+                        position_cells: [4.0, 2.0, 0.0],
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            append_new_player_movements_from_history(&mut replay, &history),
+            1
+        );
+        assert_eq!(replay.player_movements.len(), 1);
+        assert_eq!(
+            replay.player_movements[0]
+                .keyframes
+                .iter()
+                .map(|frame| frame.time_ms)
+                .collect::<Vec<_>>(),
+            vec![3_000 + FOCUS_TRANSITION_MS, 4_000 + FOCUS_TRANSITION_MS]
+        );
+        assert_eq!(
+            replay.duration_ms,
+            4_000 + FOCUS_TRANSITION_MS
+        );
+        assert_eq!(
+            interpolated_player_position(
+                &replay.player_movements,
+                42,
+                3_500 + FOCUS_TRANSITION_MS,
+                0.0,
+            ),
+            Some(Vec3::new(2.0, 1.0, 0.0) * VOXEL_SIZE)
+        );
+
+        let duration_after_first_import = replay.duration_ms;
+        assert_eq!(
+            append_new_player_movements_from_history(&mut replay, &history),
+            0
+        );
+        assert_eq!(
+            replay.duration_ms,
+            duration_after_first_import
+        );
+        assert_eq!(replay.player_movements.len(), 1);
+
+        history.sessions[0]
+            .keyframes
+            .push(PersistedPlayerMovementKeyframe {
+                source_unix_ms: 101_200,
+                position_cells: [5.0, 0.0, 0.0],
+            });
+        assert_eq!(
+            append_new_player_movements_from_history(&mut replay, &history),
+            1
+        );
+        assert_eq!(replay.player_movements.len(), 2);
+        assert_eq!(
+            replay.player_movements[1].keyframes[0].position_cells,
+            [5.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
     fn replay_playback_visibly_moves_the_player_standee() {
         let mut replay = test_replay(Vec::new());
         replay.duration_ms = 100;
@@ -9716,6 +9936,7 @@ mod tests {
             camera_transition_curve: default_camera_transition_curve(),
             player_movement_curve: default_player_movement_curve(),
             player_movements: Vec::new(),
+            player_movement_history_cursor_unix_ms: 1,
             dialogue,
             area_blocks: Vec::new(),
             area_radius_cells: DEFAULT_AREA_RADIUS_CELLS,
