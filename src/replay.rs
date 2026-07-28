@@ -4975,6 +4975,7 @@ fn assign_replay_line_ids(dialogue: &mut [ReplayDialogue]) {
 struct ReplayStandeePlaybackState {
     active: bool,
     original_positions: HashMap<u64, Vec3>,
+    original_rotations: HashMap<u64, Quat>,
 }
 
 fn apply_replay_standee_positions(
@@ -4997,10 +4998,16 @@ fn apply_replay_standee_positions(
             .iter()
             .map(|(transform, standee)| (standee.user_id, transform.translation))
             .collect();
+        state.original_rotations = standees
+            .iter()
+            .map(|(transform, standee)| (standee.user_id, transform.rotation))
+            .collect();
     }
 
     if active {
         if let Some(replay) = studio.replay.as_ref() {
+            let camera_position = interpolated_camera(&replay.camera, studio.playback_ms)
+                .map(|transform| transform.translation);
             let positions = replay
                 .dialogue
                 .iter()
@@ -5018,6 +5025,11 @@ fn apply_replay_standee_positions(
                 if let Some(position) = positions.get(&standee.user_id) {
                     transform.translation = *position;
                 }
+                if let Some(rotation) = camera_position.and_then(|camera_position| {
+                    replay_standee_facing_rotation(transform.translation, camera_position)
+                }) {
+                    transform.rotation = rotation;
+                }
             }
         }
     } else if state.active {
@@ -5025,10 +5037,22 @@ fn apply_replay_standee_positions(
             if let Some(position) = state.original_positions.get(&standee.user_id) {
                 transform.translation = *position;
             }
+            if let Some(rotation) = state.original_rotations.get(&standee.user_id) {
+                transform.rotation = *rotation;
+            }
         }
         state.original_positions.clear();
+        state.original_rotations.clear();
     }
     state.active = active;
+}
+
+fn replay_standee_facing_rotation(standee_position: Vec3, camera_position: Vec3) -> Option<Quat> {
+    let direction = (camera_position - standee_position) * Vec3::new(1.0, 0.0, 1.0);
+    let direction = direction.try_normalize()?;
+    Some(Quat::from_rotation_y(
+        direction.x.atan2(direction.z),
+    ))
 }
 
 fn auto_group_replay_areas(replay: &mut ReplayFile) {
@@ -6935,6 +6959,21 @@ mod tests {
             interpolated_camera(&frames, 2_000).unwrap().translation.x,
             10.0
         );
+    }
+
+    #[test]
+    fn replay_standee_faces_the_camera_without_tilting() {
+        let rotation = replay_standee_facing_rotation(
+            Vec3::new(2.0, 1.0, 3.0),
+            Vec3::new(8.0, 20.0, -5.0),
+        )
+        .unwrap();
+        let portrait_normal = rotation * Vec3::Z;
+        let expected = Vec3::new(6.0, 0.0, -8.0).normalize();
+
+        assert!(portrait_normal.dot(expected) > 0.9999);
+        assert!(portrait_normal.y.abs() < 0.0001);
+        assert!(replay_standee_facing_rotation(Vec3::ZERO, Vec3::new(0.0, 10.0, 0.0)).is_none());
     }
 
     #[test]
