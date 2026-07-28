@@ -325,6 +325,17 @@ pub(crate) struct VoxelPlayerStandee {
     half_size: Vec2,
 }
 
+#[cfg(test)]
+impl VoxelPlayerStandee {
+    pub(crate) fn replay_test(user_id: u64) -> Self {
+        Self {
+            user_id,
+            image_source: String::new(),
+            half_size: Vec2::splat(VOXEL_SIZE),
+        }
+    }
+}
+
 #[derive(Resource, Default)]
 struct VoxelPlayerStandeeAssets {
     entities: HashMap<u64, Entity>,

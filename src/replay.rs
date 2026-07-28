@@ -151,6 +151,10 @@ const PLAYER_MOVEMENT_SAMPLE_SECONDS: f32 = 0.1;
 const DEFAULT_PLAYER_MOVEMENT_CURVE: f32 = 0.75;
 const MIN_PLAYER_MOVEMENT_CURVE: f32 = 0.0;
 const MAX_PLAYER_MOVEMENT_CURVE: f32 = 1.0;
+const MAX_PERSISTED_MOVEMENT_SESSIONS: usize = 256;
+const MOVEMENT_HISTORY_LEAD_MS: u64 = 5 * 60 * 1_000;
+const MOVEMENT_HISTORY_TAIL_MS: u64 = 15 * 60 * 1_000;
+const MOVEMENT_HISTORY_PERSIST_SECONDS: f32 = 0.5;
 
 pub struct ReplayPlugin;
 
@@ -172,15 +176,31 @@ impl Plugin for ReplayPlugin {
             .revert_to_default_on_deserialization_errors(true)
             .build()
             .expect("failed to initialize replay voice favorites");
+        let player_movement_history = Persistent::<ReplayPlayerMovementHistory>::builder()
+            .name("replay_player_movement_history")
+            .format(StorageFormat::Toml)
+            .path(
+                Path::new(".data")
+                    .join("willowblossom")
+                    .join("replay_player_movements.toml"),
+            )
+            .default(ReplayPlayerMovementHistory::default())
+            .revertible(true)
+            .revert_to_default_on_deserialization_errors(true)
+            .build()
+            .expect("failed to initialize replay player movement history");
         app.init_resource::<ReplayStudio>()
             .init_resource::<ReplayVideoCaptureActive>()
             .init_resource::<PreviewSpeechController>()
             .init_resource::<ReplaySnapshotTracker>()
+            .init_resource::<ReplayMovementHistoryRecorder>()
             .insert_resource(voice_favorites)
+            .insert_resource(player_movement_history)
             .add_systems(
                 Update,
                 (
                     snapshot_new_replay_messages,
+                    record_player_movement_history.after(VoxelPlayerStandeeSynced),
                     record_replay
                         .after(snapshot_new_replay_messages)
                         .after(VoxelPlayerStandeeSynced),
@@ -427,6 +447,33 @@ struct ReplayPlayerMovement {
 struct ReplayPlayerMovementKeyframe {
     time_ms: u64,
     position_cells: [f32; 3],
+}
+
+#[derive(Resource, Debug, Clone, Default, Serialize, Deserialize)]
+struct ReplayPlayerMovementHistory {
+    #[serde(default)]
+    sessions: Vec<PersistedPlayerMovementSession>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedPlayerMovementSession {
+    campaign_id: String,
+    user_id: u64,
+    keyframes: Vec<PersistedPlayerMovementKeyframe>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct PersistedPlayerMovementKeyframe {
+    source_unix_ms: u64,
+    position_cells: [f32; 3],
+}
+
+#[derive(Resource, Default)]
+struct ReplayMovementHistoryRecorder {
+    active_session: Option<(String, u64)>,
+    session_index: Option<usize>,
+    sample_accumulator: f32,
+    persist_accumulator: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -714,6 +761,84 @@ impl Default for ReplayStudio {
             video_encoding: None,
             status: "尚未创建回放".to_owned(),
             panel_open: true,
+        }
+    }
+}
+
+fn record_player_movement_history(
+    time: Res<Time>,
+    manager: Res<Persistent<NapcatMessageManager>>,
+    possession: Res<VoxelPossessionState>,
+    studio: Res<ReplayStudio>,
+    standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
+    mut history: ResMut<Persistent<ReplayPlayerMovementHistory>>,
+    mut recorder: ResMut<ReplayMovementHistoryRecorder>,
+) {
+    let active_session = if replay_blocks_mouse_interaction(&studio) {
+        None
+    } else {
+        manager.active_campaign_id().zip(possession.active_user_id)
+    };
+    let session_changed = recorder.active_session != active_session;
+    if session_changed {
+        if recorder.active_session.is_some() {
+            if let Err(err) = history.persist() {
+                eprintln!("failed to persist replay player movement history: {err}");
+            }
+        }
+        recorder.active_session = active_session.clone();
+        recorder.session_index = None;
+        recorder.sample_accumulator = 0.0;
+        recorder.persist_accumulator = 0.0;
+    } else if active_session.is_some() {
+        recorder.sample_accumulator += time.delta_secs();
+        recorder.persist_accumulator += time.delta_secs();
+    }
+
+    let sample_due =
+        session_changed || recorder.sample_accumulator >= PLAYER_MOVEMENT_SAMPLE_SECONDS;
+    let Some((campaign_id, user_id)) = active_session.filter(|_| sample_due) else {
+        return;
+    };
+    let Some(position) = standees.iter().find_map(|(transform, standee)| {
+        (standee.user_id == user_id).then_some(transform.translation)
+    }) else {
+        return;
+    };
+    recorder.sample_accumulator %= PLAYER_MOVEMENT_SAMPLE_SECONDS;
+
+    let index = recorder.session_index.unwrap_or_else(|| {
+        if history.sessions.len() >= MAX_PERSISTED_MOVEMENT_SESSIONS {
+            let remove_count = history.sessions.len() + 1 - MAX_PERSISTED_MOVEMENT_SESSIONS;
+            history.sessions.drain(..remove_count);
+        }
+        history.sessions.push(PersistedPlayerMovementSession {
+            campaign_id,
+            user_id,
+            keyframes: Vec::new(),
+        });
+        history.sessions.len() - 1
+    });
+    recorder.session_index = Some(index);
+    let keyframe = PersistedPlayerMovementKeyframe {
+        source_unix_ms: unix_time_ms(),
+        position_cells: (position / VOXEL_SIZE).to_array(),
+    };
+    let session = &mut history.sessions[index];
+    if let Some(last) = session
+        .keyframes
+        .last_mut()
+        .filter(|last| last.source_unix_ms == keyframe.source_unix_ms)
+    {
+        *last = keyframe;
+    } else {
+        session.keyframes.push(keyframe);
+    }
+
+    if recorder.persist_accumulator >= MOVEMENT_HISTORY_PERSIST_SECONDS {
+        recorder.persist_accumulator %= MOVEMENT_HISTORY_PERSIST_SECONDS;
+        if let Err(err) = history.persist() {
+            eprintln!("failed to persist replay player movement history: {err}");
         }
     }
 }
@@ -1955,6 +2080,7 @@ fn replay_studio_ui(
     mut deepseek_manager: ResMut<Persistent<DeepseekManager>>,
     mut studio: ResMut<ReplayStudio>,
     mut voice_favorites: ResMut<Persistent<ReplayVoiceFavorites>>,
+    player_movement_history: Res<Persistent<ReplayPlayerMovementHistory>>,
     speech: Res<PreviewSpeechController>,
     camera: Query<&Transform, With<VoxelViewportCamera>>,
     standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
@@ -2020,6 +2146,7 @@ fn replay_studio_ui(
                     &mut deepseek_manager,
                     &mut studio,
                     &voice_favorites,
+                    &player_movement_history,
                     &speech,
                     &camera,
                     &standees,
@@ -2088,6 +2215,7 @@ fn replay_controls(
     deepseek_manager: &mut Persistent<DeepseekManager>,
     studio: &mut ReplayStudio,
     voice_favorites: &ReplayVoiceFavorites,
+    player_movement_history: &ReplayPlayerMovementHistory,
     speech: &PreviewSpeechController,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
@@ -2102,6 +2230,7 @@ fn replay_controls(
     occlusion_debug_gizmo: &mut bool,
 ) {
     ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
+    ui.small("DM 使用玩家接管工具时会自动保存移动轨迹，无需先点击“开始录制”；从现有聊天生成时会按战役导入。");
     ui.separator();
     ui.horizontal(|ui| {
         ui.label("发布范围");
@@ -2314,6 +2443,7 @@ fn replay_controls(
                     studio,
                     manager,
                     voice_favorites,
+                    player_movement_history,
                     camera,
                     standees,
                     grids,
@@ -2323,11 +2453,17 @@ fn replay_controls(
     });
 
     if let Some(replay) = studio.replay.as_ref() {
+        let movement_frame_count = replay
+            .player_movements
+            .iter()
+            .map(|movement| movement.keyframes.len())
+            .sum::<usize>();
         ui.label(format!(
-            "{} · {} · {} 个镜头帧 · {} 条对话 · {} 个体素",
+            "{} · {} · {} 个镜头帧 · {} 帧玩家移动 · {} 条对话 · {} 个体素",
             replay.title,
             format_time(replay.duration_ms),
             replay.camera.len(),
+            movement_frame_count,
             replay.dialogue.len(),
             replay.scene.voxels.len(),
         ));
@@ -2424,6 +2560,7 @@ fn replay_controls(
                         studio,
                         manager,
                         voice_favorites,
+                        player_movement_history,
                         camera,
                         standees,
                         grids,
@@ -2780,6 +2917,7 @@ fn replay_controls(
             studio,
             manager,
             voice_favorites,
+            player_movement_history,
             camera,
             standees,
             grids,
@@ -3229,6 +3367,7 @@ fn build_from_history(
     studio: &mut ReplayStudio,
     manager: &NapcatMessageManager,
     voice_favorites: &ReplayVoiceFavorites,
+    player_movement_history: &ReplayPlayerMovementHistory,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
@@ -3310,6 +3449,20 @@ fn build_from_history(
     rebuild_area_blocks(&mut replay);
     replay.duration_ms = compile_area_block_timeline(&mut replay);
     extend_replay_for_speech(&mut replay);
+    replay.player_movements = replay_player_movements_from_history(
+        player_movement_history,
+        &campaign_id,
+        &replay.dialogue,
+    );
+    if let Some(movement_end) = replay
+        .player_movements
+        .iter()
+        .filter_map(|movement| movement.keyframes.last())
+        .map(|frame| frame.time_ms)
+        .max()
+    {
+        replay.duration_ms = replay.duration_ms.max(movement_end);
+    }
     if let Ok(transform) = camera.single() {
         let obstacles = ReplayCameraObstacles::from_scene(&replay.scene);
         replay.camera = turn_based_camera_track(
@@ -3326,6 +3479,11 @@ fn build_from_history(
     studio.director_response_hash = None;
     studio.auto_export_after_director = false;
     let dialogue_count = replay.dialogue.len();
+    let movement_frame_count = replay
+        .player_movements
+        .iter()
+        .map(|movement| movement.keyframes.len())
+        .sum::<usize>();
     studio.replay = Some(replay);
     let favorite_status = if favorite_count == 0 {
         String::new()
@@ -3333,7 +3491,7 @@ fn build_from_history(
         format!("；已自动应用 {favorite_count} 个角色的语音收藏")
     };
     studio.status = format!(
-        "已生成 {dialogue_count} 句区域回放台词；其中 {estimated_count} 句旧消息使用当前立牌位置或原点估算，可由 DM 编辑{favorite_status}"
+        "已生成 {dialogue_count} 句区域回放台词和 {movement_frame_count} 帧接管移动；其中 {estimated_count} 句旧消息使用当前立牌位置或原点估算，可由 DM 编辑{favorite_status}"
     );
 }
 
@@ -5663,6 +5821,84 @@ fn replay_speaker_positions(dialogue: &[ReplayDialogue]) -> HashMap<u64, Vec3> {
         .collect()
 }
 
+fn replay_player_movements_from_history(
+    history: &ReplayPlayerMovementHistory,
+    campaign_id: &str,
+    dialogue: &[ReplayDialogue],
+) -> Vec<ReplayPlayerMovement> {
+    let mut anchors = dialogue
+        .iter()
+        .filter(|line| line.included && line.source_time > 0 && line.time_ms != u64::MAX)
+        .map(|line| {
+            (
+                line.source_time.saturating_mul(1_000),
+                line.time_ms,
+            )
+        })
+        .collect::<Vec<_>>();
+    anchors.sort_unstable_by_key(|(source_unix_ms, _)| *source_unix_ms);
+    anchors.dedup_by_key(|(source_unix_ms, _)| *source_unix_ms);
+    let (Some((first_source_ms, _)), Some((last_source_ms, _))) = (
+        anchors.first().copied(),
+        anchors.last().copied(),
+    ) else {
+        return Vec::new();
+    };
+    let history_start = first_source_ms.saturating_sub(MOVEMENT_HISTORY_LEAD_MS);
+    let history_end = last_source_ms.saturating_add(MOVEMENT_HISTORY_TAIL_MS);
+    let visible_user_ids = dialogue
+        .iter()
+        .filter(|line| line.included)
+        .flat_map(|line| [Some(line.sender_id), line.camera_focus_id])
+        .flatten()
+        .collect::<HashSet<_>>();
+
+    history
+        .sessions
+        .iter()
+        .filter(|session| session.campaign_id == campaign_id)
+        .filter(|session| visible_user_ids.contains(&session.user_id))
+        .filter_map(|session| {
+            let keyframes = session
+                .keyframes
+                .iter()
+                .filter(|frame| (history_start..=history_end).contains(&frame.source_unix_ms))
+                .map(|frame| ReplayPlayerMovementKeyframe {
+                    time_ms: replay_time_for_source_unix_ms(&anchors, frame.source_unix_ms),
+                    position_cells: frame.position_cells,
+                })
+                .collect::<Vec<_>>();
+            (!keyframes.is_empty()).then_some(ReplayPlayerMovement {
+                user_id: session.user_id,
+                keyframes,
+            })
+        })
+        .collect()
+}
+
+fn replay_time_for_source_unix_ms(anchors: &[(u64, u64)], source_unix_ms: u64) -> u64 {
+    let Some(&(first_source_ms, first_replay_ms)) = anchors.first() else {
+        return 0;
+    };
+    if source_unix_ms <= first_source_ms {
+        return first_replay_ms.saturating_sub(first_source_ms - source_unix_ms);
+    }
+    let Some(&(last_source_ms, last_replay_ms)) = anchors.last() else { return 0 };
+    if source_unix_ms >= last_source_ms {
+        return last_replay_ms.saturating_add(source_unix_ms - last_source_ms);
+    }
+    let right_index =
+        anchors.partition_point(|(anchor_source_ms, _)| *anchor_source_ms <= source_unix_ms);
+    let (left_source_ms, left_replay_ms) = anchors[right_index - 1];
+    let (right_source_ms, right_replay_ms) = anchors[right_index];
+    let source_span = right_source_ms.saturating_sub(left_source_ms).max(1);
+    let elapsed = source_unix_ms.saturating_sub(left_source_ms);
+    left_replay_ms.saturating_add(
+        ((elapsed as u128 * right_replay_ms.saturating_sub(left_replay_ms) as u128)
+            / source_span as u128) as u64,
+    )
+}
+
 fn replay_camera_focus_at(
     dialogue: &[ReplayDialogue],
     time_ms: u64,
@@ -7610,6 +7846,112 @@ mod tests {
         assert_eq!(
             interpolated_player_position(&movements, 42, 1_000, 1.0).unwrap(),
             Vec3::new(10.0, 0.0, 0.0) * VOXEL_SIZE
+        );
+    }
+
+    #[test]
+    fn history_generated_replay_imports_campaign_movement_on_the_dialogue_timeline() {
+        let mut first = test_dialogue(1_000, 600, DialogueSide::Right);
+        first.source_time = 100;
+        first.sender_id = 42;
+        let mut second = test_dialogue(3_000, 600, DialogueSide::Right);
+        second.source_time = 110;
+        second.sender_id = 42;
+        let history = ReplayPlayerMovementHistory {
+            sessions: vec![
+                PersistedPlayerMovementSession {
+                    campaign_id: "campaign".to_owned(),
+                    user_id: 42,
+                    keyframes: vec![
+                        PersistedPlayerMovementKeyframe {
+                            source_unix_ms: 100_000,
+                            position_cells: [0.0, 0.0, 0.0],
+                        },
+                        PersistedPlayerMovementKeyframe {
+                            source_unix_ms: 105_000,
+                            position_cells: [1.0, 0.0, 0.0],
+                        },
+                        PersistedPlayerMovementKeyframe {
+                            source_unix_ms: 110_000,
+                            position_cells: [2.0, 0.0, 0.0],
+                        },
+                    ],
+                },
+                PersistedPlayerMovementSession {
+                    campaign_id: "other".to_owned(),
+                    user_id: 99,
+                    keyframes: vec![PersistedPlayerMovementKeyframe {
+                        source_unix_ms: 105_000,
+                        position_cells: [9.0, 0.0, 0.0],
+                    }],
+                },
+            ],
+        };
+
+        let movements =
+            replay_player_movements_from_history(&history, "campaign", &[first, second]);
+
+        assert_eq!(movements.len(), 1);
+        assert_eq!(movements[0].user_id, 42);
+        assert_eq!(
+            movements[0]
+                .keyframes
+                .iter()
+                .map(|frame| frame.time_ms)
+                .collect::<Vec<_>>(),
+            vec![1_000, 2_000, 3_000]
+        );
+    }
+
+    #[test]
+    fn replay_playback_visibly_moves_the_player_standee() {
+        let mut replay = test_replay(Vec::new());
+        replay.duration_ms = 100;
+        replay.player_movements = vec![ReplayPlayerMovement {
+            user_id: 42,
+            keyframes: vec![
+                ReplayPlayerMovementKeyframe {
+                    time_ms: 0,
+                    position_cells: [0.0, 0.0, 0.0],
+                },
+                ReplayPlayerMovementKeyframe {
+                    time_ms: 100,
+                    position_cells: [4.0, 0.0, 0.0],
+                },
+            ],
+        }];
+        let mut studio = ReplayStudio::default();
+        studio.mode = ReplayMode::Paused;
+        studio.replay = Some(replay);
+        let mut app = App::new();
+        app.insert_resource(studio)
+            .add_systems(Update, apply_replay_standee_positions);
+        let standee = app
+            .world_mut()
+            .spawn((
+                Transform::from_xyz(9.0, 0.0, 0.0),
+                VoxelPlayerStandee::replay_test(42),
+            ))
+            .id();
+
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(standee)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            Vec3::ZERO
+        );
+        app.world_mut().resource_mut::<ReplayStudio>().playback_ms = 100;
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(standee)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            Vec3::X
         );
     }
 
