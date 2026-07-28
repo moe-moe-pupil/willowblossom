@@ -180,7 +180,7 @@ const PLANET_SCIENCE_LAB_CENTER: IVec2 = IVec2::new(-45, 20);
 const PLANET_SCIENCE_LAB_FLOOR_Y: i32 = 485;
 const VOXEL_MINIMAP_RESOLUTION: usize = 64;
 const VOXEL_OCCLUSION_FADE_SHADER: &str = "shaders/voxel_occlusion_fade.wgsl";
-const VOXEL_OCCLUSION_FOCUS_RADIUS: f32 = PLAYER_STANDEE_HEIGHT;
+const VOXEL_OCCLUSION_FOCUS_RADIUS: f32 = PLAYER_STANDEE_HEIGHT * 0.5;
 
 pub struct TrpgVoxelPlugin;
 
@@ -5763,7 +5763,8 @@ fn sync_voxel_occlusion_fade(
         Without<MeshMaterial3d<StandardMaterial>>,
     >,
 ) {
-    let target_count = if fade.active { fade.targets.len() } else { 0 };
+    let fade_enabled = fade.active && fade.opacity < 0.999;
+    let target_count = if fade_enabled { fade.targets.len() } else { 0 };
     let settings = VoxelOcclusionFadeUniform {
         camera_and_target_count: fade.camera.extend(target_count as f32),
         opacity: Vec4::new(
@@ -5791,7 +5792,7 @@ fn sync_voxel_occlusion_fade(
             material.extension.settings = settings;
         }
     }
-    if fade.active {
+    if fade_enabled {
         for (entity, material, aabb, transform) in &normal_entities {
             if !replay_sightline_intersects_any_aabb(
                 fade.camera,
@@ -5872,10 +5873,18 @@ fn replay_sightline_intersects_aabb(
     aabb: &Aabb,
     transform: &GlobalTransform,
 ) -> bool {
+    let sightline = focus - camera;
+    let sightline_length = sightline.length();
+    if sightline_length <= f32::EPSILON {
+        return false;
+    }
+    let sightline_direction = sightline / sightline_length;
     let local_center = Vec3::from(aabb.center);
     let local_half_extents = Vec3::from(aabb.half_extents);
     let mut world_min = Vec3::splat(f32::INFINITY);
     let mut world_max = Vec3::splat(f32::NEG_INFINITY);
+    let mut nearest_along_sightline = f32::INFINITY;
+    let mut farthest_along_sightline = f32::NEG_INFINITY;
     for x in [-1.0, 1.0] {
         for y in [-1.0, 1.0] {
             for z in [-1.0, 1.0] {
@@ -5883,8 +5892,14 @@ fn replay_sightline_intersects_aabb(
                 let world_corner = transform.transform_point(local_corner);
                 world_min = world_min.min(world_corner);
                 world_max = world_max.max(world_corner);
+                let along_sightline = (world_corner - camera).dot(sightline_direction);
+                nearest_along_sightline = nearest_along_sightline.min(along_sightline);
+                farthest_along_sightline = farthest_along_sightline.max(along_sightline);
             }
         }
+    }
+    if nearest_along_sightline >= sightline_length || farthest_along_sightline <= 0.0 {
+        return false;
     }
     world_min -= Vec3::splat(radius);
     world_max += Vec3::splat(radius);
@@ -9814,6 +9829,14 @@ mod tests {
             .world()
             .entity(voxel)
             .contains::<MeshMaterial3d<StandardMaterial>>());
+        assert!(app
+            .world()
+            .entity(second_wall)
+            .contains::<MeshMaterial3d<StandardMaterial>>());
+        assert!(app
+            .world()
+            .entity(other_player_wall)
+            .contains::<MeshMaterial3d<StandardMaterial>>());
         assert!(!app
             .world()
             .entity(voxel)
@@ -9878,11 +9901,19 @@ mod tests {
 
         app.world_mut()
             .resource_mut::<VoxelReplayOcclusionFade>()
-            .active = false;
+            .opacity = 1.0;
         app.update();
         assert!(app
             .world()
             .entity(voxel)
+            .contains::<MeshMaterial3d<StandardMaterial>>());
+        assert!(app
+            .world()
+            .entity(second_wall)
+            .contains::<MeshMaterial3d<StandardMaterial>>());
+        assert!(app
+            .world()
+            .entity(other_player_wall)
             .contains::<MeshMaterial3d<StandardMaterial>>());
         assert!(!app
             .world()
@@ -9895,6 +9926,7 @@ mod tests {
         let bounds = Aabb::from_min_max(Vec3::splat(-1.0), Vec3::splat(1.0));
         let blocking_transform = GlobalTransform::from_translation(Vec3::new(0.0, 0.0, 5.0));
         let off_axis_transform = GlobalTransform::from_translation(Vec3::new(4.0, 0.0, 5.0));
+        let behind_player_transform = GlobalTransform::from_translation(Vec3::new(0.0, 0.0, 11.1));
 
         assert!(replay_sightline_intersects_aabb(
             Vec3::ZERO,
@@ -9910,14 +9942,27 @@ mod tests {
             &bounds,
             &off_axis_transform,
         ));
+        assert!(!replay_sightline_intersects_aabb(
+            Vec3::ZERO,
+            Vec3::Z * 10.0,
+            VOXEL_OCCLUSION_FOCUS_RADIUS,
+            &bounds,
+            &behind_player_transform,
+        ));
     }
 
     #[test]
     fn replay_fade_shader_preserves_floors_and_applies_dm_opacity() {
         let shader = include_str!("../assets/shaders/voxel_occlusion_fade.wgsl");
 
+        assert_eq!(
+            VOXEL_OCCLUSION_FOCUS_RADIUS,
+            PLAYER_STANDEE_HEIGHT * 0.5
+        );
         assert!(shader.contains("abs(pbr_input.N.y) >= 0.75"));
-        assert!(shader.contains("base_color.a *= fade_settings.opacity.x"));
+        assert!(shader.contains("progress <= 0.0 || progress >= 1.0"));
+        assert!(shader.contains("occluder_opacity < 0.999"));
+        assert!(shader.contains("base_color.a *= occluder_opacity"));
     }
 
     #[test]

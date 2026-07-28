@@ -53,11 +53,10 @@ fn inside_player_sightline(world_position: vec3<f32>, target: vec4<f32>) -> bool
         return false;
     }
 
-    let progress = clamp(
-        dot(world_position - camera, sightline) / sightline_length_squared,
-        0.0,
-        1.0,
-    );
+    let progress = dot(world_position - camera, sightline) / sightline_length_squared;
+    if progress <= 0.0 || progress >= 1.0 {
+        return false;
+    }
     let closest_point = camera + sightline * progress;
     let tunnel_radius = target.w * progress;
     return distance(world_position, closest_point) <= tunnel_radius;
@@ -91,14 +90,15 @@ fn fragment(
 
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     let target_count = u32(fade_settings.camera_and_target_count.w);
+    let occluder_opacity = clamp(fade_settings.opacity.x, 0.0, 1.0);
     let is_horizontal_surface = abs(pbr_input.N.y) >= 0.75;
-    if !is_horizontal_surface {
+    if !is_horizontal_surface && occluder_opacity < 0.999 {
         for (var target_index = 0u; target_index < target_count; target_index += 1u) {
             if inside_player_sightline(in.world_position.xyz, fade_targets[target_index]) {
-                if fade_settings.opacity.x <= 0.001 {
+                if occluder_opacity <= 0.001 {
                     discard;
                 }
-                pbr_input.material.base_color.a *= fade_settings.opacity.x;
+                pbr_input.material.base_color.a *= occluder_opacity;
                 break;
             }
         }

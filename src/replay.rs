@@ -534,7 +534,6 @@ pub(crate) struct ReplayStudio {
     playback_ms: u64,
     playback_speed: f32,
     camera_distance_scale: f32,
-    occlusion_opacity: f32,
     record_camera_enabled: bool,
     deepseek_director_enabled: bool,
     director_response_hash: Option<u64>,
@@ -643,7 +642,6 @@ impl Default for ReplayStudio {
             playback_ms: 0,
             playback_speed: 1.0,
             camera_distance_scale: default_directed_camera_distance_scale(),
-            occlusion_opacity: 0.0,
             record_camera_enabled: false,
             deepseek_director_enabled: false,
             director_response_hash: None,
@@ -1777,7 +1775,6 @@ fn apply_replay_camera(
     if let Some(fade) = fade.as_mut() {
         fade.active = false;
         fade.targets.clear();
-        fade.opacity = studio.occlusion_opacity;
     }
     if !matches!(
         studio.mode,
@@ -1836,9 +1833,11 @@ fn replay_studio_ui(
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut capture_active: ResMut<ReplayVideoCaptureActive>,
+    mut occlusion_fade: Option<ResMut<VoxelReplayOcclusionFade>>,
     mut avatar_textures: Local<HashMap<String, egui::TextureHandle>>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else { return };
+    let mut occlusion_opacity = occlusion_fade.as_ref().map_or(0.0, |fade| fade.opacity);
 
     if !capture_active.0 {
         egui::Area::new(egui::Id::new("replay-studio-button"))
@@ -1881,9 +1880,13 @@ fn replay_studio_ui(
                     &mut grids,
                     &mut windows,
                     &mut capture_active,
+                    &mut occlusion_opacity,
                 )
             });
         studio.panel_open = open;
+    }
+    if let Some(fade) = occlusion_fade.as_mut() {
+        fade.opacity = occlusion_opacity.clamp(0.0, 1.0);
     }
 
     if studio.speech_settings_open && !capture_active.0 {
@@ -1923,6 +1926,7 @@ fn replay_controls(
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
     capture_active: &mut ReplayVideoCaptureActive,
+    occlusion_opacity: &mut f32,
 ) {
     ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
     ui.separator();
@@ -2005,7 +2009,7 @@ fn replay_controls(
         );
     }
     ui.add(
-        egui::Slider::new(&mut studio.occlusion_opacity, 0.0..=1.0)
+        egui::Slider::new(occlusion_opacity, 0.0..=1.0)
             .text("穿墙遮挡不透明度")
             .fixed_decimals(2),
     )
