@@ -67,8 +67,8 @@ use crate::voxel::{
     VoxelLightTool,
     VoxelMinimapSnapshot,
     VoxelPlayerStandee,
-    VoxelPossessionState,
     VoxelPossessionMovementStore,
+    VoxelPossessionState,
     VoxelTeleportDestination,
     MAX_VOXEL_BRUSH_RADIUS,
 };
@@ -710,6 +710,7 @@ use crate::{
         EquipmentSlot,
         ImageData,
         InventoryItem,
+        InventoryItemSkill,
         InventoryQuality,
         NapcatIOSender,
         NapcatMessage,
@@ -7589,19 +7590,24 @@ fn character_inventory_editor_ui(
                 });
 
             if !character.inventory.items.is_empty() {
-                ui.collapsing("背包物品属性加成", |ui| {
+                ui.collapsing("背包物品属性与技能", |ui| {
                     for (index, item) in character.inventory.items.iter_mut().enumerate() {
                         ui.push_id(("inventory_item_stat_effects", index), |ui| {
                             ui.collapsing(
                                 format!(
-                                    "{} · {}项加成",
+                                    "{} · {}项加成 · {}个技能",
                                     item_display_name(item),
-                                    item.stat_effects.len()
+                                    item.stat_effects.len(),
+                                    item.skills.len(),
                                 ),
                                 |ui| {
                                     changed |= item_stat_effects_editor_ui(
                                         ui,
                                         &mut item.stat_effects,
+                                    );
+                                    changed |= inventory_item_skills_editor_ui(
+                                        ui,
+                                        &mut item.skills,
                                     );
                                 },
                             );
@@ -7845,6 +7851,7 @@ fn same_stackable_item(left: &InventoryItem, right: &InventoryItem) -> bool {
         && left.item_level == right.item_level
         && left.soulbound == right.soulbound
         && left.stat_effects == right.stat_effects
+        && left.skills == right.skills
         && left.max_stack > 1
 }
 
@@ -10641,7 +10648,66 @@ fn inventory_item_definition_ui(ui: &mut Ui, item: &mut InventoryItem) -> bool {
             changed |= item_stat_effects_editor_ui(ui, &mut item.stat_effects);
         },
     );
+    ui.collapsing(
+        format!("物品技能 ({})", item.skills.len()),
+        |ui| {
+            changed |= inventory_item_skills_editor_ui(ui, &mut item.skills);
+        },
+    );
     changed
+}
+
+fn inventory_item_skills_editor_ui(ui: &mut Ui, skills: &mut Vec<InventoryItemSkill>) -> bool {
+    let before = skills.clone();
+    let mut remove_index = None;
+    for (index, skill) in skills.iter_mut().enumerate() {
+        ui.push_id(("inventory_item_skill", index), |ui| {
+            ui.group(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("技能");
+                    ui.add(egui::TextEdit::singleline(&mut skill.name).desired_width(140.0));
+                    ui.add(
+                        egui::DragValue::new(&mut skill.mp_cost)
+                            .range(0.0..=9999.0)
+                            .prefix("MP "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut skill.cooldown_turns)
+                            .range(0..=999)
+                            .prefix("冷却 "),
+                    );
+                    ui.checkbox(&mut skill.consume_item, "释放后消耗1个");
+                    if ui.button("-").on_hover_text("移除物品技能").clicked() {
+                        remove_index = Some(index);
+                    }
+                });
+                ui.collapsing("技能结构", |ui| {
+                    character_skill_shape_metadata_ui(ui, &mut skill.metadata);
+                });
+                ui.label("规则描述");
+                ui.add(
+                    egui::TextEdit::multiline(&mut skill.note)
+                        .desired_rows(2)
+                        .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
+                );
+                let args = skill_rule_args(&skill.metadata.args);
+                if let Err(error) = parse_skill_note(
+                    &skill.note,
+                    &args,
+                    skill.metadata.skill_type.as_deref(),
+                ) {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove_index {
+        skills.remove(index);
+    }
+    if ui.button("+ 物品技能").clicked() {
+        skills.push(InventoryItemSkill::default());
+    }
+    *skills != before
 }
 
 fn item_stat_effects_editor_ui(ui: &mut Ui, effects: &mut Vec<BuffEffect>) -> bool {

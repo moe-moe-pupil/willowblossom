@@ -598,6 +598,37 @@ pub struct InventoryItem {
     pub soulbound: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stat_effects: Vec<BuffEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<InventoryItemSkill>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct InventoryItemSkill {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub mp_cost: f32,
+    #[serde(default)]
+    pub cooldown_turns: u32,
+    #[serde(default)]
+    pub metadata: CharacterSkillMetadata,
+    #[serde(default)]
+    pub consume_item: bool,
+}
+
+impl Default for InventoryItemSkill {
+    fn default() -> Self {
+        Self {
+            name: "新技能".to_owned(),
+            note: String::new(),
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            metadata: CharacterSkillMetadata::default(),
+            consume_item: false,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -622,6 +653,7 @@ impl Default for InventoryItem {
             item_level: 0,
             soulbound: false,
             stat_effects: Vec::new(),
+            skills: Vec::new(),
         }
     }
 }
