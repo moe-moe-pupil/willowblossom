@@ -36,7 +36,7 @@
 
 struct VoxelOcclusionFadeSettings {
     camera_and_target_count: vec4<f32>,
-    opacity: vec4<f32>,
+    opacity_and_voxel_size: vec4<f32>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100)
@@ -45,7 +45,7 @@ var<uniform> fade_settings: VoxelOcclusionFadeSettings;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101)
 var<storage, read> fade_targets: array<vec4<f32>>;
 
-fn inside_player_sightline(world_position: vec3<f32>, target: vec4<f32>) -> bool {
+fn inside_player_cube_cast(voxel_center: vec3<f32>, target: vec4<f32>) -> bool {
     let camera = fade_settings.camera_and_target_count.xyz;
     let sightline = target.xyz - camera;
     let sightline_length_squared = dot(sightline, sightline);
@@ -53,13 +53,25 @@ fn inside_player_sightline(world_position: vec3<f32>, target: vec4<f32>) -> bool
         return false;
     }
 
-    let progress = dot(world_position - camera, sightline) / sightline_length_squared;
+    let progress = dot(voxel_center - camera, sightline) / sightline_length_squared;
     if progress <= 0.0 || progress >= 1.0 {
         return false;
     }
     let closest_point = camera + sightline * progress;
-    let tunnel_radius = target.w * progress;
-    return distance(world_position, closest_point) <= tunnel_radius;
+    let touched_voxel_half_extent =
+        target.w + fade_settings.opacity_and_voxel_size.y * 0.5;
+    return all(
+        abs(voxel_center - closest_point) <= vec3<f32>(touched_voxel_half_extent),
+    );
+}
+
+fn voxel_center_from_surface(
+    world_position: vec3<f32>,
+    world_normal: vec3<f32>,
+) -> vec3<f32> {
+    let voxel_size = fade_settings.opacity_and_voxel_size.y;
+    let inside_position = world_position - world_normal * voxel_size * 0.01;
+    return round(inside_position / voxel_size) * voxel_size;
 }
 
 fn opacity_dither_threshold(fragment_position: vec2<f32>) -> f32 {
@@ -97,11 +109,12 @@ fn fragment(
 
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     let target_count = u32(fade_settings.camera_and_target_count.w);
-    let occluder_opacity = clamp(fade_settings.opacity.x, 0.0, 1.0);
-    let is_horizontal_surface = abs(pbr_input.N.y) >= 0.75;
-    if !is_horizontal_surface && occluder_opacity < 0.999 {
+    let occluder_opacity = clamp(fade_settings.opacity_and_voxel_size.x, 0.0, 1.0);
+    if occluder_opacity < 0.999 {
+        let voxel_center =
+            voxel_center_from_surface(in.world_position.xyz, pbr_input.N);
         for (var target_index = 0u; target_index < target_count; target_index += 1u) {
-            if inside_player_sightline(in.world_position.xyz, fade_targets[target_index]) {
+            if inside_player_cube_cast(voxel_center, fade_targets[target_index]) {
                 if opacity_dither_threshold(in.position.xy) >= occluder_opacity {
                     discard;
                 }

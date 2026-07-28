@@ -180,7 +180,9 @@ const PLANET_SCIENCE_LAB_CENTER: IVec2 = IVec2::new(-45, 20);
 const PLANET_SCIENCE_LAB_FLOOR_Y: i32 = 485;
 const VOXEL_MINIMAP_RESOLUTION: usize = 64;
 const VOXEL_OCCLUSION_FADE_SHADER: &str = "shaders/voxel_occlusion_fade.wgsl";
-const VOXEL_OCCLUSION_FOCUS_RADIUS: f32 = PLAYER_STANDEE_HEIGHT * 0.5;
+pub(crate) const DEFAULT_VOXEL_OCCLUSION_CUBE_SIZE_CELLS: f32 = 2.0;
+pub(crate) const MIN_VOXEL_OCCLUSION_CUBE_SIZE_CELLS: f32 = 1.0;
+pub(crate) const MAX_VOXEL_OCCLUSION_CUBE_SIZE_CELLS: f32 = 16.0;
 
 pub struct TrpgVoxelPlugin;
 
@@ -188,18 +190,31 @@ pub struct TrpgVoxelConnector;
 
 type VoxelFadeMaterial = ExtendedMaterial<StandardMaterial, VoxelOcclusionFadeExtension>;
 
-#[derive(Resource, Debug, Clone, Default)]
+#[derive(Resource, Debug, Clone)]
 pub(crate) struct VoxelReplayOcclusionFade {
     pub(crate) active: bool,
     pub(crate) camera: Vec3,
     pub(crate) targets: Vec<Vec3>,
     pub(crate) opacity: f32,
+    pub(crate) cube_size_cells: f32,
+}
+
+impl Default for VoxelReplayOcclusionFade {
+    fn default() -> Self {
+        Self {
+            active: false,
+            camera: Vec3::ZERO,
+            targets: Vec::new(),
+            opacity: 0.0,
+            cube_size_cells: DEFAULT_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
+        }
+    }
 }
 
 #[derive(ShaderType, Reflect, Debug, Clone, Copy, Default)]
 struct VoxelOcclusionFadeUniform {
     camera_and_target_count: Vec4,
-    opacity: Vec4,
+    opacity_and_voxel_size: Vec4,
 }
 
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
@@ -5763,11 +5778,13 @@ fn sync_voxel_occlusion_fade(
 ) {
     let fade_enabled = fade.active && fade.opacity < 0.999;
     let target_count = if fade_enabled { fade.targets.len() } else { 0 };
+    let cube_half_extent = voxel_occlusion_cube_half_extent(fade.cube_size_cells);
+    let touched_voxel_half_extent = cube_half_extent + VOXEL_SIZE * 0.5;
     let settings = VoxelOcclusionFadeUniform {
         camera_and_target_count: fade.camera.extend(target_count as f32),
-        opacity: Vec4::new(
+        opacity_and_voxel_size: Vec4::new(
             fade.opacity.clamp(0.0, 1.0),
-            0.0,
+            VOXEL_SIZE,
             0.0,
             0.0,
         ),
@@ -5778,7 +5795,7 @@ fn sync_voxel_occlusion_fade(
         } else {
             fade.targets
                 .iter()
-                .map(|target| target.extend(VOXEL_OCCLUSION_FOCUS_RADIUS))
+                .map(|target| target.extend(cube_half_extent))
                 .collect()
         };
         buffer.set_data(targets);
@@ -5795,6 +5812,7 @@ fn sync_voxel_occlusion_fade(
             if !replay_sightline_intersects_any_aabb(
                 fade.camera,
                 &fade.targets,
+                touched_voxel_half_extent,
                 aabb,
                 transform,
             ) {
@@ -5815,6 +5833,7 @@ fn sync_voxel_occlusion_fade(
             if replay_sightline_intersects_any_aabb(
                 fade.camera,
                 &fade.targets,
+                touched_voxel_half_extent,
                 aabb,
                 transform,
             ) {
@@ -5847,9 +5866,18 @@ fn sync_voxel_occlusion_fade(
     }
 }
 
+fn voxel_occlusion_cube_half_extent(cube_size_cells: f32) -> f32 {
+    cube_size_cells.clamp(
+        MIN_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
+        MAX_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
+    ) * VOXEL_SIZE
+        * 0.5
+}
+
 fn replay_sightline_intersects_any_aabb(
     camera: Vec3,
     targets: &[Vec3],
+    touched_voxel_half_extent: f32,
     aabb: &Aabb,
     transform: &GlobalTransform,
 ) -> bool {
@@ -5857,7 +5885,7 @@ fn replay_sightline_intersects_any_aabb(
         replay_sightline_intersects_aabb(
             camera,
             *target,
-            VOXEL_OCCLUSION_FOCUS_RADIUS,
+            touched_voxel_half_extent,
             aabb,
             transform,
         )
@@ -5867,7 +5895,7 @@ fn replay_sightline_intersects_any_aabb(
 fn replay_sightline_intersects_aabb(
     camera: Vec3,
     focus: Vec3,
-    radius: f32,
+    half_extent: f32,
     aabb: &Aabb,
     transform: &GlobalTransform,
 ) -> bool {
@@ -5899,8 +5927,8 @@ fn replay_sightline_intersects_aabb(
     if nearest_along_sightline >= sightline_length || farthest_along_sightline <= 0.0 {
         return false;
     }
-    world_min -= Vec3::splat(radius);
-    world_max += Vec3::splat(radius);
+    world_min -= Vec3::splat(half_extent);
+    world_max += Vec3::splat(half_extent);
     segment_intersects_bounds(camera, focus, world_min, world_max)
 }
 
@@ -9787,6 +9815,7 @@ mod tests {
             camera: Vec3::new(1.0, 2.0, 3.0),
             targets: vec![Vec3::new(4.0, 5.0, 6.0), Vec3::new(-4.0, 5.0, 6.0)],
             opacity: 0.35,
+            cube_size_cells: 2.0,
         })
         .add_systems(Update, sync_voxel_occlusion_fade);
         let voxel = app
@@ -9888,8 +9917,8 @@ mod tests {
                 Vec4::new(1.0, 2.0, 3.0, 2.0)
             );
             assert_eq!(
-                settings.opacity,
-                Vec4::new(0.35, 0.0, 0.0, 0.0)
+                settings.opacity_and_voxel_size,
+                Vec4::new(0.35, VOXEL_SIZE, 0.0, 0.0)
             );
             assert_eq!(
                 assets.get(handle).unwrap().extension.targets,
@@ -9920,44 +9949,48 @@ mod tests {
     }
 
     #[test]
-    fn replay_fade_uses_the_whole_mesh_only_when_it_blocks_the_sightline() {
+    fn replay_cube_cast_selects_blockers_only_between_camera_and_player() {
         let bounds = Aabb::from_min_max(Vec3::splat(-1.0), Vec3::splat(1.0));
         let blocking_transform = GlobalTransform::from_translation(Vec3::new(0.0, 0.0, 5.0));
         let off_axis_transform = GlobalTransform::from_translation(Vec3::new(4.0, 0.0, 5.0));
         let behind_player_transform = GlobalTransform::from_translation(Vec3::new(0.0, 0.0, 11.1));
+        let touched_voxel_half_extent =
+            voxel_occlusion_cube_half_extent(DEFAULT_VOXEL_OCCLUSION_CUBE_SIZE_CELLS)
+                + VOXEL_SIZE * 0.5;
 
         assert!(replay_sightline_intersects_aabb(
             Vec3::ZERO,
             Vec3::Z * 10.0,
-            VOXEL_OCCLUSION_FOCUS_RADIUS,
+            touched_voxel_half_extent,
             &bounds,
             &blocking_transform,
         ));
         assert!(!replay_sightline_intersects_aabb(
             Vec3::ZERO,
             Vec3::Z * 10.0,
-            VOXEL_OCCLUSION_FOCUS_RADIUS,
+            touched_voxel_half_extent,
             &bounds,
             &off_axis_transform,
         ));
         assert!(!replay_sightline_intersects_aabb(
             Vec3::ZERO,
             Vec3::Z * 10.0,
-            VOXEL_OCCLUSION_FOCUS_RADIUS,
+            touched_voxel_half_extent,
             &bounds,
             &behind_player_transform,
         ));
     }
 
     #[test]
-    fn replay_fade_shader_preserves_floors_and_applies_dm_opacity() {
+    fn replay_cube_cast_uses_canonical_voxels_and_dm_opacity() {
         let shader = include_str!("../assets/shaders/voxel_occlusion_fade.wgsl");
 
         assert_eq!(
-            VOXEL_OCCLUSION_FOCUS_RADIUS,
-            PLAYER_STANDEE_HEIGHT * 0.5
+            voxel_occlusion_cube_half_extent(2.0),
+            VOXEL_SIZE
         );
-        assert!(shader.contains("abs(pbr_input.N.y) >= 0.75"));
+        assert!(shader.contains("round(inside_position / voxel_size) * voxel_size"));
+        assert!(shader.contains("inside_player_cube_cast"));
         assert!(shader.contains("progress <= 0.0 || progress >= 1.0"));
         assert!(shader.contains("occluder_opacity < 0.999"));
         assert!(shader.contains("opacity_dither_threshold(in.position.xy)"));
