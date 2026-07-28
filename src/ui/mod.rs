@@ -738,6 +738,7 @@ use crate::{
         TrpgLegacySendPane,
         TrpgLegacyTeamChatMessage,
         UnitPoolEntry,
+        UnitRarity,
         Visibility,
         LEGACY_NEGATIVE_TIMEOUT_MS,
         NAPCAT_MANAGER_EXPORT_VERSION,
@@ -9989,6 +9990,8 @@ fn unit_pool_settings_ui(
                         label: target_display_name(manager, &source_id),
                         note: "从玩家角色复制".to_owned(),
                         legacy_member_id: None,
+                        rarity: UnitRarity::Normal,
+                        base_damage: 0.0,
                         character,
                     };
                     prepare_unit_pool_entry(&unit_id, &mut unit);
@@ -10193,6 +10196,56 @@ fn unit_pool_entry_editor_ui(ui: &mut Ui, unit_id: &str, unit: &mut UnitPoolEntr
                 .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
         )
         .changed();
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("稀有度");
+        egui::ComboBox::from_id_salt(format!("unit_rarity_{unit_id}"))
+            .selected_text(match unit.rarity {
+                UnitRarity::Normal => "普通",
+                UnitRarity::Rare => "稀有",
+                UnitRarity::Elite => "精英",
+                UnitRarity::RareElite => "稀有精英",
+            })
+            .show_ui(ui, |ui| {
+                changed |= ui
+                    .selectable_value(
+                        &mut unit.rarity,
+                        UnitRarity::Normal,
+                        "普通",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut unit.rarity,
+                        UnitRarity::Rare,
+                        "稀有",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut unit.rarity,
+                        UnitRarity::Elite,
+                        "精英",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut unit.rarity,
+                        UnitRarity::RareElite,
+                        "稀有精英",
+                    )
+                    .changed();
+            });
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut unit.base_damage)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("基础伤害 "),
+            )
+            .changed();
+        ui.small("与每名玩家交互时按其等级动态缩放（仅PvE）");
+    });
 
     changed |= unit_character_template_editor_ui(ui, unit_id, &mut unit.character);
     changed

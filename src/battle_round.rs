@@ -71,6 +71,7 @@ use crate::{
         character_minimum_range_meters,
         character_moonberry_talent_damage_attribute_bonus,
         character_mutual_aid_healing_rate,
+        character_next_level_exp,
         character_one_heart_healing_bonus_per_stack,
         character_overhealing_shield_cap_rate,
         character_penance_healing_bonus_percent,
@@ -99,6 +100,7 @@ use crate::{
         status_damage_attribute_multiplier,
         status_healing_attribute_multiplier,
         trpg_config_with_weave,
+        update_character_from_status_with_config,
         wounded_healing_dealt_multiplier,
         CharacterStatus,
         NapcatMessageManager,
@@ -109,6 +111,7 @@ use crate::{
         TrpgDamageTakenKind,
         TrpgGroup,
         UnitPoolEntry,
+        UnitRarity,
     },
     rule_engine::{
         apply_skill_type_damage_default,
@@ -266,6 +269,8 @@ pub struct BattleEncounter {
     pub action_log: Vec<String>,
     #[serde(default)]
     pub combat_log: Vec<CombatLogEntry>,
+    #[serde(default)]
+    pub combat_log_start: usize,
 }
 
 impl Default for BattleEncounter {
@@ -283,6 +288,7 @@ impl Default for BattleEncounter {
             participants: Vec::new(),
             action_log: Vec::new(),
             combat_log: Vec::new(),
+            combat_log_start: 0,
         }
     }
 }
@@ -323,6 +329,14 @@ pub struct BattleParticipantSnapshot {
     pub unit_character: Option<PlayerCharacter>,
     #[serde(default)]
     pub player_character: bool,
+    #[serde(default = "default_participant_level")]
+    pub level: i32,
+    #[serde(default)]
+    pub exp: i32,
+    #[serde(default)]
+    pub base_damage: f32,
+    #[serde(default)]
+    pub unit_rarity: UnitRarity,
     #[serde(default)]
     pub turn: u32,
     #[serde(default)]
@@ -459,6 +473,8 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub damage_contributors: Vec<String>,
     #[serde(default)]
+    pub damage_contribution_amounts: HashMap<String, f32>,
+    #[serde(default)]
     pub wound_healing_taken_turns: i32,
     #[serde(default)]
     pub delayed_damage_ticks: Vec<BattleDelayedDamageTick>,
@@ -567,6 +583,8 @@ fn default_true() -> bool { true }
 
 fn default_combat_modifier() -> f32 { 1.0 }
 
+fn default_participant_level() -> i32 { 1 }
+
 fn record_participant_damage_taken(
     participant: &mut BattleParticipantSnapshot,
     amount: f32,
@@ -639,6 +657,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
     }
 
     if active {
+        encounter.combat_log_start = encounter.combat_log.len();
         encounter.combat_completed_turns = 0;
         let mut logs = Vec::new();
         for participant in &mut encounter.participants {
@@ -646,6 +665,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.combat_turns_completed = 0;
             participant.combat_damage_taken_total = 0.0;
             participant.damage_contributors.clear();
+            participant.damage_contribution_amounts.clear();
             participant.arrogance_damage_source_ids.clear();
             participant.endless_pain_stacks = 0;
             participant.infinite_focus_target_id = None;
@@ -693,7 +713,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
                     "{}的希望化身随战斗结束，角色死亡",
                     participant.display_name
                 ));
-                if let Some(outcome) = participant_defeat_outcome(participant, was_alive) {
+                if let Some(outcome) = participant_defeat_outcome(participant, was_alive, None) {
                     defeat_outcomes.push(outcome);
                 }
             }
@@ -719,6 +739,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         }
         for participant in &mut encounter.participants {
             participant.damage_contributors.clear();
+            participant.damage_contribution_amounts.clear();
         }
     }
     encounter.active = active;
@@ -780,10 +801,16 @@ fn advance_participant_overhealing_shield(participant: &mut BattleParticipantSna
 fn record_participant_damage_contributor(
     participant: &mut BattleParticipantSnapshot,
     source_id: &str,
+    amount: f32,
 ) {
-    if source_id.trim().is_empty() || participant.target_id == source_id {
+    let amount = amount.max(0.0);
+    if source_id.trim().is_empty() || participant.target_id == source_id || amount <= f32::EPSILON {
         return;
     }
+    *participant
+        .damage_contribution_amounts
+        .entry(source_id.to_owned())
+        .or_default() += amount;
     if !participant
         .damage_contributors
         .iter()
@@ -1094,8 +1121,14 @@ fn apply_participant_liquid_body_healing(
 
 struct BattleDefeatOutcome {
     contributors: Vec<String>,
+    contribution_amounts: HashMap<String, f32>,
+    killer_id: Option<String>,
+    defeated_id: String,
     defeated_player_character: bool,
+    defeated_level: i32,
     defeated_max_hp: f32,
+    defeated_base_damage: f32,
+    defeated_rarity: UnitRarity,
 }
 
 struct BattleDamageResolution {
@@ -1110,15 +1143,27 @@ struct BattleDamageResolution {
 fn participant_defeat_outcome(
     participant: &mut BattleParticipantSnapshot,
     was_alive: bool,
+    killer_id: Option<&str>,
 ) -> Option<BattleDefeatOutcome> {
     if !was_alive || participant.alive {
         return None;
     }
     let contributors = std::mem::take(&mut participant.damage_contributors);
+    let contribution_amounts = std::mem::take(&mut participant.damage_contribution_amounts);
+    let killer_id = killer_id
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| contributors.last().cloned());
     Some(BattleDefeatOutcome {
         contributors,
+        contribution_amounts,
+        killer_id,
+        defeated_id: participant.target_id.clone(),
         defeated_player_character: participant.player_character,
+        defeated_level: participant.level.max(1),
         defeated_max_hp: participant.max_hp,
+        defeated_base_damage: participant.base_damage,
+        defeated_rarity: participant.unit_rarity,
     })
 }
 
@@ -1187,7 +1232,7 @@ fn apply_participant_damage_for_battle(
         participant.combat_damage_taken_total += damage_applied;
     }
     if was_alive && damage_applied > f32::EPSILON {
-        record_participant_damage_contributor(participant, source_id);
+        record_participant_damage_contributor(participant, source_id, damage_applied);
         if encounter_active {
             record_participant_arrogance_damage_source(participant, source_id);
             record_participant_endless_pain_stack(participant);
@@ -1211,7 +1256,7 @@ fn apply_participant_damage_for_battle(
         undying_rage_triggered,
         hope_avatar_triggered,
         hope_avatar_immune: false,
-        defeat_outcome: participant_defeat_outcome(participant, was_alive),
+        defeat_outcome: participant_defeat_outcome(participant, was_alive, Some(source_id)),
     }
 }
 
@@ -1236,7 +1281,7 @@ fn advance_participant_hope_avatar(
             "{}的希望化身结束，角色死亡",
             participant.display_name
         )),
-        participant_defeat_outcome(participant, was_alive),
+        participant_defeat_outcome(participant, was_alive, None),
     )
 }
 
@@ -1354,7 +1399,167 @@ fn apply_sin_on_sin_kill_participation(
     encounter.action_log.extend(logs);
 }
 
+fn grant_participant_experience(participant: &mut BattleParticipantSnapshot, amount: i32) -> i32 {
+    if amount <= 0 {
+        return 0;
+    }
+    participant.level = participant.level.max(1);
+    participant.exp = participant.exp.saturating_add(amount);
+    let mut level_ups = 0;
+    while participant.level < 999 {
+        let required = character_next_level_exp(participant.level);
+        if participant.exp < required {
+            break;
+        }
+        participant.exp -= required;
+        participant.level += 1;
+        level_ups += 1;
+    }
+    level_ups
+}
+
+fn battle_defeat_total_experience(
+    encounter: &BattleEncounter,
+    outcome: &BattleDefeatOutcome,
+) -> i32 {
+    let killer_level = outcome
+        .killer_id
+        .as_deref()
+        .and_then(|killer_id| {
+            encounter
+                .participants
+                .iter()
+                .find(|participant| participant.target_id == killer_id)
+        })
+        .map(|participant| participant.level.max(1))
+        .unwrap_or(outcome.defeated_level);
+    let pve_level_scale = if outcome.defeated_player_character {
+        1.0
+    } else {
+        killer_level as f32 / outcome.defeated_level.max(1) as f32
+    };
+    let threat = outcome.defeated_max_hp.max(0.0) * pve_level_scale
+        + outcome.defeated_base_damage.max(0.0) * pve_level_scale * 5.0
+        + outcome.defeated_level.max(1) as f32 * pve_level_scale * 3.0;
+    let mode_multiplier = if outcome.defeated_player_character {
+        TrpgBasicConfig::default().exp_gain_per_level_pvp
+    } else {
+        outcome.defeated_rarity.experience_multiplier()
+    };
+    (threat * mode_multiplier)
+        .round()
+        .clamp(1.0, i32::MAX as f32) as i32
+}
+
+fn apply_battle_experience_reward(encounter: &mut BattleEncounter, outcome: &BattleDefeatOutcome) {
+    let Some(killer_id) = outcome.killer_id.as_deref() else {
+        return;
+    };
+    let total_exp = battle_defeat_total_experience(encounter, outcome);
+    let player_ids = encounter
+        .participants
+        .iter()
+        .filter(|participant| {
+            participant.player_character && participant.target_id != outcome.defeated_id
+        })
+        .map(|participant| participant.target_id.clone())
+        .collect::<HashSet<_>>();
+    if !player_ids.contains(killer_id) {
+        return;
+    }
+
+    let killer_max_hp = encounter
+        .participants
+        .iter()
+        .find(|participant| participant.target_id == killer_id)
+        .map(|participant| participant.max_hp.max(1.0))
+        .unwrap_or(1.0);
+    let mut weights = outcome
+        .contribution_amounts
+        .iter()
+        .filter(|(source_id, amount)| player_ids.contains(*source_id) && **amount > f32::EPSILON)
+        .map(|(source_id, amount)| (source_id.clone(), *amount))
+        .collect::<HashMap<_, _>>();
+
+    // Healing and beneficial buffs only assist when they were applied to the eventual killer.
+    for entry in encounter.combat_log.iter().skip(encounter.combat_log_start) {
+        if entry.target_id != killer_id || !player_ids.contains(&entry.source_id) {
+            continue;
+        }
+        let support = match entry.kind {
+            CombatLogKind::Healing => entry.effective_amount.max(0.0),
+            CombatLogKind::Buff if entry.benefits.iter().any(|benefit| benefit == "有益") => {
+                killer_max_hp * 0.05
+            },
+            _ => 0.0,
+        };
+        if support > f32::EPSILON {
+            *weights.entry(entry.source_id.clone()).or_default() += support;
+        }
+    }
+    // The killing blow matters without overpowering sustained contribution.
+    let existing_weight = weights.values().copied().sum::<f32>().max(1.0);
+    *weights.entry(killer_id.to_owned()).or_default() += existing_weight * 0.20;
+    weights.retain(|source_id, weight| player_ids.contains(source_id) && *weight > f32::EPSILON);
+    if weights.is_empty() {
+        return;
+    }
+
+    let weight_sum = weights.values().copied().sum::<f32>();
+    let mut shares = weights
+        .into_iter()
+        .map(|(source_id, weight)| {
+            let exact = total_exp as f32 * weight / weight_sum;
+            (
+                source_id,
+                exact.floor() as i32,
+                exact.fract(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let assigned = shares.iter().map(|(_, amount, _)| *amount).sum::<i32>();
+    let mut remainder = total_exp.saturating_sub(assigned);
+    shares.sort_by(|left, right| {
+        right
+            .2
+            .total_cmp(&left.2)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (_, amount, _) in &mut shares {
+        if remainder == 0 {
+            break;
+        }
+        *amount += 1;
+        remainder -= 1;
+    }
+
+    for (source_id, amount, _) in shares {
+        if amount <= 0 {
+            continue;
+        }
+        if let Some(participant) = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == source_id)
+        {
+            let level_ups = grant_participant_experience(participant, amount);
+            encounter.action_log.push(if level_ups > 0 {
+                format!(
+                    "{}获得{}经验并提升{}级",
+                    participant.display_name, amount, level_ups
+                )
+            } else {
+                format!(
+                    "{}获得{}经验",
+                    participant.display_name, amount
+                )
+            });
+        }
+    }
+}
+
 fn apply_battle_defeat_outcome(encounter: &mut BattleEncounter, outcome: BattleDefeatOutcome) {
+    apply_battle_experience_reward(encounter, &outcome);
     if encounter.active {
         apply_dominion_target_death(encounter, outcome.defeated_max_hp);
     }
@@ -3231,6 +3436,7 @@ impl BattleRoundStore {
                 participants,
                 action_log: Vec::new(),
                 combat_log: Vec::new(),
+                combat_log_start: 0,
             });
         encounter_id
     }
@@ -3638,6 +3844,7 @@ impl BattleRoundStore {
             return false;
         };
         let actor_name = actor.display_name.clone();
+        let actor_snapshot = actor.clone();
         if !participant_can_act(actor) {
             encounter.action_log.push(format!(
                 "{}已经倒下或完成本轮行动，无法再次行动",
@@ -3668,7 +3875,8 @@ impl BattleRoundStore {
             ));
             return false;
         }
-        let final_damage = damage.max(0.0);
+        let final_damage =
+            damage.max(0.0) * personalized_pve_level_multiplier(&actor_snapshot, target);
         let resolution = apply_participant_damage_for_battle(
             target,
             final_damage,
@@ -3966,6 +4174,7 @@ impl BattleRoundStore {
                         let incoming_amount = (amount
                             * actor_damage_multiplier
                             * infinite_focus_multiplier
+                            * personalized_pve_level_multiplier(&actor_snapshot, target)
                             * target_damage_multiplier)
                             .max(0.0);
                         let target_large_hit_modifier = target_character
@@ -4503,10 +4712,16 @@ impl BattleRoundStore {
                             base_amount: 0.0,
                             effective_amount: 0.0,
                             modifiers: Vec::new(),
-                            benefits: vec![format!(
-                                "{}（{}回合）",
-                                buff.name, buff.turns_remaining,
-                            )],
+                            benefits: {
+                                let mut benefits = vec![format!(
+                                    "{}（{}回合）",
+                                    buff.name, buff.turns_remaining,
+                                )];
+                                if buff.beneficial {
+                                    benefits.push("有益".to_owned());
+                                }
+                                benefits
+                            },
                         });
                     }
                 },
@@ -5059,9 +5274,19 @@ fn sync_encounter_to_manager(
         {
             continue;
         }
+        let stat_config = manager.character_stat_config_for_target(&participant.target_id);
         let Some(character) = manager.player_characters.get_mut(&participant.target_id) else {
             continue;
         };
+        if character.level != participant.level {
+            character.level = participant.level.max(1);
+            update_character_from_status_with_config(character, &stat_config);
+            changed = true;
+        }
+        if character.exp != participant.exp {
+            character.exp = participant.exp.max(0);
+            changed = true;
+        }
         let hp = participant.hp.clamp(0.0, character.max_hp.max(0.0));
         let mp = participant.mp.clamp(0.0, character.max_mp.max(0.0));
         if (character.hp - hp).abs() > f32::EPSILON {
@@ -5801,6 +6026,10 @@ fn participant_from_character(
         unit_template_id: None,
         unit_character: None,
         player_character: true,
+        level: character.level.max(1),
+        exp: character.exp.max(0),
+        base_damage: status.str_.max(status.dex).max(status.int_).max(1) as f32,
+        unit_rarity: UnitRarity::Normal,
         turn: 0,
         combat_turns_completed: 0,
         str_: status.str_,
@@ -5874,6 +6103,7 @@ fn participant_from_character(
         penance_healing_bonus_percent: character_penance_healing_bonus_percent(character),
         penance_kill_assist_count: 0,
         damage_contributors: Vec::new(),
+        damage_contribution_amounts: HashMap::new(),
         wound_healing_taken_turns: 0,
         delayed_damage_ticks: Vec::new(),
         delayed_healing_ticks: Vec::new(),
@@ -5900,6 +6130,10 @@ fn participant_from_unit_template(
         unit_template_id: Some(unit_id.to_owned()),
         unit_character: Some(character.clone()),
         player_character: false,
+        level: character.level.max(1),
+        exp: 0,
+        base_damage: unit.base_damage.max(0.0),
+        unit_rarity: unit.rarity,
         turn: 0,
         combat_turns_completed: 0,
         str_: status.str_,
@@ -5973,6 +6207,7 @@ fn participant_from_unit_template(
         penance_healing_bonus_percent: character_penance_healing_bonus_percent(character),
         penance_kill_assist_count: 0,
         damage_contributors: Vec::new(),
+        damage_contribution_amounts: HashMap::new(),
         wound_healing_taken_turns: 0,
         delayed_damage_ticks: Vec::new(),
         delayed_healing_ticks: Vec::new(),
@@ -5997,6 +6232,10 @@ fn participant_from_target(
         unit_template_id: None,
         unit_character: None,
         player_character: false,
+        level: 1,
+        exp: 0,
+        base_damage: 0.0,
+        unit_rarity: UnitRarity::Normal,
         turn: 0,
         combat_turns_completed: 0,
         str_: 0,
@@ -6064,6 +6303,7 @@ fn participant_from_target(
         penance_healing_bonus_percent: 0.0,
         penance_kill_assist_count: 0,
         damage_contributors: Vec::new(),
+        damage_contribution_amounts: HashMap::new(),
         wound_healing_taken_turns: 0,
         delayed_damage_ticks: Vec::new(),
         delayed_healing_ticks: Vec::new(),
@@ -6096,6 +6336,9 @@ fn sync_participant_from_manager(
             participant.display_name =
                 unit_participant_display_name(&participant.target_id, unit_id, unit);
             participant.player_character = false;
+            participant.level = character.level.max(1);
+            participant.base_damage = unit.base_damage.max(0.0);
+            participant.unit_rarity = unit.rarity;
             participant.max_hp = character.max_hp;
             participant.max_mp = character.max_mp;
             participant.hp_regen = character.hp_regen;
@@ -6186,6 +6429,11 @@ fn sync_participant_from_manager(
             manager,
         );
         participant.player_character = true;
+        participant.level = character.level.max(1);
+        participant.exp = character.exp.max(0);
+        let total = character.status.combined(&character.extra_status);
+        participant.base_damage = total.str_.max(total.dex).max(total.int_).max(1) as f32;
+        participant.unit_rarity = UnitRarity::Normal;
         participant.max_hp = character.max_hp;
         participant.max_mp = character.max_mp;
         participant.hp_regen = character.hp_regen;
@@ -6370,6 +6618,24 @@ fn participant_order_speed(
         1.0
     };
     base_speed * inspiration_multiplier
+}
+
+/// WoW-style PvE normalization: a mob is evaluated at each interacting player's
+/// level. The encounter stores one shared health percentage, so player damage is
+/// converted back into the template mob's health units. Mob damage is scaled up
+/// or down for the particular player it hits. Player-versus-player is unchanged.
+fn personalized_pve_level_multiplier(
+    source: &BattleParticipantSnapshot,
+    target: &BattleParticipantSnapshot,
+) -> f32 {
+    if source.player_character == target.player_character {
+        return 1.0;
+    }
+    let mob = if source.player_character { target } else { source };
+    if mob.unit_template_id.is_none() {
+        return 1.0;
+    }
+    target.level.max(1) as f32 / source.level.max(1) as f32
 }
 
 fn ordered_participant_indices(encounter: &BattleEncounter) -> Vec<usize> {
@@ -7635,6 +7901,10 @@ mod area_tests {
             unit_template_id: None,
             unit_character: None,
             player_character: false,
+            level: 1,
+            exp: 0,
+            base_damage: 0.0,
+            unit_rarity: UnitRarity::Normal,
             turn: 0,
             combat_turns_completed: 0,
             str_: 0,
@@ -7702,6 +7972,7 @@ mod area_tests {
             penance_healing_bonus_percent: 0.0,
             penance_kill_assist_count: 0,
             damage_contributors: Vec::new(),
+            damage_contribution_amounts: HashMap::new(),
             wound_healing_taken_turns: 0,
             delayed_damage_ticks: Vec::new(),
             delayed_healing_ticks: Vec::new(),
@@ -7807,6 +8078,10 @@ mod tests {
             unit_template_id: None,
             unit_character: None,
             player_character: false,
+            level: 1,
+            exp: 0,
+            base_damage: 0.0,
+            unit_rarity: UnitRarity::Normal,
             turn,
             combat_turns_completed: 0,
             str_: 0,
@@ -7874,6 +8149,7 @@ mod tests {
             penance_healing_bonus_percent: 0.0,
             penance_kill_assist_count: 0,
             damage_contributors: Vec::new(),
+            damage_contribution_amounts: HashMap::new(),
             wound_healing_taken_turns: 0,
             delayed_damage_ticks: Vec::new(),
             delayed_healing_ticks: Vec::new(),
@@ -9111,6 +9387,8 @@ mod tests {
             label: "史莱姆".to_owned(),
             note: String::new(),
             legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
             character: PlayerCharacter {
                 hp: 8.0,
                 max_hp: 12.0,
@@ -9165,6 +9443,8 @@ mod tests {
             label: "史莱姆".to_owned(),
             note: String::new(),
             legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
             character: PlayerCharacter {
                 hp: 20.0,
                 max_hp: 20.0,
@@ -9365,6 +9645,8 @@ mod tests {
             label: "史莱姆".to_owned(),
             note: String::new(),
             legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
             character: PlayerCharacter {
                 hp: 20.0,
                 max_hp: 20.0,
@@ -9443,6 +9725,8 @@ mod tests {
             label: "史莱姆".to_owned(),
             note: String::new(),
             legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
             character: PlayerCharacter {
                 hp: 10.0,
                 max_hp: 20.0,
@@ -9510,6 +9794,8 @@ mod tests {
             label: "史莱姆".to_owned(),
             note: String::new(),
             legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
             character: PlayerCharacter {
                 hp: 4.0,
                 max_hp: 6.0,
@@ -15772,5 +16058,111 @@ mod tests {
             1
         );
         assert!((store.encounters["battle"].participants[1].hp - 96.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn pve_level_scaling_is_personalized_and_pvp_is_unscaled() {
+        let mut player = participant("player", 0);
+        player.player_character = true;
+        player.level = 10;
+        let mut other_player = participant("other-player", 0);
+        other_player.player_character = true;
+        other_player.level = 3;
+        let mut mob = participant("unit:wolf", 0);
+        mob.unit_template_id = Some("wolf".to_owned());
+        mob.level = 5;
+
+        assert!((personalized_pve_level_multiplier(&player, &mob) - 0.5).abs() < f32::EPSILON);
+        assert!((personalized_pve_level_multiplier(&mob, &player) - 2.0).abs() < f32::EPSILON);
+        assert_eq!(
+            personalized_pve_level_multiplier(&player, &other_player),
+            1.0
+        );
+    }
+
+    #[test]
+    fn kill_experience_is_weighted_across_damage_healing_and_buffs_without_exceeding_total() {
+        let mut killer = participant("killer", 0);
+        killer.player_character = true;
+        killer.level = 1;
+        let mut damage_assist = participant("damage-assist", 0);
+        damage_assist.player_character = true;
+        damage_assist.level = 1;
+        let mut healer = participant("healer", 0);
+        healer.player_character = true;
+        healer.level = 1;
+        let mut buffer = participant("buffer", 0);
+        buffer.player_character = true;
+        buffer.level = 1;
+        let mut victim = participant("unit:wolf", 0);
+        victim.unit_template_id = Some("wolf".to_owned());
+        victim.level = 1;
+        victim.max_hp = 20.0;
+        victim.base_damage = 2.0;
+
+        let mut encounter = BattleEncounter {
+            participants: vec![killer, damage_assist, healer, buffer, victim],
+            combat_log: vec![
+                CombatLogEntry {
+                    round: 1,
+                    kind: CombatLogKind::Healing,
+                    source_id: "healer".to_owned(),
+                    source_name: "healer".to_owned(),
+                    target_id: "killer".to_owned(),
+                    target_name: "killer".to_owned(),
+                    action_name: "heal".to_owned(),
+                    base_amount: 4.0,
+                    effective_amount: 4.0,
+                    modifiers: Vec::new(),
+                    benefits: Vec::new(),
+                },
+                CombatLogEntry {
+                    round: 1,
+                    kind: CombatLogKind::Buff,
+                    source_id: "buffer".to_owned(),
+                    source_name: "buffer".to_owned(),
+                    target_id: "killer".to_owned(),
+                    target_name: "killer".to_owned(),
+                    action_name: "buff".to_owned(),
+                    base_amount: 0.0,
+                    effective_amount: 0.0,
+                    modifiers: Vec::new(),
+                    benefits: vec!["有益".to_owned()],
+                },
+            ],
+            ..Default::default()
+        };
+        let outcome = BattleDefeatOutcome {
+            contributors: vec!["killer".to_owned(), "damage-assist".to_owned()],
+            contribution_amounts: HashMap::from([
+                ("killer".to_owned(), 6.0),
+                ("damage-assist".to_owned(), 10.0),
+            ]),
+            killer_id: Some("killer".to_owned()),
+            defeated_id: "unit:wolf".to_owned(),
+            defeated_player_character: false,
+            defeated_level: 1,
+            defeated_max_hp: 20.0,
+            defeated_base_damage: 2.0,
+            defeated_rarity: UnitRarity::Normal,
+        };
+        let total = battle_defeat_total_experience(&encounter, &outcome);
+
+        apply_battle_experience_reward(&mut encounter, &outcome);
+
+        let awarded = encounter
+            .participants
+            .iter()
+            .filter(|participant| participant.player_character)
+            .map(|participant| participant.exp)
+            .sum::<i32>();
+        assert_eq!(awarded, total);
+        for id in ["killer", "damage-assist", "healer", "buffer"] {
+            assert!(encounter
+                .participants
+                .iter()
+                .find(|participant| participant.target_id == id)
+                .is_some_and(|participant| participant.exp > 0));
+        }
     }
 }

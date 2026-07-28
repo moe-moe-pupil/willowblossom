@@ -769,6 +769,27 @@ pub struct RandomPool {
     pub checked_results: Vec<RandomPoolCheckedResult>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitRarity {
+    #[default]
+    Normal,
+    Rare,
+    Elite,
+    RareElite,
+}
+
+impl UnitRarity {
+    pub fn experience_multiplier(self) -> f32 {
+        match self {
+            Self::Normal => 1.0,
+            Self::Rare => 1.5,
+            Self::Elite => 2.0,
+            Self::RareElite => 3.0,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UnitPoolEntry {
     #[serde(default)]
@@ -777,6 +798,11 @@ pub struct UnitPoolEntry {
     pub note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_member_id: Option<String>,
+    #[serde(default)]
+    pub rarity: UnitRarity,
+    /// Unmodified per-hit damage used for threat/experience valuation and PvE scaling.
+    #[serde(default)]
+    pub base_damage: f32,
     #[serde(default)]
     pub character: PlayerCharacter,
 }
@@ -787,6 +813,8 @@ impl Default for UnitPoolEntry {
             label: "新单位".to_owned(),
             note: String::new(),
             legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
             character: PlayerCharacter::default(),
         }
     }
@@ -3627,6 +3655,8 @@ impl NapcatMessageManager {
                 label,
                 note: note_parts.join("\n"),
                 legacy_member_id,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character,
             });
             summary.unit_templates += 1;
@@ -10747,6 +10777,8 @@ mod tests {
                 label: "行尸".to_owned(),
                 note: "缓慢近战单位".to_owned(),
                 legacy_member_id: None,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("行尸"),
             });
         manager
@@ -10755,6 +10787,8 @@ mod tests {
                 label: "弓手".to_owned(),
                 note: "远程单位".to_owned(),
                 legacy_member_id: None,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("弓手"),
             });
         manager.messages.insert("2".to_owned(), vec![test_message(
@@ -10795,6 +10829,8 @@ mod tests {
                 label: "直接单位".to_owned(),
                 note: String::new(),
                 legacy_member_id: None,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("直接单位"),
             });
         manager
@@ -10803,6 +10839,8 @@ mod tests {
                 label: "别名B".to_owned(),
                 note: String::new(),
                 legacy_member_id: Some("20001".to_owned()),
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("别名B"),
             });
         manager
@@ -10811,6 +10849,8 @@ mod tests {
                 label: "别名A".to_owned(),
                 note: String::new(),
                 legacy_member_id: Some("20001".to_owned()),
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("别名A"),
             });
         manager.unit_pool.insert(
@@ -10819,6 +10859,8 @@ mod tests {
                 label: "旧兼容单位".to_owned(),
                 note: String::new(),
                 legacy_member_id: None,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("旧兼容单位"),
             },
         );
@@ -10846,12 +10888,16 @@ mod tests {
             label: "新弓手".to_owned(),
             note: "导入版本".to_owned(),
             legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
             character: completed_character("新弓手"),
         });
         source.unit_pool.insert("zombie".to_owned(), UnitPoolEntry {
             label: "行尸".to_owned(),
             note: "缓慢近战单位".to_owned(),
             legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
             character: completed_character("行尸"),
         });
         let json = source.to_unit_pool_export_json().unwrap();
@@ -10866,6 +10912,8 @@ mod tests {
                 label: "旧弓手".to_owned(),
                 note: "本地旧版本".to_owned(),
                 legacy_member_id: None,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("旧弓手"),
             });
 
