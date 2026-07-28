@@ -179,8 +179,6 @@ const PLANET_SCIENCE_LAB_CENTER: IVec2 = IVec2::new(-45, 20);
 const PLANET_SCIENCE_LAB_FLOOR_Y: i32 = 485;
 const VOXEL_MINIMAP_RESOLUTION: usize = 64;
 const VOXEL_OCCLUSION_FADE_SHADER: &str = "shaders/voxel_occlusion_fade.wgsl";
-const VOXEL_OCCLUSION_FADE_PREPASS_SHADER: &str =
-    "shaders/voxel_occlusion_fade_prepass.wgsl";
 const VOXEL_OCCLUSION_FOCUS_RADIUS: f32 = PLAYER_STANDEE_HEIGHT;
 pub(crate) const DEFAULT_VOXEL_OCCLUSION_OPACITY: f32 = 0.2;
 
@@ -223,10 +221,6 @@ struct VoxelOcclusionFadeExtension {
 
 impl MaterialExtension for VoxelOcclusionFadeExtension {
     fn fragment_shader() -> ShaderRef { VOXEL_OCCLUSION_FADE_SHADER.into() }
-
-    fn prepass_fragment_shader() -> ShaderRef {
-        VOXEL_OCCLUSION_FADE_PREPASS_SHADER.into()
-    }
 
     fn deferred_fragment_shader() -> ShaderRef { VOXEL_OCCLUSION_FADE_SHADER.into() }
 }
@@ -9861,27 +9855,6 @@ mod tests {
             ..default()
         });
         assert!(matches!(blended.base.alpha_mode, AlphaMode::Blend));
-    }
-
-    #[test]
-    fn replay_fade_uses_its_discard_shader_in_the_depth_prepass() {
-        assert!(matches!(
-            VoxelOcclusionFadeExtension::prepass_fragment_shader(),
-            ShaderRef::Path(path) if path == VOXEL_OCCLUSION_FADE_PREPASS_SHADER.into()
-        ));
-    }
-
-    #[test]
-    fn replay_fade_applies_opacity_to_the_whole_selected_wall() {
-        let color_shader = include_str!("../assets/shaders/voxel_occlusion_fade.wgsl");
-        let prepass_shader =
-            include_str!("../assets/shaders/voxel_occlusion_fade_prepass.wgsl");
-
-        for shader in [color_shader, prepass_shader] {
-            assert!(shader.contains("hash_pixel(floor(in.position.xy)) >= requested_opacity"));
-            assert!(!shader.contains("distance_from_view"));
-            assert!(!shader.contains("silhouette_overlap"));
-        }
     }
 
     #[test]
