@@ -203,6 +203,7 @@ pub struct BattleRoundUiState {
     selected_add_player: HashMap<String, String>,
     selected_add_unit: HashMap<String, String>,
     selected_action_target: HashMap<String, String>,
+    selected_action_actor: HashMap<String, String>,
     selected_skill_index: HashMap<String, usize>,
     selected_item_index: HashMap<String, usize>,
     selected_item_skill_index: HashMap<String, usize>,
@@ -2808,33 +2809,31 @@ fn encounter_action_ui(
         "当前行动者：{}",
         actor.display_name
     ));
+    let actor_changed = ui_state
+        .selected_action_actor
+        .insert(
+            encounter_id.to_owned(),
+            actor.target_id.clone(),
+        )
+        .as_deref()
+        != Some(actor.target_id.as_str());
     let target = ui_state
         .selected_action_target
         .entry(encounter_id.to_owned())
         .or_insert_with(|| {
-            target_options
-                .iter()
-                .find(|(target_id, _)| {
-                    target_id != &actor.target_id && living_target_ids.contains(target_id)
-                })
-                .or_else(|| {
-                    target_options
-                        .iter()
-                        .find(|(target_id, _)| target_id != &actor.target_id)
-                })
-                .or_else(|| target_options.first())
-                .map(|(target_id, _)| target_id.clone())
-                .unwrap_or_default()
+            default_action_target_id(
+                &target_options,
+                &living_target_ids,
+                &actor.target_id,
+            )
         });
-    if !target_options
-        .iter()
-        .any(|(target_id, _)| target_id == target)
-    {
-        *target = target_options
-            .first()
-            .map(|(target_id, _)| target_id.clone())
-            .unwrap_or_default();
-    }
+    update_action_target_for_actor(
+        target,
+        &actor.target_id,
+        actor_changed,
+        &target_options,
+        &living_target_ids,
+    );
     targeting_line.actor_id = Some(actor.target_id.clone());
     targeting_line.target_id = (!target.is_empty()).then(|| target.clone());
     let amount = ui_state
@@ -3062,6 +3061,43 @@ fn encounter_action_ui(
     }
 
     changed
+}
+
+fn default_action_target_id(
+    target_options: &[(String, String)],
+    living_target_ids: &HashSet<String>,
+    actor_id: &str,
+) -> String {
+    target_options
+        .iter()
+        .find(|(target_id, _)| target_id != actor_id && living_target_ids.contains(target_id))
+        .or_else(|| {
+            target_options
+                .iter()
+                .find(|(target_id, _)| target_id != actor_id)
+        })
+        .or_else(|| target_options.first())
+        .map(|(target_id, _)| target_id.clone())
+        .unwrap_or_default()
+}
+
+fn update_action_target_for_actor(
+    target: &mut String,
+    actor_id: &str,
+    actor_changed: bool,
+    target_options: &[(String, String)],
+    living_target_ids: &HashSet<String>,
+) {
+    let target_exists = target_options
+        .iter()
+        .any(|(target_id, _)| target_id == target);
+    if !target_exists || (actor_changed && target == actor_id) {
+        *target = default_action_target_id(
+            target_options,
+            living_target_ids,
+            actor_id,
+        );
+    }
 }
 
 fn encounter_log_ui(ui: &mut egui::Ui, store: &BattleRoundStore, encounter_id: &str) {
@@ -7680,6 +7716,67 @@ mod area_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_target_moves_off_the_new_actor_when_turn_changes() {
+        let target_options = vec![
+            ("a".to_owned(), "A".to_owned()),
+            ("b".to_owned(), "B".to_owned()),
+        ];
+        let living_target_ids = HashSet::from(["a".to_owned(), "b".to_owned()]);
+        let mut target = "b".to_owned();
+
+        update_action_target_for_actor(
+            &mut target,
+            "b",
+            true,
+            &target_options,
+            &living_target_ids,
+        );
+
+        assert_eq!(target, "a");
+    }
+
+    #[test]
+    fn action_target_keeps_a_non_self_selection_when_turn_changes() {
+        let target_options = vec![
+            ("a".to_owned(), "A".to_owned()),
+            ("b".to_owned(), "B".to_owned()),
+            ("c".to_owned(), "C".to_owned()),
+        ];
+        let living_target_ids = HashSet::from(["a".to_owned(), "b".to_owned(), "c".to_owned()]);
+        let mut target = "c".to_owned();
+
+        update_action_target_for_actor(
+            &mut target,
+            "b",
+            true,
+            &target_options,
+            &living_target_ids,
+        );
+
+        assert_eq!(target, "c");
+    }
+
+    #[test]
+    fn action_target_allows_manual_self_selection_during_the_same_turn() {
+        let target_options = vec![
+            ("a".to_owned(), "A".to_owned()),
+            ("b".to_owned(), "B".to_owned()),
+        ];
+        let living_target_ids = HashSet::from(["a".to_owned(), "b".to_owned()]);
+        let mut target = "b".to_owned();
+
+        update_action_target_for_actor(
+            &mut target,
+            "b",
+            false,
+            &target_options,
+            &living_target_ids,
+        );
+
+        assert_eq!(target, "b");
+    }
 
     fn empty_manager() -> NapcatMessageManager {
         NapcatMessageManager {
