@@ -2486,6 +2486,11 @@ fn replay_controls(
                 ReplayMode::Playing | ReplayMode::Paused
             ) && ui.button("▶ 播放").clicked()
             {
+                let newly_recorded_movement_start = studio
+                    .replay
+                    .as_ref()
+                    .map(|replay| replay.duration_ms)
+                    .unwrap_or_default();
                 let imported = studio
                     .replay
                     .as_mut()
@@ -2495,7 +2500,8 @@ fn replay_controls(
                     .unwrap_or_default();
                 start_playback(studio, grids);
                 if imported > 0 {
-                    studio.status = format!("正在回放（已载入 {imported} 段刚才控制玩家的移动）");
+                    studio.playback_ms = newly_recorded_movement_start;
+                    studio.status = format!("正在回放（已跳转到刚载入的 {imported} 段玩家移动）");
                 }
             }
             ui.add(
