@@ -9872,6 +9872,19 @@ mod tests {
     }
 
     #[test]
+    fn replay_fade_applies_opacity_to_the_whole_selected_wall() {
+        let color_shader = include_str!("../assets/shaders/voxel_occlusion_fade.wgsl");
+        let prepass_shader =
+            include_str!("../assets/shaders/voxel_occlusion_fade_prepass.wgsl");
+
+        for shader in [color_shader, prepass_shader] {
+            assert!(shader.contains("hash_pixel(floor(in.position.xy)) >= requested_opacity"));
+            assert!(!shader.contains("distance_from_view"));
+            assert!(!shader.contains("silhouette_overlap"));
+        }
+    }
+
+    #[test]
     fn replay_fade_uses_the_whole_mesh_only_when_it_blocks_the_sightline() {
         let bounds = Aabb::from_min_max(Vec3::splat(-1.0), Vec3::splat(1.0));
         let blocking_transform = GlobalTransform::from_translation(Vec3::new(0.0, 0.0, 5.0));
