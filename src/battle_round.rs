@@ -2199,7 +2199,7 @@ fn encounter_ui(
                     .changed();
                 changed |= ui
                     .checkbox(&mut encounter.sort_by_turn, "排序")
-                    .on_hover_text("按速度和AGI排序行动顺序。")
+                    .on_hover_text("仅按AGI排序行动顺序。")
                     .changed();
                 if ui.button("刷新玩家").clicked() {
                     changed |= refresh_encounter_players(encounter, manager);
@@ -6339,31 +6339,22 @@ fn participant_order_speed(
 fn ordered_participant_indices(encounter: &BattleEncounter) -> Vec<usize> {
     let mut indices = (0..encounter.participants.len()).collect::<Vec<_>>();
     if encounter.sort_by_turn {
-        let living_player_count = living_player_participant_count(encounter);
         indices.sort_by(|left, right| {
             let left_participant = &encounter.participants[*left];
             let right_participant = &encounter.participants[*right];
-            participant_order_speed(
-                right_participant,
-                living_player_count,
-                encounter.active,
-            )
-            .total_cmp(&participant_order_speed(
-                left_participant,
-                living_player_count,
-                encounter.active,
-            ))
-            .then_with(|| right_participant.agi.cmp(&left_participant.agi))
-            .then_with(|| {
-                left_participant
-                    .action_done
-                    .cmp(&right_participant.action_done)
-            })
-            .then_with(|| {
-                left_participant
-                    .display_name
-                    .cmp(&right_participant.display_name)
-            })
+            right_participant
+                .agi
+                .cmp(&left_participant.agi)
+                .then_with(|| {
+                    left_participant
+                        .action_done
+                        .cmp(&right_participant.action_done)
+                })
+                .then_with(|| {
+                    left_participant
+                        .display_name
+                        .cmp(&right_participant.display_name)
+                })
         });
     } else {
         indices.sort_by(|left, right| {
@@ -8926,7 +8917,7 @@ mod tests {
     }
 
     #[test]
-    fn battle_order_uses_gale_force_low_survivor_speed_when_player_count_drops() {
+    fn battle_order_uses_agi_and_ignores_speed_modifiers() {
         let mut manager = empty_manager();
         let gale = PlayerCharacter {
             hp: 10.0,
@@ -8993,7 +8984,7 @@ mod tests {
                 .into_iter()
                 .map(|index| encounter.participants[index].target_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["fast", "gale", "p3", "p4"]
+            vec!["gale", "fast", "p3", "p4"]
         );
 
         encounter
