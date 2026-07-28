@@ -62,7 +62,10 @@ use bevy_egui::{
     EguiContexts,
     EguiPrimaryContextPass,
 };
-use bevy_persistent::Persistent;
+use bevy_persistent::{
+    Persistent,
+    StorageFormat,
+};
 use crossbeam_channel::{
     bounded,
     unbounded,
@@ -139,10 +142,24 @@ pub(crate) struct ReplayCameraApplied;
 
 impl Plugin for ReplayPlugin {
     fn build(&self, app: &mut App) {
+        let voice_favorites = Persistent::<ReplayVoiceFavorites>::builder()
+            .name("replay_voice_favorites")
+            .format(StorageFormat::Toml)
+            .path(
+                Path::new(".data")
+                    .join("willowblossom")
+                    .join("replay_voice_favorites.toml"),
+            )
+            .default(ReplayVoiceFavorites::default())
+            .revertible(true)
+            .revert_to_default_on_deserialization_errors(true)
+            .build()
+            .expect("failed to initialize replay voice favorites");
         app.init_resource::<ReplayStudio>()
             .init_resource::<ReplayVideoCaptureActive>()
             .init_resource::<PreviewSpeechController>()
             .init_resource::<ReplaySnapshotTracker>()
+            .insert_resource(voice_favorites)
             .add_systems(
                 Update,
                 (
@@ -459,7 +476,7 @@ enum DirectorMotion {
     DriftRight,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SpeakerVoiceSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     voice_name: Option<String>,
@@ -471,6 +488,18 @@ struct SpeakerVoiceSettings {
     pitch: i32,
     speech_rate: i32,
     volume: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ReplayVoiceFavorite {
+    name: String,
+    settings: SpeakerVoiceSettings,
+}
+
+#[derive(Resource, Debug, Clone, Default, Serialize, Deserialize)]
+struct ReplayVoiceFavorites {
+    #[serde(default)]
+    favorites: Vec<ReplayVoiceFavorite>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -519,6 +548,8 @@ pub(crate) struct ReplayStudio {
     speech_enabled: bool,
     speech_volume: f32,
     speech_settings_open: bool,
+    voice_search: String,
+    voice_favorite_name_drafts: HashMap<u64, String>,
     deepseek_custom_prompt: String,
     project_export_path: String,
     project_import_path: String,
@@ -625,6 +656,8 @@ impl Default for ReplayStudio {
             speech_enabled: true,
             speech_volume: 1.25,
             speech_settings_open: false,
+            voice_search: String::new(),
+            voice_favorite_name_drafts: HashMap::new(),
             deepseek_custom_prompt: String::new(),
             project_export_path: DEFAULT_REPLAY_PATH.to_owned(),
             project_import_path: DEFAULT_REPLAY_PATH.to_owned(),
@@ -1808,6 +1841,7 @@ fn replay_studio_ui(
     deepseek_sender: Option<Res<DeepseekIOSender>>,
     mut deepseek_manager: ResMut<Persistent<DeepseekManager>>,
     mut studio: ResMut<ReplayStudio>,
+    mut voice_favorites: ResMut<Persistent<ReplayVoiceFavorites>>,
     speech: Res<PreviewSpeechController>,
     camera: Query<&Transform, With<VoxelViewportCamera>>,
     standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
@@ -1864,7 +1898,7 @@ fn replay_studio_ui(
     }
 
     if studio.speech_settings_open && !capture_active.0 {
-        speech_settings_window(ctx, &mut studio);
+        speech_settings_window(ctx, &mut studio, &mut voice_favorites);
     }
 
     if matches!(
@@ -2538,7 +2572,11 @@ fn can_start_director_export(studio: &ReplayStudio, has_active_campaign: bool) -
             || has_active_campaign)
 }
 
-fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
+fn speech_settings_window(
+    ctx: &egui::Context,
+    studio: &mut ReplayStudio,
+    voice_favorites: &mut Persistent<ReplayVoiceFavorites>,
+) {
     let mut open = studio.speech_settings_open;
     let installed_speakers = installed_emotivoice_speakers();
     let speakers = studio
@@ -2559,6 +2597,7 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         })
         .unwrap_or_default();
     let mut settings_changed = false;
+    let mut pending_status = None;
 
     egui::Window::new("角色语音设置")
         .id(egui::Id::new("replay-speaker-voice-settings"))
@@ -2567,15 +2606,58 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
         .max_width(620.0)
         .show(ctx, |ui| {
             ui.label(format!(
-                "EmotiVoice 已加载 {} 个固定中文角色音色。同一玩家始终使用同一说话人 ID；声音较机械，但不会因台词内容改变声线。",
-                installed_speakers.len()
+                "官方 EmotiVoice 音色目录共 {} 个音色。同一玩家始终使用同一说话人 ID；收藏会自动保存到本机。",
+                emotivoice_voice_profiles().len()
             ));
             if installed_speakers.is_empty() {
                 ui.colored_label(
                     egui::Color32::YELLOW,
-                    "未找到已安装音色目录，暂时只显示推荐音色。",
+                    "未找到已安装的 EmotiVoice 运行环境；仍可配置音色，安装后即可试听和导出。",
                 );
             }
+            ui.horizontal(|ui| {
+                ui.label("搜索音色");
+                ui.text_edit_singleline(&mut studio.voice_search)
+                    .on_hover_text("可按音色 ID、姓名、性别或说明筛选；留空显示全部音色");
+                if !studio.voice_search.is_empty() && ui.button("清空").clicked() {
+                    studio.voice_search.clear();
+                }
+            });
+            ui.collapsing(
+                format!("收藏管理（{}）", voice_favorites.favorites.len()),
+                |ui| {
+                    if voice_favorites.favorites.is_empty() {
+                        ui.label("尚未收藏角色语音设置。");
+                    }
+                    let mut delete_index = None;
+                    for (index, favorite) in voice_favorites.favorites.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "{} · {} · {} · 语速 {:+}% · 音量 {:.0}%",
+                                favorite.name,
+                                emotivoice_speaker_label(
+                                    favorite.settings.voice_name.as_deref().unwrap_or_default()
+                                ),
+                                resolved_emotivoice_emotion(
+                                    favorite.settings.emotion.as_deref()
+                                ),
+                                favorite.settings.speech_rate,
+                                favorite.settings.volume * 100.0,
+                            ));
+                            if ui.small_button("删除").clicked() {
+                                delete_index = Some(index);
+                            }
+                        });
+                    }
+                    if let Some(index) = delete_index {
+                        voice_favorites.favorites.remove(index);
+                        pending_status = Some(match voice_favorites.persist() {
+                            Ok(()) => "语音收藏已删除并保存".to_owned(),
+                            Err(err) => format!("删除了语音收藏，但保存失败：{err}"),
+                        });
+                    }
+                },
+            );
             if speakers.is_empty() {
                 ui.label("请先录制回放或从现有聊天生成回放。");
                 return;
@@ -2609,28 +2691,35 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                             .selected_text(emotivoice_speaker_label(&selected_speaker))
                             .height(360.0)
                             .show_ui(ui, |ui| {
+                                let query = studio.voice_search.trim().to_lowercase();
                                 ui.strong("男声");
-                                for (speaker, label) in EMOTIVOICE_VOICE_PROFILES {
-                                    if !label.starts_with("男声") {
+                                for profile in emotivoice_voice_profiles() {
+                                    if profile.gender != "M"
+                                        || !emotivoice_voice_matches(profile, &query)
+                                    {
                                         continue;
                                     }
                                     ui.selectable_value(
                                         &mut selected_speaker,
-                                        speaker.to_owned(),
-                                        label,
-                                    );
+                                        profile.id.to_owned(),
+                                        emotivoice_profile_label(profile),
+                                    )
+                                    .on_hover_text(profile.description);
                                 }
                                 ui.separator();
                                 ui.strong("女声");
-                                for (speaker, label) in EMOTIVOICE_VOICE_PROFILES {
-                                    if !label.starts_with("女声") {
-                                            continue;
+                                for profile in emotivoice_voice_profiles() {
+                                    if profile.gender != "F"
+                                        || !emotivoice_voice_matches(profile, &query)
+                                    {
+                                        continue;
                                     }
                                     ui.selectable_value(
                                         &mut selected_speaker,
-                                        speaker.to_owned(),
-                                        label,
-                                    );
+                                        profile.id.to_owned(),
+                                        emotivoice_profile_label(profile),
+                                    )
+                                    .on_hover_text(profile.description);
                                 }
                             });
                         if ui
@@ -2652,6 +2741,26 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                             settings.voice_name = Some(selected_speaker);
                             settings_changed = true;
                         }
+                        ui.horizontal(|ui| {
+                            ui.label("情绪");
+                            egui::ComboBox::from_id_salt(("replay-emotivoice-emotion", sender_id))
+                                .selected_text(resolved_emotivoice_emotion(
+                                    settings.emotion.as_deref(),
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for emotion in EMOTIVOICE_EMOTIONS {
+                                        settings_changed |= ui
+                                            .selectable_value(
+                                                settings
+                                                    .emotion
+                                                    .get_or_insert_with(|| "普通".to_owned()),
+                                                emotion.to_owned(),
+                                                emotion,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                        });
                         settings_changed |= ui
                             .add(
                                 egui::Slider::new(&mut settings.speech_rate, -30..=180)
@@ -2666,6 +2775,56 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                                     .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
                             )
                             .changed();
+                        ui.horizontal(|ui| {
+                            ui.menu_button("应用收藏", |ui| {
+                                if voice_favorites.favorites.is_empty() {
+                                    ui.label("尚无收藏");
+                                }
+                                for favorite in &voice_favorites.favorites {
+                                    if ui.button(favorite.name.as_str()).clicked() {
+                                        *settings = favorite.settings.clone();
+                                        settings_changed = true;
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            let draft = studio
+                                .voice_favorite_name_drafts
+                                .entry(*sender_id)
+                                .or_default();
+                            ui.add(
+                                egui::TextEdit::singleline(draft)
+                                    .hint_text("收藏名称")
+                                    .desired_width(180.0),
+                            );
+                            if ui.button("收藏当前设置").clicked() {
+                                let favorite_name = if draft.trim().is_empty() {
+                                    format!("{name} · {}", emotivoice_speaker_label(
+                                        settings.voice_name.as_deref().unwrap_or_default()
+                                    ))
+                                } else {
+                                    draft.trim().to_owned()
+                                };
+                                let favorite = ReplayVoiceFavorite {
+                                    name: favorite_name.clone(),
+                                    settings: settings.clone(),
+                                };
+                                if let Some(existing) = voice_favorites
+                                    .favorites
+                                    .iter_mut()
+                                    .find(|item| item.name.eq_ignore_ascii_case(&favorite_name))
+                                {
+                                    *existing = favorite;
+                                } else {
+                                    voice_favorites.favorites.push(favorite);
+                                }
+                                *draft = favorite_name;
+                                pending_status = Some(match voice_favorites.persist() {
+                                    Ok(()) => "语音收藏已保存，重新启动后仍会保留".to_owned(),
+                                    Err(err) => format!("已添加语音收藏，但保存失败：{err}"),
+                                });
+                            }
+                        });
                         if ui.button("恢复该角色默认值").clicked() {
                             *settings = defaults;
                             settings_changed = true;
@@ -2675,7 +2834,9 @@ fn speech_settings_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
             });
         });
     studio.speech_settings_open = open;
-    if settings_changed {
+    if let Some(status) = pending_status {
+        studio.status = status;
+    } else if settings_changed {
         studio.status = "角色语音设置已更新，将用于下一句预览和视频导出".to_owned();
     }
 }
@@ -4018,31 +4179,109 @@ fn write_narration_track(
         .map_err(|err| format!("完成角色语音轨道失败：{err}"))
 }
 
-const EMOTIVOICE_VOICE_PROFILES: [(&str, &str); 11] = [
-    ("9000", "男声 9000（推荐）"),
-    ("984", "男声 984"),
-    ("985", "男声 985"),
-    ("6671", "男声 6671"),
-    ("6670", "男声 6670"),
-    ("65", "女声 65（推荐）"),
-    ("92", "女声 92"),
-    ("102", "女声 102"),
-    ("225", "女声 225"),
-    ("1088", "女声 1088"),
-    ("1093", "女声 1093"),
-
+const DEFAULT_EMOTIVOICE_SPEAKERS: [&str; 11] = [
+    "9000", "984", "985", "6671", "6670", "65", "92", "102", "225", "1088", "1093",
+];
+const RECOMMENDED_EMOTIVOICE_SPEAKERS: [&str; 9] = [
+    "9000", "984", "985", "65", "92", "102", "225", "1088", "1093",
 ];
 
+const EMOTIVOICE_VOICE_CATALOG: &str = concat!(
+    include_str!("../assets/emotivoice/catalog/voices_00.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_01.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_02.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_03.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_04.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_05.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_06.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_07.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_08.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_09.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_10.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_11.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_12.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_13.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_14.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_15.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_16.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_17.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_18.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_19.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_20.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_21.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_22.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_23.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_24.tsv"),
+    "\n",
+    include_str!("../assets/emotivoice/catalog/voices_25.tsv"),
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EmotivoiceVoiceProfile {
+    id: &'static str,
+    gender: &'static str,
+    name: &'static str,
+    description: &'static str,
+}
+
 const EMOTIVOICE_EMOTIONS: [&str; 7] = ["普通", "开心", "悲伤", "生气", "惊讶", "厌恶", "恐惧"];
+
+fn emotivoice_voice_profiles() -> &'static [EmotivoiceVoiceProfile] {
+    static PROFILES: OnceLock<Vec<EmotivoiceVoiceProfile>> = OnceLock::new();
+    PROFILES
+        .get_or_init(|| {
+            EMOTIVOICE_VOICE_CATALOG
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        return None;
+                    }
+                    let mut fields = line.splitn(4, '\t');
+                    Some(EmotivoiceVoiceProfile {
+                        id: fields.next()?,
+                        gender: fields.next()?,
+                        name: fields.next()?,
+                        description: fields.next().unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .as_slice()
+}
 
 fn installed_emotivoice_speakers() -> &'static [String] {
     static INSTALLED_SPEAKERS: OnceLock<Vec<String>> = OnceLock::new();
     INSTALLED_SPEAKERS
         .get_or_init(|| {
             if onnx_tts_is_available() {
-                EMOTIVOICE_VOICE_PROFILES
+                emotivoice_voice_profiles()
                     .iter()
-                    .map(|(id, _)| (*id).to_owned())
+                    .map(|profile| profile.id.to_owned())
                     .collect()
             } else {
                 Vec::new()
@@ -4068,24 +4307,48 @@ fn random_emotivoice_speaker(speakers: &[String], current: &str) -> Option<Strin
 }
 
 fn emotivoice_speaker_label(speaker: &str) -> String {
-    EMOTIVOICE_VOICE_PROFILES
+    emotivoice_voice_profiles()
         .iter()
-        .find_map(|(id, label)| (*id == speaker).then_some((*label).to_owned()))
+        .find(|profile| profile.id == speaker)
+        .map(emotivoice_profile_label)
         .unwrap_or_else(|| format!("音色 {speaker}"))
 }
 
+fn emotivoice_profile_label(profile: &EmotivoiceVoiceProfile) -> String {
+    let gender = if profile.gender == "F" { "女声" } else { "男声" };
+    let recommended = if RECOMMENDED_EMOTIVOICE_SPEAKERS.contains(&profile.id) {
+        "（推荐）"
+    } else {
+        ""
+    };
+    format!(
+        "{gender} {} · {}{recommended}",
+        profile.id, profile.name
+    )
+}
+
+fn emotivoice_voice_matches(profile: &EmotivoiceVoiceProfile, query: &str) -> bool {
+    query.is_empty()
+        || profile.id.to_lowercase().contains(query)
+        || profile.name.to_lowercase().contains(query)
+        || profile.gender.to_lowercase().contains(query)
+        || profile.description.to_lowercase().contains(query)
+        || (profile.gender == "M" && ("男声".contains(query) || "男性".contains(query)))
+        || (profile.gender == "F" && ("女声".contains(query) || "女性".contains(query)))
+}
+
 fn default_emotivoice_speaker(sender_id: u64) -> &'static str {
-    let index = (sender_id as usize) % EMOTIVOICE_VOICE_PROFILES.len();
-    EMOTIVOICE_VOICE_PROFILES[index].0
+    let index = (sender_id as usize) % DEFAULT_EMOTIVOICE_SPEAKERS.len();
+    DEFAULT_EMOTIVOICE_SPEAKERS[index]
 }
 
 fn resolved_emotivoice_speaker(configured: Option<&str>, sender_id: u64) -> String {
     configured
         .map(str::trim)
         .filter(|speaker| {
-            EMOTIVOICE_VOICE_PROFILES
+            emotivoice_voice_profiles()
                 .iter()
-                .any(|(profile, _)| profile == speaker)
+                .any(|profile| profile.id == *speaker)
         })
         .map(str::to_owned)
         .unwrap_or_else(|| default_emotivoice_speaker(sender_id).to_owned())
@@ -7579,17 +7842,15 @@ mod tests {
     fn speaker_voice_profiles_use_fixed_emotivoice_speakers() {
         let profiles = (0..8).map(speaker_voice_profile).collect::<Vec<_>>();
         assert!(profiles.iter().all(|(pitch, _)| *pitch == 0));
-        assert_eq!(EMOTIVOICE_VOICE_PROFILES.len(), 11);
-        assert_eq!(EMOTIVOICE_VOICE_PROFILES[3].0, "6671");
-        assert_eq!(EMOTIVOICE_VOICE_PROFILES[4].0, "6670");
-        assert_eq!(
-            default_emotivoice_speaker(0),
-            "9000"
-        );
-        assert_eq!(
-            default_emotivoice_speaker(1),
-            "984"
-        );
+        assert_eq!(DEFAULT_EMOTIVOICE_SPEAKERS.len(), 11);
+        assert_eq!(DEFAULT_EMOTIVOICE_SPEAKERS[3], "6671");
+        assert_eq!(DEFAULT_EMOTIVOICE_SPEAKERS[4], "6670");
+        assert_eq!(emotivoice_voice_profiles().len(), 2_014);
+        assert!(emotivoice_voice_profiles()
+            .iter()
+            .any(|profile| profile.id == "8051" && profile.name == "Maria Kasper"));
+        assert_eq!(default_emotivoice_speaker(0), "9000");
+        assert_eq!(default_emotivoice_speaker(1), "984");
         assert_ne!(
             default_emotivoice_speaker(0),
             default_emotivoice_speaker(3)
@@ -7613,6 +7874,30 @@ mod tests {
             resolved_emotivoice_speaker(Some("9000"), 0),
             "9000"
         );
+        assert_eq!(
+            resolved_emotivoice_speaker(Some("8051"), 0),
+            "8051"
+        );
+    }
+
+    #[test]
+    fn replay_voice_favorites_round_trip_every_voice_setting() {
+        let favorites = ReplayVoiceFavorites {
+            favorites: vec![ReplayVoiceFavorite {
+                name: "反派低语".to_owned(),
+                settings: SpeakerVoiceSettings {
+                    voice_name: Some("8051".to_owned()),
+                    emotion: Some("悲伤".to_owned()),
+                    onnx_speaker_id: None,
+                    pitch: -3,
+                    speech_rate: 42,
+                    volume: 0.73,
+                },
+            }],
+        };
+        let serialized = serde_json::to_string(&favorites).unwrap();
+        let restored: ReplayVoiceFavorites = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored.favorites, favorites.favorites);
     }
 
     #[test]
