@@ -105,9 +105,10 @@ use crate::{
         VoxelPlayerStandee,
         VoxelReplayOcclusionFade,
         VoxelViewportCamera,
-        DEFAULT_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
-        MAX_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
-        MIN_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
+        DEFAULT_VOXEL_OCCLUSION_CAST_HEIGHT_CELLS,
+        DEFAULT_VOXEL_OCCLUSION_CAST_WIDTH_CELLS,
+        MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+        MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
         VOXEL_SIZE,
     },
 };
@@ -1841,10 +1842,16 @@ fn replay_studio_ui(
 ) {
     let Ok(ctx) = contexts.ctx_mut() else { return };
     let mut occlusion_opacity = occlusion_fade.as_ref().map_or(0.0, |fade| fade.opacity);
-    let mut occlusion_cube_size_cells = occlusion_fade.as_ref().map_or(
-        DEFAULT_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
-        |fade| fade.cube_size_cells,
+    let mut occlusion_cast_width_cells = occlusion_fade.as_ref().map_or(
+        DEFAULT_VOXEL_OCCLUSION_CAST_WIDTH_CELLS,
+        |fade| fade.cast_width_cells,
     );
+    let mut occlusion_cast_height_cells = occlusion_fade.as_ref().map_or(
+        DEFAULT_VOXEL_OCCLUSION_CAST_HEIGHT_CELLS,
+        |fade| fade.cast_height_cells,
+    );
+    let mut occlusion_debug_gizmo =
+        occlusion_fade.as_ref().is_some_and(|fade| fade.debug_gizmo);
 
     if !capture_active.0 {
         egui::Area::new(egui::Id::new("replay-studio-button"))
@@ -1888,17 +1895,24 @@ fn replay_studio_ui(
                     &mut windows,
                     &mut capture_active,
                     &mut occlusion_opacity,
-                    &mut occlusion_cube_size_cells,
+                    &mut occlusion_cast_width_cells,
+                    &mut occlusion_cast_height_cells,
+                    &mut occlusion_debug_gizmo,
                 )
             });
         studio.panel_open = open;
     }
     if let Some(fade) = occlusion_fade.as_mut() {
         fade.opacity = occlusion_opacity.clamp(0.0, 1.0);
-        fade.cube_size_cells = occlusion_cube_size_cells.clamp(
-            MIN_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
-            MAX_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
+        fade.cast_width_cells = occlusion_cast_width_cells.clamp(
+            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+            MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
         );
+        fade.cast_height_cells = occlusion_cast_height_cells.clamp(
+            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+            MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+        );
+        fade.debug_gizmo = occlusion_debug_gizmo;
     }
 
     if studio.speech_settings_open && !capture_active.0 {
@@ -1939,7 +1953,9 @@ fn replay_controls(
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
     capture_active: &mut ReplayVideoCaptureActive,
     occlusion_opacity: &mut f32,
-    occlusion_cube_size_cells: &mut f32,
+    occlusion_cast_width_cells: &mut f32,
+    occlusion_cast_height_cells: &mut f32,
+    occlusion_debug_gizmo: &mut bool,
 ) {
     ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
     ui.separator();
@@ -2023,19 +2039,30 @@ fn replay_controls(
     }
     ui.add(
         egui::Slider::new(
-            occlusion_cube_size_cells,
-            MIN_VOXEL_OCCLUSION_CUBE_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
+            occlusion_cast_width_cells,
+            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
         )
-        .text("剔除方盒边长（体素）")
+        .text("剔除方盒宽度（体素）")
         .integer(),
     )
-    .on_hover_text("沿回放镜头到每名玩家扫掠此尺寸的方盒；仅处理方盒触碰到的体素。");
+    .on_hover_text("沿回放镜头到每名玩家扫掠此宽度的方盒。");
+    ui.add(
+        egui::Slider::new(
+            occlusion_cast_height_cells,
+            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+        )
+        .text("剔除方盒高度（体素）")
+        .integer(),
+    )
+    .on_hover_text("方盒高度独立于宽度；仅处理方盒触碰到的体素。");
     ui.add(
         egui::Slider::new(occlusion_opacity, 0.0..=1.0)
             .text("方盒内体素不透明度")
             .fixed_decimals(2),
     )
-    .on_hover_text("0 为完全剔除，1 为完全不透明；中间值保留相应比例的像素。");
+    .on_hover_text("0 为完全透明，1 为完全不透明；中间值使用真实半透明混合。");
+    ui.checkbox(occlusion_debug_gizmo, "显示剔除射线调试框")
+        .on_hover_text("显示镜头到每名玩家的中心线和宽高方盒。");
 
     ui.horizontal(|ui| match studio.mode {
         ReplayMode::Recording => {
@@ -6790,8 +6817,12 @@ mod tests {
         assert_eq!(fade.camera, camera);
         assert_eq!(fade.targets, players);
         assert_eq!(
-            fade.cube_size_cells,
-            DEFAULT_VOXEL_OCCLUSION_CUBE_SIZE_CELLS
+            fade.cast_width_cells,
+            DEFAULT_VOXEL_OCCLUSION_CAST_WIDTH_CELLS
+        );
+        assert_eq!(
+            fade.cast_height_cells,
+            DEFAULT_VOXEL_OCCLUSION_CAST_HEIGHT_CELLS
         );
     }
 

@@ -46,29 +46,22 @@ use bevy::{
     mesh::{
         Indices,
         PrimitiveTopology,
-    },
-    pbr::{
-        ExtendedMaterial,
-        MaterialExtension,
+        VertexAttributeValues,
     },
     prelude::*,
     render::{
         render_resource::{
-            AsBindGroup,
             Extent3d,
             Face,
-            ShaderType,
             TextureDimension,
             TextureFormat,
             TextureUsages,
         },
-        storage::ShaderBuffer,
         view::screenshot::{
             Screenshot,
             ScreenshotCaptured,
         },
     },
-    shader::ShaderRef,
     window::{
         CursorGrabMode,
         CursorOptions,
@@ -179,16 +172,14 @@ const PLANET_CLOUD_PUFF_COUNT: usize = 24;
 const PLANET_SCIENCE_LAB_CENTER: IVec2 = IVec2::new(-45, 20);
 const PLANET_SCIENCE_LAB_FLOOR_Y: i32 = 485;
 const VOXEL_MINIMAP_RESOLUTION: usize = 64;
-const VOXEL_OCCLUSION_FADE_SHADER: &str = "shaders/voxel_occlusion_fade.wgsl";
-pub(crate) const DEFAULT_VOXEL_OCCLUSION_CUBE_SIZE_CELLS: f32 = 2.0;
-pub(crate) const MIN_VOXEL_OCCLUSION_CUBE_SIZE_CELLS: f32 = 1.0;
-pub(crate) const MAX_VOXEL_OCCLUSION_CUBE_SIZE_CELLS: f32 = 16.0;
+pub(crate) const DEFAULT_VOXEL_OCCLUSION_CAST_WIDTH_CELLS: f32 = 2.0;
+pub(crate) const DEFAULT_VOXEL_OCCLUSION_CAST_HEIGHT_CELLS: f32 = 2.0;
+pub(crate) const MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS: f32 = 1.0;
+pub(crate) const MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS: f32 = 16.0;
 
 pub struct TrpgVoxelPlugin;
 
 pub struct TrpgVoxelConnector;
-
-type VoxelFadeMaterial = ExtendedMaterial<StandardMaterial, VoxelOcclusionFadeExtension>;
 
 #[derive(Resource, Debug, Clone)]
 pub(crate) struct VoxelReplayOcclusionFade {
@@ -196,7 +187,9 @@ pub(crate) struct VoxelReplayOcclusionFade {
     pub(crate) camera: Vec3,
     pub(crate) targets: Vec<Vec3>,
     pub(crate) opacity: f32,
-    pub(crate) cube_size_cells: f32,
+    pub(crate) cast_width_cells: f32,
+    pub(crate) cast_height_cells: f32,
+    pub(crate) debug_gizmo: bool,
 }
 
 impl Default for VoxelReplayOcclusionFade {
@@ -206,41 +199,23 @@ impl Default for VoxelReplayOcclusionFade {
             camera: Vec3::ZERO,
             targets: Vec::new(),
             opacity: 0.0,
-            cube_size_cells: DEFAULT_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
+            cast_width_cells: DEFAULT_VOXEL_OCCLUSION_CAST_WIDTH_CELLS,
+            cast_height_cells: DEFAULT_VOXEL_OCCLUSION_CAST_HEIGHT_CELLS,
+            debug_gizmo: false,
         }
     }
 }
 
-#[derive(ShaderType, Reflect, Debug, Clone, Copy, Default)]
-struct VoxelOcclusionFadeUniform {
-    camera_and_target_count: Vec4,
-    opacity_and_voxel_size: Vec4,
+#[derive(Component)]
+struct VoxelOcclusionMesh {
+    original_mesh: Handle<Mesh>,
+    opaque_mesh: Handle<Mesh>,
+    transparent_mesh: Handle<Mesh>,
+    transparent_entity: Entity,
 }
 
-#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
-struct VoxelOcclusionFadeExtension {
-    #[uniform(100)]
-    settings: VoxelOcclusionFadeUniform,
-    #[storage(101, read_only)]
-    targets: Handle<ShaderBuffer>,
-}
-
-impl MaterialExtension for VoxelOcclusionFadeExtension {
-    fn fragment_shader() -> ShaderRef { VOXEL_OCCLUSION_FADE_SHADER.into() }
-
-    fn deferred_fragment_shader() -> ShaderRef { VOXEL_OCCLUSION_FADE_SHADER.into() }
-
-    fn enable_prepass() -> bool { false }
-}
-
-impl VoxelOcclusionFadeExtension {
-    fn new(targets: Handle<ShaderBuffer>) -> Self {
-        Self {
-            targets,
-            ..default()
-        }
-    }
-}
+#[derive(Component)]
+struct VoxelOcclusionTransparentMesh;
 
 fn voxel_emissive(red: f32, green: f32, blue: f32) -> LinearRgba {
     LinearRgba::rgb(
@@ -775,9 +750,8 @@ struct VoxelMaterials {
 
 #[derive(Resource)]
 struct VoxelReplayFadeMaterials {
-    handles: [Handle<VoxelFadeMaterial>; VOXEL_MATERIAL_COUNT],
-    planet_ocean: Handle<VoxelFadeMaterial>,
-    targets: Handle<ShaderBuffer>,
+    handles: [Handle<StandardMaterial>; VOXEL_MATERIAL_COUNT],
+    planet_ocean: Handle<StandardMaterial>,
 }
 
 #[derive(Resource, Default)]
@@ -1494,7 +1468,6 @@ impl Plugin for TrpgVoxelPlugin {
             VoxelPlugin::<u8>::default(),
             ConnectivityPlugin::<TrpgVoxelConnector>::default(),
             VoxelRadianceCascadePlugin,
-            MaterialPlugin::<VoxelFadeMaterial>::default(),
         ))
         // Player observation is a prepared screenshot, so one inexpensive physics substep is
         // sufficient and avoids repeating the solver when explosions create many fragments.
@@ -1590,7 +1563,11 @@ impl Plugin for TrpgVoxelPlugin {
         )
         .add_systems(
             PostUpdate,
-            sync_voxel_occlusion_fade
+            (
+                sync_voxel_occlusion_fade,
+                draw_voxel_occlusion_cast_gizmos,
+            )
+                .chain()
                 .after(crate::replay::ReplayCameraApplied)
                 .before(TransformSystems::Propagate),
         )
@@ -2024,8 +2001,6 @@ fn setup_voxel_materials(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut fade_materials: ResMut<Assets<VoxelFadeMaterial>>,
-    mut storage_buffers: ResMut<Assets<ShaderBuffer>>,
 ) {
     let paths = [
         "textures/voxel_grass.png",
@@ -2062,7 +2037,6 @@ fn setup_voxel_materials(
             });
         })
         .load("textures/voxel_space_hifi.png");
-    let fade_targets = storage_buffers.add(ShaderBuffer::from(vec![Vec4::ZERO]));
     let mut fade_handles = std::array::from_fn(|_| Handle::default());
     let handles = std::array::from_fn(|index| {
         let mut material = if index < textures.len() {
@@ -2145,17 +2119,18 @@ fn setup_voxel_materials(
             },
             _ => {},
         }
-        fade_handles[index] = fade_materials.add(ExtendedMaterial {
-            base: material.clone(),
-            extension: VoxelOcclusionFadeExtension::new(fade_targets.clone()),
-        });
+        let mut fade_material = material.clone();
+        fade_material.base_color = fade_material.base_color.with_alpha(0.0);
+        fade_material.alpha_mode = AlphaMode::Blend;
+        fade_handles[index] = materials.add(fade_material);
         materials.add(material)
     });
     let planet_ocean_material = opaque_planet_ocean_material(textures[3].clone());
-    let fade_planet_ocean = fade_materials.add(ExtendedMaterial {
-        base: planet_ocean_material.clone(),
-        extension: VoxelOcclusionFadeExtension::new(fade_targets.clone()),
-    });
+    let mut fade_planet_ocean_material = planet_ocean_material.clone();
+    fade_planet_ocean_material.base_color =
+        fade_planet_ocean_material.base_color.with_alpha(0.0);
+    fade_planet_ocean_material.alpha_mode = AlphaMode::Blend;
+    let fade_planet_ocean = materials.add(fade_planet_ocean_material);
     let planet_ocean = materials.add(planet_ocean_material);
     commands.insert_resource(VoxelMaterials {
         handles,
@@ -2164,7 +2139,6 @@ fn setup_voxel_materials(
     commands.insert_resource(VoxelReplayFadeMaterials {
         handles: fade_handles,
         planet_ocean: fade_planet_ocean,
-        targets: fade_targets,
     });
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.48, 0.56, 0.68),
@@ -5715,7 +5689,6 @@ fn animate_voxel_materials(
     voxel_materials: Res<VoxelMaterials>,
     fade_materials: Res<VoxelReplayFadeMaterials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut fade_assets: ResMut<Assets<VoxelFadeMaterial>>,
 ) {
     let seconds = time.elapsed_secs();
     let water_uv = Affine2::from_translation(Vec2::new(
@@ -5728,8 +5701,8 @@ fn animate_voxel_materials(
         }
     }
     for handle in [&fade_materials.handles[3], &fade_materials.planet_ocean] {
-        if let Some(mut water) = fade_assets.get_mut(handle) {
-            water.base.uv_transform = water_uv;
+        if let Some(mut water) = materials.get_mut(handle) {
+            water.uv_transform = water_uv;
         }
     }
     if let Some(mut lava) = materials.get_mut(&voxel_materials.handles[4]) {
@@ -5740,13 +5713,13 @@ fn animate_voxel_materials(
         let pulse = 4.5 + (seconds * 2.4).sin() * 1.2;
         lava.emissive = voxel_emissive(pulse, pulse * 0.11, 0.015);
     }
-    if let Some(mut lava) = fade_assets.get_mut(&fade_materials.handles[4]) {
-        lava.base.uv_transform = Affine2::from_translation(Vec2::new(
+    if let Some(mut lava) = materials.get_mut(&fade_materials.handles[4]) {
+        lava.uv_transform = Affine2::from_translation(Vec2::new(
             seconds * -0.018,
             seconds * 0.027,
         ));
         let pulse = 4.5 + (seconds * 2.4).sin() * 1.2;
-        lava.base.emissive = voxel_emissive(pulse, pulse * 0.11, 0.015);
+        lava.emissive = voxel_emissive(pulse, pulse * 0.11, 0.015);
     }
 }
 
@@ -5755,123 +5728,272 @@ fn sync_voxel_occlusion_fade(
     fade: Res<VoxelReplayOcclusionFade>,
     voxel_materials: Res<VoxelMaterials>,
     fade_materials: Res<VoxelReplayFadeMaterials>,
-    mut materials: ResMut<Assets<VoxelFadeMaterial>>,
-    mut storage_buffers: ResMut<Assets<ShaderBuffer>>,
-    normal_entities: Query<
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    voxel_meshes: Query<
         (
             Entity,
+            &Mesh3d,
             &MeshMaterial3d<StandardMaterial>,
             &Aabb,
             &GlobalTransform,
+            Option<&VoxelOcclusionMesh>,
         ),
-        Without<MeshMaterial3d<VoxelFadeMaterial>>,
-    >,
-    faded_entities: Query<
-        (
-            Entity,
-            &MeshMaterial3d<VoxelFadeMaterial>,
-            &Aabb,
-            &GlobalTransform,
-        ),
-        Without<MeshMaterial3d<StandardMaterial>>,
+        Without<VoxelOcclusionTransparentMesh>,
     >,
 ) {
-    let fade_enabled = fade.active && fade.opacity < 0.999;
-    let target_count = if fade_enabled { fade.targets.len() } else { 0 };
-    let cube_half_extent = voxel_occlusion_cube_half_extent(fade.cube_size_cells);
-    let touched_voxel_half_extent = cube_half_extent + VOXEL_SIZE * 0.5;
-    let settings = VoxelOcclusionFadeUniform {
-        camera_and_target_count: fade.camera.extend(target_count as f32),
-        opacity_and_voxel_size: Vec4::new(
-            fade.opacity.clamp(0.0, 1.0),
-            VOXEL_SIZE,
-            0.0,
-            0.0,
-        ),
-    };
-    if let Some(mut buffer) = storage_buffers.get_mut(&fade_materials.targets) {
-        let targets = if target_count == 0 {
-            vec![Vec4::ZERO]
-        } else {
-            fade.targets
-                .iter()
-                .map(|target| target.extend(cube_half_extent))
-                .collect()
-        };
-        buffer.set_data(targets);
-    }
-    for handle in fade_materials.handles.iter().chain(std::iter::once(
-        &fade_materials.planet_ocean,
-    )) {
+    let opacity = fade.opacity.clamp(0.0, 1.0);
+    for handle in fade_materials
+        .handles
+        .iter()
+        .chain(std::iter::once(&fade_materials.planet_ocean))
+    {
         if let Some(mut material) = materials.get_mut(handle) {
-            material.extension.settings = settings;
+            material.base_color = material.base_color.with_alpha(opacity);
         }
     }
-    if fade_enabled {
-        for (entity, material, aabb, transform) in &normal_entities {
-            if !replay_sightline_intersects_any_aabb(
-                fade.camera,
-                &fade.targets,
-                touched_voxel_half_extent,
-                aabb,
-                transform,
-            ) {
-                continue;
+
+    let fade_enabled = fade.active && opacity < 0.999 && !fade.targets.is_empty();
+    let broadphase_half_extent = voxel_occlusion_cast_broadphase_half_extent(&fade);
+    for (entity, current_mesh, material, aabb, transform, occlusion_mesh) in &voxel_meshes {
+        let original_mesh = occlusion_mesh
+            .map(|state| &state.original_mesh)
+            .unwrap_or(&current_mesh.0);
+        let Some(fade_handle) =
+            replay_fade_handle(material, &voxel_materials, &fade_materials)
+        else {
+            continue;
+        };
+
+        if !fade_enabled
+            || (occlusion_mesh.is_none()
+                && !replay_sightline_intersects_any_aabb(
+                    fade.camera,
+                    &fade.targets,
+                    broadphase_half_extent,
+                    aabb,
+                    transform,
+                ))
+        {
+            if let Some(state) = occlusion_mesh {
+                restore_voxel_occlusion_mesh(&mut commands, &mut meshes, entity, state);
             }
-            if let Some(fade_handle) = replay_fade_handle(
-                material,
-                &voxel_materials,
-                &fade_materials,
-            ) {
-                commands
-                    .entity(entity)
-                    .remove::<MeshMaterial3d<StandardMaterial>>()
-                    .insert(MeshMaterial3d(fade_handle));
-            }
+            continue;
         }
-        for (entity, material, aabb, transform) in &faded_entities {
-            if replay_sightline_intersects_any_aabb(
-                fade.camera,
-                &fade.targets,
-                touched_voxel_half_extent,
-                aabb,
-                transform,
-            ) {
-                continue;
+
+        let Some(source_mesh) = meshes.get(original_mesh).cloned() else {
+            continue;
+        };
+        let Some((opaque_mesh, transparent_mesh)) =
+            partition_voxel_mesh_for_replay_cast(&source_mesh, transform, &fade)
+        else {
+            if let Some(state) = occlusion_mesh {
+                restore_voxel_occlusion_mesh(&mut commands, &mut meshes, entity, state);
             }
-            if let Some(normal_handle) = normal_voxel_handle(
-                material,
-                &voxel_materials,
-                &fade_materials,
-            ) {
-                commands
-                    .entity(entity)
-                    .remove::<MeshMaterial3d<VoxelFadeMaterial>>()
-                    .insert(MeshMaterial3d(normal_handle));
+            continue;
+        };
+
+        if let Some(state) = occlusion_mesh {
+            if let Some(mut mesh) = meshes.get_mut(&state.opaque_mesh) {
+                *mesh = opaque_mesh;
             }
-        }
-    } else {
-        for (entity, material, ..) in &faded_entities {
-            if let Some(normal_handle) = normal_voxel_handle(
-                material,
-                &voxel_materials,
-                &fade_materials,
-            ) {
-                commands
-                    .entity(entity)
-                    .remove::<MeshMaterial3d<VoxelFadeMaterial>>()
-                    .insert(MeshMaterial3d(normal_handle));
+            if let Some(mut mesh) = meshes.get_mut(&state.transparent_mesh) {
+                *mesh = transparent_mesh;
             }
+        } else {
+            let original_mesh = current_mesh.0.clone();
+            let opaque_mesh = meshes.add(opaque_mesh);
+            let transparent_mesh = meshes.add(transparent_mesh);
+            let transparent_entity = commands
+                .spawn((
+                    Mesh3d(transparent_mesh.clone()),
+                    MeshMaterial3d(fade_handle),
+                    Transform::IDENTITY,
+                    VoxelOcclusionTransparentMesh,
+                ))
+                .id();
+            commands.entity(entity).add_child(transparent_entity).insert((
+                Mesh3d(opaque_mesh.clone()),
+                VoxelOcclusionMesh {
+                    original_mesh,
+                    opaque_mesh,
+                    transparent_mesh,
+                    transparent_entity,
+                },
+            ));
         }
     }
 }
 
-fn voxel_occlusion_cube_half_extent(cube_size_cells: f32) -> f32 {
-    cube_size_cells.clamp(
-        MIN_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
-        MAX_VOXEL_OCCLUSION_CUBE_SIZE_CELLS,
+fn restore_voxel_occlusion_mesh(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    entity: Entity,
+    state: &VoxelOcclusionMesh,
+) {
+    commands
+        .entity(entity)
+        .insert(Mesh3d(state.original_mesh.clone()))
+        .remove::<VoxelOcclusionMesh>();
+    commands.entity(state.transparent_entity).despawn();
+    meshes.remove(state.opaque_mesh.id());
+    meshes.remove(state.transparent_mesh.id());
+}
+
+fn partition_voxel_mesh_for_replay_cast(
+    mesh: &Mesh,
+    transform: &GlobalTransform,
+    fade: &VoxelReplayOcclusionFade,
+) -> Option<(Mesh, Mesh)> {
+    let VertexAttributeValues::Float32x3(positions) =
+        mesh.attribute(Mesh::ATTRIBUTE_POSITION)?
+    else {
+        return None;
+    };
+    let VertexAttributeValues::Float32x3(normals) = mesh.attribute(Mesh::ATTRIBUTE_NORMAL)? else {
+        return None;
+    };
+    let indices = match mesh.indices()? {
+        Indices::U16(indices) => indices.iter().map(|index| *index as u32).collect::<Vec<_>>(),
+        Indices::U32(indices) => indices.clone(),
+    };
+    let mut opaque_indices = Vec::with_capacity(indices.len());
+    let mut transparent_indices = Vec::new();
+    for triangle in indices.chunks_exact(3) {
+        let first = triangle[0] as usize;
+        let second = triangle[1] as usize;
+        let third = triangle[2] as usize;
+        let surface_center = (
+            Vec3::from(positions[first])
+                + Vec3::from(positions[second])
+                + Vec3::from(positions[third])
+        ) / 3.0;
+        let surface_normal = Vec3::from(normals[first]);
+        let inside_position = surface_center - surface_normal * VOXEL_SIZE * 0.01;
+        let cell_center =
+            (inside_position / VOXEL_SIZE).floor() * VOXEL_SIZE + Vec3::splat(VOXEL_SIZE * 0.5);
+        let world_center = transform.transform_point(cell_center);
+        let destination = if voxel_is_touched_by_replay_cast(world_center, transform, fade) {
+            &mut transparent_indices
+        } else {
+            &mut opaque_indices
+        };
+        destination.extend_from_slice(triangle);
+    }
+    if transparent_indices.is_empty() {
+        return None;
+    }
+
+    let mut opaque_mesh = mesh.clone();
+    opaque_mesh.insert_indices(Indices::U32(opaque_indices));
+    let mut transparent_mesh = mesh.clone();
+    transparent_mesh.insert_indices(Indices::U32(transparent_indices));
+    Some((opaque_mesh, transparent_mesh))
+}
+
+fn voxel_is_touched_by_replay_cast(
+    world_center: Vec3,
+    transform: &GlobalTransform,
+    fade: &VoxelReplayOcclusionFade,
+) -> bool {
+    let affine = transform.affine();
+    let cell_half_axes = [
+        affine.transform_vector3(Vec3::X * VOXEL_SIZE * 0.5),
+        affine.transform_vector3(Vec3::Y * VOXEL_SIZE * 0.5),
+        affine.transform_vector3(Vec3::Z * VOXEL_SIZE * 0.5),
+    ];
+    fade.targets.iter().any(|target| {
+        let Some((forward, right, up, length)) = replay_cast_frame(fade.camera, *target) else {
+            return false;
+        };
+        let offset = world_center - fade.camera;
+        let forward_radius = projected_voxel_half_extent(cell_half_axes, forward);
+        let right_radius = projected_voxel_half_extent(cell_half_axes, right);
+        let up_radius = projected_voxel_half_extent(cell_half_axes, up);
+        let along = offset.dot(forward);
+        along >= -forward_radius
+            && along <= length + forward_radius
+            && offset.dot(right).abs()
+                <= voxel_occlusion_cast_width(fade.cast_width_cells) * 0.5 + right_radius
+            && offset.dot(up).abs()
+                <= voxel_occlusion_cast_height(fade.cast_height_cells) * 0.5 + up_radius
+    })
+}
+
+fn projected_voxel_half_extent(cell_half_axes: [Vec3; 3], axis: Vec3) -> f32 {
+    cell_half_axes
+        .iter()
+        .map(|half_axis| half_axis.dot(axis).abs())
+        .sum()
+}
+
+fn replay_cast_frame(camera: Vec3, target: Vec3) -> Option<(Vec3, Vec3, Vec3, f32)> {
+    let sightline = target - camera;
+    let length = sightline.length();
+    if length <= f32::EPSILON {
+        return None;
+    }
+    let forward = sightline / length;
+    let horizontal = forward.cross(Vec3::Y);
+    let right = if horizontal.length_squared() > 1.0e-6 {
+        horizontal.normalize()
+    } else {
+        Vec3::X
+    };
+    let up = right.cross(forward).normalize();
+    Some((forward, right, up, length))
+}
+
+fn voxel_occlusion_cast_width(width_cells: f32) -> f32 {
+    width_cells.clamp(
+        MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+        MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
     ) * VOXEL_SIZE
+}
+
+fn voxel_occlusion_cast_height(height_cells: f32) -> f32 {
+    height_cells.clamp(
+        MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+        MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+    ) * VOXEL_SIZE
+}
+
+fn voxel_occlusion_cast_broadphase_half_extent(fade: &VoxelReplayOcclusionFade) -> f32 {
+    voxel_occlusion_cast_width(fade.cast_width_cells)
+        .max(voxel_occlusion_cast_height(fade.cast_height_cells))
         * 0.5
+        + VOXEL_SIZE
+}
+
+fn draw_voxel_occlusion_cast_gizmos(
+    mut gizmos: Gizmos,
+    fade: Res<VoxelReplayOcclusionFade>,
+) {
+    if !fade.active || !fade.debug_gizmo {
+        return;
+    }
+    let width = voxel_occlusion_cast_width(fade.cast_width_cells);
+    let height = voxel_occlusion_cast_height(fade.cast_height_cells);
+    for target in &fade.targets {
+        let Some((forward, _, _, length)) = replay_cast_frame(fade.camera, *target) else {
+            continue;
+        };
+        let up_hint = if forward.dot(Vec3::Y).abs() > 0.99 {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        };
+        let transform = Transform::from_translation((fade.camera + *target) * 0.5)
+            .looking_at(*target, up_hint)
+            .with_scale(Vec3::new(width, height, length));
+        gizmos.cube(transform, Color::srgb(0.1, 0.95, 1.0));
+        gizmos.line(fade.camera, *target, Color::srgb(1.0, 0.2, 0.8));
+        gizmos.sphere(
+            Isometry3d::from_translation(*target),
+            VOXEL_SIZE * 0.35,
+            Color::srgb(1.0, 0.85, 0.1),
+        );
+    }
 }
 
 fn replay_sightline_intersects_any_aabb(
@@ -5961,7 +6083,7 @@ fn replay_fade_handle(
     material: &MeshMaterial3d<StandardMaterial>,
     voxel_materials: &VoxelMaterials,
     fade_materials: &VoxelReplayFadeMaterials,
-) -> Option<Handle<VoxelFadeMaterial>> {
+) -> Option<Handle<StandardMaterial>> {
     voxel_materials
         .handles
         .iter()
@@ -5970,22 +6092,6 @@ fn replay_fade_handle(
         .or_else(|| {
             (material.0 == voxel_materials.planet_ocean)
                 .then(|| fade_materials.planet_ocean.clone())
-        })
-}
-
-fn normal_voxel_handle(
-    material: &MeshMaterial3d<VoxelFadeMaterial>,
-    voxel_materials: &VoxelMaterials,
-    fade_materials: &VoxelReplayFadeMaterials,
-) -> Option<Handle<StandardMaterial>> {
-    fade_materials
-        .handles
-        .iter()
-        .zip(&voxel_materials.handles)
-        .find_map(|(fade, normal)| (material.0 == *fade).then(|| normal.clone()))
-        .or_else(|| {
-            (material.0 == fade_materials.planet_ocean)
-                .then(|| voxel_materials.planet_ocean.clone())
         })
 }
 
@@ -9772,15 +9878,10 @@ mod tests {
     }
 
     #[test]
-    fn replay_fade_materials_never_touch_the_normal_dm_view() {
+    fn replay_fade_splits_only_touched_voxels_into_a_transparent_mesh() {
         let mut app = App::new();
         app.init_resource::<Assets<StandardMaterial>>()
-            .init_resource::<Assets<VoxelFadeMaterial>>()
-            .init_resource::<Assets<ShaderBuffer>>();
-        let fade_targets = app
-            .world_mut()
-            .resource_mut::<Assets<ShaderBuffer>>()
-            .add(ShaderBuffer::from(vec![Vec4::ZERO]));
+            .init_resource::<Assets<Mesh>>();
         let (normal_handles, normal_planet_ocean) = {
             let mut assets = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
             let handles = std::array::from_fn(|_| assets.add(StandardMaterial::default()));
@@ -9788,16 +9889,16 @@ mod tests {
             (handles, planet_ocean)
         };
         let (fade_handles, fade_planet_ocean) = {
-            let mut assets = app.world_mut().resource_mut::<Assets<VoxelFadeMaterial>>();
+            let mut assets = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
             let handles = std::array::from_fn(|_| {
-                assets.add(ExtendedMaterial {
-                    base: StandardMaterial::default(),
-                    extension: VoxelOcclusionFadeExtension::new(fade_targets.clone()),
+                assets.add(StandardMaterial {
+                    alpha_mode: AlphaMode::Blend,
+                    ..default()
                 })
             });
-            let planet_ocean = assets.add(ExtendedMaterial {
-                base: StandardMaterial::default(),
-                extension: VoxelOcclusionFadeExtension::new(fade_targets.clone()),
+            let planet_ocean = assets.add(StandardMaterial {
+                alpha_mode: AlphaMode::Blend,
+                ..default()
             });
             (handles, planet_ocean)
         };
@@ -9808,144 +9909,84 @@ mod tests {
         .insert_resource(VoxelReplayFadeMaterials {
             handles: fade_handles.clone(),
             planet_ocean: fade_planet_ocean.clone(),
-            targets: fade_targets.clone(),
         })
         .insert_resource(VoxelReplayOcclusionFade {
             active: false,
-            camera: Vec3::new(1.0, 2.0, 3.0),
-            targets: vec![Vec3::new(4.0, 5.0, 6.0), Vec3::new(-4.0, 5.0, 6.0)],
+            camera: Vec3::new(VOXEL_SIZE * 0.5, VOXEL_SIZE * 0.5, -1.0),
+            targets: vec![Vec3::new(VOXEL_SIZE * 0.5, VOXEL_SIZE * 0.5, 1.0)],
             opacity: 0.35,
-            cube_size_cells: 2.0,
+            cast_width_cells: 1.0,
+            cast_height_cells: 1.0,
+            debug_gizmo: false,
         })
         .add_systems(Update, sync_voxel_occlusion_fade);
+        let source_mesh = {
+            let (mut material_meshes, _) =
+                build_voxel_meshes_from_cells(&[(IVec3::ZERO, 1)]);
+            app.world_mut()
+                .resource_mut::<Assets<Mesh>>()
+                .add(material_meshes.remove(0).1)
+        };
         let voxel = app
             .world_mut()
             .spawn((
+                Mesh3d(source_mesh.clone()),
                 MeshMaterial3d(normal_handles[0].clone()),
                 Aabb::from_min_max(Vec3::splat(-0.25), Vec3::splat(0.25)),
-                GlobalTransform::from_translation(Vec3::new(2.5, 3.5, 4.5)),
-            ))
-            .id();
-        let second_wall = app
-            .world_mut()
-            .spawn((
-                MeshMaterial3d(normal_handles[0].clone()),
-                Aabb::from_min_max(Vec3::splat(-0.25), Vec3::splat(0.25)),
-                GlobalTransform::from_translation(Vec3::new(3.25, 4.25, 5.25)),
-            ))
-            .id();
-        let other_player_wall = app
-            .world_mut()
-            .spawn((
-                MeshMaterial3d(normal_handles[1].clone()),
-                Aabb::from_min_max(Vec3::splat(-0.25), Vec3::splat(0.25)),
-                GlobalTransform::from_translation(Vec3::new(-1.5, 3.5, 4.5)),
+                Transform::IDENTITY,
+                GlobalTransform::IDENTITY,
             ))
             .id();
         let off_axis_voxel = app
             .world_mut()
             .spawn((
+                Mesh3d(source_mesh.clone()),
                 MeshMaterial3d(normal_handles[1].clone()),
                 Aabb::from_min_max(Vec3::splat(-0.25), Vec3::splat(0.25)),
-                GlobalTransform::from_translation(Vec3::new(20.0, 3.5, 4.5)),
+                Transform::from_xyz(2.0, 0.0, 0.0),
+                GlobalTransform::from_translation(Vec3::new(2.0, 0.0, 0.0)),
             ))
             .id();
 
         app.update();
-        assert!(app
-            .world()
-            .entity(voxel)
-            .contains::<MeshMaterial3d<StandardMaterial>>());
-        assert!(app
-            .world()
-            .entity(second_wall)
-            .contains::<MeshMaterial3d<StandardMaterial>>());
-        assert!(app
-            .world()
-            .entity(other_player_wall)
-            .contains::<MeshMaterial3d<StandardMaterial>>());
-        assert!(!app
-            .world()
-            .entity(voxel)
-            .contains::<MeshMaterial3d<VoxelFadeMaterial>>());
+        assert!(!app.world().entity(voxel).contains::<VoxelOcclusionMesh>());
 
         app.world_mut()
             .resource_mut::<VoxelReplayOcclusionFade>()
             .active = true;
         app.update();
-        assert!(!app
+        let transparent_entity = app
             .world()
             .entity(voxel)
-            .contains::<MeshMaterial3d<StandardMaterial>>());
+            .get::<VoxelOcclusionMesh>()
+            .unwrap()
+            .transparent_entity;
         assert_eq!(
             app.world()
-                .entity(voxel)
-                .get::<MeshMaterial3d<VoxelFadeMaterial>>()
+                .entity(transparent_entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
                 .unwrap()
                 .0,
             fade_handles[0]
         );
-        assert!(app
-            .world()
-            .entity(second_wall)
-            .contains::<MeshMaterial3d<VoxelFadeMaterial>>());
-        assert_eq!(
-            app.world()
-                .entity(other_player_wall)
-                .get::<MeshMaterial3d<VoxelFadeMaterial>>()
-                .unwrap()
-                .0,
-            fade_handles[1]
-        );
-        assert!(app
-            .world()
-            .entity(off_axis_voxel)
-            .contains::<MeshMaterial3d<StandardMaterial>>());
         assert!(!app
             .world()
             .entity(off_axis_voxel)
-            .contains::<MeshMaterial3d<VoxelFadeMaterial>>());
-
-        let assets = app.world().resource::<Assets<VoxelFadeMaterial>>();
-        for handle in fade_handles
-            .iter()
-            .chain(std::iter::once(&fade_planet_ocean))
-        {
-            let settings = assets.get(handle).unwrap().extension.settings;
-            assert_eq!(
-                settings.camera_and_target_count,
-                Vec4::new(1.0, 2.0, 3.0, 2.0)
-            );
-            assert_eq!(
-                settings.opacity_and_voxel_size,
-                Vec4::new(0.35, VOXEL_SIZE, 0.0, 0.0)
-            );
-            assert_eq!(
-                assets.get(handle).unwrap().extension.targets,
-                fade_targets
-            );
-        }
+            .contains::<VoxelOcclusionMesh>());
+        let assets = app.world().resource::<Assets<StandardMaterial>>();
+        assert_eq!(assets.get(&fade_handles[0]).unwrap().base_color.alpha(), 0.35);
+        assert!(matches!(
+            assets.get(&fade_handles[0]).unwrap().alpha_mode,
+            AlphaMode::Blend
+        ));
 
         app.world_mut()
             .resource_mut::<VoxelReplayOcclusionFade>()
             .opacity = 1.0;
         app.update();
-        assert!(app
-            .world()
-            .entity(voxel)
-            .contains::<MeshMaterial3d<StandardMaterial>>());
-        assert!(app
-            .world()
-            .entity(second_wall)
-            .contains::<MeshMaterial3d<StandardMaterial>>());
-        assert!(app
-            .world()
-            .entity(other_player_wall)
-            .contains::<MeshMaterial3d<StandardMaterial>>());
-        assert!(!app
-            .world()
-            .entity(voxel)
-            .contains::<MeshMaterial3d<VoxelFadeMaterial>>());
+        assert!(!app.world().entity(voxel).contains::<VoxelOcclusionMesh>());
+        assert_eq!(app.world().entity(voxel).get::<Mesh3d>().unwrap().0, source_mesh);
+        assert!(app.world().get_entity(transparent_entity).is_err());
     }
 
     #[test]
@@ -9954,9 +9995,7 @@ mod tests {
         let blocking_transform = GlobalTransform::from_translation(Vec3::new(0.0, 0.0, 5.0));
         let off_axis_transform = GlobalTransform::from_translation(Vec3::new(4.0, 0.0, 5.0));
         let behind_player_transform = GlobalTransform::from_translation(Vec3::new(0.0, 0.0, 11.1));
-        let touched_voxel_half_extent =
-            voxel_occlusion_cube_half_extent(DEFAULT_VOXEL_OCCLUSION_CUBE_SIZE_CELLS)
-                + VOXEL_SIZE * 0.5;
+        let touched_voxel_half_extent = VOXEL_SIZE * 1.5;
 
         assert!(replay_sightline_intersects_aabb(
             Vec3::ZERO,
@@ -9982,19 +10021,48 @@ mod tests {
     }
 
     #[test]
-    fn replay_cube_cast_uses_canonical_voxels_and_dm_opacity() {
-        let shader = include_str!("../assets/shaders/voxel_occlusion_fade.wgsl");
+    fn replay_box_cast_has_independent_width_and_height_and_finite_length() {
+        let fade = VoxelReplayOcclusionFade {
+            active: true,
+            camera: Vec3::ZERO,
+            targets: vec![Vec3::Z * 10.0],
+            opacity: 0.5,
+            cast_width_cells: 2.0,
+            cast_height_cells: 4.0,
+            debug_gizmo: true,
+        };
+        let transform = GlobalTransform::IDENTITY;
 
+        assert_eq!(voxel_occlusion_cast_width(fade.cast_width_cells), VOXEL_SIZE * 2.0);
         assert_eq!(
-            voxel_occlusion_cube_half_extent(2.0),
-            VOXEL_SIZE
+            voxel_occlusion_cast_height(fade.cast_height_cells),
+            VOXEL_SIZE * 4.0
         );
-        assert!(shader.contains("round(inside_position / voxel_size) * voxel_size"));
-        assert!(shader.contains("inside_player_cube_cast"));
-        assert!(shader.contains("progress <= 0.0 || progress >= 1.0"));
-        assert!(shader.contains("occluder_opacity < 0.999"));
-        assert!(shader.contains("opacity_dither_threshold(in.position.xy)"));
-        assert!(!VoxelOcclusionFadeExtension::enable_prepass());
+        assert!(voxel_is_touched_by_replay_cast(
+            Vec3::new(0.35, 0.0, 5.0),
+            &transform,
+            &fade,
+        ));
+        assert!(!voxel_is_touched_by_replay_cast(
+            Vec3::new(0.5, 0.0, 5.0),
+            &transform,
+            &fade,
+        ));
+        assert!(voxel_is_touched_by_replay_cast(
+            Vec3::new(0.0, 0.6, 5.0),
+            &transform,
+            &fade,
+        ));
+        assert!(!voxel_is_touched_by_replay_cast(
+            Vec3::new(0.0, 0.75, 5.0),
+            &transform,
+            &fade,
+        ));
+        assert!(!voxel_is_touched_by_replay_cast(
+            Vec3::new(0.0, 0.0, 11.0),
+            &transform,
+            &fade,
+        ));
     }
 
     #[test]
