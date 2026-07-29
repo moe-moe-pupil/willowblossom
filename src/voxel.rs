@@ -180,6 +180,9 @@ const FIRST_PERSON_FLY_SPEED: f32 = 3.5;
 const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
+const VOXEL_SPACESHIP_SAVE_SECONDS: f32 = 1.0;
+const COMBAT_SPACESHIP_ID: &str = "usi-arrogance";
+const SMALL_SPACESHIP_COUNT: usize = 6;
 const ORBITAL_LAYOUT_SCALE: i32 = 5;
 const RESEARCH_STATION_CENTER: IVec3 =
     IVec3::new(100 * ORBITAL_LAYOUT_SCALE, 0, 100 * ORBITAL_LAYOUT_SCALE);
@@ -495,6 +498,108 @@ impl VoxelGeometryDirtyChunks {
 struct VoxelPhysicsBody {
     local_center: Vec3,
     cells: Vec<(IVec3, u8)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VoxelSpaceshipClass {
+    Cruiser,
+    Shuttle,
+    Interceptor,
+    Scout,
+}
+
+impl VoxelSpaceshipClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cruiser => "战斗巡洋舰",
+            Self::Shuttle => "穿梭艇",
+            Self::Interceptor => "截击艇",
+            Self::Scout => "侦察艇",
+        }
+    }
+}
+
+#[derive(Component, Clone)]
+struct VoxelSpaceship {
+    id: String,
+    name: String,
+    class: VoxelSpaceshipClass,
+    cockpit_eye_local: Vec3,
+    thrust_acceleration: f32,
+    vertical_acceleration: f32,
+    turn_speed: f32,
+    max_speed: f32,
+}
+
+#[derive(Clone)]
+struct VoxelSpaceshipSpec {
+    ship: VoxelSpaceship,
+    cells: Vec<(IVec3, u8)>,
+    transform: Transform,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PersistedVoxelSpaceship {
+    id: String,
+    #[serde(default)]
+    pilot_user_id: Option<u64>,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    linear_velocity: [f32; 3],
+    angular_velocity: [f32; 3],
+}
+
+#[derive(Resource, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct VoxelSpaceshipStore {
+    ships: Vec<PersistedVoxelSpaceship>,
+}
+
+#[derive(Resource)]
+struct VoxelSpaceshipControlState {
+    selected_ship_id: Option<String>,
+    driving_ship_id: Option<String>,
+    cockpit_eye: Option<Vec3>,
+    cockpit_rotation: Quat,
+    thrust_input: f32,
+    vertical_input: f32,
+    boost_active: bool,
+    brake_active: bool,
+    emergency_stop_requested: bool,
+    exit_pending: bool,
+}
+
+impl Default for VoxelSpaceshipControlState {
+    fn default() -> Self {
+        Self {
+            selected_ship_id: Some(COMBAT_SPACESHIP_ID.to_owned()),
+            driving_ship_id: None,
+            cockpit_eye: None,
+            cockpit_rotation: Quat::IDENTITY,
+            thrust_input: 0.0,
+            vertical_input: 0.0,
+            boost_active: false,
+            brake_active: false,
+            emergency_stop_requested: false,
+            exit_pending: false,
+        }
+    }
+}
+
+impl VoxelSpaceshipControlState {
+    fn stop_driving(&mut self) {
+        self.exit_pending |= self.driving_ship_id.is_some();
+        self.driving_ship_id = None;
+        self.cockpit_eye = None;
+        self.thrust_input = 0.0;
+        self.vertical_input = 0.0;
+        self.boost_active = false;
+        self.brake_active = false;
+    }
+}
+
+#[derive(Resource, Default)]
+struct VoxelSpaceshipPersistenceState {
+    elapsed_seconds: f32,
 }
 
 #[derive(Resource, Default)]
@@ -1664,6 +1769,19 @@ impl Plugin for TrpgVoxelPlugin {
             .revert_to_default_on_deserialization_errors(true)
             .build()
             .expect("failed to initialize voxel scene store");
+        let spaceship_store = Persistent::<VoxelSpaceshipStore>::builder()
+            .name("voxel_spaceships")
+            .format(StorageFormat::Toml)
+            .path(
+                Path::new(".data")
+                    .join("willowblossom")
+                    .join("voxel_spaceships.toml"),
+            )
+            .default(VoxelSpaceshipStore::default())
+            .revertible(true)
+            .revert_to_default_on_deserialization_errors(true)
+            .build()
+            .expect("failed to initialize voxel spaceship store");
         app.add_plugins((
             PhysicsPlugins::default(),
             VoxelPlugin::<u8>::default(),
@@ -1688,6 +1806,8 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPhysicsChunkLoader>()
         .init_resource::<VoxelGeometryDirtyChunks>()
         .init_resource::<VoxelScenePersistenceState>()
+        .init_resource::<VoxelSpaceshipControlState>()
+        .init_resource::<VoxelSpaceshipPersistenceState>()
         .init_resource::<VoxelMinimapSnapshot>()
         .init_resource::<VoxelReplayOcclusionFade>()
         .insert_resource(player_camera_store)
@@ -1695,6 +1815,7 @@ impl Plugin for TrpgVoxelPlugin {
         .insert_resource(inventory_store)
         .insert_resource(toolbar_settings_store)
         .insert_resource(scene_store)
+        .insert_resource(spaceship_store)
         .add_systems(
             Startup,
             (
@@ -1709,6 +1830,7 @@ impl Plugin for TrpgVoxelPlugin {
                 setup_voxel_radiance_volume,
                 setup_voxel_view,
                 load_persisted_voxel_scene,
+                setup_voxel_spaceships,
                 setup_voxel_player_cameras,
             )
                 .chain(),
@@ -1738,27 +1860,35 @@ impl Plugin for TrpgVoxelPlugin {
                 )
                     .chain(),
                 (
-                    update_loaded_voxel_physics_chunks,
-                    stream_voxel_physics_bodies,
-                    animate_voxel_auto_doors,
-                    rebuild_voxel_geometry,
-                    sync_voxel_radiance_volume,
-                    sync_voxel_lighting,
-                    apply_voxel_teleport,
-                    control_first_person_player,
-                    control_voxel_camera
-                        .run_if(crate::replay::replay_mouse_interaction_inactive),
-                    sync_possessed_player_camera,
-                    sync_voxel_player_cameras,
-                    sync_voxel_player_standees.in_set(VoxelPlayerStandeeSynced),
-                    sync_voxel_scene_character_positions,
-                    capture_voxel_player_view,
-                    draw_voxel_target.run_if(crate::replay::replay_video_capture_inactive),
-                    animate_planet_clouds,
-                    animate_voxel_materials,
-                    persist_voxel_inventory,
-                    persist_voxel_toolbar_settings,
-                    persist_voxel_scene,
+                    (
+                        update_loaded_voxel_physics_chunks,
+                        stream_voxel_physics_bodies,
+                        animate_voxel_auto_doors,
+                        rebuild_voxel_geometry,
+                        sync_voxel_radiance_volume,
+                        sync_voxel_lighting,
+                        apply_voxel_teleport,
+                        control_voxel_spaceships,
+                        control_first_person_player,
+                        control_voxel_camera
+                            .run_if(crate::replay::replay_mouse_interaction_inactive),
+                    )
+                        .chain(),
+                    (
+                        sync_possessed_player_camera,
+                        sync_voxel_player_cameras,
+                        sync_voxel_player_standees.in_set(VoxelPlayerStandeeSynced),
+                        sync_voxel_scene_character_positions,
+                        capture_voxel_player_view,
+                        draw_voxel_target.run_if(crate::replay::replay_video_capture_inactive),
+                        animate_planet_clouds,
+                        animate_voxel_materials,
+                        persist_voxel_inventory,
+                        persist_voxel_toolbar_settings,
+                        persist_voxel_scene,
+                        persist_voxel_spaceships,
+                    )
+                        .chain(),
                 )
                     .chain(),
             )
@@ -1782,7 +1912,12 @@ impl Plugin for TrpgVoxelPlugin {
         )
         .add_systems(
             EguiPrimaryContextPass,
-            voxel_player_camera_panel.run_if(crate::replay::replay_video_capture_inactive),
+            (
+                voxel_player_camera_panel,
+                voxel_spaceship_panel,
+            )
+                .chain()
+                .run_if(crate::replay::replay_video_capture_inactive),
         );
     }
 }
@@ -2043,7 +2178,7 @@ fn persist_voxel_scene(
         &Transform,
         &LinearVelocity,
         &AngularVelocity,
-    )>,
+    ), Without<VoxelSpaceship>>,
     placed_lights: Query<(
         &VoxelPlacedLight,
         &Transform,
@@ -2152,13 +2287,17 @@ fn voxel_editor_shortcuts(
     keyboard: Res<ButtonInput<KeyCode>>,
     egui_input: Res<EguiWantsInput>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    spaceship_control: Option<Res<VoxelSpaceshipControlState>>,
     mut editor: ResMut<VoxelEditorState>,
     mut possession: ResMut<VoxelPossessionState>,
 ) {
     if egui_input.wants_any_keyboard_input() {
         return;
     }
-    if keyboard.just_pressed(KeyCode::KeyE) {
+    let driving_spaceship = spaceship_control
+        .as_deref()
+        .is_some_and(|control| control.driving_ship_id.is_some());
+    if keyboard.just_pressed(KeyCode::KeyE) && !driving_spaceship {
         editor.teleport_menu_open = false;
         if possession.active_user_id.is_some() {
             possession.player_inventory_open = !possession.player_inventory_open;
@@ -2706,6 +2845,15 @@ fn workbook_orbital_locations() -> [(IVec3, WorkbookMapDesign); 5] {
         (SENSOR_STATION_CENTER, ARBITRATOR),
         (CANNON_STATION_CENTER, KYO),
         (COMBAT_SPACESHIP_CENTER, ARROGANCE),
+        (ABANDONED_STATION_CENTER, ABANDONED),
+    ]
+}
+
+fn static_workbook_orbital_locations() -> [(IVec3, WorkbookMapDesign); 4] {
+    [
+        (RESEARCH_STATION_CENTER, NIFFY),
+        (SENSOR_STATION_CENTER, ARBITRATOR),
+        (CANNON_STATION_CENTER, KYO),
         (ABANDONED_STATION_CENTER, ABANDONED),
     ]
 }
@@ -3309,6 +3457,14 @@ fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
     doors
 }
 
+fn static_voxel_auto_doors() -> Vec<VoxelAutoDoor> {
+    let mut doors = Vec::new();
+    for (center, design) in static_workbook_orbital_locations() {
+        doors.extend(workbook_auto_doors(center, design));
+    }
+    doors
+}
+
 fn workbook_auto_doors(center: IVec3, design: WorkbookMapDesign) -> Vec<VoxelAutoDoor> {
     let decoded = design.decode();
     let mut seen = vec![false; decoded.styles.len()];
@@ -3414,7 +3570,7 @@ fn setup_voxel_auto_doors(
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
-    for door in voxel_auto_doors() {
+    for door in static_voxel_auto_doors() {
         for panel in voxel_auto_door_panels(&door) {
             let size = voxel_auto_door_panel_size(&panel);
             let translation = panel.closed_translation;
@@ -3544,11 +3700,6 @@ fn workbook_interior_lights() -> Vec<(Vec3, Color)> {
             Color::srgb(1.0, 0.64, 0.32),
         ),
         (
-            COMBAT_SPACESHIP_CENTER,
-            ARROGANCE,
-            Color::srgb(0.48, 0.78, 1.0),
-        ),
-        (
             ABANDONED_STATION_CENTER,
             ABANDONED,
             Color::srgb(0.72, 0.24, 0.18),
@@ -3623,7 +3774,7 @@ fn voxel_prop_cells(size: IVec3, base_material: u8, accent_material: u8) -> Vec<
 
 fn voxel_physics_prop_specs() -> Vec<(Vec<(IVec3, u8)>, Transform)> {
     let mut specs = Vec::new();
-    for (center, design) in workbook_orbital_locations() {
+    for (center, design) in static_workbook_orbital_locations() {
         let decoded = design.decode();
         let candidates = decoded
             .enclosed
@@ -3689,6 +3840,526 @@ fn spawn_default_voxel_physics_props(
             LinearVelocity::ZERO,
             AngularVelocity::ZERO,
         );
+    }
+}
+
+fn combat_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
+    let mut world = World::new();
+    let grid_entity = world.spawn(Grid::<u8>::new()).id();
+    {
+        let mut entity = world.entity_mut(grid_entity);
+        let mut grid = entity
+            .get_mut::<Grid<u8>>()
+            .expect("temporary spaceship grid must exist");
+        build_workbook_orbital_location(
+            &mut grid,
+            IVec3::ZERO,
+            ARROGANCE,
+        );
+        for door in workbook_auto_doors(IVec3::ZERO, ARROGANCE) {
+            for cell in door.cells {
+                grid.set(cell, 0);
+            }
+        }
+    }
+    let grid = world
+        .entity(grid_entity)
+        .get::<Grid<u8>>()
+        .expect("temporary spaceship grid must still exist");
+    let mut cells = voxel_cells(grid);
+    cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
+    cells
+}
+
+fn remove_static_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
+    for (cell, _) in combat_spaceship_voxel_cells() {
+        grid.set(COMBAT_SPACESHIP_CENTER + cell, 0);
+    }
+}
+
+fn small_spaceship_voxel_cells(variant: usize) -> Vec<(IVec3, u8)> {
+    let half_width = 2 + (variant % 2) as i32;
+    let nose = -8 - (variant % 3) as i32;
+    let tail = 5 + (variant % 2) as i32;
+    let wing_span = half_width + 2 + (variant % 3 == 2) as i32;
+    let mut cells = HashMap::<IVec3, u8>::new();
+
+    for z in nose..=tail {
+        let taper = if z < -4 {
+            ((z - nose) / 2 + 1).min(half_width)
+        } else if z > tail - 2 {
+            (tail - z + 1).max(1).min(half_width)
+        } else {
+            half_width
+        };
+        for x in -taper..=taper {
+            let edge = x.abs() == taper;
+            cells.insert(
+                IVec3::new(x, 0, z),
+                if edge { 7 } else { 6 },
+            );
+            if !edge && (-5..=tail - 1).contains(&z) {
+                cells.insert(
+                    IVec3::new(x, 1, z),
+                    if (-4..=-1).contains(&z) { 8 } else { 6 },
+                );
+            }
+        }
+    }
+
+    for z in -1_i32..=3 {
+        let span = wing_span - (z - 1).abs() / 2;
+        for x in -span..=span {
+            cells.entry(IVec3::new(x, 0, z)).or_insert(7);
+        }
+    }
+    for x in [-half_width + 1, half_width - 1] {
+        cells.insert(IVec3::new(x, 0, tail + 1), 9);
+        cells.insert(IVec3::new(x, 1, tail), 9);
+    }
+    cells.insert(IVec3::new(0, 2, -2), 8);
+    cells.insert(IVec3::new(0, 1, nose), 7);
+    if variant % 2 == 1 {
+        for z in -2..=2 {
+            cells.insert(IVec3::new(-wing_span, 1, z), 10);
+            cells.insert(IVec3::new(wing_span, 1, z), 10);
+        }
+    }
+
+    let mut cells = cells.into_iter().collect::<Vec<_>>();
+    cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
+    cells
+}
+
+fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
+    let mut specs = vec![VoxelSpaceshipSpec {
+        ship: VoxelSpaceship {
+            id: COMBAT_SPACESHIP_ID.to_owned(),
+            name: "U.S.I 狂妄号".to_owned(),
+            class: VoxelSpaceshipClass::Cruiser,
+            cockpit_eye_local: Vec3::new(
+                ARROGANCE.spawn[0] as f32 + 0.5,
+                2.5,
+                ARROGANCE.spawn[1] as f32 + 0.5,
+            ) * VOXEL_SIZE,
+            thrust_acceleration: 2.4,
+            vertical_acceleration: 1.4,
+            turn_speed: 0.32,
+            max_speed: 14.0,
+        },
+        cells: combat_spaceship_voxel_cells(),
+        transform: Transform::from_translation(
+            COMBAT_SPACESHIP_CENTER.as_vec3() * VOXEL_SIZE,
+        ),
+    }];
+    let names = [
+        "WB-01 雨燕号",
+        "WB-02 萤火号",
+        "WB-03 云雀号",
+        "WB-04 信风号",
+        "WB-05 渡鸦号",
+        "WB-06 星槎号",
+    ];
+    let classes = [
+        VoxelSpaceshipClass::Shuttle,
+        VoxelSpaceshipClass::Interceptor,
+        VoxelSpaceshipClass::Scout,
+        VoxelSpaceshipClass::Shuttle,
+        VoxelSpaceshipClass::Interceptor,
+        VoxelSpaceshipClass::Scout,
+    ];
+    let offsets = [
+        IVec3::new(-132, 18, -72),
+        IVec3::new(-82, 22, -82),
+        IVec3::new(-28, 26, -86),
+        IVec3::new(30, 20, -86),
+        IVec3::new(84, 24, -82),
+        IVec3::new(134, 18, -72),
+    ];
+    for index in 0..SMALL_SPACESHIP_COUNT {
+        let class = classes[index];
+        let (thrust_acceleration, vertical_acceleration, turn_speed, max_speed) = match class {
+            VoxelSpaceshipClass::Shuttle => (8.0, 6.0, 1.35, 26.0),
+            VoxelSpaceshipClass::Interceptor => (12.0, 8.0, 1.8, 36.0),
+            VoxelSpaceshipClass::Scout => (10.0, 7.0, 1.6, 32.0),
+            VoxelSpaceshipClass::Cruiser => unreachable!(),
+        };
+        specs.push(VoxelSpaceshipSpec {
+            ship: VoxelSpaceship {
+                id: format!("small-ship-{:02}", index + 1),
+                name: names[index].to_owned(),
+                class,
+                cockpit_eye_local: Vec3::new(0.5, 2.8, -1.5) * VOXEL_SIZE,
+                thrust_acceleration,
+                vertical_acceleration,
+                turn_speed,
+                max_speed,
+            },
+            cells: small_spaceship_voxel_cells(index),
+            transform: Transform::from_translation(
+                (COMBAT_SPACESHIP_CENTER + offsets[index]).as_vec3() * VOXEL_SIZE,
+            )
+            .with_rotation(Quat::from_rotation_y(
+                (index as f32 - 2.5) * 0.08,
+            )),
+        });
+    }
+    specs
+}
+
+fn persisted_voxel_spaceship_from_spec(
+    spec: &VoxelSpaceshipSpec,
+    pilot_user_id: Option<u64>,
+) -> PersistedVoxelSpaceship {
+    PersistedVoxelSpaceship {
+        id: spec.ship.id.clone(),
+        pilot_user_id,
+        translation: spec.transform.translation.to_array(),
+        rotation: spec.transform.rotation.to_array(),
+        linear_velocity: [0.0; 3],
+        angular_velocity: [0.0; 3],
+    }
+}
+
+fn finite_array<const N: usize>(values: [f32; N]) -> bool {
+    values.into_iter().all(f32::is_finite)
+}
+
+fn voxel_spaceship_runtime_pose(
+    persisted: &PersistedVoxelSpaceship,
+    fallback: &VoxelSpaceshipSpec,
+) -> (Transform, LinearVelocity, AngularVelocity) {
+    let translation = finite_array(persisted.translation)
+        .then(|| Vec3::from_array(persisted.translation))
+        .unwrap_or(fallback.transform.translation);
+    let saved_rotation = Quat::from_array(persisted.rotation);
+    let rotation = if finite_array(persisted.rotation)
+        && saved_rotation.length_squared() > f32::EPSILON
+    {
+        saved_rotation.normalize()
+    } else {
+        fallback.transform.rotation
+    };
+    let linear_velocity = finite_array(persisted.linear_velocity)
+        .then(|| Vec3::from_array(persisted.linear_velocity))
+        .unwrap_or(Vec3::ZERO);
+    let angular_velocity = finite_array(persisted.angular_velocity)
+        .then(|| Vec3::from_array(persisted.angular_velocity))
+        .unwrap_or(Vec3::ZERO);
+    (
+        Transform {
+            translation,
+            rotation,
+            scale: Vec3::ONE,
+        },
+        LinearVelocity(linear_velocity),
+        AngularVelocity(angular_velocity),
+    )
+}
+
+fn spawn_voxel_spaceship(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &VoxelMaterials,
+    spec: &VoxelSpaceshipSpec,
+    transform: Transform,
+    linear_velocity: LinearVelocity,
+    angular_velocity: AngularVelocity,
+) -> Entity {
+    let collider_cells = spec
+        .cells
+        .iter()
+        .filter_map(|(cell, material)| TrpgVoxelConnector::solid(material).then_some(*cell))
+        .collect::<Vec<_>>();
+    let min = collider_cells
+        .iter()
+        .copied()
+        .reduce(IVec3::min)
+        .unwrap_or(IVec3::ZERO);
+    let max = collider_cells
+        .iter()
+        .copied()
+        .reduce(IVec3::max)
+        .unwrap_or(IVec3::ZERO);
+    let local_center =
+        (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE;
+    let (material_meshes, _) = build_voxel_meshes_from_cells(&spec.cells);
+    commands
+        .spawn((
+            Name::new(spec.ship.name.clone()),
+            spec.ship.clone(),
+            VoxelPhysicsBody {
+                local_center,
+                cells: spec.cells.clone(),
+            },
+            RigidBody::Dynamic,
+            canonical_voxel_collider(&collider_cells),
+            GravityScale(0.0),
+            Friction::new(0.25),
+            Restitution::new(0.05),
+            linear_velocity,
+            angular_velocity,
+            LinearDamping(0.05),
+            AngularDamping(1.1),
+            transform,
+            Visibility::Visible,
+        ))
+        .with_children(|parent| {
+            for (material_id, mesh) in material_meshes {
+                parent.spawn((
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
+                ));
+            }
+        })
+        .id()
+}
+
+fn spawn_default_voxel_spaceships(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &VoxelMaterials,
+    store: &mut Persistent<VoxelSpaceshipStore>,
+    reset_poses: bool,
+) {
+    let specs = default_voxel_spaceship_specs();
+    let mut changed = false;
+    for spec in &specs {
+        let persisted = if let Some(existing) = store
+            .ships
+            .iter_mut()
+            .find(|ship| ship.id == spec.ship.id)
+        {
+            if reset_poses {
+                let pilot_user_id = existing.pilot_user_id;
+                *existing = persisted_voxel_spaceship_from_spec(spec, pilot_user_id);
+                changed = true;
+            }
+            existing.clone()
+        } else {
+            let persisted = persisted_voxel_spaceship_from_spec(spec, None);
+            store.ships.push(persisted.clone());
+            changed = true;
+            persisted
+        };
+        let (transform, linear_velocity, angular_velocity) =
+            voxel_spaceship_runtime_pose(&persisted, spec);
+        spawn_voxel_spaceship(
+            commands,
+            meshes,
+            materials,
+            spec,
+            transform,
+            linear_velocity,
+            angular_velocity,
+        );
+    }
+    if changed {
+        if let Err(err) = store.persist() {
+            eprintln!("failed to persist default voxel spaceships: {err}");
+        }
+    }
+}
+
+fn setup_voxel_spaceships(
+    mut commands: Commands,
+    mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
+    mut store: ResMut<Persistent<VoxelSpaceshipStore>>,
+) {
+    if let Ok(mut grid) = grids.single_mut() {
+        remove_static_combat_spaceship(&mut grid);
+    }
+    spawn_default_voxel_spaceships(
+        &mut commands,
+        &mut meshes,
+        &materials,
+        &mut store,
+        false,
+    );
+}
+
+fn voxel_spaceship_driver_authorized(
+    pilot_user_id: Option<u64>,
+    active_user_id: Option<u64>,
+) -> bool {
+    match pilot_user_id {
+        Some(pilot_user_id) => active_user_id == Some(pilot_user_id),
+        None => active_user_id.is_none(),
+    }
+}
+
+fn control_voxel_spaceships(
+    time: Res<Time>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    egui_input: Res<EguiWantsInput>,
+    mut editor: ResMut<VoxelEditorState>,
+    mut possession: ResMut<VoxelPossessionState>,
+    store: Res<Persistent<VoxelSpaceshipStore>>,
+    mut control: ResMut<VoxelSpaceshipControlState>,
+    mut spaceships: Query<
+        (
+            &VoxelSpaceship,
+            &Transform,
+            &mut LinearVelocity,
+            &mut AngularVelocity,
+        ),
+        (
+            With<VoxelSpaceship>,
+            Without<VoxelFirstPersonPlayer>,
+            Without<VoxelViewportCamera>,
+        ),
+    >,
+) {
+    control.cockpit_eye = None;
+    control.thrust_input = 0.0;
+    control.vertical_input = 0.0;
+    control.boost_active = false;
+    control.brake_active = false;
+    let Some(driving_ship_id) = control.driving_ship_id.clone() else {
+        if control.exit_pending {
+            possession.applied_user_id = None;
+            editor.first_person_enabled = true;
+            editor.first_person_flying = possession.active_user_id.is_none();
+            control.exit_pending = false;
+        }
+        return;
+    };
+    let pilot_user_id = store
+        .ships
+        .iter()
+        .find(|ship| ship.id == driving_ship_id)
+        .and_then(|ship| ship.pilot_user_id);
+    if !voxel_spaceship_driver_authorized(pilot_user_id, possession.active_user_id) {
+        control.stop_driving();
+        possession.applied_user_id = None;
+        return;
+    }
+    let Some((ship, transform, mut linear_velocity, mut angular_velocity)) = spaceships
+        .iter_mut()
+        .find(|(ship, ..)| ship.id == driving_ship_id)
+    else {
+        control.stop_driving();
+        possession.applied_user_id = None;
+        return;
+    };
+    if keyboard.just_pressed(KeyCode::KeyF) && !egui_input.wants_any_keyboard_input() {
+        control.stop_driving();
+        possession.applied_user_id = None;
+        return;
+    }
+
+    possession.applied_user_id = None;
+    control.cockpit_eye = Some(
+        transform
+            .compute_affine()
+            .transform_point3(ship.cockpit_eye_local),
+    );
+    control.cockpit_rotation = transform.rotation;
+    if control.emergency_stop_requested {
+        linear_velocity.0 = Vec3::ZERO;
+        angular_velocity.0 = Vec3::ZERO;
+        control.emergency_stop_requested = false;
+    }
+
+    let input_blocked = egui_input.wants_any_keyboard_input()
+        || editor.creative_inventory_open
+        || editor.teleport_menu_open
+        || possession.player_inventory_open
+        || editor.first_person_cursor_released;
+    if input_blocked {
+        return;
+    }
+    let thrust_input =
+        keyboard.pressed(KeyCode::KeyW) as i8 - keyboard.pressed(KeyCode::KeyS) as i8;
+    let vertical_input = keyboard.pressed(KeyCode::Space) as i8
+        - (keyboard.pressed(KeyCode::ControlLeft)
+            || keyboard.pressed(KeyCode::ControlRight)) as i8;
+    let yaw_input =
+        keyboard.pressed(KeyCode::KeyA) as i8 - keyboard.pressed(KeyCode::KeyD) as i8;
+    let pitch_input = keyboard.pressed(KeyCode::ArrowDown) as i8
+        - keyboard.pressed(KeyCode::ArrowUp) as i8;
+    let roll_input =
+        keyboard.pressed(KeyCode::KeyQ) as i8 - keyboard.pressed(KeyCode::KeyE) as i8;
+    let boost = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
+    let braking = keyboard.pressed(KeyCode::KeyX);
+    let delta_seconds = time.delta_secs().clamp(0.0, 0.05);
+    let boost_scale = if boost { 1.75 } else { 1.0 };
+    let forward = transform.rotation * Vec3::NEG_Z;
+    let up = transform.rotation * Vec3::Y;
+    linear_velocity.0 += (
+        forward * thrust_input as f32 * ship.thrust_acceleration
+            + up * vertical_input as f32 * ship.vertical_acceleration
+    ) * boost_scale
+        * delta_seconds;
+    if braking {
+        let response = (-7.0 * delta_seconds).exp();
+        linear_velocity.0 *= response;
+        angular_velocity.0 *= response;
+    }
+    linear_velocity.0 = linear_velocity
+        .0
+        .clamp_length_max(ship.max_speed * boost_scale);
+
+    let local_angular_target = Vec3::new(
+        pitch_input as f32,
+        yaw_input as f32,
+        roll_input as f32,
+    ) * ship.turn_speed
+        * boost_scale;
+    let world_angular_target = transform.rotation * local_angular_target;
+    let angular_response = 1.0 - (-5.0 * delta_seconds).exp();
+    angular_velocity.0 = angular_velocity
+        .0
+        .lerp(world_angular_target, angular_response);
+
+    control.thrust_input = thrust_input as f32;
+    control.vertical_input = vertical_input as f32;
+    control.boost_active = boost;
+    control.brake_active = braking;
+}
+
+fn persist_voxel_spaceships(
+    time: Res<Time>,
+    mut app_exit: MessageReader<AppExit>,
+    mut persistence: ResMut<VoxelSpaceshipPersistenceState>,
+    spaceships: Query<(
+        &VoxelSpaceship,
+        &Transform,
+        &LinearVelocity,
+        &AngularVelocity,
+    )>,
+    mut store: ResMut<Persistent<VoxelSpaceshipStore>>,
+) {
+    persistence.elapsed_seconds += time.delta_secs();
+    let exiting = app_exit.read().next().is_some();
+    if !exiting && persistence.elapsed_seconds < VOXEL_SPACESHIP_SAVE_SECONDS {
+        return;
+    }
+    persistence.elapsed_seconds = 0.0;
+    let mut changed = false;
+    for (ship, transform, linear_velocity, angular_velocity) in &spaceships {
+        let Some(record) = store.ships.iter_mut().find(|record| record.id == ship.id) else {
+            continue;
+        };
+        let snapshot = PersistedVoxelSpaceship {
+            id: ship.id.clone(),
+            pilot_user_id: record.pilot_user_id,
+            translation: transform.translation.to_array(),
+            rotation: transform.rotation.to_array(),
+            linear_velocity: linear_velocity.0.to_array(),
+            angular_velocity: angular_velocity.0.to_array(),
+        };
+        if *record != snapshot {
+            *record = snapshot;
+            changed = true;
+        }
+    }
+    if changed {
+        if let Err(err) = store.persist() {
+            eprintln!("failed to persist voxel spaceship state: {err}");
+        }
     }
 }
 
@@ -4184,6 +4855,353 @@ fn voxel_player_camera_panel(
                 }
             }
         });
+}
+
+#[derive(Clone)]
+struct VoxelSpaceshipTelemetry {
+    id: String,
+    name: String,
+    class: VoxelSpaceshipClass,
+    max_speed: f32,
+    speed: f32,
+    forward_speed: f32,
+    angular_speed: f32,
+    translation: Vec3,
+    rotation: Quat,
+}
+
+fn voxel_spaceship_pilot_user_ids(
+    manager: Option<&Persistent<NapcatMessageManager>>,
+) -> Vec<u64> {
+    let mut user_ids = manager
+        .and_then(|manager| manager.current_group())
+        .into_iter()
+        .flat_map(|group| &group.players)
+        .filter_map(|target_id| target_id.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    user_ids.sort_unstable();
+    user_ids.dedup();
+    user_ids
+}
+
+fn draw_voxel_spaceship_hud(
+    ctx: &egui::Context,
+    telemetry: &VoxelSpaceshipTelemetry,
+    pilot_label: &str,
+    control: &VoxelSpaceshipControlState,
+) {
+    egui::Area::new(egui::Id::new("voxel_spaceship_cockpit_hud"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 76.0))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(5, 18, 30, 232))
+                .stroke(egui::Stroke::new(
+                    1.5,
+                    egui::Color32::from_rgb(55, 205, 235),
+                ))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_width(460.0);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(105, 235, 255),
+                            format!("◈ {}", telemetry.name),
+                        );
+                        ui.separator();
+                        ui.small(telemetry.class.label());
+                        ui.separator();
+                        ui.small(format!("驾驶：{pilot_label}"));
+                        if control.boost_active {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 190, 70),
+                                "加力",
+                            );
+                        }
+                        if control.brake_active {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(120, 225, 170),
+                                "制动",
+                            );
+                        }
+                    });
+                    let displayed_max_speed = telemetry.max_speed
+                        * if control.boost_active { 1.75 } else { 1.0 };
+                    let speed_fraction =
+                        (telemetry.speed / displayed_max_speed.max(f32::EPSILON)).clamp(0.0, 1.0);
+                    ui.add(
+                        egui::ProgressBar::new(speed_fraction)
+                            .desired_width(460.0)
+                            .fill(egui::Color32::from_rgb(32, 176, 220))
+                            .text(format!(
+                                "速度 {:05.1} / {:05.1}  ·  前向 {:+05.1}",
+                                telemetry.speed,
+                                displayed_max_speed,
+                                telemetry.forward_speed,
+                            )),
+                    );
+
+                    let (yaw, pitch, roll) = telemetry.rotation.to_euler(EulerRot::YXZ);
+                    let (horizon_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(460.0, 38.0),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter_at(horizon_rect);
+                    let center = horizon_rect.center();
+                    let half_width = 112.0;
+                    let horizon_offset = pitch.sin() * 18.0;
+                    let horizon_slope = roll.sin() * 28.0;
+                    painter.line_segment(
+                        [
+                            center + egui::vec2(-half_width, horizon_offset - horizon_slope),
+                            center + egui::vec2(half_width, horizon_offset + horizon_slope),
+                        ],
+                        egui::Stroke::new(
+                            1.5,
+                            egui::Color32::from_rgb(80, 220, 245),
+                        ),
+                    );
+                    painter.circle_stroke(
+                        center,
+                        6.0,
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(255, 215, 100),
+                        ),
+                    );
+                    painter.text(
+                        horizon_rect.left_center() + egui::vec2(4.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("艏向 {:03.0}°", yaw.to_degrees().rem_euclid(360.0)),
+                        egui::FontId::monospace(12.0),
+                        egui::Color32::LIGHT_GRAY,
+                    );
+                    painter.text(
+                        horizon_rect.right_center() - egui::vec2(4.0, 0.0),
+                        egui::Align2::RIGHT_CENTER,
+                        format!("角速 {:.2}", telemetry.angular_speed),
+                        egui::FontId::monospace(12.0),
+                        egui::Color32::LIGHT_GRAY,
+                    );
+                    ui.centered_and_justified(|ui| {
+                        ui.small(
+                            "W/S 推进 · A/D 偏航 · ↑/↓ 俯仰 · Q/E 翻滚 · 空格/Ctrl 升降 · Shift 加力 · X 制动 · F 离舰",
+                        );
+                    });
+                });
+        });
+}
+
+fn voxel_spaceship_panel(
+    mut contexts: EguiContexts,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    mut voxel_editor: ResMut<VoxelEditorState>,
+    mut possession: ResMut<VoxelPossessionState>,
+    mut control: ResMut<VoxelSpaceshipControlState>,
+    mut store: ResMut<Persistent<VoxelSpaceshipStore>>,
+    spaceships: Query<(
+        &VoxelSpaceship,
+        &Transform,
+        &LinearVelocity,
+        &AngularVelocity,
+    )>,
+) {
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    let mut telemetry = spaceships
+        .iter()
+        .map(|(ship, transform, linear_velocity, angular_velocity)| {
+            VoxelSpaceshipTelemetry {
+                id: ship.id.clone(),
+                name: ship.name.clone(),
+                class: ship.class,
+                max_speed: ship.max_speed,
+                speed: linear_velocity.length(),
+                forward_speed: linear_velocity.dot(transform.rotation * Vec3::NEG_Z),
+                angular_speed: angular_velocity.length(),
+                translation: transform.translation,
+                rotation: transform.rotation,
+            }
+        })
+        .collect::<Vec<_>>();
+    telemetry.sort_by(|left, right| left.id.cmp(&right.id));
+    if telemetry.is_empty() {
+        control.stop_driving();
+        return;
+    }
+    if control
+        .selected_ship_id
+        .as_ref()
+        .is_none_or(|selected| !telemetry.iter().any(|ship| &ship.id == selected))
+    {
+        control.selected_ship_id = Some(telemetry[0].id.clone());
+    }
+    let pilot_user_ids = voxel_spaceship_pilot_user_ids(manager.as_deref());
+    let mut assignment_changed = false;
+
+    egui::Window::new("舰船调度台")
+        .id(egui::Id::new("voxel_spaceship_control_window"))
+        .default_pos(egui::pos2(324.0, 270.0))
+        .default_width(310.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            let mut selected_id = control
+                .selected_ship_id
+                .clone()
+                .unwrap_or_else(|| telemetry[0].id.clone());
+            let selected_name = telemetry
+                .iter()
+                .find(|ship| ship.id == selected_id)
+                .map(|ship| ship.name.as_str())
+                .unwrap_or("舰船");
+            egui::ComboBox::from_label("舰船")
+                .selected_text(selected_name)
+                .show_ui(ui, |ui| {
+                    for ship in &telemetry {
+                        ui.selectable_value(
+                            &mut selected_id,
+                            ship.id.clone(),
+                            format!("{} · {}", ship.name, ship.class.label()),
+                        );
+                    }
+                });
+            control.selected_ship_id = Some(selected_id.clone());
+            let Some(selected) = telemetry.iter().find(|ship| ship.id == selected_id) else {
+                return;
+            };
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(90, 225, 155),
+                    "● 动态物理",
+                );
+                ui.colored_label(
+                    egui::Color32::from_rgb(95, 205, 245),
+                    "● 零重力",
+                );
+                ui.small(format!("{} 方块舰体", selected.class.label()));
+            });
+            ui.small(format!(
+                "位置 X {:.1}  Y {:.1}  Z {:.1} · 速度 {:.1}",
+                selected.translation.x,
+                selected.translation.y,
+                selected.translation.z,
+                selected.speed,
+            ));
+            ui.separator();
+
+            let mut pilot_user_id = store
+                .ships
+                .iter()
+                .find(|ship| ship.id == selected.id)
+                .and_then(|ship| ship.pilot_user_id);
+            let previous_pilot = pilot_user_id;
+            let pilot_text = pilot_user_id.map_or_else(
+                || "GM / 未分配".to_owned(),
+                |user_id| voxel_player_display_name(manager.as_deref(), user_id),
+            );
+            egui::ComboBox::from_label("驾驶权限")
+                .selected_text(pilot_text)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut pilot_user_id,
+                        None,
+                        "GM / 未分配",
+                    );
+                    for user_id in &pilot_user_ids {
+                        ui.selectable_value(
+                            &mut pilot_user_id,
+                            Some(*user_id),
+                            voxel_player_display_name(manager.as_deref(), *user_id),
+                        );
+                    }
+                });
+            if pilot_user_id != previous_pilot {
+                if let Some(record) = store
+                    .ships
+                    .iter_mut()
+                    .find(|ship| ship.id == selected.id)
+                {
+                    record.pilot_user_id = pilot_user_id;
+                    assignment_changed = true;
+                }
+                if control.driving_ship_id.as_deref() == Some(selected.id.as_str())
+                    && !voxel_spaceship_driver_authorized(
+                        pilot_user_id,
+                        possession.active_user_id,
+                    )
+                {
+                    control.stop_driving();
+                }
+            }
+            ui.small("只有 GM 可在此分配；玩家身份按 QQ 数字 ID 校验。");
+
+            let driving_selected =
+                control.driving_ship_id.as_deref() == Some(selected.id.as_str());
+            ui.horizontal(|ui| {
+                if driving_selected {
+                    if ui.button("停止驾驶").clicked() {
+                        control.stop_driving();
+                    }
+                } else {
+                    let label = if pilot_user_id.is_some() {
+                        "以该玩家驾驶"
+                    } else {
+                        "GM 开始驾驶"
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(label)
+                                .fill(egui::Color32::from_rgb(18, 104, 132)),
+                        )
+                        .clicked()
+                    {
+                        control.driving_ship_id = Some(selected.id.clone());
+                        control.exit_pending = false;
+                        control.selected_ship_id = Some(selected.id.clone());
+                        if let Some(user_id) = pilot_user_id {
+                            possession.possess(user_id);
+                        } else {
+                            possession.release();
+                        }
+                        voxel_editor.camera_yaw = 0.0;
+                        voxel_editor.camera_pitch = 0.0;
+                        voxel_editor.first_person_enabled = true;
+                        voxel_editor.creative_inventory_open = false;
+                        voxel_editor.teleport_menu_open = false;
+                        voxel_editor.first_person_cursor_released = true;
+                    }
+                }
+                if ui
+                    .button("紧急制动")
+                    .on_hover_text("下一物理帧把线速度和角速度归零")
+                    .clicked()
+                {
+                    control.emergency_stop_requested = true;
+                }
+            });
+            ui.small("开始后点击 3D 视口锁定鼠标；离舰不会改动玩家的角色归属。");
+        });
+
+    if assignment_changed {
+        if let Err(err) = store.persist() {
+            eprintln!("failed to persist voxel spaceship pilot assignment: {err}");
+        }
+    }
+    if let Some(active_ship_id) = control.driving_ship_id.as_deref() {
+        if let Some(active) = telemetry.iter().find(|ship| ship.id == active_ship_id) {
+            let pilot_user_id = store
+                .ships
+                .iter()
+                .find(|ship| ship.id == active_ship_id)
+                .and_then(|ship| ship.pilot_user_id);
+            let pilot_label = pilot_user_id.map_or_else(
+                || "GM".to_owned(),
+                |user_id| voxel_player_display_name(manager.as_deref(), user_id),
+            );
+            draw_voxel_spaceship_hud(ctx, active, &pilot_label, &control);
+        }
+    }
 }
 
 fn voxel_player_hotbar_slot_label(
@@ -5679,7 +6697,7 @@ fn stream_voxel_physics_bodies(
         &Transform,
         &LinearVelocity,
         &AngularVelocity,
-    )>,
+    ), Without<VoxelSpaceship>>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
@@ -6390,6 +7408,8 @@ fn handle_editor_requests(
     mut planets: Query<&mut VoxelOrbitalPlanet>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
+    mut spaceship_store: Option<ResMut<Persistent<VoxelSpaceshipStore>>>,
+    mut spaceship_control: Option<ResMut<VoxelSpaceshipControlState>>,
 ) {
     let Ok(mut grid) = grids.single_mut() else {
         return;
@@ -6407,6 +7427,7 @@ fn handle_editor_requests(
             grid.set(position, 0);
         }
         populate_default_grid(&mut grid);
+        remove_static_combat_spaceship(&mut grid);
         if let Ok(mut planet) = planets.single_mut() {
             planet.cells = voxel_orbital_planet_cells().into_iter().collect();
             planet.refresh_cell_bounds();
@@ -6414,6 +7435,19 @@ fn handle_editor_requests(
             planet.dirty = true;
         }
         spawn_default_voxel_physics_props(&mut commands, &mut meshes, &materials);
+        if let Some(store) = spaceship_store.as_deref_mut() {
+            spawn_default_voxel_spaceships(
+                &mut commands,
+                &mut meshes,
+                &materials,
+                store,
+                true,
+            );
+        }
+        if let Some(control) = spaceship_control.as_deref_mut() {
+            control.stop_driving();
+            control.selected_ship_id = Some(COMBAT_SPACESHIP_ID.to_owned());
+        }
         editor.undo.clear();
         editor.redo.clear();
         editor.selection_anchor = None;
@@ -6871,7 +7905,7 @@ fn process_voxel_scene_history(
         &Transform,
         &LinearVelocity,
         &AngularVelocity,
-    )>,
+    ), Without<VoxelSpaceship>>,
     placed_lights: Query<(Entity, &VoxelPlacedLight)>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
@@ -8054,9 +9088,18 @@ fn apply_voxel_teleport(
             Without<VoxelViewportCamera>,
             Without<VoxelPlayerCaptureCamera>,
             Without<VoxelPlayerStandee>,
+            Without<VoxelSpaceship>,
         ),
     >,
     standees: Query<(&VoxelPlayerStandee, &GlobalTransform), Without<VoxelFirstPersonPlayer>>,
+    spaceships: Query<
+        (&VoxelSpaceship, &Transform),
+        (
+            With<VoxelSpaceship>,
+            Without<VoxelFirstPersonPlayer>,
+            Without<VoxelPlayerStandee>,
+        ),
+    >,
 ) {
     let Some(destination) = editor.teleport_requested.take() else { return };
     if possession.active_user_id.is_some() {
@@ -8072,6 +9115,18 @@ fn apply_voxel_teleport(
                 return;
             };
             first_person_player_position(standee_transform.translation())
+        },
+        VoxelTeleportDestination::CombatSpaceship => {
+            let Some((ship, ship_transform)) = spaceships
+                .iter()
+                .find(|(ship, _)| ship.id == COMBAT_SPACESHIP_ID)
+            else {
+                return;
+            };
+            ship_transform
+                .compute_affine()
+                .transform_point3(ship.cockpit_eye_local)
+                - ship_transform.rotation * Vec3::Y * FIRST_PERSON_EYE_OFFSET
         },
         _ => {
             let Some(position) = destination.player_position() else { return };
@@ -8286,6 +9341,7 @@ fn control_first_person_player(
     mut movement_store: Option<ResMut<Persistent<VoxelPossessionMovementStore>>>,
     mut editor: ResMut<VoxelEditorState>,
     mut possession: ResMut<VoxelPossessionState>,
+    spaceship_control: Option<Res<VoxelSpaceshipControlState>>,
     mut players: Query<
         (
             Entity,
@@ -8313,6 +9369,34 @@ fn control_first_person_player(
     else {
         return;
     };
+
+    if let Some((cockpit_eye, cockpit_rotation)) = spaceship_control
+        .as_deref()
+        .and_then(|control| {
+            control
+                .cockpit_eye
+                .map(|eye| (eye, control.cockpit_rotation))
+        })
+    {
+        possession.applied_user_id = None;
+        possession.last_player_position = None;
+        possession.turn_start_position = None;
+        possession.movement_happened = false;
+        editor.first_person_enabled = true;
+        editor.first_person_was_enabled = true;
+        editor.first_person_flying = false;
+        editor.creative_inventory_open = false;
+        editor.teleport_menu_open = false;
+        possession.player_inventory_open = false;
+        transform.translation =
+            cockpit_eye - cockpit_rotation * Vec3::Y * FIRST_PERSON_EYE_OFFSET;
+        velocity.0 = Vec3::ZERO;
+        acceleration.0 = Vec3::ZERO;
+        if !is_sensor {
+            commands.entity(entity).insert(Sensor);
+        }
+        return;
+    }
 
     if possession.active_user_id != possession.applied_user_id {
         if let Some(previous_user_id) = possession.applied_user_id {
@@ -8856,6 +9940,7 @@ fn control_voxel_camera(
     >,
     mut editor: ResMut<VoxelEditorState>,
     mut possession: ResMut<VoxelPossessionState>,
+    spaceship_control: Option<Res<VoxelSpaceshipControlState>>,
     egui_input: Res<EguiWantsInput>,
 ) {
     editor.first_person_enabled = true;
@@ -8976,9 +10061,21 @@ fn control_voxel_camera(
             0.0,
         );
         if let Ok((mut camera_transform, mut projection)) = cameras.single_mut() {
-            camera_transform.translation =
-                player_transform.translation + Vec3::Y * FIRST_PERSON_EYE_OFFSET;
-            camera_transform.rotation = rotation;
+            if let Some((cockpit_eye, cockpit_rotation)) = spaceship_control
+                .as_deref()
+                .and_then(|control| {
+                    control
+                        .cockpit_eye
+                        .map(|eye| (eye, control.cockpit_rotation))
+                })
+            {
+                camera_transform.translation = cockpit_eye;
+                camera_transform.rotation = cockpit_rotation * rotation;
+            } else {
+                camera_transform.translation =
+                    player_transform.translation + Vec3::Y * FIRST_PERSON_EYE_OFFSET;
+                camera_transform.rotation = rotation;
+            }
             if let Projection::Perspective(perspective) = &mut *projection {
                 perspective.fov = FIRST_PERSON_FOV_RADIANS;
             }
@@ -11585,7 +12682,10 @@ mod tests {
     #[test]
     fn voxel_physics_props_detail_workbook_interiors() {
         let specs = voxel_physics_prop_specs();
-        assert_eq!(specs.len(), 10);
+        assert_eq!(
+            specs.len(),
+            static_workbook_orbital_locations().len() * 2
+        );
         assert!(specs.iter().all(|(cells, _)| !cells.is_empty()));
         assert!(specs.iter().all(
             |(cells, _)| cells.iter().all(
@@ -12666,5 +13766,167 @@ mod tests {
         let possession = app.world().resource::<VoxelPossessionState>();
         assert_eq!(possession.movement_used, 0.0);
         assert!(!possession.reset_movement_requested);
+    }
+
+    #[test]
+    fn default_fleet_contains_a_cruiser_and_six_unique_small_ships() {
+        let specs = default_voxel_spaceship_specs();
+        assert_eq!(specs.len(), SMALL_SPACESHIP_COUNT + 1);
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.ship.class != VoxelSpaceshipClass::Cruiser)
+                .count(),
+            SMALL_SPACESHIP_COUNT
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.ship.id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            specs.len()
+        );
+        assert!(specs.iter().all(|spec| {
+            !spec.cells.is_empty()
+                && spec
+                    .cells
+                    .iter()
+                    .all(|(_, material)| (1..=VOXEL_MATERIAL_COUNT as u8).contains(material))
+                && spec
+                    .cells
+                    .iter()
+                    .any(|(_, material)| TrpgVoxelConnector::solid(material))
+        }));
+    }
+
+    #[test]
+    fn spawned_spaceships_are_dynamic_canonical_voxels_with_zero_gravity() {
+        fn spawn_test_spaceship(
+            mut commands: Commands,
+            mut meshes: ResMut<Assets<Mesh>>,
+            materials: Res<VoxelMaterials>,
+        ) {
+            for spec in default_voxel_spaceship_specs() {
+                spawn_voxel_spaceship(
+                    &mut commands,
+                    &mut meshes,
+                    &materials,
+                    &spec,
+                    spec.transform,
+                    LinearVelocity::ZERO,
+                    AngularVelocity::ZERO,
+                );
+            }
+        }
+
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .insert_resource(VoxelMaterials {
+                handles: std::array::from_fn(|_| Handle::default()),
+                planet_ocean: Handle::default(),
+            })
+            .add_systems(Update, spawn_test_spaceship);
+        app.update();
+
+        let mut query = app.world_mut().query_filtered::<(
+            &RigidBody,
+            &GravityScale,
+            &Collider,
+        ), With<VoxelSpaceship>>();
+        let bodies = query.iter(app.world()).collect::<Vec<_>>();
+        assert_eq!(bodies.len(), SMALL_SPACESHIP_COUNT + 1);
+        for (body, gravity_scale, collider) in bodies {
+            assert_eq!(*body, RigidBody::Dynamic);
+            assert_eq!(gravity_scale.0, 0.0);
+            assert_eq!(
+                collider
+                    .shape()
+                    .as_voxels()
+                    .expect("spaceship collider must retain voxel geometry")
+                    .voxel_size(),
+                Vec3::splat(VOXEL_SIZE)
+            );
+        }
+        let mut entities = app
+            .world_mut()
+            .query_filtered::<Entity, With<VoxelSpaceship>>();
+        for entity in entities.iter(app.world()) {
+            assert!(
+                !app.world()
+                    .entity(entity)
+                    .contains::<ConstantLinearAcceleration>(),
+                "spaceships must not receive the walking/prop gravity acceleration"
+            );
+        }
+    }
+
+    #[test]
+    fn spaceship_driver_permissions_require_the_assigned_player_identity() {
+        assert!(voxel_spaceship_driver_authorized(None, None));
+        assert!(!voxel_spaceship_driver_authorized(None, Some(42)));
+        assert!(voxel_spaceship_driver_authorized(Some(42), Some(42)));
+        assert!(!voxel_spaceship_driver_authorized(Some(42), Some(7)));
+        assert!(!voxel_spaceship_driver_authorized(Some(42), None));
+    }
+
+    #[test]
+    fn authorized_spaceship_controls_apply_thrust_and_publish_the_cockpit_pose() {
+        let spec = default_voxel_spaceship_specs().remove(1);
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Persistent::<VoxelSpaceshipStore>::builder()
+            .name("test_voxel_spaceship_controls")
+            .format(StorageFormat::Toml)
+            .path(temporary.path().join("spaceships.toml"))
+            .default(VoxelSpaceshipStore {
+                ships: vec![persisted_voxel_spaceship_from_spec(&spec, None)],
+            })
+            .build()
+            .unwrap();
+        let mut editor = VoxelEditorState::default();
+        editor.first_person_cursor_released = false;
+        let mut control = VoxelSpaceshipControlState::default();
+        control.driving_ship_id = Some(spec.ship.id.clone());
+
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<EguiWantsInput>()
+            .insert_resource(editor)
+            .init_resource::<VoxelPossessionState>()
+            .insert_resource(store)
+            .insert_resource(control)
+            .add_systems(Update, control_voxel_spaceships);
+        let entity = app
+            .world_mut()
+            .spawn((
+                spec.ship.clone(),
+                spec.transform,
+                LinearVelocity::ZERO,
+                AngularVelocity::ZERO,
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(16));
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyW);
+
+        app.update();
+
+        let velocity = app
+            .world()
+            .entity(entity)
+            .get::<LinearVelocity>()
+            .unwrap()
+            .0;
+        assert!(velocity.z < 0.0);
+        assert!(
+            app.world()
+                .resource::<VoxelSpaceshipControlState>()
+                .cockpit_eye
+                .is_some()
+        );
     }
 }
