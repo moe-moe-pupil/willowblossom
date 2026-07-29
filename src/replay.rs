@@ -143,6 +143,9 @@ const REPLAY_SPEECH_PREPARING_STATUS: &str = "正在准备当前台词语音；�
 const DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 1.5;
 const MIN_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 0.5;
 const MAX_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 4.0;
+const DEFAULT_DIRECTED_CAMERA_YAW_DEGREES: f32 = 0.0;
+const MIN_DIRECTED_CAMERA_YAW_DEGREES: f32 = -60.0;
+const MAX_DIRECTED_CAMERA_YAW_DEGREES: f32 = 60.0;
 const DEFAULT_CAMERA_TRANSITION_CURVE: f32 = 2.0;
 const MIN_CAMERA_TRANSITION_CURVE: f32 = 1.0;
 const MAX_CAMERA_TRANSITION_CURVE: f32 = 4.0;
@@ -398,6 +401,8 @@ struct ReplayFile {
     camera: Vec<ReplayCameraKeyframe>,
     #[serde(default = "default_directed_camera_distance_scale")]
     camera_distance_scale: f32,
+    #[serde(default = "default_directed_camera_yaw_degrees")]
+    camera_yaw_degrees: f32,
     #[serde(default = "default_camera_transition_curve")]
     camera_transition_curve: f32,
     #[serde(default = "default_player_movement_curve")]
@@ -650,6 +655,7 @@ pub(crate) struct ReplayStudio {
     playback_ms: u64,
     playback_speed: f32,
     camera_distance_scale: f32,
+    camera_yaw_degrees: f32,
     camera_transition_curve: f32,
     player_movement_curve: f32,
     record_camera_enabled: bool,
@@ -762,6 +768,7 @@ impl Default for ReplayStudio {
             playback_ms: 0,
             playback_speed: 1.0,
             camera_distance_scale: default_directed_camera_distance_scale(),
+            camera_yaw_degrees: default_directed_camera_yaw_degrees(),
             camera_transition_curve: default_camera_transition_curve(),
             player_movement_curve: default_player_movement_curve(),
             record_camera_enabled: false,
@@ -1055,6 +1062,7 @@ fn record_replay(
                     replay.duration_ms,
                     &speaker_positions,
                     replay.camera_distance_scale,
+                    replay.camera_yaw_degrees,
                     &obstacles,
                 );
             }
@@ -2398,6 +2406,42 @@ fn replay_controls(
             studio.camera_distance_scale
         );
     }
+    let mut requested_camera_yaw = studio.camera_yaw_degrees;
+    let camera_yaw_changed = ui
+        .horizontal(|ui| {
+            ui.label("焦点镜头水平旋转");
+            ui.add(
+                egui::DragValue::new(&mut requested_camera_yaw)
+                    .speed(1.0)
+                    .range(
+                        MIN_DIRECTED_CAMERA_YAW_DEGREES..=MAX_DIRECTED_CAMERA_YAW_DEGREES,
+                    )
+                    .fixed_decimals(1)
+                    .suffix("°"),
+            )
+            .on_hover_text(
+                "围绕当前焦点水平旋转自动生成和 DeepSeek 导演镜头；镜头仍对准玩家并保持在同一拍摄侧。",
+            )
+            .changed()
+        })
+        .inner;
+    if camera_yaw_changed {
+        let requested_camera_yaw = normalized_directed_camera_yaw_degrees(requested_camera_yaw);
+        let mut applied_camera_yaw = requested_camera_yaw;
+        if let Some(replay) = studio.replay.as_mut() {
+            let speaker_positions = standee_positions(standees);
+            applied_camera_yaw = rotate_replay_camera_yaw(
+                replay,
+                requested_camera_yaw,
+                &speaker_positions,
+            );
+        }
+        studio.camera_yaw_degrees = applied_camera_yaw;
+        studio.status = format!(
+            "焦点镜头水平旋转已设为 {:.1}°",
+            studio.camera_yaw_degrees
+        );
+    }
     let mut requested_transition_curve = studio.camera_transition_curve;
     let transition_curve_changed = ui
         .horizontal(|ui| {
@@ -3095,6 +3139,7 @@ fn replay_controls(
                         studio.playback_ms = 0;
                         studio.audience = replay.audience.clone();
                         studio.camera_distance_scale = replay.camera_distance_scale;
+                        studio.camera_yaw_degrees = replay.camera_yaw_degrees;
                         studio.camera_transition_curve = replay.camera_transition_curve;
                         studio.player_movement_curve = replay.player_movement_curve;
                         studio.status = format!("已载入项目：{}", replay.title);
@@ -3410,6 +3455,7 @@ fn start_recording(
         studio.audience.clone(),
         scene,
         studio.camera_distance_scale,
+        studio.camera_yaw_degrees,
         studio.camera_transition_curve,
         studio.player_movement_curve,
     );
@@ -3484,6 +3530,7 @@ fn build_from_history(
         studio.audience.clone(),
         scene,
         studio.camera_distance_scale,
+        studio.camera_yaw_degrees,
         studio.camera_transition_curve,
         studio.player_movement_curve,
     );
@@ -3570,6 +3617,7 @@ fn build_from_history(
             replay.duration_ms,
             &speaker_positions,
             replay.camera_distance_scale,
+            replay.camera_yaw_degrees,
             &obstacles,
         );
     }
@@ -3915,6 +3963,7 @@ fn apply_ready_director_plan(
         replay.duration_ms,
         &speaker_positions,
         replay.camera_distance_scale,
+        replay.camera_yaw_degrees,
         &obstacles,
     );
     studio.playback_ms = 0;
@@ -3947,6 +3996,7 @@ fn new_replay(
     audience: ReplayAudience,
     scene: ReplayScene,
     camera_distance_scale: f32,
+    camera_yaw_degrees: f32,
     camera_transition_curve: f32,
     player_movement_curve: f32,
 ) -> ReplayFile {
@@ -3966,6 +4016,7 @@ fn new_replay(
         scene,
         camera: Vec::new(),
         camera_distance_scale: normalized_directed_camera_distance_scale(camera_distance_scale),
+        camera_yaw_degrees: normalized_directed_camera_yaw_degrees(camera_yaw_degrees),
         camera_transition_curve: normalized_camera_transition_curve(camera_transition_curve),
         player_movement_curve: normalized_player_movement_curve(player_movement_curve),
         player_movements: Vec::new(),
@@ -4493,6 +4544,7 @@ fn replay_dialogue_editor(
                         replay.duration_ms,
                         &positions,
                         replay.camera_distance_scale,
+                        replay.camera_yaw_degrees,
                         &ReplayCameraObstacles::from_scene(&replay.scene),
                     );
                 }
@@ -4715,6 +4767,7 @@ fn replay_movement_timing_editor(
             replay.duration_ms,
             &positions,
             replay.camera_distance_scale,
+            replay.camera_yaw_degrees,
             &ReplayCameraObstacles::from_scene(&replay.scene),
         );
     }
@@ -5582,6 +5635,8 @@ fn default_master_speech_speed() -> f32 { 1.10 }
 
 fn default_directed_camera_distance_scale() -> f32 { DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE }
 
+fn default_directed_camera_yaw_degrees() -> f32 { DEFAULT_DIRECTED_CAMERA_YAW_DEGREES }
+
 fn default_camera_transition_curve() -> f32 { DEFAULT_CAMERA_TRANSITION_CURVE }
 
 fn default_player_movement_curve() -> f32 { DEFAULT_PLAYER_MOVEMENT_CURVE }
@@ -5594,6 +5649,17 @@ fn normalized_directed_camera_distance_scale(scale: f32) -> f32 {
         )
     } else {
         default_directed_camera_distance_scale()
+    }
+}
+
+fn normalized_directed_camera_yaw_degrees(yaw_degrees: f32) -> f32 {
+    if yaw_degrees.is_finite() {
+        yaw_degrees.clamp(
+            MIN_DIRECTED_CAMERA_YAW_DEGREES,
+            MAX_DIRECTED_CAMERA_YAW_DEGREES,
+        )
+    } else {
+        default_directed_camera_yaw_degrees()
     }
 }
 
@@ -6487,6 +6553,7 @@ fn append_new_player_movements_from_history(
                 &replay.dialogue,
                 &speaker_positions,
                 replay.camera_distance_scale,
+                replay.camera_yaw_degrees,
             );
             let focused = rig.speaker_shot(
                 first_position,
@@ -6508,6 +6575,7 @@ fn append_new_player_movements_from_history(
                 &replay.dialogue,
                 &speaker_positions,
                 replay.camera_distance_scale,
+                replay.camera_yaw_degrees,
             );
             let focused = rig.speaker_shot(
                 first_position,
@@ -6584,6 +6652,76 @@ fn rescale_replay_camera_distance(
         }
     }
     replay.camera_distance_scale = requested_scale;
+}
+
+fn rotate_replay_camera_yaw(
+    replay: &mut ReplayFile,
+    requested_yaw_degrees: f32,
+    speaker_positions: &HashMap<u64, Vec3>,
+) -> f32 {
+    const ROTATION_FRACTIONS: [f32; 9] = [1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.0];
+
+    let previous_yaw_degrees = normalized_directed_camera_yaw_degrees(replay.camera_yaw_degrees);
+    let requested_yaw_degrees = normalized_directed_camera_yaw_degrees(requested_yaw_degrees);
+    let yaw_delta_radians = (requested_yaw_degrees - previous_yaw_degrees).to_radians();
+    if yaw_delta_radians.abs() <= f32::EPSILON || replay.camera.is_empty() {
+        replay.camera_yaw_degrees = requested_yaw_degrees;
+        return requested_yaw_degrees;
+    }
+    let base = replay.camera.first().map(frame_transform);
+    let rig = base.as_ref().map(|base| {
+        DirectedCameraRig::for_dialogue(
+            base,
+            &replay.dialogue,
+            speaker_positions,
+            replay.camera_distance_scale,
+            previous_yaw_degrees,
+        )
+    });
+    let obstacles = ReplayCameraObstacles::from_scene(&replay.scene);
+    for fraction in ROTATION_FRACTIONS {
+        let rotation = Quat::from_rotation_y(yaw_delta_radians * fraction);
+        let mut adjusted = Vec::with_capacity(replay.camera.len());
+        let mut valid = true;
+        for frame in &replay.camera {
+            let Some(focus) = replay_camera_focus_at(
+                &replay.dialogue,
+                frame.time_ms,
+                speaker_positions,
+            ) else {
+                adjusted.push(frame.clone());
+                continue;
+            };
+            let transform = frame_transform(frame);
+            let offset = transform.translation - focus;
+            if offset.length_squared() <= f32::EPSILON {
+                adjusted.push(frame.clone());
+                continue;
+            }
+            let translation = focus + rotation * offset;
+            let stays_on_camera_side = rig.as_ref().is_none_or(|rig| {
+                rig.subject_count < 2
+                    || rig.signed_side(translation) >= DirectedCameraRig::LINE_MARGIN
+            });
+            if !stays_on_camera_side || !obstacles.camera_is_clear(translation) {
+                valid = false;
+                break;
+            }
+            adjusted.push(camera_keyframe(
+                frame.time_ms,
+                &Transform::from_translation(translation).looking_at(focus, Vec3::Y),
+            ));
+        }
+        if valid {
+            let applied_yaw_degrees =
+                previous_yaw_degrees + (requested_yaw_degrees - previous_yaw_degrees) * fraction;
+            replay.camera = adjusted;
+            replay.camera_yaw_degrees = applied_yaw_degrees;
+            return applied_yaw_degrees;
+        }
+    }
+    replay.camera_yaw_degrees = previous_yaw_degrees;
+    previous_yaw_degrees
 }
 
 fn replay_dialogue_position(
@@ -6698,6 +6836,7 @@ fn turn_based_camera_track(
     duration_ms: u64,
     speaker_positions: &HashMap<u64, Vec3>,
     camera_distance_scale: f32,
+    camera_yaw_degrees: f32,
     obstacles: &ReplayCameraObstacles,
 ) -> Vec<ReplayCameraKeyframe> {
     let rig = DirectedCameraRig::for_dialogue(
@@ -6705,6 +6844,7 @@ fn turn_based_camera_track(
         dialogue,
         speaker_positions,
         camera_distance_scale,
+        camera_yaw_degrees,
     );
     let mut frames = Vec::with_capacity(dialogue.len().saturating_mul(3).saturating_add(2));
     let mut current = (!dialogue.is_empty())
@@ -6775,6 +6915,7 @@ fn director_camera_track(
     duration_ms: u64,
     speaker_positions: &HashMap<u64, Vec3>,
     camera_distance_scale: f32,
+    camera_yaw_degrees: f32,
     obstacles: &ReplayCameraObstacles,
 ) -> Vec<ReplayCameraKeyframe> {
     let rig = DirectedCameraRig::for_dialogue(
@@ -6782,6 +6923,7 @@ fn director_camera_track(
         dialogue,
         speaker_positions,
         camera_distance_scale,
+        camera_yaw_degrees,
     );
     let mut current = base.clone();
     if let (Some(_line), Some(cue)) = (dialogue.first(), cues.first()) {
@@ -6952,6 +7094,7 @@ struct DirectedCameraRig {
     axis_origin: Vec3,
     camera_side: Vec3,
     distance_scale: f32,
+    yaw_degrees: f32,
     subject_count: usize,
 }
 
@@ -6963,6 +7106,7 @@ impl DirectedCameraRig {
         dialogue: &[ReplayDialogue],
         speaker_positions: &HashMap<u64, Vec3>,
         distance_scale: f32,
+        yaw_degrees: f32,
     ) -> Self {
         let mut subjects = Vec::<Vec3>::new();
         for (index, line) in dialogue.iter().enumerate() {
@@ -7032,6 +7176,7 @@ impl DirectedCameraRig {
             axis_origin,
             camera_side,
             distance_scale: normalized_directed_camera_distance_scale(distance_scale),
+            yaw_degrees: normalized_directed_camera_yaw_degrees(yaw_degrees),
             subject_count: composition_subjects.len(),
         }
     }
@@ -7109,7 +7254,8 @@ impl DirectedCameraRig {
         const HEIGHT_SCALES: [f32; 3] = [1.0, 0.75, 1.25];
 
         let mut best = None::<(f32, Vec3)>;
-        for yaw_degrees in YAW_OFFSETS_DEGREES {
+        for yaw_offset_degrees in YAW_OFFSETS_DEGREES {
+            let yaw_degrees = self.yaw_degrees + yaw_offset_degrees;
             let direction = Quat::from_rotation_y(yaw_degrees.to_radians()) * self.camera_side;
             for distance_scale in DISTANCE_SCALES {
                 for height_scale in HEIGHT_SCALES {
@@ -7124,7 +7270,7 @@ impl DirectedCameraRig {
                         continue;
                     }
                     let score = distance_scale * 10.0
-                        - yaw_degrees.abs() * 0.05
+                        - yaw_offset_degrees.abs() * 0.05
                         - (height_scale - 1.0).abs() * 0.5;
                     if best.is_none_or(|(best_score, _)| score > best_score) {
                         best = Some((score, candidate));
@@ -7993,6 +8139,7 @@ fn import_replay(path: &str) -> Result<ReplayFile, String> {
     let mut replay: ReplayFile = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
     replay.camera_distance_scale =
         normalized_directed_camera_distance_scale(replay.camera_distance_scale);
+    replay.camera_yaw_degrees = normalized_directed_camera_yaw_degrees(replay.camera_yaw_degrees);
     replay.camera_transition_curve =
         normalized_camera_transition_curve(replay.camera_transition_curve);
     replay.player_movement_curve = normalized_player_movement_curve(replay.player_movement_curve);
@@ -8248,6 +8395,7 @@ mod tests {
             1_000,
             &HashMap::from([(1, Vec3::new(-100.0, 0.0, 0.0))]),
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
             &ReplayCameraObstacles::default(),
         );
         let shot = frame_transform(frames.iter().find(|frame| frame.time_ms == 350).unwrap());
@@ -8272,6 +8420,7 @@ mod tests {
             1_000,
             &HashMap::from([(7, target)]),
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
             &ReplayCameraObstacles::default(),
         );
 
@@ -8302,6 +8451,7 @@ mod tests {
             1_700,
             &speaker_positions,
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
             &ReplayCameraObstacles::default(),
         );
 
@@ -8988,6 +9138,7 @@ mod tests {
             5_430,
             &speaker_positions,
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
             &obstacles,
         );
         assert!(frames
@@ -9126,6 +9277,7 @@ mod tests {
             3_050,
             &HashMap::from([(1, target)]),
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
             &obstacles,
         );
         let shot = frame_transform(frames.last().unwrap());
@@ -9168,6 +9320,7 @@ mod tests {
             &dialogue,
             &speaker_positions,
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
         );
         let obstacles = ReplayCameraObstacles::default();
         let frames = director_camera_track(
@@ -9177,6 +9330,7 @@ mod tests {
             6_020,
             &speaker_positions,
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
             &obstacles,
         );
 
@@ -9200,6 +9354,7 @@ mod tests {
             &dialogue,
             &positions,
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
         );
 
         let shot = rig.director_shot(
@@ -9258,6 +9413,7 @@ mod tests {
             6_020,
             &positions,
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
             &ReplayCameraObstacles::default(),
         );
         let before = frames
@@ -9295,6 +9451,7 @@ mod tests {
             &dialogue,
             &positions,
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
         );
         let scene = ReplayScene {
             voxels: (-20..=20)
@@ -9336,6 +9493,7 @@ mod tests {
             &dialogue,
             &positions,
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
         );
 
         let shot = rig.director_shot(
@@ -9378,6 +9536,108 @@ mod tests {
     }
 
     #[test]
+    fn focused_camera_yaw_control_rotates_existing_shots_and_keeps_focus() {
+        let target = Vec3::new(2.0, 1.0, -1.0);
+        let line = test_dialogue(350, 2_700, DialogueSide::Right);
+        let mut replay = test_replay(vec![line]);
+        let original = Transform::from_xyz(2.0, 3.25, 6.5).looking_at(target, Vec3::Y);
+        replay.camera = vec![camera_keyframe(350, &original)];
+        let speaker_positions = HashMap::from([(1, target)]);
+
+        assert_eq!(
+            rotate_replay_camera_yaw(&mut replay, 30.0, &speaker_positions),
+            30.0
+        );
+        let rotated = frame_transform(&replay.camera[0]);
+        let expected_offset =
+            Quat::from_rotation_y(30.0_f32.to_radians()) * (original.translation - target);
+        assert!((rotated.translation - target).abs_diff_eq(expected_offset, 0.000_1));
+        assert!(
+            (rotated.rotation * Vec3::NEG_Z).dot((target - rotated.translation).normalize())
+                > 0.999
+        );
+
+        assert_eq!(
+            rotate_replay_camera_yaw(&mut replay, -30.0, &speaker_positions),
+            -30.0
+        );
+        let rotated = frame_transform(&replay.camera[0]);
+        let expected_offset =
+            Quat::from_rotation_y(-30.0_f32.to_radians()) * (original.translation - target);
+        assert!((rotated.translation - target).abs_diff_eq(expected_offset, 0.000_1));
+        assert_eq!(replay.camera_yaw_degrees, -30.0);
+    }
+
+    #[test]
+    fn focused_camera_yaw_is_bounded() {
+        assert_eq!(
+            normalized_directed_camera_yaw_degrees(f32::INFINITY),
+            default_directed_camera_yaw_degrees()
+        );
+        assert_eq!(
+            normalized_directed_camera_yaw_degrees(100.0),
+            MAX_DIRECTED_CAMERA_YAW_DEGREES
+        );
+        assert_eq!(
+            normalized_directed_camera_yaw_degrees(-100.0),
+            MIN_DIRECTED_CAMERA_YAW_DEGREES
+        );
+    }
+
+    #[test]
+    fn generated_focused_camera_yaw_stays_on_the_scene_side() {
+        let base = Transform::from_xyz(0.0, 4.0, 12.0);
+        let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
+        let positions = HashMap::from([
+            (1, Vec3::new(-6.0, 1.0, 0.0)),
+            (2, Vec3::new(6.0, 1.0, 0.0)),
+        ]);
+        let default_rig = DirectedCameraRig::for_dialogue(
+            &base,
+            &dialogue,
+            &positions,
+            default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
+        );
+        let rotated_rig = DirectedCameraRig::for_dialogue(
+            &base,
+            &dialogue,
+            &positions,
+            default_directed_camera_distance_scale(),
+            45.0,
+        );
+        let target = positions[&1];
+        let default_shot = default_rig.speaker_shot(
+            target,
+            DirectorShot::SpeakerMedium,
+            0.0,
+            &ReplayCameraObstacles::default(),
+        );
+        let rotated_shot = rotated_rig.speaker_shot(
+            target,
+            DirectorShot::SpeakerMedium,
+            0.0,
+            &ReplayCameraObstacles::default(),
+        );
+        let expected_direction = Quat::from_rotation_y(45.0_f32.to_radians())
+            * horizontal(default_shot.translation - target);
+        assert!(
+            horizontal(rotated_shot.translation - target)
+                .normalize()
+                .dot(expected_direction.normalize())
+                > 0.999
+        );
+        assert!(
+            (rotated_shot.rotation * Vec3::NEG_Z)
+                .dot((target - rotated_shot.translation).normalize())
+                > 0.999
+        );
+        assert!(
+            rotated_rig.signed_side(rotated_shot.translation) >= DirectedCameraRig::LINE_MARGIN
+        );
+    }
+
+    #[test]
     fn directed_dolly_moves_along_the_locked_camera_axis_and_keeps_focus() {
         let base = Transform::from_xyz(0.0, 4.0, 10.0);
         let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
@@ -9388,6 +9648,7 @@ mod tests {
             &dialogue,
             &positions,
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
         );
         let obstacles = ReplayCameraObstacles::default();
         let arrival = rig.director_shot(
@@ -9431,6 +9692,7 @@ mod tests {
             &dialogue,
             &positions,
             default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
         );
         let obstacles = ReplayCameraObstacles::default();
         // Keep the speaker far enough onto the forbidden side that the scaled
@@ -10197,6 +10459,10 @@ mod tests {
             default_directed_camera_distance_scale()
         );
         assert_eq!(
+            replay.camera_yaw_degrees,
+            default_directed_camera_yaw_degrees()
+        );
+        assert_eq!(
             replay.camera_transition_curve,
             default_camera_transition_curve()
         );
@@ -10208,6 +10474,7 @@ mod tests {
         replay.master_speech_speed = 1.15;
         replay.master_dialogue_duration = 2.75;
         replay.camera_distance_scale = 2.25;
+        replay.camera_yaw_degrees = 37.5;
         replay.camera_transition_curve = 3.25;
         replay.player_movement_curve = 0.4;
         replay
@@ -10239,6 +10506,7 @@ mod tests {
         assert_eq!(restored.master_speech_speed, 1.15);
         assert_eq!(restored.master_dialogue_duration, 2.75);
         assert_eq!(restored.camera_distance_scale, 2.25);
+        assert_eq!(restored.camera_yaw_degrees, 37.5);
         assert_eq!(restored.camera_transition_curve, 3.25);
         assert_eq!(restored.player_movement_curve, 0.4);
     }
@@ -10486,6 +10754,7 @@ mod tests {
             scene: ReplayScene::default(),
             camera: Vec::new(),
             camera_distance_scale: default_directed_camera_distance_scale(),
+            camera_yaw_degrees: default_directed_camera_yaw_degrees(),
             camera_transition_curve: default_camera_transition_curve(),
             player_movement_curve: default_player_movement_curve(),
             player_movements: Vec::new(),
