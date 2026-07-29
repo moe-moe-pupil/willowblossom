@@ -1,3 +1,5 @@
+mod receipts;
+
 use std::{
     collections::{
         hash_map::DefaultHasher,
@@ -44,6 +46,10 @@ use futures_util::{
     StreamExt,
 };
 use rand::RngExt;
+use receipts::{
+    InboundMessageReceiptStore,
+    NAPCAT_INBOUND_RECEIPTS_PATH,
+};
 use serde::{
     Deserialize,
     Serialize,
@@ -6214,7 +6220,7 @@ fn setup(mut commands: Commands) {
         pending_group_ids: HashSet::default(),
     });
 
-    let message_manager = NapcatMessageManager {
+    let default_message_manager = NapcatMessageManager {
         messages: HashMap::default(),
         replay_snapshots: HashMap::default(),
         chat_targets: HashMap::default(),
@@ -6233,15 +6239,27 @@ fn setup(mut commands: Commands) {
         item_pool: Vec::new(),
         unit_pool: HashMap::default(),
     };
-    commands.insert_resource(
-        Persistent::<NapcatMessageManager>::builder()
-            .name("messages")
-            .format(StorageFormat::Toml)
-            .path(NAPCAT_MESSAGES_PATH)
-            .default(message_manager)
-            .build()
-            .expect("failed to init messages"),
-    );
+    let message_manager = Persistent::<NapcatMessageManager>::builder()
+        .name("messages")
+        .format(StorageFormat::Toml)
+        .path(NAPCAT_MESSAGES_PATH)
+        .default(default_message_manager)
+        .build()
+        .expect("failed to init messages");
+    let mut inbound_receipts = Persistent::<InboundMessageReceiptStore>::builder()
+        .name("inbound_receipts")
+        .format(StorageFormat::Toml)
+        .path(NAPCAT_INBOUND_RECEIPTS_PATH)
+        .default(InboundMessageReceiptStore::default())
+        .build()
+        .expect("failed to init NapCat inbound receipts");
+    if backfill_inbound_message_receipts(&mut inbound_receipts, &message_manager) {
+        if let Err(err) = persist_inbound_napcat_receipts(&inbound_receipts) {
+            eprintln!("failed to backfill NapCat inbound receipts: {err}");
+        }
+    }
+    commands.insert_resource(message_manager);
+    commands.insert_resource(inbound_receipts);
 }
 
 fn spawn_napcat_connection(
@@ -6753,6 +6771,7 @@ fn value_to_target_id(value: &Value) -> Option<String> {
 fn message_system(
     receiver: Res<NapcatIOReceiver>,
     inbound_journal: Res<NapcatInboundJournal>,
+    mut inbound_receipts: ResMut<Persistent<InboundMessageReceiptStore>>,
     sender: Option<Res<NapcatIOSender>>,
     mut automatic_replies: ResMut<NapcatAutomaticReplyRequests>,
     mut group_info_requests: ResMut<NapcatGroupInfoRequests>,
@@ -6776,7 +6795,17 @@ fn message_system(
                 NapcatMessageType::Group => json.data.group_id.unwrap_or(json.data.user_id),
             };
             let target_id = target_id.to_string();
-            if napcat_message_is_already_stored(&manager, &target_id, &json) {
+            let receipt_self_id = json.data.self_id;
+            let receipt_message_id = json.data.message_id;
+            if napcat_message_is_already_processed(&manager, &inbound_receipts, &json) {
+                if let Err(err) = record_and_persist_inbound_receipt(
+                    &mut inbound_receipts,
+                    receipt_self_id,
+                    receipt_message_id,
+                ) {
+                    eprintln!("failed to persist duplicate NapCat inbound receipt: {err}");
+                    continue;
+                }
                 if let Err(err) =
                     acknowledge_inbound_chat_message(&inbound_journal, envelope.journal_id)
                 {
@@ -6828,6 +6857,14 @@ fn message_system(
 
             if let Err(err) = persist_inbound_napcat_message(&manager) {
                 eprintln!("failed to durably persist NapCat messages: {err}");
+                continue;
+            }
+            if let Err(err) = record_and_persist_inbound_receipt(
+                &mut inbound_receipts,
+                receipt_self_id,
+                receipt_message_id,
+            ) {
+                eprintln!("failed to durably persist NapCat inbound receipt: {err}");
                 continue;
             }
             if let Err(err) =
@@ -6955,20 +6992,72 @@ fn persist_inbound_napcat_message(
         .map_err(|err| err.to_string())
 }
 
+fn record_and_persist_inbound_receipt(
+    receipts: &mut Persistent<InboundMessageReceiptStore>,
+    self_id: u64,
+    message_id: Option<i64>,
+) -> Result<(), String> {
+    let Some(message_id) = message_id.filter(|message_id| *message_id > 0) else {
+        return Ok(());
+    };
+    receipts.record(self_id, Some(message_id));
+    persist_inbound_napcat_receipts(receipts)
+}
+
+fn persist_inbound_napcat_receipts(
+    receipts: &Persistent<InboundMessageReceiptStore>,
+) -> Result<(), String> {
+    receipts.persist().map_err(|err| err.to_string())?;
+    fs::File::open(NAPCAT_INBOUND_RECEIPTS_PATH)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| err.to_string())
+}
+
+fn backfill_inbound_message_receipts(
+    receipts: &mut InboundMessageReceiptStore,
+    manager: &NapcatMessageManager,
+) -> bool {
+    if !receipts.is_empty() {
+        return false;
+    }
+
+    let mut messages = manager.messages.values().flatten().collect::<Vec<_>>();
+    messages.sort_by_key(|message| {
+        (
+            message.data.time,
+            message.data.self_id,
+            message.data.message_id.unwrap_or_default(),
+        )
+    });
+    messages.into_iter().fold(false, |changed, message| {
+        receipts.record(
+            message.data.self_id,
+            message.data.message_id,
+        ) || changed
+    })
+}
+
 fn napcat_message_is_already_stored(
     manager: &NapcatMessageManager,
-    target_id: &str,
     message: &NapcatMessage,
 ) -> bool {
-    let Some(message_id) = message.data.message_id.filter(|id| *id != 0) else {
+    let Some(message_id) = message.data.message_id.filter(|id| *id > 0) else {
         return false;
     };
-    manager.messages.get(target_id).is_some_and(|messages| {
-        messages.iter().any(|stored| {
-            stored.data.message_id == Some(message_id)
-                && stored.data.self_id == message.data.self_id
-        })
+    manager.messages.values().flatten().any(|stored| {
+        stored.data.message_id == Some(message_id) && stored.data.self_id == message.data.self_id
     })
+}
+
+fn napcat_message_is_already_processed(
+    manager: &NapcatMessageManager,
+    receipts: &InboundMessageReceiptStore,
+    message: &NapcatMessage,
+) -> bool {
+    receipts.contains(
+        message.data.self_id,
+        message.data.message_id,
+    ) || napcat_message_is_already_stored(manager, message)
 }
 
 fn cache_message_images(message: &mut NapcatMessage) {
@@ -10070,14 +10159,13 @@ position_cells = [4, 5, 6]
             .insert("42".to_owned(), vec![stored.clone()]);
 
         assert!(napcat_message_is_already_stored(
-            &manager, "42", &stored
+            &manager, &stored
         ));
 
         let mut different_account = stored.clone();
         different_account.data.self_id = 100;
         assert!(!napcat_message_is_already_stored(
             &manager,
-            "42",
             &different_account
         ));
 
@@ -10085,8 +10173,32 @@ position_cells = [4, 5, 6]
         legacy_without_id.data.message_id = None;
         assert!(!napcat_message_is_already_stored(
             &manager,
-            "42",
             &legacy_without_id
+        ));
+    }
+
+    #[test]
+    fn inbound_receipts_survive_chat_history_deletion() {
+        let mut manager = empty_manager();
+        let mut stored = test_private_message_from(42, ".gc");
+        stored.data.message_id = Some(7001);
+        stored.data.self_id = 99;
+        manager
+            .messages
+            .insert("42".to_owned(), vec![stored.clone()]);
+        let mut receipts = InboundMessageReceiptStore::default();
+
+        assert!(backfill_inbound_message_receipts(
+            &mut receipts,
+            &manager
+        ));
+        manager.messages.clear();
+
+        assert!(!napcat_message_is_already_stored(
+            &manager, &stored
+        ));
+        assert!(napcat_message_is_already_processed(
+            &manager, &receipts, &stored
         ));
     }
 
