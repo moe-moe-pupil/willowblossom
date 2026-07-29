@@ -104,8 +104,12 @@ use crate::{
         BuffValue,
     },
     scene::{
+        encode_and_send_scene_capture_video,
+        scene_capture_video_rotation,
+        SceneCaptureKind,
         SceneCaptureRequests,
         SceneCharacterPositions,
+        SCENE_CAPTURE_VIDEO_FRAMES,
     },
     voxel_radiance::{
         VoxelRadianceCascade,
@@ -401,11 +405,19 @@ struct VoxelPlayerCaptureState {
 struct PendingVoxelPlayerCapture {
     request_id: u64,
     user_id: u64,
+    campaign_id: String,
     camera_entity: Entity,
     target: Handle<Image>,
     output_path: std::path::PathBuf,
+    kind: SceneCaptureKind,
     prepare_frames_remaining: u8,
     activated: bool,
+    original_camera_transform: Option<Transform>,
+    video_frame_index: u32,
+    video_frame_prepared: bool,
+    screenshot_in_flight: bool,
+    video_frames_dir: Option<PathBuf>,
+    failure: Option<String>,
     hidden_standees: Vec<(Entity, Visibility)>,
 }
 
@@ -4507,10 +4519,11 @@ fn capture_voxel_player_view(
     mut commands: Commands,
     mut requests: ResMut<SceneCaptureRequests>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    napcat_sender: Option<Res<NapcatIOSender>>,
     runtimes: Res<VoxelPlayerCameraRuntimes>,
     mut state: ResMut<VoxelPlayerCaptureState>,
     mut cameras: Query<
-        &mut Camera,
+        (&mut Camera, &mut Transform),
         (
             With<VoxelPlayerCaptureCamera>,
             Without<VoxelPlayerStandee>,
@@ -4550,25 +4563,56 @@ fn capture_voxel_player_view(
         }
         let request_id = state.next_request_id;
         state.next_request_id += 1;
+        let (output_path, video_frames_dir) = voxel_capture_output_paths(
+            &output_dir,
+            request.kind,
+            request_id,
+            request.user_id,
+        );
+        if let Some(frames_dir) = &video_frames_dir {
+            if frames_dir.exists() {
+                if let Err(err) = std::fs::remove_dir_all(frames_dir) {
+                    eprintln!("failed to clear voxel observation video frames: {err}");
+                    continue;
+                }
+            }
+            if let Err(err) = std::fs::create_dir_all(frames_dir) {
+                eprintln!("failed to create voxel observation video frames: {err}");
+                continue;
+            }
+        }
         state.pending.push(PendingVoxelPlayerCapture {
             request_id,
             user_id: request.user_id,
+            campaign_id: request.campaign_id,
             camera_entity: camera.entity,
             target: camera.target.clone(),
-            output_path: output_dir.join(format!(
-                "player_{}.png",
-                request.user_id
-            )),
+            output_path,
+            kind: request.kind,
             prepare_frames_remaining: PLAYER_CAPTURE_PREPARE_FRAMES,
             activated: false,
+            original_camera_transform: None,
+            video_frame_index: 0,
+            video_frame_prepared: false,
+            screenshot_in_flight: false,
+            video_frames_dir,
+            failure: None,
             hidden_standees: Vec::new(),
         });
     }
 
     let Some(current) = state.pending.first_mut() else { return };
+    if current.kind == SceneCaptureKind::PanoramaVideo
+        && !manager.as_deref().is_some_and(|manager| {
+            manager.can_serve_scene_capture(current.user_id, &current.campaign_id)
+        })
+    {
+        current.failure = Some("player no longer belongs to the active campaign".to_owned());
+    }
     if !current.activated {
-        if let Ok(mut camera) = cameras.get_mut(current.camera_entity) {
+        if let Ok((mut camera, transform)) = cameras.get_mut(current.camera_entity) {
             camera.is_active = true;
+            current.original_camera_transform = Some(*transform);
         }
         for (entity, standee, mut visibility) in &mut standees {
             if voxel_player_standee_visible_to(
@@ -4588,6 +4632,112 @@ fn capture_voxel_player_view(
         current.prepare_frames_remaining -= 1;
         return;
     }
+
+    if current.kind == SceneCaptureKind::PanoramaVideo {
+        let capture_finished = current.failure.is_some()
+            || (current.video_frame_index >= SCENE_CAPTURE_VIDEO_FRAMES
+                && !current.screenshot_in_flight);
+        if capture_finished {
+            let pending = state.pending.remove(0);
+            if let Ok((mut camera, mut transform)) = cameras.get_mut(pending.camera_entity) {
+                camera.is_active = false;
+                if let Some(original) = pending.original_camera_transform {
+                    *transform = original;
+                }
+            }
+            for (entity, visibility) in &pending.hidden_standees {
+                if let Ok((_, _, mut current_visibility)) = standees.get_mut(*entity) {
+                    *current_visibility = visibility.clone();
+                }
+            }
+            if let Some(err) = pending.failure {
+                eprintln!("failed to capture voxel observation video: {err}");
+                if let Some(frames_dir) = pending.video_frames_dir {
+                    let _ = std::fs::remove_dir_all(frames_dir);
+                }
+            } else if let (Some(sender), Some(frames_dir)) = (
+                napcat_sender.as_deref(),
+                pending.video_frames_dir.clone(),
+            ) {
+                encode_and_send_scene_capture_video(
+                    sender.0.clone(),
+                    pending.request_id,
+                    pending.user_id,
+                    frames_dir,
+                    pending.output_path,
+                );
+            } else if let Some(frames_dir) = pending.video_frames_dir {
+                let _ = std::fs::remove_dir_all(frames_dir);
+            }
+            return;
+        }
+
+        if current.screenshot_in_flight {
+            return;
+        }
+        if !current.video_frame_prepared {
+            let Some(original) = current.original_camera_transform else {
+                current.failure = Some("player camera transform is unavailable".to_owned());
+                return;
+            };
+            if let Ok((_, mut transform)) = cameras.get_mut(current.camera_entity) {
+                transform.rotation = scene_capture_video_rotation(
+                    original.rotation,
+                    current.video_frame_index,
+                );
+                current.video_frame_prepared = true;
+            } else {
+                current.failure = Some("player camera no longer exists".to_owned());
+            }
+            return;
+        }
+
+        let Some(frames_dir) = current.video_frames_dir.clone() else {
+            current.failure = Some("video frame directory is unavailable".to_owned());
+            return;
+        };
+        let request_id = current.request_id;
+        let frame_path = frames_dir.join(format!(
+            "frame_{:04}.png",
+            current.video_frame_index
+        ));
+        current.screenshot_in_flight = true;
+        commands
+            .spawn(Screenshot::image(
+                current.target.clone(),
+            ))
+            .observe(
+                move |screenshot: On<ScreenshotCaptured>,
+                      mut state: ResMut<VoxelPlayerCaptureState>| {
+                    let Some(pending) = state
+                        .pending
+                        .iter_mut()
+                        .find(|pending| pending.request_id == request_id)
+                    else {
+                        return;
+                    };
+                    let save_result = screenshot
+                        .image
+                        .clone()
+                        .try_into_dynamic()
+                        .map_err(|err| err.to_string())
+                        .and_then(|image| {
+                            image
+                                .to_rgb8()
+                                .save(&frame_path)
+                                .map_err(|err| err.to_string())
+                        });
+                    pending.screenshot_in_flight = false;
+                    pending.video_frame_prepared = false;
+                    match save_result {
+                        Ok(()) => pending.video_frame_index += 1,
+                        Err(err) => pending.failure = Some(err),
+                    }
+                },
+            );
+        return;
+    }
+
     let pending = state.pending.remove(0);
     commands
         .spawn(Screenshot::image(
@@ -4846,6 +4996,28 @@ fn voxel_capture_file_uri(path: &Path) -> Result<String, String> {
                 path.display()
             )
         })
+}
+
+fn voxel_capture_output_paths(
+    output_dir: &Path,
+    kind: SceneCaptureKind,
+    request_id: u64,
+    user_id: u64,
+) -> (PathBuf, Option<PathBuf>) {
+    match kind {
+        SceneCaptureKind::Image => (
+            output_dir.join(format!("player_{user_id}.png")),
+            None,
+        ),
+        SceneCaptureKind::PanoramaVideo => (
+            output_dir.join(format!(
+                "player_{user_id}_360_{request_id}.mp4"
+            )),
+            Some(output_dir.join(format!(
+                "voxel_video_{request_id}_frames"
+            ))),
+        ),
+    }
 }
 
 fn voxel_orbital_planet_cells() -> Vec<(IVec3, u8)> {
@@ -9682,6 +9854,37 @@ mod tests {
             .texture_descriptor
             .usage
             .contains(TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC));
+    }
+
+    #[test]
+    fn active_voxel_capture_routes_video_requests_to_mp4_frames() {
+        let output_dir = Path::new("scene-captures");
+        let (image_path, image_frames) = voxel_capture_output_paths(
+            output_dir,
+            SceneCaptureKind::Image,
+            7,
+            42,
+        );
+        let (video_path, video_frames) = voxel_capture_output_paths(
+            output_dir,
+            SceneCaptureKind::PanoramaVideo,
+            7,
+            42,
+        );
+
+        assert_eq!(
+            image_path,
+            output_dir.join("player_42.png")
+        );
+        assert!(image_frames.is_none());
+        assert_eq!(
+            video_path,
+            output_dir.join("player_42_360_7.mp4")
+        );
+        assert_eq!(
+            video_frames,
+            Some(output_dir.join("voxel_video_7_frames"))
+        );
     }
 
     #[test]

@@ -141,9 +141,10 @@ const LEGACY_DEFAULT_CAMERA_SPEED: f32 = 12.0;
 const DEFAULT_CAMERA_SPEED: f32 = 64.0;
 const MAX_CAMERA_SPEED: f32 = 1800.0;
 const SCENE_CAPTURE_PREPARE_FRAMES: u8 = 12;
-const SCENE_CAPTURE_VIDEO_FPS: u32 = 15;
+pub(crate) const SCENE_CAPTURE_VIDEO_FPS: u32 = 15;
 const SCENE_CAPTURE_VIDEO_SECONDS: u32 = 10;
-const SCENE_CAPTURE_VIDEO_FRAMES: u32 = SCENE_CAPTURE_VIDEO_FPS * SCENE_CAPTURE_VIDEO_SECONDS;
+pub(crate) const SCENE_CAPTURE_VIDEO_FRAMES: u32 =
+    SCENE_CAPTURE_VIDEO_FPS * SCENE_CAPTURE_VIDEO_SECONDS;
 const SPACE_HIFI_STATION_A_CENTER: IVec3 = IVec3::new(-54, 13, 24);
 const SPACE_HIFI_STATION_B_CENTER: IVec3 = IVec3::new(58, 14, -28);
 const SPACE_HIFI_SUN_CENTER: IVec3 = IVec3::new(-88, 38, -76);
@@ -7639,7 +7640,7 @@ fn scene_capture_request_system(
     }
 }
 
-fn encode_and_send_scene_capture_video(
+pub(crate) fn encode_and_send_scene_capture_video(
     sender: tokio::sync::mpsc::Sender<NapcatOutboundMessage>,
     request_id: u64,
     user_id: u64,
@@ -7708,7 +7709,7 @@ fn encode_and_send_scene_capture_video(
     });
 }
 
-fn scene_capture_video_rotation(initial: Quat, frame_index: u32) -> Quat {
+pub(crate) fn scene_capture_video_rotation(initial: Quat, frame_index: u32) -> Quat {
     let progress = frame_index as f32 / SCENE_CAPTURE_VIDEO_FRAMES.saturating_sub(1) as f32;
     Quat::from_rotation_y(-std::f32::consts::TAU * progress) * initial
 }
