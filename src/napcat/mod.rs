@@ -87,6 +87,7 @@ use crate::{
         DamageType,
     },
     scene::{
+        SceneCaptureKind,
         SceneCaptureRequest,
         SceneCaptureRequests,
         SceneCharacterPositions,
@@ -7051,14 +7052,27 @@ fn scene_capture_request(
     Some(SceneCaptureRequest {
         user_id,
         campaign_id,
+        kind: scene_capture_command_kind(&message_text(message))?,
     })
 }
 
 pub(crate) fn is_scene_capture_command_text(text: &str) -> bool {
+    scene_capture_command_kind(text).is_some()
+}
+
+fn scene_capture_command_kind(text: &str) -> Option<SceneCaptureKind> {
     matches!(
         text.trim(),
         "#观察" | "#gc" | ".观察" | ".gc" | "。观察" | "。gc"
     )
+    .then_some(SceneCaptureKind::Image)
+    .or_else(|| {
+        matches!(
+            text.trim(),
+            "#观察视频" | "#gc2" | ".观察视频" | ".gc2" | "。观察视频" | "。gc2"
+        )
+        .then_some(SceneCaptureKind::PanoramaVideo)
+    })
 }
 
 fn private_detect_magic_response(
@@ -7412,7 +7426,7 @@ fn format_private_help() -> String {
         "【.频道】查看自己所属的全部频道",
         "【.频道人员】查看当前可见频道成员",
         "【.指南】查看当前TRPG组指南",
-        "【.观察】或【.gc】请求玩家观察画面",
+        "【.观察】或【.gc】请求玩家观察画面；【.观察视频】或【.gc2】请求360度观察视频",
         "【.抽取天赋】抽取普通天赋",
         "【.抽取辅助天赋】抽取辅助天赋",
         "【.<属性> <点数>】为已完成角色投入属性点，例如 .力量 1 或 。agi 2",
@@ -13293,6 +13307,20 @@ position_cells = [4, 5, 6]
                 "{command} should trigger capture"
             );
         }
+        for command in [
+            "#观察视频",
+            "#gc2",
+            ".观察视频",
+            ".gc2",
+            "。观察视频",
+            "。gc2",
+        ] {
+            assert_eq!(
+                scene_capture_command_kind(command),
+                Some(SceneCaptureKind::PanoramaVideo),
+                "{command} should trigger video capture"
+            );
+        }
     }
 
     #[test]
@@ -13324,6 +13352,10 @@ position_cells = [4, 5, 6]
 
         assert_eq!(player_request.user_id, 2);
         assert_eq!(player_request.campaign_id, "campaign-a");
+        assert_eq!(
+            player_request.kind,
+            SceneCaptureKind::Image
+        );
         assert_eq!(gm_request.user_id, 9);
         assert_eq!(gm_request.campaign_id, "campaign-a");
         assert!(manager.can_serve_scene_capture(
