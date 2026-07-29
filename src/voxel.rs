@@ -557,12 +557,64 @@ struct VoxelScenePersistenceState {
 #[derive(Component)]
 struct VoxelOrbitalPlanet {
     cells: HashMap<IVec3, u8>,
+    cell_bounds: Option<VoxelCellBounds>,
     removed: HashSet<IVec3>,
     collider_entity: Entity,
     mesh_entities: Vec<Entity>,
     mesh_handles: Vec<Handle<Mesh>>,
     voxel_size: f32,
     dirty: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VoxelCellBounds {
+    min: IVec3,
+    max: IVec3,
+}
+
+impl VoxelCellBounds {
+    fn from_cell(cell: IVec3) -> Self {
+        Self {
+            min: cell,
+            max: cell,
+        }
+    }
+
+    fn from_cells(cells: impl IntoIterator<Item = IVec3>) -> Option<Self> {
+        let mut cells = cells.into_iter();
+        let mut bounds = Self::from_cell(cells.next()?);
+        for cell in cells {
+            bounds.include(cell);
+        }
+        Some(bounds)
+    }
+
+    fn include(&mut self, cell: IVec3) {
+        self.min = self.min.min(cell);
+        self.max = self.max.max(cell);
+    }
+
+    fn local_aabb(self, voxel_size: f32) -> (Vec3, Vec3) {
+        let half_voxel = Vec3::splat(voxel_size * 0.5);
+        (
+            self.min.as_vec3() * voxel_size - half_voxel,
+            self.max.as_vec3() * voxel_size + half_voxel,
+        )
+    }
+}
+
+impl VoxelOrbitalPlanet {
+    fn include_cell_in_bounds(&mut self, cell: IVec3) {
+        if let Some(bounds) = &mut self.cell_bounds {
+            bounds.include(cell);
+        } else {
+            self.cell_bounds = Some(VoxelCellBounds::from_cell(cell));
+        }
+    }
+
+    fn refresh_cell_bounds(&mut self) {
+        self.cell_bounds = VoxelCellBounds::from_cells(self.cells.keys().copied());
+    }
 }
 
 #[derive(Component)]
@@ -1863,6 +1915,7 @@ fn load_persisted_voxel_scene(
             .copied()
             .map(IVec3::from_array)
             .collect();
+        planet.refresh_cell_bounds();
         planet.dirty = true;
     }
     for entity in &physics_bodies {
@@ -5276,6 +5329,7 @@ fn dig_planet_voxel(planet: &mut VoxelOrbitalPlanet, cell: IVec3) -> bool {
                 }
                 if let Some(material) = procedural_planet_material(neighbor) {
                     planet.cells.insert(neighbor, material);
+                    planet.include_cell_in_bounds(neighbor);
                 }
             }
         }
@@ -5290,6 +5344,7 @@ fn set_planet_voxel(planet: &mut VoxelOrbitalPlanet, cell: IVec3, material: u8) 
     }
     planet.removed.remove(&cell);
     planet.cells.insert(cell, material);
+    planet.include_cell_in_bounds(cell);
     planet.dirty = true;
     true
 }
@@ -5348,6 +5403,7 @@ fn spawn_voxel_orbital_planet(
     materials: &VoxelMaterials,
 ) -> Entity {
     let cells = voxel_orbital_planet_cells();
+    let cell_bounds = VoxelCellBounds::from_cells(cells.iter().map(|(cell, _)| *cell));
     let (material_meshes, collider_cells) = build_voxel_meshes_from_cells(&cells);
     let center_offset = Vec3::splat(-0.5 * VOXEL_SIZE);
     let entity = commands
@@ -5387,6 +5443,7 @@ fn spawn_voxel_orbital_planet(
     });
     commands.entity(entity).insert(VoxelOrbitalPlanet {
         cells: cells.into_iter().collect(),
+        cell_bounds,
         removed: HashSet::new(),
         collider_entity,
         mesh_entities,
@@ -5472,6 +5529,7 @@ fn rebuild_voxel_orbital_planet(
             meshes.remove(mesh_handle.id());
         }
         let cells = sorted_planet_cells(&planet);
+        planet.cell_bounds = VoxelCellBounds::from_cells(cells.iter().map(|(cell, _)| *cell));
         let (material_meshes, collider_cells) = build_voxel_meshes_from_cells(&cells);
         if collider_cells.is_empty() {
             commands
@@ -6437,6 +6495,7 @@ fn handle_editor_requests(
         populate_default_grid(&mut grid);
         if let Ok(mut planet) = planets.single_mut() {
             planet.cells = voxel_orbital_planet_cells().into_iter().collect();
+            planet.refresh_cell_bounds();
             planet.removed.clear();
             planet.dirty = true;
         }
@@ -8229,20 +8288,12 @@ fn raycast_voxel_planet(
         return None;
     }
 
-    let horizontal = ORBITAL_PLANET_CAP_RADIUS as f32 * VOXEL_SIZE + VOXEL_SIZE * 0.5;
+    let (local_min, local_max) = planet.cell_bounds?.local_aabb(planet.voxel_size);
     let (mut distance, end) = ray_aabb_distance_range(
         local_origin,
         local_direction,
-        Vec3::new(
-            -horizontal,
-            -VOXEL_SIZE * 0.5,
-            -horizontal,
-        ),
-        Vec3::new(
-            horizontal,
-            ORBITAL_PLANET_RADIUS,
-            horizontal,
-        ),
+        local_min,
+        local_max,
         PLANET_MAX_RAY_DISTANCE,
     )?;
     let step = planet.voxel_size * 0.2;
@@ -10555,8 +10606,10 @@ mod tests {
         )));
 
         let window = IVec3::new(center_x + 22, floor_y + 8, center_z);
+        let cell_bounds = VoxelCellBounds::from_cells(lab_cells.keys().copied());
         let mut planet = VoxelOrbitalPlanet {
             cells: lab_cells,
+            cell_bounds,
             removed: HashSet::new(),
             collider_entity: Entity::PLACEHOLDER,
             mesh_entities: Vec::new(),
@@ -10586,6 +10639,7 @@ mod tests {
         );
         let mut planet = VoxelOrbitalPlanet {
             cells: HashMap::from([(surface, 3)]),
+            cell_bounds: Some(VoxelCellBounds::from_cell(surface)),
             removed: HashSet::new(),
             collider_entity: Entity::PLACEHOLDER,
             mesh_entities: Vec::new(),
@@ -10610,6 +10664,7 @@ mod tests {
     fn planet_raycast_uses_centered_voxel_cells_in_planet_space() {
         let planet = VoxelOrbitalPlanet {
             cells: HashMap::from([(IVec3::ZERO, 2)]),
+            cell_bounds: Some(VoxelCellBounds::from_cell(IVec3::ZERO)),
             removed: HashSet::new(),
             collider_entity: Entity::PLACEHOLDER,
             mesh_entities: Vec::new(),
@@ -10626,10 +10681,49 @@ mod tests {
     }
 
     #[test]
+    fn planet_raycast_tracks_voxels_built_above_original_surface() {
+        let surface = IVec3::new(20, ORBITAL_PLANET_VOXEL_RADIUS - 4, 0);
+        let mut planet = VoxelOrbitalPlanet {
+            cells: HashMap::from([(surface, 3)]),
+            cell_bounds: Some(VoxelCellBounds::from_cell(surface)),
+            removed: HashSet::new(),
+            collider_entity: Entity::PLACEHOLDER,
+            mesh_entities: Vec::new(),
+            mesh_handles: Vec::new(),
+            voxel_size: VOXEL_SIZE,
+            dirty: false,
+        };
+        let built_top = IVec3::new(
+            surface.x,
+            ORBITAL_PLANET_VOXEL_RADIUS + 12,
+            surface.z,
+        );
+        for y in surface.y + 1..=built_top.y {
+            assert!(set_planet_voxel(
+                &mut planet,
+                IVec3::new(surface.x, y, surface.z),
+                1,
+            ));
+        }
+
+        let (_, local_max) = planet.cell_bounds.unwrap().local_aabb(VOXEL_SIZE);
+        assert!(local_max.y > ORBITAL_PLANET_RADIUS);
+        let ray = Ray3d::new(
+            built_top.as_vec3() * VOXEL_SIZE + Vec3::Z * 2.0,
+            Dir3::NEG_Z,
+        );
+        let hit = raycast_voxel_planet(&planet, &GlobalTransform::IDENTITY, ray)
+            .expect("player-built planet voxels above the original surface should remain aimable");
+
+        assert_eq!(hit.occupied, built_top);
+    }
+
+    #[test]
     fn planet_explosion_extracts_canonical_voxels_and_reveals_buried_cells() {
         let surface = IVec3::new(0, ORBITAL_PLANET_VOXEL_RADIUS, 0);
         let mut planet = VoxelOrbitalPlanet {
             cells: HashMap::from([(surface, 3)]),
+            cell_bounds: Some(VoxelCellBounds::from_cell(surface)),
             removed: HashSet::new(),
             collider_entity: Entity::PLACEHOLDER,
             mesh_entities: Vec::new(),
@@ -12139,6 +12233,9 @@ mod tests {
             .spawn((
                 VoxelOrbitalPlanet {
                     cells: HashMap::from([(selected_cell, 1)]),
+                    cell_bounds: Some(VoxelCellBounds::from_cell(
+                        selected_cell,
+                    )),
                     removed: HashSet::new(),
                     collider_entity: Entity::PLACEHOLDER,
                     mesh_entities: Vec::new(),
