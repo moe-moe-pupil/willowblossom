@@ -126,6 +126,20 @@ use crate::{
     },
 };
 
+// Compact, geometry-only campaign layouts decoded from the group's workbook.
+mod map_design;
+
+use map_design::{
+    DecodedWorkbookMap,
+    WorkbookMapDesign,
+    ABANDONED,
+    ARBITRATOR,
+    ARROGANCE,
+    KYO,
+    NIFFY,
+    XY_PLANET,
+};
+
 pub(crate) const VOXEL_SIZE: f32 = 0.25;
 /// Horizontal physics-body chunk radius around the DM and every player camera.
 const VOXEL_PHYSICS_CHUNK_LOAD_RADIUS: i32 = 8;
@@ -144,6 +158,7 @@ const ORBITAL_PLANET_CAP_RADIUS: i32 = 128;
 const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const VOXEL_SCENE_AUTOSAVE_SECONDS: f32 = 30.0;
+const VOXEL_SCENE_LAYOUT_REVISION: u32 = 1;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
 const VOXEL_MATERIAL_COUNT: usize = 10;
 const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
@@ -166,18 +181,25 @@ const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
 const ORBITAL_LAYOUT_SCALE: i32 = 5;
-const RESEARCH_STATION_CENTER: IVec3 = IVec3::new(-100 * ORBITAL_LAYOUT_SCALE, 0, 0);
-const SENSOR_STATION_CENTER: IVec3 = IVec3::new(100 * ORBITAL_LAYOUT_SCALE, 0, 0);
-const CANNON_STATION_CENTER: IVec3 = IVec3::new(0, 0, -150 * ORBITAL_LAYOUT_SCALE);
-const COMBAT_SPACESHIP_CENTER: IVec3 = IVec3::new(0, 0, 150 * ORBITAL_LAYOUT_SCALE);
+const RESEARCH_STATION_CENTER: IVec3 =
+    IVec3::new(100 * ORBITAL_LAYOUT_SCALE, 0, 100 * ORBITAL_LAYOUT_SCALE);
+const SENSOR_STATION_CENTER: IVec3 =
+    IVec3::new(100 * ORBITAL_LAYOUT_SCALE, 0, -100 * ORBITAL_LAYOUT_SCALE);
+const CANNON_STATION_CENTER: IVec3 =
+    IVec3::new(-100 * ORBITAL_LAYOUT_SCALE, 0, -100 * ORBITAL_LAYOUT_SCALE);
+const COMBAT_SPACESHIP_CENTER: IVec3 =
+    IVec3::new(-100 * ORBITAL_LAYOUT_SCALE, 0, 100 * ORBITAL_LAYOUT_SCALE);
+const ABANDONED_STATION_CENTER: IVec3 =
+    IVec3::new(0, 0, 200 * ORBITAL_LAYOUT_SCALE);
+const WORKBOOK_ROOM_HEIGHT: i32 = 7;
 const FIRST_PERSON_START: Vec3 = Vec3::new(
-    -6.5,
+    (COMBAT_SPACESHIP_CENTER.x + ARROGANCE.spawn[0]) as f32 * VOXEL_SIZE,
     0.5,
-    (COMBAT_SPACESHIP_CENTER.z as f32 + 15.0) * VOXEL_SIZE,
+    (COMBAT_SPACESHIP_CENTER.z + ARROGANCE.spawn[1]) as f32 * VOXEL_SIZE,
 );
 const DEFAULT_SCENE_CAMERA_FOCUS: Vec3 = Vec3::new(
-    0.0,
-    2.5,
+    COMBAT_SPACESHIP_CENTER.x as f32 * VOXEL_SIZE,
+    1.0,
     COMBAT_SPACESHIP_CENTER.z as f32 * VOXEL_SIZE,
 );
 const DEFAULT_SCENE_CAMERA_DISTANCE: f32 = 50.0;
@@ -555,9 +577,20 @@ struct PersistedVoxelPlanet {
     removed: Vec<[i32; 3]>,
 }
 
-#[derive(Resource, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Resource, Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct VoxelSceneStore {
     scene: Option<PersistedVoxelScene>,
+    #[serde(default)]
+    layout_revision: u32,
+}
+
+impl Default for VoxelSceneStore {
+    fn default() -> Self {
+        Self {
+            scene: None,
+            layout_revision: VOXEL_SCENE_LAYOUT_REVISION,
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -710,27 +743,30 @@ pub(crate) enum VoxelTeleportDestination {
     SensorStation,
     CannonStation,
     CombatSpaceship,
+    AbandonedStation,
     PlanetScienceLab,
     PlayerStandee(u64),
     MapCell(IVec3),
 }
 
 impl VoxelTeleportDestination {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::ResearchStation,
         Self::SensorStation,
         Self::CannonStation,
         Self::CombatSpaceship,
+        Self::AbandonedStation,
         Self::PlanetScienceLab,
     ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::ResearchStation => "研究空间站",
-            Self::SensorStation => "传感空间站",
-            Self::CannonStation => "巨炮空间站",
-            Self::CombatSpaceship => "战斗舰",
-            Self::PlanetScienceLab => "行星科研站",
+            Self::ResearchStation => "U.S.I Niffy女皇号科研空间站",
+            Self::SensorStation => "U.S.I 女仲裁者号探测空间站",
+            Self::CannonStation => "U.S.I Kyo空间防御炮台",
+            Self::CombatSpaceship => "U.S.I 狂妄号战斗巡洋舰",
+            Self::AbandonedStation => "废弃空间站",
+            Self::PlanetScienceLab => "XY星基地",
             Self::PlayerStandee(_) => "玩家立牌",
             Self::MapCell(_) => "地图位置",
         }
@@ -741,27 +777,45 @@ impl VoxelTeleportDestination {
             Vec3::Y * (VOXEL_SIZE + FIRST_PERSON_RADIUS + FIRST_PERSON_BODY_LENGTH * 0.5);
         Some(match self {
             Self::ResearchStation => {
-                (RESEARCH_STATION_CENTER + IVec3::new(10, 0, 10)).as_vec3() * VOXEL_SIZE
+                (RESEARCH_STATION_CENTER
+                    + IVec3::new(NIFFY.spawn[0], 0, NIFFY.spawn[1]))
+                .as_vec3()
+                    * VOXEL_SIZE
                     + floor_offset
             },
             Self::SensorStation => {
-                (SENSOR_STATION_CENTER + IVec3::new(10, 0, 10)).as_vec3() * VOXEL_SIZE
+                (SENSOR_STATION_CENTER
+                    + IVec3::new(ARBITRATOR.spawn[0], 0, ARBITRATOR.spawn[1]))
+                .as_vec3()
+                    * VOXEL_SIZE
                     + floor_offset
             },
             Self::CannonStation => {
-                (CANNON_STATION_CENTER + IVec3::new(10, 0, 10)).as_vec3() * VOXEL_SIZE
+                (CANNON_STATION_CENTER + IVec3::new(KYO.spawn[0], 0, KYO.spawn[1]))
+                    .as_vec3()
+                    * VOXEL_SIZE
                     + floor_offset
             },
             Self::CombatSpaceship => {
-                (COMBAT_SPACESHIP_CENTER + IVec3::new(1, 0, 0)).as_vec3() * VOXEL_SIZE
+                (COMBAT_SPACESHIP_CENTER
+                    + IVec3::new(ARROGANCE.spawn[0], 0, ARROGANCE.spawn[1]))
+                .as_vec3()
+                    * VOXEL_SIZE
+                    + floor_offset
+            },
+            Self::AbandonedStation => {
+                (ABANDONED_STATION_CENTER
+                    + IVec3::new(ABANDONED.spawn[0], 0, ABANDONED.spawn[1]))
+                .as_vec3()
+                    * VOXEL_SIZE
                     + floor_offset
             },
             Self::PlanetScienceLab => {
                 ORBITAL_PLANET_CENTER
                     + Vec3::new(
-                        PLANET_SCIENCE_LAB_CENTER.x as f32,
+                        (PLANET_SCIENCE_LAB_CENTER.x + XY_PLANET.spawn[0]) as f32,
                         PLANET_SCIENCE_LAB_FLOOR_Y as f32,
-                        PLANET_SCIENCE_LAB_CENTER.y as f32,
+                        (PLANET_SCIENCE_LAB_CENTER.y + XY_PLANET.spawn[1]) as f32,
                     ) * VOXEL_SIZE
                     + floor_offset
             },
@@ -1889,6 +1943,9 @@ fn load_persisted_voxel_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
+    if store.layout_revision != VOXEL_SCENE_LAYOUT_REVISION {
+        return;
+    }
     let Some(scene) = store.scene.as_ref() else {
         return;
     };
@@ -2080,6 +2137,7 @@ fn persist_voxel_scene(
             physics_bodies,
             placed_lights,
         }),
+        layout_revision: VOXEL_SCENE_LAYOUT_REVISION,
     };
     if **store == snapshot {
         return;
@@ -2632,10 +2690,9 @@ fn populate_voxel_grid(mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>) {
 }
 
 fn populate_default_grid(grid: &mut Mut<Grid<u8>>) {
-    build_space_station(grid, RESEARCH_STATION_CENTER, false);
-    build_space_station(grid, SENSOR_STATION_CENTER, true);
-    build_space_cannon_station(grid, CANNON_STATION_CENTER);
-    build_combat_spaceship(grid);
+    for (center, design) in workbook_orbital_locations() {
+        build_workbook_orbital_location(grid, center, design);
+    }
     for door in voxel_auto_doors() {
         for cell in door.cells {
             grid.set(cell, 0);
@@ -2643,773 +2700,133 @@ fn populate_default_grid(grid: &mut Mut<Grid<u8>>) {
     }
 }
 
-fn build_space_cannon_station(grid: &mut Mut<Grid<u8>>, center: IVec3) {
-    // A compact fortified station with three playable decks and a central fire-control chamber.
-    build_hollow_voxel_room(
-        grid,
-        center + IVec3::new(-45, 0, -28),
-        center + IVec3::new(45, 30, 28),
-        7,
-        2,
-    );
-    for deck_y in [0, 10, 20, 30] {
-        fill_voxel_box(
-            grid,
-            center + IVec3::new(-44, deck_y, -27),
-            center + IVec3::new(44, deck_y, 27),
-            2,
-        );
-    }
-    for deck_y in [0, 10, 20] {
-        for local_x in [-20, 20] {
-            fill_voxel_box(
-                grid,
-                center + IVec3::new(local_x, deck_y + 1, -27),
-                center + IVec3::new(local_x, deck_y + 9, 27),
-                7,
-            );
-            clear_voxel_box(
-                grid,
-                center + IVec3::new(local_x, deck_y + 1, -4),
-                center + IVec3::new(local_x, deck_y + 7, 4),
-            );
-        }
-        fill_voxel_box(
-            grid,
-            center + IVec3::new(-44, deck_y + 1, 0),
-            center + IVec3::new(44, deck_y + 9, 0),
-            7,
-        );
-        clear_voxel_box(
-            grid,
-            center + IVec3::new(-4, deck_y + 1, 0),
-            center + IVec3::new(4, deck_y + 7, 0),
-        );
-    }
-
-    // Reactor vaults, ammunition stores, and an illuminated firing-control dais.
-    for side in [-1, 1] {
-        let reactor_center = center + IVec3::new(side * 32, 1, 14);
-        build_hollow_voxel_room(
-            grid,
-            reactor_center + IVec3::new(-8, 0, -7),
-            reactor_center + IVec3::new(8, 8, 7),
-            6,
-            2,
-        );
-        for y in 2..=7 {
-            for z in -4..=4 {
-                grid.set(reactor_center + IVec3::new(0, y, z), 8);
-            }
-        }
-        for z in (-22..=-8).step_by(4) {
-            fill_voxel_box(
-                grid,
-                center + IVec3::new(side * 33 - 2, 11, z),
-                center + IVec3::new(side * 33 + 2, 14, z + 2),
-                9,
-            );
-        }
-    }
-    fill_voxel_box(
-        grid,
-        center + IVec3::new(-10, 21, -20),
-        center + IVec3::new(10, 22, -8),
-        6,
-    );
-    for x in (-8..=8).step_by(4) {
-        grid.set(center + IVec3::new(x, 23, -12), 8);
-        grid.set(center + IVec3::new(x, 23, -16), 10);
-    }
-
-    // The spinal spatial-artillery barrel leaves the aft hull and tapers toward a bright muzzle.
-    let axis_y = center.y + 22;
-    let hull_back_z = center.z - 28;
-    for z in center.z - 112..=hull_back_z {
-        let distance = hull_back_z - z;
-        let radius = (12 - distance / 16).clamp(6, 12);
-        for x in -radius..=radius {
-            for y in -radius..=radius {
-                let edge = x.abs().max(y.abs()) == radius;
-                let brace = (z - center.z).rem_euclid(10) == 0
-                    && (x.abs() == radius - 1 || y.abs() == radius - 1);
-                let energy_rail = (x == 0 && y.abs() == radius) || (y == 0 && x.abs() == radius);
-                if edge || brace || energy_rail {
-                    let material = if energy_rail || (z - center.z).rem_euclid(20) == 0 {
-                        8
-                    } else if brace {
-                        9
-                    } else {
-                        6
-                    };
-                    grid.set(
-                        IVec3::new(center.x + x, axis_y + y, z),
-                        material,
-                    );
-                }
-            }
-        }
-    }
-    let muzzle_z = center.z - 112;
-    for z in muzzle_z - 4..=muzzle_z + 4 {
-        for x in -15_i32..=15 {
-            for y in -15_i32..=15 {
-                if x.abs().max(y.abs()) >= 12 {
-                    grid.set(
-                        IVec3::new(center.x + x, axis_y + y, z),
-                        if z == muzzle_z || x.abs().max(y.abs()) == 15 { 9 } else { 6 },
-                    );
-                }
-            }
-        }
-    }
-    for z in muzzle_z - 3..=muzzle_z + 3 {
-        grid.set(IVec3::new(center.x, axis_y, z), 8);
-    }
-
-    // A sensor crown and targeting vanes distinguish the cannon station at long range.
-    build_hollow_voxel_room(
-        grid,
-        center + IVec3::new(-14, 31, -10),
-        center + IVec3::new(14, 43, 10),
-        6,
-        2,
-    );
-    for y in 44..=58 {
-        grid.set(center + IVec3::new(0, y, 0), 7);
-        if y % 4 == 0 {
-            for x in -12..=12 {
-                grid.set(center + IVec3::new(x, y, 0), 8);
-            }
-        }
-    }
+fn workbook_orbital_locations() -> [(IVec3, WorkbookMapDesign); 5] {
+    [
+        (RESEARCH_STATION_CENTER, NIFFY),
+        (SENSOR_STATION_CENTER, ARBITRATOR),
+        (CANNON_STATION_CENTER, KYO),
+        (COMBAT_SPACESHIP_CENTER, ARROGANCE),
+        (ABANDONED_STATION_CENTER, ABANDONED),
+    ]
 }
 
-fn build_space_station(grid: &mut Mut<Grid<u8>>, center: IVec3, command_station: bool) {
-    let min = center + IVec3::new(-50, 0, -40);
-    let max = center + IVec3::new(50, 36, 40);
-    build_hollow_voxel_room(grid, min, max, 6, 2);
-
-    // Five full decks make each station over 100 times larger by usable floor area.
-    for deck_y in [0, 9, 18, 27, 36] {
-        fill_voxel_box(
-            grid,
-            center + IVec3::new(-49, deck_y, -39),
-            center + IVec3::new(49, deck_y, 39),
-            2,
-        );
-    }
-
-    // Room partitions, broad passages, lift shafts, and deck-specific color bands.
-    for deck_y in [0, 9, 18, 27] {
-        for local_x in [-25, 0, 25] {
-            for y in deck_y + 1..deck_y + 9 {
-                for z in -39..=39 {
-                    if !(-4..=4).contains(&z) && !(-30..=-24).contains(&z) {
-                        grid.set(center + IVec3::new(local_x, y, z), 7);
-                    }
-                }
-            }
-        }
-        for local_z in [-20, 20] {
-            for y in deck_y + 1..deck_y + 9 {
-                for x in -49..=49 {
-                    if !(-4..=4).contains(&x) && !(-38..=-32).contains(&x) {
-                        grid.set(center + IVec3::new(x, y, local_z), 7);
-                    }
-                }
-            }
-        }
-        clear_voxel_box(
-            grid,
-            center + IVec3::new(-3, deck_y, -3),
-            center + IVec3::new(3, deck_y + 9, 3),
-        );
-        let band_material = if (deck_y / 9 + command_station as i32) % 2 == 0 { 8 } else { 7 };
-        for x in (-45..=45).step_by(5) {
-            grid.set(
-                center + IVec3::new(x, deck_y + 2, -38),
-                band_material,
-            );
-            grid.set(
-                center + IVec3::new(x, deck_y + 2, 38),
-                band_material,
-            );
-        }
-    }
-
-    // Large observation crown and a hollow docking corridor facing the center.
-    build_hollow_voxel_room(
-        grid,
-        center + IVec3::new(-26, 37, -26),
-        center + IVec3::new(26, 58, 26),
-        6,
-        2,
-    );
-    for y in [45, 52] {
-        fill_voxel_box(
-            grid,
-            center + IVec3::new(-25, y, -25),
-            center + IVec3::new(25, y, 25),
-            2,
-        );
-    }
-    clear_voxel_box(
-        grid,
-        center + IVec3::new(-3, 37, -3),
-        center + IVec3::new(3, 58, 3),
-    );
-    let dock_min_x = if center.x < 0 { center.x + 50 } else { center.x - 80 };
-    let dock_max_x = if center.x < 0 { center.x + 80 } else { center.x - 50 };
-    build_hollow_voxel_room(
-        grid,
-        IVec3::new(dock_min_x, 0, center.z - 10),
-        IVec3::new(dock_max_x, 12, center.z + 10),
-        6,
-        2,
-    );
-
-    // Gardens, command consoles, cargo racks, reactors, antennae, and hull ribs.
-    for x in -45..=-28 {
-        for z in -34..=-12 {
-            grid.set(center + IVec3::new(x, 1, z), 1);
-        }
-    }
-    let accent = if command_station { 8 } else { 7 };
-    for deck_y in [1, 10, 19, 28, 38, 46, 53] {
-        for z in (-32..=32).step_by(4) {
-            for x in [-43, -42, 42, 43] {
-                grid.set(
-                    center + IVec3::new(x, deck_y, z),
-                    accent,
-                );
-            }
-        }
-    }
-    for deck_y in [1, 10, 19, 28] {
-        for x in [-36, -12, 12, 36] {
-            for z in [-30, -10, 10, 30] {
-                fill_voxel_box(
-                    grid,
-                    center + IVec3::new(x - 1, deck_y, z - 1),
-                    center + IVec3::new(x + 1, deck_y + 1, z + 1),
-                    if (x + z) % 3 == 0 { 4 } else { accent },
-                );
-            }
-        }
-    }
-    for x in [30, 36, 42] {
-        for z in [-28, -14, 14, 28] {
-            for y in 1..=7 {
-                grid.set(center + IVec3::new(x, y, z), 5);
-            }
-        }
-    }
-    for x in (-48..=48).step_by(8) {
-        for y in 0..=38 {
-            grid.set(center + IVec3::new(x, y, -41), 7);
-            grid.set(center + IVec3::new(x, y, 41), 7);
-        }
-    }
-    for y in 59..=78 {
-        grid.set(center + IVec3::new(0, y, 0), 7);
-        if y % 4 == 0 {
-            for x in -8..=8 {
-                grid.set(center + IVec3::new(x, y, 0), 8);
-            }
-        }
-    }
+fn workbook_fixture(style: u8) -> Option<(u8, i32)> {
+    Some(match style {
+        13 => (10, 3),
+        16 => (9, 2),
+        17 | 18 => (3, 2),
+        25 => (8, 2),
+        26 => (4, 1),
+        27 => (8, 1),
+        32 => (1, 1),
+        33 => (6, WORKBOOK_ROOM_HEIGHT - 1),
+        34 => (7, WORKBOOK_ROOM_HEIGHT - 1),
+        35 | 36 => (6, WORKBOOK_ROOM_HEIGHT - 1),
+        37 => (9, 4),
+        38 => (5, 3),
+        _ => return None,
+    })
 }
 
-fn build_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
-    for x in -28..=28 {
-        for y in -5..=25 {
-            for z in -80..=80 {
-                let local = IVec3::new(x, y, z);
-                if let Some(material) = combat_corvette_voxel(local) {
-                    grid.set(
-                        COMBAT_SPACESHIP_CENTER + local,
-                        material,
-                    );
-                }
-            }
-        }
-    }
+fn workbook_exterior_fixture(style: u8) -> bool {
+    matches!(style, 13 | 33..=38)
 }
 
-fn combat_corvette_voxel(position: IVec3) -> Option<u8> {
-    const FLOOR: u8 = 2;
-    const METAL: u8 = 3;
-    const RED: u8 = 9;
-    const HULL: u8 = 6;
-    const DARK: u8 = 7;
-    const CYAN: u8 = 8;
-
-    let (x, y, z) = (position.x, position.y, position.z);
-    let mut material = None;
-    let half_width = corvette_half_width(z);
-    let roof_y = corvette_roof_y(z);
-    let vertical_inset = if y <= 1 || y >= roof_y - 1 {
-        2
-    } else if y <= 3 || y >= roof_y - 3 {
-        1
-    } else {
-        0
-    };
-    let section_width = (half_width - vertical_inset).max(2);
-
-    if (-80..=80).contains(&z) && (0..=roof_y).contains(&y) && x.abs() <= section_width {
-        let outer_shell = x.abs() == section_width || y == 0 || y == roof_y;
-        let deck = matches!(y, 7 | 14) && y < roof_y && x.abs() < section_width;
-        if outer_shell || deck {
-            material = Some(if y == 0 || deck { FLOOR } else { HULL });
-        }
-    }
-
-    // Six room divisions with broad doors through every deck that reaches the section.
-    for bulkhead_z in [-55, -35, -10, 15, 38, 55] {
-        let doorway = x.abs() <= 2 && matches!(y, 1..=5 | 8..=12 | 15..=19);
-        if z == bulkhead_z && x.abs() < half_width - 1 && (1..roof_y).contains(&y) && !doorway {
-            material = Some(DARK);
-        }
-    }
-
-    // Thin, tapered armor rails replace the previous solid rectangular side slabs.
-    if (-24..=34).contains(&z) {
-        let wing_reach = 22 + (12 - (z - 5).abs()).max(0) / 4;
-        for side in [-1, 1] {
-            let side_x = x * side;
-            let on_rail = (21..=wing_reach).contains(&side_x)
-                && (4..=9).contains(&y)
-                && (matches!(y, 4 | 9)
-                    || matches!(side_x, 21)
-                    || side_x == wing_reach
-                    || (z - 5).rem_euclid(10) == 0);
-            if on_rail {
-                material = Some(if y == 9 && z.rem_euclid(12) < 5 { RED } else { DARK });
-            }
-        }
-    }
-
-    // Port-side airlock vestibule joins the hull and frames the automatic outer door.
-    if voxel_point_in_hollow_box(
-        position,
-        IVec3::new(-24, 0, 10),
-        IVec3::new(-18, 7, 20),
-    ) {
-        material = Some(DARK);
-    }
-    if x == -18 && (1..=5).contains(&y) && (12..=18).contains(&z) {
-        material = None;
-    }
-
-    // Raised red armor bands and cyan side ports follow the tapered hull instead of flattening it.
-    for side in [-1, 1] {
-        if x == side * (section_width + 1)
-            && matches!(y, 3 | 4 | 17)
-            && matches!(z, -48..=-34 | -22..=-8 | 5..=18 | 29..=42)
-        {
-            material = Some(RED);
-        }
-        if x == side * section_width
-            && (9..=11).contains(&y)
-            && matches!(z, -42..=-38 | -20..=-16 | 3..=7 | 25..=29 | 45..=49)
-        {
-            material = Some(CYAN);
-        }
-    }
-
-    // Broad top plates provide large red fields instead of repetitive glowing stripes.
-    if y == roof_y + 1 && x.abs() <= (half_width - 9).max(1) {
-        if matches!(z, -44..=-34 | -16..=-7 | 11..=19 | 34..=41) {
-            material = Some(RED);
-        } else if matches!(z, -55..=-50 | -27..=-23 | 24..=28 | 46..=50) {
-            material = Some(HULL);
-        }
-    }
-
-    // Three long engine nacelles with layered casings, cyan bells, and red drive cores.
-    for engine_x in [-16, 0, 16] {
-        let dx = (x - engine_x).abs();
-        if dx <= 4 && (4..=12).contains(&y) && (-80..=-58).contains(&z) {
-            let casing = dx == 4
-                || matches!(y, 4 | 12)
-                || z == -58
-                || (z + 80).rem_euclid(6) == 0 && dx >= 3;
-            if casing {
-                material = Some(DARK);
-            }
-            if z <= -72 && dx <= 2 && (6..=10).contains(&y) {
-                material = Some(if z == -80 { CYAN } else { RED });
-            }
-            if z == -61 && dx <= 3 && (6..=10).contains(&y) {
-                material = Some(HULL);
-            }
-        }
-    }
-
-    // Layered dorsal command spine, sensor mast, twin turret, and forward gun rails.
-    if voxel_point_in_hollow_box(
-        position,
-        IVec3::new(-7, 22, -18),
-        IVec3::new(7, 23, 20),
-    ) {
-        material = Some(HULL);
-    }
-    if voxel_point_in_box(
-        position,
-        IVec3::new(-4, 24, -7),
-        IVec3::new(4, 25, 7),
-    ) {
-        material = Some(DARK);
-    }
-    if voxel_point_in_box(
-        position,
-        IVec3::new(-1, 23, -28),
-        IVec3::new(1, 25, -9),
-    ) || voxel_point_in_box(
-        position,
-        IVec3::new(-1, 23, 7),
-        IVec3::new(1, 25, 30),
-    ) {
-        material = Some(RED);
-    }
-    for gun_x in [-5, 5] {
-        if voxel_point_in_box(
-            position,
-            IVec3::new(gun_x - 1, 22, 18),
-            IVec3::new(gun_x + 1, 24, 30),
-        ) {
-            material = Some(DARK);
-        }
-    }
-    if x == 0 && y == 25 && (-2..=2).contains(&z) {
-        material = Some(CYAN);
-    }
-
-    // Four landing struts and broad feet make the ship read as a vehicle rather than a building.
-    for leg_x in [-13, 13] {
-        for leg_z in [-28, 22] {
-            if (x - leg_x).abs() <= 1 && z == leg_z && (-4..=-1).contains(&y) {
-                material = Some(DARK);
-            }
-            if (x - leg_x).abs() <= 3 && (z - leg_z).abs() <= 2 && y == -5 {
-                material = Some(HULL);
-            }
-        }
-    }
-
-    // Tapered panoramic bridge glazing and inset pilot consoles in the forward middle deck.
-    if z >= 68
-        && x.abs() <= section_width
-        && (6..=9).contains(&y)
-        && ((z == 80 && x.abs() <= 1) || x.abs() == section_width)
-    {
-        material = Some(CYAN);
-    }
-
-    // Playable room dressing and tactical cover, kept off the central circulation route.
-    for (min, max, prop) in [
-        (
-            IVec3::new(-2, 1, -52),
-            IVec3::new(2, 5, -44),
-            CYAN,
-        ),
-        (
-            IVec3::new(-13, 1, -51),
-            IVec3::new(-9, 4, -45),
-            RED,
-        ),
-        (
-            IVec3::new(9, 1, -51),
-            IVec3::new(13, 4, -45),
-            RED,
-        ),
-        (
-            IVec3::new(-15, 1, -31),
-            IVec3::new(-10, 4, -25),
-            METAL,
-        ),
-        (
-            IVec3::new(9, 1, -30),
-            IVec3::new(15, 3, -23),
-            METAL,
-        ),
-        (
-            IVec3::new(-15, 1, -18),
-            IVec3::new(-10, 3, -12),
-            HULL,
-        ),
-        (
-            IVec3::new(10, 1, -17),
-            IVec3::new(15, 4, -12),
-            HULL,
-        ),
-        (
-            IVec3::new(-17, 2, -3),
-            IVec3::new(-15, 5, 7),
-            DARK,
-        ),
-        (
-            IVec3::new(-16, 8, -31),
-            IVec3::new(-11, 9, -25),
-            HULL,
-        ),
-        (
-            IVec3::new(-16, 11, -31),
-            IVec3::new(-11, 12, -25),
-            HULL,
-        ),
-        (
-            IVec3::new(-16, 8, -22),
-            IVec3::new(-11, 9, -16),
-            HULL,
-        ),
-        (
-            IVec3::new(-16, 11, -22),
-            IVec3::new(-11, 12, -16),
-            HULL,
-        ),
-        (
-            IVec3::new(9, 8, -29),
-            IVec3::new(15, 9, -22),
-            METAL,
-        ),
-        (
-            IVec3::new(11, 8, -5),
-            IVec3::new(16, 12, -3),
-            DARK,
-        ),
-        (
-            IVec3::new(-16, 8, -5),
-            IVec3::new(-12, 11, 5),
-            DARK,
-        ),
-        (
-            IVec3::new(-14, 15, -8),
-            IVec3::new(-10, 17, -2),
-            HULL,
-        ),
-        (
-            IVec3::new(10, 15, -8),
-            IVec3::new(14, 17, -2),
-            HULL,
-        ),
-        (
-            IVec3::new(-6, 15, 20),
-            IVec3::new(6, 16, 27),
-            METAL,
-        ),
-        (
-            IVec3::new(-14, 15, 31),
-            IVec3::new(-9, 17, 36),
-            DARK,
-        ),
-        (
-            IVec3::new(9, 15, 31),
-            IVec3::new(14, 17, 36),
-            DARK,
-        ),
-        (
-            IVec3::new(-9, 8, 52),
-            IVec3::new(-4, 10, 60),
-            CYAN,
-        ),
-        (
-            IVec3::new(4, 8, 52),
-            IVec3::new(9, 10, 60),
-            CYAN,
-        ),
-        (
-            IVec3::new(-2, 8, 64),
-            IVec3::new(2, 9, 69),
-            DARK,
-        ),
-    ] {
-        if voxel_point_in_box(position, min, max) {
-            material = Some(prop);
-        }
-    }
-
-    // Two ladder/lift trunks provide vertical routes without blocking the main corridor.
-    for trunk_z in [-36, 32] {
-        if voxel_point_in_box(
-            position,
-            IVec3::new(4, 1, trunk_z),
-            IVec3::new(5, 20, trunk_z + 1),
-        ) && y % 2 == 1
-        {
-            material = Some(DARK);
-        }
-    }
-
-    material
-}
-
-fn corvette_half_width(z: i32) -> i32 {
-    if z >= 20 {
-        20 - (z - 20) * 18 / 60
-    } else if z <= -52 {
-        14 + (z + 80) * 6 / 28
-    } else {
-        20
-    }
-    .clamp(2, 20)
-}
-
-fn corvette_roof_y(z: i32) -> i32 {
-    if z >= 60 {
-        12
-    } else if z >= 42 {
-        16
-    } else if z <= -62 {
-        18
-    } else {
-        22
-    }
-}
-
-fn voxel_point_in_box(position: IVec3, min: IVec3, max: IVec3) -> bool {
-    let normalized_min = min.min(max);
-    let normalized_max = min.max(max);
-    position.cmpge(normalized_min).all() && position.cmple(normalized_max).all()
-}
-
-fn voxel_point_in_hollow_box(position: IVec3, min: IVec3, max: IVec3) -> bool {
-    let normalized_min = min.min(max);
-    let normalized_max = min.max(max);
-    voxel_point_in_box(position, normalized_min, normalized_max)
-        && (position.x == normalized_min.x
-            || position.x == normalized_max.x
-            || position.y == normalized_min.y
-            || position.y == normalized_max.y
-            || position.z == normalized_min.z
-            || position.z == normalized_max.z)
-}
-
-fn fill_voxel_box(grid: &mut Mut<Grid<u8>>, min: IVec3, max: IVec3, material: u8) {
-    for x in min.x..=max.x {
-        for y in min.y..=max.y {
-            for z in min.z..=max.z {
-                grid.set(IVec3::new(x, y, z), material);
-            }
-        }
-    }
-}
-
-fn clear_voxel_box(grid: &mut Mut<Grid<u8>>, min: IVec3, max: IVec3) {
-    fill_voxel_box(grid, min, max, 0);
-}
-
-fn build_hollow_voxel_room(
+fn build_workbook_orbital_location(
     grid: &mut Mut<Grid<u8>>,
-    min: IVec3,
-    max: IVec3,
-    wall_material: u8,
-    floor_material: u8,
+    center: IVec3,
+    design: WorkbookMapDesign,
 ) {
-    for x in min.x..=max.x {
-        for y in min.y..=max.y {
-            for z in min.z..=max.z {
-                let on_boundary = x == min.x
-                    || x == max.x
-                    || y == min.y
-                    || y == max.y
-                    || z == min.z
-                    || z == max.z;
-                if on_boundary {
-                    grid.set(
-                        IVec3::new(x, y, z),
-                        if y == min.y { floor_material } else { wall_material },
-                    );
-                }
+    let decoded = design.decode();
+    for (index, style) in decoded.styles.iter().copied().enumerate() {
+        let [x, z] = design.centered_offset(index);
+        let base = center + IVec3::new(x, 0, z);
+        let wall = style == 11;
+        let door = style == 15;
+        let enclosed = decoded.enclosed[index];
+
+        if wall || door || enclosed {
+            grid.set(base, if style == 12 { 7 } else { 2 });
+            grid.set(base + IVec3::Y * WORKBOOK_ROOM_HEIGHT, 6);
+        }
+        if wall {
+            for y in 1..WORKBOOK_ROOM_HEIGHT {
+                grid.set(base + IVec3::Y * y, 6);
             }
+            continue;
+        }
+
+        let Some((material, height)) = workbook_fixture(style) else {
+            continue;
+        };
+        if !enclosed && !workbook_exterior_fixture(style) {
+            continue;
+        }
+        grid.set(base, if enclosed { 2 } else { material });
+        for y in 1..=height {
+            grid.set(base + IVec3::Y * y, material);
         }
     }
 }
 
 fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
-    let mut doors = vec![
-        make_voxel_auto_door(
-            RESEARCH_STATION_CENTER + IVec3::new(50, 0, 0),
-            IVec3::Z,
-            5,
-            8,
-            3.5,
-        ),
-        make_voxel_auto_door(
-            SENSOR_STATION_CENTER + IVec3::new(-50, 0, 0),
-            IVec3::Z,
-            5,
-            8,
-            3.5,
-        ),
-        make_voxel_auto_door(
-            COMBAT_SPACESHIP_CENTER + IVec3::new(-24, 0, 15),
-            IVec3::Z,
-            3,
-            5,
-            3.5,
-        ),
-    ];
-    for station_x in [RESEARCH_STATION_CENTER.x, SENSOR_STATION_CENTER.x] {
-        for deck_y in [0, 9, 18, 27] {
-            for local_x in [-25, 25] {
-                doors.push(make_voxel_auto_door(
-                    IVec3::new(station_x + local_x, deck_y, 0),
-                    IVec3::Z,
-                    4,
-                    7,
-                    1.75,
-                ));
-            }
-            for local_z in [-20, 20] {
-                doors.push(make_voxel_auto_door(
-                    IVec3::new(station_x, deck_y, local_z),
-                    IVec3::X,
-                    4,
-                    7,
-                    1.75,
-                ));
-            }
-        }
+    let mut doors = Vec::new();
+    for (center, design) in workbook_orbital_locations() {
+        doors.extend(workbook_auto_doors(center, design));
     }
-    for local_z in [-55, -35, -10, 15, 38, 55] {
-        for deck_y in [0, 7, 14] {
-            doors.push(make_voxel_auto_door(
-                COMBAT_SPACESHIP_CENTER + IVec3::new(0, deck_y, local_z),
-                IVec3::X,
-                2,
-                5,
-                1.75,
-            ));
+    doors
+}
+
+fn workbook_auto_doors(center: IVec3, design: WorkbookMapDesign) -> Vec<VoxelAutoDoor> {
+    let decoded = design.decode();
+    let mut seen = vec![false; decoded.styles.len()];
+    let mut doors = Vec::new();
+    for start in 0..decoded.styles.len() {
+        if decoded.styles[start] != 15 || seen[start] {
+            continue;
         }
-    }
-    for deck_y in [0, 10, 20] {
-        for local_x in [-20, 20] {
-            doors.push(make_voxel_auto_door(
-                CANNON_STATION_CENTER + IVec3::new(local_x, deck_y, 0),
-                IVec3::Z,
-                4,
-                7,
-                1.75,
-            ));
+        let mut pending = vec![start];
+        seen[start] = true;
+        let mut min_x = usize::MAX;
+        let mut max_x = 0;
+        let mut min_z = usize::MAX;
+        let mut max_z = 0;
+        while let Some(index) = pending.pop() {
+            let x = index % design.width;
+            let z = index / design.width;
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_z = min_z.min(z);
+            max_z = max_z.max(z);
+            for neighbor in [
+                x.checked_sub(1).map(|x| z * design.width + x),
+                (x + 1 < design.width).then_some(z * design.width + x + 1),
+                z.checked_sub(1).map(|z| z * design.width + x),
+                (z + 1 < design.height).then_some((z + 1) * design.width + x),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if decoded.styles[neighbor] == 15 && !seen[neighbor] {
+                    seen[neighbor] = true;
+                    pending.push(neighbor);
+                }
+            }
         }
+
+        let width = max_x - min_x + 1;
+        let depth = max_z - min_z + 1;
+        let width_axis = if width >= depth { IVec3::X } else { IVec3::Z };
+        let span = width.max(depth) as i32;
+        let center_index =
+            ((min_z + max_z) / 2) * design.width + (min_x + max_x) / 2;
+        let [x, z] = design.centered_offset(center_index);
         doors.push(make_voxel_auto_door(
-            CANNON_STATION_CENTER + IVec3::new(0, deck_y, 0),
-            IVec3::X,
-            4,
-            7,
+            center + IVec3::new(x, 0, z),
+            width_axis,
+            (span - 1) / 2,
+            WORKBOOK_ROOM_HEIGHT - 2,
             1.75,
-        ));
-    }
-    for local_z in [-28, 28] {
-        doors.push(make_voxel_auto_door(
-            CANNON_STATION_CENTER + IVec3::new(0, 0, local_z),
-            IVec3::X,
-            4,
-            7,
-            2.5,
         ));
     }
     doors
@@ -3576,85 +2993,69 @@ fn despawn_unsupported_voxel_auto_doors(
     }
 }
 
-fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
+fn workbook_interior_lights() -> Vec<(Vec3, Color)> {
     let mut lights = Vec::new();
-    for (station_x, color) in [
+    for (center, design, color) in [
         (
-            RESEARCH_STATION_CENTER.x,
+            RESEARCH_STATION_CENTER,
+            NIFFY,
             Color::srgb(0.55, 0.75, 1.0),
         ),
         (
-            SENSOR_STATION_CENTER.x,
-            Color::srgb(1.0, 0.72, 0.42),
+            SENSOR_STATION_CENTER,
+            ARBITRATOR,
+            Color::srgb(0.48, 0.9, 1.0),
+        ),
+        (
+            CANNON_STATION_CENTER,
+            KYO,
+            Color::srgb(1.0, 0.64, 0.32),
+        ),
+        (
+            COMBAT_SPACESHIP_CENTER,
+            ARROGANCE,
+            Color::srgb(0.48, 0.78, 1.0),
+        ),
+        (
+            ABANDONED_STATION_CENTER,
+            ABANDONED,
+            Color::srgb(0.72, 0.24, 0.18),
         ),
     ] {
-        for deck_y in [0, 9, 18, 27] {
-            for x in [-28, 28] {
-                for z in [-22, 22] {
-                    lights.push((
-                        (Vec3::new(
-                            (station_x + x) as f32,
-                            (deck_y + 7) as f32,
-                            z as f32,
-                        ) + Vec3::splat(0.5))
-                            * VOXEL_SIZE,
-                        color,
-                    ));
-                }
+        let decoded = design.decode();
+        let candidates = decoded
+            .enclosed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, enclosed)| {
+                (*enclosed && workbook_fixture(decoded.styles[index]).is_none())
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let mut selected = HashSet::new();
+        for target_z in (8..design.height).step_by(22) {
+            for target_x in (8..design.width).step_by(26) {
+                let Some(index) = candidates.iter().copied().min_by_key(|index| {
+                    let x = index % design.width;
+                    let z = index / design.width;
+                    x.abs_diff(target_x).pow(2) + z.abs_diff(target_z).pow(2)
+                }) else {
+                    continue;
+                };
+                selected.insert(index);
             }
         }
-        for y in [43, 51, 56] {
-            for x in [-12, 12] {
-                lights.push((
-                    (Vec3::new((station_x + x) as f32, y as f32, 0.0) + Vec3::splat(0.5))
-                        * VOXEL_SIZE,
-                    color,
-                ));
-            }
-        }
-    }
-    for deck_y in [0, 7, 14] {
-        for local_z in [-45, 0, 55] {
-            for x in [-10, 10] {
-                lights.push((
-                    (COMBAT_SPACESHIP_CENTER.as_vec3()
-                        + Vec3::new(
-                            x as f32,
-                            (deck_y + 5) as f32,
-                            local_z as f32,
-                        )
-                        + Vec3::splat(0.5))
-                        * VOXEL_SIZE,
-                    if deck_y == 0 {
-                        Color::srgb(0.3, 0.85, 1.0)
-                    } else {
-                        Color::srgb(1.0, 0.66, 0.42)
-                    },
-                ));
-            }
-        }
-    }
-    for deck_y in [0, 10, 20] {
-        for x in [-32, 0, 32] {
-            for z in [-18, 18] {
-                lights.push((
-                    (CANNON_STATION_CENTER.as_vec3()
-                        + Vec3::new(x as f32, (deck_y + 7) as f32, z as f32)
-                        + Vec3::splat(0.5))
-                        * VOXEL_SIZE,
-                    Color::srgb(0.45, 0.8, 1.0),
-                ));
-            }
-        }
-    }
-    for local_z in [-48, -64, -80, -96] {
-        for x in [-6, 6] {
+        for index in selected {
+            let [x, z] = design.centered_offset(index);
             lights.push((
-                (CANNON_STATION_CENTER.as_vec3()
-                    + Vec3::new(x as f32, 22.0, local_z as f32)
-                    + Vec3::splat(0.5))
+                (center.as_vec3()
+                    + Vec3::new(
+                        x as f32 + 0.5,
+                        WORKBOOK_ROOM_HEIGHT as f32 - 1.0,
+                        z as f32 + 0.5,
+                    ))
                     * VOXEL_SIZE,
-                Color::srgb(0.25, 0.75, 1.0),
+                color,
             ));
         }
     }
@@ -3662,7 +3063,7 @@ fn voxel_interior_lights() -> Vec<(Vec3, Color)> {
 }
 
 fn setup_voxel_interior_lights(mut commands: Commands) {
-    for (position, color) in voxel_interior_lights() {
+    for (position, color) in workbook_interior_lights() {
         commands.spawn((
             PointLight {
                 color,
@@ -3690,92 +3091,45 @@ fn voxel_prop_cells(size: IVec3, base_material: u8, accent_material: u8) -> Vec<
 
 fn voxel_physics_prop_specs() -> Vec<(Vec<(IVec3, u8)>, Transform)> {
     let mut specs = Vec::new();
-    let mut add = |position, size, base_material, accent_material, yaw| {
-        specs.push((
-            voxel_prop_cells(size, base_material, accent_material),
-            Transform::from_translation(position).with_rotation(Quat::from_rotation_y(yaw)),
-        ));
-    };
-
-    for station_x in [
-        RESEARCH_STATION_CENTER.x as f32 * VOXEL_SIZE,
-        SENSOR_STATION_CENTER.x as f32 * VOXEL_SIZE,
-    ] {
-        add(
-            Vec3::new(station_x, 14.55, 0.0),
-            IVec3::new(5, 3, 3),
-            6,
-            8,
-            if station_x < 0.0 { 0.55 } else { -0.55 },
-        );
-        for (offset_x, z, yaw) in [(-4.0, -3.5, 0.2), (4.0, -3.5, -0.2), (0.0, 4.0, 0.0)] {
-            add(
-                Vec3::new(station_x + offset_x, 14.55, z),
-                IVec3::new(5, 1, 2),
-                7,
-                8,
-                yaw,
-            );
+    for (center, design) in workbook_orbital_locations() {
+        let decoded = design.decode();
+        let candidates = decoded
+            .enclosed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, enclosed)| {
+                (*enclosed && workbook_fixture(decoded.styles[index]).is_none())
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for (ordinal, target) in [
+            [design.spawn[0] - 5, design.spawn[1] + 4],
+            [design.spawn[0] + 5, design.spawn[1] + 4],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let Some(index) = candidates.iter().copied().min_by_key(|index| {
+                let [x, z] = design.centered_offset(*index);
+                x.abs_diff(target[0]).pow(2) + z.abs_diff(target[1]).pow(2)
+            }) else {
+                continue;
+            };
+            let [x, z] = design.centered_offset(index);
+            specs.push((
+                voxel_prop_cells(
+                    IVec3::new(2, 2, 2),
+                    if ordinal == 0 { 6 } else { 7 },
+                    if ordinal == 0 { 8 } else { 10 },
+                ),
+                Transform::from_translation(Vec3::new(
+                    (center.x + x) as f32 * VOXEL_SIZE,
+                    VOXEL_SIZE * 1.1,
+                    (center.z + z) as f32 * VOXEL_SIZE,
+                ))
+                .with_rotation(Quat::from_rotation_y(ordinal as f32 * 0.35)),
+            ));
         }
-        for deck_y in [0.28, 2.53, 4.78, 7.03] {
-            for z in [-5.5, 5.5] {
-                add(
-                    Vec3::new(station_x, deck_y, z),
-                    IVec3::new(3, 2, 2),
-                    6,
-                    10,
-                    if z < 0.0 { 0.0 } else { std::f32::consts::PI },
-                );
-            }
-        }
-    }
-
-    for (x, z, yaw) in [(-3.6, 31.5, 0.35), (0.0, 37.0, 0.0), (3.6, 42.0, -0.35)] {
-        add(
-            Vec3::new(x, 0.28, z),
-            IVec3::new(5, 3, 5),
-            6,
-            8,
-            yaw,
-        );
-    }
-    for (x, z, yaw) in [
-        (-3.2, 34.0, 0.0),
-        (3.2, 34.0, 0.0),
-        (-3.2, 36.5, 0.4),
-        (3.2, 36.5, -0.4),
-    ] {
-        add(
-            Vec3::new(x, 0.28, z),
-            IVec3::new(3, 2, 3),
-            2,
-            8,
-            yaw,
-        );
-    }
-    for deck_y in [0.28, 2.03, 3.78] {
-        for (x, z, yaw) in [(-3.7, 29.5, 0.0), (3.7, 29.5, std::f32::consts::PI)] {
-            add(
-                Vec3::new(x, deck_y, z),
-                IVec3::new(2, 3, 2),
-                7,
-                10,
-                yaw,
-            );
-        }
-    }
-    for (x, z, yaw) in [
-        (-1.8, 52.5, 0.0),
-        (0.0, 54.0, 0.0),
-        (1.8, 52.5, std::f32::consts::PI),
-    ] {
-        add(
-            Vec3::new(x, 2.03, z),
-            IVec3::new(3, 2, 2),
-            6,
-            8,
-            yaw,
-        );
     }
     specs
 }
@@ -5223,7 +4577,7 @@ fn voxel_orbital_planet_cells() -> Vec<(IVec3, u8)> {
             }
         }
     }
-    cells.extend(planet_science_lab_cells());
+    cells.extend(xy_planet_map_cells());
     let mut cells = cells
         .into_iter()
         .collect::<HashMap<_, _>>()
@@ -5242,168 +4596,64 @@ fn planet_surface_y(x: i32, z: i32) -> Option<i32> {
     Some((radius.powi(2) - horizontal_squared as f32).sqrt().floor() as i32)
 }
 
-fn planet_science_lab_cells() -> Vec<(IVec3, u8)> {
-    let center_x = PLANET_SCIENCE_LAB_CENTER.x;
-    let center_z = PLANET_SCIENCE_LAB_CENTER.y;
-    let floor_y = PLANET_SCIENCE_LAB_FLOOR_Y;
-    let half_width = 22;
-    let half_depth = 16;
-    let wall_height = 20;
-    let roof_y = floor_y + wall_height + 1;
+fn xy_planet_map_cells() -> Vec<(IVec3, u8)> {
+    let decoded = XY_PLANET.decode();
     let mut cells = Vec::new();
+    for (index, style) in decoded.styles.iter().copied().enumerate() {
+        let [local_x, local_z] = XY_PLANET.centered_offset(index);
+        let x = PLANET_SCIENCE_LAB_CENTER.x + local_x;
+        let z = PLANET_SCIENCE_LAB_CENTER.y + local_z;
+        let Some(surface_y) = planet_surface_y(x, z) else {
+            continue;
+        };
+        if let Some(material) = match style {
+            7 => Some(1),
+            8 | 10 => Some(3),
+            9 => Some(2),
+            19 | 20 => Some(4),
+            _ => None,
+        } {
+            cells.push((IVec3::new(x, surface_y, z), material));
+        }
 
-    // Level the curved surface with a solid canonical-voxel foundation.
-    for local_x in -half_width..=half_width {
-        for local_z in -half_depth..=half_depth {
-            let x = center_x + local_x;
-            let z = center_z + local_z;
-            let Some(surface_y) = planet_surface_y(x, z) else { continue };
-            for y in surface_y + 1..=floor_y {
+        let wall = style == 11;
+        let door = style == 15;
+        let enclosed = decoded.enclosed[index];
+        if wall || door || enclosed {
+            for y in surface_y + 1..=PLANET_SCIENCE_LAB_FLOOR_Y {
                 cells.push((IVec3::new(x, y, z), 6));
             }
-        }
-    }
-
-    // An enclosed shell with a tall front doorway and luminous window bands.
-    for local_x in -half_width..=half_width {
-        for local_z in -half_depth..=half_depth {
-            if local_x.abs() != half_width && local_z.abs() != half_depth {
-                continue;
-            }
-            for local_y in 1..=wall_height {
-                let doorway = local_z == -half_depth && local_x.abs() <= 3 && local_y <= 10;
-                if doorway {
-                    continue;
-                }
-                let corner = local_x.abs() == half_width && local_z.abs() == half_depth;
-                let trim = local_y <= 2 || local_y >= wall_height - 1;
-                let front_window = local_z == -half_depth
-                    && (7..=18).contains(&local_x.abs())
-                    && (7..=13).contains(&local_y);
-                let rear_window =
-                    local_z == half_depth && local_x.abs() <= 16 && (7..=13).contains(&local_y);
-                let side_window = local_x.abs() == half_width
-                    && local_z.abs() <= 10
-                    && (7..=13).contains(&local_y);
-                let material = if front_window || rear_window || side_window {
-                    8
-                } else if corner || trim {
-                    6
-                } else {
-                    7
-                };
-                cells.push((
-                    IVec3::new(
-                        center_x + local_x,
-                        floor_y + local_y,
-                        center_z + local_z,
-                    ),
-                    material,
-                ));
-            }
-        }
-    }
-
-    // Roof, glowing skylight, and bright entrance frame.
-    for local_x in -half_width..=half_width {
-        for local_z in -half_depth..=half_depth {
-            let skylight = local_x.abs() <= 10 && local_z.abs() <= 6;
             cells.push((
-                IVec3::new(
-                    center_x + local_x,
-                    roof_y,
-                    center_z + local_z,
-                ),
-                if skylight { 8 } else { 6 },
+                IVec3::new(x, PLANET_SCIENCE_LAB_FLOOR_Y, z),
+                if style == 12 { 7 } else { 2 },
             ));
-        }
-    }
-    for local_y in 1..=11 {
-        for local_x in [-4, 4] {
             cells.push((
                 IVec3::new(
-                    center_x + local_x,
-                    floor_y + local_y,
-                    center_z - half_depth,
-                ),
-                10,
-            ));
-        }
-    }
-    for local_x in -4..=4 {
-        cells.push((
-            IVec3::new(
-                center_x + local_x,
-                floor_y + 11,
-                center_z - half_depth,
-            ),
-            10,
-        ));
-    }
-
-    // Two usable laboratory benches leave a broad central aisle.
-    for bench_z in [-6, 6] {
-        for local_x in -15..=15 {
-            cells.push((
-                IVec3::new(
-                    center_x + local_x,
-                    floor_y + 3,
-                    center_z + bench_z,
-                ),
-                8,
-            ));
-        }
-        for local_x in (-15..=15).step_by(10) {
-            for local_y in 1..=2 {
-                cells.push((
-                    IVec3::new(
-                        center_x + local_x,
-                        floor_y + local_y,
-                        center_z + bench_z,
-                    ),
-                    6,
-                ));
-            }
-        }
-    }
-
-    // Wide stairs meet the curved ground instead of leaving a floating door.
-    for depth in 1..=6 {
-        let step_y = floor_y - (depth - 1) / 2;
-        for local_x in -5..=5 {
-            cells.push((
-                IVec3::new(
-                    center_x + local_x,
-                    step_y,
-                    center_z - half_depth - depth,
+                    x,
+                    PLANET_SCIENCE_LAB_FLOOR_Y + WORKBOOK_ROOM_HEIGHT,
+                    z,
                 ),
                 6,
             ));
         }
+        if wall {
+            for y in 1..WORKBOOK_ROOM_HEIGHT {
+                cells.push((
+                    IVec3::new(x, PLANET_SCIENCE_LAB_FLOOR_Y + y, z),
+                    6,
+                ));
+            }
+        } else if enclosed {
+            if let Some((material, height)) = workbook_fixture(style) {
+                for y in 1..=height {
+                    cells.push((
+                        IVec3::new(x, PLANET_SCIENCE_LAB_FLOOR_Y + y, z),
+                        material,
+                    ));
+                }
+            }
+        }
     }
-
-    // A rooftop telemetry mast makes the building recognizable at a distance.
-    for local_y in 1..=12 {
-        cells.push((
-            IVec3::new(
-                center_x - 14,
-                roof_y + local_y,
-                center_z + 7,
-            ),
-            if local_y >= 10 { 8 } else { 6 },
-        ));
-    }
-    for offset in -4..=4 {
-        cells.push((
-            IVec3::new(
-                center_x - 14 + offset,
-                roof_y + 9,
-                center_z + 7,
-            ),
-            8,
-        ));
-    }
-
     cells
 }
 
@@ -10137,14 +9387,30 @@ mod tests {
         assert_eq!(
             VoxelTeleportDestination::ResearchStation.player_position(),
             Some(
-                (RESEARCH_STATION_CENTER + IVec3::new(10, 0, 10)).as_vec3() * VOXEL_SIZE
+                (RESEARCH_STATION_CENTER
+                    + IVec3::new(NIFFY.spawn[0], 0, NIFFY.spawn[1]))
+                .as_vec3()
+                    * VOXEL_SIZE
                     + Vec3::Y * 0.5
             )
         );
         assert_eq!(
             VoxelTeleportDestination::CombatSpaceship.player_position(),
             Some(
-                (COMBAT_SPACESHIP_CENTER + IVec3::new(1, 0, 0)).as_vec3() * VOXEL_SIZE
+                (COMBAT_SPACESHIP_CENTER
+                    + IVec3::new(ARROGANCE.spawn[0], 0, ARROGANCE.spawn[1]))
+                .as_vec3()
+                    * VOXEL_SIZE
+                    + Vec3::Y * 0.5
+            )
+        );
+        assert_eq!(
+            VoxelTeleportDestination::AbandonedStation.player_position(),
+            Some(
+                (ABANDONED_STATION_CENTER
+                    + IVec3::new(ABANDONED.spawn[0], 0, ABANDONED.spawn[1]))
+                .as_vec3()
+                    * VOXEL_SIZE
                     + Vec3::Y * 0.5
             )
         );
@@ -10153,9 +9419,9 @@ mod tests {
             Some(
                 ORBITAL_PLANET_CENTER
                     + Vec3::new(
-                        PLANET_SCIENCE_LAB_CENTER.x as f32,
+                        (PLANET_SCIENCE_LAB_CENTER.x + XY_PLANET.spawn[0]) as f32,
                         PLANET_SCIENCE_LAB_FLOOR_Y as f32,
-                        PLANET_SCIENCE_LAB_CENTER.y as f32,
+                        (PLANET_SCIENCE_LAB_CENTER.y + XY_PLANET.spawn[1]) as f32,
                     ) * VOXEL_SIZE
                     + Vec3::Y * 0.5
             )
@@ -10640,77 +9906,47 @@ mod tests {
     }
 
     #[test]
-    fn default_space_map_has_three_station_interiors_and_a_corvette_interior() {
+    fn default_space_map_contains_each_workbook_floorplan() {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
 
-        for station_center in [RESEARCH_STATION_CENTER, SENSOR_STATION_CENTER] {
-            assert_eq!(
-                grid.get(station_center + IVec3::new(10, 0, 10)).copied(),
-                Some(2)
+        for (center, design) in workbook_orbital_locations() {
+            let spawn = center + IVec3::new(design.spawn[0], 0, design.spawn[1]);
+            assert!(
+                matches!(grid.get(spawn).copied(), Some(2 | 7)),
+                "{} spawn must be on its workbook floor",
+                design.name
             );
             assert_eq!(
-                grid.get(station_center + IVec3::new(10, 4, 10))
-                    .copied()
-                    .unwrap_or(0),
-                0
+                grid.get(spawn + IVec3::Y).copied().unwrap_or(0),
+                0,
+                "{} spawn must have standing room",
+                design.name
+            );
+            let decoded = design.decode();
+            let wall_index = decoded
+                .styles
+                .iter()
+                .position(|style| *style == 11)
+                .unwrap();
+            let [wall_x, wall_z] = design.centered_offset(wall_index);
+            assert_eq!(
+                grid.get(center + IVec3::new(wall_x, 1, wall_z)).copied(),
+                Some(6),
+                "{} wall must use canonical voxels",
+                design.name
             );
         }
-        assert_eq!(
-            grid.get(COMBAT_SPACESHIP_CENTER + IVec3::new(1, 0, 0))
-                .copied(),
-            Some(2)
-        );
-        assert_eq!(
-            grid.get(COMBAT_SPACESHIP_CENTER + IVec3::new(1, 4, 0))
-                .copied()
-                .unwrap_or(0),
-            0
-        );
-        assert_eq!(
-            grid.get(COMBAT_SPACESHIP_CENTER + IVec3::new(1, 14, 0))
-                .copied(),
-            Some(2)
-        );
-        assert_eq!(
-            grid.get(CANNON_STATION_CENTER + IVec3::new(10, 0, 10))
-                .copied(),
-            Some(2)
-        );
-        assert_eq!(
-            grid.get(CANNON_STATION_CENTER + IVec3::new(10, 4, 10))
-                .copied()
-                .unwrap_or(0),
-            0
-        );
-        assert_eq!(
-            grid.get(CANNON_STATION_CENTER + IVec3::new(0, 22, -112))
-                .copied(),
-            Some(8)
-        );
-        assert_eq!(
-            grid.get(CANNON_STATION_CENTER + IVec3::new(15, 22, -112))
-                .copied(),
-            Some(9)
-        );
-
-        let old_station_interior_volume = 19 * 7 * 15;
-        let new_station_interior_volume = 99 * 35 * 79;
-        let old_station_floor_area = 19 * 15;
-        let new_station_floor_area = 99 * 79 * 5;
-        assert!(new_station_interior_volume >= old_station_interior_volume * 100);
-        assert!(new_station_floor_area >= old_station_floor_area * 100);
     }
 
     #[test]
     fn orbital_layout_is_five_times_wider_and_clear_of_the_planet() {
         assert_eq!(ORBITAL_LAYOUT_SCALE, 5);
-        assert_eq!(
-            SENSOR_STATION_CENTER.x - RESEARCH_STATION_CENTER.x,
-            1_000
-        );
-        assert_eq!(COMBAT_SPACESHIP_CENTER.z, 750);
-        assert_eq!(CANNON_STATION_CENTER.z, -750);
+        assert_eq!(RESEARCH_STATION_CENTER, IVec3::new(500, 0, 500));
+        assert_eq!(SENSOR_STATION_CENTER, IVec3::new(500, 0, -500));
+        assert_eq!(CANNON_STATION_CENTER, IVec3::new(-500, 0, -500));
+        assert_eq!(COMBAT_SPACESHIP_CENTER, IVec3::new(-500, 0, 500));
+        assert_eq!(ABANDONED_STATION_CENTER, IVec3::new(0, 0, 1_000));
 
         let planet_top = ORBITAL_PLANET_CENTER.y + ORBITAL_PLANET_RADIUS;
         assert!(planet_top <= -100.0);
@@ -10722,9 +9958,9 @@ mod tests {
                 .iter()
                 .map(|(_, material)| *material)
                 .collect::<HashSet<_>>(),
-            HashSet::from([1, 2, 3, 4, 6, 7, 8, 10])
+            HashSet::from([1, 2, 3, 4, 6, 7, 9, 10])
         );
-        let lab_cells = planet_science_lab_cells()
+        let lab_cells = xy_planet_map_cells()
             .into_iter()
             .map(|(cell, _)| cell)
             .collect::<HashSet<_>>();
@@ -10745,8 +9981,8 @@ mod tests {
     }
 
     #[test]
-    fn planet_science_lab_is_canonical_editable_planet_geometry() {
-        let lab_cells = planet_science_lab_cells()
+    fn xy_planet_base_is_canonical_editable_workbook_geometry() {
+        let lab_cells = xy_planet_map_cells()
             .into_iter()
             .collect::<HashMap<_, _>>();
         let planet_cells = voxel_orbital_planet_cells()
@@ -10755,49 +9991,35 @@ mod tests {
         let center_x = PLANET_SCIENCE_LAB_CENTER.x;
         let center_z = PLANET_SCIENCE_LAB_CENTER.y;
         let floor_y = PLANET_SCIENCE_LAB_FLOOR_Y;
+        let decoded = XY_PLANET.decode();
+        let wall_index = decoded
+            .styles
+            .iter()
+            .position(|style| *style == 11)
+            .unwrap();
+        let door_index = decoded
+            .styles
+            .iter()
+            .position(|style| *style == 15)
+            .unwrap();
+        let [wall_x, wall_z] = XY_PLANET.centered_offset(wall_index);
+        let [door_x, door_z] = XY_PLANET.centered_offset(door_index);
+        let wall = IVec3::new(center_x + wall_x, floor_y + 1, center_z + wall_z);
+        let door = IVec3::new(center_x + door_x, floor_y + 1, center_z + door_z);
+        let spawn = IVec3::new(
+            center_x + XY_PLANET.spawn[0],
+            floor_y,
+            center_z + XY_PLANET.spawn[1],
+        );
 
-        assert!(lab_cells.len() > 5_000);
+        assert!(lab_cells.len() > 1_000);
         assert!(lab_cells
             .iter()
             .all(|(cell, material)| planet_cells.get(cell) == Some(material)));
-        assert!(lab_cells
-            .values()
-            .all(|material| (6..=10).contains(material)));
-        assert_eq!(
-            lab_cells.get(&IVec3::new(center_x, floor_y, center_z)),
-            Some(&6)
-        );
-        assert_eq!(
-            lab_cells.get(&IVec3::new(
-                center_x + 22,
-                floor_y + 8,
-                center_z
-            )),
-            Some(&8)
-        );
-        assert_eq!(
-            lab_cells.get(&IVec3::new(
-                center_x,
-                floor_y + 3,
-                center_z + 6
-            )),
-            Some(&8)
-        );
-        assert_eq!(
-            lab_cells.get(&IVec3::new(
-                center_x + 4,
-                floor_y + 5,
-                center_z - 16
-            )),
-            Some(&10)
-        );
-        assert!(!planet_cells.contains_key(&IVec3::new(
-            center_x,
-            floor_y + 5,
-            center_z - 16,
-        )));
+        assert!(matches!(lab_cells.get(&spawn), Some(2 | 7)));
+        assert_eq!(lab_cells.get(&wall), Some(&6));
+        assert!(!lab_cells.contains_key(&door));
 
-        let window = IVec3::new(center_x + 22, floor_y + 8, center_z);
         let cell_bounds = VoxelCellBounds::from_cells(lab_cells.keys().copied());
         let mut planet = VoxelOrbitalPlanet {
             cells: lab_cells,
@@ -10811,14 +10033,14 @@ mod tests {
         };
         let removed = explode_planet_voxels(
             &mut planet,
-            window.as_vec3() * VOXEL_SIZE,
+            wall.as_vec3() * VOXEL_SIZE,
             VOXEL_SIZE,
         );
         assert!(removed
             .iter()
-            .any(|(cell, material)| *cell == window && *material == 8));
-        assert!(planet.removed.contains(&window));
-        assert!(!planet.cells.contains_key(&window));
+            .any(|(cell, material)| *cell == wall && *material == 6));
+        assert!(planet.removed.contains(&wall));
+        assert!(!planet.cells.contains_key(&wall));
         assert!(planet.dirty);
     }
 
@@ -10938,57 +10160,22 @@ mod tests {
     }
 
     #[test]
-    fn combat_corvette_matches_the_three_deck_trpg_layout() {
-        for floor_y in [0, 7, 14] {
-            assert_eq!(
-                combat_corvette_voxel(IVec3::new(0, floor_y, 0)),
-                Some(2)
-            );
-        }
-        for walkway_y in [4, 11, 18] {
-            assert_eq!(
-                combat_corvette_voxel(IVec3::new(0, walkway_y, 0)),
-                None
-            );
-            assert_eq!(
-                combat_corvette_voxel(IVec3::new(0, walkway_y, 15)),
-                None
-            );
-        }
-
-        for (position, expected_material) in [
-            (IVec3::new(0, 3, -48), 8),
-            (IVec3::new(-12, 2, -28), 3),
-            (IVec3::new(-13, 8, -28), 6),
-            (IVec3::new(11, 8, -25), 3),
-            (IVec3::new(10, 15, -5), 6),
-            (IVec3::new(0, 15, 23), 3),
-            (IVec3::new(6, 8, 55), 8),
-            (IVec3::new(16, 8, -80), 8),
-            (IVec3::new(20, 3, 5), 9),
-            (IVec3::new(20, 10, 5), 8),
-            (IVec3::new(13, -5, -28), 6),
-            (IVec3::new(0, 24, 0), 7),
-            (IVec3::new(5, 23, 25), 7),
-            (IVec3::new(23, 4, 5), 7),
-        ] {
-            assert_eq!(
-                combat_corvette_voxel(position),
-                Some(expected_material),
-                "unexpected corvette voxel at {position:?}"
-            );
-        }
+    fn arrogance_cruiser_preserves_workbook_walls_doors_and_fixtures() {
+        let decoded = ARROGANCE.decode();
+        assert_eq!((ARROGANCE.width, ARROGANCE.height), (216, 84));
         assert_eq!(
-            combat_corvette_voxel(IVec3::new(0, 11, 65)),
-            None
+            decoded.styles.iter().filter(|style| **style == 11).count(),
+            1_033
         );
         assert_eq!(
-            combat_corvette_voxel(IVec3::new(23, 6, 6)),
-            None
+            decoded.styles.iter().filter(|style| **style == 15).count(),
+            42
         );
-        assert_eq!(corvette_half_width(-80), 14);
-        assert_eq!(corvette_half_width(0), 20);
-        assert_eq!(corvette_half_width(80), 2);
+        assert!(decoded
+            .styles
+            .iter()
+            .copied()
+            .any(|style| workbook_fixture(style).is_some()));
     }
 
     #[test]
@@ -11244,19 +10431,18 @@ mod tests {
             .into_iter()
             .map(|(_, material)| material)
             .collect::<HashSet<_>>();
-        assert!(voxel_cells(grid).len() >= 100_000);
+        assert!(voxel_cells(grid).len() >= 20_000);
         assert_eq!(
             materials,
             HashSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         );
 
         let doors = voxel_auto_doors();
-        assert_eq!(doors.len(), 64);
-        assert!(doors.iter().take(2).all(|door| door.cells.len() == 88));
-        assert_eq!(doors[2].cells.len(), 35);
-        assert!(doors[3..35].iter().all(|door| door.cells.len() == 63));
-        assert!(doors[35..53].iter().all(|door| door.cells.len() == 25));
-        assert!(doors[53..].iter().all(|door| door.cells.len() == 63));
+        assert_eq!(doors.len(), 30);
+        assert!(doors.iter().all(|door| {
+            door.cells.len() >= 5
+                && door.cells.len() % (WORKBOOK_ROOM_HEIGHT as usize - 2) == 0
+        }));
         assert!(doors
             .iter()
             .flat_map(|door| &door.cells)
@@ -11289,8 +10475,8 @@ mod tests {
             ));
         }
 
-        let lights = voxel_interior_lights();
-        assert_eq!(lights.len(), 88);
+        let lights = workbook_interior_lights();
+        assert!(lights.len() >= 20);
         assert!(lights.iter().all(|(position, _)| position.y > 0.0));
     }
 
@@ -11427,6 +10613,7 @@ mod tests {
                 physics_bodies: vec![persisted_body],
                 placed_lights: vec![persisted_light],
             }),
+            layout_revision: VOXEL_SCENE_LAYOUT_REVISION,
         };
 
         let bytes = StorageFormat::Bincode
@@ -11578,8 +10765,11 @@ mod tests {
     fn raycast_hits_voxel_and_adjacent_air() {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
+        let [spawn_x, spawn_z] = NIFFY.spawn;
         let ray = Ray3d::new(
-            (RESEARCH_STATION_CENTER.as_vec3() + Vec3::new(20.5, 120.0, 10.5)) * VOXEL_SIZE,
+            (RESEARCH_STATION_CENTER.as_vec3()
+                + Vec3::new(spawn_x as f32 + 0.5, 120.0, spawn_z as f32 + 0.5))
+                * VOXEL_SIZE,
             Dir3::NEG_Y,
         );
         let hit = raycast_grid(grid, ray).unwrap();
@@ -11722,9 +10912,9 @@ mod tests {
     }
 
     #[test]
-    fn voxel_physics_props_detail_station_roofs_and_corvette_interiors() {
+    fn voxel_physics_props_detail_workbook_interiors() {
         let specs = voxel_physics_prop_specs();
-        assert_eq!(specs.len(), 40);
+        assert_eq!(specs.len(), 10);
         assert!(specs.iter().all(|(cells, _)| !cells.is_empty()));
         assert!(specs.iter().all(
             |(cells, _)| cells.iter().all(
@@ -11732,8 +10922,7 @@ mod tests {
                     && (1..=VOXEL_MATERIAL_COUNT as u8).contains(material)
             )
         ));
-        assert!(specs.iter().any(|(cells, _)| cells.len() == 5 * 3 * 5));
-        assert!(specs.iter().any(|(cells, _)| cells.len() == 5 * 1 * 2));
+        assert!(specs.iter().all(|(cells, _)| cells.len() == 2 * 2 * 2));
     }
 
     #[test]
