@@ -9,6 +9,7 @@ use bevy::{
         FullscreenShader,
     },
     ecs::error::BevyError,
+    post_process::bloom::bloom,
     prelude::*,
     render::{
         extract_component::{
@@ -77,6 +78,7 @@ impl Plugin for VoxelRadianceCascadePlugin {
                 Core3d,
                 voxel_radiance_cascade
                     .in_set(Core3dSystems::PostProcess)
+                    .before(bloom)
                     .before(tonemapping),
             );
     }
@@ -156,8 +158,8 @@ fn init_radiance_pipeline(
     });
     let volume_sampler = render_device.create_sampler(&SamplerDescriptor {
         label: Some("voxel_radiance_volume_sampler"),
-        mag_filter: FilterMode::Nearest,
-        min_filter: FilterMode::Nearest,
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Linear,
         address_mode_u: AddressMode::ClampToEdge,
         address_mode_v: AddressMode::ClampToEdge,
         address_mode_w: AddressMode::ClampToEdge,

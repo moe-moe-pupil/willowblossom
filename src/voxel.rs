@@ -3,6 +3,7 @@ use std::{
         hash_map::DefaultHasher,
         HashMap,
         HashSet,
+        VecDeque,
     },
     fs,
     hash::{
@@ -23,6 +24,7 @@ use ab_glyph::{
 };
 use avian3d::prelude::*;
 use bevy::{
+    anti_alias::taa::TemporalAntiAliasing,
     asset::RenderAssetUsages,
     camera::{
         primitives::Aabb,
@@ -48,6 +50,12 @@ use bevy::{
         PrimitiveTopology,
         VertexAttributeValues,
     },
+    pbr::{
+        ContactShadows,
+        ScreenSpaceAmbientOcclusion,
+        ScreenSpaceAmbientOcclusionQualityLevel,
+    },
+    post_process::bloom::Bloom,
     prelude::*,
     render::{
         render_resource::{
@@ -139,7 +147,11 @@ const VOXEL_SCENE_AUTOSAVE_SECONDS: f32 = 30.0;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
 const VOXEL_MATERIAL_COUNT: usize = 10;
 const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
-const VOXEL_RADIANCE_MAX_DIMENSION: i32 = 192;
+const VOXEL_RADIANCE_VOLUME_DIMENSION: i32 = 96;
+const VOXEL_RADIANCE_REBUILD_STEP: i32 = 16;
+const VOXEL_RADIANCE_SKYLIGHT: [u8; 3] = [44, 62, 92];
+const VOXEL_RADIANCE_TRANSMISSION: u16 = 238;
+const VOXEL_RADIANCE_CUTOFF: u8 = 3;
 const DEFAULT_AMBIENT_BRIGHTNESS: f32 = 72.0;
 const DEFAULT_KEY_LIGHT_ILLUMINANCE: f32 = 8_500.0;
 const DEFAULT_FILL_LIGHT_ILLUMINANCE: f32 = 1_600.0;
@@ -2345,8 +2357,7 @@ fn hifi_voxel_tile_transform(row: usize) -> Affine2 {
 
 fn radiance_voxel_color(material: u8) -> [u8; 4] {
     match material {
-        // Alpha stores occupancy for visibility. RGB stores emitted radiance,
-        // not albedo, so ordinary walls do not incorrectly cast brown light.
+        // Alpha stores occupancy. RGB seeds the colored block-light volume.
         5 => [255, 72, 8, 255],
         8 => [34, 176, 220, 255],
         10 => [196, 78, 18, 255],
@@ -2355,48 +2366,130 @@ fn radiance_voxel_color(material: u8) -> [u8; 4] {
     }
 }
 
-fn build_voxel_radiance_image(grid: &Grid<u8>) -> (Image, Vec3, f32, Vec3) {
-    let solid_cells = grid
-        .iter()
-        .flat_map(|(chunk_position, chunk)| {
-            prism(IVec3::ZERO, DIMS).filter_map(move |local| {
-                let material = chunk[local];
-                TrpgVoxelConnector::solid(&material)
-                    .then_some((*chunk_position * DIMS + local, material))
-            })
-        })
-        .collect::<Vec<_>>();
-    let min = solid_cells
-        .iter()
-        .map(|(cell, _)| *cell)
-        .reduce(IVec3::min)
-        .unwrap_or(IVec3::ZERO);
-    let max = solid_cells
-        .iter()
-        .map(|(cell, _)| *cell)
-        .reduce(IVec3::max)
-        .unwrap_or(IVec3::ZERO);
-    let extent = max - min + IVec3::ONE;
-    let stride = ((extent.max_element() + VOXEL_RADIANCE_MAX_DIMENSION - 1)
-        / VOXEL_RADIANCE_MAX_DIMENSION)
-        .max(1);
-    let dimensions = (extent + IVec3::splat(stride - 1)) / stride;
-    let texel_count = dimensions.x as usize * dimensions.y as usize * dimensions.z as usize;
-    let mut data = vec![0; texel_count * 4];
-    for (cell, material) in solid_cells {
-        let local = (cell - min) / stride;
-        let index = (local.x + dimensions.x * (local.y + dimensions.y * local.z)) as usize * 4;
-        let color = radiance_voxel_color(material);
-        let old_energy = data[index] as u16 + data[index + 1] as u16 + data[index + 2] as u16;
-        let new_energy = color[0] as u16 + color[1] as u16 + color[2] as u16;
-        if data[index + 3] == 0 || new_energy >= old_energy {
-            data[index..index + 4].copy_from_slice(&color);
+fn voxel_radiance_volume_origin(focus: Vec3) -> IVec3 {
+    let focus = if focus.is_finite() { focus } else { Vec3::ZERO };
+    let focus_cell = (focus / VOXEL_SIZE).floor().as_ivec3();
+    let snapped_focus = IVec3::new(
+        focus_cell.x.div_euclid(VOXEL_RADIANCE_REBUILD_STEP) * VOXEL_RADIANCE_REBUILD_STEP,
+        focus_cell.y.div_euclid(VOXEL_RADIANCE_REBUILD_STEP) * VOXEL_RADIANCE_REBUILD_STEP,
+        focus_cell.z.div_euclid(VOXEL_RADIANCE_REBUILD_STEP) * VOXEL_RADIANCE_REBUILD_STEP,
+    );
+    snapped_focus - IVec3::splat(VOXEL_RADIANCE_VOLUME_DIMENSION / 2)
+}
+
+fn voxel_radiance_index(local: IVec3) -> usize {
+    let dimension = VOXEL_RADIANCE_VOLUME_DIMENSION;
+    (local.x + dimension * (local.y + dimension * local.z)) as usize
+}
+
+fn propagate_voxel_radiance(data: &mut [u8], queue: &mut VecDeque<usize>) {
+    let dimension = VOXEL_RADIANCE_VOLUME_DIMENSION as usize;
+    let layer_len = dimension * dimension;
+    const NEIGHBORS: [IVec3; 6] = [
+        IVec3::X,
+        IVec3::NEG_X,
+        IVec3::Y,
+        IVec3::NEG_Y,
+        IVec3::Z,
+        IVec3::NEG_Z,
+    ];
+
+    while let Some(index) = queue.pop_front() {
+        let byte_index = index * 4;
+        let propagated = [
+            (data[byte_index] as u16 * VOXEL_RADIANCE_TRANSMISSION / 255) as u8,
+            (data[byte_index + 1] as u16 * VOXEL_RADIANCE_TRANSMISSION / 255) as u8,
+            (data[byte_index + 2] as u16 * VOXEL_RADIANCE_TRANSMISSION / 255) as u8,
+        ];
+        if propagated.iter().copied().max().unwrap_or_default() <= VOXEL_RADIANCE_CUTOFF {
+            continue;
+        }
+
+        let local = IVec3::new(
+            (index % dimension) as i32,
+            ((index / dimension) % dimension) as i32,
+            (index / layer_len) as i32,
+        );
+        for offset in NEIGHBORS {
+            let neighbor = local + offset;
+            if neighbor.min_element() < 0
+                || neighbor.max_element() >= VOXEL_RADIANCE_VOLUME_DIMENSION
+            {
+                continue;
+            }
+            let neighbor_index = voxel_radiance_index(neighbor);
+            let neighbor_byte = neighbor_index * 4;
+            if data[neighbor_byte + 3] != 0 {
+                continue;
+            }
+            let mut changed = false;
+            for channel in 0..3 {
+                if propagated[channel] > data[neighbor_byte + channel] {
+                    data[neighbor_byte + channel] = propagated[channel];
+                    changed = true;
+                }
+            }
+            if changed {
+                queue.push_back(neighbor_index);
+            }
         }
     }
+}
+
+fn build_voxel_radiance_image(grid: &Grid<u8>, focus: Vec3) -> (Image, Vec3, f32, Vec3) {
+    let origin = voxel_radiance_volume_origin(focus);
+    let dimensions = IVec3::splat(VOXEL_RADIANCE_VOLUME_DIMENSION);
+    let texel_count = VOXEL_RADIANCE_VOLUME_DIMENSION as usize
+        * VOXEL_RADIANCE_VOLUME_DIMENSION as usize
+        * VOXEL_RADIANCE_VOLUME_DIMENSION as usize;
+    let mut data = vec![0; texel_count * 4];
+    let mut queue = VecDeque::new();
+
+    for (chunk_position, chunk) in grid.iter() {
+        for chunk_local in prism(IVec3::ZERO, DIMS) {
+            let material = chunk[chunk_local];
+            if material == 0 {
+                continue;
+            }
+            let local = *chunk_position * DIMS + chunk_local - origin;
+            if local.min_element() < 0 || local.max_element() >= VOXEL_RADIANCE_VOLUME_DIMENSION {
+                continue;
+            }
+            let color = radiance_voxel_color(material);
+            let index = voxel_radiance_index(local);
+            let byte_index = index * 4;
+            data[byte_index..byte_index + 4].copy_from_slice(&color);
+            if color[..3].iter().any(|channel| *channel != 0) {
+                queue.push_back(index);
+            }
+        }
+    }
+
+    // Minecraft keeps a separate skylight channel: full-strength light travels
+    // down open columns, while a roof blocks it. The shared flood fill below
+    // then carries that light sideways through windows and doorways with falloff.
+    for z in 0..VOXEL_RADIANCE_VOLUME_DIMENSION {
+        for x in 0..VOXEL_RADIANCE_VOLUME_DIMENSION {
+            let mut sky_visible = true;
+            for y in (0..VOXEL_RADIANCE_VOLUME_DIMENSION).rev() {
+                let local = IVec3::new(x, y, z);
+                let index = voxel_radiance_index(local);
+                let byte_index = index * 4;
+                if data[byte_index + 3] != 0 {
+                    sky_visible = false;
+                } else if sky_visible {
+                    data[byte_index..byte_index + 3].copy_from_slice(&VOXEL_RADIANCE_SKYLIGHT);
+                    queue.push_back(index);
+                }
+            }
+        }
+    }
+    propagate_voxel_radiance(&mut data, &mut queue);
+
     let size = Extent3d {
-        width: dimensions.x.max(1) as u32,
-        height: dimensions.y.max(1) as u32,
-        depth_or_array_layers: dimensions.z.max(1) as u32,
+        width: VOXEL_RADIANCE_VOLUME_DIMENSION as u32,
+        height: VOXEL_RADIANCE_VOLUME_DIMENSION as u32,
+        depth_or_array_layers: VOXEL_RADIANCE_VOLUME_DIMENSION as u32,
     };
     let mut image = Image::new(
         size,
@@ -2409,28 +2502,30 @@ fn build_voxel_radiance_image(grid: &Grid<u8>) -> (Image, Vec3, f32, Vec3) {
         address_mode_u: ImageAddressMode::ClampToEdge,
         address_mode_v: ImageAddressMode::ClampToEdge,
         address_mode_w: ImageAddressMode::ClampToEdge,
-        mag_filter: ImageFilterMode::Nearest,
-        min_filter: ImageFilterMode::Nearest,
-        mipmap_filter: ImageFilterMode::Nearest,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
         ..default()
     });
     (
         image,
-        min.as_vec3() * VOXEL_SIZE,
-        VOXEL_SIZE * stride as f32,
+        origin.as_vec3() * VOXEL_SIZE,
+        VOXEL_SIZE,
         dimensions.as_vec3(),
     )
 }
 
 fn setup_voxel_radiance_volume(
     grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
+    editor: Res<VoxelEditorState>,
     mut images: ResMut<Assets<Image>>,
     mut volume: ResMut<VoxelRadianceVolume>,
 ) {
     let Ok(grid) = grids.single() else {
         return;
     };
-    let (image, volume_min, voxel_world_size, volume_dimensions) = build_voxel_radiance_image(grid);
+    let (image, volume_min, voxel_world_size, volume_dimensions) =
+        build_voxel_radiance_image(grid, editor.camera_focus);
     volume.image = images.add(image);
     volume.volume_min = volume_min;
     volume.voxel_world_size = voxel_world_size;
@@ -2438,16 +2533,37 @@ fn setup_voxel_radiance_volume(
 }
 
 fn sync_voxel_radiance_volume(
-    grids: Query<&Grid<u8>, (With<TrpgVoxelGrid>, Changed<Grid<u8>>)>,
+    grids: Query<Ref<Grid<u8>>, With<TrpgVoxelGrid>>,
+    players: Query<&Transform, With<VoxelFirstPersonPlayer>>,
     editor: Res<VoxelEditorState>,
     mut images: ResMut<Assets<Image>>,
     mut volume: ResMut<VoxelRadianceVolume>,
-    mut cameras: Query<&mut VoxelRadianceCascadeUniform, With<VoxelViewportCamera>>,
+    mut cameras: Query<
+        (
+            &mut VoxelRadianceCascade,
+            &mut VoxelRadianceCascadeUniform,
+        ),
+        With<VoxelViewportCamera>,
+    >,
 ) {
     let Ok(grid) = grids.single() else {
         return;
     };
-    let (image, volume_min, voxel_world_size, volume_dimensions) = build_voxel_radiance_image(grid);
+    let focus = if editor.first_person_enabled {
+        players
+            .single()
+            .map(|transform| transform.translation)
+            .unwrap_or(editor.camera_focus)
+    } else {
+        editor.camera_focus
+    };
+    let desired_min = voxel_radiance_volume_origin(focus).as_vec3() * VOXEL_SIZE;
+    if !grid.is_changed() && desired_min == volume.volume_min && images.contains(&volume.image) {
+        return;
+    }
+
+    let (image, volume_min, voxel_world_size, volume_dimensions) =
+        build_voxel_radiance_image(&grid, focus);
     if images.contains(&volume.image) {
         *images.get_mut(&volume.image).unwrap() = image;
     } else {
@@ -2457,7 +2573,8 @@ fn sync_voxel_radiance_volume(
     volume.voxel_world_size = voxel_world_size;
     volume.volume_dimensions = volume_dimensions;
     let uniform = volume.uniform(editor.radiance_intensity);
-    for mut camera_uniform in &mut cameras {
+    for (mut cascade, mut camera_uniform) in &mut cameras {
+        cascade.volume = volume.image.clone();
         *camera_uniform = uniform;
     }
 }
@@ -3739,6 +3856,7 @@ fn setup_voxel_view(
         DirectionalLight {
             illuminance: DEFAULT_KEY_LIGHT_ILLUMINANCE,
             shadow_maps_enabled: true,
+            contact_shadows_enabled: true,
             ..default()
         },
         VoxelKeyLight,
@@ -3757,10 +3875,24 @@ fn setup_voxel_view(
     commands.spawn((
         Camera3d::default(),
         DepthPrepass,
-        // The radiance-cascade pass samples the viewport depth buffer directly.
+        // Voxel GI and screen-space contact lighting sample the viewport depth.
         // Keep this camera single-sampled so that depth is available as a normal
         // texture instead of an unresolved multisampled attachment.
         Msaa::Off,
+        TemporalAntiAliasing::default(),
+        ScreenSpaceAmbientOcclusion {
+            quality_level: ScreenSpaceAmbientOcclusionQualityLevel::High,
+            constant_object_thickness: VOXEL_SIZE,
+        },
+        ContactShadows {
+            linear_steps: 16,
+            thickness: VOXEL_SIZE * 0.4,
+            length: VOXEL_SIZE * 6.0,
+        },
+        Bloom {
+            intensity: 0.08,
+            ..Bloom::OLD_SCHOOL
+        },
         Camera {
             order: 0,
             clear_color: ClearColorConfig::Custom(Color::srgb(0.055, 0.065, 0.075)),
@@ -10291,18 +10423,26 @@ mod tests {
     }
 
     #[test]
-    fn radiance_volume_contains_scene_voxels_and_stays_gpu_bounded() {
+    fn radiance_volume_is_a_canonical_camera_focus_clipmap() {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
-        let (image, _volume_min, voxel_world_size, volume_dimensions) =
-            build_voxel_radiance_image(grid);
+        let focus = DEFAULT_SCENE_CAMERA_FOCUS;
+        let (image, volume_min, voxel_world_size, volume_dimensions) =
+            build_voxel_radiance_image(grid, focus);
 
         assert_eq!(
             image.texture_descriptor.dimension,
             TextureDimension::D3
         );
-        assert!(volume_dimensions.max_element() <= VOXEL_RADIANCE_MAX_DIMENSION as f32);
-        assert!(voxel_world_size >= VOXEL_SIZE);
+        assert_eq!(
+            volume_dimensions,
+            Vec3::splat(VOXEL_RADIANCE_VOLUME_DIMENSION as f32)
+        );
+        assert_eq!(voxel_world_size, VOXEL_SIZE);
+        assert_eq!(
+            volume_min,
+            voxel_radiance_volume_origin(focus).as_vec3() * VOXEL_SIZE
+        );
         assert_eq!(
             image.texture_descriptor.size.width,
             volume_dimensions.x as u32
@@ -10317,6 +10457,58 @@ mod tests {
         );
         let data = image.data.as_ref().expect("radiance volume has CPU texels");
         assert!(data.chunks_exact(4).any(|rgba| rgba[3] != 0));
+    }
+
+    #[test]
+    fn radiance_clipmap_origin_moves_in_stable_canonical_steps() {
+        let origin = voxel_radiance_volume_origin(Vec3::ZERO);
+        assert_eq!(
+            voxel_radiance_volume_origin(Vec3::splat(
+                VOXEL_SIZE * (VOXEL_RADIANCE_REBUILD_STEP as f32 - 0.01),
+            )),
+            origin
+        );
+        assert_eq!(
+            voxel_radiance_volume_origin(Vec3::X * VOXEL_SIZE * VOXEL_RADIANCE_REBUILD_STEP as f32),
+            origin + IVec3::X * VOXEL_RADIANCE_REBUILD_STEP
+        );
+    }
+
+    #[test]
+    fn radiance_volume_flood_fills_emission_but_not_solid_cells() {
+        let mut app = App::new();
+        let entity = app.world_mut().spawn(Grid::<u8>::new()).id();
+        {
+            let mut entity_mut = app.world_mut().entity_mut(entity);
+            let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
+            grid.set(IVec3::ZERO, 5);
+            grid.set(IVec3::X, 2);
+            grid.set(IVec3::new(8, 0, 0), 2);
+        }
+        let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
+        let (image, volume_min, voxel_world_size, _) = build_voxel_radiance_image(grid, Vec3::ZERO);
+        let origin = (volume_min / voxel_world_size).as_ivec3();
+        let emitter_index = voxel_radiance_index(-origin) * 4;
+        let empty_neighbor_index = voxel_radiance_index(IVec3::NEG_X - origin) * 4;
+        let solid_neighbor_index = voxel_radiance_index(IVec3::X - origin) * 4;
+        let roof_above_index = voxel_radiance_index(IVec3::new(8, 1, 0) - origin) * 4;
+        let roof_below_index = voxel_radiance_index(IVec3::new(8, -1, 0) - origin) * 4;
+        let data = image.data.as_ref().expect("radiance volume has CPU texels");
+
+        assert_eq!(
+            &data[emitter_index..emitter_index + 4],
+            &[255, 72, 8, 255]
+        );
+        assert!(data[empty_neighbor_index] > VOXEL_RADIANCE_SKYLIGHT[0]);
+        assert_eq!(
+            &data[solid_neighbor_index..solid_neighbor_index + 4],
+            &[0, 0, 0, 255]
+        );
+        assert_eq!(
+            data[roof_above_index + 2],
+            VOXEL_RADIANCE_SKYLIGHT[2]
+        );
+        assert!(data[roof_below_index + 2] < VOXEL_RADIANCE_SKYLIGHT[2]);
     }
 
     #[test]
