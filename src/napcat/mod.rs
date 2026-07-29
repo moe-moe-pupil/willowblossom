@@ -6702,6 +6702,8 @@ fn message_system(
             };
             let auto_forward =
                 auto_forward_request(&manager, &json, &target_id).or(party_auto_forward);
+            let defeated_auto_forward_guidance =
+                defeated_auto_forward_guidance(&manager, &json, &target_id);
             let character_creation_response = if is_incoming_message
                 && matches!(
                     json.data.message_type,
@@ -6715,6 +6717,7 @@ fn message_system(
                 )
                 .or_else(|| handle_character_creation_message(&mut manager, &json, &target_id))
                 .or(party_channel_guidance)
+                .or(defeated_auto_forward_guidance)
             } else {
                 None
             };
@@ -9423,6 +9426,20 @@ fn auto_forward_sender_is_alive(manager: &NapcatMessageManager, target_id: &str)
         .player_characters
         .get(target_id)
         .is_none_or(|character| character.hp > 0.0)
+}
+
+fn defeated_auto_forward_guidance(
+    manager: &NapcatMessageManager,
+    message: &NapcatMessage,
+    target_id: &str,
+) -> Option<String> {
+    if auto_forward_sender_is_alive(manager, target_id) {
+        return None;
+    }
+    if quoted_auto_forward_text(message).is_none() && parsed_party_channel_text(message).is_none() {
+        return None;
+    }
+    Some("你的角色当前已阵亡，无法发言；这条消息不会被自动转发。".to_owned())
 }
 
 fn auto_forward_recipient_allowed(
@@ -13764,6 +13781,15 @@ position_cells = [4, 5, 6]
             "2",
         )
         .is_none());
+        assert_eq!(
+            defeated_auto_forward_guidance(
+                &manager,
+                &test_private_message_from(2, "\"last words\""),
+                "2",
+            )
+            .as_deref(),
+            Some("你的角色当前已阵亡，无法发言；这条消息不会被自动转发。")
+        );
 
         let mut group = TrpgGroup {
             players: vec!["2".to_owned(), "3".to_owned()],
@@ -13778,6 +13804,21 @@ position_cells = [4, 5, 6]
         assert!(party_channel_auto_forward_request(
             &manager,
             &test_private_message_from(2, "[last words]"),
+            "2",
+        )
+        .is_none());
+        assert_eq!(
+            defeated_auto_forward_guidance(
+                &manager,
+                &test_private_message_from(2, "[last words]"),
+                "2",
+            )
+            .as_deref(),
+            Some("你的角色当前已阵亡，无法发言；这条消息不会被自动转发。")
+        );
+        assert!(defeated_auto_forward_guidance(
+            &manager,
+            &test_private_message_from(2, "ordinary private text"),
             "2",
         )
         .is_none());
