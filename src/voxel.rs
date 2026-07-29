@@ -158,7 +158,7 @@ const ORBITAL_PLANET_CAP_RADIUS: i32 = 128;
 const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const VOXEL_SCENE_AUTOSAVE_SECONDS: f32 = 30.0;
-const VOXEL_SCENE_LAYOUT_REVISION: u32 = 1;
+const VOXEL_SCENE_LAYOUT_REVISION: u32 = 2;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
 const VOXEL_MATERIAL_COUNT: usize = 10;
 const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
@@ -2766,6 +2766,538 @@ fn build_workbook_orbital_location(
         for y in 1..=height {
             grid.set(base + IVec3::Y * y, material);
         }
+    }
+    for (cell, material) in workbook_hull_cells(design, &decoded) {
+        grid.set(center + cell, material);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkbookHullStyle {
+    ResearchStation,
+    SensorStation,
+    CannonStation,
+    CombatCruiser,
+    AbandonedStation,
+}
+
+#[derive(Clone, Copy)]
+struct WorkbookHullPalette {
+    hull: u8,
+    trim: u8,
+    armor: u8,
+    window: u8,
+    rib_spacing: i32,
+}
+
+fn workbook_hull_style(design: WorkbookMapDesign) -> WorkbookHullStyle {
+    match design.name {
+        "U.S.I Niffy女皇号空间站" => WorkbookHullStyle::ResearchStation,
+        "U.S.I 女仲裁者号空间站" => WorkbookHullStyle::SensorStation,
+        "U.S.I Kyo空间站" => WorkbookHullStyle::CannonStation,
+        "U.S.I 狂妄号" => WorkbookHullStyle::CombatCruiser,
+        "废弃太空站" => WorkbookHullStyle::AbandonedStation,
+        name => panic!("missing workbook hull style for {name}"),
+    }
+}
+
+fn workbook_hull_palette(style: WorkbookHullStyle) -> WorkbookHullPalette {
+    match style {
+        WorkbookHullStyle::ResearchStation => WorkbookHullPalette {
+            hull: 6,
+            trim: 7,
+            armor: 10,
+            window: 8,
+            rib_spacing: 12,
+        },
+        WorkbookHullStyle::SensorStation => WorkbookHullPalette {
+            hull: 6,
+            trim: 7,
+            armor: 10,
+            window: 8,
+            rib_spacing: 10,
+        },
+        WorkbookHullStyle::CannonStation => WorkbookHullPalette {
+            hull: 6,
+            trim: 9,
+            armor: 7,
+            window: 8,
+            rib_spacing: 9,
+        },
+        WorkbookHullStyle::CombatCruiser => WorkbookHullPalette {
+            hull: 6,
+            trim: 7,
+            armor: 9,
+            window: 8,
+            rib_spacing: 11,
+        },
+        WorkbookHullStyle::AbandonedStation => WorkbookHullPalette {
+            hull: 7,
+            trim: 6,
+            armor: 9,
+            window: 10,
+            rib_spacing: 14,
+        },
+    }
+}
+
+fn workbook_hull_cells(
+    design: WorkbookMapDesign,
+    decoded: &DecodedWorkbookMap,
+) -> Vec<(IVec3, u8)> {
+    let style = workbook_hull_style(design);
+    let palette = workbook_hull_palette(style);
+    let mut cells = HashMap::new();
+    let directions = [
+        (IVec3::NEG_X, -1, 0),
+        (IVec3::X, 1, 0),
+        (IVec3::NEG_Z, 0, -1),
+        (IVec3::Z, 0, 1),
+    ];
+
+    // Preserve the exact workbook outline, but give every exposed wall the
+    // layered shell, window bands, armor, and ribs used by the previous map.
+    for (index, cell_style) in decoded.styles.iter().copied().enumerate() {
+        if !matches!(cell_style, 11 | 15) {
+            continue;
+        }
+        let sheet_x = index % design.width;
+        let sheet_z = index / design.width;
+        let [local_x, local_z] = design.centered_offset(index);
+        let wall = cell_style == 11;
+        for (direction, dx, dz) in directions {
+            let neighbor_x = sheet_x as i32 + dx;
+            let neighbor_z = sheet_z as i32 + dz;
+            let exterior = if neighbor_x < 0
+                || neighbor_z < 0
+                || neighbor_x >= design.width as i32
+                || neighbor_z >= design.height as i32
+            {
+                true
+            } else {
+                decoded.exterior[neighbor_z as usize * design.width + neighbor_x as usize]
+            };
+            if !exterior {
+                continue;
+            }
+
+            let outside = IVec3::new(local_x + dx, 0, local_z + dz);
+            let longitudinal = if dx != 0 { local_z } else { local_x };
+            let pattern = longitudinal.rem_euclid(palette.rib_spacing);
+            let rib = pattern == 0;
+            if wall {
+                cells.insert(outside, palette.hull);
+                for y in 1..WORKBOOK_ROOM_HEIGHT {
+                    let material = if matches!(y, 3 | 4)
+                        && matches!(pattern, 4 | 5)
+                    {
+                        palette.window
+                    } else if y == 1 || y == WORKBOOK_ROOM_HEIGHT - 1 {
+                        palette.trim
+                    } else if y == 2 && pattern == 7 {
+                        palette.armor
+                    } else {
+                        palette.hull
+                    };
+                    cells.insert(outside + IVec3::Y * y, material);
+                }
+                cells.insert(
+                    outside + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
+                    palette.hull,
+                );
+                cells.insert(
+                    IVec3::new(local_x, WORKBOOK_ROOM_HEIGHT + 1, local_z),
+                    if rib { palette.armor } else { palette.trim },
+                );
+                if rib {
+                    let outer_rib = outside + direction;
+                    for y in 0..=WORKBOOK_ROOM_HEIGHT {
+                        cells.insert(
+                            outer_rib + IVec3::Y * y,
+                            if y == 3 { palette.armor } else { palette.trim },
+                        );
+                    }
+                }
+            } else {
+                // Keep exterior doors usable while extending their threshold
+                // and canopy through the thicker shell.
+                cells.insert(outside, 2);
+                cells.insert(
+                    outside + IVec3::Y * (WORKBOOK_ROOM_HEIGHT - 1),
+                    palette.trim,
+                );
+                cells.insert(
+                    outside + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
+                    palette.trim,
+                );
+            }
+        }
+    }
+
+    match style {
+        WorkbookHullStyle::ResearchStation => {
+            let crown_anchor =
+                workbook_roof_anchor(design, decoded, IVec2::new(14, 10));
+            add_workbook_roof_crown(
+                &mut cells,
+                crown_anchor,
+                IVec2::new(14, 10),
+                8,
+                palette,
+            );
+            add_workbook_sensor_mast(
+                &mut cells,
+                crown_anchor + IVec3::Y * 17,
+                11,
+                7,
+                palette,
+            );
+        },
+        WorkbookHullStyle::SensorStation => {
+            let crown_anchor =
+                workbook_roof_anchor(design, decoded, IVec2::new(12, 12));
+            add_workbook_roof_crown(
+                &mut cells,
+                crown_anchor,
+                IVec2::new(12, 12),
+                7,
+                palette,
+            );
+            add_workbook_sensor_mast(
+                &mut cells,
+                crown_anchor + IVec3::Y * 16,
+                18,
+                11,
+                palette,
+            );
+        },
+        WorkbookHullStyle::CannonStation => {
+            let crown_anchor =
+                workbook_roof_anchor(design, decoded, IVec2::new(14, 9));
+            add_workbook_roof_crown(
+                &mut cells,
+                crown_anchor,
+                IVec2::new(14, 9),
+                7,
+                palette,
+            );
+            add_workbook_cannon_hull(
+                &mut cells,
+                design,
+                crown_anchor,
+                palette,
+            );
+        },
+        WorkbookHullStyle::CombatCruiser => {
+            let crown_anchor =
+                workbook_roof_anchor(design, decoded, IVec2::new(20, 5));
+            add_workbook_roof_crown(
+                &mut cells,
+                crown_anchor,
+                IVec2::new(20, 5),
+                5,
+                palette,
+            );
+            add_workbook_cruiser_hull(
+                &mut cells,
+                design,
+                decoded,
+                palette,
+            );
+        },
+        WorkbookHullStyle::AbandonedStation => {
+            add_workbook_abandoned_hull(&mut cells, palette);
+        },
+    }
+
+    let mut cells = cells.into_iter().collect::<Vec<_>>();
+    cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
+    cells
+}
+
+fn workbook_roof_anchor(
+    design: WorkbookMapDesign,
+    decoded: &DecodedWorkbookMap,
+    half_size: IVec2,
+) -> IVec3 {
+    let stride = design.width + 1;
+    let mut prefix = vec![0_usize; stride * (design.height + 1)];
+    for z in 0..design.height {
+        let mut row_sum = 0;
+        for x in 0..design.width {
+            let index = z * design.width + x;
+            row_sum += usize::from(
+                decoded.enclosed[index]
+                    || matches!(decoded.styles[index], 11 | 15),
+            );
+            prefix[(z + 1) * stride + x + 1] =
+                prefix[z * stride + x + 1] + row_sum;
+        }
+    }
+
+    let half_width = half_size.x as usize;
+    let half_depth = half_size.y as usize;
+    let center_x = (design.width - 1) / 2;
+    let center_z = (design.height - 1) / 2;
+    let mut best = (0_usize, usize::MAX, center_x, center_z);
+    for z in half_depth..design.height.saturating_sub(half_depth) {
+        for x in half_width..design.width.saturating_sub(half_width) {
+            let min_x = x - half_width;
+            let max_x = x + half_width + 1;
+            let min_z = z - half_depth;
+            let max_z = z + half_depth + 1;
+            let supported = prefix[max_z * stride + max_x]
+                + prefix[min_z * stride + min_x]
+                - prefix[min_z * stride + max_x]
+                - prefix[max_z * stride + min_x];
+            let center_distance =
+                x.abs_diff(center_x).pow(2) + z.abs_diff(center_z).pow(2);
+            if supported > best.0
+                || (supported == best.0 && center_distance < best.1)
+            {
+                best = (supported, center_distance, x, z);
+            }
+        }
+    }
+    let index = best.3 * design.width + best.2;
+    let [x, z] = design.centered_offset(index);
+    IVec3::new(x, 0, z)
+}
+
+fn add_workbook_roof_crown(
+    cells: &mut HashMap<IVec3, u8>,
+    center: IVec3,
+    half_size: IVec2,
+    height: i32,
+    palette: WorkbookHullPalette,
+) {
+    let base_y = WORKBOOK_ROOM_HEIGHT + 1;
+    let top_y = base_y + height;
+    for x in -half_size.x..=half_size.x {
+        for z in -half_size.y..=half_size.y {
+            for y in base_y..=top_y {
+                let side = x.abs() == half_size.x || z.abs() == half_size.y;
+                if y != base_y && y != top_y && !side {
+                    continue;
+                }
+                let corner = x.abs() == half_size.x && z.abs() == half_size.y;
+                let material = if side
+                    && !corner
+                    && (base_y + 3..=base_y + 5).contains(&y)
+                    && (x + z).rem_euclid(5) != 0
+                {
+                    palette.window
+                } else if y == base_y || y == top_y || corner {
+                    palette.trim
+                } else {
+                    palette.hull
+                };
+                cells.insert(center + IVec3::new(x, y, z), material);
+            }
+        }
+    }
+}
+
+fn add_workbook_sensor_mast(
+    cells: &mut HashMap<IVec3, u8>,
+    base: IVec3,
+    height: i32,
+    arm_length: i32,
+    palette: WorkbookHullPalette,
+) {
+    for y in 0..=height {
+        cells.insert(base + IVec3::Y * y, palette.trim);
+        if y > 0 && y % 5 == 0 {
+            for offset in -arm_length..=arm_length {
+                cells.insert(
+                    base + IVec3::new(offset, y, 0),
+                    if offset.abs() == arm_length {
+                        palette.window
+                    } else {
+                        palette.armor
+                    },
+                );
+                cells.insert(
+                    base + IVec3::new(0, y, offset),
+                    if offset.abs() == arm_length {
+                        palette.window
+                    } else {
+                        palette.armor
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn add_workbook_cannon_hull(
+    cells: &mut HashMap<IVec3, u8>,
+    design: WorkbookMapDesign,
+    crown_anchor: IVec3,
+    palette: WorkbookHullPalette,
+) {
+    let sheet_min_z = -((design.height as i32 - 1) / 2);
+    let muzzle_z = sheet_min_z - 58;
+    let axis_y = WORKBOOK_ROOM_HEIGHT + 7;
+    for z in muzzle_z..=crown_anchor.z {
+        let radius: i32 = if z < sheet_min_z - 34 { 4 } else { 5 };
+        for x in -radius..=radius {
+            for y in -radius..=radius {
+                let edge = x.abs().max(y.abs()) == radius;
+                let brace = (z - muzzle_z).rem_euclid(9) == 0
+                    && x.abs().max(y.abs()) >= radius - 1;
+                let energy_rail =
+                    (x == 0 && y.abs() == radius) || (y == 0 && x.abs() == radius);
+                if edge || brace || energy_rail {
+                    cells.insert(
+                        IVec3::new(
+                            crown_anchor.x + x,
+                            axis_y + y,
+                            z,
+                        ),
+                        if energy_rail {
+                            palette.window
+                        } else if brace {
+                            palette.armor
+                        } else {
+                            palette.hull
+                        },
+                    );
+                }
+            }
+        }
+    }
+    for z in muzzle_z - 3..=muzzle_z + 3 {
+        for x in -8_i32..=8 {
+            for y in -8_i32..=8 {
+                if x.abs().max(y.abs()) >= 6 {
+                    cells.insert(
+                        IVec3::new(
+                            crown_anchor.x + x,
+                            axis_y + y,
+                            z,
+                        ),
+                        if z == muzzle_z {
+                            palette.armor
+                        } else {
+                            palette.trim
+                        },
+                    );
+                }
+            }
+        }
+        cells.insert(
+            IVec3::new(crown_anchor.x, axis_y, z),
+            palette.window,
+        );
+    }
+}
+
+fn add_workbook_cruiser_hull(
+    cells: &mut HashMap<IVec3, u8>,
+    design: WorkbookMapDesign,
+    decoded: &DecodedWorkbookMap,
+    palette: WorkbookHullPalette,
+) {
+    // Frame the exhaust cells authored in the workbook instead of inventing
+    // disconnected engines. This keeps every drive exactly on the Excel hull.
+    for (index, style) in decoded.styles.iter().copied().enumerate() {
+        if style != 38 || !decoded.exterior[index] {
+            continue;
+        }
+        let sheet_x = index % design.width;
+        let sheet_z = index / design.width;
+        let [x, z] = design.centered_offset(index);
+        let exhaust = IVec3::new(x, 0, z);
+        cells.insert(exhaust + IVec3::Y * 4, palette.window);
+        for (direction, dx, dz) in [
+            (IVec3::NEG_X, -1, 0),
+            (IVec3::X, 1, 0),
+            (IVec3::NEG_Z, 0, -1),
+            (IVec3::Z, 0, 1),
+        ] {
+            let neighbor_x = sheet_x as i32 + dx;
+            let neighbor_z = sheet_z as i32 + dz;
+            let exterior = if neighbor_x < 0
+                || neighbor_z < 0
+                || neighbor_x >= design.width as i32
+                || neighbor_z >= design.height as i32
+            {
+                true
+            } else {
+                let neighbor =
+                    neighbor_z as usize * design.width + neighbor_x as usize;
+                decoded.exterior[neighbor] && decoded.styles[neighbor] != 38
+            };
+            if exterior {
+                for y in 0..=4 {
+                    cells.insert(
+                        exhaust + direction + IVec3::Y * y,
+                        if y == 2 {
+                            palette.armor
+                        } else {
+                            palette.trim
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    // Broad dorsal armor fields echo the previous corvette without covering
+    // or narrowing any workbook room below the roof.
+    for (start_x, end_x) in [(-76, -48), (-28, 2), (30, 62)] {
+        for x in start_x..=end_x {
+            for z in -13_i32..=13 {
+                if matches!(z.abs(), 12 | 13)
+                    || x == start_x
+                    || x == end_x
+                {
+                    cells.insert(
+                        IVec3::new(x, WORKBOOK_ROOM_HEIGHT + 1, z),
+                        palette.armor,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn add_workbook_abandoned_hull(
+    cells: &mut HashMap<IVec3, u8>,
+    palette: WorkbookHullPalette,
+) {
+    let roof_y = WORKBOOK_ROOM_HEIGHT + 1;
+    for x in -18_i32..=18 {
+        if x.rem_euclid(4) != 1 {
+            cells.insert(
+                IVec3::new(x, roof_y, -9),
+                if x.rem_euclid(9) == 0 {
+                    palette.armor
+                } else {
+                    palette.trim
+                },
+            );
+        }
+    }
+    for z in -9_i32..=11 {
+        if z.rem_euclid(5) != 2 {
+            cells.insert(
+                IVec3::new(-18, roof_y + 2, z),
+                palette.hull,
+            );
+        }
+    }
+    for y in 0..=13 {
+        let drift = y / 4;
+        cells.insert(
+            IVec3::new(4 + drift, roof_y + y, 3),
+            if y % 4 == 0 {
+                palette.armor
+            } else {
+                palette.trim
+            },
+        );
     }
 }
 
@@ -10176,6 +10708,145 @@ mod tests {
             .iter()
             .copied()
             .any(|style| workbook_fixture(style).is_some()));
+    }
+
+    #[test]
+    fn workbook_hulls_leave_authored_interiors_untouched() {
+        for design in [NIFFY, ARBITRATOR, KYO, ARROGANCE, ABANDONED] {
+            let decoded = design.decode();
+            let hull = workbook_hull_cells(design, &decoded);
+            assert!(
+                hull.len() > 500,
+                "{} should receive a detailed exterior hull",
+                design.name
+            );
+            let sheet_origin_x = (design.width as i32 - 1) / 2;
+            let sheet_origin_z = (design.height as i32 - 1) / 2;
+            for (cell, material) in hull {
+                assert!(
+                    matches!(material, 2 | 6 | 7 | 8 | 9 | 10),
+                    "{} hull used noncanonical material {material}",
+                    design.name
+                );
+                if cell.y > WORKBOOK_ROOM_HEIGHT {
+                    continue;
+                }
+                let sheet_x = cell.x + sheet_origin_x;
+                let sheet_z = cell.z + sheet_origin_z;
+                if sheet_x < 0
+                    || sheet_z < 0
+                    || sheet_x >= design.width as i32
+                    || sheet_z >= design.height as i32
+                {
+                    continue;
+                }
+                let index = sheet_z as usize * design.width + sheet_x as usize;
+                assert!(
+                    decoded.exterior[index],
+                    "{} hull decoration entered an authored room at {cell:?}",
+                    design.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workbook_hulls_restore_each_previous_exterior_motif() {
+        let hull_map = |design: WorkbookMapDesign| {
+            workbook_hull_cells(design, &design.decode())
+                .into_iter()
+                .collect::<HashMap<_, _>>()
+        };
+
+        let niffy = hull_map(NIFFY);
+        let niffy_anchor =
+            workbook_roof_anchor(NIFFY, &NIFFY.decode(), IVec2::new(14, 10));
+        assert_eq!(
+            niffy.get(&(niffy_anchor + IVec3::new(14, 11, 0))),
+            Some(&8)
+        );
+        assert!(niffy.contains_key(&(niffy_anchor + IVec3::Y * 28)));
+
+        let arbitrator = hull_map(ARBITRATOR);
+        let arbitrator_anchor = workbook_roof_anchor(
+            ARBITRATOR,
+            &ARBITRATOR.decode(),
+            IVec2::new(12, 12),
+        );
+        assert!(arbitrator.contains_key(
+            &(arbitrator_anchor + IVec3::new(11, 31, 0))
+        ));
+
+        let kyo = hull_map(KYO);
+        let kyo_anchor =
+            workbook_roof_anchor(KYO, &KYO.decode(), IVec2::new(14, 9));
+        let kyo_muzzle_z = -((KYO.height as i32 - 1) / 2) - 58;
+        assert_eq!(
+            kyo.get(&IVec3::new(
+                kyo_anchor.x,
+                WORKBOOK_ROOM_HEIGHT + 7,
+                kyo_muzzle_z
+            )),
+            Some(&8)
+        );
+
+        let arrogance = hull_map(ARROGANCE);
+        let arrogance_decoded = ARROGANCE.decode();
+        let exhaust_index = arrogance_decoded
+            .styles
+            .iter()
+            .enumerate()
+            .position(|(index, style)| {
+                *style == 38 && arrogance_decoded.exterior[index]
+            })
+            .unwrap();
+        let [exhaust_x, exhaust_z] = ARROGANCE.centered_offset(exhaust_index);
+        assert_eq!(
+            arrogance.get(&IVec3::new(exhaust_x, 4, exhaust_z)),
+            Some(&8)
+        );
+
+        let abandoned = hull_map(ABANDONED);
+        assert!(abandoned.contains_key(&IVec3::new(
+            7,
+            WORKBOOK_ROOM_HEIGHT + 14,
+            3
+        )));
+    }
+
+    #[test]
+    fn workbook_roof_crowns_choose_supported_authored_roofs() {
+        for (design, half_size) in [
+            (NIFFY, IVec2::new(14, 10)),
+            (ARBITRATOR, IVec2::new(12, 12)),
+            (KYO, IVec2::new(14, 9)),
+            (ARROGANCE, IVec2::new(20, 5)),
+        ] {
+            let decoded = design.decode();
+            let anchor = workbook_roof_anchor(design, &decoded, half_size);
+            let origin_x = (design.width as i32 - 1) / 2;
+            let origin_z = (design.height as i32 - 1) / 2;
+            let mut supported = 0;
+            let mut total = 0;
+            for x in -half_size.x..=half_size.x {
+                for z in -half_size.y..=half_size.y {
+                    total += 1;
+                    let sheet_x = anchor.x + x + origin_x;
+                    let sheet_z = anchor.z + z + origin_z;
+                    let index =
+                        sheet_z as usize * design.width + sheet_x as usize;
+                    supported += usize::from(
+                        decoded.enclosed[index]
+                            || matches!(decoded.styles[index], 11 | 15),
+                    );
+                }
+            }
+            assert!(
+                supported * 10 >= total * 7,
+                "{} crown support was only {supported}/{total}",
+                design.name
+            );
+        }
     }
 
     #[test]
