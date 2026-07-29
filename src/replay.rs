@@ -487,6 +487,15 @@ pub(crate) fn clear_campaign_replay_movement_history(
     previous_len - history.sessions.len()
 }
 
+pub(crate) fn clear_player_replay_movement_history(
+    history: &mut ReplayPlayerMovementHistory,
+    user_id: u64,
+) -> usize {
+    let previous_len = history.sessions.len();
+    history.sessions.retain(|session| session.user_id != user_id);
+    previous_len - history.sessions.len()
+}
+
 #[derive(Resource, Default)]
 struct ReplayMovementHistoryRecorder {
     active_session: Option<(String, u64)>,

@@ -519,6 +519,14 @@ pub struct ScenePlayerViewRequest {
 }
 
 impl ScenePlayerViewRequest {
+    pub fn clear_player(&mut self, user_id: u64) {
+        if self.user_id == Some(user_id) {
+            self.user_id = None;
+            self.use_capture_camera = false;
+            self.restore_gm_view = true;
+        }
+    }
+
     pub fn view_with_capture_camera(&mut self, user_id: u64) {
         self.user_id = Some(user_id);
         self.use_capture_camera = true;
@@ -679,6 +687,13 @@ struct VoxelSceneStoreExportOwned {
 }
 
 impl VoxelSceneStore {
+    pub fn remove_player_data(&mut self, target_id: &str) -> bool {
+        let previous_len = self.character_standees.len();
+        self.character_standees
+            .retain(|standee| standee.target_id != target_id);
+        previous_len != self.character_standees.len()
+    }
+
     pub fn to_export_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(&VoxelSceneStoreExportRef {
             version: VOXEL_SCENE_EXPORT_VERSION,

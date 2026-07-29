@@ -1996,6 +1996,43 @@ impl TrpgLegacyNegativeTimer {
 }
 
 impl TrpgGroup {
+    fn remove_player_references(&mut self, target_id: &str, player_id: Option<u64>) {
+        self.players.retain(|player| player != target_id);
+        self.group_chats.retain(|target| target != target_id);
+        if let Some(player_id) = player_id {
+            self.gm_users.remove(&player_id);
+        }
+        self.player_parties.remove(target_id);
+        for party in self.parties.values_mut() {
+            party.players.retain(|player| player != target_id);
+        }
+        for team in &mut self.legacy_teams {
+            team.players.retain(|player| player != target_id);
+            let previous_len = team.chat_messages.len();
+            team.chat_messages
+                .retain(|message| message.sender_id != target_id);
+            team.chat_message_count = team
+                .chat_message_count
+                .saturating_sub(previous_len - team.chat_messages.len());
+        }
+        for world in &mut self.legacy_worlds {
+            world.players.retain(|player| player != target_id);
+            for area in world.chat_areas.iter_mut().chain(world.areas.iter_mut()) {
+                area.members.retain(|member| member != target_id);
+            }
+        }
+        for pane in &mut self.legacy_send_panes {
+            pane.targets.retain(|target| target != target_id);
+        }
+        self.legacy_negative_timers
+            .retain(|timer| timer.target_id != target_id);
+        self.player_turns.remove(target_id);
+        self.initial_player_states.remove(target_id);
+        self.sync_parties();
+        self.sync_turn_players();
+        self.sync_legacy_negative_timers();
+    }
+
     pub fn sync_turn_players(&mut self) -> bool {
         let player_len = self.players.len();
         let mut seen = HashSet::new();
@@ -3065,6 +3102,12 @@ pub struct NapcatMessageManager {
     pub unit_pool: HashMap<String, UnitPoolEntry>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlayerDeletionSummary {
+    pub removed_messages: usize,
+    pub affected_chat_targets: Vec<String>,
+}
+
 pub const NAPCAT_MANAGER_EXPORT_VERSION: u32 = 1;
 
 #[derive(Serialize)]
@@ -3306,6 +3349,99 @@ fn merge_max_usize(map: &mut HashMap<String, usize>, key: String, value: usize) 
 }
 
 impl NapcatMessageManager {
+    pub fn delete_player(&mut self, target_id: &str) -> Option<PlayerDeletionSummary> {
+        let target_id = target_id.trim();
+        if target_id.is_empty() {
+            return None;
+        }
+        let is_known_player = self.player_characters.contains_key(target_id)
+            || self.is_private_chat_target(target_id)
+            || self
+                .trpg_groups
+                .values()
+                .any(|group| group.players.iter().any(|player_id| player_id == target_id));
+        if !is_known_player {
+            return None;
+        }
+
+        let player_id = target_id.parse::<u64>().ok();
+        let mut summary = PlayerDeletionSummary {
+            affected_chat_targets: vec![target_id.to_owned()],
+            ..Default::default()
+        };
+        let message_target_ids = self.messages.keys().cloned().collect::<Vec<_>>();
+        for message_target_id in message_target_ids {
+            if message_target_id == target_id {
+                let removed = self
+                    .messages
+                    .remove(&message_target_id)
+                    .map(|messages| messages.len())
+                    .unwrap_or_default();
+                self.replay_snapshots.remove(&message_target_id);
+                if removed > 0 {
+                    summary.removed_messages += removed;
+                    summary.affected_chat_targets.push(message_target_id);
+                }
+                continue;
+            }
+
+            let Some(messages) = self.messages.get_mut(&message_target_id) else {
+                continue;
+            };
+            let removed_indexes = messages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, message)| {
+                    message_belongs_to_player(message, player_id).then_some(index)
+                })
+                .collect::<HashSet<_>>();
+            if removed_indexes.is_empty() {
+                continue;
+            }
+
+            let mut index = 0;
+            messages.retain(|_| {
+                let keep = !removed_indexes.contains(&index);
+                index += 1;
+                keep
+            });
+            if let Some(snapshots) = self.replay_snapshots.get_mut(&message_target_id) {
+                let mut snapshot_index = 0;
+                snapshots.retain(|_| {
+                    let keep = !removed_indexes.contains(&snapshot_index);
+                    snapshot_index += 1;
+                    keep
+                });
+            }
+            summary.removed_messages += removed_indexes.len();
+            summary
+                .affected_chat_targets
+                .push(message_target_id.clone());
+            self.read_message_counts
+                .insert(message_target_id.clone(), messages.len());
+            self.summarized_message_counts.remove(&message_target_id);
+        }
+
+        self.chat_targets.remove(target_id);
+        self.chat_target_kinds.remove(target_id);
+        self.player_characters.remove(target_id);
+        self.read_message_counts.remove(target_id);
+        self.summarized_message_counts.remove(target_id);
+        self.open_chat_targets.remove(target_id);
+        self.pending_chat_targets.remove(target_id);
+        self.rejected_chat_targets.remove(target_id);
+        for group in self.groups.values_mut() {
+            group.members.retain(|member_id| member_id != target_id);
+        }
+        for group in self.trpg_groups.values_mut() {
+            group.remove_player_references(target_id, player_id);
+        }
+
+        summary.affected_chat_targets.sort();
+        summary.affected_chat_targets.dedup();
+        Some(summary)
+    }
+
     pub fn to_export_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(&NapcatMessageManagerExportRef {
             version: NAPCAT_MANAGER_EXPORT_VERSION,
@@ -4962,6 +5098,21 @@ fn is_internal_chat_storage_key(target_id: &str) -> bool {
     ["campaign:", "group:", "replay:", "replay-director:"]
         .iter()
         .any(|prefix| target_id.starts_with(prefix))
+}
+
+fn message_belongs_to_player(message: &NapcatMessage, player_id: Option<u64>) -> bool {
+    let Some(player_id) = player_id else {
+        return false;
+    };
+    message.data.sender.user_id == player_id
+        || message.data.visibility == Visibility::Player(player_id)
+        || message.data.message.iter().any(|segment| {
+            matches!(
+                &segment.variant,
+                NapcatMessageChainType::ForwardedReplay { data }
+                    if data.sender_id == player_id
+            )
+        })
 }
 
 fn moonberry_group_name(group: &Value, index: usize) -> String {
@@ -9535,6 +9686,123 @@ position_cells = [4, 5, 6]
                 access_scope_resolved: false,
             },
         }
+    }
+
+    #[test]
+    fn deleting_player_removes_chat_character_and_group_references() {
+        let mut manager = empty_manager();
+        manager.chat_targets.insert("2".to_owned(), Default::default());
+        manager
+            .chat_target_kinds
+            .insert("2".to_owned(), ChatTargetExportKind::Private);
+        manager
+            .player_characters
+            .insert("2".to_owned(), PlayerCharacter::default());
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message_from(2, "private"),
+        ]);
+        manager.replay_snapshots.insert("2".to_owned(), vec![None]);
+        manager.messages.insert("99".to_owned(), vec![
+            test_private_message_from(2, "group contribution"),
+            test_private_message_from(3, "keep"),
+        ]);
+        manager.replay_snapshots.insert("99".to_owned(), vec![
+            Some(ReplayMessageSnapshot {
+                turn_index: 1,
+                position_cells: [1, 2, 3],
+            }),
+            Some(ReplayMessageSnapshot {
+                turn_index: 2,
+                position_cells: [4, 5, 6],
+            }),
+        ]);
+        manager.groups.insert("table".to_owned(), ChatGroup {
+            members: vec!["2".to_owned(), "3".to_owned()],
+        });
+        manager.open_chat_targets.insert("2".to_owned());
+        manager.read_message_counts.insert("2".to_owned(), 1);
+        manager.summarized_message_counts.insert("2".to_owned(), 1);
+        manager.trpg_groups.insert("campaign".to_owned(), TrpgGroup {
+            gm_users: HashSet::from([2]),
+            players: vec!["2".to_owned(), "3".to_owned()],
+            parties: HashMap::from([("red".to_owned(), TrpgParty {
+                players: vec!["2".to_owned(), "3".to_owned()],
+                ..Default::default()
+            })]),
+            player_parties: HashMap::from([("2".to_owned(), "red".to_owned())]),
+            legacy_teams: vec![TrpgLegacyTeam {
+                players: vec!["2".to_owned(), "3".to_owned()],
+                chat_message_count: 2,
+                chat_messages: vec![
+                    TrpgLegacyTeamChatMessage {
+                        sender_id: "2".to_owned(),
+                        ..Default::default()
+                    },
+                    TrpgLegacyTeamChatMessage {
+                        sender_id: "3".to_owned(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            legacy_worlds: vec![TrpgLegacyWorld {
+                players: vec!["2".to_owned(), "3".to_owned()],
+                chat_areas: vec![TrpgLegacyArea {
+                    members: vec!["2".to_owned(), "3".to_owned()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            legacy_send_panes: vec![TrpgLegacySendPane {
+                targets: vec!["2".to_owned(), "3".to_owned()],
+                ..Default::default()
+            }],
+            legacy_negative_timers: vec![TrpgLegacyNegativeTimer::for_target("2")],
+            player_turns: HashMap::from([("2".to_owned(), Default::default())]),
+            initial_player_states: HashMap::from([(
+                "2".to_owned(),
+                PlayerCharacter::default(),
+            )]),
+            ..Default::default()
+        });
+
+        let summary = manager.delete_player("2").unwrap();
+
+        assert_eq!(summary.removed_messages, 2);
+        assert_eq!(summary.affected_chat_targets, vec![
+            "2".to_owned(),
+            "99".to_owned()
+        ]);
+        assert_eq!(manager.messages["99"].len(), 1);
+        assert_eq!(
+            manager.replay_snapshots["99"][0]
+                .unwrap()
+                .turn_index,
+            2
+        );
+        assert!(!manager.chat_targets.contains_key("2"));
+        assert!(!manager.player_characters.contains_key("2"));
+        assert!(!manager.groups["table"].members.contains(&"2".to_owned()));
+        let group = &manager.trpg_groups["campaign"];
+        assert_eq!(group.players, vec!["3".to_owned()]);
+        assert!(!group.gm_users.contains(&2));
+        assert_eq!(group.parties["red"].players, vec!["3".to_owned()]);
+        assert!(!group.player_parties.contains_key("2"));
+        assert_eq!(group.legacy_teams[0].players, vec!["3".to_owned()]);
+        assert_eq!(group.legacy_teams[0].chat_message_count, 1);
+        assert_eq!(group.legacy_teams[0].chat_messages.len(), 1);
+        assert_eq!(group.legacy_worlds[0].players, vec!["3".to_owned()]);
+        assert_eq!(
+            group.legacy_worlds[0].chat_areas[0].members,
+            vec!["3".to_owned()]
+        );
+        assert_eq!(
+            group.legacy_send_panes[0].targets,
+            vec!["3".to_owned()]
+        );
+        assert!(group.legacy_negative_timers.is_empty());
+        assert!(!group.player_turns.contains_key("2"));
+        assert!(!group.initial_player_states.contains_key("2"));
     }
 
     #[test]

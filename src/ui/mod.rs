@@ -61,12 +61,15 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::voxel::{
     clear_campaign_possession_movement,
+    clear_player_camera,
+    clear_player_possession_movement,
     VoxelCreativeItem,
     VoxelEditMode,
     VoxelEditorState,
     VoxelLightTool,
     VoxelMinimapSnapshot,
     VoxelPlayerStandee,
+    VoxelPlayerCameraStore,
     VoxelPossessionMovementStore,
     VoxelPossessionState,
     VoxelTargetingPreview,
@@ -747,6 +750,7 @@ use crate::{
     },
     replay::{
         clear_campaign_replay_movement_history,
+        clear_player_replay_movement_history,
         ReplayPlayerMovementHistory,
     },
     rule_engine::{
@@ -833,7 +837,7 @@ pub(crate) struct TrpgGroupSettingsState {
     item_pool_category_filter: String,
     unit_pool_source_target: String,
     focused_group_name: Option<String>,
-    pending_character_delete: Option<String>,
+    pending_player_delete: Option<String>,
     pending_party_delete: Option<(String, String)>,
     pending_turn_zero_reset: Option<String>,
     pending_initial_stats_restore: Option<String>,
@@ -893,6 +897,25 @@ pub(crate) struct CharacterEditState {
     exp_award_drafts: HashMap<String, i32>,
 }
 
+impl CharacterEditState {
+    fn remove_target(&mut self, target_id: &str) {
+        self.unlocked_status_targets.remove(target_id);
+        self.gm_status_drafts.remove(target_id);
+        self.buff_drafts.remove(target_id);
+        if self.pending_character_reset.as_deref() == Some(target_id) {
+            self.pending_character_reset = None;
+        }
+        self.pending_skill_delete
+            .take_if(|(pending_target, _)| pending_target == target_id);
+        self.quick_cast_skill_index.remove(target_id);
+        self.pending_force_cast
+            .take_if(|(pending_target, _)| pending_target == target_id);
+        self.skill_pool_selected_index.remove(target_id);
+        self.item_pool_selected_index.remove(target_id);
+        self.exp_award_drafts.remove(target_id);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct BuffDraft {
     name: String,
@@ -944,6 +967,7 @@ pub struct UiSystemLocals<'w, 's> {
     battle_store: Option<ResMut<'w, Persistent<BattleRoundStore>>>,
     possession_movement_store: ResMut<'w, Persistent<VoxelPossessionMovementStore>>,
     replay_movement_history: ResMut<'w, Persistent<ReplayPlayerMovementHistory>>,
+    player_camera_store: ResMut<'w, Persistent<VoxelPlayerCameraStore>>,
     player_standees: Query<
         'w,
         's,
@@ -4164,6 +4188,48 @@ fn parse_group_summary_key(summary_key: &str) -> Option<(&str, SummaryScope)> {
         )),
         _ => None,
     }
+}
+
+fn summary_key_targets_any(summary_key: &str, target_ids: &HashSet<&str>) -> bool {
+    let scope_key = parse_campaign_summary_key(summary_key)
+        .map(|(_, scope_key)| scope_key)
+        .unwrap_or(summary_key);
+    let target_id = parse_group_summary_key(scope_key)
+        .map(|(target_id, _)| target_id)
+        .unwrap_or(scope_key);
+    target_ids.contains(target_id)
+}
+
+fn clear_player_related_summaries(
+    manager: &mut NapcatMessageManager,
+    deepseek_manager: &mut DeepseekManager,
+    affected_chat_targets: &[String],
+) {
+    let target_ids = affected_chat_targets
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    manager
+        .summarized_message_counts
+        .retain(|summary_key, _| !summary_key_targets_any(summary_key, &target_ids));
+    let removed_summary_keys = deepseek_manager
+        .summaries
+        .keys()
+        .filter(|summary_key| summary_key_targets_any(summary_key, &target_ids))
+        .cloned()
+        .collect::<Vec<_>>();
+    deepseek_manager
+        .summaries
+        .retain(|summary_key, _| !summary_key_targets_any(summary_key, &target_ids));
+    deepseek_manager
+        .director_request_fingerprints
+        .retain(|fingerprint_key, _| {
+            !removed_summary_keys.iter().any(|summary_key| {
+                fingerprint_key == summary_key
+                    || fingerprint_key.starts_with(&format!("{summary_key}:"))
+            })
+        });
+    deepseek_manager.last_post_text.clear();
 }
 
 fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: &DeepseekManager) {
@@ -12905,6 +12971,8 @@ fn trpg_group_settings_window(
     mut battle_store: Option<&mut Persistent<BattleRoundStore>>,
     possession_movement_store: &mut Persistent<VoxelPossessionMovementStore>,
     replay_movement_history: &mut Persistent<ReplayPlayerMovementHistory>,
+    player_camera_store: &mut Persistent<VoxelPlayerCameraStore>,
+    player_view_request: Option<&mut ScenePlayerViewRequest>,
     napcat_sender: Option<&NapcatIOSender>,
     ime: &mut ImeManager,
     chat_input_msgs: &mut Local<HashMap<String, String>>,
@@ -12920,7 +12988,7 @@ fn trpg_group_settings_window(
     let group_chat_targets = sorted_pool_targets(manager, true);
     let mut changed = false;
     let mut group_to_delete = None;
-    let mut character_to_delete = None;
+    let mut player_to_delete = None;
     let mut turn_action: Option<(String, String, bool)> = None;
     let mut turn_reset: Option<String> = None;
     let mut turn_advance: Option<String> = None;
@@ -12992,18 +13060,21 @@ fn trpg_group_settings_window(
                                     character_status_summary_ui(ui, character);
                                     ui.horizontal(|ui| {
                                         let pending_delete =
-                                            state.pending_character_delete.as_deref()
+                                            state.pending_player_delete.as_deref()
                                                 == Some(target_id.as_str());
                                         if pending_delete {
-                                            ui.label("确认删除？");
-                                            if ui.button("删除角色").clicked() {
-                                                character_to_delete = Some(target_id.clone());
+                                            ui.colored_label(
+                                                egui::Color32::LIGHT_RED,
+                                                "将删除该玩家、角色、聊天记录及全部关联数据。",
+                                            );
+                                            if ui.button("确认彻底删除玩家").clicked() {
+                                                player_to_delete = Some(target_id.clone());
                                             }
                                             if ui.button("取消").clicked() {
-                                                state.pending_character_delete = None;
+                                                state.pending_player_delete = None;
                                             }
-                                        } else if ui.button("删除角色").clicked() {
-                                            state.pending_character_delete =
+                                        } else if ui.button("删除玩家").clicked() {
+                                            state.pending_player_delete =
                                                 Some(target_id.clone());
                                         }
                                     });
@@ -13881,12 +13952,43 @@ fn trpg_group_settings_window(
         }
         changed = true;
     }
-    if let Some(target_id) = character_to_delete {
-        manager
-            .player_characters
-            .insert(target_id, PlayerCharacter::default());
-        state.pending_character_delete = None;
-        changed = true;
+    if let Some(target_id) = player_to_delete {
+        if let Some(deletion) = manager.delete_player(&target_id) {
+            clear_player_related_summaries(
+                manager.as_mut(),
+                deepseek_manager.as_mut(),
+                &deletion.affected_chat_targets,
+            );
+            if let Some(scene_store) = scene_store.as_deref_mut() {
+                if scene_store.remove_player_data(&target_id) {
+                    scene_store.persist().ok();
+                }
+            }
+            if let Some(battle_store) = battle_store.as_deref_mut() {
+                if battle_store.remove_player_data(&target_id) > 0 {
+                    battle_store.persist().ok();
+                }
+            }
+            if let Ok(user_id) = target_id.parse::<u64>() {
+                if clear_player_camera(player_camera_store, user_id) {
+                    player_camera_store.persist().ok();
+                }
+                if clear_player_possession_movement(possession_movement_store, user_id) > 0 {
+                    possession_movement_store.persist().ok();
+                }
+                if clear_player_replay_movement_history(replay_movement_history, user_id) > 0 {
+                    replay_movement_history.persist().ok();
+                }
+                if let Some(player_view_request) = player_view_request {
+                    player_view_request.clear_player(user_id);
+                }
+            }
+            chat_input_msgs.remove(&target_id);
+            character_edit_state.remove_target(&target_id);
+            deepseek_manager.persist().ok();
+            changed = true;
+        }
+        state.pending_player_delete = None;
     }
 
     if changed {
@@ -13944,6 +14046,7 @@ pub fn ui_system(
     let battle_store = &mut locals.battle_store;
     let possession_movement_store = &mut locals.possession_movement_store;
     let replay_movement_history = &mut locals.replay_movement_history;
+    let player_camera_store = &mut locals.player_camera_store;
     let player_standees = &locals.player_standees;
 
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -14028,6 +14131,8 @@ pub fn ui_system(
         battle_store.as_deref_mut(),
         possession_movement_store,
         replay_movement_history,
+        player_camera_store,
+        player_view_request.as_deref_mut(),
         napcat_sender,
         &mut *ime,
         chat_input_msgs,
@@ -15790,6 +15895,40 @@ mod tests {
             item_pool: Vec::new(),
             unit_pool: HashMap::default(),
         }
+    }
+
+    #[test]
+    fn deleting_player_related_summaries_clears_private_and_affected_group_scopes() {
+        let mut manager = empty_manager();
+        let private_key = SummaryScope::Private.summary_key("campaign", "2");
+        let group_key = SummaryScope::GroupParty("red".to_owned())
+            .summary_key("campaign", "99");
+        let retained_key = SummaryScope::Private.summary_key("campaign", "3");
+        for key in [&private_key, &group_key, &retained_key] {
+            manager.summarized_message_counts.insert(key.clone(), 1);
+        }
+        let mut deepseek = DeepseekManager::default();
+        for key in [&private_key, &group_key, &retained_key] {
+            deepseek.summaries.insert(key.clone(), Default::default());
+        }
+        deepseek.director_request_fingerprints.insert(
+            format!("{group_key}:dialogue-count:1"),
+            "stale".to_owned(),
+        );
+
+        clear_player_related_summaries(
+            &mut manager,
+            &mut deepseek,
+            &["2".to_owned(), "99".to_owned()],
+        );
+
+        assert!(!manager.summarized_message_counts.contains_key(&private_key));
+        assert!(!manager.summarized_message_counts.contains_key(&group_key));
+        assert!(manager.summarized_message_counts.contains_key(&retained_key));
+        assert!(!deepseek.summaries.contains_key(&private_key));
+        assert!(!deepseek.summaries.contains_key(&group_key));
+        assert!(deepseek.summaries.contains_key(&retained_key));
+        assert!(deepseek.director_request_fingerprints.is_empty());
     }
 
     fn test_private_message(user_id: u64) -> NapcatMessage {

@@ -367,7 +367,7 @@ struct PersistedVoxelPlayerCamera {
 }
 
 #[derive(Resource, Default, Serialize, Deserialize)]
-struct VoxelPlayerCameraStore {
+pub(crate) struct VoxelPlayerCameraStore {
     cameras: Vec<PersistedVoxelPlayerCamera>,
 }
 
@@ -8510,6 +8510,24 @@ pub(crate) fn clear_campaign_possession_movement(
         .records
         .retain(|record| record.campaign_id != campaign_id);
     previous_len - store.records.len()
+}
+
+pub(crate) fn clear_player_possession_movement(
+    store: &mut VoxelPossessionMovementStore,
+    user_id: u64,
+) -> usize {
+    let previous_len = store.records.len();
+    store.records.retain(|record| record.user_id != user_id);
+    previous_len - store.records.len()
+}
+
+pub(crate) fn clear_player_camera(
+    store: &mut VoxelPlayerCameraStore,
+    user_id: u64,
+) -> bool {
+    let previous_len = store.cameras.len();
+    store.cameras.retain(|camera| camera.user_id != user_id);
+    previous_len != store.cameras.len()
 }
 
 fn clamp_horizontal_movement_step(

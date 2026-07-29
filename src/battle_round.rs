@@ -228,6 +228,54 @@ pub struct BattleRoundStore {
     next_encounter_index: u64,
 }
 
+impl BattleRoundStore {
+    pub fn remove_player_data(&mut self, target_id: &str) -> usize {
+        let mut removed = 0;
+        for encounter in self.encounters.values_mut() {
+            let previous_participant_len = encounter.participants.len();
+            encounter
+                .participants
+                .retain(|participant| participant.target_id != target_id);
+            removed += previous_participant_len - encounter.participants.len();
+
+            for participant in &mut encounter.participants {
+                participant
+                    .arrogance_damage_source_ids
+                    .retain(|source_id| source_id != target_id);
+                if participant.infinite_focus_target_id.as_deref() == Some(target_id) {
+                    participant.infinite_focus_target_id = None;
+                    participant.infinite_focus_stacks = 0;
+                }
+                if participant.one_heart_target_id.as_deref() == Some(target_id) {
+                    participant.one_heart_target_id = None;
+                    participant.one_heart_stacks = 0;
+                }
+                if participant.inspiration_target_id.as_deref() == Some(target_id) {
+                    participant.inspiration_target_id = None;
+                }
+                participant.inspiration_sources.remove(target_id);
+                participant
+                    .damage_contributors
+                    .retain(|source_id| source_id != target_id);
+                participant.damage_contribution_amounts.remove(target_id);
+                participant
+                    .delayed_damage_ticks
+                    .retain(|tick| tick.source_id != target_id);
+                participant
+                    .delayed_healing_ticks
+                    .retain(|tick| tick.source_id != target_id);
+            }
+            encounter.combat_log.retain(|entry| {
+                entry.source_id != target_id && entry.target_id != target_id
+            });
+            encounter.combat_log_start = encounter
+                .combat_log_start
+                .min(encounter.combat_log.len());
+        }
+        removed
+    }
+}
+
 pub const BATTLE_ROUND_EXPORT_VERSION: u32 = 1;
 
 #[derive(Serialize)]
