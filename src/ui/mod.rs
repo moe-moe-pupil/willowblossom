@@ -1811,7 +1811,14 @@ fn chat_window(
     let window_id = current_group
         .map(|group_name| group_member_chat_window_id(group_name, target_id))
         .unwrap_or_else(|| standalone_chat_window_id(id, target_id));
-    let mut window = egui::Window::new(nickname)
+    let chat_window_accent = manager
+        .player_chat_window_color(target_id)
+        .map(|[red, green, blue]| egui::Color32::from_rgb(red, green, blue));
+    let mut window_title = egui::RichText::new(nickname);
+    if let Some(accent) = chat_window_accent {
+        window_title = window_title.color(accent).strong();
+    }
+    let mut window = egui::Window::new(window_title)
         .open(&mut window_open)
         .id(window_id)
         .constrain_to(constraint_rect)
@@ -1819,6 +1826,11 @@ fn chat_window(
         .min_size(window_min_size)
         .max_size(max_window_size)
         .resizable(true);
+    if let Some(accent) = chat_window_accent {
+        window = window.frame(
+            egui::Frame::window(&ctx.style_of(ctx.theme())).stroke(Stroke::new(3.0, accent)),
+        );
+    }
     if let Some(group_name) = current_group {
         let offset_key = (
             group_name.to_owned(),
@@ -1877,6 +1889,15 @@ fn chat_window(
     let mut player_acted_toggle: Option<(String, String, bool)> = None;
     let player_visible_options = player_visible_preview_options(manager, target_id, messages);
     let response = window.show(ctx, |ui| {
+        if let Some(accent) = chat_window_accent {
+            let (accent_rect, accent_response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 4.0),
+                Sense::hover(),
+            );
+            ui.painter().rect_filled(accent_rect, 2.0, accent);
+            accent_response.on_hover_text("玩家聊天颜色；重启后保持不变");
+            ui.add_space(2.0);
+        }
         if current_group.is_some() || show_character_button || trpg_membership_group.is_some() {
             ui.horizontal_wrapped(|ui| {
                 if let Some(group_name) = trpg_membership_group.as_deref() {

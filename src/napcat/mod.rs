@@ -137,6 +137,24 @@ const NAPCAT_RESPONSE_ECHO_PREFIX: &str = "willowblossom:";
 const NAPCAT_ACTION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const NAPCAT_MESSAGES_PATH: &str = ".data/willowblossom/messages.toml";
 const NAPCAT_INBOUND_JOURNAL_PATH: &str = ".data/willowblossom/inbound_messages.jsonl";
+const PLAYER_CHAT_WINDOW_COLOR_PALETTE: [[u8; 3]; 16] = [
+    [239, 68, 68],
+    [249, 115, 22],
+    [245, 158, 11],
+    [132, 204, 22],
+    [34, 197, 94],
+    [16, 185, 129],
+    [20, 184, 166],
+    [6, 182, 212],
+    [14, 165, 233],
+    [59, 130, 246],
+    [99, 102, 241],
+    [139, 92, 246],
+    [168, 85, 247],
+    [217, 70, 239],
+    [236, 72, 153],
+    [244, 63, 94],
+];
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -589,6 +607,9 @@ pub struct ChatTargetMetadata {
     pub display_name: String,
     #[serde(default)]
     pub automatic_name: String,
+    /// Stable player accent stored with the chat target so restarts keep the same color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_window_color_rgb: Option<[u8; 3]>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -4351,6 +4372,50 @@ impl NapcatMessageManager {
         self.chat_target_kind(target_id) == ChatTargetExportKind::Private
     }
 
+    pub fn player_chat_window_color(&self, target_id: &str) -> Option<[u8; 3]> {
+        if !self.is_private_chat_target(target_id) {
+            return None;
+        }
+
+        self.chat_targets
+            .get(target_id)
+            .and_then(|metadata| metadata.chat_window_color_rgb)
+    }
+
+    fn ensure_player_chat_window_color(&mut self, target_id: &str) -> bool {
+        if !self.is_private_chat_target(target_id)
+            || self
+                .chat_targets
+                .get(target_id)
+                .is_some_and(|metadata| metadata.chat_window_color_rgb.is_some())
+        {
+            return false;
+        }
+
+        let used_colors = self
+            .chat_targets
+            .iter()
+            .filter(|(other_id, _)| other_id.as_str() != target_id)
+            .filter_map(|(_, metadata)| metadata.chat_window_color_rgb)
+            .collect::<HashSet<_>>();
+        let mut hasher = DefaultHasher::new();
+        target_id.hash(&mut hasher);
+        let preferred_index = (hasher.finish() as usize) % PLAYER_CHAT_WINDOW_COLOR_PALETTE.len();
+        let color = (0..PLAYER_CHAT_WINDOW_COLOR_PALETTE.len())
+            .map(|offset| {
+                PLAYER_CHAT_WINDOW_COLOR_PALETTE
+                    [(preferred_index + offset) % PLAYER_CHAT_WINDOW_COLOR_PALETTE.len()]
+            })
+            .find(|color| !used_colors.contains(color))
+            .unwrap_or(PLAYER_CHAT_WINDOW_COLOR_PALETTE[preferred_index]);
+
+        self.chat_targets
+            .entry(target_id.to_owned())
+            .or_default()
+            .chat_window_color_rgb = Some(color);
+        true
+    }
+
     fn apply_imported_chat_window_state(
         &mut self,
         target_id: &str,
@@ -4448,13 +4513,15 @@ impl NapcatMessageManager {
                 }
             }
         }
-        let private_targets = self
+        let mut private_targets = self
             .chat_targets
             .keys()
             .filter(|target_id| self.is_private_chat_target(target_id))
             .cloned()
             .collect::<Vec<_>>();
+        private_targets.sort();
         for target_id in private_targets {
+            changed |= self.ensure_player_chat_window_color(&target_id);
             if !self.player_characters.contains_key(&target_id) {
                 self.player_characters
                     .insert(target_id, PlayerCharacter::default());
@@ -9666,6 +9733,64 @@ mod tests {
     }
 
     #[test]
+    fn player_chat_window_colors_are_distinct_and_survive_toml_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("messages.toml");
+        let mut manager = empty_manager();
+        for target_id in ["2", "3"] {
+            manager.chat_targets.insert(
+                target_id.to_owned(),
+                ChatTargetMetadata::default(),
+            );
+            manager.chat_target_kinds.insert(
+                target_id.to_owned(),
+                ChatTargetExportKind::Private,
+            );
+        }
+        manager
+            .chat_targets
+            .insert("99".to_owned(), ChatTargetMetadata::default());
+        manager
+            .chat_target_kinds
+            .insert("99".to_owned(), ChatTargetExportKind::Group);
+
+        assert!(manager.sync_chat_targets());
+        let first_color = manager.player_chat_window_color("2").unwrap();
+        let second_color = manager.player_chat_window_color("3").unwrap();
+        assert_ne!(first_color, second_color);
+        assert_eq!(manager.player_chat_window_color("99"), None);
+        assert!(!manager.sync_chat_targets());
+
+        let persistent = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path.clone())
+            .default(manager)
+            .build()
+            .unwrap();
+        persistent.persist().unwrap();
+
+        let encoded = fs::read_to_string(&path).unwrap();
+        assert!(encoded.contains("chat_window_color_rgb"));
+        let restored = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path)
+            .default(empty_manager())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            restored.player_chat_window_color("2"),
+            Some(first_color)
+        );
+        assert_eq!(
+            restored.player_chat_window_color("3"),
+            Some(second_color)
+        );
+    }
+
+    #[test]
     fn toml_persistence_loads_legacy_aligned_replay_snapshots() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("messages.toml");
@@ -11077,6 +11202,7 @@ position_cells = [4, 5, 6]
             .insert("2".to_owned(), ChatTargetMetadata {
                 display_name: "玩家".to_owned(),
                 automatic_name: "tester".to_owned(),
+                chat_window_color_rgb: None,
             });
         manager.player_characters.insert(
             "2".to_owned(),
@@ -11173,6 +11299,7 @@ position_cells = [4, 5, 6]
             .insert("2".to_owned(), ChatTargetMetadata {
                 display_name: "保留聊天名".to_owned(),
                 automatic_name: "friend".to_owned(),
+                chat_window_color_rgb: None,
             });
         manager.player_characters.insert(
             "2".to_owned(),
@@ -11235,6 +11362,7 @@ position_cells = [4, 5, 6]
             .insert("2".to_owned(), ChatTargetMetadata {
                 display_name: "玩家二".to_owned(),
                 automatic_name: "friend".to_owned(),
+                chat_window_color_rgb: None,
             });
         manager.read_message_counts.insert("2".to_owned(), 3);
         manager.summarized_message_counts.insert("99".to_owned(), 5);
@@ -11357,6 +11485,7 @@ position_cells = [4, 5, 6]
             .insert("2".to_owned(), ChatTargetMetadata {
                 display_name: "导入玩家".to_owned(),
                 automatic_name: "source".to_owned(),
+                chat_window_color_rgb: None,
             });
         source.read_message_counts.insert("2".to_owned(), 3);
         source.summarized_message_counts.insert("99".to_owned(), 5);
