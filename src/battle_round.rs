@@ -102,6 +102,7 @@ use crate::{
         trpg_config_with_weave,
         update_character_from_status_with_config,
         wounded_healing_dealt_multiplier,
+        CharacterSkillSourceKind,
         CharacterStatus,
         NapcatMessageManager,
         PlayerCharacter,
@@ -136,6 +137,7 @@ use crate::{
 };
 
 const MAX_GROUP_CLOCK_CATCH_UP_ROUNDS_PER_FRAME: u32 = 64;
+const SUPPORT_TALENT_EXPERIENCE_BONUS_RATE: f32 = 0.15;
 
 pub struct BattleRoundPlugin;
 
@@ -381,6 +383,8 @@ pub struct BattleParticipantSnapshot {
     pub level: i32,
     #[serde(default)]
     pub exp: i32,
+    #[serde(default)]
+    pub support_talent_experience_bonus_rate: f32,
     #[serde(default)]
     pub base_damage: f32,
     #[serde(default)]
@@ -1466,6 +1470,15 @@ fn grant_participant_experience(participant: &mut BattleParticipantSnapshot, amo
     level_ups
 }
 
+fn experience_with_bonus(amount: i32, bonus_rate: f32) -> i32 {
+    if amount <= 0 {
+        return 0;
+    }
+    ((amount as f64) * (1.0 + bonus_rate.max(0.0) as f64))
+        .round()
+        .clamp(1.0, i32::MAX as f64) as i32
+}
+
 fn battle_defeat_total_experience(
     encounter: &BattleEncounter,
     outcome: &BattleDefeatOutcome,
@@ -1590,16 +1603,28 @@ fn apply_battle_experience_reward(encounter: &mut BattleEncounter, outcome: &Bat
             .iter_mut()
             .find(|participant| participant.target_id == source_id)
         {
+            let base_amount = amount;
+            let bonus_rate = participant.support_talent_experience_bonus_rate;
+            let amount = experience_with_bonus(base_amount, bonus_rate);
+            let bonus_note = if bonus_rate > f32::EPSILON {
+                format!(
+                    "（辅助天赋经验加成{}%，基础{}）",
+                    format_number((bonus_rate * 100.0).round()),
+                    base_amount
+                )
+            } else {
+                String::new()
+            };
             let level_ups = grant_participant_experience(participant, amount);
             encounter.action_log.push(if level_ups > 0 {
                 format!(
-                    "{}获得{}经验并提升{}级",
-                    participant.display_name, amount, level_ups
+                    "{}获得{}经验{}并提升{}级",
+                    participant.display_name, amount, bonus_note, level_ups
                 )
             } else {
                 format!(
-                    "{}获得{}经验",
-                    participant.display_name, amount
+                    "{}获得{}经验{}",
+                    participant.display_name, amount, bonus_note
                 )
             });
         }
@@ -6061,6 +6086,19 @@ fn character_battle_speeds(character: &PlayerCharacter) -> (f32, f32) {
     })
 }
 
+fn character_support_talent_experience_bonus_rate(character: &PlayerCharacter) -> f32 {
+    if character.skill_metadata.iter().any(|metadata| {
+        metadata.is_approved()
+            && metadata.source == CharacterSkillSourceKind::Talent
+            && (metadata.source_pool_id.as_deref() == Some("support_talent")
+                || metadata.source_pool_label.as_deref() == Some("辅助天赋"))
+    }) {
+        SUPPORT_TALENT_EXPERIENCE_BONUS_RATE
+    } else {
+        0.0
+    }
+}
+
 fn participant_from_character(
     target_id: &str,
     character: &PlayerCharacter,
@@ -6076,6 +6114,9 @@ fn participant_from_character(
         player_character: true,
         level: character.level.max(1),
         exp: character.exp.max(0),
+        support_talent_experience_bonus_rate: character_support_talent_experience_bonus_rate(
+            character,
+        ),
         base_damage: status.str_.max(status.dex).max(status.int_).max(1) as f32,
         unit_rarity: UnitRarity::Normal,
         turn: 0,
@@ -6180,6 +6221,7 @@ fn participant_from_unit_template(
         player_character: false,
         level: character.level.max(1),
         exp: 0,
+        support_talent_experience_bonus_rate: 0.0,
         base_damage: unit.base_damage.max(0.0),
         unit_rarity: unit.rarity,
         turn: 0,
@@ -6282,6 +6324,7 @@ fn participant_from_target(
         player_character: false,
         level: 1,
         exp: 0,
+        support_talent_experience_bonus_rate: 0.0,
         base_damage: 0.0,
         unit_rarity: UnitRarity::Normal,
         turn: 0,
@@ -6385,6 +6428,7 @@ fn sync_participant_from_manager(
                 unit_participant_display_name(&participant.target_id, unit_id, unit);
             participant.player_character = false;
             participant.level = character.level.max(1);
+            participant.support_talent_experience_bonus_rate = 0.0;
             participant.base_damage = unit.base_damage.max(0.0);
             participant.unit_rarity = unit.rarity;
             participant.max_hp = character.max_hp;
@@ -6479,6 +6523,8 @@ fn sync_participant_from_manager(
         participant.player_character = true;
         participant.level = character.level.max(1);
         participant.exp = character.exp.max(0);
+        participant.support_talent_experience_bonus_rate =
+            character_support_talent_experience_bonus_rate(character);
         let total = character.status.combined(&character.extra_status);
         participant.base_damage = total.str_.max(total.dex).max(total.int_).max(1) as f32;
         participant.unit_rarity = UnitRarity::Normal;
@@ -6553,6 +6599,7 @@ fn sync_participant_from_manager(
         participant.alive = participant.hp > 0.0 || participant_hope_avatar_active(participant);
     } else {
         participant.player_character = false;
+        participant.support_talent_experience_bonus_rate = 0.0;
         participant.low_survivor_speed = participant.speed.max(0.0);
         participant.arrogance_damage_bonus_per_source = 0.0;
         participant.endless_pain_bonus_damage_per_stack = 0.0;
@@ -7951,6 +7998,7 @@ mod area_tests {
             player_character: false,
             level: 1,
             exp: 0,
+            support_talent_experience_bonus_rate: 0.0,
             base_damage: 0.0,
             unit_rarity: UnitRarity::Normal,
             turn: 0,
@@ -8128,6 +8176,7 @@ mod tests {
             player_character: false,
             level: 1,
             exp: 0,
+            support_talent_experience_bonus_rate: 0.0,
             base_damage: 0.0,
             unit_rarity: UnitRarity::Normal,
             turn,
@@ -8214,6 +8263,7 @@ mod tests {
         actor.action_done = true;
         actor.hp = 6.0;
         actor.arcane_shield = 4.5;
+        actor.support_talent_experience_bonus_rate = SUPPORT_TALENT_EXPERIENCE_BONUS_RATE;
         actor.damage_contributors = vec!["enemy".to_owned()];
         actor.skill_cooldown_ready_turns = HashMap::from([("0".to_owned(), 12)]);
         let store = BattleRoundStore {
@@ -8256,6 +8306,10 @@ mod tests {
         ]);
         assert_eq!(actor.hp, 6.0);
         assert_eq!(actor.arcane_shield, 4.5);
+        assert_eq!(
+            actor.support_talent_experience_bonus_rate,
+            SUPPORT_TALENT_EXPERIENCE_BONUS_RATE
+        );
         assert_eq!(actor.damage_contributors, vec![
             "enemy".to_owned()
         ]);
@@ -16217,5 +16271,65 @@ mod tests {
                 .find(|participant| participant.target_id == id)
                 .is_some_and(|participant| participant.exp > 0));
         }
+    }
+
+    #[test]
+    fn approved_support_talent_draw_grants_fifteen_percent_extra_battle_experience() {
+        let manager = empty_manager();
+        let mut support_character = PlayerCharacter {
+            level: 2,
+            skill_names: vec!["互帮互助".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "support_talent",
+                "辅助天赋",
+            )],
+            ..Default::default()
+        };
+        let support = participant_from_character("support", &support_character, &manager);
+        assert_eq!(
+            support.support_talent_experience_bonus_rate,
+            SUPPORT_TALENT_EXPERIENCE_BONUS_RATE
+        );
+
+        support_character.skill_metadata[0].st_approved = false;
+        assert_eq!(
+            character_support_talent_experience_bonus_rate(&support_character),
+            0.0
+        );
+
+        let mut victim = participant("unit:wolf", 0);
+        victim.unit_template_id = Some("wolf".to_owned());
+        victim.level = 2;
+        victim.max_hp = 79.0;
+        victim.base_damage = 3.0;
+        let mut encounter = BattleEncounter {
+            participants: vec![support, victim],
+            ..Default::default()
+        };
+        let outcome = BattleDefeatOutcome {
+            contributors: vec!["support".to_owned()],
+            contribution_amounts: HashMap::from([("support".to_owned(), 10.0)]),
+            killer_id: Some("support".to_owned()),
+            defeated_id: "unit:wolf".to_owned(),
+            defeated_player_character: false,
+            defeated_level: 2,
+            defeated_max_hp: 79.0,
+            defeated_base_damage: 3.0,
+            defeated_rarity: UnitRarity::Normal,
+        };
+        let base_exp = battle_defeat_total_experience(&encounter, &outcome);
+        assert_eq!(base_exp, 100);
+
+        apply_battle_experience_reward(&mut encounter, &outcome);
+
+        assert_eq!(encounter.participants[0].level, 2);
+        assert_eq!(encounter.participants[0].exp, 115);
+        assert!(
+            encounter.action_log.iter().any(|entry| {
+                entry.contains("获得115经验")
+                    && entry.contains("辅助天赋经验加成15%")
+                    && entry.contains("基础100")
+            })
+        );
     }
 }
