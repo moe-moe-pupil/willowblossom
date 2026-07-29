@@ -1,3 +1,5 @@
+mod post_match;
+
 use std::{
     collections::{
         hash_map::DefaultHasher,
@@ -203,6 +205,7 @@ fn draw_battle_targeting_line(
 pub struct BattleRoundUiState {
     panel_open: bool,
     combat_log_open: bool,
+    post_match: post_match::PostMatchSummaryUiState,
     new_encounter_name: String,
     selected_group: String,
     selected_add_player: HashMap<String, String>,
@@ -350,6 +353,9 @@ pub enum CombatLogKind {
     Healing,
     Buff,
     Resource,
+    Experience,
+    Elimination,
+    Assist,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -712,6 +718,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         encounter.combat_log_start = encounter.combat_log.len();
         encounter.combat_completed_turns = 0;
         let mut logs = Vec::new();
+        let mut combat_entries = Vec::new();
         for participant in &mut encounter.participants {
             clear_participant_dominion_bonus(participant);
             participant.combat_turns_completed = 0;
@@ -733,14 +740,31 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.hope_avatar_rounds_remaining = 0;
             participant.arcane_shield =
                 participant.max_mp.max(0.0) * participant.arcane_shield_rate.max(0.0);
+            let previous_hp = participant.hp;
             if let Some(log) = apply_participant_rest_then_fight_healing(participant) {
                 logs.push(log);
+                let effective_amount = (participant.hp - previous_hp).max(0.0);
+                combat_entries.push(CombatLogEntry {
+                    round: encounter.round,
+                    kind: CombatLogKind::Healing,
+                    source_id: participant.target_id.clone(),
+                    source_name: participant.display_name.clone(),
+                    target_id: participant.target_id.clone(),
+                    target_name: participant.display_name.clone(),
+                    action_name: "以逸待劳".to_owned(),
+                    base_amount: effective_amount,
+                    effective_amount,
+                    modifiers: Vec::new(),
+                    benefits: Vec::new(),
+                });
             }
         }
         encounter.action_log.extend(logs);
+        encounter.combat_log.extend(combat_entries);
     } else {
         encounter.combat_completed_turns = 0;
         let mut logs = Vec::new();
+        let mut combat_entries = Vec::new();
         let mut defeat_outcomes = Vec::new();
         for participant in &mut encounter.participants {
             clear_participant_dominion_bonus(participant);
@@ -778,13 +802,35 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             let shield_cap_rate = participant.overhealing_shield_cap_rate;
             let resolution =
                 apply_participant_healing_for_battle(participant, healing, shield_cap_rate);
+            let effective_amount = resolution.effective_amount();
+            let mut benefits = Vec::new();
+            if resolution.shield_gained > f32::EPSILON {
+                benefits.push(format!(
+                    "过量治疗转化{}点护盾",
+                    format_number(resolution.shield_gained)
+                ));
+            }
             logs.push(format!(
                 "{}触发息心，回复{}点生命值",
                 participant.display_name,
-                format_number(resolution.effective_amount())
+                format_number(effective_amount)
             ));
+            combat_entries.push(CombatLogEntry {
+                round: encounter.round,
+                kind: CombatLogKind::Healing,
+                source_id: participant.target_id.clone(),
+                source_name: participant.display_name.clone(),
+                target_id: participant.target_id.clone(),
+                target_name: participant.display_name.clone(),
+                action_name: "息心".to_owned(),
+                base_amount: healing,
+                effective_amount,
+                modifiers: Vec::new(),
+                benefits,
+            });
         }
         encounter.action_log.extend(logs);
+        encounter.combat_log.extend(combat_entries);
         encounter.active = false;
         for outcome in defeat_outcomes {
             apply_battle_defeat_outcome(encounter, outcome);
@@ -1154,7 +1200,8 @@ fn participant_liquid_body_split_damage(
 fn apply_participant_liquid_body_healing(
     participant: &mut BattleParticipantSnapshot,
     previous_damage_taken: f32,
-) -> Option<String> {
+    round: u32,
+) -> Option<(String, CombatLogEntry)> {
     if !participant.alive || participant.liquid_body_self_healing_rate <= f32::EPSILON {
         return None;
     }
@@ -1164,10 +1211,33 @@ fn apply_participant_liquid_body_healing(
     }
     let shield_cap_rate = participant.overhealing_shield_cap_rate;
     let resolution = apply_participant_healing_for_battle(participant, healing, shield_cap_rate);
-    Some(format!(
-        "{}触发液态躯体，回复{}点生命值",
-        participant.display_name,
-        format_number(resolution.effective_amount())
+    let effective_amount = resolution.effective_amount();
+    let mut benefits = Vec::new();
+    if resolution.shield_gained > f32::EPSILON {
+        benefits.push(format!(
+            "过量治疗转化{}点护盾",
+            format_number(resolution.shield_gained)
+        ));
+    }
+    Some((
+        format!(
+            "{}触发液态躯体，回复{}点生命值",
+            participant.display_name,
+            format_number(effective_amount)
+        ),
+        CombatLogEntry {
+            round,
+            kind: CombatLogKind::Healing,
+            source_id: participant.target_id.clone(),
+            source_name: participant.display_name.clone(),
+            target_id: participant.target_id.clone(),
+            target_name: participant.display_name.clone(),
+            action_name: "液态躯体".to_owned(),
+            base_amount: healing,
+            effective_amount,
+            modifiers: Vec::new(),
+            benefits,
+        },
     ))
 }
 
@@ -1411,6 +1481,7 @@ fn apply_sin_on_sin_kill_participation(
         return;
     }
     let mut logs = Vec::new();
+    let mut combat_entries = Vec::new();
     for participant in &mut encounter.participants {
         if !participant.alive
             || !contributor_ids.contains(&participant.target_id)
@@ -1428,14 +1499,49 @@ fn apply_sin_on_sin_kill_participation(
             .max(0.0);
         if hp_recovered > f32::EPSILON {
             let shield_cap_rate = participant.overhealing_shield_cap_rate;
-            apply_participant_healing_for_battle(
+            let resolution = apply_participant_healing_for_battle(
                 participant,
                 hp_recovered,
                 shield_cap_rate,
             );
+            let hp_effective = resolution.effective_amount();
+            let mut benefits = Vec::new();
+            if resolution.shield_gained > f32::EPSILON {
+                benefits.push(format!(
+                    "过量治疗转化{}点护盾",
+                    format_number(resolution.shield_gained)
+                ));
+            }
+            combat_entries.push(CombatLogEntry {
+                round: encounter.round,
+                kind: CombatLogKind::Healing,
+                source_id: participant.target_id.clone(),
+                source_name: participant.display_name.clone(),
+                target_id: participant.target_id.clone(),
+                target_name: participant.display_name.clone(),
+                action_name: "罪上加罪".to_owned(),
+                base_amount: hp_recovered,
+                effective_amount: hp_effective,
+                modifiers: Vec::new(),
+                benefits,
+            });
         }
+        let previous_mp = participant.mp;
         if mp_recovered > f32::EPSILON {
             participant.mp = (participant.mp + mp_recovered).min(participant.max_mp);
+            combat_entries.push(CombatLogEntry {
+                round: encounter.round,
+                kind: CombatLogKind::Resource,
+                source_id: participant.target_id.clone(),
+                source_name: participant.display_name.clone(),
+                target_id: participant.target_id.clone(),
+                target_name: participant.display_name.clone(),
+                action_name: "罪上加罪·魔法回复".to_owned(),
+                base_amount: mp_recovered,
+                effective_amount: (participant.mp - previous_mp).max(0.0),
+                modifiers: Vec::new(),
+                benefits: Vec::new(),
+            });
         }
         logs.push(format!(
             "{}触发罪上加罪，回复{}点生命值、{}点魔法值，经验加成{}%",
@@ -1449,6 +1555,7 @@ fn apply_sin_on_sin_kill_participation(
         ));
     }
     encounter.action_log.extend(logs);
+    encounter.combat_log.extend(combat_entries);
 }
 
 fn grant_participant_experience(participant: &mut BattleParticipantSnapshot, amount: i32) -> i32 {
@@ -1616,6 +1723,22 @@ fn apply_battle_experience_reward(encounter: &mut BattleEncounter, outcome: &Bat
                 String::new()
             };
             let level_ups = grant_participant_experience(participant, amount);
+            let experience_event = CombatLogEntry {
+                round: encounter.round,
+                kind: CombatLogKind::Experience,
+                source_id: source_id.clone(),
+                source_name: participant.display_name.clone(),
+                target_id: source_id.clone(),
+                target_name: participant.display_name.clone(),
+                action_name: "战斗经验".to_owned(),
+                base_amount: amount as f32,
+                effective_amount: amount as f32,
+                modifiers: Vec::new(),
+                benefits: (level_ups > 0)
+                    .then(|| format!("提升{level_ups}级"))
+                    .into_iter()
+                    .collect(),
+            };
             encounter.action_log.push(if level_ups > 0 {
                 format!(
                     "{}获得{}经验{}并提升{}级",
@@ -1627,11 +1750,99 @@ fn apply_battle_experience_reward(encounter: &mut BattleEncounter, outcome: &Bat
                     participant.display_name, amount, bonus_note
                 )
             });
+            encounter.combat_log.push(experience_event);
         }
     }
 }
 
+fn battle_participant_display_name(encounter: &BattleEncounter, target_id: &str) -> String {
+    encounter
+        .participants
+        .iter()
+        .find(|participant| participant.target_id == target_id)
+        .map(|participant| participant.display_name.clone())
+        .unwrap_or_else(|| target_id.to_owned())
+}
+
+fn record_battle_defeat_events(encounter: &mut BattleEncounter, outcome: &BattleDefeatOutcome) {
+    let defeated_name = battle_participant_display_name(encounter, &outcome.defeated_id);
+    let killer_id = outcome
+        .killer_id
+        .as_deref()
+        .filter(|killer_id| *killer_id != outcome.defeated_id);
+    let (killer_source_id, killer_name) = killer_id
+        .map(|killer_id| {
+            (
+                killer_id.to_owned(),
+                battle_participant_display_name(encounter, killer_id),
+            )
+        })
+        .unwrap_or_else(|| ("system".to_owned(), "环境".to_owned()));
+    encounter.combat_log.push(CombatLogEntry {
+        round: encounter.round,
+        kind: CombatLogKind::Elimination,
+        source_id: killer_source_id,
+        source_name: killer_name,
+        target_id: outcome.defeated_id.clone(),
+        target_name: defeated_name.clone(),
+        action_name: "击败".to_owned(),
+        base_amount: 1.0,
+        effective_amount: 1.0,
+        modifiers: Vec::new(),
+        benefits: Vec::new(),
+    });
+
+    let Some(killer_id) = killer_id else {
+        return;
+    };
+    let mut assistants = HashMap::<String, &'static str>::new();
+    for contributor_id in &outcome.contributors {
+        if contributor_id != killer_id && contributor_id != &outcome.defeated_id {
+            assistants.insert(contributor_id.clone(), "伤害贡献");
+        }
+    }
+    for entry in encounter.combat_log.iter().skip(encounter.combat_log_start) {
+        if entry.target_id != killer_id
+            || entry.source_id == killer_id
+            || entry.source_id == outcome.defeated_id
+        {
+            continue;
+        }
+        let support_kind = match entry.kind {
+            CombatLogKind::Healing => Some("治疗支援"),
+            CombatLogKind::Buff if entry.benefits.iter().any(|benefit| benefit == "有益") => {
+                Some("有益状态支援")
+            },
+            _ => None,
+        };
+        if let Some(support_kind) = support_kind {
+            assistants
+                .entry(entry.source_id.clone())
+                .or_insert(support_kind);
+        }
+    }
+
+    let mut assistants = assistants.into_iter().collect::<Vec<_>>();
+    assistants.sort_by(|left, right| left.0.cmp(&right.0));
+    for (assistant_id, reason) in assistants {
+        encounter.combat_log.push(CombatLogEntry {
+            round: encounter.round,
+            kind: CombatLogKind::Assist,
+            source_name: battle_participant_display_name(encounter, &assistant_id),
+            source_id: assistant_id,
+            target_id: outcome.defeated_id.clone(),
+            target_name: defeated_name.clone(),
+            action_name: "助攻".to_owned(),
+            base_amount: 1.0,
+            effective_amount: 1.0,
+            modifiers: Vec::new(),
+            benefits: vec![reason.to_owned()],
+        });
+    }
+}
+
 fn apply_battle_defeat_outcome(encounter: &mut BattleEncounter, outcome: BattleDefeatOutcome) {
+    record_battle_defeat_events(encounter, &outcome);
     apply_battle_experience_reward(encounter, &outcome);
     if encounter.active {
         apply_dominion_target_death(encounter, outcome.defeated_max_hp);
@@ -1700,12 +1911,14 @@ fn schedule_participant_delayed_healing(
 #[derive(Default)]
 struct BattleDelayedDamageAdvance {
     logs: Vec<String>,
+    combat_log: Vec<CombatLogEntry>,
     defeat_outcomes: Vec<BattleDefeatOutcome>,
 }
 
 fn advance_participant_delayed_damage_ticks(
     participant: &mut BattleParticipantSnapshot,
     encounter_active: bool,
+    round: u32,
 ) -> BattleDelayedDamageAdvance {
     if participant.delayed_damage_ticks.is_empty() {
         return BattleDelayedDamageAdvance::default();
@@ -1738,6 +1951,26 @@ fn advance_participant_delayed_damage_ticks(
             &tick.source_id,
             encounter_active,
         );
+        let mut benefits = Vec::new();
+        if resolution.damage_absorbed > f32::EPSILON {
+            benefits.push(format!(
+                "护盾/免疫吸收{}点",
+                format_number(resolution.damage_absorbed)
+            ));
+        }
+        advance.combat_log.push(CombatLogEntry {
+            round,
+            kind: CombatLogKind::Damage,
+            source_id: tick.source_id.clone(),
+            source_name: tick.source_name.clone(),
+            target_id: participant.target_id.clone(),
+            target_name: display_name.clone(),
+            action_name: tick.name.clone(),
+            base_amount: final_amount,
+            effective_amount: resolution.damage_applied,
+            modifiers: Vec::new(),
+            benefits,
+        });
         if let Some(outcome) = resolution.defeat_outcome {
             advance.defeat_outcomes.push(outcome);
         }
@@ -1775,11 +2008,18 @@ fn advance_participant_delayed_damage_ticks(
     advance
 }
 
+#[derive(Default)]
+struct BattleDelayedHealingAdvance {
+    logs: Vec<String>,
+    combat_log: Vec<CombatLogEntry>,
+}
+
 fn advance_participant_delayed_healing_ticks(
     participant: &mut BattleParticipantSnapshot,
-) -> Vec<String> {
+    round: u32,
+) -> BattleDelayedHealingAdvance {
     if participant.delayed_healing_ticks.is_empty() {
-        return Vec::new();
+        return BattleDelayedHealingAdvance::default();
     }
     let display_name = participant.display_name.clone();
     let mut due = Vec::new();
@@ -1793,9 +2033,9 @@ fn advance_participant_delayed_healing_ticks(
         }
     });
     if !participant.alive {
-        return Vec::new();
+        return BattleDelayedHealingAdvance::default();
     }
-    let mut logs = Vec::new();
+    let mut advance = BattleDelayedHealingAdvance::default();
     for tick in due {
         let final_amount = tick.amount.max(0.0);
         if final_amount <= f32::EPSILON {
@@ -1806,15 +2046,36 @@ fn advance_participant_delayed_healing_ticks(
             final_amount,
             tick.overhealing_shield_cap_rate,
         );
-        logs.push(format!(
+        let effective_amount = resolution.effective_amount();
+        let mut benefits = Vec::new();
+        if resolution.shield_gained > f32::EPSILON {
+            benefits.push(format!(
+                "过量治疗转化{}点护盾",
+                format_number(resolution.shield_gained)
+            ));
+        }
+        advance.combat_log.push(CombatLogEntry {
+            round,
+            kind: CombatLogKind::Healing,
+            source_id: tick.source_id.clone(),
+            source_name: tick.source_name.clone(),
+            target_id: participant.target_id.clone(),
+            target_name: display_name.clone(),
+            action_name: tick.name.clone(),
+            base_amount: final_amount,
+            effective_amount,
+            modifiers: Vec::new(),
+            benefits,
+        });
+        advance.logs.push(format!(
             "{}触发{}，为{}回复{}点生命值",
             tick.source_name,
             tick.name,
             display_name,
-            format_number(resolution.effective_amount())
+            format_number(effective_amount)
         ));
     }
-    logs
+    advance
 }
 
 fn setup_battle_round_store(mut commands: Commands) {
@@ -2141,9 +2402,16 @@ fn battle_round_panel(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     changed |= create_encounter_ui(ui, &mut ui_state, store, manager);
-                    if ui.button("打开GM战斗明细").clicked() {
-                        ui_state.combat_log_open = true;
-                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("打开GM战斗明细").clicked() {
+                            ui_state.combat_log_open = true;
+                        }
+                        if ui.button("打开GM赛后统计").clicked() {
+                            ui_state
+                                .post_match
+                                .open_for(store.active_encounter_id.as_deref());
+                        }
+                    });
                     ui.separator();
 
                     let mut encounter_rows = encounters.iter().collect::<Vec<_>>();
@@ -2187,6 +2455,7 @@ fn battle_round_panel(
         &mut ui_state.combat_log_open,
         store,
     );
+    post_match::show_window(ctx, &mut ui_state.post_match, store);
     ui_state.panel_open = panel_open && !close_requested;
     if changed {
         store.persist().ok();
@@ -2230,6 +2499,9 @@ fn gm_combat_log_window(ctx: &egui::Context, open: &mut bool, store: &BattleRoun
                                             CombatLogKind::Healing => "治疗",
                                             CombatLogKind::Buff => "状态",
                                             CombatLogKind::Resource => "资源",
+                                            CombatLogKind::Experience => "经验",
+                                            CombatLogKind::Elimination => "击杀",
+                                            CombatLogKind::Assist => "助攻",
                                         };
                                         ui.collapsing(
                                             format!(
@@ -2471,7 +2743,11 @@ fn encounter_ui(
                 }
                 let mut active = encounter.active;
                 if ui.checkbox(&mut active, "进行中").changed() {
+                    let match_ended = encounter.active && !active;
                     changed |= set_encounter_active_state(encounter, active);
+                    if match_ended {
+                        ui_state.post_match.open_for(Some(encounter_id));
+                    }
                 }
                 changed |= ui
                     .checkbox(&mut encounter.negative_enabled, "消极")
@@ -2485,6 +2761,9 @@ fn encounter_ui(
                 }
                 if ui.button("下一轮").clicked() {
                     next_round_requested = true;
+                }
+                if ui.button("统计").clicked() {
+                    ui_state.post_match.open_for(Some(encounter_id));
                 }
                 if ui.button("删除").clicked() {
                     remove = true;
@@ -3635,6 +3914,7 @@ impl BattleRoundStore {
         encounter.round = encounter.round.saturating_add(1);
         advance_encounter_inspiration(encounter);
         let mut delayed_logs = Vec::new();
+        let mut delayed_combat_log = Vec::new();
         let mut defeat_outcomes = Vec::new();
         let mut skipped_combat_turns = 0_u32;
         for participant in &mut encounter.participants {
@@ -3660,10 +3940,13 @@ impl BattleRoundStore {
                 continue;
             }
             if encounter.active {
-                if let Some(log) =
-                    apply_participant_liquid_body_healing(participant, previous_damage_taken)
-                {
+                if let Some((log, combat_entry)) = apply_participant_liquid_body_healing(
+                    participant,
+                    previous_damage_taken,
+                    encounter.round,
+                ) {
                     delayed_logs.push(log);
+                    delayed_combat_log.push(combat_entry);
                 }
             }
             if participant.wound_healing_taken_turns > 0 {
@@ -3677,14 +3960,23 @@ impl BattleRoundStore {
                 }
                 participant.mp = (participant.mp + participant.mp_regen).min(participant.max_mp);
             }
-            let delayed = advance_participant_delayed_damage_ticks(participant, encounter.active);
+            let delayed = advance_participant_delayed_damage_ticks(
+                participant,
+                encounter.active,
+                encounter.round,
+            );
             delayed_logs.extend(delayed.logs);
+            delayed_combat_log.extend(delayed.combat_log);
             defeat_outcomes.extend(delayed.defeat_outcomes);
-            delayed_logs.extend(advance_participant_delayed_healing_ticks(participant));
+            let delayed_healing =
+                advance_participant_delayed_healing_ticks(participant, encounter.round);
+            delayed_logs.extend(delayed_healing.logs);
+            delayed_combat_log.extend(delayed_healing.combat_log);
         }
         encounter.combat_completed_turns = encounter
             .combat_completed_turns
             .saturating_add(skipped_combat_turns);
+        encounter.combat_log.extend(delayed_combat_log);
         for outcome in defeat_outcomes {
             apply_battle_defeat_outcome(encounter, outcome);
         }
@@ -4489,11 +4781,32 @@ impl BattleRoundStore {
                                 pending_actor_lifesteal,
                                 actor_snapshot.overhealing_shield_cap_rate,
                             );
+                            let effective_amount = resolution.effective_amount();
+                            let mut benefits = Vec::new();
+                            if resolution.shield_gained > f32::EPSILON {
+                                benefits.push(format!(
+                                    "过量治疗转化{}点护盾",
+                                    format_number(resolution.shield_gained)
+                                ));
+                            }
                             encounter.action_log.push(format!(
                                 "{}触发禅宗古训，回复{}点生命值",
                                 actor_name,
-                                format_number(resolution.effective_amount())
+                                format_number(effective_amount)
                             ));
+                            encounter.combat_log.push(CombatLogEntry {
+                                round: encounter.round,
+                                kind: CombatLogKind::Healing,
+                                source_id: actor_id.to_owned(),
+                                source_name: actor_name.clone(),
+                                target_id: actor_id.to_owned(),
+                                target_name: actor_name.clone(),
+                                action_name: "禅宗古训".to_owned(),
+                                base_amount: pending_actor_lifesteal,
+                                effective_amount,
+                                modifiers: Vec::new(),
+                                benefits,
+                            });
                         }
                     }
                 },
@@ -4731,11 +5044,32 @@ impl BattleRoundStore {
                                 pending_actor_mutual_aid_healing,
                                 shield_cap_rate,
                             );
+                            let effective_amount = resolution.effective_amount();
+                            let mut benefits = Vec::new();
+                            if resolution.shield_gained > f32::EPSILON {
+                                benefits.push(format!(
+                                    "过量治疗转化{}点护盾",
+                                    format_number(resolution.shield_gained)
+                                ));
+                            }
                             encounter.action_log.push(format!(
                                 "{}触发互帮互助，回复{}点生命值",
                                 actor_name,
-                                format_number(resolution.effective_amount())
+                                format_number(effective_amount)
                             ));
+                            encounter.combat_log.push(CombatLogEntry {
+                                round: encounter.round,
+                                kind: CombatLogKind::Healing,
+                                source_id: actor_id.to_owned(),
+                                source_name: actor_name.clone(),
+                                target_id: actor_id.to_owned(),
+                                target_name: actor_name.clone(),
+                                action_name: "互帮互助".to_owned(),
+                                base_amount: pending_actor_mutual_aid_healing,
+                                effective_amount,
+                                modifiers: Vec::new(),
+                                benefits,
+                            });
                         }
                     }
                 },
@@ -5028,6 +5362,7 @@ impl BattleRoundStore {
         participant.undying_rage_active = false;
         advance_participant_overhealing_shield(participant);
         let mut delayed_logs = Vec::new();
+        let mut delayed_combat_log = Vec::new();
         let (hope_log, hope_outcome) = advance_participant_hope_avatar(participant);
         let mut defeat_outcomes = hope_outcome.into_iter().collect::<Vec<_>>();
         participant.inspiration_sources.retain(|_, turns| {
@@ -5038,19 +5373,30 @@ impl BattleRoundStore {
             delayed_logs.push(log);
         } else {
             if encounter.active {
-                if let Some(log) =
-                    apply_participant_liquid_body_healing(participant, previous_damage_taken)
-                {
+                if let Some((log, combat_entry)) = apply_participant_liquid_body_healing(
+                    participant,
+                    previous_damage_taken,
+                    encounter.round,
+                ) {
                     delayed_logs.push(log);
+                    delayed_combat_log.push(combat_entry);
                 }
             }
             if participant.wound_healing_taken_turns > 0 {
                 participant.wound_healing_taken_turns -= 1;
             }
-            let delayed = advance_participant_delayed_damage_ticks(participant, encounter.active);
+            let delayed = advance_participant_delayed_damage_ticks(
+                participant,
+                encounter.active,
+                encounter.round,
+            );
             delayed_logs.extend(delayed.logs);
+            delayed_combat_log.extend(delayed.combat_log);
             defeat_outcomes.extend(delayed.defeat_outcomes);
-            delayed_logs.extend(advance_participant_delayed_healing_ticks(participant));
+            let delayed_healing =
+                advance_participant_delayed_healing_ticks(participant, encounter.round);
+            delayed_logs.extend(delayed_healing.logs);
+            delayed_combat_log.extend(delayed_healing.combat_log);
         }
         participant.turn = participant.turn.saturating_add(1);
         if encounter.active {
@@ -5070,6 +5416,7 @@ impl BattleRoundStore {
         if encounter.negative_enabled {
             mark_negative_candidates(encounter);
         }
+        encounter.combat_log.extend(delayed_combat_log);
         for outcome in defeat_outcomes {
             apply_battle_defeat_outcome(encounter, outcome);
         }
@@ -5587,6 +5934,7 @@ fn sync_battle_round_buff_advancement(
 struct BattleBuffTick {
     source_id: String,
     target_id: String,
+    action_name: String,
     action: BuffTickAction,
 }
 
@@ -5627,6 +5975,7 @@ fn advance_unit_participant_buffs(
                     .map(|action| BattleBuffTick {
                         source_id: buff.source_id.clone(),
                         target_id: participant.target_id.clone(),
+                        action_name: buff.name.clone(),
                         action,
                     }),
             );
@@ -5733,6 +6082,26 @@ fn apply_battle_buff_ticks(
                     &tick.source_id,
                     encounter.active,
                 );
+                let mut benefits = Vec::new();
+                if resolution.damage_absorbed > f32::EPSILON {
+                    benefits.push(format!(
+                        "护盾/免疫吸收{}点",
+                        format_number(resolution.damage_absorbed)
+                    ));
+                }
+                encounter.combat_log.push(CombatLogEntry {
+                    round: encounter.round,
+                    kind: CombatLogKind::Damage,
+                    source_id: tick.source_id.clone(),
+                    source_name: source_name.clone(),
+                    target_id: tick.target_id.clone(),
+                    target_name: target_name.clone(),
+                    action_name: tick.action_name.clone(),
+                    base_amount: amount.max(0.0),
+                    effective_amount: resolution.damage_applied,
+                    modifiers: Vec::new(),
+                    benefits,
+                });
                 encounter.action_log.push(format!(
                     "状态触发：{}对{}造成{}点伤害",
                     source_name,
@@ -5773,6 +6142,26 @@ fn apply_battle_buff_ticks(
                     &tick.source_id,
                     encounter.active,
                 );
+                let mut benefits = Vec::new();
+                if resolution.damage_absorbed > f32::EPSILON {
+                    benefits.push(format!(
+                        "护盾/免疫吸收{}点",
+                        format_number(resolution.damage_absorbed)
+                    ));
+                }
+                encounter.combat_log.push(CombatLogEntry {
+                    round: encounter.round,
+                    kind: CombatLogKind::Damage,
+                    source_id: tick.source_id.clone(),
+                    source_name: source_name.clone(),
+                    target_id: tick.target_id.clone(),
+                    target_name: target_name.clone(),
+                    action_name: tick.action_name.clone(),
+                    base_amount: amount.max(0.0),
+                    effective_amount: resolution.damage_applied,
+                    modifiers: Vec::new(),
+                    benefits,
+                });
                 encounter.action_log.push(format!(
                     "状态触发：{}对{}造成{}点固定伤害",
                     source_name,
@@ -5854,6 +6243,26 @@ fn apply_battle_buff_ticks(
                     source_overhealing_shield_cap_rate,
                 );
                 let effective_amount = resolution.effective_amount();
+                let mut benefits = Vec::new();
+                if resolution.shield_gained > f32::EPSILON {
+                    benefits.push(format!(
+                        "过量治疗转化{}点护盾",
+                        format_number(resolution.shield_gained)
+                    ));
+                }
+                encounter.combat_log.push(CombatLogEntry {
+                    round: encounter.round,
+                    kind: CombatLogKind::Healing,
+                    source_id: tick.source_id.clone(),
+                    source_name: source_name.clone(),
+                    target_id: tick.target_id.clone(),
+                    target_name: target_name.clone(),
+                    action_name: tick.action_name.clone(),
+                    base_amount: amount.max(0.0),
+                    effective_amount,
+                    modifiers: Vec::new(),
+                    benefits,
+                });
                 let mutual_aid_healing =
                     if tick.source_id != tick.target_id && effective_amount > f32::EPSILON {
                         effective_amount
@@ -5886,11 +6295,32 @@ fn apply_battle_buff_ticks(
                             mutual_aid_healing,
                             shield_cap_rate,
                         );
+                        let effective_amount = resolution.effective_amount();
+                        let mut benefits = Vec::new();
+                        if resolution.shield_gained > f32::EPSILON {
+                            benefits.push(format!(
+                                "过量治疗转化{}点护盾",
+                                format_number(resolution.shield_gained)
+                            ));
+                        }
                         encounter.action_log.push(format!(
                             "{}触发互帮互助，回复{}点生命值",
                             source_name,
-                            format_number(resolution.effective_amount())
+                            format_number(effective_amount)
                         ));
+                        encounter.combat_log.push(CombatLogEntry {
+                            round: encounter.round,
+                            kind: CombatLogKind::Healing,
+                            source_id: tick.source_id.clone(),
+                            source_name: source_name.clone(),
+                            target_id: tick.source_id.clone(),
+                            target_name: source_name.clone(),
+                            action_name: "互帮互助".to_owned(),
+                            base_amount: mutual_aid_healing,
+                            effective_amount,
+                            modifiers: Vec::new(),
+                            benefits,
+                        });
                     }
                 }
             },
@@ -12816,6 +13246,7 @@ mod tests {
             BattleBuffTick {
                 source_id: "source".to_owned(),
                 target_id: "target".to_owned(),
+                action_name: "持续治疗".to_owned(),
                 action: BuffTickAction::Heal { amount: 4.0 },
             },
         ]);
@@ -12864,6 +13295,7 @@ mod tests {
             BattleBuffTick {
                 source_id: "source".to_owned(),
                 target_id: "damage-target".to_owned(),
+                action_name: "持续伤害".to_owned(),
                 action: BuffTickAction::Damage {
                     amount: 10.0,
                     damage_type: DamageType::Physical,
@@ -12872,6 +13304,7 @@ mod tests {
             BattleBuffTick {
                 source_id: "source".to_owned(),
                 target_id: "healing-target".to_owned(),
+                action_name: "持续治疗".to_owned(),
                 action: BuffTickAction::Heal { amount: 10.0 },
             },
         ]);
@@ -12933,6 +13366,7 @@ mod tests {
             BattleBuffTick {
                 source_id: "source".to_owned(),
                 target_id: "target".to_owned(),
+                action_name: "持续伤害".to_owned(),
                 action: BuffTickAction::Damage {
                     amount: 50.0,
                     damage_type: DamageType::Physical,
@@ -13005,11 +13439,13 @@ mod tests {
                 BattleBuffTick {
                     source_id: "source".to_owned(),
                     target_id: "target".to_owned(),
+                    action_name: "持续治疗".to_owned(),
                     action: BuffTickAction::Heal { amount: 5.0 },
                 },
                 BattleBuffTick {
                     source_id: "source".to_owned(),
                     target_id: "target".to_owned(),
+                    action_name: "持续伤害".to_owned(),
                     action: BuffTickAction::Damage {
                         amount: 2.0,
                         damage_type: DamageType::Physical,
@@ -13018,6 +13454,7 @@ mod tests {
                 BattleBuffTick {
                     source_id: "source".to_owned(),
                     target_id: "target".to_owned(),
+                    action_name: "持续固定伤害".to_owned(),
                     action: BuffTickAction::FixedDamage {
                         amount: 2.0,
                         damage_type: DamageType::None,
