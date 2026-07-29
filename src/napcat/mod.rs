@@ -111,6 +111,13 @@ struct NapcatInboundJournal(Arc<Mutex<InboundMessageJournal>>);
 struct NapcatInboundEnvelope {
     message: Message,
     journal_id: Option<u64>,
+    origin: NapcatInboundOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NapcatInboundOrigin {
+    Live,
+    JournalReplay,
 }
 
 #[derive(Resource)]
@@ -6097,6 +6104,7 @@ fn setup(mut commands: Commands) {
                 let _ = client_to_game_sender.send(NapcatInboundEnvelope {
                     message: Message::Text(payload.into()),
                     journal_id: Some(journal_id),
+                    origin: NapcatInboundOrigin::JournalReplay,
                 });
             }
         },
@@ -6221,6 +6229,7 @@ async fn run_napcat_connection(
                                     .send(NapcatInboundEnvelope {
                                         message: msg,
                                         journal_id,
+                                        origin: NapcatInboundOrigin::Live,
                                     })
                                     .is_err()
                                 {
@@ -6338,16 +6347,18 @@ fn journal_inbound_chat_message(
     }
 }
 
-fn acknowledge_inbound_chat_message(journal: &NapcatInboundJournal, journal_id: Option<u64>) {
-    let Some(journal_id) = journal_id else { return };
-    if let Err(err) = journal
+fn acknowledge_inbound_chat_message(
+    journal: &NapcatInboundJournal,
+    journal_id: Option<u64>,
+) -> Result<(), String> {
+    let Some(journal_id) = journal_id else {
+        return Ok(());
+    };
+    journal
         .0
         .lock()
         .map_err(|err| err.to_string())
         .and_then(|mut journal| journal.acknowledge(journal_id))
-    {
-        eprintln!("failed to acknowledge persisted NapCat inbound message: {err}");
-    }
 }
 
 fn correlated_outbound_message(
@@ -6672,7 +6683,6 @@ fn message_system(
         let json_res = serde_json::from_str::<NapcatMessage>(&msg.to_string());
         if let Ok(mut json) = json_res {
             dbg!(&json);
-            cache_message_images(&mut json);
             let target_id = match json.data.message_type {
                 NapcatMessageType::Private => {
                     if json.data.user_id == json.data.self_id {
@@ -6685,48 +6695,27 @@ fn message_system(
             };
             let target_id = target_id.to_string();
             if napcat_message_is_already_stored(&manager, &target_id, &json) {
-                acknowledge_inbound_chat_message(&inbound_journal, envelope.journal_id);
+                if let Err(err) =
+                    acknowledge_inbound_chat_message(&inbound_journal, envelope.journal_id)
+                {
+                    eprintln!("failed to acknowledge duplicate NapCat inbound message: {err}");
+                }
                 continue;
             }
+            cache_message_images(&mut json);
             let is_new_target = !manager.messages.contains_key(&target_id);
             let is_incoming_message = json.data.user_id != json.data.self_id;
             let incoming_user_id = json.data.user_id;
             manager.annotate_incoming_message_access(&target_id, &mut json);
 
-            let party_channel_forward =
-                party_channel_auto_forward_request(&manager, &json, &target_id);
-            let (party_auto_forward, party_channel_guidance) = match party_channel_forward {
-                Some(PartyChannelAutoForward::Forward(request)) => (Some(request), None),
-                Some(PartyChannelAutoForward::Guidance(guidance)) => (None, Some(guidance)),
-                None => (None, None),
-            };
-            let auto_forward =
-                auto_forward_request(&manager, &json, &target_id).or(party_auto_forward);
-            let defeated_auto_forward_guidance =
-                defeated_auto_forward_guidance(&manager, &json, &target_id);
-            let character_creation_response = if is_incoming_message
-                && matches!(
-                    json.data.message_type,
-                    NapcatMessageType::Private
-                ) {
-                private_detect_magic_response(
-                    &manager,
-                    &json,
-                    &target_id,
-                    scene_character_positions.as_deref(),
-                )
-                .or_else(|| handle_character_creation_message(&mut manager, &json, &target_id))
-                .or(party_channel_guidance)
-                .or(defeated_auto_forward_guidance)
-            } else {
-                None
-            };
-            if let (Some(scene_capture_requests), Some(request)) = (
-                scene_capture_requests.as_deref_mut(),
-                scene_capture_request(&manager, &json),
-            ) {
-                scene_capture_requests.requests.push(request);
-            }
+            let automatic_actions = prepare_inbound_automatic_actions(
+                &mut manager,
+                &json,
+                &target_id,
+                is_incoming_message,
+                scene_character_positions.as_deref(),
+                envelope.origin,
+            );
 
             manager
                 .messages
@@ -6755,9 +6744,27 @@ fn message_system(
                 manager.register_incoming_target(&target_id, is_new_target);
             }
 
+            if let Err(err) = persist_inbound_napcat_message(&manager) {
+                eprintln!("failed to durably persist NapCat messages: {err}");
+                continue;
+            }
+            if let Err(err) =
+                acknowledge_inbound_chat_message(&inbound_journal, envelope.journal_id)
+            {
+                eprintln!("failed to acknowledge persisted NapCat inbound message: {err}");
+                continue;
+            }
+
+            if let (Some(scene_capture_requests), Some(request)) = (
+                scene_capture_requests.as_deref_mut(),
+                automatic_actions.scene_capture,
+            ) {
+                scene_capture_requests.requests.push(request);
+            }
+
             if let (Some(sender), Some(response)) = (
                 sender.as_deref(),
-                character_creation_response.as_deref(),
+                automatic_actions.private_response.as_deref(),
             ) {
                 queue_private_text_response(
                     sender,
@@ -6767,12 +6774,10 @@ fn message_system(
                 );
             }
 
-            match persist_inbound_napcat_message(&manager) {
-                Ok(()) => acknowledge_inbound_chat_message(&inbound_journal, envelope.journal_id),
-                Err(err) => eprintln!("failed to durably persist NapCat messages: {err}"),
-            }
-
-            if let (Some(sender), Some(auto_forward)) = (sender.as_deref(), auto_forward) {
+            if let (Some(sender), Some(auto_forward)) = (
+                sender.as_deref(),
+                automatic_actions.auto_forward,
+            ) {
                 for user_id in auto_forward.recipients {
                     queue_private_text_response_with_forwarded_attribution(
                         sender,
@@ -6803,6 +6808,59 @@ fn message_system(
                 );
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct InboundAutomaticActions {
+    private_response: Option<String>,
+    scene_capture: Option<SceneCaptureRequest>,
+    auto_forward: Option<AutoForwardRequest>,
+}
+
+fn prepare_inbound_automatic_actions(
+    manager: &mut NapcatMessageManager,
+    message: &NapcatMessage,
+    target_id: &str,
+    is_incoming_message: bool,
+    scene_character_positions: Option<&SceneCharacterPositions>,
+    origin: NapcatInboundOrigin,
+) -> InboundAutomaticActions {
+    if origin == NapcatInboundOrigin::JournalReplay {
+        return InboundAutomaticActions::default();
+    }
+
+    let party_channel_forward = party_channel_auto_forward_request(manager, message, target_id);
+    let (party_auto_forward, party_channel_guidance) = match party_channel_forward {
+        Some(PartyChannelAutoForward::Forward(request)) => (Some(request), None),
+        Some(PartyChannelAutoForward::Guidance(guidance)) => (None, Some(guidance)),
+        None => (None, None),
+    };
+    let auto_forward = auto_forward_request(manager, message, target_id).or(party_auto_forward);
+    let defeated_auto_forward_guidance =
+        defeated_auto_forward_guidance(manager, message, target_id);
+    let private_response = if is_incoming_message
+        && matches!(
+            message.data.message_type,
+            NapcatMessageType::Private
+        ) {
+        private_detect_magic_response(
+            manager,
+            message,
+            target_id,
+            scene_character_positions,
+        )
+        .or_else(|| handle_character_creation_message(manager, message, target_id))
+        .or(party_channel_guidance)
+        .or(defeated_auto_forward_guidance)
+    } else {
+        None
+    };
+
+    InboundAutomaticActions {
+        private_response,
+        scene_capture: scene_capture_request(manager, message),
+        auto_forward,
     }
 }
 
@@ -9890,6 +9948,44 @@ position_cells = [4, 5, 6]
             "42",
             &legacy_without_id
         ));
+    }
+
+    #[test]
+    fn journal_replay_never_retriggers_scene_capture_command() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            campaign_id: "campaign-a".to_owned(),
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("alpha".to_owned());
+        let message = test_private_message_from(2, ".gc");
+
+        let replayed = prepare_inbound_automatic_actions(
+            &mut manager,
+            &message,
+            "2",
+            true,
+            None,
+            NapcatInboundOrigin::JournalReplay,
+        );
+        assert!(replayed.private_response.is_none());
+        assert!(replayed.scene_capture.is_none());
+        assert!(replayed.auto_forward.is_none());
+        assert!(!manager.player_characters.contains_key("2"));
+
+        let live = prepare_inbound_automatic_actions(
+            &mut manager,
+            &message,
+            "2",
+            true,
+            None,
+            NapcatInboundOrigin::Live,
+        );
+        assert_eq!(
+            live.scene_capture.unwrap().kind,
+            SceneCaptureKind::Image
+        );
     }
 
     #[test]
