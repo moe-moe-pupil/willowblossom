@@ -3274,68 +3274,83 @@ fn merge_skill_pool_entries(target: &mut Vec<SkillPoolEntry>, imported: Vec<Skil
 }
 
 pub fn content_pool_generation_prompt() -> String {
-    let example_item = InventoryItem {
-        category: "测试物品".to_owned(),
-        name: "示例治疗药水".to_owned(),
-        description: "回复生命值的测试消耗品。".to_owned(),
-        stack: 3,
-        max_stack: 20,
-        ..Default::default()
-    };
-    let example = ContentPoolBundle {
-        version: CONTENT_POOL_BUNDLE_VERSION,
-        export_type: "content_pools".to_owned(),
-        units: vec![UnitPoolExportEntry {
-            unit_id: "example-training-dummy".to_owned(),
-            unit: UnitPoolEntry {
-                category: "训练单位".to_owned(),
-                label: "示例训练假人".to_owned(),
-                rarity: UnitRarity::Normal,
-                base_damage: 4.0,
-                character: PlayerCharacter {
-                    inited: true,
-                    name: "示例训练假人".to_owned(),
-                    nickname: "示例训练假人".to_owned(),
-                    level: 5,
-                    hp: 60.0,
-                    max_hp: 60.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
+    let example = json!({
+        "version": CONTENT_POOL_BUNDLE_VERSION,
+        "export_type": "content_pools",
+        "units": [{
+            "unit_id": "example-training-dummy",
+            "unit": {
+                "category": "训练单位",
+                "label": "示例训练假人",
+                "note": "用于测试基础战斗。",
+                "rarity": "normal",
+                "base_damage": 4.0,
+                "character": {
+                    "inited": true,
+                    "name": "示例训练假人",
+                    "nickname": "示例训练假人",
+                    "level": 5,
+                    "hp": 60.0,
+                    "max_hp": 60.0
+                }
+            }
         }],
-        skills: vec![SkillPoolEntry {
-            name: "示例重击".to_owned(),
-            note: "主动使用对目标造成8点物理伤害".to_owned(),
-            category: Some("战斗技能".to_owned()),
-            ..Default::default()
+        "skills": [{
+            "name": "示例重击",
+            "note": "主动使用对目标造成8点物理伤害。",
+            "mp_cost": 3.0,
+            "cooldown_turns": 1,
+            "category": "战斗技能",
+            "tags": ["物理"]
         }],
-        items: vec![example_item.clone()],
-        random_pools: vec![RandomPoolExportEntry {
-            name: "示例掉落池".to_owned(),
-            pool: RandomPool {
-                category: "测试掉落".to_owned(),
-                description: "用于验证导入与抽取。".to_owned(),
-                entries: vec![RandomPoolEntry {
-                    item: example_item,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
+        "items": [{
+            "category": "测试物品",
+            "name": "示例治疗药水",
+            "description": "回复生命值的测试消耗品。",
+            "quality": "common",
+            "equipment_slot": "none",
+            "stack": 3,
+            "max_stack": 20,
+            "item_level": 5,
+            "soulbound": false
         }],
-    };
+        "random_pools": [{
+            "name": "示例掉落池",
+            "pool": {
+                "category": "测试掉落",
+                "description": "用于验证导入与抽取。",
+                "entries": [{
+                    "item": {
+                        "category": "测试物品",
+                        "name": "示例治疗药水",
+                        "description": "回复生命值的测试消耗品。",
+                        "quality": "common",
+                        "equipment_slot": "none",
+                        "stack": 1,
+                        "max_stack": 20
+                    },
+                    "weight": 1.0,
+                    "enabled": true,
+                    "result_text": "获得示例治疗药水。",
+                    "min_count": 1,
+                    "max_count": 1
+                }]
+            }
+        }]
+    });
     let example_json = serde_json::to_string_pretty(&example).unwrap_or_else(|_| "{}".to_owned());
     format!(
         "你是 DeepSeek。请为 Willowblossom 生成一个包含随机化测试内容的 GM 内容池 JSON 包。\n\
          只生成可测试的单位、技能、物品和随机池规则，不生成剧情、玩家决定、隐藏信息或场景结论。\n\
-         默认生成至少8个不同稀有度与等级的单位、12个不同品质/用途的物品、8个技能，以及至少3个有不同权重的随机池；内容应有变化但数值必须合理。\n\
+         顶层 units 数组必须至少8项、顶层 skills 数组必须至少8项、顶层 items 数组必须至少12项、顶层 random_pools 数组必须至少3项；随机池内嵌物品不计入顶层 items 数量。内容应有变化且数值合理。\n\
          只输出一个合法 JSON 对象，不要 Markdown 代码围栏或说明文字。\n\
          必须保留 version={CONTENT_POOL_BUNDLE_VERSION} 和 export_type=\"content_pools\"。\n\
          每个单位、技能、物品、随机池都填写 category；相同 category 表示同一个 GM 逻辑池，允许多个 category。\n\
          单位 rarity 只能是 normal、rare、elite、rare_elite。base_damage 是未缩放的基础伤害；character.max_hp、hp、level 必须为正数。\n\
-         物品 quality 只能是 poor、common、uncommon、rare、epic、legendary；equipment_slot 使用 snake_case。\n\
+         物品 quality 只能是 poor、common、uncommon、rare、epic、legendary。equipment_slot 只能是 head、neck、shoulder、back、chest、wrist、hands、waist、legs、feet、finger、trinket、main_hand、off_hand、ranged、none；普通物品使用 none，禁止使用 weapon、armor 等其他值。\n\
          随机池每个启用条目的 weight 必须大于 0，min_count 不得大于 max_count。\n\
-         可以增删数组元素，但不要改字段名。以下是由应用真实类型生成的完整可导入示例：\n{example_json}"
+         为缩短输出，只填写示例中出现的必要字段；未出现的字段由应用填默认值。单位 character 不要展开 creation_step、inventory、技能、BUFF或其他默认字段。不要改字段名。\n\
+         以下是紧凑的可导入 JSON 示例；必须扩充四个顶层数组到上述数量，不要只复制单个示例项：\n{example_json}"
     )
 }
 
@@ -16143,6 +16158,10 @@ position_cells = [4, 5, 6]
         assert!(prompt.contains("\"category\""));
         assert!(prompt.contains("只输出一个合法 JSON 对象"));
         assert!(prompt.contains("你是 DeepSeek"));
+        assert!(prompt.contains("顶层 items 数组必须至少12项"));
+        assert!(prompt.contains("main_hand、off_hand、ranged、none"));
+        assert!(!prompt.contains("\"creation_step\""));
+        assert!(!prompt.contains("\"inventory\""));
     }
 
     #[test]

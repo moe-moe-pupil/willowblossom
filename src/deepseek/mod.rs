@@ -40,7 +40,10 @@ use serde::{
     Deserialize,
     Serialize,
 };
-use serde_json::json;
+use serde_json::{
+    json,
+    Value,
+};
 use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -375,12 +378,13 @@ impl DeepseekManager {
     }
 
     fn post_content_pools(prompt: &str) -> Result<String, String> {
-        Self::post_chat_completion(
+        let text = Self::post_chat_completion(
             prompt,
             "现在生成可直接导入的随机化测试内容。只返回JSON对象。",
             16_000,
             true,
-        )
+        )?;
+        normalize_generated_content_pool_json(&text)
     }
 
     fn post_director_batch(
@@ -435,6 +439,60 @@ impl DeepseekManager {
         combined_dialogue.extend(cues.iter().cloned());
         raw_batch_responses.push(parsed);
         Ok(())
+    }
+}
+
+fn normalize_generated_content_pool_json(text: &str) -> Result<String, String> {
+    let mut value: Value = serde_json::from_str(text)
+        .map_err(|err| format!("DeepSeek内容池输出不是有效JSON：{err}"))?;
+    normalize_generated_equipment_slots(&mut value);
+    serde_json::to_string_pretty(&value)
+        .map_err(|err| format!("无法规范化DeepSeek内容池输出：{err}"))
+}
+
+fn normalize_generated_equipment_slots(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                normalize_generated_equipment_slots(value);
+            }
+        },
+        Value::Object(fields) => {
+            if let Some(slot) = fields.get_mut("equipment_slot") {
+                let canonical = match slot {
+                    Value::String(slot) => canonical_generated_equipment_slot(slot),
+                    _ => "none",
+                };
+                *slot = Value::String(canonical.to_owned());
+            }
+            for value in fields.values_mut() {
+                normalize_generated_equipment_slots(value);
+            }
+        },
+        _ => {},
+    }
+}
+
+fn canonical_generated_equipment_slot(slot: &str) -> &'static str {
+    let normalized = slot.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match normalized.as_str() {
+        "head" | "helmet" => "head",
+        "neck" | "amulet" => "neck",
+        "shoulder" | "shoulders" => "shoulder",
+        "back" | "cloak" => "back",
+        "chest" | "armor" | "body" | "body_armor" => "chest",
+        "wrist" | "bracer" | "bracers" => "wrist",
+        "hands" | "glove" | "gloves" => "hands",
+        "waist" | "belt" => "waist",
+        "legs" | "pants" => "legs",
+        "feet" | "boot" | "boots" => "feet",
+        "finger" | "ring" => "finger",
+        "trinket" | "accessory" => "trinket",
+        "main_hand" | "mainhand" | "weapon" | "melee" | "one_handed" | "two_handed" => "main_hand",
+        "off_hand" | "offhand" | "shield" => "off_hand",
+        "ranged" | "bow" | "gun" => "ranged",
+        "none" => "none",
+        _ => "none",
     }
 }
 
@@ -837,6 +895,50 @@ fn content_pool_error_clears_pending_generation() {
         manager.content_pool_generation.error.as_deref(),
         Some("rate limited")
     );
+}
+
+#[test]
+fn generated_content_pool_equipment_slots_are_normalized_before_import() {
+    let normalized = normalize_generated_content_pool_json(
+        r#"{
+            "version": 1,
+            "export_type": "content_pools",
+            "units": [],
+            "skills": [],
+            "items": [
+                {"name": "训练剑", "equipment_slot": "weapon"},
+                {"name": "训练甲", "equipment_slot": "body armor"}
+            ],
+            "random_pools": [{
+                "name": "测试池",
+                "pool": {
+                    "entries": [{
+                        "item": {"name": "奇怪物品", "equipment_slot": "invented_slot"}
+                    }]
+                }
+            }]
+        }"#,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&normalized).unwrap();
+    assert_eq!(
+        value["items"][0]["equipment_slot"],
+        "main_hand"
+    );
+    assert_eq!(
+        value["items"][1]["equipment_slot"],
+        "chest"
+    );
+    assert_eq!(
+        value["random_pools"][0]["pool"]["entries"][0]["item"]["equipment_slot"],
+        "none"
+    );
+
+    let mut manager: crate::napcat::NapcatMessageManager =
+        serde_json::from_str(r#"{"messages":{}}"#).unwrap();
+    let summary = manager.merge_content_pool_bundle_json(&normalized).unwrap();
+    assert_eq!(summary.items, 2);
+    assert_eq!(summary.random_pools, 1);
 }
 
 #[test]
