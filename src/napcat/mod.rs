@@ -415,6 +415,82 @@ pub struct ReplayMessageSnapshot {
     pub position_cells: [i32; 3],
 }
 
+mod replay_snapshots_serde {
+    use serde::{
+        de::Error as _,
+        Deserializer,
+        Serializer,
+    };
+
+    use super::*;
+
+    type ReplaySnapshots = HashMap<String, Vec<Option<ReplayMessageSnapshot>>>;
+    type SparseReplaySnapshots = BTreeMap<String, BTreeMap<String, ReplayMessageSnapshot>>;
+
+    pub fn serialize<S>(snapshots: &ReplaySnapshots, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let sparse = snapshots
+            .iter()
+            .map(|(target_id, snapshots)| {
+                let indexed = snapshots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, snapshot)| {
+                        snapshot.map(|snapshot| (index.to_string(), snapshot))
+                    })
+                    .collect();
+                (target_id.clone(), indexed)
+            })
+            .collect::<SparseReplaySnapshots>();
+        sparse.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ReplaySnapshots, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StoredReplaySnapshots {
+            Sparse(SparseReplaySnapshots),
+            LegacyAligned(ReplaySnapshots),
+        }
+
+        match StoredReplaySnapshots::deserialize(deserializer)? {
+            StoredReplaySnapshots::LegacyAligned(snapshots) => Ok(snapshots),
+            StoredReplaySnapshots::Sparse(sparse) => sparse
+                .into_iter()
+                .map(|(target_id, indexed)| {
+                    let indexed = indexed
+                        .into_iter()
+                        .map(|(index, snapshot)| {
+                            index
+                                .parse::<usize>()
+                                .map(|index| (index, snapshot))
+                                .map_err(|_| {
+                                    D::Error::custom(format!(
+                                        "invalid replay snapshot index {index:?} for target \
+                                         {target_id:?}"
+                                    ))
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut snapshots = Vec::new();
+                    if let Some(max_index) = indexed.iter().map(|(index, _)| *index).max() {
+                        snapshots.resize(max_index + 1, None);
+                    }
+                    for (index, snapshot) in indexed {
+                        snapshots[index] = Some(snapshot);
+                    }
+                    Ok((target_id, snapshots))
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayerAccess {
     pub player_id: u64,
@@ -2955,7 +3031,7 @@ pub struct NapcatMessageManager {
     pub messages: HashMap<String, Vec<NapcatMessage>>,
     /// Message-index-aligned replay metadata. Missing entries are legacy messages whose
     /// historical position must not be guessed.
-    #[serde(default)]
+    #[serde(default, with = "replay_snapshots_serde")]
     pub replay_snapshots: HashMap<String, Vec<Option<ReplayMessageSnapshot>>>,
     #[serde(default)]
     pub chat_targets: HashMap<String, ChatTargetMetadata>,
@@ -9306,6 +9382,80 @@ mod tests {
             item_pool: Vec::new(),
             unit_pool: HashMap::default(),
         }
+    }
+
+    #[test]
+    fn toml_persistence_round_trips_sparse_replay_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("messages.toml");
+        let snapshot = ReplayMessageSnapshot {
+            turn_index: 7,
+            position_cells: [11, 12, 13],
+        };
+        let mut manager = empty_manager();
+        manager
+            .replay_snapshots
+            .insert("2383680235".to_owned(), vec![
+                None,
+                None,
+                Some(snapshot),
+            ]);
+        let persistent = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path.clone())
+            .default(manager)
+            .build()
+            .unwrap();
+
+        persistent.persist().unwrap();
+
+        let encoded = fs::read_to_string(&path).unwrap();
+        assert!(encoded.contains("[replay_snapshots.2383680235.2]"));
+        let restored = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path)
+            .default(empty_manager())
+            .build()
+            .unwrap();
+        assert_eq!(
+            restored.replay_snapshots["2383680235"],
+            vec![None, None, Some(snapshot)]
+        );
+    }
+
+    #[test]
+    fn toml_persistence_loads_legacy_aligned_replay_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("messages.toml");
+        fs::write(
+            &path,
+            r#"
+messages = {}
+
+[[replay_snapshots.2383680235]]
+turn_index = 3
+position_cells = [4, 5, 6]
+"#,
+        )
+        .unwrap();
+
+        let restored = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path)
+            .default(empty_manager())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            restored.replay_snapshots["2383680235"],
+            vec![Some(ReplayMessageSnapshot {
+                turn_index: 3,
+                position_cells: [4, 5, 6],
+            })]
+        );
     }
 
     fn test_message(message_type: NapcatMessageType) -> NapcatMessage {
