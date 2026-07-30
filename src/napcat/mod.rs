@@ -3467,8 +3467,10 @@ impl NapcatMessageManager {
             summary
                 .affected_chat_targets
                 .push(message_target_id.clone());
-            self.read_message_counts
-                .insert(message_target_id.clone(), messages.len());
+            self.read_message_counts.insert(
+                message_target_id.clone(),
+                messages.len(),
+            );
             self.summarized_message_counts.remove(&message_target_id);
         }
 
@@ -6987,7 +6989,10 @@ fn persist_inbound_napcat_message(
     manager: &Persistent<NapcatMessageManager>,
 ) -> Result<(), String> {
     manager.persist().map_err(|err| err.to_string())?;
-    fs::File::open(NAPCAT_MESSAGES_PATH)
+
+    OpenOptions::new()
+        .write(true)
+        .open(NAPCAT_MESSAGES_PATH)
         .and_then(|file| file.sync_all())
         .map_err(|err| err.to_string())
 }
@@ -7008,7 +7013,9 @@ fn persist_inbound_napcat_receipts(
     receipts: &Persistent<InboundMessageReceiptStore>,
 ) -> Result<(), String> {
     receipts.persist().map_err(|err| err.to_string())?;
-    fs::File::open(NAPCAT_INBOUND_RECEIPTS_PATH)
+    OpenOptions::new()
+        .write(true)
+        .open(NAPCAT_INBOUND_RECEIPTS_PATH)
         .and_then(|file| file.sync_all())
         .map_err(|err| err.to_string())
 }
@@ -10009,13 +10016,17 @@ position_cells = [4, 5, 6]
     #[test]
     fn deleting_player_removes_chat_character_and_group_references() {
         let mut manager = empty_manager();
-        manager.chat_targets.insert("2".to_owned(), Default::default());
         manager
-            .chat_target_kinds
-            .insert("2".to_owned(), ChatTargetExportKind::Private);
-        manager
-            .player_characters
-            .insert("2".to_owned(), PlayerCharacter::default());
+            .chat_targets
+            .insert("2".to_owned(), Default::default());
+        manager.chat_target_kinds.insert(
+            "2".to_owned(),
+            ChatTargetExportKind::Private,
+        );
+        manager.player_characters.insert(
+            "2".to_owned(),
+            PlayerCharacter::default(),
+        );
         manager.messages.insert("2".to_owned(), vec![
             test_private_message_from(2, "private"),
         ]);
@@ -10040,49 +10051,51 @@ position_cells = [4, 5, 6]
         manager.open_chat_targets.insert("2".to_owned());
         manager.read_message_counts.insert("2".to_owned(), 1);
         manager.summarized_message_counts.insert("2".to_owned(), 1);
-        manager.trpg_groups.insert("campaign".to_owned(), TrpgGroup {
-            gm_users: HashSet::from([2]),
-            players: vec!["2".to_owned(), "3".to_owned()],
-            parties: HashMap::from([("red".to_owned(), TrpgParty {
+        manager
+            .trpg_groups
+            .insert("campaign".to_owned(), TrpgGroup {
+                gm_users: HashSet::from([2]),
                 players: vec!["2".to_owned(), "3".to_owned()],
-                ..Default::default()
-            })]),
-            player_parties: HashMap::from([("2".to_owned(), "red".to_owned())]),
-            legacy_teams: vec![TrpgLegacyTeam {
-                players: vec!["2".to_owned(), "3".to_owned()],
-                chat_message_count: 2,
-                chat_messages: vec![
-                    TrpgLegacyTeamChatMessage {
-                        sender_id: "2".to_owned(),
-                        ..Default::default()
-                    },
-                    TrpgLegacyTeamChatMessage {
-                        sender_id: "3".to_owned(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            }],
-            legacy_worlds: vec![TrpgLegacyWorld {
-                players: vec!["2".to_owned(), "3".to_owned()],
-                chat_areas: vec![TrpgLegacyArea {
-                    members: vec!["2".to_owned(), "3".to_owned()],
+                parties: HashMap::from([("red".to_owned(), TrpgParty {
+                    players: vec!["2".to_owned(), "3".to_owned()],
+                    ..Default::default()
+                })]),
+                player_parties: HashMap::from([("2".to_owned(), "red".to_owned())]),
+                legacy_teams: vec![TrpgLegacyTeam {
+                    players: vec!["2".to_owned(), "3".to_owned()],
+                    chat_message_count: 2,
+                    chat_messages: vec![
+                        TrpgLegacyTeamChatMessage {
+                            sender_id: "2".to_owned(),
+                            ..Default::default()
+                        },
+                        TrpgLegacyTeamChatMessage {
+                            sender_id: "3".to_owned(),
+                            ..Default::default()
+                        },
+                    ],
                     ..Default::default()
                 }],
+                legacy_worlds: vec![TrpgLegacyWorld {
+                    players: vec!["2".to_owned(), "3".to_owned()],
+                    chat_areas: vec![TrpgLegacyArea {
+                        members: vec!["2".to_owned(), "3".to_owned()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                legacy_send_panes: vec![TrpgLegacySendPane {
+                    targets: vec!["2".to_owned(), "3".to_owned()],
+                    ..Default::default()
+                }],
+                legacy_negative_timers: vec![TrpgLegacyNegativeTimer::for_target("2")],
+                player_turns: HashMap::from([("2".to_owned(), Default::default())]),
+                initial_player_states: HashMap::from([(
+                    "2".to_owned(),
+                    PlayerCharacter::default(),
+                )]),
                 ..Default::default()
-            }],
-            legacy_send_panes: vec![TrpgLegacySendPane {
-                targets: vec!["2".to_owned(), "3".to_owned()],
-                ..Default::default()
-            }],
-            legacy_negative_timers: vec![TrpgLegacyNegativeTimer::for_target("2")],
-            player_turns: HashMap::from([("2".to_owned(), Default::default())]),
-            initial_player_states: HashMap::from([(
-                "2".to_owned(),
-                PlayerCharacter::default(),
-            )]),
-            ..Default::default()
-        });
+            });
 
         let summary = manager.delete_player("2").unwrap();
 
@@ -10093,9 +10106,7 @@ position_cells = [4, 5, 6]
         ]);
         assert_eq!(manager.messages["99"].len(), 1);
         assert_eq!(
-            manager.replay_snapshots["99"][0]
-                .unwrap()
-                .turn_index,
+            manager.replay_snapshots["99"][0].unwrap().turn_index,
             2
         );
         assert!(!manager.chat_targets.contains_key("2"));
@@ -10104,12 +10115,24 @@ position_cells = [4, 5, 6]
         let group = &manager.trpg_groups["campaign"];
         assert_eq!(group.players, vec!["3".to_owned()]);
         assert!(!group.gm_users.contains(&2));
-        assert_eq!(group.parties["red"].players, vec!["3".to_owned()]);
+        assert_eq!(group.parties["red"].players, vec![
+            "3".to_owned()
+        ]);
         assert!(!group.player_parties.contains_key("2"));
-        assert_eq!(group.legacy_teams[0].players, vec!["3".to_owned()]);
-        assert_eq!(group.legacy_teams[0].chat_message_count, 1);
-        assert_eq!(group.legacy_teams[0].chat_messages.len(), 1);
-        assert_eq!(group.legacy_worlds[0].players, vec!["3".to_owned()]);
+        assert_eq!(group.legacy_teams[0].players, vec![
+            "3".to_owned()
+        ]);
+        assert_eq!(
+            group.legacy_teams[0].chat_message_count,
+            1
+        );
+        assert_eq!(
+            group.legacy_teams[0].chat_messages.len(),
+            1
+        );
+        assert_eq!(group.legacy_worlds[0].players, vec![
+            "3".to_owned()
+        ]);
         assert_eq!(
             group.legacy_worlds[0].chat_areas[0].members,
             vec!["3".to_owned()]

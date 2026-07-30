@@ -14,3 +14,4 @@ assets/audio/*
 !assets/audio/.gitkeep
 .codex/skills/willowblossom-trpg-access/references/napcat-docs/
 .codex/skills/willowblossom-trpg-access/references/bevy-0.18.1/
+/.dist

@@ -12,6 +12,11 @@ opt-level = 1
 opt-level = 3 # Improves performance when developing, but slows down first compilation significantly
 debug = false # Disabled debug symbols for dependencies
 
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+
 [features]
 dev = [
     "bevy/file_watcher",    # Enables hot reloading of assets

@@ -424,6 +424,41 @@ struct ReplayFile {
     speaker_voice_settings: HashMap<u64, SpeakerVoiceSettings>,
 }
 
+#[derive(Debug, Clone)]
+struct ReplayGenerationSettings {
+    area_radius_cells: u32,
+    master_speech_speed: f32,
+    master_dialogue_duration: f32,
+    speaker_voice_settings: HashMap<u64, SpeakerVoiceSettings>,
+}
+
+impl ReplayGenerationSettings {
+    fn from_replay(replay: &ReplayFile) -> Self {
+        Self {
+            area_radius_cells: replay.area_radius_cells,
+            master_speech_speed: replay.master_speech_speed,
+            master_dialogue_duration: replay.master_dialogue_duration,
+            speaker_voice_settings: replay.speaker_voice_settings.clone(),
+        }
+    }
+
+    fn apply_to(self, replay: &mut ReplayFile) {
+        replay.area_radius_cells = self.area_radius_cells;
+        replay.master_speech_speed = self.master_speech_speed;
+        replay.master_dialogue_duration = self.master_dialogue_duration;
+        let speaker_ids = replay
+            .dialogue
+            .iter()
+            .map(|line| line.sender_id)
+            .collect::<HashSet<_>>();
+        for (sender_id, settings) in self.speaker_voice_settings {
+            if speaker_ids.contains(&sender_id) {
+                replay.speaker_voice_settings.insert(sender_id, settings);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ReplayScene {
     voxels: Vec<ReplayVoxel>,
@@ -1593,7 +1628,8 @@ fn create_onnx_tts() -> Result<EmotiVoiceTts, String> {
         );
     }
     let cache_root = emotivoice_root().join("worker-cache");
-    fs::create_dir_all(&cache_root).map_err(|err| format!("无法创建 EmotiVoice 缓存目录：{err}"))?;
+    fs::create_dir_all(&cache_root)
+        .map_err(|err| format!("无法创建 EmotiVoice 缓存目录：{err}"))?;
     let cache = tempfile::Builder::new()
         .prefix("worker-")
         .tempdir_in(&cache_root)
@@ -1604,7 +1640,10 @@ fn create_onnx_tts() -> Result<EmotiVoiceTts, String> {
     command
         .arg(emotivoice_worker_path())
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("EMOTIVOICE_SOURCE", emotivoice_source_path())
+        .env(
+            "EMOTIVOICE_SOURCE",
+            emotivoice_source_path(),
+        )
         .env("HF_HUB_OFFLINE", "1")
         .env("TRANSFORMERS_OFFLINE", "1")
         .env("PYTHONUTF8", "1")
@@ -1724,7 +1763,8 @@ impl EmotiVoiceTts {
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
         }
-        let wav = fs::read(&output_path).map_err(|err| format!("无法读取 EmotiVoice WAV：{err}"))?;
+        let wav =
+            fs::read(&output_path).map_err(|err| format!("无法读取 EmotiVoice WAV：{err}"))?;
         let _ = fs::remove_file(&output_path);
         Ok(wav)
     }
@@ -2204,8 +2244,7 @@ fn replay_studio_ui(
         DEFAULT_VOXEL_OCCLUSION_CAST_END_HEIGHT_CELLS,
         |fade| fade.cast_end_height_cells,
     );
-    let mut occlusion_debug_gizmo =
-        occlusion_fade.as_ref().is_some_and(|fade| fade.debug_gizmo);
+    let mut occlusion_debug_gizmo = occlusion_fade.as_ref().is_some_and(|fade| fade.debug_gizmo);
 
     if !capture_active.0 {
         egui::Area::new(egui::Id::new("replay-studio-button"))
@@ -2233,29 +2272,35 @@ fn replay_studio_ui(
             .default_width(390.0)
             .min_width(360.0)
             .max_width(max_window_width)
+            .max_height((ctx.content_rect().height() - 32.0).max(320.0))
             .show(ctx, |ui| {
                 ui.set_max_width(max_window_width);
-                replay_controls(
-                    ui,
-                    &manager,
-                    deepseek_sender.as_deref(),
-                    &mut deepseek_manager,
-                    &mut studio,
-                    &voice_favorites,
-                    &mut player_movement_history,
-                    &speech,
-                    &camera,
-                    &standees,
-                    &mut grids,
-                    &mut windows,
-                    &mut capture_active,
-                    &mut occlusion_opacity,
-                    &mut occlusion_cast_width_cells,
-                    &mut occlusion_cast_height_cells,
-                    &mut occlusion_cast_end_width_cells,
-                    &mut occlusion_cast_end_height_cells,
-                    &mut occlusion_debug_gizmo,
-                )
+                egui::ScrollArea::vertical()
+                    .id_salt("trpg-replay-studio-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        replay_controls(
+                            ui,
+                            &manager,
+                            deepseek_sender.as_deref(),
+                            &mut deepseek_manager,
+                            &mut studio,
+                            &voice_favorites,
+                            &mut player_movement_history,
+                            &speech,
+                            &camera,
+                            &standees,
+                            &mut grids,
+                            &mut windows,
+                            &mut capture_active,
+                            &mut occlusion_opacity,
+                            &mut occlusion_cast_width_cells,
+                            &mut occlusion_cast_height_cells,
+                            &mut occlusion_cast_end_width_cells,
+                            &mut occlusion_cast_end_height_cells,
+                            &mut occlusion_debug_gizmo,
+                        )
+                    });
             });
         studio.panel_open = open;
     }
@@ -2328,218 +2373,227 @@ fn replay_controls(
     ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
     ui.small("DM 使用玩家接管工具时会自动保存移动轨迹，无需先点击“开始录制”；回放生成后录到的新轨迹会在按“播放”时自动追加。");
     ui.separator();
-    ui.horizontal(|ui| {
-        ui.label("发布范围");
-        egui::ComboBox::from_id_salt("replay-audience")
-            .selected_text(studio.audience.label())
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut studio.audience,
-                    ReplayAudience::Public,
-                    "公开",
-                );
-                if let Some(group) = manager.current_group() {
-                    let mut parties = group.parties.keys().cloned().collect::<Vec<_>>();
-                    parties.sort();
-                    for party in parties {
-                        ui.selectable_value(
-                            &mut studio.audience,
-                            ReplayAudience::Party(party.clone()),
-                            format!("队伍：{party}"),
-                        );
+    ui.collapsing("录制、镜头与遮挡设置", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("发布范围");
+            egui::ComboBox::from_id_salt("replay-audience")
+                .selected_text(studio.audience.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut studio.audience,
+                        ReplayAudience::Public,
+                        "公开",
+                    );
+                    if let Some(group) = manager.current_group() {
+                        let mut parties = group.parties.keys().cloned().collect::<Vec<_>>();
+                        parties.sort();
+                        for party in parties {
+                            ui.selectable_value(
+                                &mut studio.audience,
+                                ReplayAudience::Party(party.clone()),
+                                format!("队伍：{party}"),
+                            );
+                        }
+                        let mut players = group
+                            .players
+                            .iter()
+                            .filter_map(|id| id.parse::<u64>().ok())
+                            .collect::<Vec<_>>();
+                        players.sort_unstable();
+                        for player in players {
+                            ui.selectable_value(
+                                &mut studio.audience,
+                                ReplayAudience::Player(player),
+                                format!("玩家：{player}"),
+                            );
+                        }
                     }
-                    let mut players = group
-                        .players
-                        .iter()
-                        .filter_map(|id| id.parse::<u64>().ok())
-                        .collect::<Vec<_>>();
-                    players.sort_unstable();
-                    for player in players {
-                        ui.selectable_value(
-                            &mut studio.audience,
-                            ReplayAudience::Player(player),
-                            format!("玩家：{player}"),
-                        );
-                    }
-                }
-                ui.selectable_value(
-                    &mut studio.audience,
-                    ReplayAudience::All,
-                    "全部 / All（GM 可见的全部内容）",
+                    ui.selectable_value(
+                        &mut studio.audience,
+                        ReplayAudience::All,
+                        "全部 / All（GM 可见的全部内容）",
+                    );
+                });
+        });
+        ui.checkbox(
+            &mut studio.record_camera_enabled,
+            "录制 DM 自由镜头（默认关闭，点击后才采集）",
+        )
+        .on_hover_text("关闭时只记录场景和台词，不持续采集你的镜头移动。");
+        let mut requested_camera_distance = studio.camera_distance_scale;
+        let camera_distance_changed = ui
+            .horizontal(|ui| {
+                ui.label("自动导演镜头距离");
+                ui.add(
+                    egui::DragValue::new(&mut requested_camera_distance)
+                        .speed(0.05)
+                        .range(
+                            MIN_DIRECTED_CAMERA_DISTANCE_SCALE..=MAX_DIRECTED_CAMERA_DISTANCE_SCALE,
+                        )
+                        .fixed_decimals(2)
+                        .suffix("×"),
+                )
+                .on_hover_text("调整自动生成和 DeepSeek 导演镜头与当前说话玩家之间的距离。")
+                .changed()
+            })
+            .inner;
+        if camera_distance_changed {
+            studio.camera_distance_scale =
+                normalized_directed_camera_distance_scale(requested_camera_distance);
+            let camera_distance_scale = studio.camera_distance_scale;
+            if let Some(replay) = studio.replay.as_mut() {
+                let speaker_positions = standee_positions(standees);
+                rescale_replay_camera_distance(
+                    replay,
+                    camera_distance_scale,
+                    &speaker_positions,
                 );
-            });
-    });
-    ui.checkbox(
-        &mut studio.record_camera_enabled,
-        "录制 DM 自由镜头（默认关闭，点击后才采集）",
-    )
-    .on_hover_text("关闭时只记录场景和台词，不持续采集你的镜头移动。");
-    let mut requested_camera_distance = studio.camera_distance_scale;
-    let camera_distance_changed = ui
-        .horizontal(|ui| {
-            ui.label("自动导演镜头距离");
-            ui.add(
-                egui::DragValue::new(&mut requested_camera_distance)
-                    .speed(0.05)
-                    .range(MIN_DIRECTED_CAMERA_DISTANCE_SCALE..=MAX_DIRECTED_CAMERA_DISTANCE_SCALE)
-                    .fixed_decimals(2)
-                    .suffix("×"),
-            )
-            .on_hover_text("调整自动生成和 DeepSeek 导演镜头与当前说话玩家之间的距离。")
-            .changed()
-        })
-        .inner;
-    if camera_distance_changed {
-        studio.camera_distance_scale =
-            normalized_directed_camera_distance_scale(requested_camera_distance);
-        let camera_distance_scale = studio.camera_distance_scale;
-        if let Some(replay) = studio.replay.as_mut() {
-            let speaker_positions = standee_positions(standees);
-            rescale_replay_camera_distance(
-                replay,
-                camera_distance_scale,
-                &speaker_positions,
+            }
+            studio.status = format!(
+                "自动导演镜头距离已设为 {:.2}×",
+                studio.camera_distance_scale
             );
         }
-        studio.status = format!(
-            "自动导演镜头距离已设为 {:.2}×",
-            studio.camera_distance_scale
-        );
-    }
-    let mut requested_camera_yaw = studio.camera_yaw_degrees;
-    let camera_yaw_changed = ui
-        .horizontal(|ui| {
-            ui.label("焦点镜头水平旋转");
-            ui.add(
-                egui::DragValue::new(&mut requested_camera_yaw)
-                    .speed(1.0)
-                    .range(
-                        MIN_DIRECTED_CAMERA_YAW_DEGREES..=MAX_DIRECTED_CAMERA_YAW_DEGREES,
+        let mut requested_camera_yaw = studio.camera_yaw_degrees;
+        let camera_yaw_changed = ui
+            .horizontal(|ui| {
+                ui.label("焦点镜头水平旋转");
+                ui.add(
+                    egui::DragValue::new(&mut requested_camera_yaw)
+                        .speed(1.0)
+                        .range(
+                            MIN_DIRECTED_CAMERA_YAW_DEGREES
+                                ..=MAX_DIRECTED_CAMERA_YAW_DEGREES,
+                        )
+                        .fixed_decimals(1)
+                        .suffix("°"),
+                )
+                .on_hover_text(
+                    "围绕当前焦点水平旋转自动生成和 DeepSeek 导演镜头；镜头仍对准玩家并保持在同一拍摄侧。",
+                )
+                .changed()
+            })
+            .inner;
+        if camera_yaw_changed {
+            let requested_camera_yaw =
+                normalized_directed_camera_yaw_degrees(requested_camera_yaw);
+            let mut applied_camera_yaw = requested_camera_yaw;
+            if let Some(replay) = studio.replay.as_mut() {
+                let speaker_positions = standee_positions(standees);
+                applied_camera_yaw = rotate_replay_camera_yaw(
+                    replay,
+                    requested_camera_yaw,
+                    &speaker_positions,
+                );
+            }
+            studio.camera_yaw_degrees = applied_camera_yaw;
+            studio.status = format!(
+                "焦点镜头水平旋转已设为 {:.1}°",
+                studio.camera_yaw_degrees
+            );
+        }
+        let mut requested_transition_curve = studio.camera_transition_curve;
+        let transition_curve_changed = ui
+            .horizontal(|ui| {
+                ui.label("焦点切换缓动曲线");
+                ui.add(
+                    egui::Slider::new(
+                        &mut requested_transition_curve,
+                        MIN_CAMERA_TRANSITION_CURVE..=MAX_CAMERA_TRANSITION_CURVE,
                     )
-                    .fixed_decimals(1)
-                    .suffix("°"),
-            )
-            .on_hover_text(
-                "围绕当前焦点水平旋转自动生成和 DeepSeek 导演镜头；镜头仍对准玩家并保持在同一拍摄侧。",
-            )
-            .changed()
-        })
-        .inner;
-    if camera_yaw_changed {
-        let requested_camera_yaw = normalized_directed_camera_yaw_degrees(requested_camera_yaw);
-        let mut applied_camera_yaw = requested_camera_yaw;
-        if let Some(replay) = studio.replay.as_mut() {
-            let speaker_positions = standee_positions(standees);
-            applied_camera_yaw = rotate_replay_camera_yaw(
-                replay,
-                requested_camera_yaw,
-                &speaker_positions,
+                    .step_by(0.1)
+                    .fixed_decimals(1),
+                )
+                .on_hover_text("1.0 为匀速；数值越高，切换玩家时镜头起步和停下越柔和。")
+                .changed()
+            })
+            .inner;
+        if transition_curve_changed {
+            studio.camera_transition_curve =
+                normalized_camera_transition_curve(requested_transition_curve);
+            if let Some(replay) = studio.replay.as_mut() {
+                replay.camera_transition_curve = studio.camera_transition_curve;
+            }
+            studio.status = format!(
+                "焦点切换缓动曲线已设为 {:.1}",
+                studio.camera_transition_curve
             );
         }
-        studio.camera_yaw_degrees = applied_camera_yaw;
-        studio.status = format!(
-            "焦点镜头水平旋转已设为 {:.1}°",
-            studio.camera_yaw_degrees
-        );
-    }
-    let mut requested_transition_curve = studio.camera_transition_curve;
-    let transition_curve_changed = ui
-        .horizontal(|ui| {
-            ui.label("焦点切换缓动曲线");
-            ui.add(
-                egui::Slider::new(
-                    &mut requested_transition_curve,
-                    MIN_CAMERA_TRANSITION_CURVE..=MAX_CAMERA_TRANSITION_CURVE,
+        let mut requested_player_movement_curve = studio.player_movement_curve;
+        let player_movement_curve_changed = ui
+            .horizontal(|ui| {
+                ui.label("玩家移动平滑曲线");
+                ui.add(
+                    egui::Slider::new(
+                        &mut requested_player_movement_curve,
+                        MIN_PLAYER_MOVEMENT_CURVE..=MAX_PLAYER_MOVEMENT_CURVE,
+                    )
+                    .step_by(0.05)
+                    .fixed_decimals(2),
                 )
-                .step_by(0.1)
-                .fixed_decimals(1),
-            )
-            .on_hover_text("1.0 为匀速；数值越高，切换玩家时镜头起步和停下越柔和。")
-            .changed()
-        })
-        .inner;
-    if transition_curve_changed {
-        studio.camera_transition_curve =
-            normalized_camera_transition_curve(requested_transition_curve);
-        if let Some(replay) = studio.replay.as_mut() {
-            replay.camera_transition_curve = studio.camera_transition_curve;
+                .on_hover_text("0 为逐点直线移动；1 为最平滑的轨迹曲线。")
+                .changed()
+            })
+            .inner;
+        if player_movement_curve_changed {
+            studio.player_movement_curve =
+                normalized_player_movement_curve(requested_player_movement_curve);
+            if let Some(replay) = studio.replay.as_mut() {
+                replay.player_movement_curve = studio.player_movement_curve;
+            }
+            studio.status = format!(
+                "玩家移动平滑曲线已设为 {:.2}",
+                studio.player_movement_curve
+            );
         }
-        studio.status = format!(
-            "焦点切换缓动曲线已设为 {:.1}",
-            studio.camera_transition_curve
-        );
-    }
-    let mut requested_player_movement_curve = studio.player_movement_curve;
-    let player_movement_curve_changed = ui
-        .horizontal(|ui| {
-            ui.label("玩家移动平滑曲线");
-            ui.add(
-                egui::Slider::new(
-                    &mut requested_player_movement_curve,
-                    MIN_PLAYER_MOVEMENT_CURVE..=MAX_PLAYER_MOVEMENT_CURVE,
-                )
-                .step_by(0.05)
+        ui.add(
+            egui::Slider::new(
+                occlusion_cast_width_cells,
+                MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+            )
+            .text("镜头端宽度（体素）")
+            .integer(),
+        )
+        .on_hover_text("射线方盒在回放镜头位置的起始宽度。");
+        ui.add(
+            egui::Slider::new(
+                occlusion_cast_height_cells,
+                MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+            )
+            .text("镜头端高度（体素）")
+            .integer(),
+        )
+        .on_hover_text("射线方盒在回放镜头位置的起始高度。");
+        ui.add(
+            egui::Slider::new(
+                occlusion_cast_end_width_cells,
+                MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+            )
+            .text("玩家端宽度（体素）")
+            .integer(),
+        )
+        .on_hover_text("方盒沿距离线性缩小，在玩家目标位置达到此宽度。");
+        ui.add(
+            egui::Slider::new(
+                occlusion_cast_end_height_cells,
+                MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+            )
+            .text("玩家端高度（体素）")
+            .integer(),
+        )
+        .on_hover_text("方盒沿距离线性缩小，在玩家目标位置达到此高度。");
+        ui.add(
+            egui::Slider::new(occlusion_opacity, 0.0..=1.0)
+                .text("方盒内体素不透明度")
                 .fixed_decimals(2),
-            )
-            .on_hover_text("0 为逐点直线移动；1 为最平滑的轨迹曲线。")
-            .changed()
-        })
-        .inner;
-    if player_movement_curve_changed {
-        studio.player_movement_curve =
-            normalized_player_movement_curve(requested_player_movement_curve);
-        if let Some(replay) = studio.replay.as_mut() {
-            replay.player_movement_curve = studio.player_movement_curve;
-        }
-        studio.status = format!(
-            "玩家移动平滑曲线已设为 {:.2}",
-            studio.player_movement_curve
-        );
-    }
-    ui.add(
-        egui::Slider::new(
-            occlusion_cast_width_cells,
-            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
         )
-        .text("镜头端宽度（体素）")
-        .integer(),
-    )
-    .on_hover_text("射线方盒在回放镜头位置的起始宽度。");
-    ui.add(
-        egui::Slider::new(
-            occlusion_cast_height_cells,
-            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
+        .on_hover_text("0 为完全透明，1 为完全不透明；中间值使用真实半透明混合。");
+        ui.checkbox(
+            occlusion_debug_gizmo,
+            "显示剔除射线调试框",
         )
-        .text("镜头端高度（体素）")
-        .integer(),
-    )
-    .on_hover_text("射线方盒在回放镜头位置的起始高度。");
-    ui.add(
-        egui::Slider::new(
-            occlusion_cast_end_width_cells,
-            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
-        )
-        .text("玩家端宽度（体素）")
-        .integer(),
-    )
-    .on_hover_text("方盒沿距离线性缩小，在玩家目标位置达到此宽度。");
-    ui.add(
-        egui::Slider::new(
-            occlusion_cast_end_height_cells,
-            MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS..=MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS,
-        )
-        .text("玩家端高度（体素）")
-        .integer(),
-    )
-    .on_hover_text("方盒沿距离线性缩小，在玩家目标位置达到此高度。");
-    ui.add(
-        egui::Slider::new(occlusion_opacity, 0.0..=1.0)
-            .text("方盒内体素不透明度")
-            .fixed_decimals(2),
-    )
-    .on_hover_text("0 为完全透明，1 为完全不透明；中间值使用真实半透明混合。");
-    ui.checkbox(occlusion_debug_gizmo, "显示剔除射线调试框")
         .on_hover_text("显示镜头到每名玩家的中心线和宽高方盒。");
+    });
 
     ui.horizontal(|ui| match studio.mode {
         ReplayMode::Recording => {
@@ -2552,15 +2606,28 @@ fn replay_controls(
             }
         },
         ReplayMode::Playing | ReplayMode::Paused => {
+            let completed = replay_has_completed(studio);
             if ui
-                .button(if studio.mode == ReplayMode::Playing { "暂停" } else { "继续" })
+                .button(if studio.mode == ReplayMode::Playing {
+                    "暂停"
+                } else if completed {
+                    "重播"
+                } else {
+                    "继续"
+                })
                 .clicked()
             {
                 studio.mode = if studio.mode == ReplayMode::Playing {
                     ReplayMode::Paused
                 } else {
+                    if completed {
+                        studio.playback_ms = 0;
+                    }
                     ReplayMode::Playing
                 };
+                if studio.mode == ReplayMode::Playing {
+                    studio.status = REPLAY_PLAYING_STATUS.to_owned();
+                }
             }
             if ui.button("停止回放").clicked() {
                 stop_playback(studio, grids);
@@ -2601,7 +2668,12 @@ fn replay_controls(
         ));
     }
     replay_dialogue_editor(ui, studio, camera);
-    replay_movement_timing_editor(ui, studio, player_movement_history, camera);
+    replay_movement_timing_editor(
+        ui,
+        studio,
+        player_movement_history,
+        camera,
+    );
     if !matches!(studio.mode, ReplayMode::Recording) && studio.replay.is_some() {
         let duration = studio.replay.as_ref().unwrap().duration_ms.max(1);
         ui.horizontal(|ui| {
@@ -2652,7 +2724,7 @@ fn replay_controls(
     }
 
     ui.separator();
-    ui.heading("DeepSeek 视频导演");
+    ui.collapsing("DeepSeek 视频导演", |ui| {
     ui.small("DeepSeek 可直接润色当前发布范围内且场景中有立牌的玩家台词，并为每句选择固定构图或缓慢推拉。三人及以上时，本地镜头会优先放在队伍正面的中央位置，避免从侧面拍摄时角色互相遮挡；镜头只平滑移动位置，不环绕角色。它还会生成只供 EmotiVoice 使用的中文谐音读法，画面字幕仍显示正常原文。不会读取其他队伍的隐藏内容，也不得新增剧情事实。");
     let visible_standees = standees
         .iter()
@@ -2844,9 +2916,11 @@ fn replay_controls(
     ui.small(
         "较长回放会自动分批交给 DeepSeek，再按原台词顺序合并；单个批次若被截断会继续拆分重试。",
     );
+    });
 
     ui.separator();
     ui.heading("导出 MP4 视频");
+    ui.collapsing("视频、背景音乐与角色语音设置", |ui| {
     ui.label("视频路径");
     ui.text_edit_singleline(&mut studio.video_path);
     ui.horizontal(|ui| {
@@ -3013,6 +3087,7 @@ fn replay_controls(
             format_time(replay.duration_ms)
         ));
     }
+    });
     let can_export_video = studio.replay.is_some()
         && studio.video_encoding.is_none()
         && studio.mode != ReplayMode::Recording;
@@ -3520,6 +3595,11 @@ fn build_from_history(
         studio.status = "请先选择跑团组（战役）".to_owned();
         return;
     };
+    let previous_settings = studio
+        .replay
+        .as_ref()
+        .map(ReplayGenerationSettings::from_replay);
+    let retained_previous_settings = previous_settings.is_some();
     let scene = grids
         .single_mut()
         .map(|grid| capture_scene(&grid))
@@ -3590,6 +3670,9 @@ fn build_from_history(
     deduplicate_broadcast_dialogue(&mut replay.dialogue, manager);
     assign_replay_line_ids(&mut replay.dialogue);
     let favorite_count = apply_favorite_voice_settings(&mut replay, voice_favorites);
+    if let Some(settings) = previous_settings {
+        settings.apply_to(&mut replay);
+    }
     auto_group_replay_areas(&mut replay);
     rebuild_area_blocks(&mut replay);
     replay.duration_ms = compile_area_block_timeline(&mut replay);
@@ -3637,8 +3720,13 @@ fn build_from_history(
     } else {
         format!("；已自动应用 {favorite_count} 个角色的语音收藏")
     };
+    let retained_settings_status = if retained_previous_settings {
+        "；已保留当前回放的语速、台词停留和角色语音设置"
+    } else {
+        ""
+    };
     studio.status = format!(
-        "已生成 {dialogue_count} 句区域回放台词和 {movement_frame_count} 帧接管移动；其中 {estimated_count} 句旧消息使用当前立牌位置或原点估算，可由 DM 编辑{favorite_status}"
+        "已生成 {dialogue_count} 句区域回放台词和 {movement_frame_count} 帧接管移动；其中 {estimated_count} 句旧消息使用当前立牌位置或原点估算，可由 DM 编辑{favorite_status}{retained_settings_status}"
     );
 }
 
@@ -4044,6 +4132,14 @@ fn start_playback(
     studio.playback_ms = 0;
     studio.mode = ReplayMode::Playing;
     studio.status = REPLAY_PLAYING_STATUS.to_owned();
+}
+
+fn replay_has_completed(studio: &ReplayStudio) -> bool {
+    studio.mode == ReplayMode::Paused
+        && studio
+            .replay
+            .as_ref()
+            .is_some_and(|replay| studio.playback_ms >= replay.duration_ms)
 }
 
 fn append_dm_replay_dialogue(replay: &mut ReplayFile) -> u64 {
@@ -6882,7 +6978,10 @@ fn turn_based_camera_track(
                     &focused,
                 ));
             } else {
-                frames.push(camera_keyframe(line.time_ms.saturating_sub(1), &current));
+                frames.push(camera_keyframe(
+                    line.time_ms.saturating_sub(1),
+                    &current,
+                ));
                 frames.push(camera_keyframe(line.time_ms, &focused));
             }
             frames.push(camera_keyframe(line_end, &settled));
@@ -6982,7 +7081,10 @@ fn director_camera_track(
                 &arrival,
             ));
         } else {
-            frames.push(camera_keyframe(line.time_ms.saturating_sub(1), &current));
+            frames.push(camera_keyframe(
+                line.time_ms.saturating_sub(1),
+                &current,
+            ));
             frames.push(camera_keyframe(line.time_ms, &arrival));
         }
         frames.push(camera_keyframe(line_end, &settled));
@@ -7113,8 +7215,7 @@ impl DirectedCameraRig {
             if !line.included {
                 continue;
             }
-            let Some(position) =
-                replay_dialogue_focus_position(dialogue, index, speaker_positions)
+            let Some(position) = replay_dialogue_focus_position(dialogue, index, speaker_positions)
             else {
                 continue;
             };
@@ -7139,8 +7240,7 @@ impl DirectedCameraRig {
         let first = composition_subjects.first().copied();
         let second = composition_subjects.get(1).copied();
         let composition_origin = (!composition_subjects.is_empty()).then(|| {
-            composition_subjects.iter().copied().sum::<Vec3>()
-                / composition_subjects.len() as f32
+            composition_subjects.iter().copied().sum::<Vec3>() / composition_subjects.len() as f32
         });
         let (axis_origin, mut camera_side) = match (first, second) {
             (Some(first), Some(second)) => {
@@ -7201,13 +7301,13 @@ impl DirectedCameraRig {
             DirectorShot::SpeakerWide => 2.1,
             DirectorShot::Establishing | DirectorShot::Environment => 3.2,
         } * self.distance_scale;
-        let camera_anchor = if self.subject_count >= 3 {
-            self.axis_origin
-        } else {
-            target
-        };
-        let static_position =
-            self.visible_position(camera_anchor, base_distance, height, obstacles);
+        let camera_anchor = if self.subject_count >= 3 { self.axis_origin } else { target };
+        let static_position = self.visible_position(
+            camera_anchor,
+            base_distance,
+            height,
+            obstacles,
+        );
         let dolly_axis = (static_position - target).normalize();
         let desired_position =
             static_position + dolly_axis * (distance_delta * self.distance_scale);
@@ -8455,8 +8555,7 @@ mod tests {
             &ReplayCameraObstacles::default(),
         );
 
-        let shot =
-            frame_transform(frames.iter().find(|frame| frame.time_ms == 1_000).unwrap());
+        let shot = frame_transform(frames.iter().find(|frame| frame.time_ms == 1_000).unwrap());
         let forward = shot.rotation * Vec3::NEG_Z;
         assert!(
             forward.dot((target - shot.translation).normalize()) > 0.99,
@@ -8508,10 +8607,17 @@ mod tests {
             },
         ];
 
-        assert!(move_replay_dialogue(&mut replay, 1, 3, true));
+        assert!(move_replay_dialogue(
+            &mut replay,
+            1,
+            3,
+            true
+        ));
 
         assert_eq!(replay.area_blocks[0].line_ids, vec![2]);
-        assert_eq!(replay.area_blocks[1].line_ids, vec![3, 1]);
+        assert_eq!(replay.area_blocks[1].line_ids, vec![
+            3, 1
+        ]);
         assert_eq!(
             replay
                 .dialogue
@@ -8576,11 +8682,16 @@ mod tests {
         assert_eq!(line_id, 5);
         assert_eq!(added.name, "DM");
         assert!(added.text.is_empty());
-        assert_eq!(added.visibility, Visibility::Party("split-a".to_owned()));
+        assert_eq!(
+            added.visibility,
+            Visibility::Party("split-a".to_owned())
+        );
         assert_eq!(added.camera_focus_id, Some(77));
         assert_eq!(added.turn_index, 3);
         assert_eq!(added.position_cells, [8, 4, -12]);
-        assert_eq!(replay.area_blocks[0].line_ids, vec![4, 5]);
+        assert_eq!(replay.area_blocks[0].line_ids, vec![
+            4, 5
+        ]);
     }
 
     #[test]
@@ -8886,16 +8997,21 @@ mod tests {
         let encoded = serde_json::to_string(&history).unwrap();
         let restored: ReplayPlayerMovementHistory = serde_json::from_str(&encoded).unwrap();
 
-        let first_build = replay_player_movements_from_history(
-            &restored,
-            "campaign",
-            &[player.clone(), gm.clone()],
-        );
+        let first_build = replay_player_movements_from_history(&restored, "campaign", &[
+            player.clone(),
+            gm.clone(),
+        ]);
         let second_build =
             replay_player_movements_from_history(&restored, "campaign", &[player, gm]);
 
-        assert_eq!(first_build[0].keyframes[0].time_ms, 3_400);
-        assert_eq!(first_build[0].keyframes[1].time_ms, 4_400);
+        assert_eq!(
+            first_build[0].keyframes[0].time_ms,
+            3_400
+        );
+        assert_eq!(
+            first_build[0].keyframes[1].time_ms,
+            4_400
+        );
         assert_eq!(
             first_build[0]
                 .keyframes
@@ -8932,7 +9048,10 @@ mod tests {
             1
         );
         assert_eq!(history.sessions.len(), 1);
-        assert_eq!(history.sessions[0].campaign_id, "campaign-b");
+        assert_eq!(
+            history.sessions[0].campaign_id,
+            "campaign-b"
+        );
     }
 
     #[test]
@@ -9109,11 +9228,7 @@ mod tests {
 
         app.update();
 
-        let transform = app
-            .world()
-            .entity(standee)
-            .get::<Transform>()
-            .unwrap();
+        let transform = app.world().entity(standee).get::<Transform>().unwrap();
         let toward_camera = horizontal(camera.translation - transform.translation).normalize();
         assert!((transform.rotation * Vec3::NEG_Z).dot(toward_camera) > 0.9999);
         assert!((transform.rotation * Vec3::Z).dot(toward_camera) < -0.9999);
@@ -9372,8 +9487,7 @@ mod tests {
         assert!(directions[0].dot(directions[1]) < 0.99);
         assert!(directions[1].dot(directions[2]) < 0.99);
         assert!(
-            (shot.rotation * Vec3::NEG_Z)
-                .dot((positions[&3] - shot.translation).normalize())
+            (shot.rotation * Vec3::NEG_Z).dot((positions[&3] - shot.translation).normalize())
                 > 0.999
         );
     }
@@ -9429,13 +9543,11 @@ mod tests {
         let after = frame_transform(after);
         assert!(before.translation.distance(after.translation) > 1.0);
         assert!(
-            (before.rotation * Vec3::NEG_Z)
-                .dot((positions[&1] - before.translation).normalize())
+            (before.rotation * Vec3::NEG_Z).dot((positions[&1] - before.translation).normalize())
                 > 0.999
         );
         assert!(
-            (after.rotation * Vec3::NEG_Z)
-                .dot((positions[&2] - after.translation).normalize())
+            (after.rotation * Vec3::NEG_Z).dot((positions[&2] - after.translation).normalize())
                 > 0.999
         );
     }
@@ -9956,6 +10068,60 @@ mod tests {
         let studio = ReplayStudio::default();
         assert_eq!(studio.music_volume, 0.65);
         assert_eq!(studio.speech_volume, 1.25);
+    }
+
+    #[test]
+    fn completed_replay_is_distinct_from_mid_replay_pause() {
+        let mut studio = ReplayStudio::default();
+        let mut replay = test_replay(Vec::new());
+        replay.duration_ms = 10_000;
+        studio.replay = Some(replay);
+        studio.mode = ReplayMode::Paused;
+        studio.playback_ms = 9_999;
+        assert!(!replay_has_completed(&studio));
+
+        studio.playback_ms = 10_000;
+        assert!(replay_has_completed(&studio));
+    }
+
+    #[test]
+    fn regenerated_replay_inherits_project_and_matching_voice_settings() {
+        let retained_voice = test_voice_settings("9000", 42);
+        let removed_voice = test_voice_settings("65", -12);
+        let mut previous = test_replay(vec![test_dialogue_for_speaker(7)]);
+        previous.area_radius_cells = 24;
+        previous.master_speech_speed = 1.75;
+        previous.master_dialogue_duration = 2.25;
+        previous
+            .speaker_voice_settings
+            .insert(7, retained_voice.clone());
+        previous.speaker_voice_settings.insert(99, removed_voice);
+
+        let mut regenerated = test_replay(vec![
+            test_dialogue_for_speaker(7),
+            test_dialogue_for_speaker(8),
+        ]);
+        let new_voice = test_voice_settings("1001", 10);
+        regenerated
+            .speaker_voice_settings
+            .insert(8, new_voice.clone());
+        ReplayGenerationSettings::from_replay(&previous).apply_to(&mut regenerated);
+
+        assert_eq!(regenerated.area_radius_cells, 24);
+        assert_eq!(regenerated.master_speech_speed, 1.75);
+        assert_eq!(
+            regenerated.master_dialogue_duration,
+            2.25
+        );
+        assert_eq!(
+            regenerated.speaker_voice_settings.get(&7),
+            Some(&retained_voice)
+        );
+        assert_eq!(
+            regenerated.speaker_voice_settings.get(&8),
+            Some(&new_voice)
+        );
+        assert!(!regenerated.speaker_voice_settings.contains_key(&99));
     }
 
     #[test]
