@@ -1,17 +1,28 @@
+mod receipts;
+
 use std::{
     collections::{
         hash_map::DefaultHasher,
+        BTreeMap,
         HashMap,
         HashSet,
     },
-    fs,
+    fs::{
+        self,
+        OpenOptions,
+    },
     hash::{
         Hash,
         Hasher,
     },
+    io::Write,
     path::{
         Path,
         PathBuf,
+    },
+    sync::{
+        Arc,
+        Mutex,
     },
     thread,
     time::{
@@ -35,6 +46,10 @@ use futures_util::{
     StreamExt,
 };
 use rand::RngExt;
+use receipts::{
+    InboundMessageReceiptStore,
+    NAPCAT_INBOUND_RECEIPTS_PATH,
+};
 use serde::{
     Deserialize,
     Serialize,
@@ -78,6 +93,7 @@ use crate::{
         DamageType,
     },
     scene::{
+        SceneCaptureKind,
         SceneCaptureRequest,
         SceneCaptureRequests,
         SceneCharacterPositions,
@@ -92,7 +108,23 @@ pub enum ConnectionState {
 }
 
 #[derive(Resource)]
-struct NapcatIOReceiver(CBReceiver<Message>);
+struct NapcatIOReceiver(CBReceiver<NapcatInboundEnvelope>);
+
+#[derive(Resource, Clone)]
+struct NapcatInboundJournal(Arc<Mutex<InboundMessageJournal>>);
+
+#[derive(Debug)]
+struct NapcatInboundEnvelope {
+    message: Message,
+    journal_id: Option<u64>,
+    origin: NapcatInboundOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NapcatInboundOrigin {
+    Live,
+    JournalReplay,
+}
 
 #[derive(Resource)]
 struct NapcatSendResultReceiver(CBReceiver<NapcatSendResult>);
@@ -109,6 +141,148 @@ pub struct NapcatOutboundMessage {
 
 const NAPCAT_RESPONSE_ECHO_PREFIX: &str = "willowblossom:";
 const NAPCAT_ACTION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const NAPCAT_MESSAGES_PATH: &str = ".data/willowblossom/messages.toml";
+const NAPCAT_INBOUND_JOURNAL_PATH: &str = ".data/willowblossom/inbound_messages.jsonl";
+const PLAYER_CHAT_WINDOW_COLOR_PALETTE: [[u8; 3]; 16] = [
+    [239, 68, 68],
+    [249, 115, 22],
+    [245, 158, 11],
+    [132, 204, 22],
+    [34, 197, 94],
+    [16, 185, 129],
+    [20, 184, 166],
+    [6, 182, 212],
+    [14, 165, 233],
+    [59, 130, 246],
+    [99, 102, 241],
+    [139, 92, 246],
+    [168, 85, 247],
+    [217, 70, 239],
+    [236, 72, 153],
+    [244, 63, 94],
+];
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InboundMessageJournalRecord {
+    Message { id: u64, payload: String },
+    Ack { id: u64 },
+}
+
+#[derive(Debug)]
+struct InboundMessageJournal {
+    path: PathBuf,
+    next_id: u64,
+    pending_ids: HashSet<u64>,
+}
+
+impl InboundMessageJournal {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            next_id: 1,
+            pending_ids: HashSet::new(),
+        }
+    }
+
+    fn load_pending(&mut self) -> Result<Vec<(u64, String)>, String> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.to_string()),
+        };
+        let complete_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or_default();
+        if complete_len < bytes.len() {
+            OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .and_then(|file| file.set_len(complete_len as u64))
+                .map_err(|err| err.to_string())?;
+        }
+
+        let mut pending = BTreeMap::new();
+        let mut highest_id = 0_u64;
+        for (line_index, line) in bytes[..complete_len]
+            .split(|byte| *byte == b'\n')
+            .enumerate()
+        {
+            if line.is_empty() {
+                continue;
+            }
+            let record = match serde_json::from_slice::<InboundMessageJournalRecord>(line) {
+                Ok(record) => record,
+                Err(err) => {
+                    eprintln!(
+                        "ignored invalid NapCat inbound journal line {}: {err}",
+                        line_index + 1
+                    );
+                    continue;
+                },
+            };
+            match record {
+                InboundMessageJournalRecord::Message { id, payload } => {
+                    highest_id = highest_id.max(id);
+                    pending.insert(id, payload);
+                },
+                InboundMessageJournalRecord::Ack { id } => {
+                    highest_id = highest_id.max(id);
+                    pending.remove(&id);
+                },
+            }
+        }
+        self.next_id = highest_id.saturating_add(1).max(1);
+        self.pending_ids = pending.keys().copied().collect();
+        if pending.is_empty() && complete_len > 0 {
+            self.clear()?;
+        }
+        Ok(pending.into_iter().collect())
+    }
+
+    fn append_message(&mut self, payload: String) -> Result<u64, String> {
+        let id = self.next_id;
+        self.append_record(&InboundMessageJournalRecord::Message { id, payload })?;
+        self.next_id = self.next_id.saturating_add(1).max(1);
+        self.pending_ids.insert(id);
+        Ok(id)
+    }
+
+    fn acknowledge(&mut self, id: u64) -> Result<(), String> {
+        self.append_record(&InboundMessageJournalRecord::Ack { id })?;
+        self.pending_ids.remove(&id);
+        if self.pending_ids.is_empty() {
+            self.clear()?;
+        }
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), String> {
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .map_err(|err| err.to_string())?;
+        file.sync_all().map_err(|err| err.to_string())
+    }
+
+    fn append_record(&self, record: &InboundMessageJournalRecord) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|err| err.to_string())?;
+        serde_json::to_writer(&mut file, record).map_err(|err| err.to_string())?;
+        file.write_all(b"\n").map_err(|err| err.to_string())?;
+        file.flush().map_err(|err| err.to_string())?;
+        file.sync_data().map_err(|err| err.to_string())
+    }
+}
 
 #[derive(Debug)]
 struct PendingNapcatRequest {
@@ -139,6 +313,7 @@ struct NapcatAutomaticReplyRequests {
 struct PendingAutomaticPrivateReply {
     recipient_id: u64,
     text: String,
+    forwarded: Option<ForwardedAttribution>,
 }
 
 #[derive(Resource)]
@@ -159,6 +334,15 @@ pub struct NapcatMessage {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TextData {
     pub text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ForwardedReplayData {
+    pub sender_id: u64,
+    pub sender_name: String,
+    pub text: String,
+    #[serde(default)]
+    pub source_time: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -191,6 +375,9 @@ pub enum NapcatMessageChainType {
     Source(Source),
     Text {
         data: TextData,
+    },
+    ForwardedReplay {
+        data: ForwardedReplayData,
     },
     Image {
         data: ImageData,
@@ -251,6 +438,89 @@ pub struct CampaignMessage {
     pub visibility: Visibility,
     pub text: String,
     pub time: u64,
+    pub forwarded: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayMessageSnapshot {
+    pub turn_index: u32,
+    pub position_cells: [i32; 3],
+}
+
+mod replay_snapshots_serde {
+    use serde::{
+        de::Error as _,
+        Deserializer,
+        Serializer,
+    };
+
+    use super::*;
+
+    type ReplaySnapshots = HashMap<String, Vec<Option<ReplayMessageSnapshot>>>;
+    type SparseReplaySnapshots = BTreeMap<String, BTreeMap<String, ReplayMessageSnapshot>>;
+
+    pub fn serialize<S>(snapshots: &ReplaySnapshots, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let sparse = snapshots
+            .iter()
+            .map(|(target_id, snapshots)| {
+                let indexed = snapshots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, snapshot)| {
+                        snapshot.map(|snapshot| (index.to_string(), snapshot))
+                    })
+                    .collect();
+                (target_id.clone(), indexed)
+            })
+            .collect::<SparseReplaySnapshots>();
+        sparse.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ReplaySnapshots, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StoredReplaySnapshots {
+            Sparse(SparseReplaySnapshots),
+            LegacyAligned(ReplaySnapshots),
+        }
+
+        match StoredReplaySnapshots::deserialize(deserializer)? {
+            StoredReplaySnapshots::LegacyAligned(snapshots) => Ok(snapshots),
+            StoredReplaySnapshots::Sparse(sparse) => sparse
+                .into_iter()
+                .map(|(target_id, indexed)| {
+                    let indexed = indexed
+                        .into_iter()
+                        .map(|(index, snapshot)| {
+                            index
+                                .parse::<usize>()
+                                .map(|index| (index, snapshot))
+                                .map_err(|_| {
+                                    D::Error::custom(format!(
+                                        "invalid replay snapshot index {index:?} for target \
+                                         {target_id:?}"
+                                    ))
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut snapshots = Vec::new();
+                    if let Some(max_index) = indexed.iter().map(|(index, _)| *index).max() {
+                        snapshots.resize(max_index + 1, None);
+                    }
+                    for (index, snapshot) in indexed {
+                        snapshots[index] = Some(snapshot);
+                    }
+                    Ok((target_id, snapshots))
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -258,6 +528,7 @@ pub struct PlayerAccess {
     pub player_id: u64,
     pub character_id: Option<String>,
     pub party_id: Option<String>,
+    pub party_ids: Vec<String>,
     pub is_gm: bool,
 }
 
@@ -269,7 +540,13 @@ impl PlayerAccess {
 
         match visibility {
             Visibility::Public => true,
-            Visibility::Party(party_id) => self.party_id.as_deref() == Some(party_id.as_str()),
+            Visibility::Party(party_id) => {
+                self.party_id.as_deref() == Some(party_id.as_str())
+                    || self
+                        .party_ids
+                        .iter()
+                        .any(|visible_id| visible_id == party_id)
+            },
             Visibility::Player(player_id) => self.player_id == *player_id,
             Visibility::Gm | Visibility::System => false,
         }
@@ -301,6 +578,8 @@ where
 pub struct NapcatMessageData {
     pub time: u64,
     pub message_type: NapcatMessageType,
+    #[serde(default)]
+    pub message_id: Option<i64>,
     #[serde(deserialize_with = "deserialize_message_chains")]
     pub message: Vec<NapcatMessageChain>,
     pub self_id: u64,
@@ -334,6 +613,9 @@ pub struct ChatTargetMetadata {
     pub display_name: String,
     #[serde(default)]
     pub automatic_name: String,
+    /// Stable player accent stored with the chat target so restarts keep the same color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_window_color_rgb: Option<[u8; 3]>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -407,6 +689,9 @@ pub enum EquipmentSlot {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct InventoryItem {
+    /// GM-defined logical pool. Empty values are treated as uncategorized.
+    #[serde(default)]
+    pub category: String,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -427,6 +712,37 @@ pub struct InventoryItem {
     pub soulbound: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stat_effects: Vec<BuffEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<InventoryItemSkill>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct InventoryItemSkill {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub mp_cost: f32,
+    #[serde(default)]
+    pub cooldown_turns: u32,
+    #[serde(default)]
+    pub metadata: CharacterSkillMetadata,
+    #[serde(default)]
+    pub consume_item: bool,
+}
+
+impl Default for InventoryItemSkill {
+    fn default() -> Self {
+        Self {
+            name: "新技能".to_owned(),
+            note: String::new(),
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            metadata: CharacterSkillMetadata::default(),
+            consume_item: false,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -436,11 +752,13 @@ pub enum CharacterHotbarSlot {
     Empty,
     Item(usize),
     Skill(usize),
+    ReleaseControl,
 }
 
 impl Default for InventoryItem {
     fn default() -> Self {
         Self {
+            category: String::new(),
             name: String::new(),
             description: String::new(),
             icon: String::new(),
@@ -451,6 +769,7 @@ impl Default for InventoryItem {
             item_level: 0,
             soulbound: false,
             stat_effects: Vec::new(),
+            skills: Vec::new(),
         }
     }
 }
@@ -545,6 +864,9 @@ impl Default for RandomPoolCheckedResult {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct RandomPool {
+    /// GM-defined logical pool. Empty values are treated as uncategorized.
+    #[serde(default)]
+    pub category: String,
     #[serde(default)]
     pub entries: Vec<RandomPoolEntry>,
     #[serde(default)]
@@ -565,8 +887,32 @@ pub struct RandomPool {
     pub checked_results: Vec<RandomPoolCheckedResult>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitRarity {
+    #[default]
+    Normal,
+    Rare,
+    Elite,
+    RareElite,
+}
+
+impl UnitRarity {
+    pub fn experience_multiplier(self) -> f32 {
+        match self {
+            Self::Normal => 1.0,
+            Self::Rare => 1.5,
+            Self::Elite => 2.0,
+            Self::RareElite => 3.0,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UnitPoolEntry {
+    /// GM-defined logical pool. Empty values are treated as uncategorized.
+    #[serde(default)]
+    pub category: String,
     #[serde(default)]
     pub label: String,
     #[serde(default)]
@@ -574,15 +920,23 @@ pub struct UnitPoolEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_member_id: Option<String>,
     #[serde(default)]
+    pub rarity: UnitRarity,
+    /// Unmodified per-hit damage used for threat/experience valuation and PvE scaling.
+    #[serde(default)]
+    pub base_damage: f32,
+    #[serde(default)]
     pub character: PlayerCharacter,
 }
 
 impl Default for UnitPoolEntry {
     fn default() -> Self {
         Self {
+            category: String::new(),
             label: "新单位".to_owned(),
             note: String::new(),
             legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
             character: PlayerCharacter::default(),
         }
     }
@@ -1177,7 +1531,11 @@ fn default_item_max_stack() -> u32 { 1 }
 
 fn default_bag_slots() -> usize { 16 }
 
-fn default_character_hotbar() -> Vec<CharacterHotbarSlot> { vec![CharacterHotbarSlot::Empty; 9] }
+fn default_character_hotbar() -> Vec<CharacterHotbarSlot> {
+    let mut hotbar = vec![CharacterHotbarSlot::Empty; 9];
+    hotbar[8] = CharacterHotbarSlot::ReleaseControl;
+    hotbar
+}
 
 fn default_random_pool_weight() -> f32 { 1.0 }
 
@@ -1396,10 +1754,16 @@ pub struct TrpgParty {
     pub name: String,
     #[serde(default)]
     pub players: Vec<String>,
+    #[serde(default)]
+    pub anonymous: bool,
 }
 
 impl PartialEq for TrpgParty {
-    fn eq(&self, other: &Self) -> bool { self.name == other.name && self.players == other.players }
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.players == other.players
+            && self.anonymous == other.anonymous
+    }
 }
 
 impl Eq for TrpgParty {}
@@ -1592,6 +1956,8 @@ pub struct TrpgGroup {
     pub world_turn: u32,
     #[serde(default)]
     pub player_turns: HashMap<String, TrpgPlayerTurnState>,
+    #[serde(default)]
+    pub initial_player_states: HashMap<String, PlayerCharacter>,
 }
 
 impl Default for TrpgGroup {
@@ -1620,6 +1986,7 @@ impl Default for TrpgGroup {
             group_chats: Vec::new(),
             world_turn: 0,
             player_turns: HashMap::default(),
+            initial_player_states: HashMap::default(),
         }
     }
 }
@@ -1664,6 +2031,43 @@ impl TrpgLegacyNegativeTimer {
 }
 
 impl TrpgGroup {
+    fn remove_player_references(&mut self, target_id: &str, player_id: Option<u64>) {
+        self.players.retain(|player| player != target_id);
+        self.group_chats.retain(|target| target != target_id);
+        if let Some(player_id) = player_id {
+            self.gm_users.remove(&player_id);
+        }
+        self.player_parties.remove(target_id);
+        for party in self.parties.values_mut() {
+            party.players.retain(|player| player != target_id);
+        }
+        for team in &mut self.legacy_teams {
+            team.players.retain(|player| player != target_id);
+            let previous_len = team.chat_messages.len();
+            team.chat_messages
+                .retain(|message| message.sender_id != target_id);
+            team.chat_message_count = team
+                .chat_message_count
+                .saturating_sub(previous_len - team.chat_messages.len());
+        }
+        for world in &mut self.legacy_worlds {
+            world.players.retain(|player| player != target_id);
+            for area in world.chat_areas.iter_mut().chain(world.areas.iter_mut()) {
+                area.members.retain(|member| member != target_id);
+            }
+        }
+        for pane in &mut self.legacy_send_panes {
+            pane.targets.retain(|target| target != target_id);
+        }
+        self.legacy_negative_timers
+            .retain(|timer| timer.target_id != target_id);
+        self.player_turns.remove(target_id);
+        self.initial_player_states.remove(target_id);
+        self.sync_parties();
+        self.sync_turn_players();
+        self.sync_legacy_negative_timers();
+    }
+
     pub fn sync_turn_players(&mut self) -> bool {
         let player_len = self.players.len();
         let mut seen = HashSet::new();
@@ -1672,7 +2076,12 @@ impl TrpgGroup {
         let before_len = self.player_turns.len();
         self.player_turns
             .retain(|target_id, _| self.players.contains(target_id));
-        let mut changed = player_len != self.players.len() || before_len != self.player_turns.len();
+        let initial_state_len = self.initial_player_states.len();
+        self.initial_player_states
+            .retain(|target_id, _| self.players.contains(target_id));
+        let mut changed = player_len != self.players.len()
+            || before_len != self.player_turns.len()
+            || initial_state_len != self.initial_player_states.len();
 
         for target_id in &self.players {
             if !self.player_turns.contains_key(target_id) {
@@ -1887,37 +2296,17 @@ impl TrpgGroup {
             party.players.dedup();
         }
 
-        let mut party_ids = self.parties.keys().cloned().collect::<Vec<_>>();
-        party_ids.sort();
-        let mut inferred_assignments = Vec::new();
-        for party_id in party_ids {
-            let Some(party) = self.parties.get(&party_id) else {
-                continue;
-            };
-            for target_id in &party.players {
-                inferred_assignments.push((target_id.clone(), party_id.clone()));
-            }
-        }
-        for (target_id, party_id) in inferred_assignments {
-            self.player_parties.entry(target_id).or_insert(party_id);
-        }
-
         let existing_party_ids = self.parties.keys().cloned().collect::<HashSet<_>>();
         self.player_parties.retain(|target_id, party_id| {
             valid_players.contains(target_id) && existing_party_ids.contains(party_id)
         });
 
-        for party in self.parties.values_mut() {
-            party.players.clear();
-        }
-
-        let mut assignments = self
+        let legacy_assignments = self
             .player_parties
             .iter()
             .map(|(target_id, party_id)| (target_id.clone(), party_id.clone()))
             .collect::<Vec<_>>();
-        assignments.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-        for (target_id, party_id) in assignments {
+        for (target_id, party_id) in legacy_assignments {
             let Some(party) = self.parties.get_mut(&party_id) else {
                 continue;
             };
@@ -1928,6 +2317,19 @@ impl TrpgGroup {
         for party in self.parties.values_mut() {
             party.players.sort();
             party.players.dedup();
+        }
+
+        let mut party_ids = self.parties.keys().cloned().collect::<Vec<_>>();
+        party_ids.sort();
+        for party_id in party_ids {
+            let Some(party) = self.parties.get(&party_id) else {
+                continue;
+            };
+            for target_id in &party.players {
+                self.player_parties
+                    .entry(target_id.clone())
+                    .or_insert_with(|| party_id.clone());
+            }
         }
 
         self.parties != before_parties || self.player_parties != before_player_parties
@@ -1945,6 +2347,7 @@ impl TrpgGroup {
         self.parties.insert(party_id.to_owned(), TrpgParty {
             name: party_id.to_owned(),
             players: Vec::new(),
+            anonymous: false,
         });
         true
     }
@@ -1959,8 +2362,6 @@ impl TrpgGroup {
         let before_player_parties = self.player_parties.clone();
 
         self.parties.remove(party_id);
-        self.player_parties
-            .retain(|_, assigned| assigned != party_id);
         self.sync_parties();
 
         self.parties != before_parties || self.player_parties != before_player_parties
@@ -1986,15 +2387,13 @@ impl TrpgGroup {
             .get(from_party_id)
             .map(|party| party.players.clone())
             .unwrap_or_default();
-        for target_id in source_players {
-            if self.players.iter().any(|player_id| player_id == &target_id) {
-                self.player_parties
-                    .insert(target_id, to_party_id.to_owned());
-            }
-        }
-        for assigned in self.player_parties.values_mut() {
-            if assigned == from_party_id {
-                *assigned = to_party_id.to_owned();
+        if let Some(target_party) = self.parties.get_mut(to_party_id) {
+            for target_id in source_players {
+                if self.players.iter().any(|player_id| player_id == &target_id)
+                    && !target_party.players.contains(&target_id)
+                {
+                    target_party.players.push(target_id);
+                }
             }
         }
         self.parties.remove(from_party_id);
@@ -2026,6 +2425,7 @@ impl TrpgGroup {
                 .or_insert_with(|| TrpgParty {
                     name: party_id.to_owned(),
                     players: Vec::new(),
+                    anonymous: false,
                 });
             self.player_parties.insert(
                 target_id.to_owned(),
@@ -2045,7 +2445,71 @@ impl TrpgGroup {
     }
 
     pub fn party_id_for_player(&self, target_id: &str) -> Option<&str> {
-        self.player_parties.get(target_id).map(String::as_str)
+        self.player_parties
+            .get(target_id)
+            .map(String::as_str)
+            .or_else(|| self.party_ids_for_player(target_id).into_iter().next())
+    }
+
+    pub fn party_ids_for_player(&self, target_id: &str) -> Vec<&str> {
+        let mut party_ids = self
+            .parties
+            .iter()
+            .filter_map(|(party_id, party)| {
+                party
+                    .players
+                    .iter()
+                    .any(|player_id| player_id == target_id)
+                    .then_some(party_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        party_ids.sort();
+        party_ids
+    }
+
+    pub fn player_in_party(&self, target_id: &str, party_id: &str) -> bool {
+        self.parties
+            .get(party_id)
+            .is_some_and(|party| party.players.iter().any(|player_id| player_id == target_id))
+    }
+
+    pub fn set_player_party_membership(
+        &mut self,
+        target_id: &str,
+        party_id: &str,
+        assigned: bool,
+    ) -> bool {
+        if !self.players.iter().any(|player_id| player_id == target_id) {
+            return false;
+        }
+        let party_id = party_id.trim();
+        if party_id.is_empty() {
+            return false;
+        }
+
+        let before_parties = self.parties.clone();
+        let before_player_parties = self.player_parties.clone();
+        if assigned {
+            let party = self
+                .parties
+                .entry(party_id.to_owned())
+                .or_insert_with(|| TrpgParty {
+                    name: party_id.to_owned(),
+                    players: Vec::new(),
+                    anonymous: false,
+                });
+            if !party.players.iter().any(|player_id| player_id == target_id) {
+                party.players.push(target_id.to_owned());
+            }
+        } else if let Some(party) = self.parties.get_mut(party_id) {
+            party.players.retain(|player_id| player_id != target_id);
+            if self.player_parties.get(target_id).map(String::as_str) == Some(party_id) {
+                self.player_parties.remove(target_id);
+            }
+        }
+        self.sync_parties();
+
+        self.parties != before_parties || self.player_parties != before_player_parties
     }
 
     pub fn legacy_team(&self, team_id: &str) -> Option<&TrpgLegacyTeam> {
@@ -2360,7 +2824,11 @@ impl TrpgGroup {
             return false;
         };
         let party_name = legacy_party_name(&team.name, &team.id, "旧频道");
-        self.promote_legacy_members_to_party(&party_name, &team.players)
+        self.promote_legacy_members_to_party(
+            &party_name,
+            &team.players,
+            team.anonymous_speakers,
+        )
     }
 
     pub fn promote_legacy_chat_area_to_party(&mut self, area_id: &str) -> bool {
@@ -2368,10 +2836,15 @@ impl TrpgGroup {
             return false;
         };
         let party_name = legacy_party_name(&area.name, &area.id, "虚拟讨论组");
-        self.promote_legacy_members_to_party(&party_name, &area.members)
+        self.promote_legacy_members_to_party(&party_name, &area.members, false)
     }
 
-    fn promote_legacy_members_to_party(&mut self, party_name: &str, members: &[String]) -> bool {
+    fn promote_legacy_members_to_party(
+        &mut self,
+        party_name: &str,
+        members: &[String],
+        anonymous: bool,
+    ) -> bool {
         let party_name = party_name.trim();
         if party_name.is_empty() {
             return false;
@@ -2397,14 +2870,16 @@ impl TrpgGroup {
             .or_insert_with(|| TrpgParty {
                 name: party_name.to_owned(),
                 players: Vec::new(),
+                anonymous,
             });
+        if anonymous {
+            self.parties
+                .get_mut(party_name)
+                .expect("promoted party should exist")
+                .anonymous = true;
+        }
 
         for member_id in members {
-            for party in self.parties.values_mut() {
-                party.players.retain(|player_id| player_id != &member_id);
-            }
-            self.player_parties
-                .insert(member_id.clone(), party_name.to_owned());
             if let Some(party) = self.parties.get_mut(party_name) {
                 if !party
                     .players
@@ -2467,10 +2942,16 @@ impl TrpgGroup {
     pub fn player_access(&self, player_id: u64) -> PlayerAccess {
         let target_id = player_id.to_string();
         let is_player = self.players.iter().any(|member_id| member_id == &target_id);
+        let party_ids = self
+            .party_ids_for_player(&target_id)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         PlayerAccess {
             player_id,
             character_id: is_player.then_some(target_id.clone()),
-            party_id: self.party_id_for_player(&target_id).map(str::to_owned),
+            party_id: party_ids.first().cloned(),
+            party_ids,
             is_gm: self.gm_users.contains(&player_id),
         }
     }
@@ -2492,6 +2973,20 @@ impl TrpgGroup {
                 changed = true;
             }
         }
+        changed
+    }
+
+    pub fn reset_all_turns(&mut self) -> bool {
+        let mut changed = self.sync_turn_players();
+        changed |= self.world_turn != 0;
+        self.world_turn = 0;
+        for turn in self.player_turns.values_mut() {
+            changed |= turn.turns_passed != 0 || turn.acted || turn.skipped;
+            turn.turns_passed = 0;
+            turn.acted = false;
+            turn.skipped = false;
+        }
+        changed |= self.reset_all_legacy_negative_timers();
         changed
     }
 
@@ -2606,6 +3101,10 @@ fn legacy_party_name(name: &str, id: &str, fallback: &str) -> String {
 #[derive(Resource, Serialize, Deserialize)]
 pub struct NapcatMessageManager {
     pub messages: HashMap<String, Vec<NapcatMessage>>,
+    /// Message-index-aligned replay metadata. Missing entries are legacy messages whose
+    /// historical position must not be guessed.
+    #[serde(default, with = "replay_snapshots_serde")]
+    pub replay_snapshots: HashMap<String, Vec<Option<ReplayMessageSnapshot>>>,
     #[serde(default)]
     pub chat_targets: HashMap<String, ChatTargetMetadata>,
     #[serde(default)]
@@ -2636,6 +3135,12 @@ pub struct NapcatMessageManager {
     pub item_pool: Vec<InventoryItem>,
     #[serde(default)]
     pub unit_pool: HashMap<String, UnitPoolEntry>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlayerDeletionSummary {
+    pub removed_messages: usize,
+    pub affected_chat_targets: Vec<String>,
 }
 
 pub const NAPCAT_MANAGER_EXPORT_VERSION: u32 = 1;
@@ -2712,6 +3217,149 @@ struct NapcatUnitPoolExport {
     units: Vec<UnitPoolExportEntry>,
 }
 
+pub const CONTENT_POOL_BUNDLE_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RandomPoolExportEntry {
+    pub name: String,
+    pub pool: RandomPool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ContentPoolBundle {
+    version: u32,
+    export_type: String,
+    #[serde(default)]
+    units: Vec<UnitPoolExportEntry>,
+    #[serde(default)]
+    skills: Vec<SkillPoolEntry>,
+    #[serde(default)]
+    items: Vec<InventoryItem>,
+    #[serde(default)]
+    random_pools: Vec<RandomPoolExportEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentPoolImportSummary {
+    pub units: usize,
+    pub skills: usize,
+    pub items: usize,
+    pub random_pools: usize,
+}
+
+fn normalized_pool_category(category: &str) -> &str { category.trim() }
+
+fn merge_item_pool_entries(target: &mut Vec<InventoryItem>, imported: Vec<InventoryItem>) {
+    for item in imported {
+        let key = (
+            normalized_pool_category(&item.category).to_owned(),
+            item.name.trim().to_owned(),
+        );
+        if let Some(existing) = target.iter_mut().find(|existing| {
+            normalized_pool_category(&existing.category) == key.0 && existing.name.trim() == key.1
+        }) {
+            *existing = item;
+        } else {
+            target.push(item);
+        }
+    }
+}
+
+fn merge_skill_pool_entries(target: &mut Vec<SkillPoolEntry>, imported: Vec<SkillPoolEntry>) {
+    for skill in imported {
+        let category = skill.category.as_deref().unwrap_or_default().trim();
+        if let Some(existing) = target.iter_mut().find(|existing| {
+            existing.category.as_deref().unwrap_or_default().trim() == category
+                && existing.name.trim() == skill.name.trim()
+        }) {
+            *existing = skill;
+        } else {
+            target.push(skill);
+        }
+    }
+}
+
+pub fn content_pool_generation_prompt() -> String {
+    let example = json!({
+        "version": CONTENT_POOL_BUNDLE_VERSION,
+        "export_type": "content_pools",
+        "units": [{
+            "unit_id": "example-training-dummy",
+            "unit": {
+                "category": "训练单位",
+                "label": "示例训练假人",
+                "note": "用于测试基础战斗。",
+                "rarity": "normal",
+                "base_damage": 4.0,
+                "character": {
+                    "inited": true,
+                    "name": "示例训练假人",
+                    "nickname": "示例训练假人",
+                    "level": 5,
+                    "hp": 60.0,
+                    "max_hp": 60.0
+                }
+            }
+        }],
+        "skills": [{
+            "name": "示例重击",
+            "note": "主动使用对目标造成8点物理伤害。",
+            "mp_cost": 3.0,
+            "cooldown_turns": 1,
+            "category": "战斗技能",
+            "tags": ["物理"]
+        }],
+        "items": [{
+            "category": "测试物品",
+            "name": "示例治疗药水",
+            "description": "回复生命值的测试消耗品。",
+            "quality": "common",
+            "equipment_slot": "none",
+            "stack": 3,
+            "max_stack": 20,
+            "item_level": 5,
+            "soulbound": false
+        }],
+        "random_pools": [{
+            "name": "示例掉落池",
+            "pool": {
+                "category": "测试掉落",
+                "description": "用于验证导入与抽取。",
+                "entries": [{
+                    "item": {
+                        "category": "测试物品",
+                        "name": "示例治疗药水",
+                        "description": "回复生命值的测试消耗品。",
+                        "quality": "common",
+                        "equipment_slot": "none",
+                        "stack": 1,
+                        "max_stack": 20
+                    },
+                    "weight": 1.0,
+                    "enabled": true,
+                    "result_text": "获得示例治疗药水。",
+                    "min_count": 1,
+                    "max_count": 1
+                }]
+            }
+        }]
+    });
+    let example_json = serde_json::to_string_pretty(&example).unwrap_or_else(|_| "{}".to_owned());
+    format!(
+        "你是 DeepSeek。请为 Willowblossom 生成一个包含随机化测试内容的 GM 内容池 JSON 包。\n\
+         只生成可测试的单位、技能、物品和随机池规则，不生成剧情、玩家决定、隐藏信息或场景结论。\n\
+         顶层 units 数组必须至少8项、顶层 skills 数组必须至少8项、顶层 items 数组必须至少12项、顶层 random_pools 数组必须至少3项；随机池内嵌物品不计入顶层 items 数量。内容应有变化且数值合理。\n\
+         只输出一个合法 JSON 对象，不要 Markdown 代码围栏或说明文字。\n\
+         必须保留 version={CONTENT_POOL_BUNDLE_VERSION} 和 export_type=\"content_pools\"。\n\
+         每个单位、技能、物品、随机池都填写 category；相同 category 表示同一个 GM 逻辑池，允许多个 category。\n\
+         单位 rarity 只能是 normal、rare、elite、rare_elite。base_damage 是未缩放的基础伤害；character.max_hp、hp、level 必须为正数。\n\
+         物品 quality 只能是 poor、common、uncommon、rare、epic、legendary。equipment_slot 只能是 head、neck、shoulder、back、chest、wrist、hands、waist、legs、feet、finger、trinket、main_hand、off_hand、ranged、none；普通物品使用 none，禁止使用 weapon、armor 等其他值。\n\
+         随机池每个启用条目的 weight 必须大于 0，min_count 不得大于 max_count。\n\
+         为缩短输出，只填写示例中出现的必要字段；未出现的字段由应用填默认值。单位 character 不要展开 creation_step、inventory、技能、BUFF或其他默认字段。不要改字段名。\n\
+         以下是紧凑的可导入 JSON 示例；必须扩充四个顶层数组到上述数量，不要只复制单个示例项：\n{example_json}"
+    )
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MoonberryLegacyImportSummary {
     pub groups: usize,
@@ -2751,6 +3399,99 @@ fn merge_max_usize(map: &mut HashMap<String, usize>, key: String, value: usize) 
 }
 
 impl NapcatMessageManager {
+    pub fn delete_player(&mut self, target_id: &str) -> Option<PlayerDeletionSummary> {
+        let target_id = target_id.trim();
+        if target_id.is_empty() {
+            return None;
+        }
+        let is_known_player = self.player_characters.contains_key(target_id)
+            || self.is_private_chat_target(target_id)
+            || self
+                .trpg_groups
+                .values()
+                .any(|group| group.players.iter().any(|player_id| player_id == target_id));
+        if !is_known_player {
+            return None;
+        }
+
+        let player_id = target_id.parse::<u64>().ok();
+        let mut summary = PlayerDeletionSummary {
+            affected_chat_targets: vec![target_id.to_owned()],
+            ..Default::default()
+        };
+        let message_target_ids = self.messages.keys().cloned().collect::<Vec<_>>();
+        for message_target_id in message_target_ids {
+            if message_target_id == target_id {
+                let removed = self
+                    .messages
+                    .remove(&message_target_id)
+                    .map(|messages| messages.len())
+                    .unwrap_or_default();
+                self.replay_snapshots.remove(&message_target_id);
+                if removed > 0 {
+                    summary.removed_messages += removed;
+                    summary.affected_chat_targets.push(message_target_id);
+                }
+                continue;
+            }
+
+            let Some(messages) = self.messages.get_mut(&message_target_id) else {
+                continue;
+            };
+            let removed_indexes = messages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, message)| {
+                    message_belongs_to_player(message, player_id).then_some(index)
+                })
+                .collect::<HashSet<_>>();
+            if removed_indexes.is_empty() {
+                continue;
+            }
+
+            let mut index = 0;
+            messages.retain(|_| {
+                let keep = !removed_indexes.contains(&index);
+                index += 1;
+                keep
+            });
+            if let Some(snapshots) = self.replay_snapshots.get_mut(&message_target_id) {
+                let mut snapshot_index = 0;
+                snapshots.retain(|_| {
+                    let keep = !removed_indexes.contains(&snapshot_index);
+                    snapshot_index += 1;
+                    keep
+                });
+            }
+            summary.removed_messages += removed_indexes.len();
+            summary
+                .affected_chat_targets
+                .push(message_target_id.clone());
+            self.read_message_counts
+                .insert(message_target_id.clone(), messages.len());
+            self.summarized_message_counts.remove(&message_target_id);
+        }
+
+        self.chat_targets.remove(target_id);
+        self.chat_target_kinds.remove(target_id);
+        self.player_characters.remove(target_id);
+        self.read_message_counts.remove(target_id);
+        self.summarized_message_counts.remove(target_id);
+        self.open_chat_targets.remove(target_id);
+        self.pending_chat_targets.remove(target_id);
+        self.rejected_chat_targets.remove(target_id);
+        for group in self.groups.values_mut() {
+            group.members.retain(|member_id| member_id != target_id);
+        }
+        for group in self.trpg_groups.values_mut() {
+            group.remove_player_references(target_id, player_id);
+        }
+
+        summary.affected_chat_targets.sort();
+        summary.affected_chat_targets.dedup();
+        Some(summary)
+    }
+
     pub fn to_export_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(&NapcatMessageManagerExportRef {
             version: NAPCAT_MANAGER_EXPORT_VERSION,
@@ -2922,6 +3663,89 @@ impl NapcatMessageManager {
         let imported_count = imported.len();
         self.unit_pool.extend(imported);
         Ok(imported_count)
+    }
+
+    pub fn to_content_pool_bundle_json(&self) -> Result<String, String> {
+        let mut random_pools = self
+            .random_pools
+            .iter()
+            .map(|(name, pool)| RandomPoolExportEntry {
+                name: name.clone(),
+                pool: pool.clone(),
+            })
+            .collect::<Vec<_>>();
+        random_pools.sort_by(|left, right| left.name.cmp(&right.name));
+
+        serde_json::to_string_pretty(&ContentPoolBundle {
+            version: CONTENT_POOL_BUNDLE_VERSION,
+            export_type: "content_pools".to_owned(),
+            units: self.unit_pool_export_entries(),
+            skills: self.skill_pool.clone(),
+            items: self.item_pool.clone(),
+            random_pools,
+        })
+        .map_err(|err| err.to_string())
+    }
+
+    pub fn merge_content_pool_bundle_json(
+        &mut self,
+        text: &str,
+    ) -> Result<ContentPoolImportSummary, String> {
+        let bundle: ContentPoolBundle =
+            serde_json::from_str(text).map_err(|err| err.to_string())?;
+        if bundle.version != CONTENT_POOL_BUNDLE_VERSION {
+            return Err(format!(
+                "unsupported content pool bundle version {}; expected {}",
+                bundle.version, CONTENT_POOL_BUNDLE_VERSION
+            ));
+        }
+        if bundle.export_type != "content_pools" {
+            return Err(format!(
+                "unsupported content pool export type {}",
+                bundle.export_type
+            ));
+        }
+
+        let mut imported_units = HashMap::new();
+        for entry in bundle.units {
+            let unit_id = entry.unit_id.trim();
+            if unit_id.is_empty() {
+                return Err("content pool bundle contains an empty unit id".to_owned());
+            }
+            imported_units.insert(unit_id.to_owned(), entry.unit);
+        }
+
+        let mut imported_random_pools = HashMap::new();
+        for entry in bundle.random_pools {
+            let name = entry.name.trim();
+            if name.is_empty() {
+                return Err("content pool bundle contains an empty random pool name".to_owned());
+            }
+            imported_random_pools.insert(name.to_owned(), entry.pool);
+        }
+
+        for skill in &bundle.skills {
+            if skill.name.trim().is_empty() {
+                return Err("content pool bundle contains an unnamed skill".to_owned());
+            }
+        }
+        for item in &bundle.items {
+            if item.name.trim().is_empty() {
+                return Err("content pool bundle contains an unnamed item".to_owned());
+            }
+        }
+
+        let summary = ContentPoolImportSummary {
+            units: imported_units.len(),
+            skills: bundle.skills.len(),
+            items: bundle.items.len(),
+            random_pools: imported_random_pools.len(),
+        };
+        self.unit_pool.extend(imported_units);
+        merge_skill_pool_entries(&mut self.skill_pool, bundle.skills);
+        merge_item_pool_entries(&mut self.item_pool, bundle.items);
+        self.random_pools.extend(imported_random_pools);
+        Ok(summary)
     }
 
     pub fn unit_pool_ids_for_legacy_members(&self, members: &[String]) -> Vec<String> {
@@ -3312,9 +4136,12 @@ impl NapcatMessageManager {
                 }
             }
             self.unit_pool.insert(unit_id, UnitPoolEntry {
+                category: String::new(),
                 label,
                 note: note_parts.join("\n"),
                 legacy_member_id,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character,
             });
             summary.unit_templates += 1;
@@ -3443,6 +4270,7 @@ impl NapcatMessageManager {
                 });
             }
             let pool = RandomPool {
+                category: String::new(),
                 entries,
                 last_pick: None,
                 last_text_result: None,
@@ -3565,6 +4393,50 @@ impl NapcatMessageManager {
         self.chat_target_kind(target_id) == ChatTargetExportKind::Private
     }
 
+    pub fn player_chat_window_color(&self, target_id: &str) -> Option<[u8; 3]> {
+        if !self.is_private_chat_target(target_id) {
+            return None;
+        }
+
+        self.chat_targets
+            .get(target_id)
+            .and_then(|metadata| metadata.chat_window_color_rgb)
+    }
+
+    fn ensure_player_chat_window_color(&mut self, target_id: &str) -> bool {
+        if !self.is_private_chat_target(target_id)
+            || self
+                .chat_targets
+                .get(target_id)
+                .is_some_and(|metadata| metadata.chat_window_color_rgb.is_some())
+        {
+            return false;
+        }
+
+        let used_colors = self
+            .chat_targets
+            .iter()
+            .filter(|(other_id, _)| other_id.as_str() != target_id)
+            .filter_map(|(_, metadata)| metadata.chat_window_color_rgb)
+            .collect::<HashSet<_>>();
+        let mut hasher = DefaultHasher::new();
+        target_id.hash(&mut hasher);
+        let preferred_index = (hasher.finish() as usize) % PLAYER_CHAT_WINDOW_COLOR_PALETTE.len();
+        let color = (0..PLAYER_CHAT_WINDOW_COLOR_PALETTE.len())
+            .map(|offset| {
+                PLAYER_CHAT_WINDOW_COLOR_PALETTE
+                    [(preferred_index + offset) % PLAYER_CHAT_WINDOW_COLOR_PALETTE.len()]
+            })
+            .find(|color| !used_colors.contains(color))
+            .unwrap_or(PLAYER_CHAT_WINDOW_COLOR_PALETTE[preferred_index]);
+
+        self.chat_targets
+            .entry(target_id.to_owned())
+            .or_default()
+            .chat_window_color_rgb = Some(color);
+        true
+    }
+
     fn apply_imported_chat_window_state(
         &mut self,
         target_id: &str,
@@ -3662,13 +4534,15 @@ impl NapcatMessageManager {
                 }
             }
         }
-        let private_targets = self
+        let mut private_targets = self
             .chat_targets
             .keys()
             .filter(|target_id| self.is_private_chat_target(target_id))
             .cloned()
             .collect::<Vec<_>>();
+        private_targets.sort();
         for target_id in private_targets {
+            changed |= self.ensure_player_chat_window_color(&target_id);
             if !self.player_characters.contains_key(&target_id) {
                 self.player_characters
                     .insert(target_id, PlayerCharacter::default());
@@ -4033,7 +4907,24 @@ impl NapcatMessageManager {
         target_id: &str,
         message: &NapcatMessage,
     ) -> CampaignMessage {
-        let text = message_text(message);
+        let forwarded = self.replay_forwarded_attribution(message);
+        let text = forwarded
+            .as_ref()
+            .map(|forwarded| forwarded.text.clone())
+            .unwrap_or_else(|| message_text(message));
+        let sender_id = forwarded
+            .as_ref()
+            .map(|forwarded| forwarded.sender_id)
+            .unwrap_or(message.data.user_id);
+        let sender_name = forwarded
+            .as_ref()
+            .map(|forwarded| forwarded.sender_name.clone())
+            .unwrap_or_else(|| message.data.sender.nickname.clone());
+        let source_time = forwarded
+            .as_ref()
+            .map(|forwarded| forwarded.source_time)
+            .filter(|source_time| *source_time != 0)
+            .unwrap_or(message.data.time);
         let message_group = self.group_for_message_target(target_id, message);
         let campaign_id = if message.data.campaign_id.trim().is_empty() {
             message_group
@@ -4056,22 +4947,24 @@ impl NapcatMessageManager {
                 } else {
                     message.data.user_id
                 };
+                let access_player_id = if forwarded.is_some() { sender_id } else { peer_id };
                 let access = message_group
-                    .map(|group| group.player_access(peer_id))
+                    .map(|group| group.player_access(access_player_id))
                     .unwrap_or(PlayerAccess {
-                        player_id: peer_id,
+                        player_id: access_player_id,
                         ..Default::default()
                     });
                 CampaignMessage {
                     campaign_id,
-                    sender_id: message.data.user_id,
-                    sender_name: message.data.sender.nickname.clone(),
+                    sender_id,
+                    sender_name,
                     source: MessageSource::Friend { user_id: peer_id },
                     character_id: access.character_id,
                     party_id: access.party_id,
                     visibility: Visibility::Player(peer_id),
                     text,
-                    time: message.data.time,
+                    time: source_time,
+                    forwarded: forwarded.is_some(),
                 }
             },
             NapcatMessageType::Group => {
@@ -4102,9 +4995,9 @@ impl NapcatMessageManager {
                     // Legacy messages predate persisted access metadata, so derive from the same
                     // configured target mapping used at ingest. New messages are saved annotated.
                     let access = message_group
-                        .map(|group| group.player_access(message.data.user_id))
+                        .map(|group| group.player_access(sender_id))
                         .unwrap_or(PlayerAccess {
-                            player_id: message.data.user_id,
+                            player_id: sender_id,
                             ..Default::default()
                         });
                     let visibility = access
@@ -4120,20 +5013,41 @@ impl NapcatMessageManager {
                 };
                 CampaignMessage {
                     campaign_id,
-                    sender_id: message.data.user_id,
-                    sender_name: message.data.sender.nickname.clone(),
+                    sender_id,
+                    sender_name,
                     source: MessageSource::Group {
                         group_id,
-                        user_id: message.data.user_id,
+                        user_id: sender_id,
                     },
                     character_id,
                     party_id,
                     visibility,
                     text,
-                    time: message.data.time,
+                    time: source_time,
+                    forwarded: forwarded.is_some(),
                 }
             },
         }
+    }
+
+    pub fn replay_message_sender_id(&self, message: &NapcatMessage) -> u64 {
+        self.replay_forwarded_attribution(message)
+            .map(|forwarded| forwarded.sender_id)
+            .unwrap_or(message.data.user_id)
+    }
+
+    fn replay_forwarded_attribution(
+        &self,
+        message: &NapcatMessage,
+    ) -> Option<ForwardedAttribution> {
+        forwarded_replay_data(message)
+            .map(|forwarded| ForwardedAttribution {
+                sender_id: forwarded.sender_id,
+                sender_name: forwarded.sender_name.clone(),
+                text: forwarded.text.clone(),
+                source_time: forwarded.source_time,
+            })
+            .or_else(|| infer_legacy_forwarded_attribution(self, message))
     }
 
     pub fn sync_skill_pool_from_completed_characters(&mut self) -> bool {
@@ -4280,6 +5194,21 @@ fn is_internal_chat_storage_key(target_id: &str) -> bool {
     ["campaign:", "group:", "replay:", "replay-director:"]
         .iter()
         .any(|prefix| target_id.starts_with(prefix))
+}
+
+fn message_belongs_to_player(message: &NapcatMessage, player_id: Option<u64>) -> bool {
+    let Some(player_id) = player_id else {
+        return false;
+    };
+    message.data.sender.user_id == player_id
+        || message.data.visibility == Visibility::Player(player_id)
+        || message.data.message.iter().any(|segment| {
+            matches!(
+                &segment.variant,
+                NapcatMessageChainType::ForwardedReplay { data }
+                    if data.sender_id == player_id
+            )
+        })
 }
 
 fn moonberry_group_name(group: &Value, index: usize) -> String {
@@ -5064,6 +5993,7 @@ fn moonberry_chat_to_napcat_message(
         data: NapcatMessageData {
             time,
             message_type,
+            message_id: None,
             message: chains,
             self_id: 0,
             user_id: sender_id,
@@ -5246,17 +6176,38 @@ impl Plugin for NapcatPlugin {
 }
 
 fn setup(mut commands: Commands) {
-    let (client_to_game_sender, client_to_game_receiver) = unbounded::<Message>();
+    let (client_to_game_sender, client_to_game_receiver) = unbounded::<NapcatInboundEnvelope>();
     let (game_to_client_sender, game_to_client_receiver) = tokio::sync::mpsc::channel(100);
     let (send_result_sender, send_result_receiver) = unbounded::<NapcatSendResult>();
+    let inbound_journal = Arc::new(Mutex::new(InboundMessageJournal::new(
+        PathBuf::from(NAPCAT_INBOUND_JOURNAL_PATH),
+    )));
+    match inbound_journal
+        .lock()
+        .map_err(|err| err.to_string())
+        .and_then(|mut journal| journal.load_pending())
+    {
+        Ok(pending) => {
+            for (journal_id, payload) in pending {
+                let _ = client_to_game_sender.send(NapcatInboundEnvelope {
+                    message: Message::Text(payload.into()),
+                    journal_id: Some(journal_id),
+                    origin: NapcatInboundOrigin::JournalReplay,
+                });
+            }
+        },
+        Err(err) => eprintln!("failed to load NapCat inbound journal: {err}"),
+    }
     let napcat_io = NapcatIOReceiver(client_to_game_receiver.clone());
     let napcat_send_results = NapcatSendResultReceiver(send_result_receiver);
     spawn_napcat_connection(
         client_to_game_sender.clone(),
         game_to_client_receiver,
         send_result_sender,
+        inbound_journal.clone(),
     );
     commands.insert_resource(napcat_io);
+    commands.insert_resource(NapcatInboundJournal(inbound_journal));
     commands.insert_resource(napcat_send_results);
     commands.insert_resource(NapcatIOSender(game_to_client_sender));
     commands.insert_resource(NapcatSendManager::default());
@@ -5269,8 +6220,9 @@ fn setup(mut commands: Commands) {
         pending_group_ids: HashSet::default(),
     });
 
-    let message_manager = NapcatMessageManager {
+    let default_message_manager = NapcatMessageManager {
         messages: HashMap::default(),
+        replay_snapshots: HashMap::default(),
         chat_targets: HashMap::default(),
         chat_target_kinds: HashMap::default(),
         player_characters: HashMap::default(),
@@ -5287,22 +6239,34 @@ fn setup(mut commands: Commands) {
         item_pool: Vec::new(),
         unit_pool: HashMap::default(),
     };
-    let config_dir = Path::new(".data").join("willowblossom");
-    commands.insert_resource(
-        Persistent::<NapcatMessageManager>::builder()
-            .name("messages")
-            .format(StorageFormat::Toml)
-            .path(config_dir.join("messages.toml"))
-            .default(message_manager)
-            .build()
-            .expect("failed to init messages"),
-    );
+    let message_manager = Persistent::<NapcatMessageManager>::builder()
+        .name("messages")
+        .format(StorageFormat::Toml)
+        .path(NAPCAT_MESSAGES_PATH)
+        .default(default_message_manager)
+        .build()
+        .expect("failed to init messages");
+    let mut inbound_receipts = Persistent::<InboundMessageReceiptStore>::builder()
+        .name("inbound_receipts")
+        .format(StorageFormat::Toml)
+        .path(NAPCAT_INBOUND_RECEIPTS_PATH)
+        .default(InboundMessageReceiptStore::default())
+        .build()
+        .expect("failed to init NapCat inbound receipts");
+    if backfill_inbound_message_receipts(&mut inbound_receipts, &message_manager) {
+        if let Err(err) = persist_inbound_napcat_receipts(&inbound_receipts) {
+            eprintln!("failed to backfill NapCat inbound receipts: {err}");
+        }
+    }
+    commands.insert_resource(message_manager);
+    commands.insert_resource(inbound_receipts);
 }
 
 fn spawn_napcat_connection(
-    client_to_game_sender: CBSender<Message>,
+    client_to_game_sender: CBSender<NapcatInboundEnvelope>,
     game_to_client_receiver: Receiver<NapcatOutboundMessage>,
     send_result_sender: CBSender<NapcatSendResult>,
+    inbound_journal: Arc<Mutex<InboundMessageJournal>>,
 ) {
     thread::Builder::new()
         .name("napcat-websocket".to_owned())
@@ -5315,15 +6279,17 @@ fn spawn_napcat_connection(
                 client_to_game_sender,
                 game_to_client_receiver,
                 send_result_sender,
+                inbound_journal,
             ));
         })
         .expect("failed to spawn NapCat websocket thread");
 }
 
 async fn run_napcat_connection(
-    client_to_game_sender: CBSender<Message>,
+    client_to_game_sender: CBSender<NapcatInboundEnvelope>,
     mut game_to_client_receiver: Receiver<NapcatOutboundMessage>,
     send_result_sender: CBSender<NapcatSendResult>,
+    inbound_journal: Arc<Mutex<InboundMessageJournal>>,
 ) {
     const NAPCAT_WS_URL: &str = "ws://localhost:3001";
 
@@ -5355,7 +6321,18 @@ async fn run_napcat_connection(
                                 ) {
                                     let _ = send_result_sender.send(result);
                                 }
-                                if client_to_game_sender.send(msg).is_err() {
+                                let journal_id = journal_inbound_chat_message(
+                                    &msg,
+                                    &inbound_journal,
+                                );
+                                if client_to_game_sender
+                                    .send(NapcatInboundEnvelope {
+                                        message: msg,
+                                        journal_id,
+                                        origin: NapcatInboundOrigin::Live,
+                                    })
+                                    .is_err()
+                                {
                                     fail_pending_napcat_requests(
                                         &mut pending_requests,
                                         &send_result_sender,
@@ -5442,6 +6419,46 @@ async fn run_napcat_connection(
 
         sleep(Duration::from_secs(2)).await;
     }
+}
+
+fn journal_inbound_chat_message(
+    message: &Message,
+    journal: &Arc<Mutex<InboundMessageJournal>>,
+) -> Option<u64> {
+    let payload = message.to_text().ok()?;
+    let chat_message = serde_json::from_str::<NapcatMessage>(payload).ok()?;
+    let payload = match serde_json::to_string(&chat_message) {
+        Ok(payload) => payload,
+        Err(err) => {
+            eprintln!("failed to serialize inbound NapCat chat for journaling: {err}");
+            return None;
+        },
+    };
+    match journal
+        .lock()
+        .map_err(|err| err.to_string())
+        .and_then(|mut journal| journal.append_message(payload))
+    {
+        Ok(id) => Some(id),
+        Err(err) => {
+            eprintln!("failed to journal inbound NapCat chat message: {err}");
+            None
+        },
+    }
+}
+
+fn acknowledge_inbound_chat_message(
+    journal: &NapcatInboundJournal,
+    journal_id: Option<u64>,
+) -> Result<(), String> {
+    let Some(journal_id) = journal_id else {
+        return Ok(());
+    };
+    journal
+        .0
+        .lock()
+        .map_err(|err| err.to_string())
+        .and_then(|mut journal| journal.acknowledge(journal_id))
 }
 
 fn correlated_outbound_message(
@@ -5599,12 +6616,15 @@ fn apply_automatic_private_reply_result(
         );
         return Some(false);
     }
-    Some(append_local_private_text_response(
-        manager,
-        &expected_target_id,
-        pending.recipient_id,
-        &pending.text,
-    ))
+    Some(
+        append_local_private_text_response_with_forwarded_attribution(
+            manager,
+            &expected_target_id,
+            pending.recipient_id,
+            &pending.text,
+            pending.forwarded,
+        ),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -5750,6 +6770,8 @@ fn value_to_target_id(value: &Value) -> Option<String> {
 
 fn message_system(
     receiver: Res<NapcatIOReceiver>,
+    inbound_journal: Res<NapcatInboundJournal>,
+    mut inbound_receipts: ResMut<Persistent<InboundMessageReceiptStore>>,
     sender: Option<Res<NapcatIOSender>>,
     mut automatic_replies: ResMut<NapcatAutomaticReplyRequests>,
     mut group_info_requests: ResMut<NapcatGroupInfoRequests>,
@@ -5757,11 +6779,11 @@ fn message_system(
     scene_character_positions: Option<Res<SceneCharacterPositions>>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
 ) {
-    while let Ok(msg) = receiver.0.try_recv() {
+    while let Ok(envelope) = receiver.0.try_recv() {
+        let msg = envelope.message;
         let json_res = serde_json::from_str::<NapcatMessage>(&msg.to_string());
         if let Ok(mut json) = json_res {
             dbg!(&json);
-            cache_message_images(&mut json);
             let target_id = match json.data.message_type {
                 NapcatMessageType::Private => {
                     if json.data.user_id == json.data.self_id {
@@ -5773,33 +6795,38 @@ fn message_system(
                 NapcatMessageType::Group => json.data.group_id.unwrap_or(json.data.user_id),
             };
             let target_id = target_id.to_string();
+            let receipt_self_id = json.data.self_id;
+            let receipt_message_id = json.data.message_id;
+            if napcat_message_is_already_processed(&manager, &inbound_receipts, &json) {
+                if let Err(err) = record_and_persist_inbound_receipt(
+                    &mut inbound_receipts,
+                    receipt_self_id,
+                    receipt_message_id,
+                ) {
+                    eprintln!("failed to persist duplicate NapCat inbound receipt: {err}");
+                    continue;
+                }
+                if let Err(err) =
+                    acknowledge_inbound_chat_message(&inbound_journal, envelope.journal_id)
+                {
+                    eprintln!("failed to acknowledge duplicate NapCat inbound message: {err}");
+                }
+                continue;
+            }
+            cache_message_images(&mut json);
             let is_new_target = !manager.messages.contains_key(&target_id);
             let is_incoming_message = json.data.user_id != json.data.self_id;
             let incoming_user_id = json.data.user_id;
             manager.annotate_incoming_message_access(&target_id, &mut json);
 
-            let auto_forward = auto_forward_request(&manager, &json, &target_id);
-            let character_creation_response = if is_incoming_message
-                && matches!(
-                    json.data.message_type,
-                    NapcatMessageType::Private
-                ) {
-                private_detect_magic_response(
-                    &manager,
-                    &json,
-                    &target_id,
-                    scene_character_positions.as_deref(),
-                )
-                .or_else(|| handle_character_creation_message(&mut manager, &json, &target_id))
-            } else {
-                None
-            };
-            if let (Some(scene_capture_requests), Some(request)) = (
-                scene_capture_requests.as_deref_mut(),
-                scene_capture_request(&manager, &json),
-            ) {
-                scene_capture_requests.requests.push(request);
-            }
+            let automatic_actions = prepare_inbound_automatic_actions(
+                &mut manager,
+                &json,
+                &target_id,
+                is_incoming_message,
+                scene_character_positions.as_deref(),
+                envelope.origin,
+            );
 
             manager
                 .messages
@@ -5828,9 +6855,35 @@ fn message_system(
                 manager.register_incoming_target(&target_id, is_new_target);
             }
 
+            if let Err(err) = persist_inbound_napcat_message(&manager) {
+                eprintln!("failed to durably persist NapCat messages: {err}");
+                continue;
+            }
+            if let Err(err) = record_and_persist_inbound_receipt(
+                &mut inbound_receipts,
+                receipt_self_id,
+                receipt_message_id,
+            ) {
+                eprintln!("failed to durably persist NapCat inbound receipt: {err}");
+                continue;
+            }
+            if let Err(err) =
+                acknowledge_inbound_chat_message(&inbound_journal, envelope.journal_id)
+            {
+                eprintln!("failed to acknowledge persisted NapCat inbound message: {err}");
+                continue;
+            }
+
+            if let (Some(scene_capture_requests), Some(request)) = (
+                scene_capture_requests.as_deref_mut(),
+                automatic_actions.scene_capture,
+            ) {
+                scene_capture_requests.requests.push(request);
+            }
+
             if let (Some(sender), Some(response)) = (
                 sender.as_deref(),
-                character_creation_response.as_deref(),
+                automatic_actions.private_response.as_deref(),
             ) {
                 queue_private_text_response(
                     sender,
@@ -5840,17 +6893,17 @@ fn message_system(
                 );
             }
 
-            if let Err(err) = manager.persist() {
-                eprintln!("failed to persist NapCat messages: {err}");
-            }
-
-            if let (Some(sender), Some(auto_forward)) = (sender.as_deref(), auto_forward) {
+            if let (Some(sender), Some(auto_forward)) = (
+                sender.as_deref(),
+                automatic_actions.auto_forward,
+            ) {
                 for user_id in auto_forward.recipients {
-                    queue_private_text_response(
+                    queue_private_text_response_with_forwarded_attribution(
                         sender,
                         &mut automatic_replies,
                         user_id,
                         auto_forward.text.clone(),
+                        auto_forward.forwarded.clone(),
                     );
                 }
             }
@@ -5875,6 +6928,136 @@ fn message_system(
             }
         }
     }
+}
+
+#[derive(Default)]
+struct InboundAutomaticActions {
+    private_response: Option<String>,
+    scene_capture: Option<SceneCaptureRequest>,
+    auto_forward: Option<AutoForwardRequest>,
+}
+
+fn prepare_inbound_automatic_actions(
+    manager: &mut NapcatMessageManager,
+    message: &NapcatMessage,
+    target_id: &str,
+    is_incoming_message: bool,
+    scene_character_positions: Option<&SceneCharacterPositions>,
+    origin: NapcatInboundOrigin,
+) -> InboundAutomaticActions {
+    if origin == NapcatInboundOrigin::JournalReplay {
+        return InboundAutomaticActions::default();
+    }
+
+    let party_channel_forward = party_channel_auto_forward_request(manager, message, target_id);
+    let (party_auto_forward, party_channel_guidance) = match party_channel_forward {
+        Some(PartyChannelAutoForward::Forward(request)) => (Some(request), None),
+        Some(PartyChannelAutoForward::Guidance(guidance)) => (None, Some(guidance)),
+        None => (None, None),
+    };
+    let auto_forward = auto_forward_request(manager, message, target_id).or(party_auto_forward);
+    let defeated_auto_forward_guidance =
+        defeated_auto_forward_guidance(manager, message, target_id);
+    let private_response = if is_incoming_message
+        && matches!(
+            message.data.message_type,
+            NapcatMessageType::Private
+        ) {
+        private_detect_magic_response(
+            manager,
+            message,
+            target_id,
+            scene_character_positions,
+        )
+        .or_else(|| handle_character_creation_message(manager, message, target_id))
+        .or(party_channel_guidance)
+        .or(defeated_auto_forward_guidance)
+    } else {
+        None
+    };
+
+    InboundAutomaticActions {
+        private_response,
+        scene_capture: scene_capture_request(manager, message),
+        auto_forward,
+    }
+}
+
+fn persist_inbound_napcat_message(
+    manager: &Persistent<NapcatMessageManager>,
+) -> Result<(), String> {
+    manager.persist().map_err(|err| err.to_string())?;
+    fs::File::open(NAPCAT_MESSAGES_PATH)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| err.to_string())
+}
+
+fn record_and_persist_inbound_receipt(
+    receipts: &mut Persistent<InboundMessageReceiptStore>,
+    self_id: u64,
+    message_id: Option<i64>,
+) -> Result<(), String> {
+    let Some(message_id) = message_id.filter(|message_id| *message_id > 0) else {
+        return Ok(());
+    };
+    receipts.record(self_id, Some(message_id));
+    persist_inbound_napcat_receipts(receipts)
+}
+
+fn persist_inbound_napcat_receipts(
+    receipts: &Persistent<InboundMessageReceiptStore>,
+) -> Result<(), String> {
+    receipts.persist().map_err(|err| err.to_string())?;
+    fs::File::open(NAPCAT_INBOUND_RECEIPTS_PATH)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| err.to_string())
+}
+
+fn backfill_inbound_message_receipts(
+    receipts: &mut InboundMessageReceiptStore,
+    manager: &NapcatMessageManager,
+) -> bool {
+    if !receipts.is_empty() {
+        return false;
+    }
+
+    let mut messages = manager.messages.values().flatten().collect::<Vec<_>>();
+    messages.sort_by_key(|message| {
+        (
+            message.data.time,
+            message.data.self_id,
+            message.data.message_id.unwrap_or_default(),
+        )
+    });
+    messages.into_iter().fold(false, |changed, message| {
+        receipts.record(
+            message.data.self_id,
+            message.data.message_id,
+        ) || changed
+    })
+}
+
+fn napcat_message_is_already_stored(
+    manager: &NapcatMessageManager,
+    message: &NapcatMessage,
+) -> bool {
+    let Some(message_id) = message.data.message_id.filter(|id| *id > 0) else {
+        return false;
+    };
+    manager.messages.values().flatten().any(|stored| {
+        stored.data.message_id == Some(message_id) && stored.data.self_id == message.data.self_id
+    })
+}
+
+fn napcat_message_is_already_processed(
+    manager: &NapcatMessageManager,
+    receipts: &InboundMessageReceiptStore,
+    message: &NapcatMessage,
+) -> bool {
+    receipts.contains(
+        message.data.self_id,
+        message.data.message_id,
+    ) || napcat_message_is_already_stored(manager, message)
 }
 
 fn cache_message_images(message: &mut NapcatMessage) {
@@ -5933,6 +7116,22 @@ fn queue_private_text_response(
     user_id: u64,
     text: String,
 ) -> bool {
+    queue_private_text_response_with_forwarded_attribution(
+        sender,
+        automatic_replies,
+        user_id,
+        text,
+        None,
+    )
+}
+
+fn queue_private_text_response_with_forwarded_attribution(
+    sender: &NapcatIOSender,
+    automatic_replies: &mut NapcatAutomaticReplyRequests,
+    user_id: u64,
+    text: String,
+    forwarded: Option<ForwardedAttribution>,
+) -> bool {
     let request_id = automatic_replies.next_request_id;
     automatic_replies.next_request_id += 1;
     let message = Message::Text(
@@ -5967,6 +7166,7 @@ fn queue_private_text_response(
             PendingAutomaticPrivateReply {
                 recipient_id: user_id,
                 text,
+                forwarded,
             },
         );
         true
@@ -5978,6 +7178,22 @@ fn append_local_private_text_response(
     target_id: &str,
     recipient_id: u64,
     text: &str,
+) -> bool {
+    append_local_private_text_response_with_forwarded_attribution(
+        manager,
+        target_id,
+        recipient_id,
+        text,
+        None,
+    )
+}
+
+fn append_local_private_text_response_with_forwarded_attribution(
+    manager: &mut NapcatMessageManager,
+    target_id: &str,
+    recipient_id: u64,
+    text: &str,
+    forwarded: Option<ForwardedAttribution>,
 ) -> bool {
     let self_id = manager
         .messages
@@ -5996,17 +7212,31 @@ fn append_local_private_text_response(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
+    let mut message_segments = vec![NapcatMessageChain {
+        variant: NapcatMessageChainType::Text {
+            data: TextData {
+                text: text.to_owned(),
+            },
+        },
+    }];
+    if let Some(forwarded) = forwarded {
+        message_segments.push(NapcatMessageChain {
+            variant: NapcatMessageChainType::ForwardedReplay {
+                data: ForwardedReplayData {
+                    sender_id: forwarded.sender_id,
+                    sender_name: forwarded.sender_name,
+                    text: forwarded.text,
+                    source_time: forwarded.source_time,
+                },
+            },
+        });
+    }
     let mut message = NapcatMessage {
         data: NapcatMessageData {
             time,
             message_type: NapcatMessageType::Private,
-            message: vec![NapcatMessageChain {
-                variant: NapcatMessageChainType::Text {
-                    data: TextData {
-                        text: text.to_owned(),
-                    },
-                },
-            }],
+            message_id: None,
+            message: message_segments,
             self_id,
             user_id: self_id,
             group_id: None,
@@ -6054,14 +7284,27 @@ fn scene_capture_request(
     Some(SceneCaptureRequest {
         user_id,
         campaign_id,
+        kind: scene_capture_command_kind(&message_text(message))?,
     })
 }
 
 pub(crate) fn is_scene_capture_command_text(text: &str) -> bool {
+    scene_capture_command_kind(text).is_some()
+}
+
+fn scene_capture_command_kind(text: &str) -> Option<SceneCaptureKind> {
     matches!(
         text.trim(),
         "#观察" | "#gc" | ".观察" | ".gc" | "。观察" | "。gc"
     )
+    .then_some(SceneCaptureKind::Image)
+    .or_else(|| {
+        matches!(
+            text.trim(),
+            "#观察视频" | "#gc2" | ".观察视频" | ".gc2" | "。观察视频" | "。gc2"
+        )
+        .then_some(SceneCaptureKind::PanoramaVideo)
+    })
 }
 
 fn private_detect_magic_response(
@@ -6388,6 +7631,9 @@ fn handle_private_player_command(
         "冷却" => Some(format_private_character_cooldowns(
             manager, target_id,
         )),
+        "频道" => Some(format_private_channels(
+            manager, target_id,
+        )),
         "频道人员" => Some(format_private_channel_members(
             manager, target_id,
         )),
@@ -6409,9 +7655,10 @@ fn format_private_help() -> String {
         "【.侦测魔法】或【.detect magic】侦测附近的施法痕迹（需要INT 20）",
         "【.已兑换】查看技能与兑换内容",
         "【.冷却】查看技能冷却",
+        "【.频道】查看自己所属的全部频道",
         "【.频道人员】查看当前可见频道成员",
         "【.指南】查看当前TRPG组指南",
-        "【.观察】或【.gc】请求玩家观察画面",
+        "【.观察】或【.gc】请求玩家观察画面；【.观察视频】或【.gc2】请求360度观察视频",
         "【.抽取天赋】抽取普通天赋",
         "【.抽取辅助天赋】抽取辅助天赋",
         "【.<属性> <点数>】为已完成角色投入属性点，例如 .力量 1 或 。agi 2",
@@ -7007,10 +8254,23 @@ fn format_private_channel_members(manager: &NapcatMessageManager, target_id: &st
         };
     };
 
+    let party_ids = group.party_ids_for_player(target_id);
+    if party_ids.len() > 1 {
+        return "你属于多个频道。输入【.频道】查看全部频道；频道成员不能跨频道合并显示。"
+            .to_owned();
+    }
     let access = target_id
         .parse::<u64>()
         .map(|player_id| group.player_access(player_id))
         .unwrap_or_default();
+    if access
+        .party_id
+        .as_deref()
+        .and_then(|party_id| group.parties.get(party_id))
+        .is_some_and(|party| party.anonymous)
+    {
+        return "当前频道：匿名频道\n成员：不可查看".to_owned();
+    }
     let scope_name = access
         .party_id
         .as_deref()
@@ -7019,7 +8279,7 @@ fn format_private_channel_members(manager: &NapcatMessageManager, target_id: &st
     let names = group
         .players
         .iter()
-        .filter(|member_id| visible_channel_member(group, &access, member_id))
+        .filter(|member_id| same_channel_member(group, &access, member_id))
         .map(|member_id| private_target_display_name(manager, member_id))
         .collect::<Vec<_>>();
     if names.is_empty() {
@@ -7028,6 +8288,34 @@ fn format_private_channel_members(manager: &NapcatMessageManager, target_id: &st
         format!(
             "当前频道：{scope_name}\n成员：{}",
             names.join("、")
+        )
+    }
+}
+
+fn format_private_channels(manager: &NapcatMessageManager, target_id: &str) -> String {
+    let Some(group) = manager.group_for_player_target(target_id) else {
+        return if manager.trpg_groups.is_empty() {
+            "当前没有TRPG组。".to_owned()
+        } else {
+            "你还没有加入当前TRPG组。".to_owned()
+        };
+    };
+
+    let channel_names = group
+        .party_ids_for_player(target_id)
+        .into_iter()
+        .filter_map(|party_id| {
+            let party = group.parties.get(party_id)?;
+            let name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
+            Some(if party.anonymous { format!("{name}（匿名）") } else { name.to_owned() })
+        })
+        .collect::<Vec<_>>();
+    if channel_names.is_empty() {
+        "你当前不属于任何频道。".to_owned()
+    } else {
+        format!(
+            "你所在的频道：{}\n多频道发送格式：[频道名: 内容]，例如[狂妄号:你好]。",
+            channel_names.join("、")
         )
     }
 }
@@ -7049,13 +8337,34 @@ fn format_private_group_guide(manager: &NapcatMessageManager, target_id: &str) -
     }
 }
 
+fn same_channel_member(group: &TrpgGroup, access: &PlayerAccess, target_id: &str) -> bool {
+    let target_party_ids = group.party_ids_for_player(target_id);
+    if target_party_ids.is_empty() {
+        access.party_ids.is_empty() && access.party_id.is_none()
+    } else {
+        target_party_ids.iter().any(|party_id| {
+            access.party_id.as_deref() == Some(*party_id)
+                || access
+                    .party_ids
+                    .iter()
+                    .any(|access_party_id| access_party_id == party_id)
+        })
+    }
+}
+
 fn visible_channel_member(group: &TrpgGroup, access: &PlayerAccess, target_id: &str) -> bool {
     if target_id == access.player_id.to_string() {
         return true;
     }
-    match group.party_id_for_player(target_id) {
-        Some(party_id) => access.can_read(&Visibility::Party(party_id.to_owned())),
-        None => access.can_read(&Visibility::Public),
+    let party_ids = group.party_ids_for_player(target_id);
+    if party_ids.is_empty() {
+        access.can_read(&Visibility::Public)
+    } else {
+        party_ids.iter().any(|party_id| {
+            access.can_read(&Visibility::Party(
+                (*party_id).to_owned(),
+            ))
+        })
     }
 }
 
@@ -8068,11 +9377,73 @@ fn message_text(message: &NapcatMessage) -> String {
         .filter_map(|chain| match &chain.variant {
             NapcatMessageChainType::Text { data } => Some(data.text.as_str()),
             NapcatMessageChainType::Source(_) => None,
+            NapcatMessageChainType::ForwardedReplay { .. } => None,
             NapcatMessageChainType::Image { .. } => None,
             NapcatMessageChainType::Unsupported => None,
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn forwarded_replay_data(message: &NapcatMessage) -> Option<&ForwardedReplayData> {
+    message.data.message.iter().find_map(|chain| {
+        let NapcatMessageChainType::ForwardedReplay { data } = &chain.variant else {
+            return None;
+        };
+        Some(data)
+    })
+}
+
+fn infer_legacy_forwarded_attribution(
+    manager: &NapcatMessageManager,
+    message: &NapcatMessage,
+) -> Option<ForwardedAttribution> {
+    if !matches!(
+        message.data.message_type,
+        NapcatMessageType::Private
+    ) || message.data.user_id != message.data.self_id
+    {
+        return None;
+    }
+    let text = message_text(message);
+    let (sender_label, forwarded_text) = text.split_once(": ")?;
+    let sender_name = sender_label
+        .rsplit_once('】')
+        .map(|(_, name)| name)
+        .unwrap_or(sender_label)
+        .trim();
+    let forwarded_text = forwarded_text.trim();
+    if sender_name.is_empty() || forwarded_text.is_empty() || sender_name.contains("匿名") {
+        return None;
+    }
+
+    let matching_sender_ids = manager
+        .messages
+        .values()
+        .flatten()
+        .filter(|candidate| candidate.data.user_id != candidate.data.self_id)
+        .filter(|candidate| candidate.data.sender.nickname.trim() == sender_name)
+        .filter(|candidate| {
+            candidate.data.time <= message.data.time
+                && message.data.time.saturating_sub(candidate.data.time) <= 300
+        })
+        .filter(|candidate| {
+            quoted_auto_forward_text(candidate).as_deref() == Some(forwarded_text)
+                || parsed_party_channel_text(candidate)
+                    .is_some_and(|parsed| parsed.text.trim() == forwarded_text)
+        })
+        .map(|candidate| candidate.data.user_id)
+        .collect::<HashSet<_>>();
+    if matching_sender_ids.len() != 1 {
+        return None;
+    }
+    let sender_id = matching_sender_ids.into_iter().next()?;
+    Some(ForwardedAttribution {
+        sender_id,
+        sender_name: sender_name.to_owned(),
+        text: forwarded_text.to_owned(),
+        source_time: message.data.time,
+    })
 }
 
 fn message_image_reference(message: &NapcatMessage) -> Option<String> {
@@ -8095,6 +9466,20 @@ fn message_image_reference(message: &NapcatMessage) -> Option<String> {
 struct AutoForwardRequest {
     recipients: Vec<u64>,
     text: String,
+    forwarded: Option<ForwardedAttribution>,
+}
+
+#[derive(Debug, Clone)]
+struct ForwardedAttribution {
+    sender_id: u64,
+    sender_name: String,
+    text: String,
+    source_time: u64,
+}
+
+enum PartyChannelAutoForward {
+    Forward(AutoForwardRequest),
+    Guidance(String),
 }
 
 fn auto_forward_request(
@@ -8107,6 +9492,9 @@ fn auto_forward_request(
         NapcatMessageType::Private
     ) || message.data.user_id == message.data.self_id
     {
+        return None;
+    }
+    if !auto_forward_sender_is_alive(manager, target_id) {
         return None;
     }
 
@@ -8150,7 +9538,107 @@ fn auto_forward_request(
             "{}: {}",
             message.data.sender.nickname, text
         ),
+        forwarded: Some(ForwardedAttribution {
+            sender_id: message.data.user_id,
+            sender_name: message.data.sender.nickname.clone(),
+            text,
+            source_time: message.data.time,
+        }),
     })
+}
+
+fn party_channel_auto_forward_request(
+    manager: &NapcatMessageManager,
+    message: &NapcatMessage,
+    target_id: &str,
+) -> Option<PartyChannelAutoForward> {
+    if !matches!(
+        message.data.message_type,
+        NapcatMessageType::Private
+    ) || message.data.user_id == message.data.self_id
+    {
+        return None;
+    }
+    if !auto_forward_sender_is_alive(manager, target_id) {
+        return None;
+    }
+
+    let channel_message = parsed_party_channel_text(message)?;
+    let group = manager.group_for_player_target(target_id)?;
+    let party_ids = group.party_ids_for_player(target_id);
+    let party_id = if let Some(requested_channel) = channel_message.channel_name.as_deref() {
+        let matching_ids = party_ids
+            .iter()
+            .copied()
+            .filter(|party_id| {
+                let Some(party) = group.parties.get(*party_id) else {
+                    return false;
+                };
+                *party_id == requested_channel || party.name.trim() == requested_channel
+            })
+            .collect::<Vec<_>>();
+        if matching_ids.len() != 1 {
+            return Some(PartyChannelAutoForward::Guidance(
+                "没有找到唯一匹配的所属频道。输入【.频道】查看频道，并使用[频道名: 内容]发送。"
+                    .to_owned(),
+            ));
+        }
+        matching_ids[0]
+    } else {
+        match party_ids.as_slice() {
+            [] => return None,
+            [party_id] => *party_id,
+            _ => {
+                return Some(PartyChannelAutoForward::Guidance(
+                    "你属于多个频道，请使用[频道名: 内容]发送，例如[狂妄号:你好]。输入【.频道】查看全部频道。"
+                        .to_owned(),
+                ));
+            },
+        }
+    };
+    let party = group.parties.get(party_id)?;
+    let recipients = party
+        .players
+        .iter()
+        .filter(|member_id| member_id.as_str() != target_id)
+        .filter(|member_id| manager.chat_target_kind(member_id) == ChatTargetExportKind::Private)
+        .filter_map(|member_id| member_id.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+
+    if recipients.is_empty() {
+        return None;
+    }
+
+    let forwarded_text = if party.anonymous {
+        let party_name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
+        format!(
+            "{party_name}(匿名): {}",
+            channel_message.text
+        )
+    } else {
+        let party_name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
+        let channel_name = if party_name.ends_with("频道") {
+            party_name.to_owned()
+        } else {
+            format!("{party_name}频道")
+        };
+        format!(
+            "【{}】{}: {}",
+            channel_name, message.data.sender.nickname, channel_message.text
+        )
+    };
+    Some(PartyChannelAutoForward::Forward(
+        AutoForwardRequest {
+            recipients,
+            text: forwarded_text,
+            forwarded: (!party.anonymous).then(|| ForwardedAttribution {
+                sender_id: message.data.user_id,
+                sender_name: message.data.sender.nickname.clone(),
+                text: channel_message.text,
+                source_time: message.data.time,
+            }),
+        },
+    ))
 }
 
 fn auto_forward_sender_access<'a>(
@@ -8160,6 +9648,27 @@ fn auto_forward_sender_access<'a>(
     let group = manager.group_for_player_target(target_id)?;
     let player_id = target_id.parse::<u64>().ok()?;
     Some((group, group.player_access(player_id)))
+}
+
+fn auto_forward_sender_is_alive(manager: &NapcatMessageManager, target_id: &str) -> bool {
+    manager
+        .player_characters
+        .get(target_id)
+        .is_none_or(|character| character.hp > 0.0)
+}
+
+fn defeated_auto_forward_guidance(
+    manager: &NapcatMessageManager,
+    message: &NapcatMessage,
+    target_id: &str,
+) -> Option<String> {
+    if auto_forward_sender_is_alive(manager, target_id) {
+        return None;
+    }
+    if quoted_auto_forward_text(message).is_none() && parsed_party_channel_text(message).is_none() {
+        return None;
+    }
+    Some("你的角色当前已阵亡，无法发言；这条消息不会被自动转发。".to_owned())
 }
 
 fn auto_forward_recipient_allowed(
@@ -8201,6 +9710,65 @@ fn is_auto_forward_quote(character: char) -> bool {
     matches!(character, '"' | '“' | '”' | '＂')
 }
 
+fn party_channel_text(message: &NapcatMessage) -> Option<String> {
+    let mut text = String::new();
+    for chain in &message.data.message {
+        if let NapcatMessageChainType::Text { data } = &chain.variant {
+            text.push_str(&data.text);
+        }
+    }
+
+    let mut indexed_chars = text.char_indices();
+    let (_, start_bracket) = indexed_chars.next()?;
+    let (end_bracket_index, end_bracket) = indexed_chars.next_back()?;
+    let brackets_match = matches!(
+        (start_bracket, end_bracket),
+        ('[', ']') | ('【', '】')
+    );
+    if !brackets_match {
+        return None;
+    }
+
+    let inner = text[start_bracket.len_utf8()..end_bracket_index].trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_owned())
+    }
+}
+
+struct ParsedPartyChannelText {
+    channel_name: Option<String>,
+    text: String,
+}
+
+fn parsed_party_channel_text(message: &NapcatMessage) -> Option<ParsedPartyChannelText> {
+    let text = party_channel_text(message)?;
+    let separator_index = text.find([':', '：']);
+    let Some(separator_index) = separator_index else {
+        return Some(ParsedPartyChannelText {
+            channel_name: None,
+            text,
+        });
+    };
+
+    let channel_name = text[..separator_index].trim();
+    let message_text = text[separator_index..]
+        .chars()
+        .next()
+        .map(char::len_utf8)
+        .and_then(|separator_len| text.get(separator_index + separator_len..))?
+        .trim();
+    if channel_name.is_empty() || message_text.is_empty() {
+        return None;
+    }
+
+    Some(ParsedPartyChannelText {
+        channel_name: Some(channel_name.to_owned()),
+        text: message_text.to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8208,6 +9776,7 @@ mod tests {
     fn empty_manager() -> NapcatMessageManager {
         NapcatMessageManager {
             messages: HashMap::default(),
+            replay_snapshots: HashMap::default(),
             chat_targets: HashMap::default(),
             chat_target_kinds: HashMap::default(),
             player_characters: HashMap::default(),
@@ -8224,6 +9793,138 @@ mod tests {
             item_pool: Vec::new(),
             unit_pool: HashMap::default(),
         }
+    }
+
+    #[test]
+    fn toml_persistence_round_trips_sparse_replay_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("messages.toml");
+        let snapshot = ReplayMessageSnapshot {
+            turn_index: 7,
+            position_cells: [11, 12, 13],
+        };
+        let mut manager = empty_manager();
+        manager
+            .replay_snapshots
+            .insert("2383680235".to_owned(), vec![
+                None,
+                None,
+                Some(snapshot),
+            ]);
+        let persistent = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path.clone())
+            .default(manager)
+            .build()
+            .unwrap();
+
+        persistent.persist().unwrap();
+
+        let encoded = fs::read_to_string(&path).unwrap();
+        assert!(encoded.contains("[replay_snapshots.2383680235.2]"));
+        let restored = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path)
+            .default(empty_manager())
+            .build()
+            .unwrap();
+        assert_eq!(
+            restored.replay_snapshots["2383680235"],
+            vec![None, None, Some(snapshot)]
+        );
+    }
+
+    #[test]
+    fn player_chat_window_colors_are_distinct_and_survive_toml_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("messages.toml");
+        let mut manager = empty_manager();
+        for target_id in ["2", "3"] {
+            manager.chat_targets.insert(
+                target_id.to_owned(),
+                ChatTargetMetadata::default(),
+            );
+            manager.chat_target_kinds.insert(
+                target_id.to_owned(),
+                ChatTargetExportKind::Private,
+            );
+        }
+        manager
+            .chat_targets
+            .insert("99".to_owned(), ChatTargetMetadata::default());
+        manager
+            .chat_target_kinds
+            .insert("99".to_owned(), ChatTargetExportKind::Group);
+
+        assert!(manager.sync_chat_targets());
+        let first_color = manager.player_chat_window_color("2").unwrap();
+        let second_color = manager.player_chat_window_color("3").unwrap();
+        assert_ne!(first_color, second_color);
+        assert_eq!(manager.player_chat_window_color("99"), None);
+        assert!(!manager.sync_chat_targets());
+
+        let persistent = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path.clone())
+            .default(manager)
+            .build()
+            .unwrap();
+        persistent.persist().unwrap();
+
+        let encoded = fs::read_to_string(&path).unwrap();
+        assert!(encoded.contains("chat_window_color_rgb"));
+        let restored = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path)
+            .default(empty_manager())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            restored.player_chat_window_color("2"),
+            Some(first_color)
+        );
+        assert_eq!(
+            restored.player_chat_window_color("3"),
+            Some(second_color)
+        );
+    }
+
+    #[test]
+    fn toml_persistence_loads_legacy_aligned_replay_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("messages.toml");
+        fs::write(
+            &path,
+            r#"
+messages = {}
+
+[[replay_snapshots.2383680235]]
+turn_index = 3
+position_cells = [4, 5, 6]
+"#,
+        )
+        .unwrap();
+
+        let restored = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path)
+            .default(empty_manager())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            restored.replay_snapshots["2383680235"],
+            vec![Some(ReplayMessageSnapshot {
+                turn_index: 3,
+                position_cells: [4, 5, 6],
+            })]
+        );
     }
 
     fn test_message(message_type: NapcatMessageType) -> NapcatMessage {
@@ -8243,6 +9944,7 @@ mod tests {
             data: NapcatMessageData {
                 time: 1780132600,
                 message_type,
+                message_id: None,
                 message: vec![NapcatMessageChain {
                     variant: NapcatMessageChainType::Text {
                         data: TextData {
@@ -8273,6 +9975,7 @@ mod tests {
             data: NapcatMessageData {
                 time: 1780132600,
                 message_type: NapcatMessageType::Private,
+                message_id: None,
                 message: vec![NapcatMessageChain {
                     variant: NapcatMessageChainType::Image {
                         data: ImageData {
@@ -8301,6 +10004,240 @@ mod tests {
                 access_scope_resolved: false,
             },
         }
+    }
+
+    #[test]
+    fn deleting_player_removes_chat_character_and_group_references() {
+        let mut manager = empty_manager();
+        manager.chat_targets.insert("2".to_owned(), Default::default());
+        manager
+            .chat_target_kinds
+            .insert("2".to_owned(), ChatTargetExportKind::Private);
+        manager
+            .player_characters
+            .insert("2".to_owned(), PlayerCharacter::default());
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message_from(2, "private"),
+        ]);
+        manager.replay_snapshots.insert("2".to_owned(), vec![None]);
+        manager.messages.insert("99".to_owned(), vec![
+            test_private_message_from(2, "group contribution"),
+            test_private_message_from(3, "keep"),
+        ]);
+        manager.replay_snapshots.insert("99".to_owned(), vec![
+            Some(ReplayMessageSnapshot {
+                turn_index: 1,
+                position_cells: [1, 2, 3],
+            }),
+            Some(ReplayMessageSnapshot {
+                turn_index: 2,
+                position_cells: [4, 5, 6],
+            }),
+        ]);
+        manager.groups.insert("table".to_owned(), ChatGroup {
+            members: vec!["2".to_owned(), "3".to_owned()],
+        });
+        manager.open_chat_targets.insert("2".to_owned());
+        manager.read_message_counts.insert("2".to_owned(), 1);
+        manager.summarized_message_counts.insert("2".to_owned(), 1);
+        manager.trpg_groups.insert("campaign".to_owned(), TrpgGroup {
+            gm_users: HashSet::from([2]),
+            players: vec!["2".to_owned(), "3".to_owned()],
+            parties: HashMap::from([("red".to_owned(), TrpgParty {
+                players: vec!["2".to_owned(), "3".to_owned()],
+                ..Default::default()
+            })]),
+            player_parties: HashMap::from([("2".to_owned(), "red".to_owned())]),
+            legacy_teams: vec![TrpgLegacyTeam {
+                players: vec!["2".to_owned(), "3".to_owned()],
+                chat_message_count: 2,
+                chat_messages: vec![
+                    TrpgLegacyTeamChatMessage {
+                        sender_id: "2".to_owned(),
+                        ..Default::default()
+                    },
+                    TrpgLegacyTeamChatMessage {
+                        sender_id: "3".to_owned(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            legacy_worlds: vec![TrpgLegacyWorld {
+                players: vec!["2".to_owned(), "3".to_owned()],
+                chat_areas: vec![TrpgLegacyArea {
+                    members: vec!["2".to_owned(), "3".to_owned()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            legacy_send_panes: vec![TrpgLegacySendPane {
+                targets: vec!["2".to_owned(), "3".to_owned()],
+                ..Default::default()
+            }],
+            legacy_negative_timers: vec![TrpgLegacyNegativeTimer::for_target("2")],
+            player_turns: HashMap::from([("2".to_owned(), Default::default())]),
+            initial_player_states: HashMap::from([(
+                "2".to_owned(),
+                PlayerCharacter::default(),
+            )]),
+            ..Default::default()
+        });
+
+        let summary = manager.delete_player("2").unwrap();
+
+        assert_eq!(summary.removed_messages, 2);
+        assert_eq!(summary.affected_chat_targets, vec![
+            "2".to_owned(),
+            "99".to_owned()
+        ]);
+        assert_eq!(manager.messages["99"].len(), 1);
+        assert_eq!(
+            manager.replay_snapshots["99"][0]
+                .unwrap()
+                .turn_index,
+            2
+        );
+        assert!(!manager.chat_targets.contains_key("2"));
+        assert!(!manager.player_characters.contains_key("2"));
+        assert!(!manager.groups["table"].members.contains(&"2".to_owned()));
+        let group = &manager.trpg_groups["campaign"];
+        assert_eq!(group.players, vec!["3".to_owned()]);
+        assert!(!group.gm_users.contains(&2));
+        assert_eq!(group.parties["red"].players, vec!["3".to_owned()]);
+        assert!(!group.player_parties.contains_key("2"));
+        assert_eq!(group.legacy_teams[0].players, vec!["3".to_owned()]);
+        assert_eq!(group.legacy_teams[0].chat_message_count, 1);
+        assert_eq!(group.legacy_teams[0].chat_messages.len(), 1);
+        assert_eq!(group.legacy_worlds[0].players, vec!["3".to_owned()]);
+        assert_eq!(
+            group.legacy_worlds[0].chat_areas[0].members,
+            vec!["3".to_owned()]
+        );
+        assert_eq!(
+            group.legacy_send_panes[0].targets,
+            vec!["3".to_owned()]
+        );
+        assert!(group.legacy_negative_timers.is_empty());
+        assert!(!group.player_turns.contains_key("2"));
+        assert!(!group.initial_player_states.contains_key("2"));
+    }
+
+    #[test]
+    fn inbound_journal_replays_only_messages_not_acknowledged_after_persist() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("inbound.jsonl");
+        let mut journal = InboundMessageJournal::new(path.clone());
+        assert!(journal.load_pending().unwrap().is_empty());
+
+        let first_id = journal.append_message("first".to_owned()).unwrap();
+        let second_id = journal.append_message("second".to_owned()).unwrap();
+        journal.acknowledge(first_id).unwrap();
+
+        let mut restarted = InboundMessageJournal::new(path);
+        assert_eq!(restarted.load_pending().unwrap(), vec![
+            (second_id, "second".to_owned())
+        ]);
+        let third_id = restarted.append_message("third".to_owned()).unwrap();
+        assert!(third_id > second_id);
+        restarted.acknowledge(second_id).unwrap();
+        restarted.acknowledge(third_id).unwrap();
+        assert_eq!(
+            fs::metadata(&restarted.path).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn replayed_journal_message_is_deduplicated_by_napcat_message_id() {
+        let mut manager = empty_manager();
+        let mut stored = test_private_message_from(42, "last message");
+        stored.data.message_id = Some(7001);
+        stored.data.self_id = 99;
+        manager
+            .messages
+            .insert("42".to_owned(), vec![stored.clone()]);
+
+        assert!(napcat_message_is_already_stored(
+            &manager, &stored
+        ));
+
+        let mut different_account = stored.clone();
+        different_account.data.self_id = 100;
+        assert!(!napcat_message_is_already_stored(
+            &manager,
+            &different_account
+        ));
+
+        let mut legacy_without_id = stored;
+        legacy_without_id.data.message_id = None;
+        assert!(!napcat_message_is_already_stored(
+            &manager,
+            &legacy_without_id
+        ));
+    }
+
+    #[test]
+    fn inbound_receipts_survive_chat_history_deletion() {
+        let mut manager = empty_manager();
+        let mut stored = test_private_message_from(42, ".gc");
+        stored.data.message_id = Some(7001);
+        stored.data.self_id = 99;
+        manager
+            .messages
+            .insert("42".to_owned(), vec![stored.clone()]);
+        let mut receipts = InboundMessageReceiptStore::default();
+
+        assert!(backfill_inbound_message_receipts(
+            &mut receipts,
+            &manager
+        ));
+        manager.messages.clear();
+
+        assert!(!napcat_message_is_already_stored(
+            &manager, &stored
+        ));
+        assert!(napcat_message_is_already_processed(
+            &manager, &receipts, &stored
+        ));
+    }
+
+    #[test]
+    fn journal_replay_never_retriggers_scene_capture_command() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            campaign_id: "campaign-a".to_owned(),
+            players: vec!["2".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("alpha".to_owned());
+        let message = test_private_message_from(2, ".gc");
+
+        let replayed = prepare_inbound_automatic_actions(
+            &mut manager,
+            &message,
+            "2",
+            true,
+            None,
+            NapcatInboundOrigin::JournalReplay,
+        );
+        assert!(replayed.private_response.is_none());
+        assert!(replayed.scene_capture.is_none());
+        assert!(replayed.auto_forward.is_none());
+        assert!(!manager.player_characters.contains_key("2"));
+
+        let live = prepare_inbound_automatic_actions(
+            &mut manager,
+            &message,
+            "2",
+            true,
+            None,
+            NapcatInboundOrigin::Live,
+        );
+        assert_eq!(
+            live.scene_capture.unwrap().kind,
+            SceneCaptureKind::Image
+        );
     }
 
     #[test]
@@ -8473,6 +10410,35 @@ mod tests {
     }
 
     #[test]
+    fn trpg_group_player_can_join_multiple_parties() {
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("red"));
+        group.set_player_party("4", Some("blue"));
+
+        assert!(group.set_player_party_membership("2", "blue", true));
+        assert_eq!(group.party_ids_for_player("2"), vec![
+            "blue", "red"
+        ]);
+        assert!(group.player_in_party("2", "red"));
+        assert!(group.player_in_party("2", "blue"));
+        let access = group.player_access(2);
+        assert!(access.can_read(&Visibility::Party("red".to_owned())));
+        assert!(access.can_read(&Visibility::Party("blue".to_owned())));
+
+        assert!(group.set_player_party_membership("2", "red", false));
+        assert_eq!(group.party_ids_for_player("2"), vec![
+            "blue"
+        ]);
+        assert!(!group.player_in_party("2", "red"));
+    }
+
+    #[test]
     fn trpg_group_merge_party_moves_players_and_access_scope() {
         let mut group = TrpgGroup {
             players: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
@@ -8540,6 +10506,7 @@ mod tests {
                 id: "1".to_owned(),
                 name: "红队频道".to_owned(),
                 players: vec!["10002".to_owned(), "10003".to_owned(), "99999".to_owned()],
+                anonymous_speakers: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -8565,6 +10532,7 @@ mod tests {
             "10002".to_owned(),
             "10003".to_owned()
         ]);
+        assert!(group.parties["红队频道"].anonymous);
         assert!(
             group.player_access(10002).can_read(&Visibility::Party(
                 "红队频道".to_owned()
@@ -9361,6 +11329,7 @@ mod tests {
             .insert("2".to_owned(), ChatTargetMetadata {
                 display_name: "玩家".to_owned(),
                 automatic_name: "tester".to_owned(),
+                chat_window_color_rgb: None,
             });
         manager.player_characters.insert(
             "2".to_owned(),
@@ -9457,6 +11426,7 @@ mod tests {
             .insert("2".to_owned(), ChatTargetMetadata {
                 display_name: "保留聊天名".to_owned(),
                 automatic_name: "friend".to_owned(),
+                chat_window_color_rgb: None,
             });
         manager.player_characters.insert(
             "2".to_owned(),
@@ -9519,6 +11489,7 @@ mod tests {
             .insert("2".to_owned(), ChatTargetMetadata {
                 display_name: "玩家二".to_owned(),
                 automatic_name: "friend".to_owned(),
+                chat_window_color_rgb: None,
             });
         manager.read_message_counts.insert("2".to_owned(), 3);
         manager.summarized_message_counts.insert("99".to_owned(), 5);
@@ -9641,6 +11612,7 @@ mod tests {
             .insert("2".to_owned(), ChatTargetMetadata {
                 display_name: "导入玩家".to_owned(),
                 automatic_name: "source".to_owned(),
+                chat_window_color_rgb: None,
             });
         source.read_message_counts.insert("2".to_owned(), 3);
         source.summarized_message_counts.insert("99".to_owned(), 5);
@@ -9827,17 +11799,23 @@ mod tests {
         manager
             .unit_pool
             .insert("zombie".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "行尸".to_owned(),
                 note: "缓慢近战单位".to_owned(),
                 legacy_member_id: None,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("行尸"),
             });
         manager
             .unit_pool
             .insert("archer".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "弓手".to_owned(),
                 note: "远程单位".to_owned(),
                 legacy_member_id: None,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("弓手"),
             });
         manager.messages.insert("2".to_owned(), vec![test_message(
@@ -9875,33 +11853,45 @@ mod tests {
         manager
             .unit_pool
             .insert("direct".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "直接单位".to_owned(),
                 note: String::new(),
                 legacy_member_id: None,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("直接单位"),
             });
         manager
             .unit_pool
             .insert("alias-b".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "别名B".to_owned(),
                 note: String::new(),
                 legacy_member_id: Some("20001".to_owned()),
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("别名B"),
             });
         manager
             .unit_pool
             .insert("alias-a".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "别名A".to_owned(),
                 note: String::new(),
                 legacy_member_id: Some("20001".to_owned()),
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("别名A"),
             });
         manager.unit_pool.insert(
             "moonberry-unit-30001".to_owned(),
             UnitPoolEntry {
+                category: String::new(),
                 label: "旧兼容单位".to_owned(),
                 note: String::new(),
                 legacy_member_id: None,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("旧兼容单位"),
             },
         );
@@ -9926,15 +11916,21 @@ mod tests {
     fn unit_pool_export_json_merges_by_unit_id_without_chat_data() {
         let mut source = empty_manager();
         source.unit_pool.insert("archer".to_owned(), UnitPoolEntry {
+            category: String::new(),
             label: "新弓手".to_owned(),
             note: "导入版本".to_owned(),
             legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
             character: completed_character("新弓手"),
         });
         source.unit_pool.insert("zombie".to_owned(), UnitPoolEntry {
+            category: String::new(),
             label: "行尸".to_owned(),
             note: "缓慢近战单位".to_owned(),
             legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
             character: completed_character("行尸"),
         });
         let json = source.to_unit_pool_export_json().unwrap();
@@ -9946,9 +11942,12 @@ mod tests {
         manager
             .unit_pool
             .insert("archer".to_owned(), UnitPoolEntry {
+                category: String::new(),
                 label: "旧弓手".to_owned(),
                 note: "本地旧版本".to_owned(),
                 legacy_member_id: None,
+                rarity: UnitRarity::Normal,
+                base_damage: 0.0,
                 character: completed_character("旧弓手"),
             });
 
@@ -10966,10 +12965,12 @@ mod tests {
                 ("red".to_owned(), TrpgParty {
                     name: "red".to_owned(),
                     players: vec!["2".to_owned(), "3".to_owned()],
+                    anonymous: false,
                 }),
                 ("blue".to_owned(), TrpgParty {
                     name: "blue".to_owned(),
                     players: vec!["4".to_owned()],
+                    anonymous: false,
                 }),
             ]),
             player_parties: HashMap::from([
@@ -11450,6 +13451,98 @@ mod tests {
         assert!(response.contains("晨星"));
         assert!(response.contains("白露"));
         assert!(!response.contains("夜航"));
+
+        manager
+            .trpg_groups
+            .get_mut("table")
+            .unwrap()
+            .parties
+            .get_mut("red")
+            .unwrap()
+            .anonymous = true;
+        let anonymous_response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".频道人员"),
+            "2",
+        )
+        .unwrap();
+
+        assert_eq!(
+            anonymous_response,
+            "当前频道：匿名频道\n成员：不可查看"
+        );
+    }
+
+    #[test]
+    fn private_channels_command_lists_every_membership() {
+        let mut manager = empty_manager();
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("human");
+        group.ensure_party("ship");
+        group.parties.get_mut("human").unwrap().name = "人类".to_owned();
+        group.parties.get_mut("ship").unwrap().name = "狂妄号".to_owned();
+        group.parties.get_mut("human").unwrap().anonymous = true;
+        group.set_player_party("2", Some("human"));
+        group.set_player_party_membership("2", "ship", true);
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".频道"),
+            "2",
+        )
+        .unwrap();
+
+        assert!(response.contains("人类（匿名）"));
+        assert!(response.contains("狂妄号"));
+        assert!(response.contains("[频道名: 内容]"));
+        assert!(response.contains("[狂妄号:你好]"));
+    }
+
+    #[test]
+    fn private_channel_members_command_keeps_gm_in_assigned_party() {
+        let mut manager = empty_manager();
+        for (target_id, nickname) in [("2", "晨星"), ("3", "白露"), ("4", "夜航"), ("5", "远山")]
+        {
+            manager.player_characters.insert(
+                target_id.to_owned(),
+                completed_character(nickname),
+            );
+        }
+        let mut group = TrpgGroup {
+            players: vec![
+                "2".to_owned(),
+                "3".to_owned(),
+                "4".to_owned(),
+                "5".to_owned(),
+            ],
+            gm_users: HashSet::from([2]),
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("red"));
+        group.set_player_party("4", Some("blue"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".频道人员"),
+            "2",
+        )
+        .unwrap();
+
+        assert!(response.contains("小队「red」"));
+        assert!(response.contains("晨星"));
+        assert!(response.contains("白露"));
+        assert!(!response.contains("夜航"));
+        assert!(!response.contains("远山"));
     }
 
     #[test]
@@ -11583,6 +13676,20 @@ mod tests {
                 "{command} should trigger capture"
             );
         }
+        for command in [
+            "#观察视频",
+            "#gc2",
+            ".观察视频",
+            ".gc2",
+            "。观察视频",
+            "。gc2",
+        ] {
+            assert_eq!(
+                scene_capture_command_kind(command),
+                Some(SceneCaptureKind::PanoramaVideo),
+                "{command} should trigger video capture"
+            );
+        }
     }
 
     #[test]
@@ -11614,6 +13721,10 @@ mod tests {
 
         assert_eq!(player_request.user_id, 2);
         assert_eq!(player_request.campaign_id, "campaign-a");
+        assert_eq!(
+            player_request.kind,
+            SceneCaptureKind::Image
+        );
         assert_eq!(gm_request.user_id, 9);
         assert_eq!(gm_request.campaign_id, "campaign-a");
         assert!(manager.can_serve_scene_capture(
@@ -11718,6 +13829,69 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_private_reply_preserves_original_speaker_for_replay() {
+        let mut manager = empty_manager();
+
+        assert!(
+            append_local_private_text_response_with_forwarded_attribution(
+                &mut manager,
+                "3",
+                3,
+                "moemoe: hello",
+                Some(ForwardedAttribution {
+                    sender_id: 2,
+                    sender_name: "moemoe".to_owned(),
+                    text: "hello".to_owned(),
+                    source_time: 100,
+                }),
+            )
+        );
+
+        let stored = &manager.messages["3"][0];
+        assert_eq!(message_text(stored), "moemoe: hello");
+        assert_eq!(
+            manager.replay_message_sender_id(stored),
+            2
+        );
+        let persisted = serde_json::to_string(stored).unwrap();
+        let restored: NapcatMessage = serde_json::from_str(&persisted).unwrap();
+        let replay_message = manager.campaign_message_for_target("3", &restored);
+        assert_eq!(replay_message.sender_id, 2);
+        assert_eq!(replay_message.sender_name, "moemoe");
+        assert_eq!(replay_message.text, "hello");
+        assert_eq!(replay_message.time, 100);
+        assert!(replay_message.forwarded);
+        assert_eq!(
+            replay_message.visibility,
+            Visibility::Player(3)
+        );
+    }
+
+    #[test]
+    fn legacy_forwarded_reply_is_inferred_from_its_original_message() {
+        let mut manager = empty_manager();
+        let mut original = test_private_message_from(2, "“hello”");
+        original.data.sender.nickname = "moemoe".to_owned();
+        original.data.time = 100;
+        manager.messages.insert("2".to_owned(), vec![original]);
+        assert!(append_local_private_text_response(
+            &mut manager,
+            "3",
+            3,
+            "moemoe: hello",
+        ));
+        manager.messages.get_mut("3").unwrap()[0].data.time = 101;
+
+        let stored = &manager.messages["3"][0];
+        let replay_message = manager.campaign_message_for_target("3", stored);
+
+        assert_eq!(replay_message.sender_id, 2);
+        assert_eq!(replay_message.sender_name, "moemoe");
+        assert_eq!(replay_message.text, "hello");
+        assert!(replay_message.forwarded);
+    }
+
+    #[test]
     fn rejects_auto_forward_text_without_strict_boundary_quotes() {
         let message = serde_json::from_str::<NapcatMessage>(
             r#"{
@@ -11755,6 +13929,251 @@ mod tests {
         .expect("private message should parse");
 
         assert_eq!(quoted_auto_forward_text(&message), None);
+    }
+
+    #[test]
+    fn detects_party_channel_text_with_ascii_and_full_width_brackets() {
+        assert_eq!(
+            party_channel_text(&test_private_message_from(
+                2,
+                "[hello party]"
+            )),
+            Some("hello party".to_owned())
+        );
+        assert_eq!(
+            party_channel_text(&test_private_message_from(
+                2,
+                "【你好，小队】"
+            )),
+            Some("你好，小队".to_owned())
+        );
+    }
+
+    #[test]
+    fn parses_named_party_channel_text_with_both_colon_styles() {
+        let ascii = parsed_party_channel_text(&test_private_message_from(
+            2,
+            "[狂妄号: hello]",
+        ))
+        .unwrap();
+        assert_eq!(
+            ascii.channel_name.as_deref(),
+            Some("狂妄号")
+        );
+        assert_eq!(ascii.text, "hello");
+
+        let full_width = parsed_party_channel_text(&test_private_message_from(
+            2,
+            "【狂妄号：你好】",
+        ))
+        .unwrap();
+        assert_eq!(
+            full_width.channel_name.as_deref(),
+            Some("狂妄号")
+        );
+        assert_eq!(full_width.text, "你好");
+    }
+
+    #[test]
+    fn party_channel_text_requires_exact_matching_boundaries() {
+        for text in [
+            "I would say [hi]",
+            "[hi],",
+            " [hi]",
+            "[hi] ",
+            "[hi】",
+            "【hi]",
+            "[]",
+            "【 】",
+        ] {
+            assert_eq!(
+                party_channel_text(&test_private_message_from(2, text)),
+                None,
+                "{text:?} must not activate the party channel"
+            );
+        }
+    }
+
+    #[test]
+    fn party_channel_auto_forward_only_targets_same_party() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3, 4, 5] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message_from(user_id, "hello"),
+            ]);
+        }
+        let mut group = TrpgGroup {
+            players: vec![
+                "2".to_owned(),
+                "3".to_owned(),
+                "4".to_owned(),
+                "5".to_owned(),
+            ],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.ensure_party("blue");
+        group.parties.get_mut("red").unwrap().name = "人类".to_owned();
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("red"));
+        group.set_player_party("4", Some("blue"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        let Some(PartyChannelAutoForward::Forward(request)) = party_channel_auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "【red-only clue】"),
+            "2",
+        ) else {
+            panic!("same-party recipient should be available");
+        };
+
+        assert_eq!(request.recipients, vec![3]);
+        assert!(!request.recipients.contains(&4));
+        assert!(!request.recipients.contains(&5));
+        assert_eq!(
+            request.text,
+            "【人类频道】user-2: red-only clue"
+        );
+
+        manager
+            .trpg_groups
+            .get_mut("table")
+            .unwrap()
+            .parties
+            .get_mut("red")
+            .unwrap()
+            .anonymous = true;
+        let Some(PartyChannelAutoForward::Forward(anonymous_request)) =
+            party_channel_auto_forward_request(
+                &manager,
+                &test_private_message_from(2, "[anonymous clue]"),
+                "2",
+            )
+        else {
+            panic!("anonymous same-party recipient should be available");
+        };
+
+        assert_eq!(anonymous_request.recipients, vec![3]);
+        assert_eq!(
+            anonymous_request.text,
+            "人类(匿名): anonymous clue"
+        );
+
+        {
+            let group = manager.trpg_groups.get_mut("table").unwrap();
+            group.parties.get_mut("blue").unwrap().name = "狂妄号".to_owned();
+            assert!(group.set_player_party_membership("2", "blue", true));
+        }
+        let Some(PartyChannelAutoForward::Guidance(guidance)) = party_channel_auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "[ambiguous clue]"),
+            "2",
+        ) else {
+            panic!("unnamed multi-channel message should return guidance");
+        };
+        assert!(guidance.contains("[频道名: 内容]"));
+
+        let Some(PartyChannelAutoForward::Forward(blue_request)) =
+            party_channel_auto_forward_request(
+                &manager,
+                &test_private_message_from(2, "[狂妄号:你好]"),
+                "2",
+            )
+        else {
+            panic!("named channel message should resolve the selected channel");
+        };
+        assert_eq!(blue_request.recipients, vec![4]);
+        assert_eq!(
+            blue_request.text,
+            "【狂妄号频道】user-2: 你好"
+        );
+    }
+
+    #[test]
+    fn party_channel_auto_forward_requires_party_assignment() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message_from(user_id, "hello"),
+            ]);
+        }
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
+
+        assert!(party_channel_auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "[public message]"),
+            "2",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn defeated_character_cannot_auto_forward_messages() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message_from(user_id, "hello"),
+            ]);
+        }
+        manager.groups.insert("讨论组".to_owned(), ChatGroup {
+            members: vec!["2".to_owned(), "3".to_owned()],
+        });
+        let mut defeated = completed_character("阵亡者");
+        defeated.hp = 0.0;
+        manager.player_characters.insert("2".to_owned(), defeated);
+
+        assert!(auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "\"last words\""),
+            "2",
+        )
+        .is_none());
+        assert_eq!(
+            defeated_auto_forward_guidance(
+                &manager,
+                &test_private_message_from(2, "\"last words\""),
+                "2",
+            )
+            .as_deref(),
+            Some("你的角色当前已阵亡，无法发言；这条消息不会被自动转发。")
+        );
+
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("dead-space");
+        group.set_player_party("2", Some("dead-space"));
+        group.set_player_party("3", Some("dead-space"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        assert!(party_channel_auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "[last words]"),
+            "2",
+        )
+        .is_none());
+        assert_eq!(
+            defeated_auto_forward_guidance(
+                &manager,
+                &test_private_message_from(2, "[last words]"),
+                "2",
+            )
+            .as_deref(),
+            Some("你的角色当前已阵亡，无法发言；这条消息不会被自动转发。")
+        );
+        assert!(defeated_auto_forward_guidance(
+            &manager,
+            &test_private_message_from(2, "ordinary private text"),
+            "2",
+        )
+        .is_none());
     }
 
     #[test]
@@ -13659,6 +16078,36 @@ mod tests {
     }
 
     #[test]
+    fn trpg_group_reset_all_turns_sets_world_and_player_clocks_to_zero() {
+        let mut group = TrpgGroup {
+            players: vec!["a".to_owned(), "b".to_owned()],
+            world_turn: 8,
+            player_turns: HashMap::from([
+                ("a".to_owned(), TrpgPlayerTurnState {
+                    turns_passed: 8,
+                    acted: true,
+                    skipped: false,
+                }),
+                ("b".to_owned(), TrpgPlayerTurnState {
+                    turns_passed: 7,
+                    acted: false,
+                    skipped: true,
+                }),
+            ]),
+            ..Default::default()
+        };
+
+        assert!(group.reset_all_turns());
+
+        assert_eq!(group.world_turn, 0);
+        assert!(group
+            .player_turns
+            .values()
+            .all(|turn| { turn.turns_passed == 0 && !turn.acted && !turn.skipped }));
+        assert!(!group.reset_all_turns());
+    }
+
+    #[test]
     fn trpg_group_max_world_turn_rejects_partial_advance() {
         let mut group = TrpgGroup {
             players: vec!["a".to_owned()],
@@ -13730,7 +16179,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_character_inventory_defaults_to_nine_empty_hotbar_slots() {
+    fn character_inventory_defaults_release_control_to_the_last_hotbar_slot() {
         let inventory = serde_json::from_value::<CharacterInventory>(serde_json::json!({
             "bag_slots": 16,
             "gold": 4,
@@ -13743,6 +16192,103 @@ mod tests {
         assert!(inventory
             .hotbar
             .iter()
+            .take(8)
             .all(|slot| *slot == CharacterHotbarSlot::Empty));
+        assert_eq!(
+            inventory.hotbar[8],
+            CharacterHotbarSlot::ReleaseControl
+        );
+    }
+
+    #[test]
+    fn content_pool_bundle_round_trips_all_categorized_pools() {
+        let mut source = empty_manager();
+        source.unit_pool.insert("wolf".to_owned(), UnitPoolEntry {
+            category: "森林".to_owned(),
+            label: "狼".to_owned(),
+            ..Default::default()
+        });
+        source.skill_pool.push(SkillPoolEntry {
+            name: "撕咬".to_owned(),
+            note: "造成伤害".to_owned(),
+            category: Some("野兽".to_owned()),
+            ..Default::default()
+        });
+        source.item_pool.push(InventoryItem {
+            category: "药剂".to_owned(),
+            name: "治疗药水".to_owned(),
+            ..Default::default()
+        });
+        source
+            .random_pools
+            .insert("森林掉落".to_owned(), RandomPool {
+                category: "森林".to_owned(),
+                ..Default::default()
+            });
+
+        let json = source.to_content_pool_bundle_json().unwrap();
+        let mut target = empty_manager();
+        let summary = target.merge_content_pool_bundle_json(&json).unwrap();
+
+        assert_eq!(summary, ContentPoolImportSummary {
+            units: 1,
+            skills: 1,
+            items: 1,
+            random_pools: 1,
+        });
+        assert_eq!(
+            target.unit_pool["wolf"].category,
+            "森林"
+        );
+        assert_eq!(
+            target.skill_pool[0].category.as_deref(),
+            Some("野兽")
+        );
+        assert_eq!(target.item_pool[0].category, "药剂");
+        assert_eq!(
+            target.random_pools["森林掉落"].category,
+            "森林"
+        );
+    }
+
+    #[test]
+    fn legacy_pool_entries_default_to_uncategorized() {
+        let unit: UnitPoolEntry =
+            serde_json::from_str(r#"{"label":"旧单位","character":{}}"#).unwrap();
+        let item: InventoryItem = serde_json::from_str(r#"{"name":"旧物品"}"#).unwrap();
+        let pool: RandomPool = serde_json::from_str(r#"{"entries":[]}"#).unwrap();
+
+        assert!(unit.category.is_empty());
+        assert!(item.category.is_empty());
+        assert!(pool.category.is_empty());
+    }
+
+    #[test]
+    fn content_pool_prompt_contains_import_contract() {
+        let prompt = content_pool_generation_prompt();
+        assert!(prompt.contains("\"export_type\": \"content_pools\""));
+        assert!(prompt.contains("\"category\""));
+        assert!(prompt.contains("只输出一个合法 JSON 对象"));
+        assert!(prompt.contains("你是 DeepSeek"));
+        assert!(prompt.contains("顶层 items 数组必须至少12项"));
+        assert!(prompt.contains("main_hand、off_hand、ranged、none"));
+        assert!(!prompt.contains("\"creation_step\""));
+        assert!(!prompt.contains("\"inventory\""));
+    }
+
+    #[test]
+    fn content_pool_bundle_rejects_wrong_version_without_mutating_pools() {
+        let mut manager = empty_manager();
+        let error = manager
+            .merge_content_pool_bundle_json(
+                r#"{"version":999,"export_type":"content_pools","units":[],"skills":[],"items":[],"random_pools":[]}"#,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("unsupported content pool bundle version"));
+        assert!(manager.unit_pool.is_empty());
+        assert!(manager.skill_pool.is_empty());
+        assert!(manager.item_pool.is_empty());
+        assert!(manager.random_pools.is_empty());
     }
 }

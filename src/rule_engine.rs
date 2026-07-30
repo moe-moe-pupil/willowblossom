@@ -20,6 +20,44 @@ use serde_json::{
     Value,
 };
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuleModifier {
+    pub source: String,
+    pub multiplier: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuleAmountResolution {
+    pub base_amount: f32,
+    pub modifiers: Vec<RuleModifier>,
+    pub resolved_amount: f32,
+}
+
+impl RuleAmountResolution {
+    pub fn new(base_amount: f32, modifiers: impl IntoIterator<Item = RuleModifier>) -> Self {
+        let base_amount = base_amount.max(0.0);
+        let modifiers = modifiers.into_iter().collect::<Vec<_>>();
+        let resolved_amount = modifiers
+            .iter()
+            .fold(base_amount, |amount, modifier| {
+                amount * modifier.multiplier.max(0.0)
+            })
+            .max(0.0);
+        Self {
+            base_amount,
+            modifiers,
+            resolved_amount,
+        }
+    }
+
+    pub fn factor(source: impl Into<String>, multiplier: f32) -> RuleModifier {
+        RuleModifier {
+            source: source.into(),
+            multiplier,
+        }
+    }
+}
+
 pub struct RuleEnginePlugin;
 
 impl Plugin for RuleEnginePlugin {
@@ -5103,6 +5141,24 @@ mod tests {
         assert_eq!(
             engine.characters.get("alice").unwrap().max_hp,
             20.0
+        );
+    }
+
+    #[test]
+    fn common_amount_resolution_keeps_modifier_provenance() {
+        let resolution = RuleAmountResolution::new(10.0, [
+            RuleAmountResolution::factor("STR属性加成", 1.25),
+            RuleAmountResolution::factor("守护BUFF", 0.8),
+        ]);
+
+        assert!((resolution.resolved_amount - 10.0).abs() < f32::EPSILON);
+        assert_eq!(
+            resolution.modifiers[0].source,
+            "STR属性加成"
+        );
+        assert_eq!(
+            resolution.modifiers[1].source,
+            "守护BUFF"
         );
     }
 }

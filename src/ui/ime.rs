@@ -258,6 +258,41 @@ mod tests {
         assert!(first_retry.message.to_string().contains("\"user_id\":42"));
         assert!(second_retry.message.to_string().contains("\"user_id\":43"));
     }
+
+    #[test]
+    fn enter_does_not_send_while_ime_composition_is_active() {
+        assert!(!should_send_chat_input(
+            true, true, false, true, None
+        ));
+        assert!(!should_send_chat_input(
+            true,
+            true,
+            false,
+            false,
+            Some(false)
+        ));
+        assert!(should_send_chat_input(
+            true, true, false, false, None
+        ));
+    }
+
+    #[test]
+    fn ime_composition_update_tracks_preedit_and_commit_events() {
+        let preedit = egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "xspace".to_owned(),
+            active_range_chars: Some(0..6),
+        });
+        assert_eq!(
+            ime_composition_update(&[preedit]),
+            Some(true)
+        );
+
+        let commit = egui::Event::Ime(egui::ImeEvent::Commit("小".to_owned()));
+        assert_eq!(
+            ime_composition_update(&[commit]),
+            Some(false)
+        );
+    }
 }
 
 fn reset_egui_ime_enabled_after_commit(
@@ -280,10 +315,32 @@ fn reset_egui_ime_enabled_after_commit(
     }
 }
 
+fn ime_composition_update(events: &[egui::Event]) -> Option<bool> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => Some(!text.is_empty()),
+            egui::Event::Ime(egui::ImeEvent::Commit(_)) => Some(false),
+            _ => None,
+        })
+        .last()
+}
+
+fn should_send_chat_input(
+    has_focus: bool,
+    enter_pressed: bool,
+    shift_pressed: bool,
+    was_ime_composing: bool,
+    ime_update: Option<bool>,
+) -> bool {
+    has_focus && enter_pressed && !shift_pressed && !was_ime_composing && ime_update.is_none()
+}
+
 #[derive(Debug, Resource)]
 pub struct ImeManager {
     next_send_request_id: u64,
     send_states: HashMap<String, ChatInputSendState>,
+    ime_composition_input: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -309,6 +366,7 @@ impl Default for ImeManager {
         ImeManager {
             next_send_request_id: 1,
             send_states: HashMap::new(),
+            ime_composition_input: None,
         }
     }
 }
@@ -332,8 +390,29 @@ impl ImeManager {
             .lock_focus(true)
             .return_key(None)
             .show(ui);
-        let send_on_enter = teo.response.has_focus()
-            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+        let (enter_pressed, shift_pressed, ime_update) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.modifiers.shift,
+                ime_composition_update(&i.events),
+            )
+        });
+        let was_ime_composing = self.ime_composition_input.as_deref() == Some(target_id);
+        let send_on_enter = should_send_chat_input(
+            teo.response.has_focus(),
+            enter_pressed,
+            shift_pressed,
+            was_ime_composing,
+            ime_update,
+        );
+
+        if teo.response.has_focus() {
+            if let Some(is_composing) = ime_update {
+                self.ime_composition_input = is_composing.then(|| target_id.to_owned());
+            }
+        } else if was_ime_composing {
+            self.ime_composition_input = None;
+        }
 
         if send_on_enter {
             ui.input_mut(|i| {

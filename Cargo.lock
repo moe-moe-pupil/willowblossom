@@ -9083,6 +9083,7 @@ dependencies = [
  "bevy_embedded_assets",
  "bevy_kira_audio",
  "bevy_voxel_world",
+ "blake3",
  "crossbeam-channel",
  "curl",
  "dirs",

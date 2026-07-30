@@ -40,7 +40,10 @@ use serde::{
     Deserialize,
     Serialize,
 };
-use serde_json::json;
+use serde_json::{
+    json,
+    Value,
+};
 use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -61,6 +64,17 @@ pub struct DeepseekManager {
     pub last_post_text: String,
     #[serde(default)]
     pub summaries: HashMap<String, DeepseekSummary>,
+    #[serde(default)]
+    pub director_request_fingerprints: HashMap<String, String>,
+    #[serde(skip)]
+    pub content_pool_generation: DeepseekContentPoolGeneration,
+}
+
+#[derive(Debug, Default)]
+pub struct DeepseekContentPoolGeneration {
+    pub pending: bool,
+    pub latest: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -124,7 +138,7 @@ const SUMMARY_SYSTEM_PROMPT: &str = "\
 待跟进：...";
 
 const DIRECTOR_SYSTEM_PROMPT: &str = r#"
-你是TRPG回放视频的剪辑导演。输入只包含已经通过发布范围检查的台词，以及场景中是否存在对应角色模型。
+你是TRPG回放视频的剪辑导演。输入只包含已经通过发布范围检查、且说话者在场景中拥有角色模型的台词；输入顺序已经按回合和角色立牌距离排好。
 你的工作是润色每句台词并为每句选择镜头，不是制作摘要。
 
 必须遵守：
@@ -133,11 +147,11 @@ const DIRECTOR_SYSTEM_PROMPT: &str = r#"
 3. text 是画面字幕：保留原意、专有名词、数字和正常中英文写法；不要把玩家的话改成旁白。
 4. 台词要频繁连续，中文每句适合一次呼吸读完；不要加入长停顿说明。
 5. speech_text 只供中文 TTS 使用，不会显示在画面。它必须与 text 含义完全相同，但要把英文品牌、单词、缩写、阿拉伯数字和符号改成中国人自然说话时会使用的中文读法，不得机械地逐字母或逐数字念。整数按数值读，例如 10 读“十”、21 读“二十一”，不能读成“一零”或“二一”；英文品牌优先使用通行中文名或自然音译，例如 Steam 读“斯地母”，不能读成“艾丝踢伊诶艾姆”；AI 可读“诶艾”。例如 text 为“Steam上的AI有10个方案”时，speech_text 应为“斯地母上的诶艾有十个方案”。只有编号、电话号码、年份等语境明确要求逐位读时才逐位读。不得为了配音改写 text。
-6. has_character_model 为 true 时，必须使用 speaker_close、speaker_medium 或 speaker_wide，并让镜头持续对准当前说话者的角色模型；不得选择环境镜头。
-7. has_character_model 为 false 时才可使用 establishing 或 environment，并且只能进行极慢的短距离环境移动。
-8. 连续两句不要机械重复同一构图。禁止环绕、快速摇镜、快速推拉、大范围横移或跨越场景飞行。
+6. has_character_model 必须为 true；必须使用 speaker_close、speaker_medium 或 speaker_wide，并从台词开始的第一刻到结束持续对准当前说话者的角色模型，不得选择环境镜头。
+7. 不得改变输入给定的回合顺序；镜头只在说话者切换时切换到下一个角色立牌。
+8. 镜头必须保持同一场景轴线和拍摄侧，不得跨越180度线。禁止旋转镜头、环绕角色、摇镜、横移或跨越场景飞行。三人及以上时优先采用队伍正面中央的构图，避免从侧面拍摄造成角色互相遮挡。
 9. shot 只能是 speaker_close、speaker_medium、speaker_wide、establishing、environment。
-10. motion 只能是 static、dolly_in、dolly_out、drift_left、drift_right；优先 static。
+10. motion 只能是 static、dolly_in、dolly_out、drift_left、drift_right；优先 static，只在台词确有强调时使用缓慢 dolly_in 或 dolly_out，不得使用 drift_left 或 drift_right。dolly 只表示沿镜头光轴平滑改变 translation，绝不表示改变 rotation；具体坐标、旋转、避障和插值全部由本地程序决定。
 11. 只返回严格 JSON，不要 Markdown、解释或代码围栏。
 
 返回格式：
@@ -363,6 +377,16 @@ impl DeepseekManager {
         .map_err(|err| format!("无法合并 DeepSeek 导演方案：{err}"))
     }
 
+    fn post_content_pools(prompt: &str) -> Result<String, String> {
+        let text = Self::post_chat_completion(
+            prompt,
+            "现在生成可直接导入的随机化测试内容。只返回JSON对象。",
+            16_000,
+            true,
+        )?;
+        normalize_generated_content_pool_json(&text)
+    }
+
     fn post_director_batch(
         dialogue: &[serde_json::Value],
         custom_prompt: &str,
@@ -418,6 +442,60 @@ impl DeepseekManager {
     }
 }
 
+fn normalize_generated_content_pool_json(text: &str) -> Result<String, String> {
+    let mut value: Value = serde_json::from_str(text)
+        .map_err(|err| format!("DeepSeek内容池输出不是有效JSON：{err}"))?;
+    normalize_generated_equipment_slots(&mut value);
+    serde_json::to_string_pretty(&value)
+        .map_err(|err| format!("无法规范化DeepSeek内容池输出：{err}"))
+}
+
+fn normalize_generated_equipment_slots(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                normalize_generated_equipment_slots(value);
+            }
+        },
+        Value::Object(fields) => {
+            if let Some(slot) = fields.get_mut("equipment_slot") {
+                let canonical = match slot {
+                    Value::String(slot) => canonical_generated_equipment_slot(slot),
+                    _ => "none",
+                };
+                *slot = Value::String(canonical.to_owned());
+            }
+            for value in fields.values_mut() {
+                normalize_generated_equipment_slots(value);
+            }
+        },
+        _ => {},
+    }
+}
+
+fn canonical_generated_equipment_slot(slot: &str) -> &'static str {
+    let normalized = slot.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match normalized.as_str() {
+        "head" | "helmet" => "head",
+        "neck" | "amulet" => "neck",
+        "shoulder" | "shoulders" => "shoulder",
+        "back" | "cloak" => "back",
+        "chest" | "armor" | "body" | "body_armor" => "chest",
+        "wrist" | "bracer" | "bracers" => "wrist",
+        "hands" | "glove" | "gloves" => "hands",
+        "waist" | "belt" => "waist",
+        "legs" | "pants" => "legs",
+        "feet" | "boot" | "boots" => "feet",
+        "finger" | "ring" => "finger",
+        "trinket" | "accessory" => "trinket",
+        "main_hand" | "mainhand" | "weapon" | "melee" | "one_handed" | "two_handed" => "main_hand",
+        "off_hand" | "offhand" | "shield" => "off_hand",
+        "ranged" | "bow" | "gun" => "ranged",
+        "none" => "none",
+        _ => "none",
+    }
+}
+
 fn summary_user_text(text: &str, custom_prompt: &str) -> String {
     let custom_prompt = filter_control_characters(custom_prompt)
         .chars()
@@ -449,6 +527,9 @@ pub enum DeepseekRequest {
         #[serde(default)]
         custom_prompt: String,
     },
+    ContentPools {
+        prompt: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -462,6 +543,12 @@ enum DeepseekResponse {
     Director {
         target_id: String,
         message_count: usize,
+        text: String,
+    },
+    ContentPools {
+        text: String,
+    },
+    ContentPoolsError {
         text: String,
     },
     Error {
@@ -641,6 +728,20 @@ async fn handle_connection<'a>(client_to_game_sender: CBSender<Message>) -> Comm
                                             .send(response.into())
                                             .expect("Could not send message");
                                     },
+                                    DeepseekRequest::ContentPools { prompt } => {
+                                        let response =
+                                            match DeepseekManager::post_content_pools(&prompt) {
+                                                Ok(text) => DeepseekResponse::ContentPools { text },
+                                                Err(text) => {
+                                                    DeepseekResponse::ContentPoolsError { text }
+                                                },
+                                            };
+                                        let response = serde_json::to_string(&response)
+                                            .expect("failed to serialize DeepSeek response");
+                                        client_to_game_sender
+                                            .send(response.into())
+                                            .expect("Could not send message");
+                                    },
                                 }
                             } else {
                                 eprintln!(
@@ -710,6 +811,18 @@ fn apply_deepseek_response(deepseek_manager: &mut DeepseekManager, text: &str) -
                 });
             true
         },
+        Ok(DeepseekResponse::ContentPools { text }) => {
+            deepseek_manager.content_pool_generation.pending = false;
+            deepseek_manager.content_pool_generation.latest = Some(text);
+            deepseek_manager.content_pool_generation.error = None;
+            true
+        },
+        Ok(DeepseekResponse::ContentPoolsError { text }) => {
+            deepseek_manager.content_pool_generation.pending = false;
+            deepseek_manager.content_pool_generation.latest = None;
+            deepseek_manager.content_pool_generation.error = Some(text);
+            true
+        },
         Ok(DeepseekResponse::Error {
             target_id,
             message_count,
@@ -744,6 +857,88 @@ fn invalid_deepseek_response_does_not_mutate_manager() {
     ));
 
     assert!(manager.summaries.is_empty());
+}
+
+#[test]
+fn content_pool_response_is_delivered_to_the_gm_ui_without_persistence() {
+    let mut manager = DeepseekManager::default();
+    manager.content_pool_generation.pending = true;
+
+    assert!(apply_deepseek_response(
+        &mut manager,
+        r#"{"type":"content_pools","text":"{\"version\":1}"}"#,
+    ));
+    assert!(!manager.content_pool_generation.pending);
+    assert_eq!(
+        manager.content_pool_generation.latest.as_deref(),
+        Some(r#"{"version":1}"#)
+    );
+    assert!(manager.content_pool_generation.error.is_none());
+
+    let persisted = serde_json::to_string(&manager).unwrap();
+    assert!(!persisted.contains("content_pool_generation"));
+    assert!(!persisted.contains(r#"{\"version\":1}"#));
+}
+
+#[test]
+fn content_pool_error_clears_pending_generation() {
+    let mut manager = DeepseekManager::default();
+    manager.content_pool_generation.pending = true;
+
+    assert!(apply_deepseek_response(
+        &mut manager,
+        r#"{"type":"content_pools_error","text":"rate limited"}"#,
+    ));
+    assert!(!manager.content_pool_generation.pending);
+    assert!(manager.content_pool_generation.latest.is_none());
+    assert_eq!(
+        manager.content_pool_generation.error.as_deref(),
+        Some("rate limited")
+    );
+}
+
+#[test]
+fn generated_content_pool_equipment_slots_are_normalized_before_import() {
+    let normalized = normalize_generated_content_pool_json(
+        r#"{
+            "version": 1,
+            "export_type": "content_pools",
+            "units": [],
+            "skills": [],
+            "items": [
+                {"name": "训练剑", "equipment_slot": "weapon"},
+                {"name": "训练甲", "equipment_slot": "body armor"}
+            ],
+            "random_pools": [{
+                "name": "测试池",
+                "pool": {
+                    "entries": [{
+                        "item": {"name": "奇怪物品", "equipment_slot": "invented_slot"}
+                    }]
+                }
+            }]
+        }"#,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&normalized).unwrap();
+    assert_eq!(
+        value["items"][0]["equipment_slot"],
+        "main_hand"
+    );
+    assert_eq!(
+        value["items"][1]["equipment_slot"],
+        "chest"
+    );
+    assert_eq!(
+        value["random_pools"][0]["pool"]["entries"][0]["item"]["equipment_slot"],
+        "none"
+    );
+
+    let mut manager: crate::napcat::NapcatMessageManager =
+        serde_json::from_str(r#"{"messages":{}}"#).unwrap();
+    let summary = manager.merge_content_pool_bundle_json(&normalized).unwrap();
+    assert_eq!(summary.items, 2);
+    assert_eq!(summary.random_pools, 1);
 }
 
 #[test]

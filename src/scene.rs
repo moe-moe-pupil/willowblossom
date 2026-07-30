@@ -18,7 +18,9 @@ use std::{
         Path,
         PathBuf,
     },
+    process::Command,
     sync::Arc,
+    thread,
     time::{
         SystemTime,
         UNIX_EPOCH,
@@ -139,6 +141,10 @@ const LEGACY_DEFAULT_CAMERA_SPEED: f32 = 12.0;
 const DEFAULT_CAMERA_SPEED: f32 = 64.0;
 const MAX_CAMERA_SPEED: f32 = 1800.0;
 const SCENE_CAPTURE_PREPARE_FRAMES: u8 = 12;
+pub(crate) const SCENE_CAPTURE_VIDEO_FPS: u32 = 15;
+const SCENE_CAPTURE_VIDEO_SECONDS: u32 = 10;
+pub(crate) const SCENE_CAPTURE_VIDEO_FRAMES: u32 =
+    SCENE_CAPTURE_VIDEO_FPS * SCENE_CAPTURE_VIDEO_SECONDS;
 const SPACE_HIFI_STATION_A_CENTER: IVec3 = IVec3::new(-54, 13, 24);
 const SPACE_HIFI_STATION_B_CENTER: IVec3 = IVec3::new(58, 14, -28);
 const SPACE_HIFI_SUN_CENTER: IVec3 = IVec3::new(-88, 38, -76);
@@ -519,6 +525,14 @@ pub struct ScenePlayerViewRequest {
 }
 
 impl ScenePlayerViewRequest {
+    pub fn clear_player(&mut self, user_id: u64) {
+        if self.user_id == Some(user_id) {
+            self.user_id = None;
+            self.use_capture_camera = false;
+            self.restore_gm_view = true;
+        }
+    }
+
     pub fn view_with_capture_camera(&mut self, user_id: u64) {
         self.user_id = Some(user_id);
         self.use_capture_camera = true;
@@ -535,6 +549,13 @@ impl ScenePlayerViewRequest {
 pub struct SceneCaptureRequest {
     pub user_id: u64,
     pub campaign_id: String,
+    pub kind: SceneCaptureKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneCaptureKind {
+    Image,
+    PanoramaVideo,
 }
 
 #[derive(Resource, Default)]
@@ -546,11 +567,19 @@ struct SceneCaptureState {
 struct PendingSceneCapture {
     request_id: u64,
     user_id: u64,
+    campaign_id: String,
     camera_entity: Entity,
     target: Handle<Image>,
     output_path: std::path::PathBuf,
+    kind: SceneCaptureKind,
     prepare_frames_remaining: u8,
     started_preparing: bool,
+    original_camera_transform: Option<Transform>,
+    video_frame_index: u32,
+    video_frame_prepared: bool,
+    screenshot_in_flight: bool,
+    video_frames_dir: Option<PathBuf>,
+    failure: Option<String>,
     voxel_view_changes: Vec<SceneCaptureVoxelViewChange>,
     standee_visibility_changes: Vec<SceneStandeeVisibilityChange>,
 }
@@ -679,6 +708,13 @@ struct VoxelSceneStoreExportOwned {
 }
 
 impl VoxelSceneStore {
+    pub fn remove_player_data(&mut self, target_id: &str) -> bool {
+        let previous_len = self.character_standees.len();
+        self.character_standees
+            .retain(|standee| standee.target_id != target_id);
+        previous_len != self.character_standees.len()
+    }
+
     pub fn to_export_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(&VoxelSceneStoreExportRef {
             version: VOXEL_SCENE_EXPORT_VERSION,
@@ -7224,13 +7260,15 @@ fn scene_capture_request_system(
     mut requests: ResMut<SceneCaptureRequests>,
     mut capture_state: ResMut<SceneCaptureState>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    napcat_sender: Option<Res<NapcatIOSender>>,
     runtime: Res<VoxelMapRuntimeState>,
     mut player_view_state: ResMut<ScenePlayerVoxelViewState>,
     player_cameras: Res<PlayerSceneCameras>,
     mut voxel_world: VoxelWorld<TrpgVoxelWorld>,
-    mut capture_camera_query: Query<&mut Camera, With<PlayerCaptureCamera>>,
+    mut capture_camera_query: Query<(&mut Camera, &mut Transform), With<PlayerCaptureCamera>>,
     mut standee_visibility_query: Query<(&CharacterStandee, &mut Visibility)>,
     voxel_camera_entities: Query<Entity, With<VoxelWorldCamera<TrpgVoxelWorld>>>,
+    free_camera: Query<Entity, With<FreeCamera>>,
 ) {
     let capture_requests = requests.requests.drain(..).collect::<Vec<_>>();
     for request in capture_requests {
@@ -7263,22 +7301,46 @@ fn scene_capture_request_system(
             eprintln!("failed to create scene capture directory: {err}");
             continue;
         }
-        let output_path = output_dir.join(format!(
-            "player_{}.png",
-            request.user_id
-        ));
         let request_id = capture_state.next_request_id;
         capture_state.next_request_id += 1;
         let user_id = request.user_id;
+        let output_path = output_dir.join(match request.kind {
+            SceneCaptureKind::Image => format!("player_{user_id}.png"),
+            SceneCaptureKind::PanoramaVideo => {
+                format!("player_{user_id}_360_{request_id}.mp4")
+            },
+        });
+        let video_frames_dir = (request.kind == SceneCaptureKind::PanoramaVideo)
+            .then(|| output_dir.join(format!("video_{request_id}_frames")));
+        if let Some(frames_dir) = &video_frames_dir {
+            if frames_dir.exists() {
+                if let Err(err) = std::fs::remove_dir_all(frames_dir) {
+                    eprintln!("failed to clear old scene video frames: {err}");
+                    continue;
+                }
+            }
+            if let Err(err) = std::fs::create_dir_all(frames_dir) {
+                eprintln!("failed to create scene video frame directory: {err}");
+                continue;
+            }
+        }
 
         capture_state.pending_captures.push(PendingSceneCapture {
             request_id,
             user_id,
+            campaign_id: request.campaign_id,
             camera_entity: player_camera.entity,
             target: player_camera.target.clone(),
             output_path,
+            kind: request.kind,
             prepare_frames_remaining: SCENE_CAPTURE_PREPARE_FRAMES,
             started_preparing: false,
+            original_camera_transform: None,
+            video_frame_index: 0,
+            video_frame_prepared: false,
+            screenshot_in_flight: false,
+            video_frames_dir,
+            failure: None,
             voxel_view_changes: Vec::new(),
             standee_visibility_changes: Vec::new(),
         });
@@ -7287,10 +7349,18 @@ fn scene_capture_request_system(
     let Some(current) = capture_state.pending_captures.first_mut() else {
         return;
     };
+    if current.kind == SceneCaptureKind::PanoramaVideo
+        && !manager.as_deref().is_some_and(|manager| {
+            manager.can_serve_scene_capture(current.user_id, &current.campaign_id)
+        })
+    {
+        current.failure = Some("player no longer belongs to the active campaign".to_owned());
+    }
 
     if !current.started_preparing {
-        if let Ok(mut camera) = capture_camera_query.get_mut(current.camera_entity) {
+        if let Ok((mut camera, transform)) = capture_camera_query.get_mut(current.camera_entity) {
             camera.is_active = true;
+            current.original_camera_transform = Some(*transform);
         }
         set_single_voxel_world_camera(
             &mut commands,
@@ -7320,6 +7390,141 @@ fn scene_capture_request_system(
 
     if current.prepare_frames_remaining > 0 {
         current.prepare_frames_remaining -= 1;
+        return;
+    }
+
+    if current.kind == SceneCaptureKind::PanoramaVideo {
+        let capture_finished = current.failure.is_some()
+            || (current.video_frame_index >= SCENE_CAPTURE_VIDEO_FRAMES
+                && !current.screenshot_in_flight);
+        if capture_finished {
+            let pending = capture_state.pending_captures.remove(0);
+            if let Ok((mut camera, mut transform)) =
+                capture_camera_query.get_mut(pending.camera_entity)
+            {
+                camera.is_active = false;
+                if let Some(original) = pending.original_camera_transform {
+                    *transform = original;
+                }
+            }
+            apply_scene_capture_voxel_view(
+                &mut voxel_world,
+                &pending.voxel_view_changes,
+                SceneCaptureVoxelView::Restore,
+            );
+            restore_scene_standee_visibility(
+                &mut standee_visibility_query,
+                &pending.standee_visibility_changes,
+            );
+            if let Some(active_user_id) = player_view_state.active_user_id {
+                let access = scene_capture_player_access(manager.as_deref(), active_user_id);
+                apply_scene_player_voxel_view(
+                    &mut voxel_world,
+                    &mut player_view_state,
+                    &runtime.edit_index,
+                    &access,
+                );
+                apply_scene_player_standee_visibility(
+                    &mut standee_visibility_query,
+                    Some(&access),
+                );
+            } else {
+                apply_scene_player_standee_visibility(&mut standee_visibility_query, None);
+            }
+            commands
+                .entity(pending.camera_entity)
+                .remove::<VoxelWorldCamera<TrpgVoxelWorld>>();
+            if let Ok(free_camera) = free_camera.single() {
+                commands
+                    .entity(free_camera)
+                    .try_insert(VoxelWorldCamera::<TrpgVoxelWorld>::default());
+            }
+
+            if let Some(err) = pending.failure {
+                eprintln!("failed to capture scene video: {err}");
+                if let Some(frames_dir) = pending.video_frames_dir {
+                    let _ = std::fs::remove_dir_all(frames_dir);
+                }
+            } else if let (Some(sender), Some(frames_dir)) = (
+                napcat_sender.as_deref(),
+                pending.video_frames_dir.clone(),
+            ) {
+                encode_and_send_scene_capture_video(
+                    sender.0.clone(),
+                    pending.request_id,
+                    pending.user_id,
+                    frames_dir,
+                    pending.output_path,
+                );
+            } else if let Some(frames_dir) = pending.video_frames_dir {
+                let _ = std::fs::remove_dir_all(frames_dir);
+            }
+            return;
+        }
+
+        if current.screenshot_in_flight {
+            return;
+        }
+        if !current.video_frame_prepared {
+            let Some(original) = current.original_camera_transform else {
+                current.failure = Some("capture camera transform is unavailable".to_owned());
+                return;
+            };
+            if let Ok((_, mut transform)) = capture_camera_query.get_mut(current.camera_entity) {
+                transform.rotation = scene_capture_video_rotation(
+                    original.rotation,
+                    current.video_frame_index,
+                );
+                current.video_frame_prepared = true;
+            } else {
+                current.failure = Some("capture camera no longer exists".to_owned());
+            }
+            return;
+        }
+
+        let Some(frames_dir) = current.video_frames_dir.clone() else {
+            current.failure = Some("video frame directory is unavailable".to_owned());
+            return;
+        };
+        let request_id = current.request_id;
+        let frame_path = frames_dir.join(format!(
+            "frame_{:04}.png",
+            current.video_frame_index
+        ));
+        current.screenshot_in_flight = true;
+        commands
+            .spawn(Screenshot::image(
+                current.target.clone(),
+            ))
+            .observe(
+                move |screenshot: On<ScreenshotCaptured>,
+                      mut capture_state: ResMut<SceneCaptureState>| {
+                    let Some(pending) = capture_state
+                        .pending_captures
+                        .iter_mut()
+                        .find(|pending| pending.request_id == request_id)
+                    else {
+                        return;
+                    };
+                    let save_result = screenshot
+                        .image
+                        .clone()
+                        .try_into_dynamic()
+                        .map_err(|err| err.to_string())
+                        .and_then(|image| {
+                            image
+                                .to_rgb8()
+                                .save(&frame_path)
+                                .map_err(|err| err.to_string())
+                        });
+                    pending.screenshot_in_flight = false;
+                    pending.video_frame_prepared = false;
+                    match save_result {
+                        Ok(()) => pending.video_frame_index += 1,
+                        Err(err) => pending.failure = Some(err),
+                    }
+                },
+            );
         return;
     }
 
@@ -7433,6 +7638,96 @@ fn scene_capture_request_system(
                 },
             );
     }
+}
+
+pub(crate) fn encode_and_send_scene_capture_video(
+    sender: tokio::sync::mpsc::Sender<NapcatOutboundMessage>,
+    request_id: u64,
+    user_id: u64,
+    frames_dir: PathBuf,
+    output_path: PathBuf,
+) {
+    thread::spawn(move || {
+        let frame_pattern = frames_dir.join("frame_%04d.png");
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(["-y", "-framerate"])
+            .arg(SCENE_CAPTURE_VIDEO_FPS.to_string())
+            .arg("-i")
+            .arg(&frame_pattern)
+            .args([
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+            ])
+            .arg(&output_path);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+
+        let encode_result = command
+            .output()
+            .map_err(|err| format!("failed to start FFmpeg: {err}"))
+            .and_then(|output| {
+                output.status.success().then_some(()).ok_or_else(|| {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    format!("FFmpeg failed: {}", stderr.trim())
+                })
+            });
+        let _ = std::fs::remove_dir_all(&frames_dir);
+
+        let message = match encode_result.and_then(|()| napcat_file_uri(&output_path)) {
+            Ok(file) => scene_capture_video_message(user_id, &file),
+            Err(err) => {
+                eprintln!("failed to encode scene capture video: {err}");
+                json!({
+                    "action": "send_private_msg",
+                    "params": {
+                        "user_id": user_id,
+                        "message": [{
+                            "type": "text",
+                            "data": {
+                                "text": format!("观察视频生成失败：{err}")
+                            }
+                        }]
+                    }
+                })
+            },
+        };
+        if let Err(err) = sender.blocking_send(NapcatOutboundMessage {
+            request_id,
+            target_id: user_id.to_string(),
+            message: Message::Text(message.to_string().into()),
+        }) {
+            eprintln!("failed to queue scene capture video response: {err}");
+        }
+    });
+}
+
+pub(crate) fn scene_capture_video_rotation(initial: Quat, frame_index: u32) -> Quat {
+    let progress = frame_index as f32 / SCENE_CAPTURE_VIDEO_FRAMES.saturating_sub(1) as f32;
+    Quat::from_rotation_y(-std::f32::consts::TAU * progress) * initial
+}
+
+fn scene_capture_video_message(user_id: u64, file: &str) -> serde_json::Value {
+    json!({
+        "action": "send_private_msg",
+        "params": {
+            "user_id": user_id,
+            "message": [{
+                "type": "video",
+                "data": {
+                    "file": file,
+                    "name": "观察视频.mp4"
+                }
+            }]
+        }
+    })
 }
 
 fn set_single_voxel_world_camera(
@@ -8633,6 +8928,7 @@ mod tests {
     fn empty_manager() -> NapcatMessageManager {
         NapcatMessageManager {
             messages: HashMap::default(),
+            replay_snapshots: HashMap::default(),
             chat_targets: HashMap::default(),
             chat_target_kinds: HashMap::default(),
             player_characters: HashMap::default(),
@@ -8649,6 +8945,36 @@ mod tests {
             item_pool: Vec::new(),
             unit_pool: HashMap::default(),
         }
+    }
+
+    #[test]
+    fn scene_capture_video_turns_exactly_once_from_player_camera() {
+        let initial = Quat::from_rotation_y(0.7) * Quat::from_rotation_x(-0.2);
+        let start = scene_capture_video_rotation(initial, 0);
+        let quarter = scene_capture_video_rotation(initial, SCENE_CAPTURE_VIDEO_FRAMES / 4);
+        let finish = scene_capture_video_rotation(initial, SCENE_CAPTURE_VIDEO_FRAMES - 1);
+
+        assert!(start.abs_diff_eq(initial, 0.0001));
+        assert!(finish.dot(initial).abs() > 0.9999);
+        let start_forward = (start * Vec3::NEG_Z).with_y(0.0).normalize();
+        let quarter_forward = (quarter * Vec3::NEG_Z).with_y(0.0).normalize();
+        assert!(start_forward.dot(quarter_forward).abs() < 0.02);
+    }
+
+    #[test]
+    fn scene_capture_video_uses_napcat_video_segment() {
+        let message = scene_capture_video_message(42, "file:///tmp/player_42_360.mp4");
+
+        assert_eq!(message["action"], "send_private_msg");
+        assert_eq!(message["params"]["user_id"], 42);
+        assert_eq!(
+            message["params"]["message"][0]["type"],
+            "video"
+        );
+        assert_eq!(
+            message["params"]["message"][0]["data"]["file"],
+            "file:///tmp/player_42_360.mp4"
+        );
     }
 
     #[test]
@@ -10179,18 +10505,21 @@ mod tests {
         let red_access = PlayerAccess {
             player_id: 2,
             party_id: Some("red".to_owned()),
+            party_ids: vec!["red".to_owned()],
             character_id: None,
             is_gm: false,
         };
         let blue_access = PlayerAccess {
             player_id: 3,
             party_id: Some("blue".to_owned()),
+            party_ids: vec!["blue".to_owned()],
             character_id: None,
             is_gm: false,
         };
         let gm_access = PlayerAccess {
             player_id: 9,
             party_id: None,
+            party_ids: Vec::new(),
             character_id: None,
             is_gm: true,
         };
@@ -10253,18 +10582,21 @@ mod tests {
         let red_access = PlayerAccess {
             player_id: 2,
             party_id: Some("red".to_owned()),
+            party_ids: vec!["red".to_owned()],
             character_id: None,
             is_gm: false,
         };
         let blue_access = PlayerAccess {
             player_id: 3,
             party_id: Some("blue".to_owned()),
+            party_ids: vec!["blue".to_owned()],
             character_id: None,
             is_gm: false,
         };
         let gm_access = PlayerAccess {
             player_id: 9,
             party_id: None,
+            party_ids: Vec::new(),
             character_id: None,
             is_gm: true,
         };

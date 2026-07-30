@@ -89,6 +89,15 @@ Display Chinese text first in all user-facing UI. Existing or new labels, button
 
 Do not place character, inventory, item-effect, or other editable form controls inside `menu_button`, popup, or context-menu surfaces. Use an inline collapsing section, scrollable panel, or normal window so pointer input and keyboard focus remain reliable.
 
+Treat discussion-group docking as an atomic UI-state transition. When a private
+or group chat is dropped into a discussion group, add its target id to that
+group's `members` and remove it from `open_chat_targets` in the same operation.
+The two states are mutually exclusive: leaving the target in
+`open_chat_targets` makes the renderer keep showing an independent window even
+though the same chat also appears as a child of the discussion group. Apply the
+standalone removal even when the member was already present, so stale persisted
+state repairs itself on the next drop.
+
 Prefer GUI controls over chat commands for:
 
 - selecting the active campaign,

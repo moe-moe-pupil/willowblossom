@@ -60,19 +60,26 @@ use serde::{
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::voxel::{
+    clear_campaign_possession_movement,
+    clear_player_camera,
+    clear_player_possession_movement,
     VoxelCreativeItem,
     VoxelEditMode,
     VoxelEditorState,
     VoxelLightTool,
+    VoxelMinimapSnapshot,
+    VoxelPlayerStandee,
+    VoxelPlayerCameraStore,
+    VoxelPossessionMovementStore,
     VoxelPossessionState,
+    VoxelTargetingPreview,
     VoxelTeleportDestination,
     MAX_VOXEL_BRUSH_RADIUS,
 };
 
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
 const CHAT_WINDOW_MIN_SIZE: Vec2 = Vec2::new(260.0, 260.0);
-const CHAT_WINDOW_MAX_SIZE: Vec2 = Vec2::new(720.0, 720.0);
-const GROUP_CHAT_MAX_WIDTH: f32 = 520.0;
+const CHAT_WINDOW_MAX_HEIGHT: f32 = 720.0;
 const GROUP_CHAT_MAX_HEIGHT: f32 = 720.0;
 const GROUP_CHAT_MIN_HEIGHT: f32 = 140.0;
 const GROUP_CHAT_SEPARATOR_HEIGHT: f32 = 10.0;
@@ -82,7 +89,7 @@ const GROUP_BROADCAST_INPUT_ROWS: usize = 3;
 const GROUP_MEMBER_WINDOW_SIDE_GAP: f32 = 14.0;
 const GROUP_MEMBER_WINDOW_TOP_GAP: f32 = 58.0;
 const GROUP_MEMBER_WINDOW_BOTTOM_GAP: f32 = GROUP_BROADCAST_INPUT_HEIGHT + 7.0;
-const GROUP_MEMBER_WINDOW_MAX_SIZE: Vec2 = Vec2::new(520.0, 620.0);
+const GROUP_MEMBER_WINDOW_MAX_HEIGHT: f32 = 620.0;
 const CHAT_AUTO_SCROLL_THRESHOLD: f32 = 48.0;
 const CHAT_IMAGE_MAX_SIZE: Vec2 = Vec2::new(220.0, 220.0);
 const CHARACTER_WINDOW_DEFAULT_WIDTH: f32 = 360.0;
@@ -97,6 +104,7 @@ const NAPCAT_CHAT_LIST_EXPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/exports/chat_list_export.json";
 const NAPCAT_UNIT_POOL_EXPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/exports/unit_pool_export.json";
+const CONTENT_POOL_BUNDLE_DEFAULT_PATH: &str = ".data/willowblossom/exports/content_pools.json";
 const NAPCAT_MOONBERRY_LEGACY_IMPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/imports/moonberry_legacy.json";
 const DEEPSEEK_SUMMARY_EXPORT_DEFAULT_PATH: &str =
@@ -677,6 +685,7 @@ use crate::{
         character_physical_damage_lifesteal,
         character_spell_range_multiplier,
         character_wounded_healing_dealt_modifier,
+        content_pool_generation_prompt,
         dying_target_healing_multiplier,
         grant_character_experience,
         is_scene_capture_command_text,
@@ -707,6 +716,7 @@ use crate::{
         EquipmentSlot,
         ImageData,
         InventoryItem,
+        InventoryItemSkill,
         InventoryQuality,
         NapcatIOSender,
         NapcatMessage,
@@ -733,9 +743,15 @@ use crate::{
         TrpgLegacySendPane,
         TrpgLegacyTeamChatMessage,
         UnitPoolEntry,
+        UnitRarity,
         Visibility,
         LEGACY_NEGATIVE_TIMEOUT_MS,
         NAPCAT_MANAGER_EXPORT_VERSION,
+    },
+    replay::{
+        clear_campaign_replay_movement_history,
+        clear_player_replay_movement_history,
+        ReplayPlayerMovementHistory,
     },
     rule_engine::{
         apply_skill_type_damage_default,
@@ -807,17 +823,26 @@ pub(crate) struct TrpgGroupSettingsState {
     pool_window_tab: PoolWindowTab,
     new_group_name: String,
     new_random_pool_name: String,
+    new_random_pool_category: String,
     random_pool_award_target: String,
     random_pool_broadcast_scope: String,
     random_pool_batch_count: u32,
     random_pool_send_status: String,
     random_pool_group_filter: String,
     random_pool_tag_filter: String,
+    random_pool_category_filter: String,
     new_unit_id: String,
+    unit_pool_category_filter: String,
+    skill_pool_category_filter: String,
+    item_pool_category_filter: String,
     unit_pool_source_target: String,
     focused_group_name: Option<String>,
-    pending_character_delete: Option<String>,
+    pending_player_delete: Option<String>,
     pending_party_delete: Option<(String, String)>,
+    pending_turn_zero_reset: Option<String>,
+    pending_initial_stats_restore: Option<String>,
+    pending_test_session_reset: Option<String>,
+    group_reset_status: HashMap<String, String>,
     legacy_send_pane_status: HashMap<String, String>,
     legacy_team_chat_status: HashMap<String, String>,
     legacy_team_chat_edit_drafts: HashMap<String, String>,
@@ -837,6 +862,8 @@ pub(crate) struct TrpgGroupSettingsState {
     pc_export_path: String,
     chat_list_export_path: String,
     unit_pool_export_path: String,
+    content_pool_bundle_path: String,
+    content_pool_bundle_status: String,
     moonberry_legacy_import_path: String,
     deepseek_summary_export_path: String,
     voxel_scene_export_path: String,
@@ -862,11 +889,31 @@ pub(crate) struct CharacterEditState {
     gm_status_drafts: HashMap<String, CharacterStatus>,
     buff_drafts: HashMap<String, BuffDraft>,
     pending_character_reset: Option<String>,
+    pending_skill_delete: Option<(String, usize)>,
     quick_cast_skill_index: HashMap<String, usize>,
     pending_force_cast: Option<(String, usize)>,
     skill_pool_selected_index: HashMap<String, usize>,
     item_pool_selected_index: HashMap<String, usize>,
     exp_award_drafts: HashMap<String, i32>,
+}
+
+impl CharacterEditState {
+    fn remove_target(&mut self, target_id: &str) {
+        self.unlocked_status_targets.remove(target_id);
+        self.gm_status_drafts.remove(target_id);
+        self.buff_drafts.remove(target_id);
+        if self.pending_character_reset.as_deref() == Some(target_id) {
+            self.pending_character_reset = None;
+        }
+        self.pending_skill_delete
+            .take_if(|(pending_target, _)| pending_target == target_id);
+        self.quick_cast_skill_index.remove(target_id);
+        self.pending_force_cast
+            .take_if(|(pending_target, _)| pending_target == target_id);
+        self.skill_pool_selected_index.remove(target_id);
+        self.item_pool_selected_index.remove(target_id);
+        self.exp_award_drafts.remove(target_id);
+    }
 }
 
 #[derive(Clone)]
@@ -900,7 +947,7 @@ pub struct UiSystemLocals<'w, 's> {
     new_chat_group_modal_string_open: Local<'s, (String, bool)>,
     chat_input_msgs: Local<'s, HashMap<String, String>>,
     chat_scroll_states: Local<'s, HashMap<String, ChatScrollState>>,
-    previous_group_rects: Local<'s, HashMap<String, Rect>>,
+    group_member_window_offsets: Local<'s, HashMap<(String, String), Vec2>>,
     chat_list_edit_target: Local<'s, Option<String>>,
     chat_list_edit_name: Local<'s, String>,
     trpg_group_settings: Local<'s, TrpgGroupSettingsState>,
@@ -913,7 +960,263 @@ pub struct UiSystemLocals<'w, 's> {
     chat_list_player_visible_filter: Local<'s, Option<String>>,
     voxel_editor: ResMut<'w, VoxelEditorState>,
     voxel_possession: ResMut<'w, VoxelPossessionState>,
+    voxel_targeting_preview: Res<'w, VoxelTargetingPreview>,
+    voxel_minimap: Res<'w, VoxelMinimapSnapshot>,
+    keyboard: Res<'w, ButtonInput<KeyCode>>,
+    voxel_map_ui: Local<'s, VoxelMapUiState>,
     battle_store: Option<ResMut<'w, Persistent<BattleRoundStore>>>,
+    possession_movement_store: ResMut<'w, Persistent<VoxelPossessionMovementStore>>,
+    replay_movement_history: ResMut<'w, Persistent<ReplayPlayerMovementHistory>>,
+    player_camera_store: ResMut<'w, Persistent<VoxelPlayerCameraStore>>,
+    player_standees: Query<
+        'w,
+        's,
+        (
+            &'static VoxelPlayerStandee,
+            &'static bevy::prelude::Visibility,
+        ),
+    >,
+}
+
+#[derive(Default)]
+struct VoxelMapUiState {
+    full_map_open: bool,
+    context_cell: Option<IVec3>,
+    context_player: Option<u64>,
+}
+
+fn voxel_map_material_color(material: u8) -> egui::Color32 {
+    voxel_material_choices()
+        .into_iter()
+        .find(|(candidate, ..)| *candidate == material)
+        .map(|(_, _, color)| color)
+        .unwrap_or(egui::Color32::from_gray(90))
+}
+
+fn voxel_map_ui(
+    ui: &mut Ui,
+    size: Vec2,
+    snapshot: &VoxelMinimapSnapshot,
+    scene_positions: Option<&SceneCharacterPositions>,
+    manager: &NapcatMessageManager,
+    state: &mut VoxelMapUiState,
+    editor: &mut VoxelEditorState,
+) {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(
+        rect,
+        4,
+        egui::Color32::from_rgb(11, 17, 24),
+    );
+    painter.rect_stroke(
+        rect,
+        4,
+        Stroke::new(1.0, egui::Color32::from_gray(90)),
+        egui::StrokeKind::Inside,
+    );
+    if snapshot.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "还没有可显示的体素",
+            egui::FontId::proportional(14.0),
+            egui::Color32::LIGHT_GRAY,
+        );
+        return;
+    }
+
+    let resolution = snapshot.resolution.max(1);
+    let tile_size = rect.size() / resolution as f32;
+    for z in 0..resolution {
+        for x in 0..resolution {
+            let Some(tile) = snapshot.tile(x, z) else {
+                continue;
+            };
+            let screen_z = resolution - 1 - z;
+            let tile_min = rect.min
+                + egui::vec2(
+                    x as f32 * tile_size.x,
+                    screen_z as f32 * tile_size.y,
+                );
+            let density = (tile.voxel_count as f32).ln_1p().min(6.0) / 6.0;
+            let color =
+                voxel_map_material_color(tile.material).gamma_multiply(0.55 + density * 0.45);
+            painter.rect_filled(
+                Rect::from_min_size(
+                    tile_min,
+                    tile_size + egui::vec2(0.5, 0.5),
+                ),
+                0,
+                color,
+            );
+        }
+    }
+    for step in 1..4 {
+        let fraction = step as f32 / 4.0;
+        let x = egui::lerp(rect.x_range(), fraction);
+        let y = egui::lerp(rect.y_range(), fraction);
+        let grid_stroke = Stroke::new(0.5, egui::Color32::from_white_alpha(35));
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            grid_stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            grid_stroke,
+        );
+    }
+
+    let mut player_points = Vec::new();
+    if let Some(scene_positions) = scene_positions {
+        for (target_id, world_position) in &scene_positions.positions {
+            let fraction = snapshot.world_fraction(*world_position);
+            let on_map = fraction.cmpge(bevy::prelude::Vec2::ZERO).all()
+                && fraction.cmple(bevy::prelude::Vec2::ONE).all();
+            let clamped = fraction.clamp(
+                bevy::prelude::Vec2::ZERO,
+                bevy::prelude::Vec2::ONE,
+            );
+            let point = egui::pos2(
+                egui::lerp(rect.x_range(), clamped.x),
+                egui::lerp(rect.y_range(), 1.0 - clamped.y),
+            );
+            let user_id = target_id.parse::<u64>().ok();
+            let name = target_display_name(manager, target_id);
+            player_points.push((user_id, name.clone(), point));
+            let marker_color = if on_map {
+                egui::Color32::from_rgb(255, 214, 64)
+            } else {
+                egui::Color32::from_rgb(255, 126, 48)
+            };
+            painter.circle_filled(point, 5.5, marker_color);
+            painter.circle_stroke(
+                point,
+                6.5,
+                Stroke::new(1.5, egui::Color32::BLACK),
+            );
+            if size.x >= 400.0 {
+                painter.text(
+                    point + egui::vec2(8.0, -7.0),
+                    egui::Align2::LEFT_CENTER,
+                    if on_map { name } else { format!("{name}（地图外）") },
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+    }
+
+    if response.secondary_clicked() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            let fraction = bevy::prelude::Vec2::new(
+                ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+                (1.0 - (pointer.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
+            );
+            let (x, z) = snapshot.tile_indices(fraction);
+            state.context_cell = snapshot.nearest_cell(x, z);
+            state.context_player = player_points
+                .iter()
+                .filter_map(|(user_id, _, point)| {
+                    user_id.map(|user_id| (user_id, point.distance(pointer)))
+                })
+                .filter(|(_, distance)| *distance <= 12.0)
+                .min_by(|left, right| left.1.total_cmp(&right.1))
+                .map(|(user_id, _)| user_id);
+        }
+    }
+    response.context_menu(|ui| {
+        ui.strong("地图操作");
+        if let Some(user_id) = state.context_player {
+            let target_id = user_id.to_string();
+            if ui
+                .button(format!(
+                    "传送到 {}",
+                    target_display_name(manager, &target_id)
+                ))
+                .clicked()
+            {
+                editor.request_teleport(VoxelTeleportDestination::PlayerStandee(
+                    user_id,
+                ));
+                ui.close();
+            }
+        }
+        if let Some(cell) = state.context_cell {
+            if ui.button("传送到这里").clicked() {
+                editor.request_teleport(VoxelTeleportDestination::MapCell(cell));
+                ui.close();
+            }
+            ui.small(format!(
+                "体素坐标：{}, {}, {}",
+                cell.x, cell.y, cell.z
+            ));
+        }
+    });
+}
+
+fn dm_voxel_map_windows(
+    ctx: &Context,
+    snapshot: &VoxelMinimapSnapshot,
+    scene_positions: Option<&SceneCharacterPositions>,
+    manager: &NapcatMessageManager,
+    state: &mut VoxelMapUiState,
+    editor: &mut VoxelEditorState,
+) {
+    // This desktop egui layer is never part of the player capture-camera render targets.
+    egui::Window::new("DM 小地图")
+        .id(Id::new("dm_voxel_minimap"))
+        .anchor(
+            egui::Align2::RIGHT_TOP,
+            egui::vec2(-286.0, 38.0),
+        )
+        .fixed_size(egui::vec2(224.0, 252.0))
+        .resizable(false)
+        .collapsible(true)
+        .show(ctx, |ui| {
+            voxel_map_ui(
+                ui,
+                egui::vec2(208.0, 208.0),
+                snapshot,
+                scene_positions,
+                manager,
+                state,
+                editor,
+            );
+            ui.small("右键地图传送 · M 打开大地图");
+        });
+
+    if !state.full_map_open {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("DM 体素地图")
+        .id(Id::new("dm_voxel_full_map"))
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .default_size(egui::vec2(720.0, 760.0))
+        .min_size(egui::vec2(420.0, 460.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("全体玩家与体素俯视图");
+                ui.separator();
+                ui.small("北（+Z）朝上");
+            });
+            let side = ui
+                .available_width()
+                .min(ui.available_height() - 26.0)
+                .max(320.0);
+            voxel_map_ui(
+                ui,
+                Vec2::splat(side),
+                snapshot,
+                scene_positions,
+                manager,
+                state,
+                editor,
+            );
+        });
+    state.full_map_open = open;
 }
 
 pub struct CircleImageButton {
@@ -959,6 +1262,10 @@ fn file_menu_button(
 
         if ui.button("TRPG设置").clicked() {
             *trpg_group_settings_open = true;
+            raise_and_expand_window(
+                ui.ctx(),
+                Id::new("trpg_group_settings_window"),
+            );
             ui.close();
         }
     });
@@ -974,10 +1281,12 @@ fn tools_menu_button(
 
         if ui.button("战斗轮").clicked() {
             battle_round_state.open_panel();
+            raise_and_expand_window(ui.ctx(), Id::new("战斗轮"));
             ui.close();
         }
         if ui.button("规则引擎").clicked() {
             rule_engine_state.open_panel();
+            raise_and_expand_window(ui.ctx(), Id::new("规则引擎"));
             ui.close();
         }
     });
@@ -1026,6 +1335,10 @@ fn pool_menu_button(
             if ui.button(label).clicked() {
                 state.pool_window_tab = tab;
                 state.pool_window_open = true;
+                raise_and_expand_window(
+                    ui.ctx(),
+                    Id::new("pool_management_window"),
+                );
                 ui.close();
             }
         }
@@ -1037,6 +1350,8 @@ fn pool_management_window(
     manager: &mut Persistent<NapcatMessageManager>,
     state: &mut TrpgGroupSettingsState,
     napcat_sender: Option<&NapcatIOSender>,
+    deepseek_sender: Option<&DeepseekIOSender>,
+    deepseek_manager: &mut DeepseekManager,
     ime: &mut ImeManager,
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
 ) {
@@ -1090,6 +1405,22 @@ fn pool_management_window(
                 );
             });
             ui.separator();
+            if matches!(
+                state.pool_window_tab,
+                PoolWindowTab::Random
+                    | PoolWindowTab::Unit
+                    | PoolWindowTab::Skill
+                    | PoolWindowTab::Item
+            ) {
+                changed |= content_pool_bundle_ui(
+                    ui,
+                    manager,
+                    state,
+                    deepseek_sender,
+                    deepseek_manager,
+                );
+                ui.separator();
+            }
             egui::ScrollArea::vertical()
                 .id_salt("pool_management_scroll")
                 .show(ui, |ui| match state.pool_window_tab {
@@ -1134,6 +1465,149 @@ fn pool_management_window(
     if changed {
         manager.persist().ok();
     }
+}
+
+fn content_pool_bundle_ui(
+    ui: &mut Ui,
+    manager: &mut NapcatMessageManager,
+    state: &mut TrpgGroupSettingsState,
+    deepseek_sender: Option<&DeepseekIOSender>,
+    deepseek_manager: &mut DeepseekManager,
+) -> bool {
+    if state.content_pool_bundle_path.trim().is_empty() {
+        state.content_pool_bundle_path = CONTENT_POOL_BUNDLE_DEFAULT_PATH.to_owned();
+    }
+
+    let mut changed = false;
+    if let Some(text) = deepseek_manager.content_pool_generation.latest.take() {
+        match manager.merge_content_pool_bundle_json(&text) {
+            Ok(summary) => {
+                changed = true;
+                let archive_status = match write_text_export(
+                    &state.content_pool_bundle_path,
+                    Ok(text),
+                ) {
+                    Ok(()) => format!(
+                        "；JSON已保存至 {}",
+                        state.content_pool_bundle_path
+                    ),
+                    Err(err) => format!("；但JSON保存失败：{err}"),
+                };
+                state.content_pool_bundle_status = format!(
+                    "DeepSeek已生成并导入：单位{}、技能{}、物品{}、随机池{}{}",
+                    summary.units,
+                    summary.skills,
+                    summary.items,
+                    summary.random_pools,
+                    archive_status
+                );
+            },
+            Err(err) => {
+                state.content_pool_bundle_status =
+                    format!("DeepSeek返回内容未通过导入校验，未修改内容池：{err}");
+            },
+        }
+    }
+    if let Some(error) = deepseek_manager.content_pool_generation.error.take() {
+        state.content_pool_bundle_status = format!("DeepSeek生成失败：{error}");
+    }
+
+    ui.collapsing(
+        "内容池导入 / 导出 / DeepSeek生成",
+        |ui| {
+            ui.small(
+                "同一JSON包包含单位、技能、物品和随机池；导入时按ID或“分类+名称”更新同名内容。",
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label("JSON路径");
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.content_pool_bundle_path)
+                        .desired_width(360.0),
+                );
+                if ui.button("导出全部内容池").clicked() {
+                    state.content_pool_bundle_status = match write_text_export(
+                        &state.content_pool_bundle_path,
+                        manager.to_content_pool_bundle_json(),
+                    ) {
+                        Ok(()) => format!(
+                            "已导出：{}",
+                            state.content_pool_bundle_path
+                        ),
+                        Err(err) => format!("导出失败：{err}"),
+                    };
+                }
+                if ui.button("导入内容池").clicked() {
+                    state.content_pool_bundle_status =
+                        match read_text_import(&state.content_pool_bundle_path)
+                            .and_then(|text| manager.merge_content_pool_bundle_json(&text))
+                        {
+                            Ok(summary) => {
+                                changed = true;
+                                format!(
+                                    "已导入：单位{}、技能{}、物品{}、随机池{}",
+                                    summary.units,
+                                    summary.skills,
+                                    summary.items,
+                                    summary.random_pools
+                                )
+                            },
+                            Err(err) => format!("导入失败：{err}"),
+                        };
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                let ready =
+                    deepseek_sender.is_some() && !deepseek_manager.content_pool_generation.pending;
+                let response = ui.add_enabled(
+                    ready,
+                    egui::Button::new("DeepSeek随机生成并导入"),
+                );
+                let clicked = response.clicked();
+                response.on_hover_text(if deepseek_sender.is_none() {
+                    "DeepSeek后台未就绪"
+                } else if deepseek_manager.content_pool_generation.pending {
+                    "DeepSeek正在生成"
+                } else {
+                    "使用.env中的DEEPSEEK_API_KEY生成并校验单位、技能、物品和随机池"
+                });
+                if clicked {
+                    let request = DeepseekRequest::ContentPools {
+                        prompt: content_pool_generation_prompt(),
+                    };
+                    let send_result = serde_json::to_string(&request)
+                        .map(|request| Message::Text(request.into()))
+                        .map_err(|err| err.to_string())
+                        .and_then(|request| {
+                            deepseek_sender
+                                .expect("DeepSeek sender checked above")
+                                .0
+                                .try_send(request)
+                                .map_err(|err| err.to_string())
+                        });
+                    match send_result {
+                        Ok(()) => {
+                            deepseek_manager.content_pool_generation.pending = true;
+                            deepseek_manager.content_pool_generation.latest = None;
+                            deepseek_manager.content_pool_generation.error = None;
+                            state.content_pool_bundle_status =
+                                "DeepSeek正在生成随机内容，请稍候…".to_owned();
+                        },
+                        Err(err) => {
+                            state.content_pool_bundle_status =
+                                format!("DeepSeek请求发送失败：{err}");
+                        },
+                    }
+                }
+            });
+            if deepseek_manager.content_pool_generation.pending {
+                ui.spinner();
+            }
+            if !state.content_pool_bundle_status.is_empty() {
+                ui.small(&state.content_pool_bundle_status);
+            }
+        },
+    );
+    changed
 }
 
 fn pool_target_list_ui(
@@ -1309,7 +1783,7 @@ fn chat_window(
     group_rects: &HashMap<String, Rect>,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
     current_group: Option<&str>,
-    group_delta: Option<Vec2>,
+    group_member_window_offsets: &mut Local<HashMap<(String, String), Vec2>>,
     unread_count: usize,
     quick_character_targets: &mut Local<HashSet<String>>,
     image_textures: &mut Local<HashMap<String, TextureHandle>>,
@@ -1321,64 +1795,59 @@ fn chat_window(
 ) {
     let mut window_open = true;
     let mut leave_group = false;
-    let constraint_rect =
-        if current_group.is_some() { group_member_constraint_rect(rect) } else { rect };
+    let grouped = current_group.is_some();
+    let constraint_rect = if grouped { group_member_constraint_rect(rect) } else { rect };
     let window_min_size = egui::vec2(
         CHAT_WINDOW_MIN_SIZE.x.min(constraint_rect.width().max(1.0)),
         CHAT_WINDOW_MIN_SIZE
             .y
             .min(constraint_rect.height().max(1.0)),
     );
-    let max_window_size = if current_group.is_some() {
-        egui::vec2(
-            GROUP_MEMBER_WINDOW_MAX_SIZE
-                .x
-                .min(constraint_rect.width())
-                .max(window_min_size.x),
-            GROUP_MEMBER_WINDOW_MAX_SIZE
-                .y
-                .min(constraint_rect.height())
-                .max(window_min_size.y),
-        )
-    } else {
-        egui::vec2(
-            CHAT_WINDOW_MAX_SIZE
-                .x
-                .min(constraint_rect.width())
-                .max(window_min_size.x),
-            CHAT_WINDOW_MAX_SIZE
-                .y
-                .min(constraint_rect.height())
-                .max(window_min_size.y),
-        )
-    };
+    let max_window_size = chat_window_max_size(
+        constraint_rect,
+        window_min_size,
+        grouped,
+    );
     let window_id = current_group
-        .map(|group_name| {
-            Id::new((
-                group_name,
-                target_id,
-                "group_member_chat_window_v2",
-            ))
-        })
+        .map(|group_name| group_member_chat_window_id(group_name, target_id))
         .unwrap_or_else(|| standalone_chat_window_id(id, target_id));
-    let mut window = egui::Window::new(nickname)
+    let chat_window_accent = manager
+        .player_chat_window_color(target_id)
+        .map(|[red, green, blue]| egui::Color32::from_rgb(red, green, blue));
+    let mut window_title = egui::RichText::new(nickname);
+    if let Some(accent) = chat_window_accent {
+        window_title = window_title.color(accent).strong();
+    }
+    let mut window = egui::Window::new(window_title)
         .open(&mut window_open)
         .id(window_id)
         .constrain_to(constraint_rect)
-        .default_size(CHAT_WINDOW_SIZE)
+        .default_size(chat_window_default_size(grouped))
         .min_size(window_min_size)
         .max_size(max_window_size)
-        .max_height(GROUP_CHAT_MAX_HEIGHT);
-    if current_group.is_some() {
-        if let Some(delta) = group_delta {
-            if let Some(member_rect) = ctx.memory(|memory| memory.area_rect(window_id)) {
-                window = window.current_pos(member_rect.min + delta);
-            }
+        .resizable(true);
+    if let Some(accent) = chat_window_accent {
+        window = window.frame(
+            egui::Frame::window(&ctx.style_of(ctx.theme())).stroke(Stroke::new(3.0, accent)),
+        );
+    }
+    if let Some(group_name) = current_group {
+        let offset_key = (
+            group_name.to_owned(),
+            target_id.to_owned(),
+        );
+        let desired_position = group_member_window_offsets
+            .get(&offset_key)
+            .map(|offset| group_member_position(constraint_rect, *offset))
+            .unwrap_or_else(|| group_member_default_pos(constraint_rect, target_id));
+        window = window.default_pos(desired_position);
+        if group_member_window_needs_position(ctx, window_id, desired_position) {
+            window = window
+                .current_pos(desired_position)
+                .drag_area(egui::WindowDrag::Anywhere);
+        } else {
+            window = window.drag_area(egui::WindowDrag::TitleBar);
         }
-        window = window.default_pos(group_member_default_pos(
-            constraint_rect,
-            target_id,
-        ));
     }
     let show_character_button = !is_group_chat_target(manager, target_id);
     let trpg_membership_group = focused_trpg_group_name
@@ -1420,8 +1889,17 @@ fn chat_window(
     let mut player_acted_toggle: Option<(String, String, bool)> = None;
     let player_visible_options = player_visible_preview_options(manager, target_id, messages);
     let response = window.show(ctx, |ui| {
+        if let Some(accent) = chat_window_accent {
+            let (accent_rect, accent_response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 4.0),
+                Sense::hover(),
+            );
+            ui.painter().rect_filled(accent_rect, 2.0, accent);
+            accent_response.on_hover_text("玩家聊天颜色；重启后保持不变");
+            ui.add_space(2.0);
+        }
         if current_group.is_some() || show_character_button || trpg_membership_group.is_some() {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if let Some(group_name) = trpg_membership_group.as_deref() {
                     if ui
                         .checkbox(
@@ -1439,6 +1917,10 @@ fn chat_window(
                 if show_character_button {
                     if ui.button("角色").clicked() {
                         quick_character_targets.insert(target_id.to_owned());
+                        raise_and_expand_window(
+                            ui.ctx(),
+                            Id::new(("quick_character_window", target_id)),
+                        );
                     }
                     let can_view_player =
                         target_id.parse::<u64>().is_ok() && player_view_request.is_some();
@@ -1646,7 +2128,10 @@ fn chat_window(
 
     if let Some(group_name) = current_group {
         ctx.set_sublayer(
-            egui::LayerId::new(egui::Order::Middle, Id::new(group_name)),
+            egui::LayerId::new(
+                egui::Order::Middle,
+                chat_group_window_id(group_name),
+            ),
             egui::LayerId::new(egui::Order::Middle, window_id),
         );
     }
@@ -1659,8 +2144,17 @@ fn chat_window(
         manager.persist().ok();
         return;
     }
+    if let (Some(_), Some(response)) = (current_group, response.as_ref()) {
+        if group_member_leave_button(ctx, window_id, response.response.rect) {
+            leave_group = true;
+        }
+    }
     if let Some(group_name) = current_group {
         if leave_group {
+            group_member_window_offsets.remove(&(
+                group_name.to_owned(),
+                target_id.to_owned(),
+            ));
             if let Some(group) = manager.groups.get_mut(group_name) {
                 group.members.retain(|member_id| member_id != target_id);
                 manager.persist().ok();
@@ -1670,6 +2164,16 @@ fn chat_window(
     }
 
     if let Some(response) = response {
+        if let Some(group_name) = current_group {
+            group_member_window_offsets.insert(
+                (
+                    group_name.to_owned(),
+                    target_id.to_owned(),
+                ),
+                group_member_offset(constraint_rect, response.response.rect),
+            );
+        }
+
         if current_group.is_none() {
             paint_unread_badge(
                 ctx,
@@ -1686,8 +2190,20 @@ fn chat_window(
             return;
         }
 
+        // egui 0.35 moves titled windows through this dedicated title-bar response;
+        // the outer area response alone only catches a few controls such as collapse.
+        let title_drag_response = ctx.read_response(window_id.with("__title_click"));
+        let window_dragged = title_drag_response
+            .as_ref()
+            .is_some_and(egui::Response::dragged)
+            || response.response.dragged();
+        let window_drag_stopped = title_drag_response
+            .as_ref()
+            .is_some_and(egui::Response::drag_stopped)
+            || response.response.drag_stopped();
+
         if let Some(drop_pos) = ctx.input(|input| input.pointer.latest_pos()) {
-            if response.response.dragged() {
+            if window_dragged {
                 if let Some((_, preview_rect)) =
                     group_rects.iter().find(|(_, rect)| rect.contains(drop_pos))
                 {
@@ -1696,7 +2212,7 @@ fn chat_window(
             }
         }
 
-        if !response.response.drag_stopped() {
+        if !window_drag_stopped {
             return;
         }
 
@@ -1706,16 +2222,82 @@ fn chat_window(
 
         for (k, rect) in group_rects {
             if rect.contains(drop_pos) {
-                let Some(members) = manager.groups.get_mut(k).map(|group| &mut group.members)
-                else {
-                    continue;
-                };
-                if !members.contains(&target_id.to_owned()) {
-                    members.push(target_id.to_string());
+                if dock_chat_target_into_group(manager, k, target_id) {
                     manager.persist().ok();
                 }
+                break;
             }
         }
+    }
+}
+
+fn dock_chat_target_into_group(
+    manager: &mut NapcatMessageManager,
+    group_name: &str,
+    target_id: &str,
+) -> bool {
+    let Some(group) = manager.groups.get_mut(group_name) else {
+        return false;
+    };
+
+    dock_chat_target_state(
+        group,
+        &mut manager.open_chat_targets,
+        target_id,
+    )
+}
+
+fn dock_chat_target_state(
+    group: &mut ChatGroup,
+    open_chat_targets: &mut HashSet<String>,
+    target_id: &str,
+) -> bool {
+    let mut changed = false;
+    if !group.members.iter().any(|member_id| member_id == target_id) {
+        group.members.push(target_id.to_owned());
+        changed = true;
+    }
+
+    // A docked chat is rendered as a child only when it is no longer also
+    // registered as a standalone window.
+    changed |= open_chat_targets.remove(target_id);
+    changed
+}
+
+#[cfg(test)]
+mod chat_group_docking_tests {
+    use super::*;
+
+    #[test]
+    fn docking_closes_standalone_window_and_adds_member() {
+        let mut group = ChatGroup {
+            members: Vec::new(),
+        };
+        let mut open_chat_targets = HashSet::from(["12345".to_owned()]);
+
+        assert!(dock_chat_target_state(
+            &mut group,
+            &mut open_chat_targets,
+            "12345"
+        ));
+        assert_eq!(group.members, vec!["12345".to_owned()]);
+        assert!(!open_chat_targets.contains("12345"));
+    }
+
+    #[test]
+    fn docking_repairs_already_grouped_chat_left_standalone() {
+        let mut group = ChatGroup {
+            members: vec!["12345".to_owned()],
+        };
+        let mut open_chat_targets = HashSet::from(["12345".to_owned()]);
+
+        assert!(dock_chat_target_state(
+            &mut group,
+            &mut open_chat_targets,
+            "12345"
+        ));
+        assert_eq!(group.members, vec!["12345".to_owned()]);
+        assert!(!open_chat_targets.contains("12345"));
     }
 }
 
@@ -1759,15 +2341,28 @@ fn window_received_focus(ctx: &Context, response: &Response) -> bool {
 }
 
 fn standalone_chat_window_id(id: Id, target_id: &str) -> Id {
+    // v4 discards resize memory whose height may have been inflated by the old
+    // chat body feeding its requested height back into the resizable window.
     Id::new((
         id,
         target_id,
-        "standalone_chat_window_v2",
+        "standalone_chat_window_v4",
     ))
 }
 
-fn focus_standalone_chat_window(ctx: &Context, target_id: &str) {
-    let window_id = standalone_chat_window_id(Id::new(target_id), target_id);
+fn chat_group_window_id(group_name: &str) -> Id { Id::new((group_name, "chat_group_window_v2")) }
+
+fn group_member_chat_window_id(group_name: &str, target_id: &str) -> Id {
+    // v7 also discards height saved while the old chat body fed its requested
+    // height back into the nested resizable window.
+    Id::new((
+        group_name,
+        target_id,
+        "group_member_chat_window_v7",
+    ))
+}
+
+pub(crate) fn raise_and_expand_window(ctx: &Context, window_id: Id) {
     let mut collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
         ctx,
         window_id.with("collapsing"),
@@ -1780,6 +2375,13 @@ fn focus_standalone_chat_window(ctx: &Context, target_id: &str) {
         window_id,
     ));
     ctx.request_repaint();
+}
+
+fn focus_standalone_chat_window(ctx: &Context, target_id: &str) {
+    raise_and_expand_window(
+        ctx,
+        standalone_chat_window_id(Id::new(target_id), target_id),
+    );
 }
 
 fn mark_target_read(
@@ -1826,11 +2428,57 @@ fn group_member_default_pos(rect: Rect, target_id: &str) -> Pos2 {
     let mut hasher = DefaultHasher::new();
     target_id.hash(&mut hasher);
     let hash = hasher.finish();
-    let x_slots = ((rect.width() - CHAT_WINDOW_SIZE.x).max(0.0) / 36.0).floor() as u64 + 1;
-    let y_slots = ((rect.height() - CHAT_WINDOW_SIZE.y).max(0.0) / 36.0).floor() as u64 + 1;
+    let x_slots = ((rect.width() - GROUP_MEMBER_CHAT_SIZE.x).max(0.0) / 36.0).floor() as u64 + 1;
+    let y_slots = ((rect.height() - GROUP_MEMBER_CHAT_SIZE.y).max(0.0) / 36.0).floor() as u64 + 1;
     let x = rect.left() + 12.0 + (hash % x_slots) as f32 * 36.0;
     let y = rect.top() + 12.0 + ((hash / 17) % y_slots) as f32 * 36.0;
     egui::pos2(x, y)
+}
+
+fn group_member_position(parent_rect: Rect, offset: Vec2) -> Pos2 { parent_rect.min + offset }
+
+fn group_member_offset(parent_rect: Rect, member_rect: Rect) -> Vec2 {
+    member_rect.min - parent_rect.min
+}
+
+fn group_member_window_needs_position(ctx: &Context, window_id: Id, position: Pos2) -> bool {
+    ctx.memory(|memory| {
+        memory
+            .area_rect(window_id)
+            .is_none_or(|rect| rect.min.distance(position) > 0.5)
+    })
+}
+
+fn chat_window_default_size(grouped: bool) -> Vec2 {
+    if grouped {
+        GROUP_MEMBER_CHAT_SIZE
+    } else {
+        CHAT_WINDOW_SIZE
+    }
+}
+
+fn chat_window_max_size(constraint_rect: Rect, min_size: Vec2, grouped: bool) -> Vec2 {
+    let max_height = if grouped { GROUP_MEMBER_WINDOW_MAX_HEIGHT } else { CHAT_WINDOW_MAX_HEIGHT };
+    egui::vec2(
+        constraint_rect.width().max(min_size.x),
+        max_height.min(constraint_rect.height()).max(min_size.y),
+    )
+}
+
+fn group_member_leave_button(ctx: &Context, window_id: Id, window_rect: Rect) -> bool {
+    let button_pos = egui::pos2(
+        window_rect.right() - 69.0,
+        window_rect.top() + 3.0,
+    );
+    egui::Area::new(window_id.with("leave_group_button"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(button_pos)
+        .show(ctx, |ui| {
+            ui.small_button("离开")
+                .on_hover_text("离开讨论组")
+                .clicked()
+        })
+        .inner
 }
 
 fn chat_body_ui(
@@ -1839,14 +2487,33 @@ fn chat_body_ui(
     messages: &Vec<NapcatMessage>,
     napcat_sender: Option<&NapcatIOSender>,
     target_id: &str,
-    chat_input_msgs: &mut Local<HashMap<String, String>>,
+    chat_input_msgs: &mut HashMap<String, String>,
     targets: Vec<NapcatSendTarget>,
-    ime: &mut ResMut<ImeManager>,
-    chat_scroll_states: &mut Local<HashMap<String, ChatScrollState>>,
-    image_textures: &mut Local<HashMap<String, TextureHandle>>,
+    ime: &mut ImeManager,
+    chat_scroll_states: &mut HashMap<String, ChatScrollState>,
+    image_textures: &mut HashMap<String, TextureHandle>,
     desired_height: Option<f32>,
 ) {
-    ui.vertical(|ui| {
+    let available_size = ui.available_size();
+    let viewport_height = desired_height
+        .unwrap_or(available_size.y)
+        .min(available_size.y)
+        .max(0.0);
+    let viewport_size = egui::vec2(available_size.x, viewport_height);
+    let (viewport_rect, _) = ui.allocate_exact_size(viewport_size, Sense::hover());
+    let mut viewport_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt((target_id, "chat_body_viewport"))
+            .max_rect(viewport_rect)
+            .layout(egui::Layout::top_down(
+                egui::Align::LEFT,
+            )),
+    );
+
+    // Keep the message pane and composer inside one already-allocated viewport.
+    // Transient composer rows such as "发送中..." can then consume or overflow
+    // this local region without increasing the parent window on every frame.
+    viewport_ui.vertical(|ui| {
         if !chat_input_msgs.contains_key(target_id) {
             chat_input_msgs.insert(target_id.to_owned(), String::new());
         }
@@ -1996,9 +2663,9 @@ fn group_broadcast_scope_ui(
                 .parties
                 .keys()
                 .filter(|party_id| {
-                    members.iter().any(|member_id| {
-                        group.party_id_for_player(member_id) == Some(party_id.as_str())
-                    })
+                    members
+                        .iter()
+                        .any(|member_id| group.player_in_party(member_id, party_id))
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -2078,8 +2745,7 @@ fn group_broadcast_targets(
         manager,
         members.iter().filter(|member_id| match requested_party {
             Some(party_id) => {
-                current_group.and_then(|group| group.party_id_for_player(member_id))
-                    == Some(party_id)
+                current_group.is_some_and(|group| group.player_in_party(member_id, party_id))
             },
             None => true,
         }),
@@ -2471,6 +3137,22 @@ fn legacy_team_chat_window_entries(
     entries
 }
 
+fn legacy_team_chat_window_id(group_name: &str, team_id: &str) -> Id {
+    Id::new((
+        "legacy_team_chat_window",
+        group_name,
+        team_id,
+    ))
+}
+
+fn legacy_send_pane_window_id(group_name: &str, pane_key: &str) -> Id {
+    Id::new((
+        "legacy_send_pane_window",
+        group_name,
+        pane_key,
+    ))
+}
+
 fn legacy_team_chat_windows(
     ctx: &Context,
     manager: &NapcatMessageManager,
@@ -2497,13 +3179,18 @@ fn legacy_team_chat_windows(
             "旧频道聊天：{} / {}",
             entry.group_name, entry.title
         ))
-        .id(Id::new((
-            "legacy_team_chat_window",
-            entry.group_name.as_str(),
-            entry.team_id.as_str(),
-        )))
+        .id(legacy_team_chat_window_id(
+            &entry.group_name,
+            &entry.team_id,
+        ))
         .default_size(entry.default_size)
         .min_width(300.0)
+        .max_size(chat_window_max_size(
+            ctx.content_rect(),
+            egui::vec2(300.0, 16.0),
+            false,
+        ))
+        .resizable(true)
         .open(&mut window_open);
         if let Some(default_pos) = entry.default_pos {
             window = window.default_pos(default_pos);
@@ -2708,13 +3395,18 @@ fn legacy_send_pane_windows(
             "旧发送窗：{} / {}",
             entry.group_name, entry.title
         ))
-        .id(Id::new((
-            "legacy_send_pane_window",
-            entry.group_name.as_str(),
-            entry.pane_key.as_str(),
-        )))
+        .id(legacy_send_pane_window_id(
+            &entry.group_name,
+            &entry.pane_key,
+        ))
         .default_size(Vec2::new(360.0, 180.0))
-        .min_width(280.0);
+        .min_width(280.0)
+        .max_size(chat_window_max_size(
+            ctx.content_rect(),
+            egui::vec2(280.0, 16.0),
+            false,
+        ))
+        .resizable(true);
         if entry.closable {
             window = window.open(&mut window_open);
         }
@@ -2776,7 +3468,7 @@ fn message_row_ui(
     ui: &mut Ui,
     message: &NapcatMessage,
     row_width: f32,
-    image_textures: &mut Local<HashMap<String, TextureHandle>>,
+    image_textures: &mut HashMap<String, TextureHandle>,
 ) {
     let is_self = message.data.self_id == message.data.user_id;
     let max_message_width = if row_width < 120.0 {
@@ -2784,37 +3476,47 @@ fn message_row_ui(
     } else {
         (row_width * 0.72).clamp(120.0, row_width)
     };
-    let margin_width = (row_width - max_message_width).max(0.0);
+    let alignment = if is_self { egui::Align::RIGHT } else { egui::Align::LEFT };
+    message_bubble_layout(
+        ui,
+        row_width,
+        max_message_width,
+        alignment,
+        |ui| {
+            message_text_ui(ui, message, image_textures);
+        },
+    );
+}
 
-    ui.horizontal_top(|ui| {
-        ui.set_width(row_width);
-        if is_self {
-            ui.add_space(margin_width);
+fn message_bubble_layout(
+    ui: &mut Ui,
+    row_width: f32,
+    bubble_width: f32,
+    alignment: egui::Align,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    ui.with_layout(
+        egui::Layout::top_down(alignment),
+        |ui| {
+            ui.set_width(row_width);
             ui.vertical(|ui| {
-                ui.set_width(max_message_width);
-                ui.set_max_width(max_message_width);
+                ui.set_width(bubble_width);
+                ui.set_max_width(bubble_width);
                 ui.with_layout(
-                    egui::Layout::top_down(egui::Align::RIGHT),
+                    egui::Layout::top_down(alignment),
                     |ui| {
-                        message_text_ui(ui, message, image_textures);
+                        add_contents(ui);
                     },
                 );
             });
-        } else {
-            ui.vertical(|ui| {
-                ui.set_width(max_message_width);
-                ui.set_max_width(max_message_width);
-                message_text_ui(ui, message, image_textures);
-            });
-            ui.add_space(margin_width);
-        }
-    });
+        },
+    );
 }
 
 fn message_text_ui(
     ui: &mut Ui,
     message: &NapcatMessage,
-    image_textures: &mut Local<HashMap<String, TextureHandle>>,
+    image_textures: &mut HashMap<String, TextureHandle>,
 ) {
     ui.label(&message.data.sender.nickname);
     for chain in &message.data.message {
@@ -2830,6 +3532,7 @@ fn message_text_ui(
                 message_image_ui(ui, data, image_textures);
             },
             NapcatMessageChainType::Source(_) => {},
+            NapcatMessageChainType::ForwardedReplay { .. } => {},
             NapcatMessageChainType::Unsupported => {},
         }
     }
@@ -2838,7 +3541,7 @@ fn message_text_ui(
 fn message_image_ui(
     ui: &mut Ui,
     data: &ImageData,
-    image_textures: &mut Local<HashMap<String, TextureHandle>>,
+    image_textures: &mut HashMap<String, TextureHandle>,
 ) {
     let Some(path) = cached_image_path(data.local_path.trim()) else {
         ui.label("[图片]");
@@ -2924,6 +3627,7 @@ pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&
                 NapcatMessageChainType::Image { .. } => {
                     len += 12;
                 },
+                NapcatMessageChainType::ForwardedReplay { .. } => {},
                 NapcatMessageChainType::Unsupported => {},
             };
         }
@@ -3040,9 +3744,7 @@ fn group_chat_inner_size(member_count: usize, max_rect: Rect) -> Vec2 {
 
 fn group_chat_max_size(max_rect: Rect) -> Vec2 {
     egui::vec2(
-        GROUP_CHAT_MAX_WIDTH
-            .min(max_rect.width())
-            .max(CHAT_WINDOW_MIN_SIZE.x),
+        max_rect.width().max(CHAT_WINDOW_MIN_SIZE.x),
         GROUP_CHAT_MAX_HEIGHT
             .min(max_rect.height())
             .max(CHAT_WINDOW_MIN_SIZE.y),
@@ -3509,6 +4211,48 @@ fn parse_group_summary_key(summary_key: &str) -> Option<(&str, SummaryScope)> {
     }
 }
 
+fn summary_key_targets_any(summary_key: &str, target_ids: &HashSet<&str>) -> bool {
+    let scope_key = parse_campaign_summary_key(summary_key)
+        .map(|(_, scope_key)| scope_key)
+        .unwrap_or(summary_key);
+    let target_id = parse_group_summary_key(scope_key)
+        .map(|(target_id, _)| target_id)
+        .unwrap_or(scope_key);
+    target_ids.contains(target_id)
+}
+
+fn clear_player_related_summaries(
+    manager: &mut NapcatMessageManager,
+    deepseek_manager: &mut DeepseekManager,
+    affected_chat_targets: &[String],
+) {
+    let target_ids = affected_chat_targets
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    manager
+        .summarized_message_counts
+        .retain(|summary_key, _| !summary_key_targets_any(summary_key, &target_ids));
+    let removed_summary_keys = deepseek_manager
+        .summaries
+        .keys()
+        .filter(|summary_key| summary_key_targets_any(summary_key, &target_ids))
+        .cloned()
+        .collect::<Vec<_>>();
+    deepseek_manager
+        .summaries
+        .retain(|summary_key, _| !summary_key_targets_any(summary_key, &target_ids));
+    deepseek_manager
+        .director_request_fingerprints
+        .retain(|fingerprint_key, _| {
+            !removed_summary_keys.iter().any(|summary_key| {
+                fingerprint_key == summary_key
+                    || fingerprint_key.starts_with(&format!("{summary_key}:"))
+            })
+        });
+    deepseek_manager.last_post_text.clear();
+}
+
 fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: &DeepseekManager) {
     ui.heading("DeepSeek 总结");
     ui.separator();
@@ -3934,6 +4678,10 @@ fn chat_list_panel(
                 if ui.button("打开工作区").clicked() {
                     trpg_group_settings.open = true;
                     trpg_group_settings.focused_group_name = Some(group_name.clone());
+                    raise_and_expand_window(
+                        ctx,
+                        Id::new("trpg_group_settings_window"),
+                    );
                 }
             });
             ui.add_space(4.0);
@@ -5650,7 +6398,7 @@ fn character_editor_ui(
     );
     ui.separator();
     let (inventory_changed, equipment_changed) = character_inventory_editor_ui(
-        ui, target_id, character, edit_state, skill_pool, item_pool, false,
+        ui, target_id, character, edit_state, item_pool, false,
     );
     changed |= inventory_changed;
     if equipment_changed {
@@ -5810,6 +6558,17 @@ fn character_skill_ui_id(target_id: &str, index: usize) -> egui::Id {
     egui::Id::new(("character_skill", target_id, index))
 }
 
+fn dangerous_button(ui: &mut Ui, label: &str) -> Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .color(egui::Color32::WHITE)
+                .strong(),
+        )
+        .fill(ui.visuals().error_fg_color),
+    )
+}
+
 fn character_skill_editor_ui(
     ui: &mut Ui,
     target_id: &str,
@@ -5860,7 +6619,7 @@ fn character_skill_editor_ui(
             |ui| {
                 ui.horizontal(|ui| {
                     let width =
-                        (ui.available_width() - 28.0).clamp(160.0, CHARACTER_FIELD_MAX_WIDTH);
+                        (ui.available_width() - 96.0).clamp(160.0, CHARACTER_FIELD_MAX_WIDTH);
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.label("技能名");
@@ -5925,9 +6684,28 @@ fn character_skill_editor_ui(
                             );
                         }
                     });
-                    if ui.button("-").on_hover_text("移除技能描述").clicked() {
-                        remove_index = Some(index);
-                    }
+                    ui.vertical(|ui| {
+                        let pending_delete = edit_state.pending_skill_delete.as_ref().is_some_and(
+                            |(pending_target, pending_index)| {
+                                pending_target == target_id && *pending_index == index
+                            },
+                        );
+                        if pending_delete {
+                            ui.colored_label(egui::Color32::RED, "确认删除？");
+                            if dangerous_button(ui, "确认删除").clicked() {
+                                remove_index = Some(index);
+                                edit_state.pending_skill_delete = None;
+                            }
+                            if ui.button("取消").clicked() {
+                                edit_state.pending_skill_delete = None;
+                            }
+                        } else if dangerous_button(ui, "删除技能")
+                            .on_hover_text("需要再次确认才会删除")
+                            .clicked()
+                        {
+                            edit_state.pending_skill_delete = Some((target_id.to_owned(), index));
+                        }
+                    });
                 });
                 if let Err(err) = &validation {
                     ui.colored_label(egui::Color32::RED, err);
@@ -6885,7 +7663,6 @@ fn character_inventory_editor_ui(
     target_id: &str,
     character: &mut PlayerCharacter,
     edit_state: &mut CharacterEditState,
-    skill_pool: &[SkillPoolEntry],
     item_pool: &[InventoryItem],
     default_open: bool,
 ) -> (bool, bool) {
@@ -6982,7 +7759,7 @@ fn character_inventory_editor_ui(
 
             ui.collapsing("生存快捷栏", |ui| {
                 ui.small("GM可把背包物品或已批准的主动技能放进玩家的1-9快捷栏。");
-                let active_skills = character_active_hotbar_skills(character, skill_pool);
+                let active_skills = character_hotbar_skills(character);
                 let active_skill_indexes = active_skills
                     .iter()
                     .map(|(index, _)| *index)
@@ -7010,6 +7787,13 @@ fn character_inventory_editor_ui(
                                         &mut character.inventory.hotbar[slot_index],
                                         CharacterHotbarSlot::Empty,
                                         "空",
+                                    )
+                                    .changed();
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut character.inventory.hotbar[slot_index],
+                                        CharacterHotbarSlot::ReleaseControl,
+                                        "工具 · 解除控制",
                                     )
                                     .changed();
                                 for item_index in 0..character.inventory.items.len() {
@@ -7103,19 +7887,24 @@ fn character_inventory_editor_ui(
                 });
 
             if !character.inventory.items.is_empty() {
-                ui.collapsing("背包物品属性加成", |ui| {
+                ui.collapsing("背包物品属性与技能", |ui| {
                     for (index, item) in character.inventory.items.iter_mut().enumerate() {
                         ui.push_id(("inventory_item_stat_effects", index), |ui| {
                             ui.collapsing(
                                 format!(
-                                    "{} · {}项加成",
+                                    "{} · {}项加成 · {}个技能",
                                     item_display_name(item),
-                                    item.stat_effects.len()
+                                    item.stat_effects.len(),
+                                    item.skills.len(),
                                 ),
                                 |ui| {
                                     changed |= item_stat_effects_editor_ui(
                                         ui,
                                         &mut item.stat_effects,
+                                    );
+                                    changed |= inventory_item_skills_editor_ui(
+                                        ui,
+                                        &mut item.skills,
                                     );
                                 },
                             );
@@ -7189,6 +7978,7 @@ fn normalize_character_hotbar(character: &mut PlayerCharacter) -> bool {
     for slot in &mut character.inventory.hotbar {
         let valid = match *slot {
             CharacterHotbarSlot::Empty => true,
+            CharacterHotbarSlot::ReleaseControl => true,
             CharacterHotbarSlot::Item(index) => index < item_count,
             CharacterHotbarSlot::Skill(index) => index < skill_count,
         };
@@ -7200,22 +7990,9 @@ fn normalize_character_hotbar(character: &mut PlayerCharacter) -> bool {
     changed
 }
 
-fn character_active_hotbar_skills(
-    character: &mut PlayerCharacter,
-    skill_pool: &[SkillPoolEntry],
-) -> Vec<(usize, String)> {
+fn character_hotbar_skills(character: &mut PlayerCharacter) -> Vec<(usize, String)> {
     quick_cast_skills(character)
         .into_iter()
-        .filter(|skill| {
-            quick_cast_effect(
-                &skill.note,
-                &skill.arg_values,
-                skill.skill_type.as_deref(),
-                skill.legacy_buff_machine_json.as_deref(),
-                skill_pool,
-            )
-            .is_some()
-        })
         .map(|skill| (skill.index, skill.name))
         .collect()
 }
@@ -7223,6 +8000,7 @@ fn character_active_hotbar_skills(
 fn character_hotbar_slot_label(slot: CharacterHotbarSlot, character: &PlayerCharacter) -> String {
     match slot {
         CharacterHotbarSlot::Empty => "空".to_owned(),
+        CharacterHotbarSlot::ReleaseControl => "工具 · 解除控制".to_owned(),
         CharacterHotbarSlot::Item(index) => character
             .inventory
             .items
@@ -7249,6 +8027,7 @@ fn character_hotbar_slot_short_label(
 ) -> String {
     let label = match slot {
         CharacterHotbarSlot::Empty => return "空".to_owned(),
+        CharacterHotbarSlot::ReleaseControl => return "解除控制".to_owned(),
         CharacterHotbarSlot::Item(index) => {
             character.inventory.items.get(index).map(item_display_name)
         },
@@ -7359,6 +8138,7 @@ fn same_stackable_item(left: &InventoryItem, right: &InventoryItem) -> bool {
         && left.item_level == right.item_level
         && left.soulbound == right.soulbound
         && left.stat_effects == right.stat_effects
+        && left.skills == right.skills
         && left.max_stack > 1
 }
 
@@ -7692,17 +8472,214 @@ fn moonberry_talent_passive_effects(
     }
 }
 
+fn capture_missing_group_initial_player_states(
+    manager: &mut NapcatMessageManager,
+    group_name: &str,
+) -> usize {
+    let Some(group) = manager.trpg_groups.get(group_name) else {
+        return 0;
+    };
+    let players = group.players.clone();
+    let snapshots = players
+        .iter()
+        .filter_map(|target_id| {
+            manager
+                .player_characters
+                .get(target_id)
+                .cloned()
+                .map(|character| (target_id.clone(), character))
+        })
+        .collect::<Vec<_>>();
+    let Some(group) = manager.trpg_groups.get_mut(group_name) else {
+        return 0;
+    };
+    let mut captured = 0;
+    group
+        .initial_player_states
+        .retain(|target_id, _| players.contains(target_id));
+    for (target_id, character) in snapshots {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            group.initial_player_states.entry(target_id)
+        {
+            entry.insert(character);
+            captured += 1;
+        }
+    }
+    captured
+}
+
+fn restore_character_initial_turn_stats(
+    character: &mut PlayerCharacter,
+    initial: &PlayerCharacter,
+) {
+    character.hp = initial.hp;
+    character.max_hp = initial.max_hp;
+    character.hp_regen = initial.hp_regen;
+    character.mp = initial.mp;
+    character.max_mp = initial.max_mp;
+    character.mp_regen = initial.mp_regen;
+    character.level = initial.level;
+    character.exp = initial.exp;
+    character.speed = initial.speed;
+    character.damage_dealt_modifier = initial.damage_dealt_modifier;
+    character.healing_dealt_modifier = initial.healing_dealt_modifier;
+    character.damage_taken_modifier = initial.damage_taken_modifier;
+    character.healing_taken_modifier = initial.healing_taken_modifier;
+    character.damage_taken_this_turn = initial.damage_taken_this_turn;
+    character.healing_taken_this_turn = initial.healing_taken_this_turn;
+    character.status = initial.status.clone();
+    character.extra_status = initial.extra_status.clone();
+    character.skill_last_cast_turns = initial.skill_last_cast_turns.clone();
+    character.skill_cooldown_ready_turns = initial.skill_cooldown_ready_turns.clone();
+    character.active_buffs = initial.active_buffs.clone();
+    character.buff_base_stats = initial.buff_base_stats.clone();
+}
+
+fn restore_group_initial_player_stats(
+    manager: &mut NapcatMessageManager,
+    group_name: &str,
+    rule_engine_state: &mut RuleEngineState,
+) -> (usize, usize) {
+    let Some(group) = manager.trpg_groups.get(group_name) else {
+        return (0, 0);
+    };
+    let players = group.players.clone();
+    let initial_states = group.initial_player_states.clone();
+    let skill_pool_snapshot = manager.skill_pool.clone();
+    let mut restored = 0;
+    let mut missing = 0;
+    for target_id in players {
+        let Some(initial) = initial_states.get(&target_id) else {
+            missing += 1;
+            continue;
+        };
+        let stat_config = manager.character_stat_config_for_target(&target_id);
+        let Some(character) = manager.player_characters.get_mut(&target_id) else {
+            missing += 1;
+            continue;
+        };
+        restore_character_initial_turn_stats(character, initial);
+        sync_character_buffs(
+            &target_id,
+            character,
+            &stat_config,
+            rule_engine_state,
+            &skill_pool_snapshot,
+        );
+        restored += 1;
+    }
+    (restored, missing)
+}
+
+fn summary_key_matches_campaign_or_legacy(summary_key: &str, campaign_id: &str) -> bool {
+    if let Some((summary_campaign_id, scope_key)) = parse_campaign_summary_key(summary_key) {
+        return summary_campaign_id == campaign_id || parse_group_summary_key(scope_key).is_some();
+    }
+    true
+}
+
+fn clear_campaign_chat_messages(manager: &mut NapcatMessageManager, campaign_id: &str) -> usize {
+    let removal_indexes = manager
+        .messages
+        .iter()
+        .map(|(target_id, messages)| {
+            let indexes = messages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, message)| {
+                    (manager
+                        .campaign_message_for_target(target_id, message)
+                        .campaign_id
+                        == campaign_id)
+                        .then_some(index)
+                })
+                .collect::<HashSet<_>>();
+            (target_id.clone(), indexes)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut removed = 0;
+    for (target_id, indexes) in removal_indexes {
+        let Some(messages) = manager.messages.get_mut(&target_id) else {
+            continue;
+        };
+        let mut index = 0;
+        messages.retain(|_| {
+            let keep = !indexes.contains(&index);
+            index += 1;
+            keep
+        });
+        removed += indexes.len();
+        manager
+            .read_message_counts
+            .insert(target_id, messages.len());
+    }
+    removed
+}
+
+fn clear_campaign_summaries(
+    manager: &mut NapcatMessageManager,
+    deepseek_manager: &mut DeepseekManager,
+    campaign_id: &str,
+) -> usize {
+    manager
+        .summarized_message_counts
+        .retain(|summary_key, _| !summary_key_matches_campaign_or_legacy(summary_key, campaign_id));
+    let previous_len = deepseek_manager.summaries.len();
+    deepseek_manager
+        .summaries
+        .retain(|summary_key, _| !summary_key_matches_campaign_or_legacy(summary_key, campaign_id));
+    deepseek_manager.last_post_text.clear();
+    previous_len.saturating_sub(deepseek_manager.summaries.len())
+}
+
+fn clear_campaign_battle_rounds(
+    battle_store: &mut BattleRoundStore,
+    group_name: &str,
+    campaign_id: &str,
+) -> usize {
+    let removed_ids = battle_store
+        .encounters
+        .iter()
+        .filter_map(|(encounter_id, encounter)| {
+            (encounter.trpg_campaign_id.as_deref() == Some(campaign_id)
+                || encounter.trpg_group.as_deref() == Some(group_name))
+            .then_some(encounter_id.clone())
+        })
+        .collect::<HashSet<_>>();
+    battle_store
+        .encounters
+        .retain(|encounter_id, _| !removed_ids.contains(encounter_id));
+    if battle_store
+        .active_encounter_id
+        .as_ref()
+        .is_some_and(|encounter_id| removed_ids.contains(encounter_id))
+    {
+        battle_store.active_encounter_id = None;
+    }
+    removed_ids.len()
+}
+
 fn advance_group_world_turn(
     manager: &mut NapcatMessageManager,
     group_name: &str,
     rule_engine_state: &mut RuleEngineState,
 ) -> bool {
+    let should_capture = manager
+        .trpg_groups
+        .get(group_name)
+        .is_some_and(|group| group.world_turn == 0);
+    let captured = if should_capture {
+        capture_missing_group_initial_player_states(manager, group_name)
+    } else {
+        0
+    };
     let Some(group) = manager.trpg_groups.get_mut(group_name) else {
         return false;
     };
     let players = group.players.clone();
-    let mut changed = group.advance_world_turn();
-    if changed {
+    let advanced = group.advance_world_turn();
+    let mut changed = captured > 0 || advanced;
+    if advanced {
         changed |= reset_turn_totals_for_players(manager, &players);
         changed |= advance_buffs_for_players(manager, &players, rule_engine_state);
     }
@@ -7716,6 +8693,15 @@ fn mark_group_player_turn(
     acted: bool,
     rule_engine_state: &mut RuleEngineState,
 ) -> bool {
+    let should_capture = manager
+        .trpg_groups
+        .get(group_name)
+        .is_some_and(|group| group.world_turn == 0);
+    let captured = if should_capture {
+        capture_missing_group_initial_player_states(manager, group_name)
+    } else {
+        0
+    };
     let Some(group) = manager.trpg_groups.get_mut(group_name) else {
         return false;
     };
@@ -7730,7 +8716,7 @@ fn mark_group_player_turn(
         let _ = reset_turn_totals_for_players(manager, &players);
         advance_buffs_for_players(manager, &players, rule_engine_state);
     }
-    changed
+    captured > 0 || changed
 }
 
 fn set_group_player_waiting(
@@ -8220,6 +9206,56 @@ fn format_buff_effect(effect: &BuffEffect) -> String {
 const RANDOM_POOL_FILTER_ALL: &str = "__all__";
 const RANDOM_POOL_FILTER_UNGROUPED: &str = "__ungrouped__";
 const RANDOM_POOL_FILTER_UNTAGGED: &str = "__untagged__";
+const POOL_CATEGORY_ALL: &str = "__all_categories__";
+const POOL_CATEGORY_UNCATEGORIZED: &str = "__uncategorized__";
+
+fn pool_category_options(categories: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut categories = categories
+        .into_iter()
+        .map(|category| category.trim().to_owned())
+        .filter(|category| !category.is_empty())
+        .collect::<Vec<_>>();
+    categories.sort();
+    categories.dedup();
+    categories
+}
+
+fn pool_category_matches(category: &str, filter: &str) -> bool {
+    filter.is_empty()
+        || filter == POOL_CATEGORY_ALL
+        || (filter == POOL_CATEGORY_UNCATEGORIZED && category.trim().is_empty())
+        || category.trim() == filter
+}
+
+fn pool_category_filter_ui(ui: &mut Ui, id: &str, filter: &mut String, categories: &[String]) {
+    if filter.is_empty() {
+        *filter = POOL_CATEGORY_ALL.to_owned();
+    }
+    let selected = if filter == POOL_CATEGORY_ALL {
+        "全部分类"
+    } else if filter == POOL_CATEGORY_UNCATEGORIZED {
+        "未分类"
+    } else {
+        filter.as_str()
+    };
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                filter,
+                POOL_CATEGORY_ALL.to_owned(),
+                "全部分类",
+            );
+            ui.selectable_value(
+                filter,
+                POOL_CATEGORY_UNCATEGORIZED.to_owned(),
+                "未分类",
+            );
+            for category in categories {
+                ui.selectable_value(filter, category.clone(), category);
+            }
+        });
+}
 
 fn random_pool_tag_tokens(tags: &str) -> Vec<String> {
     let mut tokens = tags
@@ -8283,7 +9319,14 @@ fn random_pool_matches_filters(pool: &RandomPool, group_filter: &str, tag_filter
 }
 
 fn random_pool_metadata_summary(pool: &RandomPool) -> String {
-    let mut parts = vec![random_pool_group_label(pool.legacy_group)];
+    let mut parts = vec![if pool.category.trim().is_empty() {
+        "未分类".to_owned()
+    } else {
+        format!("分类 {}", pool.category.trim())
+    }];
+    parts.push(random_pool_group_label(
+        pool.legacy_group,
+    ));
     let tags = random_pool_tag_tokens(&pool.tags);
     if !tags.is_empty() {
         parts.push(format!("标签 {}", tags.join(" ")));
@@ -8299,6 +9342,12 @@ fn random_pool_metadata_summary(pool: &RandomPool) -> String {
 
 fn random_pool_metadata_editor_ui(ui: &mut Ui, pool: &mut RandomPool) -> bool {
     let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("分类");
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut pool.category).desired_width(140.0))
+            .changed();
+    });
     ui.collapsing("月莓旧随机池元数据", |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label("旧ID");
@@ -8369,13 +9418,21 @@ fn random_pool_settings_ui(
     ui.horizontal_wrapped(|ui| {
         ui.label("池名");
         ui.text_edit_singleline(&mut state.new_random_pool_name);
+        ui.label("分类");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.new_random_pool_category).desired_width(120.0),
+        );
         if ui.button("创建随机池").clicked() {
             let name = state.new_random_pool_name.trim();
             if !name.is_empty() {
+                let category = state.new_random_pool_category.trim().to_owned();
                 manager
                     .random_pools
                     .entry(name.to_owned())
-                    .or_insert_with(RandomPool::default);
+                    .or_insert_with(|| RandomPool {
+                        category,
+                        ..Default::default()
+                    });
                 state.new_random_pool_name.clear();
                 changed = true;
             }
@@ -8407,6 +9464,12 @@ fn random_pool_settings_ui(
     });
 
     let (group_filter_options, tag_filter_options) = random_pool_filter_options(manager);
+    let category_filter_options = pool_category_options(
+        manager
+            .random_pools
+            .values()
+            .map(|pool| pool.category.clone()),
+    );
     if state.random_pool_group_filter.is_empty() {
         state.random_pool_group_filter = RANDOM_POOL_FILTER_ALL.to_owned();
     }
@@ -8414,6 +9477,13 @@ fn random_pool_settings_ui(
         state.random_pool_tag_filter = RANDOM_POOL_FILTER_ALL.to_owned();
     }
     ui.horizontal_wrapped(|ui| {
+        ui.label("分类");
+        pool_category_filter_ui(
+            ui,
+            "random_pool_category_filter",
+            &mut state.random_pool_category_filter,
+            &category_filter_options,
+        );
         egui::ComboBox::from_label("旧分组筛选")
             .selected_text(
                 if state.random_pool_group_filter == RANDOM_POOL_FILTER_ALL {
@@ -8537,6 +9607,9 @@ fn random_pool_settings_ui(
                 pool,
                 &state.random_pool_group_filter,
                 &state.random_pool_tag_filter,
+            ) && pool_category_matches(
+                &pool.category,
+                &state.random_pool_category_filter,
             )
         })
         .map(|(pool_name, _)| pool_name.clone())
@@ -9258,9 +10331,12 @@ fn unit_pool_settings_ui(
                 };
                 if let Some(character) = manager.player_characters.get(&source_id).cloned() {
                     let mut unit = UnitPoolEntry {
+                        category: state.unit_pool_draft.category.clone(),
                         label: target_display_name(manager, &source_id),
                         note: "从玩家角色复制".to_owned(),
                         legacy_member_id: None,
+                        rarity: UnitRarity::Normal,
+                        base_damage: 0.0,
                         character,
                     };
                     prepare_unit_pool_entry(&unit_id, &mut unit);
@@ -9274,10 +10350,35 @@ fn unit_pool_settings_ui(
         ui.small("还没有可复制的玩家角色。");
     }
 
-    let mut unit_ids = manager.unit_pool.keys().cloned().collect::<Vec<_>>();
+    let category_options =
+        pool_category_options(manager.unit_pool.values().map(|unit| unit.category.clone()));
+    ui.horizontal_wrapped(|ui| {
+        ui.label("分类筛选");
+        pool_category_filter_ui(
+            ui,
+            "unit_pool_category_filter",
+            &mut state.unit_pool_category_filter,
+            &category_options,
+        );
+    });
+    let mut unit_ids = manager
+        .unit_pool
+        .iter()
+        .filter(|(_, unit)| {
+            pool_category_matches(
+                &unit.category,
+                &state.unit_pool_category_filter,
+            )
+        })
+        .map(|(unit_id, _)| unit_id.clone())
+        .collect::<Vec<_>>();
     unit_ids.sort();
     if unit_ids.is_empty() {
-        ui.label("还没有单位模板。");
+        ui.label(if manager.unit_pool.is_empty() {
+            "还没有单位模板。"
+        } else {
+            "当前分类下没有单位模板。"
+        });
         return changed;
     }
 
@@ -9439,6 +10540,10 @@ fn unit_pool_entry_editor_ui(ui: &mut Ui, unit_id: &str, unit: &mut UnitPoolEntr
     let mut changed = false;
 
     ui.horizontal_wrapped(|ui| {
+        ui.label("分类");
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut unit.category).desired_width(120.0))
+            .changed();
         ui.label("显示名");
         changed |= ui
             .add(egui::TextEdit::singleline(&mut unit.label).desired_width(160.0))
@@ -9465,6 +10570,56 @@ fn unit_pool_entry_editor_ui(ui: &mut Ui, unit_id: &str, unit: &mut UnitPoolEntr
                 .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
         )
         .changed();
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("稀有度");
+        egui::ComboBox::from_id_salt(format!("unit_rarity_{unit_id}"))
+            .selected_text(match unit.rarity {
+                UnitRarity::Normal => "普通",
+                UnitRarity::Rare => "稀有",
+                UnitRarity::Elite => "精英",
+                UnitRarity::RareElite => "稀有精英",
+            })
+            .show_ui(ui, |ui| {
+                changed |= ui
+                    .selectable_value(
+                        &mut unit.rarity,
+                        UnitRarity::Normal,
+                        "普通",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut unit.rarity,
+                        UnitRarity::Rare,
+                        "稀有",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut unit.rarity,
+                        UnitRarity::Elite,
+                        "精英",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut unit.rarity,
+                        UnitRarity::RareElite,
+                        "稀有精英",
+                    )
+                    .changed();
+            });
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut unit.base_damage)
+                    .range(0.0..=999_999.0)
+                    .speed(0.5)
+                    .prefix("基础伤害 "),
+            )
+            .changed();
+        ui.small("与每名玩家交互时按其等级动态缩放（仅PvE）");
+    });
 
     changed |= unit_character_template_editor_ui(ui, unit_id, &mut unit.character);
     changed
@@ -9674,6 +10829,21 @@ fn skill_pool_settings_ui(
             changed |= manager.sync_skill_pool_from_completed_characters();
         }
     });
+    let category_options = pool_category_options(
+        manager
+            .skill_pool
+            .iter()
+            .map(|entry| entry.category.as_deref().unwrap_or_default().to_owned()),
+    );
+    ui.horizontal_wrapped(|ui| {
+        ui.label("分类筛选");
+        pool_category_filter_ui(
+            ui,
+            "skill_pool_category_filter",
+            &mut state.skill_pool_category_filter,
+            &category_options,
+        );
+    });
 
     if manager.skill_pool.is_empty() {
         ui.label("还没有技能。完成角色兑换后，技能会自动进入这里。");
@@ -9697,9 +10867,23 @@ fn skill_pool_settings_ui(
                         ui.strong("操作");
                         ui.end_row();
 
-                        for (index, entry) in manager.skill_pool.iter().enumerate() {
+                        for (index, entry) in
+                            manager
+                                .skill_pool
+                                .iter_mut()
+                                .enumerate()
+                                .filter(|(_, entry)| {
+                                    pool_category_matches(
+                                        entry.category.as_deref().unwrap_or_default(),
+                                        &state.skill_pool_category_filter,
+                                    )
+                                })
+                        {
                             ui.label(skill_pool_entry_name(entry));
-                            ui.small(skill_pool_entry_category_label(entry));
+                            let category = entry.category.get_or_insert_with(String::new);
+                            changed |= ui
+                                .add(egui::TextEdit::singleline(category).desired_width(100.0))
+                                .changed();
                             ui.small(skill_pool_entry_tags_label(entry));
                             ui.small(entry.source_character_name.as_deref().unwrap_or("手动"));
                             ui.label(format_character_number(entry.mp_cost));
@@ -9814,6 +10998,17 @@ fn item_pool_settings_ui(
     let mut changed = false;
     ui.heading("物品池");
     ui.small("物品池是GM模板库；发给玩家时会复制一份，装备后属性加成立即进入最终数值。");
+    let category_options =
+        pool_category_options(manager.item_pool.iter().map(|item| item.category.clone()));
+    ui.horizontal_wrapped(|ui| {
+        ui.label("分类筛选");
+        pool_category_filter_ui(
+            ui,
+            "item_pool_category_filter",
+            &mut state.item_pool_category_filter,
+            &category_options,
+        );
+    });
 
     if !player_targets.is_empty() {
         if !player_targets.contains(&state.item_pool_award_target) {
@@ -9837,7 +11032,17 @@ fn item_pool_settings_ui(
 
     let mut remove_index = None;
     let mut award_index = None;
-    for (index, item) in manager.item_pool.iter_mut().enumerate() {
+    for (index, item) in manager
+        .item_pool
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, item)| {
+            pool_category_matches(
+                &item.category,
+                &state.item_pool_category_filter,
+            )
+        })
+    {
         ui.push_id(("item_pool_entry", index), |ui| {
             ui.collapsing(
                 format!(
@@ -9901,6 +11106,10 @@ fn item_pool_settings_ui(
 fn inventory_item_definition_ui(ui: &mut Ui, item: &mut InventoryItem) -> bool {
     let mut changed = false;
     ui.horizontal_wrapped(|ui| {
+        ui.label("分类");
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut item.category).desired_width(120.0))
+            .changed();
         ui.label("物品");
         changed |= ui
             .add(egui::TextEdit::singleline(&mut item.name).desired_width(150.0))
@@ -9949,7 +11158,66 @@ fn inventory_item_definition_ui(ui: &mut Ui, item: &mut InventoryItem) -> bool {
             changed |= item_stat_effects_editor_ui(ui, &mut item.stat_effects);
         },
     );
+    ui.collapsing(
+        format!("物品技能 ({})", item.skills.len()),
+        |ui| {
+            changed |= inventory_item_skills_editor_ui(ui, &mut item.skills);
+        },
+    );
     changed
+}
+
+fn inventory_item_skills_editor_ui(ui: &mut Ui, skills: &mut Vec<InventoryItemSkill>) -> bool {
+    let before = skills.clone();
+    let mut remove_index = None;
+    for (index, skill) in skills.iter_mut().enumerate() {
+        ui.push_id(("inventory_item_skill", index), |ui| {
+            ui.group(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("技能");
+                    ui.add(egui::TextEdit::singleline(&mut skill.name).desired_width(140.0));
+                    ui.add(
+                        egui::DragValue::new(&mut skill.mp_cost)
+                            .range(0.0..=9999.0)
+                            .prefix("MP "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut skill.cooldown_turns)
+                            .range(0..=999)
+                            .prefix("冷却 "),
+                    );
+                    ui.checkbox(&mut skill.consume_item, "释放后消耗1个");
+                    if ui.button("-").on_hover_text("移除物品技能").clicked() {
+                        remove_index = Some(index);
+                    }
+                });
+                ui.collapsing("技能结构", |ui| {
+                    character_skill_shape_metadata_ui(ui, &mut skill.metadata);
+                });
+                ui.label("规则描述");
+                ui.add(
+                    egui::TextEdit::multiline(&mut skill.note)
+                        .desired_rows(2)
+                        .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
+                );
+                let args = skill_rule_args(&skill.metadata.args);
+                if let Err(error) = parse_skill_note(
+                    &skill.note,
+                    &args,
+                    skill.metadata.skill_type.as_deref(),
+                ) {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove_index {
+        skills.remove(index);
+    }
+    if ui.button("+ 物品技能").clicked() {
+        skills.push(InventoryItemSkill::default());
+    }
+    *skills != before
 }
 
 fn item_stat_effects_editor_ui(ui: &mut Ui, effects: &mut Vec<BuffEffect>) -> bool {
@@ -9984,15 +11252,6 @@ fn skill_pool_entry_name(entry: &SkillPoolEntry) -> String {
     } else {
         entry.name.trim().to_owned()
     }
-}
-
-fn skill_pool_entry_category_label(entry: &SkillPoolEntry) -> String {
-    entry
-        .category
-        .as_deref()
-        .filter(|category| !category.trim().is_empty())
-        .unwrap_or("-")
-        .to_owned()
 }
 
 fn skill_pool_entry_tags_label(entry: &SkillPoolEntry) -> String {
@@ -11283,15 +12542,16 @@ fn legacy_group_surfaces_ui(
                     let window_key = (group_name.to_owned(), team.id.clone());
                     let window_open = state.open_legacy_team_chat_windows.contains(&window_key);
                     let button_text =
-                        if window_open { "独立聊天窗已开" } else { "打开独立聊天窗" };
-                    let response = ui.add_enabled(
-                        !window_open,
-                        egui::Button::new(button_text),
-                    );
+                        if window_open { "置顶独立聊天窗" } else { "打开独立聊天窗" };
+                    let response = ui.button(button_text);
                     let clicked = response.clicked();
                     response.on_hover_text("打开为独立旧频道聊天窗");
                     if clicked {
                         state.open_legacy_team_chat_windows.insert(window_key);
+                        raise_and_expand_window(
+                            ui.ctx(),
+                            legacy_team_chat_window_id(group_name, &team.id),
+                        );
                     }
                     if ui.button("转为小队").clicked() {
                         action = Some(LegacyGroupSurfaceAction::Promote(
@@ -11625,11 +12885,8 @@ fn legacy_group_surfaces_ui(
                         let window_open =
                             fixed_open || state.open_legacy_send_pane_windows.contains(&window_key);
                         let button_text =
-                            if window_open { "独立窗已开" } else { "打开独立窗" };
-                        let response = ui.add_enabled(
-                            !fixed_open,
-                            egui::Button::new(button_text),
-                        );
+                            if window_open { "置顶独立窗" } else { "打开独立窗" };
+                        let response = ui.button(button_text);
                         let clicked = response.clicked();
                         response.on_hover_text(if fixed_open {
                             "这个旧发送窗会自动保持独立窗口"
@@ -11638,6 +12895,10 @@ fn legacy_group_surfaces_ui(
                         });
                         if clicked {
                             state.open_legacy_send_pane_windows.insert(window_key);
+                            raise_and_expand_window(
+                                ui.ctx(),
+                                legacy_send_pane_window_id(group_name, &pane.key),
+                            );
                         }
                         if pane.closable && ui.button("删除发送窗").clicked() {
                             action = Some(
@@ -11728,7 +12989,11 @@ fn trpg_group_settings_window(
     deepseek_manager: &mut ResMut<Persistent<DeepseekManager>>,
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
     scene_runtime: Option<&mut VoxelMapRuntimeState>,
-    battle_store: Option<&mut Persistent<BattleRoundStore>>,
+    mut battle_store: Option<&mut Persistent<BattleRoundStore>>,
+    possession_movement_store: &mut Persistent<VoxelPossessionMovementStore>,
+    replay_movement_history: &mut Persistent<ReplayPlayerMovementHistory>,
+    player_camera_store: &mut Persistent<VoxelPlayerCameraStore>,
+    player_view_request: Option<&mut ScenePlayerViewRequest>,
     napcat_sender: Option<&NapcatIOSender>,
     ime: &mut ImeManager,
     chat_input_msgs: &mut Local<HashMap<String, String>>,
@@ -11744,10 +13009,13 @@ fn trpg_group_settings_window(
     let group_chat_targets = sorted_pool_targets(manager, true);
     let mut changed = false;
     let mut group_to_delete = None;
-    let mut character_to_delete = None;
+    let mut player_to_delete = None;
     let mut turn_action: Option<(String, String, bool)> = None;
     let mut turn_reset: Option<String> = None;
     let mut turn_advance: Option<String> = None;
+    let mut turn_zero_reset: Option<String> = None;
+    let mut initial_stats_restore: Option<String> = None;
+    let mut test_session_reset: Option<String> = None;
     let mut legacy_negative_action: Option<(String, String, LegacyNegativeAction)> = None;
     let mut legacy_surface_action: Option<(String, LegacyGroupSurfaceAction)> = None;
     let mut settings_open = state.open;
@@ -11779,7 +13047,7 @@ fn trpg_group_settings_window(
                 deepseek_manager,
                 scene_store.as_deref_mut(),
                 scene_runtime,
-                battle_store,
+                battle_store.as_deref_mut(),
                 state,
             );
             ui.separator();
@@ -11813,18 +13081,21 @@ fn trpg_group_settings_window(
                                     character_status_summary_ui(ui, character);
                                     ui.horizontal(|ui| {
                                         let pending_delete =
-                                            state.pending_character_delete.as_deref()
+                                            state.pending_player_delete.as_deref()
                                                 == Some(target_id.as_str());
                                         if pending_delete {
-                                            ui.label("确认删除？");
-                                            if ui.button("删除角色").clicked() {
-                                                character_to_delete = Some(target_id.clone());
+                                            ui.colored_label(
+                                                egui::Color32::LIGHT_RED,
+                                                "将删除该玩家、角色、聊天记录及全部关联数据。",
+                                            );
+                                            if ui.button("确认彻底删除玩家").clicked() {
+                                                player_to_delete = Some(target_id.clone());
                                             }
                                             if ui.button("取消").clicked() {
-                                                state.pending_character_delete = None;
+                                                state.pending_player_delete = None;
                                             }
-                                        } else if ui.button("删除角色").clicked() {
-                                            state.pending_character_delete =
+                                        } else if ui.button("删除玩家").clicked() {
+                                            state.pending_player_delete =
                                                 Some(target_id.clone());
                                         }
                                     });
@@ -11931,7 +13202,80 @@ fn trpg_group_settings_window(
                                 if ui.button("重置行动").clicked() {
                                     turn_reset = Some(group_name.clone());
                                 }
+                                if state.pending_turn_zero_reset.as_deref()
+                                    == Some(group_name.as_str())
+                                {
+                                    if ui
+                                        .button("确认轮次全部归零")
+                                        .on_hover_text("世界轮次和所有玩家轮次都会设为0")
+                                        .clicked()
+                                    {
+                                        turn_zero_reset = Some(group_name.clone());
+                                        state.pending_turn_zero_reset = None;
+                                    }
+                                    if ui.button("取消").clicked() {
+                                        state.pending_turn_zero_reset = None;
+                                    }
+                                } else if ui
+                                    .button("轮次全部归零")
+                                    .on_hover_text("需要再次确认；不会自动恢复角色状态")
+                                    .clicked()
+                                {
+                                    state.pending_turn_zero_reset = Some(group_name.clone());
+                                }
+                                if state.pending_initial_stats_restore.as_deref()
+                                    == Some(group_name.as_str())
+                                {
+                                    if ui
+                                        .button("确认恢复首轮前状态")
+                                        .on_hover_text(
+                                            "恢复所有玩家在第一次行动前保存的HP、MP、属性、buff和冷却状态",
+                                        )
+                                        .clicked()
+                                    {
+                                        initial_stats_restore = Some(group_name.clone());
+                                        state.pending_initial_stats_restore = None;
+                                    }
+                                    if ui.button("取消").clicked() {
+                                        state.pending_initial_stats_restore = None;
+                                    }
+                                } else if ui
+                                    .button("恢复首轮前状态")
+                                    .on_hover_text("需要再次确认；不会使用建卡完成时的默认值")
+                                    .clicked()
+                                {
+                                    state.pending_initial_stats_restore =
+                                        Some(group_name.clone());
+                                }
+                                if state.pending_test_session_reset.as_deref()
+                                    == Some(group_name.as_str())
+                                {
+                                    if ui
+                                        .button("确认清空测试进度")
+                                        .on_hover_text(
+                                            "恢复玩家首轮前状态、轮次归零，并清空本活动聊天、DeepSeek总结、战斗轮和玩家移动；保留角色、团设和场景",
+                                        )
+                                        .clicked()
+                                    {
+                                        test_session_reset = Some(group_name.clone());
+                                        state.pending_test_session_reset = None;
+                                    }
+                                    if ui.button("取消").clicked() {
+                                        state.pending_test_session_reset = None;
+                                    }
+                                } else if ui
+                                    .button("清空测试进度")
+                                    .on_hover_text(
+                                        "需要再次确认；保留玩家角色、TRPG组设置和体素场景",
+                                    )
+                                    .clicked()
+                                {
+                                    state.pending_test_session_reset = Some(group_name.clone());
+                                }
                             });
+                            if let Some(status) = state.group_reset_status.get(&group_name) {
+                                ui.small(status);
+                            }
 
                             ui.collapsing("团设与建卡规则", |ui| {
                                 if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
@@ -12177,11 +13521,14 @@ fn trpg_group_settings_window(
                                 } else {
                                     ui.label("小队管理");
                                     for party_name in &party_names {
-                                        let members = snapshot
+                                        let party_snapshot = snapshot
                                             .parties
-                                            .get(party_name)
+                                            .get(party_name);
+                                        let members = party_snapshot
                                             .map(|party| party.players.clone())
                                             .unwrap_or_default();
+                                        let mut anonymous = party_snapshot
+                                            .is_some_and(|party| party.anonymous);
                                         let member_label =
                                             if members.is_empty() {
                                                 "无成员".to_owned()
@@ -12220,6 +13567,24 @@ fn trpg_group_settings_window(
                                         ui.horizontal_wrapped(|ui| {
                                             ui.strong(party_name);
                                             ui.small(format!("成员：{member_label}"));
+                                            if ui
+                                                .checkbox(&mut anonymous, "匿名频道")
+                                                .on_hover_text(
+                                                    "玩家无法查询成员；转发内容不显示频道和发送者",
+                                                )
+                                                .changed()
+                                            {
+                                                if let Some(party) = manager
+                                                    .trpg_groups
+                                                    .get_mut(&group_name)
+                                                    .and_then(|group| {
+                                                        group.parties.get_mut(party_name)
+                                                    })
+                                                {
+                                                    party.anonymous = anonymous;
+                                                    changed = true;
+                                                }
+                                            }
                                             if merge_options.is_empty() {
                                                 ui.add_enabled(
                                                     false,
@@ -12313,71 +13678,34 @@ fn trpg_group_settings_window(
                                 } else {
                                     for target_id in &snapshot.players {
                                         let display_name = target_display_name(manager, target_id);
-                                        let mut selected_party = snapshot
-                                            .party_id_for_player(target_id)
-                                            .unwrap_or_default()
-                                            .to_owned();
-                                        let before_party = selected_party.clone();
                                         ui.horizontal_wrapped(|ui| {
                                             ui.label(display_name);
-                                            egui::ComboBox::from_id_salt((
-                                                "party_assignment",
-                                                &group_name,
-                                                target_id,
-                                            ))
-                                            .selected_text(if selected_party.is_empty() {
-                                                "无小队"
-                                            } else {
-                                                selected_party.as_str()
-                                            })
-                                            .show_ui(
-                                                ui,
-                                                |ui| {
-                                                    ui.selectable_value(
-                                                        &mut selected_party,
-                                                        String::new(),
-                                                        "无小队",
-                                                    );
-                                                    for party_name in &party_names {
-                                                        ui.selectable_value(
-                                                            &mut selected_party,
-                                                            party_name.clone(),
-                                                            party_name,
+                                            let mut has_membership = false;
+                                            for party_name in &party_names {
+                                                let mut assigned = snapshot
+                                                    .player_in_party(target_id, party_name);
+                                                if ui
+                                                    .checkbox(&mut assigned, party_name)
+                                                    .changed()
+                                                {
+                                                    if let Some(group) = manager
+                                                        .trpg_groups
+                                                        .get_mut(&group_name)
+                                                    {
+                                                        changed |= group
+                                                            .set_player_party_membership(
+                                                                target_id,
+                                                                party_name,
+                                                                assigned,
                                                         );
                                                     }
-                                                },
-                                            );
-
-                                            if let Ok(user_id) = target_id.parse::<u64>() {
-                                                let mut is_gm =
-                                                    snapshot.gm_users.contains(&user_id);
-                                                if ui.checkbox(&mut is_gm, "GM").changed() {
-                                                    if let Some(group) =
-                                                        manager.trpg_groups.get_mut(&group_name)
-                                                    {
-                                                        if is_gm {
-                                                            changed |=
-                                                                group.gm_users.insert(user_id);
-                                                        } else {
-                                                            changed |=
-                                                                group.gm_users.remove(&user_id);
-                                                        }
-                                                    }
                                                 }
+                                                has_membership |= assigned;
+                                            }
+                                            if !has_membership {
+                                                ui.small("无频道");
                                             }
                                         });
-
-                                        if selected_party != before_party {
-                                            if let Some(group) =
-                                                manager.trpg_groups.get_mut(&group_name)
-                                            {
-                                                changed |= group.set_player_party(
-                                                    target_id,
-                                                    (!selected_party.is_empty())
-                                                        .then_some(selected_party.as_str()),
-                                                );
-                                            }
-                                        }
                                     }
                                 }
                             });
@@ -12482,6 +13810,95 @@ fn trpg_group_settings_window(
             rule_engine_state,
         );
     }
+    if let Some(group_name) = turn_zero_reset {
+        let captured = capture_missing_group_initial_player_states(manager.as_mut(), &group_name);
+        let reset = manager
+            .trpg_groups
+            .get_mut(&group_name)
+            .is_some_and(TrpgGroup::reset_all_turns);
+        changed |= captured > 0 || reset;
+        state.group_reset_status.insert(
+            group_name,
+            if captured == 0 {
+                "轮次已全部归零；已有首轮前状态快照保持不变".to_owned()
+            } else {
+                format!("轮次已全部归零；为 {captured} 个玩家建立了新的首轮前状态快照")
+            },
+        );
+    }
+    if let Some(group_name) = initial_stats_restore {
+        let (restored, missing) = restore_group_initial_player_stats(
+            manager.as_mut(),
+            &group_name,
+            rule_engine_state,
+        );
+        changed |= restored > 0;
+        state.group_reset_status.insert(
+            group_name,
+            if restored == 0 {
+                "没有可恢复的首轮前状态；旧跑团请先确认一次“轮次全部归零”以建立基线".to_owned()
+            } else if missing == 0 {
+                format!("已恢复 {restored} 个玩家的首轮前状态")
+            } else {
+                format!("已恢复 {restored} 个玩家；另有 {missing} 个玩家没有首轮前快照")
+            },
+        );
+    }
+    if let Some(group_name) = test_session_reset {
+        if let Some(group) = manager.trpg_groups.get(&group_name).cloned() {
+            let campaign_id = if group.campaign_id.trim().is_empty() {
+                "default".to_owned()
+            } else {
+                group.campaign_id.trim().to_owned()
+            };
+            let target_ids = group
+                .players
+                .iter()
+                .chain(group.group_chats.iter())
+                .cloned()
+                .collect::<HashSet<_>>();
+            let (restored, missing) = restore_group_initial_player_stats(
+                manager.as_mut(),
+                &group_name,
+                rule_engine_state,
+            );
+            let turns_reset = manager
+                .trpg_groups
+                .get_mut(&group_name)
+                .is_some_and(TrpgGroup::reset_all_turns);
+            let removed_messages = clear_campaign_chat_messages(manager.as_mut(), &campaign_id);
+            let removed_summaries = clear_campaign_summaries(
+                manager.as_mut(),
+                deepseek_manager.as_mut(),
+                &campaign_id,
+            );
+            let removed_battles = battle_store
+                .as_deref_mut()
+                .map(|battle_store| {
+                    let removed =
+                        clear_campaign_battle_rounds(battle_store, &group_name, &campaign_id);
+                    battle_store.persist().ok();
+                    removed
+                })
+                .unwrap_or_default();
+            let removed_movements =
+                clear_campaign_possession_movement(possession_movement_store, &campaign_id);
+            possession_movement_store.persist().ok();
+            let removed_replay_movements =
+                clear_campaign_replay_movement_history(replay_movement_history, &campaign_id);
+            replay_movement_history.persist().ok();
+            deepseek_manager.persist().ok();
+            chat_input_msgs.retain(|target_id, _| !target_ids.contains(target_id));
+            changed = true;
+            state.group_reset_status.insert(
+                group_name,
+                format!(
+                    "测试进度已清空：恢复 {restored} 个玩家（缺少首轮前快照 {missing}），轮次{}，删除 {removed_messages} 条聊天、{removed_summaries} 个 DeepSeek 总结、{removed_battles} 个战斗轮、{removed_movements} 条移动状态、{removed_replay_movements} 条回放轨迹；角色、团设和场景已保留",
+                    if turns_reset { "已归零" } else { "原本就是0" }
+                ),
+            );
+        }
+    }
     if let Some((group_name, target_id, action)) = legacy_negative_action {
         let action_changed =
             match action {
@@ -12556,12 +13973,43 @@ fn trpg_group_settings_window(
         }
         changed = true;
     }
-    if let Some(target_id) = character_to_delete {
-        manager
-            .player_characters
-            .insert(target_id, PlayerCharacter::default());
-        state.pending_character_delete = None;
-        changed = true;
+    if let Some(target_id) = player_to_delete {
+        if let Some(deletion) = manager.delete_player(&target_id) {
+            clear_player_related_summaries(
+                manager.as_mut(),
+                deepseek_manager.as_mut(),
+                &deletion.affected_chat_targets,
+            );
+            if let Some(scene_store) = scene_store.as_deref_mut() {
+                if scene_store.remove_player_data(&target_id) {
+                    scene_store.persist().ok();
+                }
+            }
+            if let Some(battle_store) = battle_store.as_deref_mut() {
+                if battle_store.remove_player_data(&target_id) > 0 {
+                    battle_store.persist().ok();
+                }
+            }
+            if let Ok(user_id) = target_id.parse::<u64>() {
+                if clear_player_camera(player_camera_store, user_id) {
+                    player_camera_store.persist().ok();
+                }
+                if clear_player_possession_movement(possession_movement_store, user_id) > 0 {
+                    possession_movement_store.persist().ok();
+                }
+                if clear_player_replay_movement_history(replay_movement_history, user_id) > 0 {
+                    replay_movement_history.persist().ok();
+                }
+                if let Some(player_view_request) = player_view_request {
+                    player_view_request.clear_player(user_id);
+                }
+            }
+            chat_input_msgs.remove(&target_id);
+            character_edit_state.remove_target(&target_id);
+            deepseek_manager.persist().ok();
+            changed = true;
+        }
+        state.pending_player_delete = None;
     }
 
     if changed {
@@ -12593,7 +14041,8 @@ pub fn ui_system(
     let chat_input_msgs: &mut Local<HashMap<String, String>> = &mut locals.chat_input_msgs;
     let chat_scroll_states: &mut Local<HashMap<String, ChatScrollState>> =
         &mut locals.chat_scroll_states;
-    let previous_group_rects: &mut Local<HashMap<String, Rect>> = &mut locals.previous_group_rects;
+    let group_member_window_offsets: &mut Local<HashMap<(String, String), Vec2>> =
+        &mut locals.group_member_window_offsets;
     let chat_list_edit_target: &mut Local<Option<String>> = &mut locals.chat_list_edit_target;
     let chat_list_edit_name: &mut Local<String> = &mut locals.chat_list_edit_name;
     let trpg_group_settings: &mut Local<TrpgGroupSettingsState> = &mut locals.trpg_group_settings;
@@ -12609,13 +14058,24 @@ pub fn ui_system(
         &mut locals.chat_player_visible_previews;
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
+    let map_toggle_requested = locals.keyboard.just_pressed(KeyCode::KeyM);
+    let voxel_minimap: &VoxelMinimapSnapshot = &locals.voxel_minimap;
+    let voxel_map_ui_state: &mut VoxelMapUiState = &mut locals.voxel_map_ui;
     let voxel_editor: &mut VoxelEditorState = &mut locals.voxel_editor;
     let voxel_possession: &mut VoxelPossessionState = &mut locals.voxel_possession;
+    let voxel_targeting_preview: &VoxelTargetingPreview = &locals.voxel_targeting_preview;
     let battle_store = &mut locals.battle_store;
+    let possession_movement_store = &mut locals.possession_movement_store;
+    let replay_movement_history = &mut locals.replay_movement_history;
+    let player_camera_store = &mut locals.player_camera_store;
+    let player_standees = &locals.player_standees;
 
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
+    if map_toggle_requested && !ctx.memory(|memory| memory.focused().is_some()) {
+        voxel_map_ui_state.full_map_open = !voxel_map_ui_state.full_map_open;
+    }
     if manager.migrate_chat_window_state()
         || manager.sync_chat_targets()
         || manager.sync_skill_pool_from_completed_characters()
@@ -12646,8 +14106,6 @@ pub fn ui_system(
     }
 
     let mut group_rects: HashMap<String, Rect> = HashMap::default();
-    let mut group_deltas: HashMap<String, Vec2> = HashMap::default();
-    let mut latest_group_rects: HashMap<String, Rect> = HashMap::default();
     let reset_data = |new_chat_group_modal_string_bool: &mut Local<'_, (String, bool)>| {
         new_chat_group_modal_string_bool.0 = "".to_owned();
         new_chat_group_modal_string_bool.1 = false;
@@ -12692,6 +14150,10 @@ pub fn ui_system(
         scene_store.as_deref_mut(),
         scene_runtime.as_deref_mut(),
         battle_store.as_deref_mut(),
+        possession_movement_store,
+        replay_movement_history,
+        player_camera_store,
+        player_view_request.as_deref_mut(),
         napcat_sender,
         &mut *ime,
         chat_input_msgs,
@@ -12738,6 +14200,8 @@ pub fn ui_system(
         &mut manager,
         trpg_group_settings,
         napcat_sender,
+        deepseek_sender,
+        &mut deepseek_manager,
         &mut ime,
         scene_store.as_deref_mut(),
     );
@@ -12888,8 +14352,27 @@ pub fn ui_system(
                         if ui.button("重做").clicked() {
                             voxel_editor.redo_requested = true;
                         }
-                        if ui.button("重置").clicked() {
-                            voxel_editor.reset_requested = true;
+                        if voxel_editor.reset_scene_confirmation() {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button("Confirm Reset Scene")
+                                    .on_hover_text(
+                                        "Delete the saved scene and restore all default voxels, physics props, and lights",
+                                    )
+                                    .clicked()
+                                {
+                                    voxel_editor.confirm_reset_scene();
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    voxel_editor.cancel_reset_scene_confirmation();
+                                }
+                            });
+                        } else if ui
+                            .button("Reset Scene")
+                            .on_hover_text("Requires a second confirmation")
+                            .clicked()
+                        {
+                            voxel_editor.request_reset_scene_confirmation();
                         }
                         if ui.button("保存当前场景").clicked() {
                             voxel_editor.request_scene_snapshot();
@@ -13111,6 +14594,39 @@ pub fn ui_system(
 
             if let Some(possessed_user_id) = voxel_possession.active_user_id {
                 voxel_editor.creative_inventory_open = false;
+                if voxel_targeting_preview.show_affected_players {
+                    let affected_names = voxel_targeting_preview
+                        .affected_user_ids
+                        .iter()
+                        .map(|user_id| target_display_name(&manager, &user_id.to_string()))
+                        .collect::<Vec<_>>();
+                    let affected_names = if affected_names.is_empty() {
+                        "无".to_owned()
+                    } else {
+                        affected_names.join("、")
+                    };
+                    egui::Area::new(egui::Id::new("voxel_player_aoe_targets"))
+                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -72.0))
+                        .order(egui::Order::Foreground)
+                        .interactable(false)
+                        .show(ctx, |ui| {
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_black_alpha(220))
+                                .corner_radius(4)
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 205, 80),
+                                        format!(
+                                            "{} · 将影响：{}",
+                                            voxel_targeting_preview.skill_name,
+                                            affected_names
+                                        ),
+                                    );
+                                });
+                        });
+                }
+                let mut release_control_requested = false;
                 egui::Area::new(egui::Id::new("voxel_player_hotbar"))
                     .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
                     .order(egui::Order::Foreground)
@@ -13145,6 +14661,9 @@ pub fn ui_system(
                                             );
                                             if response.on_hover_text(full_label).clicked() {
                                                 voxel_possession.selected_hotbar_slot = slot;
+                                                release_control_requested =
+                                                    *entry
+                                                        == CharacterHotbarSlot::ReleaseControl;
                                             }
                                         }
                                     });
@@ -13153,6 +14672,9 @@ pub fn ui_system(
                                 }
                             });
                     });
+                if release_control_requested {
+                    voxel_possession.release();
+                }
                 if voxel_possession.player_inventory_open {
                     let target_id = possessed_user_id.to_string();
                     let skill_pool_snapshot = manager.skill_pool.clone();
@@ -13184,7 +14706,6 @@ pub fn ui_system(
                                             &target_id,
                                             character,
                                             character_edit_state,
-                                            &skill_pool_snapshot,
                                             &item_pool_snapshot,
                                             true,
                                         )
@@ -13535,6 +15056,50 @@ pub fn ui_system(
                                 voxel_editor.request_teleport(destination);
                             }
                         }
+                        let mut standee_destinations = player_standees
+                            .iter()
+                            .filter(|(_, visibility)| {
+                                **visibility != bevy::prelude::Visibility::Hidden
+                            })
+                            .map(|(standee, _)| {
+                                let target_id = standee.user_id.to_string();
+                                let character_name = manager
+                                    .player_characters
+                                    .get(&target_id)
+                                    .map(|character| {
+                                        if !character.nickname.trim().is_empty() {
+                                            character.nickname.trim()
+                                        } else {
+                                            character.name.trim()
+                                        }
+                                    })
+                                    .filter(|name| !name.is_empty())
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| target_display_name(&manager, &target_id));
+                                (character_name, standee.user_id)
+                            })
+                            .collect::<Vec<_>>();
+                        standee_destinations.sort_by(|left, right| {
+                            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                        });
+                        if !standee_destinations.is_empty() {
+                            ui.separator();
+                            ui.strong("玩家立牌");
+                            for (name, user_id) in standee_destinations {
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(220.0, 28.0),
+                                        egui::Button::new(format!("传送到 {name}")),
+                                    )
+                                    .on_hover_text(format!("QQ：{user_id}"))
+                                    .clicked()
+                                {
+                                    voxel_editor.request_teleport(
+                                        VoxelTeleportDestination::PlayerStandee(user_id),
+                                    );
+                                }
+                            }
+                        }
                     });
                 if !window_open {
                     voxel_editor.teleport_menu_open = false;
@@ -13616,14 +15181,12 @@ pub fn ui_system(
                 let response = egui::Window::new(group_title)
                     .open(&mut group_open)
                     .constrain_to(ui.max_rect())
-                    .id(Id::new((
-                        k.as_str(),
-                        "chat_group_window_v2",
-                    )))
+                    .id(chat_group_window_id(k.as_str()))
                     .default_pos(ui.max_rect().left_top() + egui::vec2(12.0, 12.0))
                     .default_size(group_size)
                     .min_size(CHAT_WINDOW_MIN_SIZE)
                     .max_size(group_max_size)
+                    .resizable(true)
                     .show(ctx, |ui| {
                         group_drop_area_ui(ui, &k, &v.members);
                         group_broadcast_input_ui(
@@ -13651,13 +15214,6 @@ pub fn ui_system(
                         unread_count,
                     );
                     if response.inner.is_some() {
-                        if let Some(previous_rect) = previous_group_rects.get(k) {
-                            let delta = response.response.rect.min - previous_rect.min;
-                            if delta.length_sq() > 0.0 {
-                                group_deltas.insert(k.clone(), delta);
-                            }
-                        }
-                        latest_group_rects.insert(k.clone(), response.response.rect);
                         group_rects.insert(k.clone(), response.response.rect);
                     }
                 }
@@ -13665,13 +15221,19 @@ pub fn ui_system(
             if !closed_group_names.is_empty() {
                 for group_name in &closed_group_names {
                     manager.groups.remove(group_name);
-                    previous_group_rects.remove(group_name);
+                    group_member_window_offsets
+                        .retain(|(offset_group, _), _| offset_group != group_name);
                 }
                 if let Err(err) = manager.persist() {
                     eprintln!("failed to persist closed chat groups: {err}");
                 }
             }
-            **previous_group_rects = latest_group_rects;
+            group_member_window_offsets.retain(|(group_name, target_id), _| {
+                manager
+                    .groups
+                    .get(group_name)
+                    .is_some_and(|group| group.members.contains(target_id))
+            });
 
             let mut visible_targets: HashSet<String> = manager.open_chat_targets.clone();
             for group in manager.groups.values() {
@@ -13748,9 +15310,7 @@ pub fn ui_system(
                     &group_rects,
                     &mut manager,
                     current_group.as_deref(),
-                    current_group
-                        .as_deref()
-                        .and_then(|group_name| group_deltas.get(group_name).copied()),
+                    group_member_window_offsets,
                     unread_count,
                     quick_character_targets,
                     image_textures,
@@ -13762,6 +15322,15 @@ pub fn ui_system(
                 );
             }
         });
+
+    dm_voxel_map_windows(
+        ctx,
+        voxel_minimap,
+        scene_positions.as_deref(),
+        &manager,
+        voxel_map_ui_state,
+        voxel_editor,
+    );
 
     let should_persist_ui_memory = ctx.input(|input| {
         input.pointer.any_released()
@@ -13839,6 +15408,7 @@ fn append_local_sent_message(
         data: NapcatMessageData {
             time,
             message_type,
+            message_id: None,
             message: vec![NapcatMessageChain {
                 variant: NapcatMessageChainType::Text {
                     data: TextData {
@@ -13873,6 +15443,448 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_windows_can_use_the_full_available_width() {
+        let available_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+
+        assert_eq!(
+            chat_window_max_size(
+                available_rect,
+                CHAT_WINDOW_MIN_SIZE,
+                false
+            )
+            .x,
+            1_280.0
+        );
+        assert_eq!(
+            chat_window_max_size(
+                available_rect,
+                CHAT_WINDOW_MIN_SIZE,
+                true
+            )
+            .x,
+            1_280.0
+        );
+        assert_eq!(
+            group_chat_max_size(available_rect).x,
+            1_280.0
+        );
+    }
+
+    #[test]
+    fn width_filling_group_content_does_not_expand_each_frame() {
+        let ctx = Context::default();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let mut widths = Vec::new();
+
+        for _ in 0..6 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            });
+            let response = egui::Window::new("讨论组")
+                .id(Id::new("stable_group_width_test"))
+                .default_size(egui::vec2(360.0, 520.0))
+                .min_size(CHAT_WINDOW_MIN_SIZE)
+                .max_size(group_chat_max_size(screen_rect))
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    let body_size = egui::vec2(ui.available_width(), 180.0);
+                    ui.allocate_exact_size(body_size, Sense::hover());
+                    let mut input = String::new();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut input).desired_width(ui.available_width()),
+                    );
+                })
+                .unwrap();
+            widths.push(response.response.rect.width());
+            let _ = ctx.end_pass();
+        }
+
+        assert!(widths[1..].windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(widths.last().copied().unwrap() < screen_rect.width());
+    }
+
+    #[test]
+    fn sent_message_does_not_expand_the_chat_window_height_each_frame() {
+        let ctx = Context::default();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let target_id = "42";
+        let mut input_msgs = HashMap::from([(
+            target_id.to_owned(),
+            "发送后的消息".to_owned(),
+        )]);
+        let mut scroll_states = HashMap::new();
+        let mut image_textures = HashMap::new();
+        let mut ime = ImeManager::default();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let napcat_sender = NapcatIOSender(sender);
+        let targets = vec![NapcatSendTarget::Private(42)];
+        ime.queue_text_send(
+            target_id,
+            "发送后的消息",
+            &napcat_sender,
+            targets.clone(),
+        )
+        .unwrap();
+        let messages = vec![test_private_message(42)];
+        let mut heights = Vec::new();
+
+        for _ in 0..8 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            });
+            let response = egui::Window::new("发送后的聊天")
+                .id(Id::new(
+                    "stable_sent_message_height_test",
+                ))
+                .default_size(CHAT_WINDOW_SIZE)
+                .min_size(CHAT_WINDOW_MIN_SIZE)
+                .max_size(chat_window_max_size(
+                    screen_rect,
+                    CHAT_WINDOW_MIN_SIZE,
+                    false,
+                ))
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    chat_body_ui(
+                        ui,
+                        &ctx,
+                        &messages,
+                        Some(&napcat_sender),
+                        target_id,
+                        &mut input_msgs,
+                        targets.clone(),
+                        &mut ime,
+                        &mut scroll_states,
+                        &mut image_textures,
+                        None,
+                    );
+                })
+                .unwrap();
+            heights.push(response.response.rect.height());
+            let _ = ctx.end_pass();
+        }
+
+        assert!(
+            heights[2..]
+                .windows(2)
+                .all(|pair| (pair[0] - pair[1]).abs() < 0.1),
+            "chat heights kept changing after send: {heights:?}"
+        );
+        assert!(heights.last().copied().unwrap() < CHAT_WINDOW_MAX_HEIGHT);
+    }
+
+    #[test]
+    fn aligned_message_rows_do_not_expand_the_chat_window() {
+        let ctx = Context::default();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let mut widths = Vec::new();
+
+        for _ in 0..8 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            });
+            let response = egui::Window::new("成员消息")
+                .id(Id::new("stable_message_rows_test"))
+                .default_size(GROUP_MEMBER_CHAT_SIZE)
+                .min_size(CHAT_WINDOW_MIN_SIZE)
+                .max_size(chat_window_max_size(
+                    screen_rect,
+                    CHAT_WINDOW_MIN_SIZE,
+                    true,
+                ))
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    let row_width = ui.available_width();
+                    let bubble_width = row_width * 0.72;
+                    message_bubble_layout(
+                        ui,
+                        row_width,
+                        bubble_width,
+                        egui::Align::RIGHT,
+                        |ui| {
+                            ui.label("右侧消息会在气泡宽度内换行，不应推动窗口变宽。");
+                        },
+                    );
+                    message_bubble_layout(
+                        ui,
+                        row_width,
+                        bubble_width,
+                        egui::Align::LEFT,
+                        |ui| {
+                            ui.label("左侧消息也不应额外加入水平间距。");
+                        },
+                    );
+                    let mut input = String::new();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut input).desired_width(ui.available_width()),
+                    );
+                })
+                .unwrap();
+            widths.push(response.response.rect.width());
+            let _ = ctx.end_pass();
+        }
+
+        assert!(widths[1..].windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(widths.last().copied().unwrap() < 500.0);
+    }
+
+    #[test]
+    fn wrapped_private_chat_toolbar_keeps_the_requested_width() {
+        let ctx = Context::default();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let mut widths = Vec::new();
+
+        for _ in 0..6 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            });
+            let response = egui::Window::new("私聊")
+                .id(Id::new(
+                    "wrapped_private_chat_toolbar_test",
+                ))
+                .default_size(CHAT_WINDOW_SIZE)
+                .min_size(CHAT_WINDOW_MIN_SIZE)
+                .max_size(chat_window_max_size(
+                    screen_rect,
+                    CHAT_WINDOW_MIN_SIZE,
+                    false,
+                ))
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for label in ["角色", "查看玩家视角", "按玩家可见", "设置轮次", "当前"]
+                        {
+                            let _ = ui.button(label);
+                        }
+                    });
+                    let body_size = egui::vec2(ui.available_width(), 180.0);
+                    ui.allocate_exact_size(body_size, Sense::hover());
+                })
+                .unwrap();
+            widths.push(response.response.rect.width());
+            let _ = ctx.end_pass();
+        }
+
+        assert!(widths[1..].windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(widths.last().copied().unwrap() < 500.0);
+    }
+
+    #[test]
+    fn nested_group_chat_window_can_be_resized_with_the_pointer() {
+        let ctx = Context::default();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1_280.0, 900.0));
+        let parent_rect = Rect::from_min_size(
+            egui::pos2(80.0, 60.0),
+            egui::vec2(900.0, 760.0),
+        );
+        let constraint_rect = group_member_constraint_rect(parent_rect);
+        let window_id = group_member_chat_window_id("测试讨论组", "测试成员");
+        let position = constraint_rect.min + egui::vec2(20.0, 20.0);
+        let show_windows = |ctx: &Context| {
+            let parent_id = chat_group_window_id("测试讨论组");
+            egui::Window::new("讨论组")
+                .id(parent_id)
+                .current_pos(parent_rect.min)
+                .fixed_size(parent_rect.size())
+                .show(ctx, |ui| {
+                    ui.allocate_exact_size(ui.available_size(), Sense::hover());
+                });
+            let mut child_window = egui::Window::new("成员")
+                .id(window_id)
+                .constrain_to(constraint_rect)
+                .default_pos(position)
+                .default_size(chat_window_default_size(true))
+                .min_size(CHAT_WINDOW_MIN_SIZE)
+                .max_size(chat_window_max_size(
+                    constraint_rect,
+                    CHAT_WINDOW_MIN_SIZE,
+                    true,
+                ))
+                .resizable(true);
+            if group_member_window_needs_position(ctx, window_id, position) {
+                child_window = child_window
+                    .current_pos(position)
+                    .drag_area(egui::WindowDrag::Anywhere);
+            } else {
+                child_window = child_window.drag_area(egui::WindowDrag::TitleBar);
+            }
+            let child_rect = child_window
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let _ = ui.button("角色");
+                        let _ = ui.button("查看玩家视角");
+                        let _ = ui.button("按玩家可见");
+                    });
+                    ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 220.0),
+                        Sense::hover(),
+                    );
+                })
+                .unwrap()
+                .response
+                .rect;
+            ctx.set_sublayer(
+                egui::LayerId::new(egui::Order::Middle, parent_id),
+                egui::LayerId::new(egui::Order::Middle, window_id),
+            );
+            child_rect
+        };
+        let run_frame = |ctx: &Context, events: Vec<egui::Event>| {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events,
+                ..Default::default()
+            });
+            let rect = show_windows(ctx);
+            let _ = ctx.end_pass();
+            rect
+        };
+
+        let _ = run_frame(&ctx, Vec::new());
+        let rect = run_frame(&ctx, Vec::new());
+        let resize_start = rect.right_center();
+        let _ = run_frame(&ctx, vec![egui::Event::PointerMoved(
+            resize_start,
+        )]);
+        let _ = run_frame(&ctx, vec![egui::Event::PointerButton {
+            pos: resize_start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }]);
+        let resize_end = resize_start + egui::vec2(140.0, 0.0);
+        let _ = run_frame(&ctx, vec![egui::Event::PointerMoved(
+            resize_end,
+        )]);
+        let rect = run_frame(&ctx, Vec::new());
+        let resized_width = rect.width();
+        let _ = run_frame(&ctx, vec![egui::Event::PointerButton {
+            pos: resize_end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }]);
+
+        assert!(
+            resized_width >= GROUP_MEMBER_CHAT_SIZE.x + 100.0,
+            "nested member width stayed at {resized_width}"
+        );
+    }
+
+    #[test]
+    fn group_member_position_follows_parent_and_preserves_offset() {
+        let first_parent = Rect::from_min_size(
+            egui::pos2(100.0, 80.0),
+            egui::vec2(500.0, 400.0),
+        );
+        let member = Rect::from_min_size(
+            egui::pos2(145.0, 150.0),
+            egui::vec2(240.0, 180.0),
+        );
+        let offset = group_member_offset(first_parent, member);
+        let moved_parent = first_parent.translate(egui::vec2(90.0, -25.0));
+
+        assert_eq!(
+            group_member_position(moved_parent, offset),
+            member.min + egui::vec2(90.0, -25.0)
+        );
+    }
+
+    #[test]
+    fn collapsed_group_member_window_accepts_parent_driven_position() {
+        let ctx = Context::default();
+        let window_id = Id::new("collapsed_group_member_position_test");
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 700.0));
+        let show_at = |ctx: &Context, position: Pos2| {
+            let mut collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ctx,
+                window_id.with("collapsing"),
+                true,
+            );
+            collapsing.set_open(false);
+            collapsing.store(ctx);
+            let mut window = egui::Window::new("成员")
+                .id(window_id)
+                .default_pos(position);
+            if group_member_window_needs_position(ctx, window_id, position) {
+                window = window
+                    .current_pos(position)
+                    .drag_area(egui::WindowDrag::Anywhere);
+            } else {
+                window = window.drag_area(egui::WindowDrag::TitleBar);
+            }
+            window.show(ctx, |_| {});
+        };
+
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        });
+        show_at(&ctx, egui::pos2(80.0, 90.0));
+        let _ = ctx.end_pass();
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        });
+        show_at(&ctx, egui::pos2(310.0, 260.0));
+        let _ = ctx.end_pass();
+
+        assert_eq!(
+            ctx.memory(|memory| memory.area_rect(window_id).unwrap().min),
+            egui::pos2(310.0, 260.0)
+        );
+    }
+
+    #[test]
+    fn opening_a_window_expands_and_raises_it() {
+        let ctx = Context::default();
+        let window_id = Id::new("raise_and_expand_window_test");
+        let layer_id = egui::LayerId::new(egui::Order::Middle, window_id);
+        ctx.begin_pass(Default::default());
+        let mut collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
+            &ctx,
+            window_id.with("collapsing"),
+            true,
+        );
+        collapsing.set_open(false);
+        collapsing.store(&ctx);
+
+        raise_and_expand_window(&ctx, window_id);
+
+        assert!(
+            egui::collapsing_header::CollapsingState::load(&ctx, window_id.with("collapsing"))
+                .unwrap()
+                .is_open()
+        );
+        assert_eq!(ctx.top_layer_id(), Some(layer_id));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn group_member_window_is_layered_above_its_actual_group_window() {
+        let ctx = Context::default();
+        let parent = egui::LayerId::new(
+            egui::Order::Middle,
+            chat_group_window_id("狂妄号"),
+        );
+        let child = egui::LayerId::new(
+            egui::Order::Middle,
+            group_member_chat_window_id("狂妄号", "1670426821"),
+        );
+
+        ctx.set_sublayer(parent, child);
+
+        assert_eq!(
+            ctx.memory(|memory| memory.areas().parent_layer(child)),
+            Some(parent)
+        );
+    }
+
+    #[test]
     fn repeated_character_skill_rows_have_distinct_widget_ids() {
         assert_ne!(
             character_skill_ui_id("player", 0),
@@ -13887,6 +15899,7 @@ mod tests {
     fn empty_manager() -> NapcatMessageManager {
         NapcatMessageManager {
             messages: HashMap::default(),
+            replay_snapshots: HashMap::default(),
             chat_targets: HashMap::default(),
             chat_target_kinds: HashMap::default(),
             player_characters: HashMap::default(),
@@ -13905,11 +15918,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn deleting_player_related_summaries_clears_private_and_affected_group_scopes() {
+        let mut manager = empty_manager();
+        let private_key = SummaryScope::Private.summary_key("campaign", "2");
+        let group_key = SummaryScope::GroupParty("red".to_owned())
+            .summary_key("campaign", "99");
+        let retained_key = SummaryScope::Private.summary_key("campaign", "3");
+        for key in [&private_key, &group_key, &retained_key] {
+            manager.summarized_message_counts.insert(key.clone(), 1);
+        }
+        let mut deepseek = DeepseekManager::default();
+        for key in [&private_key, &group_key, &retained_key] {
+            deepseek.summaries.insert(key.clone(), Default::default());
+        }
+        deepseek.director_request_fingerprints.insert(
+            format!("{group_key}:dialogue-count:1"),
+            "stale".to_owned(),
+        );
+
+        clear_player_related_summaries(
+            &mut manager,
+            &mut deepseek,
+            &["2".to_owned(), "99".to_owned()],
+        );
+
+        assert!(!manager.summarized_message_counts.contains_key(&private_key));
+        assert!(!manager.summarized_message_counts.contains_key(&group_key));
+        assert!(manager.summarized_message_counts.contains_key(&retained_key));
+        assert!(!deepseek.summaries.contains_key(&private_key));
+        assert!(!deepseek.summaries.contains_key(&group_key));
+        assert!(deepseek.summaries.contains_key(&retained_key));
+        assert!(deepseek.director_request_fingerprints.is_empty());
+    }
+
     fn test_private_message(user_id: u64) -> NapcatMessage {
         NapcatMessage {
             data: NapcatMessageData {
                 time: 1780132600,
                 message_type: NapcatMessageType::Private,
+                message_id: None,
                 message: vec![NapcatMessageChain {
                     variant: NapcatMessageChainType::Text {
                         data: TextData {
@@ -13940,6 +15988,7 @@ mod tests {
             data: NapcatMessageData {
                 time: 1780132600,
                 message_type: NapcatMessageType::Group,
+                message_id: None,
                 message: vec![NapcatMessageChain {
                     variant: NapcatMessageChainType::Text {
                         data: TextData {
@@ -13979,6 +16028,128 @@ mod tests {
         manager.trpg_groups.insert("table".to_owned(), group);
         manager.current_trpg_group = Some("table".to_owned());
         manager
+    }
+
+    #[test]
+    fn test_session_cleanup_is_campaign_scoped_and_preserves_other_data() {
+        let mut manager = empty_manager();
+        let mut campaign_message = test_private_message(2);
+        campaign_message.data.campaign_id = "campaign-a".to_owned();
+        campaign_message.data.access_scope_resolved = true;
+        let mut other_message = test_private_message(2);
+        other_message.data.campaign_id = "campaign-b".to_owned();
+        other_message.data.access_scope_resolved = true;
+        manager.messages.insert("2".to_owned(), vec![
+            campaign_message,
+            other_message,
+        ]);
+        manager.read_message_counts.insert("2".to_owned(), 2);
+
+        let campaign_summary_key = SummaryScope::Private.summary_key("campaign-a", "2");
+        let other_summary_key = SummaryScope::Private.summary_key("campaign-b", "2");
+        let other_group_summary_key = SummaryScope::GroupPublic.summary_key("campaign-b", "99");
+        manager
+            .summarized_message_counts
+            .insert(campaign_summary_key.clone(), 1);
+        manager
+            .summarized_message_counts
+            .insert(other_summary_key.clone(), 1);
+        let mut deepseek_manager = DeepseekManager::default();
+        deepseek_manager.summaries.insert(
+            campaign_summary_key.clone(),
+            Default::default(),
+        );
+        deepseek_manager.summaries.insert(
+            other_summary_key.clone(),
+            Default::default(),
+        );
+        manager
+            .summarized_message_counts
+            .insert(other_group_summary_key.clone(), 1);
+        deepseek_manager.summaries.insert(
+            other_group_summary_key.clone(),
+            Default::default(),
+        );
+        for legacy_key in [
+            "group:99:public",
+            "276168175",
+            "replay-director:default:public",
+        ] {
+            manager
+                .summarized_message_counts
+                .insert(legacy_key.to_owned(), 1);
+            deepseek_manager.summaries.insert(
+                legacy_key.to_owned(),
+                Default::default(),
+            );
+        }
+        deepseek_manager.last_post_text = "old response".to_owned();
+
+        let mut battle_store = BattleRoundStore::default();
+        battle_store.encounters.insert(
+            "campaign-a-battle".to_owned(),
+            crate::battle_round::BattleEncounter {
+                trpg_campaign_id: Some("campaign-a".to_owned()),
+                ..Default::default()
+            },
+        );
+        battle_store.encounters.insert(
+            "campaign-b-battle".to_owned(),
+            crate::battle_round::BattleEncounter {
+                trpg_campaign_id: Some("campaign-b".to_owned()),
+                ..Default::default()
+            },
+        );
+        battle_store.active_encounter_id = Some("campaign-a-battle".to_owned());
+        assert_eq!(
+            clear_campaign_chat_messages(&mut manager, "campaign-a"),
+            1
+        );
+        assert_eq!(
+            clear_campaign_summaries(
+                &mut manager,
+                &mut deepseek_manager,
+                "campaign-a",
+            ),
+            5
+        );
+        assert_eq!(
+            clear_campaign_battle_rounds(
+                &mut battle_store,
+                "party-a",
+                "campaign-a"
+            ),
+            1
+        );
+
+        assert_eq!(manager.messages["2"].len(), 1);
+        assert_eq!(
+            manager.messages["2"][0].data.campaign_id,
+            "campaign-b"
+        );
+        assert_eq!(manager.read_message_counts["2"], 1);
+        assert!(!manager
+            .summarized_message_counts
+            .contains_key(&campaign_summary_key));
+        assert!(manager
+            .summarized_message_counts
+            .contains_key(&other_summary_key));
+        assert!(!deepseek_manager
+            .summaries
+            .contains_key(&campaign_summary_key));
+        assert!(deepseek_manager.summaries.contains_key(&other_summary_key));
+        assert!(!deepseek_manager
+            .summaries
+            .contains_key(&other_group_summary_key));
+        assert!(!deepseek_manager.summaries.contains_key("group:99:public"));
+        assert!(!deepseek_manager.summaries.contains_key("276168175"));
+        assert!(!deepseek_manager
+            .summaries
+            .contains_key("replay-director:default:public"));
+        assert!(deepseek_manager.last_post_text.is_empty());
+        assert!(!battle_store.encounters.contains_key("campaign-a-battle"));
+        assert!(battle_store.encounters.contains_key("campaign-b-battle"));
+        assert!(battle_store.active_encounter_id.is_none());
     }
 
     fn manager_with_noncurrent_beta_targets() -> NapcatMessageManager {
@@ -14371,6 +16542,7 @@ mod tests {
         group.set_player_party("2", Some("red"));
         group.set_player_party("3", Some("red"));
         group.set_player_party("4", Some("blue"));
+        group.set_player_party_membership("2", "blue", true);
         let members = vec!["2".to_owned(), "3".to_owned(), "4".to_owned()];
 
         let targets = group_broadcast_targets(
@@ -14383,6 +16555,17 @@ mod tests {
         assert_eq!(targets, vec![
             NapcatSendTarget::Private(2),
             NapcatSendTarget::Private(3),
+        ]);
+
+        let blue_targets = group_broadcast_targets(
+            Some(&group),
+            &members,
+            &manager,
+            &broadcast_party_scope("blue"),
+        );
+        assert_eq!(blue_targets, vec![
+            NapcatSendTarget::Private(2),
+            NapcatSendTarget::Private(4),
         ]);
     }
 
@@ -15151,6 +17334,7 @@ mod tests {
         manager
             .random_pools
             .insert("探索池".to_owned(), RandomPool {
+                category: "冒险".to_owned(),
                 legacy_pool_id: Some("random-a".to_owned()),
                 legacy_group: Some(2),
                 tags: "探索 战斗 探索".to_owned(),
@@ -15172,8 +17356,16 @@ mod tests {
         );
         assert_eq!(
             random_pool_metadata_summary(pool),
-            "旧团索引 2 · 标签 战斗 探索 · 创建 2024-01-02"
+            "分类 冒险 · 旧团索引 2 · 标签 战斗 探索 · 创建 2024-01-02"
         );
+        assert!(pool_category_matches(
+            &pool.category,
+            "冒险"
+        ));
+        assert!(!pool_category_matches(
+            &pool.category,
+            POOL_CATEGORY_UNCATEGORIZED
+        ));
         assert!(random_pool_matches_filters(
             pool,
             &random_pool_group_filter_value(Some(2)),
@@ -15940,6 +18132,23 @@ mod tests {
         assert_eq!(pending_gm_skill_count(&character), 1);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "已批准");
+    }
+
+    #[test]
+    fn hotbar_skills_include_approved_entries_without_parsed_effects() {
+        let mut character = PlayerCharacter {
+            skill_names: vec!["旋风斩".to_owned(), "待批准".to_owned()],
+            skill_notes: vec![String::new(), "主动使用对目标造成9点物理伤害".to_owned()],
+            skill_metadata: vec![CharacterSkillMetadata::default(), CharacterSkillMetadata {
+                st_approved: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let skills = character_hotbar_skills(&mut character);
+
+        assert_eq!(skills, vec![(0, "旋风斩".to_owned())]);
     }
 
     #[test]
@@ -17853,6 +20062,65 @@ mod tests {
         let target = &manager.player_characters["target"];
         assert_eq!(target.damage_taken_this_turn, 0.0);
         assert_eq!(target.healing_taken_this_turn, 0.0);
+    }
+
+    #[test]
+    fn group_restores_the_persisted_pre_first_turn_player_stats() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                name: "原角色名".to_owned(),
+                hp: 18.0,
+                max_hp: 24.0,
+                mp: 7.0,
+                max_mp: 12.0,
+                level: 3,
+                exp: 4,
+                damage_taken_this_turn: 2.0,
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+            players: vec!["target".to_owned()],
+            ..Default::default()
+        });
+        let mut rule_engine_state = RuleEngineState::default();
+        assert!(advance_group_world_turn(
+            &mut manager,
+            "party",
+            &mut rule_engine_state,
+        ));
+        assert_eq!(
+            manager.trpg_groups["party"].initial_player_states["target"].hp,
+            18.0
+        );
+        {
+            let character = manager.player_characters.get_mut("target").unwrap();
+            character.name = "后来改名".to_owned();
+            character.hp = 1.0;
+            character.max_hp = 30.0;
+            character.mp = 0.0;
+            character.level = 9;
+            character.exp = 99;
+        }
+
+        assert_eq!(
+            restore_group_initial_player_stats(
+                &mut manager,
+                "party",
+                &mut rule_engine_state,
+            ),
+            (1, 0)
+        );
+
+        let character = &manager.player_characters["target"];
+        assert_eq!(character.name, "后来改名");
+        assert_eq!(character.hp, 18.0);
+        assert_eq!(character.max_hp, 24.0);
+        assert_eq!(character.mp, 7.0);
+        assert_eq!(character.level, 3);
+        assert_eq!(character.exp, 4);
+        assert_eq!(character.damage_taken_this_turn, 2.0);
     }
 
     #[test]

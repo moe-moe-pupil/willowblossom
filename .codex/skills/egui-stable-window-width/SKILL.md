@@ -91,6 +91,109 @@ ui.horizontal(|ui| {
 });
 ```
 
+For user-resizable chat windows, do not replace runaway growth with a small
+hard-coded maximum width. Bound the width to the actual containing rectangle,
+keep any product-specific height cap separate, and make dense toolbars wrap:
+
+```rust
+let constraint_rect = if nested {
+    parent_chat_rect
+} else {
+    ctx.content_rect()
+};
+let min_size = egui::vec2(260.0, 260.0);
+let max_size = egui::vec2(
+    constraint_rect.width().max(min_size.x),
+    720.0_f32.min(constraint_rect.height()).max(min_size.y),
+);
+
+egui::Window::new(title)
+    .id(window_id)
+    .constrain_to(constraint_rect)
+    .default_size(egui::vec2(360.0, 520.0))
+    .min_size(min_size)
+    .max_size(max_size)
+    .resizable(true)
+    .show(ctx, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            // Dense chat controls.
+        });
+
+        // Width-filling content is safe after the outer window is bounded.
+        let width = ui.available_width();
+        ui.add(egui::TextEdit::multiline(input).desired_width(width));
+    });
+```
+
+Apply this contract consistently to every variant of the same surface:
+standalone/private chats, group chats, child chats nested in a discussion
+group, imported/legacy chat windows, and send windows. A nested child should
+use its parent group's usable rectangle; a standalone window should use the
+viewport or the app's central-panel rectangle.
+
+Give nested and standalone variants separate default sizes. If the parent
+discussion group starts near the standalone chat width, reusing the standalone
+default can clamp the nested child to the parent's maximum on its first frame,
+leaving no visible room to widen it:
+
+```rust
+let default_size = if nested {
+    egui::vec2(320.0, 420.0)
+} else {
+    egui::vec2(360.0, 520.0)
+};
+```
+
+If an older version used a non-wrapping toolbar or saved an invalid size,
+version that window's persistent id once (for example, `_v2` to `_v3`). Do not
+change the id every release: the one-time change intentionally discards stale
+geometry, while a stable new id preserves subsequent user resizing.
+Version nested and standalone ids independently because each has separate
+persisted `Resize` state.
+
+If a nested window must follow a movable parent, avoid combining
+`current_pos(...)` and `WindowDrag::Anywhere` on every frame. Drag-anywhere
+makes the whole child surface compete with its resize-edge hit targets. Compare
+the saved child position with the desired parent-relative position:
+
+- When the parent-relative position changed, apply `current_pos(...)` for that
+  frame and use `WindowDrag::Anywhere` so egui accepts the forced movement.
+- On normal frames, omit `current_pos(...)` and use `WindowDrag::TitleBar` so
+  the body and edges remain dedicated to content and resizing.
+
+Version the nested window id once when replacing an always-drag-anywhere
+workaround, because its persisted interaction/geometry state belongs to the old
+behavior.
+
+For left/right-aligned chat bubbles, do not build a row by setting its width
+and then adding both a spacer widget and a bubble widget:
+
+```rust
+// Wrong: horizontal layout inserts item spacing between these children,
+// so measured width becomes row_width + item_spacing.x.
+ui.horizontal(|ui| {
+    ui.set_width(row_width);
+    ui.add_space(margin_width);
+    ui.vertical(|ui| bubble_ui(ui));
+});
+```
+
+That extra item spacing feeds the measured width back into `Resize`, growing
+the window by a few pixels every frame. Align the bubble through the row layout
+instead, with no spacer child:
+
+```rust
+let alignment = if is_self { egui::Align::RIGHT } else { egui::Align::LEFT };
+ui.with_layout(egui::Layout::top_down(alignment), |ui| {
+    ui.set_width(row_width);
+    ui.vertical(|ui| {
+        ui.set_width(bubble_width);
+        ui.set_max_width(bubble_width);
+        bubble_ui(ui);
+    });
+});
+```
+
 For fixed-size item catalogs, cap the window and omit `num_columns`; call `end_row()` at the intended boundary and cap cell widths. Version the window and grid ids once if their persisted layout already contains the oversized width:
 
 ```rust
@@ -119,6 +222,17 @@ After patching:
 2. Open the affected window and manually resize it narrower.
 3. Interact with the text fields, especially long URLs and multiline skill descriptions.
 4. Close and reopen the window. If it still reopens at the old 100% width, clear persisted egui memory or temporarily change the window `.id(...)` once to discard the stored oversized rect.
+5. For chat windows, test standalone/private, discussion-group, nested member,
+   legacy chat, and send-window variants. Verify both widening toward the
+   containing rectangle and narrowing until the configured minimum.
+6. Add a multi-frame egui regression test with width-filling content. Record
+   the outer width over several frames and assert it stabilizes below the
+   viewport instead of increasing every frame.
+7. For nested windows, send pointer press/move/release events to a resize edge
+   in a regression test and assert the outer width changes. Run the child with
+   the real parent window, parent/child sublayer relationship, parent
+   constraint, conditional `current_pos`, and drag-area modes used in
+   production.
 
 ## Rules
 
@@ -130,3 +244,10 @@ After patching:
 - Avoid `desired_width(ui.available_width())` unless the parent has already been capped.
 - Clamp widths with realistic minimum and maximum values near the widget that requests size.
 - Use `horizontal_wrapped` or separate rows for dense control groups that do not need to stay on one line.
+- For a user-resizable window, use the containing rectangle as the maximum
+  width instead of an arbitrary small constant that blocks deliberate widening.
+- Treat viewport bounding and content wrapping as complementary: the bound
+  stops runaway growth, while wrapping removes minimum-width pressure and
+  permits deliberate shrinking.
+- In a width-filling horizontal row, include `item_spacing.x` when calculating
+  child widths, or prefer alignment layouts that do not need spacer widgets.
