@@ -280,6 +280,41 @@ fn arrogance_has_an_enclosed_furnished_cab_forward_of_the_hangar() {
 }
 
 #[test]
+fn arrogance_has_panorama_glass_in_its_workbook_hull_and_bridge() {
+    let original = original_combat_spaceship_voxel_cells();
+    let hull_glass_columns = original
+        .iter()
+        .filter(|(_, material)| **material == VOXEL_GLASS_MATERIAL)
+        .map(|(cell, _)| (cell.x, cell.z))
+        .collect::<HashSet<_>>();
+
+    assert!(
+        hull_glass_columns.len() >= 8,
+        "Arrogance needs multiple panoramic glass bays in its workbook hull"
+    );
+    for (x, z) in hull_glass_columns {
+        assert_eq!(original.get(&IVec3::new(x, 1, z)), Some(&6));
+        assert_eq!(
+            original.get(&IVec3::new(x, WORKBOOK_ROOM_HEIGHT - 1, z)),
+            Some(&6)
+        );
+    }
+
+    let bridge_glass_count = combat_spaceship_cab_cells()
+        .values()
+        .filter(|material| **material == VOXEL_GLASS_MATERIAL)
+        .count();
+    let finished_glass_count = combat_spaceship_voxel_cells()
+        .into_iter()
+        .filter(|(_, material)| *material == VOXEL_GLASS_MATERIAL)
+        .count();
+    assert!(
+        finished_glass_count > bridge_glass_count,
+        "the finished Arrogance must retain hull glass beyond its bridge"
+    );
+}
+
+#[test]
 fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
     let original = original_combat_spaceship_voxel_cells();
     let scaled_original = scale_combat_spaceship_cells(&original);

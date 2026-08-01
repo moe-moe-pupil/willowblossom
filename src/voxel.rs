@@ -3820,8 +3820,7 @@ fn workbook_station_wall_is_glass(
     index: usize,
     y: i32,
 ) -> bool {
-    if workbook_hull_style(design) == WorkbookHullStyle::CombatCruiser
-        || decoded.styles[index] != 11
+    if decoded.styles[index] != 11
         || !(2..WORKBOOK_ROOM_HEIGHT - 1).contains(&y)
     {
         return false;
