@@ -191,8 +191,20 @@ const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
 const VOXEL_SPACESHIP_SAVE_SECONDS: f32 = 1.0;
+const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 1;
 const COMBAT_SPACESHIP_ID: &str = "usi-arrogance";
+const MEDIUM_SPACESHIP_ID: &str = "medium-ship-01";
 const SMALL_SPACESHIP_COUNT: usize = 6;
+const HANGAR_MIN_X: i32 = -((ARROGANCE.width as i32 - 1) / 2);
+const HANGAR_MAX_X: i32 = HANGAR_MIN_X + ARROGANCE.width as i32 - 1;
+const HANGAR_REAR_Z: i32 = 20;
+const HANGAR_MOUTH_Z: i32 = 76;
+const HANGAR_CEILING_Y: i32 = 12;
+const HANGAR_PARKING_Y: i32 = 1;
+const HANGAR_PARKING_Z: i32 = 46;
+const HANGAR_DIVIDER_X: [i32; 2] = [-23, 23];
+const SMALL_SPACESHIP_BERTH_X: [i32; SMALL_SPACESHIP_COUNT] =
+    [-91, -65, -39, 39, 65, 91];
 const ORBITAL_LAYOUT_SCALE: i32 = 5;
 const RESEARCH_STATION_CENTER: IVec3 =
     IVec3::new(100 * ORBITAL_LAYOUT_SCALE, 0, 100 * ORBITAL_LAYOUT_SCALE);
@@ -542,6 +554,7 @@ struct VoxelPhysicsBody {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VoxelSpaceshipClass {
     Cruiser,
+    Corvette,
     Shuttle,
     Interceptor,
     Scout,
@@ -551,6 +564,7 @@ impl VoxelSpaceshipClass {
     fn label(self) -> &'static str {
         match self {
             Self::Cruiser => "战斗巡洋舰",
+            Self::Corvette => "中型护卫舰",
             Self::Shuttle => "穿梭艇",
             Self::Interceptor => "截击艇",
             Self::Scout => "侦察艇",
@@ -590,9 +604,20 @@ struct PersistedVoxelSpaceship {
     angular_velocity: [f32; 3],
 }
 
-#[derive(Resource, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Resource, Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct VoxelSpaceshipStore {
     ships: Vec<PersistedVoxelSpaceship>,
+    #[serde(default)]
+    layout_revision: u32,
+}
+
+impl Default for VoxelSpaceshipStore {
+    fn default() -> Self {
+        Self {
+            ships: Vec::new(),
+            layout_revision: VOXEL_SPACESHIP_LAYOUT_REVISION,
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -4102,6 +4127,78 @@ fn enclose_combat_spaceship_cabin(cells: &mut HashMap<IVec3, u8>) {
     }
 }
 
+fn add_combat_spaceship_hangar(cells: &mut HashMap<IVec3, u8>) {
+    let launch_lane_centers = std::iter::once(0)
+        .chain(SMALL_SPACESHIP_BERTH_X)
+        .collect::<Vec<_>>();
+
+    // A common deck and roof tie all three bays into the workbook hull. The
+    // colored deck cells are flush guidance markings, so they never reduce a
+    // vessel's canonical launch clearance.
+    for z in HANGAR_REAR_Z..=HANGAR_MOUTH_Z {
+        for x in HANGAR_MIN_X..=HANGAR_MAX_X {
+            let on_launch_line = launch_lane_centers
+                .iter()
+                .any(|center| (x - center).abs() <= 1);
+            let deck_material = if on_launch_line && z >= HANGAR_REAR_Z + 6 {
+                10
+            } else if z == HANGAR_REAR_Z + 8 || z == HANGAR_MOUTH_Z - 8 {
+                9
+            } else {
+                7
+            };
+            cells.insert(IVec3::new(x, 0, z), deck_material);
+
+            let skylight = (9..=16).contains(&x.rem_euclid(26))
+                && (HANGAR_REAR_Z + 3..=HANGAR_MOUTH_Z - 3).contains(&z);
+            cells.insert(
+                IVec3::new(x, HANGAR_CEILING_Y, z),
+                if skylight { 8 } else { 6 },
+            );
+        }
+    }
+
+    // The outer hull and the two longitudinal bulkheads form port, medium,
+    // and starboard bays. Their aft ends stay open as a cross-bay service area.
+    for z in HANGAR_REAR_Z..=HANGAR_MOUTH_Z {
+        for y in 1..HANGAR_CEILING_Y {
+            let material = if matches!(y, 1 | 6 | 11) || z.rem_euclid(9) == 0 {
+                7
+            } else {
+                6
+            };
+            cells.insert(IVec3::new(HANGAR_MIN_X, y, z), material);
+            cells.insert(IVec3::new(HANGAR_MAX_X, y, z), material);
+        }
+    }
+    for divider_x in HANGAR_DIVIDER_X {
+        for z in HANGAR_REAR_Z + 5..=HANGAR_MOUTH_Z {
+            for y in 1..HANGAR_CEILING_Y {
+                cells.insert(
+                    IVec3::new(divider_x, y, z),
+                    if matches!(y, 1 | 6 | 11) { 7 } else { 6 },
+                );
+            }
+        }
+    }
+
+    // Close the forward end against the original cruiser while leaving a
+    // gallery behind the dividers. The opposite end is a full-height launch
+    // mouth, with only an overhead brace above every ship's flight envelope.
+    for x in HANGAR_MIN_X..=HANGAR_MAX_X {
+        for y in 1..HANGAR_CEILING_Y {
+            cells.insert(
+                IVec3::new(x, y, HANGAR_REAR_Z),
+                if matches!(y, 1 | 6 | 11) { 7 } else { 6 },
+            );
+        }
+        cells.insert(
+            IVec3::new(x, HANGAR_CEILING_Y - 1, HANGAR_MOUTH_Z),
+            7,
+        );
+    }
+}
+
 fn combat_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
     let mut world = World::new();
     let grid_entity = world.spawn(Grid::<u8>::new()).id();
@@ -4127,6 +4224,7 @@ fn combat_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
         .expect("temporary spaceship grid must still exist");
     let mut occupied = voxel_cells(grid).into_iter().collect::<HashMap<_, _>>();
     enclose_combat_spaceship_cabin(&mut occupied);
+    add_combat_spaceship_hangar(&mut occupied);
     let mut cells = occupied.into_iter().collect::<Vec<_>>();
     cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
     cells
@@ -4275,6 +4373,131 @@ fn small_spaceship_voxel_cells(variant: usize) -> Vec<(IVec3, u8)> {
     cells
 }
 
+fn medium_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
+    const NOSE_Z: i32 = -21;
+    const TAIL_Z: i32 = 14;
+    const HULL_HALF_WIDTH: i32 = 14;
+    const WING_SPAN: i32 = 18;
+    const ROOF_Y: i32 = 8;
+
+    let mut cells = HashMap::<IVec3, u8>::new();
+    for z in NOSE_Z..=TAIL_Z {
+        let section_half_width = if z < -9 {
+            2 + (z - NOSE_Z) * (HULL_HALF_WIDTH - 2) / (-9 - NOSE_Z)
+        } else if z > 8 {
+            3 + (TAIL_Z - z) * (HULL_HALF_WIDTH - 3) / (TAIL_Z - 8)
+        } else {
+            HULL_HALF_WIDTH
+        };
+
+        for x in -section_half_width..=section_half_width {
+            cells.insert(
+                IVec3::new(x, 0, z),
+                if x.abs() == section_half_width { 7 } else { 6 },
+            );
+            cells.insert(
+                IVec3::new(x, ROOF_Y, z),
+                if (-12..=-5).contains(&z) && x.abs() <= 4 {
+                    8
+                } else if x.abs() == section_half_width {
+                    7
+                } else {
+                    6
+                },
+            );
+        }
+
+        for y in 1..ROOF_Y {
+            let material = if matches!(y, 3 | 4) && (-13..=5).contains(&z) {
+                8
+            } else if matches!(y, 1 | 7) {
+                7
+            } else {
+                6
+            };
+            cells.insert(IVec3::new(-section_half_width, y, z), material);
+            cells.insert(IVec3::new(section_half_width, y, z), material);
+        }
+
+        if z == NOSE_Z || z == TAIL_Z {
+            for x in -section_half_width..=section_half_width {
+                for y in 1..ROOF_Y {
+                    cells.insert(
+                        IVec3::new(x, y, z),
+                        if matches!(y, 3 | 4) { 8 } else { 6 },
+                    );
+                }
+            }
+        }
+    }
+
+    // Broad swept wings and attached engine nacelles give the corvette a
+    // clearly medium-class silhouette while remaining one connected body.
+    for z in -3_i32..=8 {
+        let span = WING_SPAN - (z - 2).abs() / 3;
+        for x in -span..=span {
+            cells.entry(IVec3::new(x, 0, z)).or_insert(if x.abs() >= span - 1 {
+                10
+            } else {
+                7
+            });
+        }
+    }
+    for x in [-11, 11] {
+        for z in 7..=TAIL_Z + 3 {
+            for y in 1..=3 {
+                cells.insert(
+                    IVec3::new(x, y, z),
+                    if y == 2 && z >= TAIL_Z { 8 } else { 9 },
+                );
+            }
+        }
+    }
+
+    // The walkable cabin has a bridge, paired stations, a central aisle, cargo
+    // racks, overhead lights, and an enterable aft ramp.
+    cells.insert(IVec3::new(0, 1, -12), 10);
+    cells.insert(IVec3::new(0, 2, -12), 8);
+    for x in [-3, 3] {
+        for z in [-8, -3, 3] {
+            cells.insert(IVec3::new(x, 1, z), 9);
+        }
+    }
+    for x in [-(HULL_HALF_WIDTH - 1), HULL_HALF_WIDTH - 1] {
+        for z in -7..=1 {
+            cells.insert(IVec3::new(x, 1, z), 8);
+        }
+        for z in 4..=9 {
+            cells.insert(IVec3::new(x, 1, z), 10);
+            cells.insert(IVec3::new(x, 2, z), 7);
+        }
+    }
+    for z in [-9, -4, 1, 6, 11] {
+        cells.insert(IVec3::new(0, ROOF_Y, z), 10);
+    }
+
+    for x in -2..=2 {
+        for y in 1..ROOF_Y {
+            for z in -7..=TAIL_Z {
+                cells.remove(&IVec3::new(x, y, z));
+            }
+        }
+    }
+    for step in 1_i32..=5 {
+        let ramp_half_width = (4 - step / 2).max(2);
+        for x in -ramp_half_width..=ramp_half_width {
+            cells.insert(
+                IVec3::new(x, 0, TAIL_Z + step),
+                if x.abs() == ramp_half_width { 10 } else { 7 },
+            );
+        }
+    }
+
+    let mut cells = cells.into_iter().collect::<Vec<_>>();
+    cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
+    cells
+}
+
 fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
     let arrogance_decoded = ARROGANCE.decode();
     let mut specs = vec![VoxelSpaceshipSpec {
@@ -4302,6 +4525,28 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
             COMBAT_SPACESHIP_CENTER.as_vec3() * VOXEL_SIZE,
         ),
     }];
+    specs.push(VoxelSpaceshipSpec {
+        ship: VoxelSpaceship {
+            id: MEDIUM_SPACESHIP_ID.to_owned(),
+            name: "WB-M1 苍鹭号".to_owned(),
+            class: VoxelSpaceshipClass::Corvette,
+            cockpit_eye_local: Vec3::new(0.5, 3.5, -9.5) * VOXEL_SIZE,
+            thrust_acceleration: 5.5,
+            vertical_acceleration: 3.8,
+            turn_speed: 0.78,
+            max_speed: 22.0,
+        },
+        cells: medium_spaceship_voxel_cells(),
+        micro_tiles: Vec::new(),
+        workbook_features: None,
+        transform: Transform::from_translation(
+            (COMBAT_SPACESHIP_CENTER
+                + IVec3::new(0, HANGAR_PARKING_Y, HANGAR_PARKING_Z))
+            .as_vec3()
+                * VOXEL_SIZE,
+        )
+        .with_rotation(Quat::from_rotation_y(std::f32::consts::PI)),
+    });
     let names = [
         "WB-01 雨燕号",
         "WB-02 萤火号",
@@ -4318,21 +4563,13 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
         VoxelSpaceshipClass::Interceptor,
         VoxelSpaceshipClass::Scout,
     ];
-    let offsets = [
-        IVec3::new(-132, 18, -72),
-        IVec3::new(-82, 22, -82),
-        IVec3::new(-28, 26, -86),
-        IVec3::new(30, 20, -86),
-        IVec3::new(84, 24, -82),
-        IVec3::new(134, 18, -72),
-    ];
     for index in 0..SMALL_SPACESHIP_COUNT {
         let class = classes[index];
         let (thrust_acceleration, vertical_acceleration, turn_speed, max_speed) = match class {
             VoxelSpaceshipClass::Shuttle => (8.0, 6.0, 1.35, 26.0),
             VoxelSpaceshipClass::Interceptor => (12.0, 8.0, 1.8, 36.0),
             VoxelSpaceshipClass::Scout => (10.0, 7.0, 1.6, 32.0),
-            VoxelSpaceshipClass::Cruiser => unreachable!(),
+            VoxelSpaceshipClass::Cruiser | VoxelSpaceshipClass::Corvette => unreachable!(),
         };
         specs.push(VoxelSpaceshipSpec {
             ship: VoxelSpaceship {
@@ -4349,11 +4586,16 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
             micro_tiles: Vec::new(),
             workbook_features: None,
             transform: Transform::from_translation(
-                (COMBAT_SPACESHIP_CENTER + offsets[index]).as_vec3() * VOXEL_SIZE,
+                (COMBAT_SPACESHIP_CENTER
+                    + IVec3::new(
+                        SMALL_SPACESHIP_BERTH_X[index],
+                        HANGAR_PARKING_Y,
+                        HANGAR_PARKING_Z,
+                    ))
+                .as_vec3()
+                    * VOXEL_SIZE,
             )
-            .with_rotation(Quat::from_rotation_y(
-                (index as f32 - 2.5) * 0.08,
-            )),
+            .with_rotation(Quat::from_rotation_y(std::f32::consts::PI)),
         });
     }
     specs
@@ -4487,7 +4729,12 @@ fn spawn_default_voxel_spaceships(
     reset_poses: bool,
 ) {
     let specs = default_voxel_spaceship_specs();
-    let mut changed = false;
+    let layout_changed = store.layout_revision != VOXEL_SPACESHIP_LAYOUT_REVISION;
+    let reset_poses = reset_poses || layout_changed;
+    let mut changed = layout_changed;
+    if layout_changed {
+        store.layout_revision = VOXEL_SPACESHIP_LAYOUT_REVISION;
+    }
     for spec in &specs {
         let persisted = if let Some(existing) = store
             .ships
@@ -14725,16 +14972,27 @@ mod tests {
     }
 
     #[test]
-    fn default_fleet_contains_a_cruiser_and_six_unique_small_ships() {
+    fn default_fleet_contains_a_cruiser_medium_ship_and_six_unique_small_ships() {
         let specs = default_voxel_spaceship_specs();
-        assert_eq!(specs.len(), SMALL_SPACESHIP_COUNT + 1);
+        assert_eq!(specs.len(), SMALL_SPACESHIP_COUNT + 2);
         assert_eq!(
             specs
                 .iter()
-                .filter(|spec| spec.ship.class != VoxelSpaceshipClass::Cruiser)
+                .filter(|spec| {
+                    matches!(
+                        spec.ship.class,
+                        VoxelSpaceshipClass::Shuttle
+                            | VoxelSpaceshipClass::Interceptor
+                            | VoxelSpaceshipClass::Scout
+                    )
+                })
                 .count(),
             SMALL_SPACESHIP_COUNT
         );
+        assert!(specs.iter().any(|spec| {
+            spec.ship.id == MEDIUM_SPACESHIP_ID
+                && spec.ship.class == VoxelSpaceshipClass::Corvette
+        }));
         assert_eq!(
             specs
                 .iter()
@@ -14778,8 +15036,13 @@ mod tests {
         let min_z = -((ARROGANCE.height as i32 - 1) / 2);
         let max_z = min_z + ARROGANCE.height as i32 - 1;
         assert!(specs[0].cells.iter().all(|(cell, _)| {
-            (min_x..=max_x).contains(&cell.x) && (min_z..=max_z).contains(&cell.z)
+            (min_x..=max_x).contains(&cell.x)
+                && (min_z..=HANGAR_MOUTH_Z).contains(&cell.z)
         }));
+        assert!(specs[0]
+            .cells
+            .iter()
+            .any(|(cell, _)| cell.z > max_z));
     }
 
     #[test]
@@ -14817,7 +15080,7 @@ mod tests {
             &Collider,
         ), With<VoxelSpaceship>>();
         let bodies = query.iter(app.world()).collect::<Vec<_>>();
-        assert_eq!(bodies.len(), SMALL_SPACESHIP_COUNT + 1);
+        assert_eq!(bodies.len(), SMALL_SPACESHIP_COUNT + 2);
         for (body, gravity_scale, collider) in bodies {
             assert_eq!(*body, RigidBody::Dynamic);
             assert_eq!(gravity_scale.0, 0.0);
@@ -14872,6 +15135,7 @@ mod tests {
             .path(temporary.path().join("spaceships.toml"))
             .default(VoxelSpaceshipStore {
                 ships: vec![persisted_voxel_spaceship_from_spec(&spec, None)],
+                layout_revision: VOXEL_SPACESHIP_LAYOUT_REVISION,
             })
             .build()
             .unwrap();
@@ -14913,7 +15177,7 @@ mod tests {
             .get::<LinearVelocity>()
             .unwrap()
             .0;
-        assert!(velocity.z < 0.0);
+        assert!(velocity.dot(*spec.transform.forward()) > 0.0);
         assert!(
             app.world()
                 .resource::<VoxelSpaceshipControlState>()
