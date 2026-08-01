@@ -172,6 +172,7 @@ const MICRO_TILE_SUBDIVISIONS: u32 = 16;
 const WORKBOOK_FEATURE_HOVER_MIN_Y_CELLS: f32 = 1.0;
 const WORKBOOK_FEATURE_HOVER_MAX_Y_CELLS: f32 = 4.0;
 const WORKBOOK_FEATURE_LABEL_Y_CELLS: f32 = 5.25;
+const WORKBOOK_FEATURE_LABEL_VISIBILITY_RADIUS_METERS: f32 = 20.0;
 const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
 const VOXEL_RADIANCE_VOLUME_DIMENSION: i32 = 96;
 const VOXEL_RADIANCE_REBUILD_STEP: i32 = 16;
@@ -5379,6 +5380,12 @@ fn workbook_feature_label_color(kind: WorkbookFeatureKind) -> egui::Color32 {
     }
 }
 
+fn workbook_feature_label_in_range(camera_position: Vec3, world_anchor: Vec3) -> bool {
+    let distance_squared = camera_position.distance_squared(world_anchor);
+    distance_squared.is_finite()
+        && distance_squared <= WORKBOOK_FEATURE_LABEL_VISIBILITY_RADIUS_METERS.powi(2)
+}
+
 fn project_workbook_feature_label(
     camera: &Camera,
     camera_transform: &GlobalTransform,
@@ -5388,6 +5395,9 @@ fn project_workbook_feature_label(
     pixels_per_point: f32,
 ) -> Option<ProjectedWorkbookFeatureLabel> {
     let world_anchor = local_to_world.transform_point3(workbook_feature_anchor_local(region));
+    if !workbook_feature_label_in_range(camera_transform.translation(), world_anchor) {
+        return None;
+    }
     let projected = camera
         .world_to_viewport_with_depth(camera_transform, world_anchor)
         .ok()?;
@@ -13287,6 +13297,25 @@ mod tests {
             &region,
         )
         .is_none());
+    }
+
+    #[test]
+    fn workbook_world_labels_use_an_inclusive_twenty_meter_radius() {
+        let camera = Vec3::new(4.0, -2.0, 7.0);
+        assert_eq!(WORKBOOK_FEATURE_LABEL_VISIBILITY_RADIUS_METERS, 20.0);
+        assert!(workbook_feature_label_in_range(
+            camera,
+            camera + Vec3::X * 20.0,
+        ));
+        assert!(workbook_feature_label_in_range(
+            camera,
+            camera + Vec3::new(12.0, 0.0, 16.0),
+        ));
+        assert!(!workbook_feature_label_in_range(
+            camera,
+            camera + Vec3::X * 20.001,
+        ));
+        assert!(!workbook_feature_label_in_range(camera, Vec3::NAN));
     }
 
     #[test]
