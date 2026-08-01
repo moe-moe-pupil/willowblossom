@@ -195,29 +195,26 @@ const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
 const VOXEL_SPACESHIP_SAVE_SECONDS: f32 = 1.0;
-const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 2;
+const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 3;
 const COMBAT_SPACESHIP_ID: &str = "usi-arrogance";
 const MEDIUM_SPACESHIP_ID: &str = "medium-ship-01";
 const SMALL_SPACESHIP_COUNT: usize = 6;
-const CARRIER_NOSE_Z: i32 = -112;
-const CARRIER_SHOULDER_Z: i32 = -42;
-const CARRIER_AFT_TAPER_Z: i32 = 72;
-const CARRIER_MAX_HALF_WIDTH: i32 = 154;
-const CARRIER_MOUTH_HALF_WIDTH: i32 = 144;
-const CARRIER_BOTTOM_Y: i32 = -6;
-const HANGAR_REAR_Z: i32 = 44;
-const HANGAR_MOUTH_Z: i32 = 128;
-const HANGAR_CEILING_Y: i32 = 18;
-const HANGAR_PARKING_Y: i32 = 1;
-const HANGAR_PARKING_Z: i32 = 82;
-const HANGAR_DOCK_CLEARANCE_CELLS: f32 = 28.0;
+const ARROGANCE_SCALE: i32 = 3;
+const HANGAR_MIN_X: i32 = -104;
+const HANGAR_MAX_X: i32 = 112;
+const HANGAR_REAR_Z: i32 = -48;
+const HANGAR_MOUTH_Z: i32 = 60;
+const HANGAR_CEILING_Y: i32 = WORKBOOK_ROOM_HEIGHT * ARROGANCE_SCALE;
+const HANGAR_PARKING_Y: i32 = ARROGANCE_SCALE;
+const HANGAR_PARKING_Z: i32 = -20;
+const HANGAR_DOCK_CLEARANCE_CELLS: f32 = 6.0;
 const HANGAR_DOCK_MAX_RELATIVE_SPEED: f32 = 1.0;
 const HANGAR_DOCK_MAX_RELATIVE_ANGULAR_SPEED: f32 = 0.35;
 const DEFAULT_COLLISION_LAYER_BITS: u32 = 1 << 0;
 const CARRIER_COLLISION_LAYER_BITS: u32 = 1 << 1;
 const DOCKED_SPACESHIP_COLLISION_LAYER_BITS: u32 = 1 << 2;
 const SMALL_SPACESHIP_BERTH_X: [i32; SMALL_SPACESHIP_COUNT] =
-    [-120, -80, -42, 42, 80, 120];
+    [-88, -60, -32, 36, 64, 92];
 const ORBITAL_LAYOUT_SCALE: i32 = 5;
 const RESEARCH_STATION_CENTER: IVec3 =
     IVec3::new(100 * ORBITAL_LAYOUT_SCALE, 0, 100 * ORBITAL_LAYOUT_SCALE);
@@ -231,9 +228,11 @@ const ABANDONED_STATION_CENTER: IVec3 =
     IVec3::new(0, 0, 200 * ORBITAL_LAYOUT_SCALE);
 const WORKBOOK_ROOM_HEIGHT: i32 = 7;
 const FIRST_PERSON_START: Vec3 = Vec3::new(
-    (COMBAT_SPACESHIP_CENTER.x + ARROGANCE.spawn[0]) as f32 * VOXEL_SIZE,
-    0.5,
-    (COMBAT_SPACESHIP_CENTER.z + ARROGANCE.spawn[1]) as f32 * VOXEL_SIZE,
+    (COMBAT_SPACESHIP_CENTER.x + ARROGANCE.spawn[0] * ARROGANCE_SCALE) as f32
+        * VOXEL_SIZE,
+    (HANGAR_PARKING_Y as f32 + 1.0) * VOXEL_SIZE,
+    (COMBAT_SPACESHIP_CENTER.z + ARROGANCE.spawn[1] * ARROGANCE_SCALE) as f32
+        * VOXEL_SIZE,
 );
 const DEFAULT_SCENE_CAMERA_FOCUS: Vec3 = Vec3::new(
     COMBAT_SPACESHIP_CENTER.x as f32 * VOXEL_SIZE,
@@ -4282,133 +4281,42 @@ fn enclose_combat_spaceship_cabin(cells: &mut HashMap<IVec3, u8>) {
     }
 }
 
-fn add_combat_spaceship_hangar(cells: &mut HashMap<IVec3, u8>) {
-    let launch_lane_centers = std::iter::once(0)
-        .chain(SMALL_SPACESHIP_BERTH_X)
-        .collect::<Vec<_>>();
+fn scale_combat_spaceship_cell(cell: IVec3) -> IVec3 {
+    cell * ARROGANCE_SCALE
+}
 
-    // Build a single large, tapered shell around the workbook interior and
-    // flight deck. Its stepped outline reads as a carrier hull instead of a
-    // rectangular room attached to the old map.
-    for z in CARRIER_NOSE_Z..=HANGAR_MOUTH_Z {
-        let half_width = combat_spaceship_half_width(z);
-        let previous_half_width = combat_spaceship_half_width((z - 1).max(CARRIER_NOSE_Z));
-        for x in -half_width..=half_width {
-            let armor_band = z.rem_euclid(18) <= 1 || x.abs() >= half_width - 3;
-            cells.insert(
-                IVec3::new(x, CARRIER_BOTTOM_Y, z),
-                if armor_band { 7 } else { 6 },
-            );
-            let roof_material = if z >= HANGAR_REAR_Z
-                && z < HANGAR_MOUTH_Z - 3
-                && (8..=14).contains(&x.rem_euclid(30))
-            {
-                8
-            } else if armor_band {
-                7
-            } else {
-                6
-            };
-            cells.insert(IVec3::new(x, HANGAR_CEILING_Y, z), roof_material);
-        }
-
-        // Fill each step between successive widths so the diagonal sides are
-        // watertight rather than a row of disconnected vertical strips.
-        let inner_side = previous_half_width.min(half_width);
-        let outer_side = previous_half_width.max(half_width);
-        for side_x in inner_side..=outer_side {
-            for y in CARRIER_BOTTOM_Y + 1..HANGAR_CEILING_Y {
-                let material = if matches!(y, -5 | 0 | 6 | 12 | 17)
-                    || z.rem_euclid(14) == 0
-                {
-                    7
-                } else {
-                    6
-                };
-                cells.insert(IVec3::new(side_x, y, z), material);
-                cells.insert(IVec3::new(-side_x, y, z), material);
+fn scale_combat_spaceship_cells(cells: &HashMap<IVec3, u8>) -> HashMap<IVec3, u8> {
+    let mut scaled =
+        HashMap::with_capacity(cells.len() * ARROGANCE_SCALE.pow(3) as usize);
+    for (cell, material) in cells {
+        let origin = scale_combat_spaceship_cell(*cell);
+        for offset_x in 0..ARROGANCE_SCALE {
+            for offset_y in 0..ARROGANCE_SCALE {
+                for offset_z in 0..ARROGANCE_SCALE {
+                    scaled.insert(
+                        origin + IVec3::new(offset_x, offset_y, offset_z),
+                        *material,
+                    );
+                }
             }
         }
     }
-
-    // Cap the narrow bow, then add a raised dorsal spine so the silhouette has
-    // a clear keel and command section when viewed from outside.
-    let nose_half_width = combat_spaceship_half_width(CARRIER_NOSE_Z);
-    for x in -nose_half_width..=nose_half_width {
-        for y in CARRIER_BOTTOM_Y..=HANGAR_CEILING_Y {
-            cells.insert(
-                IVec3::new(x, y, CARRIER_NOSE_Z),
-                if x.abs() == nose_half_width
-                    || matches!(y, CARRIER_BOTTOM_Y | 0 | 12 | HANGAR_CEILING_Y)
-                {
-                    7
-                } else {
-                    6
-                },
-            );
-        }
-    }
-    for z in CARRIER_NOSE_Z + 10..HANGAR_REAR_Z - 4 {
-        let spine_half_width = ((z - CARRIER_NOSE_Z) / 12 + 2).clamp(2, 9);
-        for x in -spine_half_width..=spine_half_width {
-            cells.insert(IVec3::new(x, HANGAR_CEILING_Y + 1, z), 7);
-        }
-        for x in -2..=2 {
-            cells.insert(
-                IVec3::new(x, HANGAR_CEILING_Y + 2, z),
-                if z.rem_euclid(12) <= 2 { 10 } else { 6 },
-            );
-        }
-    }
-
-    // The hangar is one broad, unobstructed internal flight deck. Flush lane
-    // and berth markings identify all seven parking positions without putting
-    // divider walls in their launch paths.
-    for z in HANGAR_REAR_Z..=HANGAR_MOUTH_Z {
-        let half_width = combat_spaceship_half_width(z) - 2;
-        for x in -half_width..=half_width {
-            let on_launch_line = launch_lane_centers
-                .iter()
-                .any(|center| (x - center).abs() <= 1);
-            let deck_material = if on_launch_line && z >= HANGAR_REAR_Z + 6 {
-                10
-            } else if z == HANGAR_REAR_Z + 8 || z == HANGAR_MOUTH_Z - 8 {
-                9
-            } else {
-                7
-            };
-            cells.insert(IVec3::new(x, 0, z), deck_material);
-        }
-    }
-
-    // A forward pressure bulkhead closes the flight deck against the workbook
-    // rooms. The aft face remains a full-width, full-height fly-through mouth;
-    // only overhead ribs cross it, safely above every parked craft.
-    let rear_half_width = combat_spaceship_half_width(HANGAR_REAR_Z) - 2;
-    for x in -rear_half_width..=rear_half_width {
-        for y in 1..HANGAR_CEILING_Y {
-            cells.insert(
-                IVec3::new(x, y, HANGAR_REAR_Z),
-                if matches!(y, 1 | 6 | 12 | 17) { 7 } else { 6 },
-            );
-        }
-    }
-    for rib_z in (HANGAR_REAR_Z + 12..=HANGAR_MOUTH_Z).step_by(16) {
-        let half_width = combat_spaceship_half_width(rib_z) - 1;
-        for x in -half_width..=half_width {
-            cells.insert(IVec3::new(x, HANGAR_CEILING_Y - 1, rib_z), 7);
-        }
-    }
-    let mouth_half_width = combat_spaceship_half_width(HANGAR_MOUTH_Z) - 1;
-    for x in -mouth_half_width..=mouth_half_width {
-        cells.insert(
-            IVec3::new(x, HANGAR_CEILING_Y - 1, HANGAR_MOUTH_Z),
-            7,
-        );
-    }
+    scaled
 }
 
-fn combat_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
+fn combat_spaceship_hangar_contains(cell: IVec3) -> bool {
+    (HANGAR_MIN_X..=HANGAR_MAX_X).contains(&cell.x)
+        && (HANGAR_PARKING_Y..HANGAR_CEILING_Y).contains(&cell.y)
+        && (HANGAR_REAR_Z..=HANGAR_MOUTH_Z).contains(&cell.z)
+}
+
+fn carve_combat_spaceship_hangar(cells: &mut HashMap<IVec3, u8>) {
+    // This is a subtraction from the proportionally enlarged workbook hull.
+    // It does not add a parking shell, room, divider, deck, roof, or outer box.
+    cells.retain(|cell, _| !combat_spaceship_hangar_contains(*cell));
+}
+
+fn original_combat_spaceship_voxel_cells() -> HashMap<IVec3, u8> {
     let mut world = World::new();
     let grid_entity = world.spawn(Grid::<u8>::new()).id();
     {
@@ -4433,7 +4341,13 @@ fn combat_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
         .expect("temporary spaceship grid must still exist");
     let mut occupied = voxel_cells(grid).into_iter().collect::<HashMap<_, _>>();
     enclose_combat_spaceship_cabin(&mut occupied);
-    add_combat_spaceship_hangar(&mut occupied);
+    occupied
+}
+
+fn combat_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
+    let original = original_combat_spaceship_voxel_cells();
+    let mut occupied = scale_combat_spaceship_cells(&original);
+    carve_combat_spaceship_hangar(&mut occupied);
     let mut cells = occupied.into_iter().collect::<Vec<_>>();
     cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
     cells
@@ -4726,26 +4640,123 @@ fn medium_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
     cells
 }
 
-fn combat_spaceship_half_width(z: i32) -> i32 {
-    const NOSE_HALF_WIDTH: i32 = 8;
-    if z <= CARRIER_NOSE_Z {
-        return NOSE_HALF_WIDTH;
+fn scale_combat_spaceship_micro_tiles(
+    tiles: Vec<VoxelMicroTile>,
+    occupied: &HashSet<IVec3>,
+) -> Vec<VoxelMicroTile> {
+    let subdivisions = MICRO_TILE_SUBDIVISIONS as i32;
+    let scale = IVec3::splat(ARROGANCE_SCALE);
+    let mut scaled = Vec::new();
+    for tile in tiles {
+        let source_min = tile.cell * subdivisions + tile.min.as_ivec3();
+        let source_max = tile.cell * subdivisions + tile.max.as_ivec3();
+        let scaled_min = IVec3::new(
+            source_min.x * scale.x,
+            source_min.y * scale.y,
+            source_min.z * scale.z,
+        );
+        let scaled_max = IVec3::new(
+            source_max.x * scale.x,
+            source_max.y * scale.y,
+            source_max.z * scale.z,
+        );
+        let min_cell = IVec3::new(
+            scaled_min.x.div_euclid(subdivisions),
+            scaled_min.y.div_euclid(subdivisions),
+            scaled_min.z.div_euclid(subdivisions),
+        );
+        let max_cell = IVec3::new(
+            (scaled_max.x - 1).div_euclid(subdivisions),
+            (scaled_max.y - 1).div_euclid(subdivisions),
+            (scaled_max.z - 1).div_euclid(subdivisions),
+        );
+        let owner_origin = scale_combat_spaceship_cell(tile.owner);
+        let owner_max = owner_origin + scale - IVec3::ONE;
+
+        for cell_x in min_cell.x..=max_cell.x {
+            for cell_y in min_cell.y..=max_cell.y {
+                for cell_z in min_cell.z..=max_cell.z {
+                    let cell = IVec3::new(cell_x, cell_y, cell_z);
+                    let owner = IVec3::new(
+                        cell.x.clamp(owner_origin.x, owner_max.x),
+                        cell.y.clamp(owner_origin.y, owner_max.y),
+                        cell.z.clamp(owner_origin.z, owner_max.z),
+                    );
+                    if !occupied.contains(&owner) || combat_spaceship_hangar_contains(cell) {
+                        continue;
+                    }
+                    let cell_min = cell * subdivisions;
+                    let min = (scaled_min - cell_min)
+                        .clamp(IVec3::ZERO, IVec3::splat(subdivisions));
+                    let max = (scaled_max - cell_min)
+                        .clamp(IVec3::ZERO, IVec3::splat(subdivisions));
+                    scaled.push(VoxelMicroTile {
+                        owner,
+                        cell,
+                        min: min.as_uvec3(),
+                        max: max.as_uvec3(),
+                        material: tile.material,
+                        kind: tile.kind,
+                    });
+                }
+            }
+        }
     }
-    if z < CARRIER_SHOULDER_Z {
-        return NOSE_HALF_WIDTH
-            + (z - CARRIER_NOSE_Z) * (CARRIER_MAX_HALF_WIDTH - NOSE_HALF_WIDTH)
-                / (CARRIER_SHOULDER_Z - CARRIER_NOSE_Z);
+    scaled.sort_unstable_by_key(|tile| {
+        (
+            tile.cell.y,
+            tile.cell.z,
+            tile.cell.x,
+            tile.material,
+            tile.min.y,
+            tile.min.z,
+            tile.min.x,
+        )
+    });
+    scaled.dedup();
+    scaled
+}
+
+fn scale_combat_spaceship_feature_annotations(
+    annotations: VoxelWorkbookFeatureAnnotations,
+) -> VoxelWorkbookFeatureAnnotations {
+    let regions = annotations
+        .regions
+        .into_iter()
+        .filter_map(|region| {
+            let target_anchor = scale_combat_spaceship_cell(region.anchor);
+            let mut cells = region
+                .cells
+                .into_iter()
+                .flat_map(|cell| {
+                    let origin = scale_combat_spaceship_cell(cell);
+                    (0..ARROGANCE_SCALE).flat_map(move |offset_x| {
+                        (0..ARROGANCE_SCALE).map(move |offset_z| {
+                            origin + IVec3::new(offset_x, 0, offset_z)
+                        })
+                    })
+                })
+                .filter(|cell| {
+                    !(HANGAR_MIN_X..=HANGAR_MAX_X).contains(&cell.x)
+                        || !(HANGAR_REAR_Z..=HANGAR_MOUTH_Z).contains(&cell.z)
+                })
+                .collect::<Vec<_>>();
+            cells.sort_unstable_by_key(|cell| (cell.z, cell.x));
+            let anchor = cells
+                .iter()
+                .copied()
+                .min_by_key(|cell| cell.distance_squared(target_anchor))?;
+            Some(WorkbookFeatureRegion {
+                kind: region.kind,
+                cells,
+                anchor,
+            })
+        })
+        .collect();
+    VoxelWorkbookFeatureAnnotations {
+        map_name: annotations.map_name,
+        regions,
     }
-    if z <= CARRIER_AFT_TAPER_Z {
-        return CARRIER_MAX_HALF_WIDTH;
-    }
-    if z < HANGAR_MOUTH_Z {
-        return CARRIER_MAX_HALF_WIDTH
-            - (z - CARRIER_AFT_TAPER_Z)
-                * (CARRIER_MAX_HALF_WIDTH - CARRIER_MOUTH_HALF_WIDTH)
-                / (HANGAR_MOUTH_Z - CARRIER_AFT_TAPER_Z);
-    }
-    CARRIER_MOUTH_HALF_WIDTH
 }
 
 fn default_voxel_spaceship_docking(berth: IVec3) -> VoxelSpaceshipDocked {
@@ -4776,27 +4787,36 @@ fn default_docked_voxel_spaceship_transform(berth: IVec3) -> Transform {
 
 fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
     let arrogance_decoded = ARROGANCE.decode();
+    let arrogance_cells = combat_spaceship_voxel_cells();
+    let arrogance_occupied = arrogance_cells
+        .iter()
+        .map(|(cell, _)| *cell)
+        .collect::<HashSet<_>>();
+    let arrogance_micro_tiles = scale_combat_spaceship_micro_tiles(
+        workbook_micro_tiles(ARROGANCE, &arrogance_decoded),
+        &arrogance_occupied,
+    );
+    let arrogance_features = scale_combat_spaceship_feature_annotations(
+        workbook_feature_annotations(ARROGANCE, &arrogance_decoded),
+    );
     let mut specs = vec![VoxelSpaceshipSpec {
         ship: VoxelSpaceship {
             id: COMBAT_SPACESHIP_ID.to_owned(),
             name: "U.S.I 狂妄号".to_owned(),
             class: VoxelSpaceshipClass::Cruiser,
             cockpit_eye_local: Vec3::new(
-                ARROGANCE.spawn[0] as f32 + 0.5,
-                2.5,
-                ARROGANCE.spawn[1] as f32 + 0.5,
+                (ARROGANCE.spawn[0] as f32 + 0.5) * ARROGANCE_SCALE as f32,
+                2.5 * ARROGANCE_SCALE as f32,
+                (ARROGANCE.spawn[1] as f32 + 0.5) * ARROGANCE_SCALE as f32,
             ) * VOXEL_SIZE,
             thrust_acceleration: 2.4,
             vertical_acceleration: 1.4,
             turn_speed: 0.32,
             max_speed: 14.0,
         },
-        cells: combat_spaceship_voxel_cells(),
-        micro_tiles: workbook_micro_tiles(ARROGANCE, &arrogance_decoded),
-        workbook_features: Some(workbook_feature_annotations(
-            ARROGANCE,
-            &arrogance_decoded,
-        )),
+        cells: arrogance_cells,
+        micro_tiles: arrogance_micro_tiles,
+        workbook_features: Some(arrogance_features),
         transform: Transform::from_translation(
             COMBAT_SPACESHIP_CENTER.as_vec3() * VOXEL_SIZE,
         ),
@@ -5266,10 +5286,10 @@ fn voxel_spaceship_inside_hangar_docking_zone(local_translation: Vec3) -> bool {
         return false;
     }
     let local_cell = local_translation / VOXEL_SIZE;
-    let z = local_cell.z.round() as i32;
-    let half_width = combat_spaceship_half_width(z) as f32 - HANGAR_DOCK_CLEARANCE_CELLS;
-    local_cell.x.abs() <= half_width
-        && (0.5..=4.0).contains(&local_cell.y)
+    local_cell.x >= HANGAR_MIN_X as f32 + HANGAR_DOCK_CLEARANCE_CELLS
+        && local_cell.x <= HANGAR_MAX_X as f32 - HANGAR_DOCK_CLEARANCE_CELLS
+        && (HANGAR_PARKING_Y as f32 - 0.5..=HANGAR_PARKING_Y as f32 + 3.0)
+            .contains(&local_cell.y)
         && local_cell.z >= HANGAR_REAR_Z as f32 + HANGAR_DOCK_CLEARANCE_CELLS
         && local_cell.z <= HANGAR_MOUTH_Z as f32 - HANGAR_DOCK_CLEARANCE_CELLS
 }
@@ -16054,21 +16074,21 @@ mod tests {
                 .is_some_and(|docking| docking.carrier_id == COMBAT_SPACESHIP_ID)
         }));
 
-        let workbook_min_x = -((ARROGANCE.width as i32 - 1) / 2);
-        let workbook_max_x = workbook_min_x + ARROGANCE.width as i32 - 1;
-        let workbook_min_z = -((ARROGANCE.height as i32 - 1) / 2);
-        let max_z = workbook_min_z + ARROGANCE.height as i32 - 1;
-        assert!(specs[0].cells.iter().all(|(cell, _)| {
-            (-CARRIER_MAX_HALF_WIDTH..=CARRIER_MAX_HALF_WIDTH).contains(&cell.x)
-                && (CARRIER_NOSE_Z..=HANGAR_MOUTH_Z).contains(&cell.z)
-        }));
-        assert!(-CARRIER_MAX_HALF_WIDTH < workbook_min_x);
-        assert!(CARRIER_MAX_HALF_WIDTH > workbook_max_x);
-        assert!(CARRIER_NOSE_Z < workbook_min_z);
+        let scaled_original =
+            scale_combat_spaceship_cells(&original_combat_spaceship_voxel_cells());
         assert!(specs[0]
             .cells
             .iter()
-            .any(|(cell, _)| cell.z > max_z));
+            .all(|(cell, material)| scaled_original.get(cell) == Some(material)));
+        let carrier_cells = specs[0]
+            .cells
+            .iter()
+            .map(|(cell, _)| *cell)
+            .collect::<HashSet<_>>();
+        assert!(specs[0]
+            .micro_tiles
+            .iter()
+            .all(|tile| carrier_cells.contains(&tile.owner)));
     }
 
     #[test]

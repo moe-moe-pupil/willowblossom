@@ -227,11 +227,61 @@ fn hangar_parked_cell(cell: IVec3, berth: IVec3) -> IVec3 {
 }
 
 #[test]
-fn enlarged_arrogance_carrier_holds_the_fleet_and_has_clear_launch_sweeps() {
-    let carrier = combat_spaceship_voxel_cells()
+fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
+    let original = original_combat_spaceship_voxel_cells();
+    let scaled_original = scale_combat_spaceship_cells(&original);
+    let carrier_cells = combat_spaceship_voxel_cells()
         .into_iter()
+        .collect::<HashMap<_, _>>();
+    let carrier = carrier_cells
+        .iter()
         .filter_map(|(cell, material)| TrpgVoxelConnector::solid(&material).then_some(cell))
+        .copied()
         .collect::<HashSet<_>>();
+
+    // The corrected carrier is only the old detailed hull enlarged in place.
+    // The hangar is carved out of it; no outer shell or parking box is added.
+    assert!(carrier_cells.len() < scaled_original.len());
+    for (cell, material) in &carrier_cells {
+        assert_eq!(scaled_original.get(cell), Some(material));
+    }
+    for (cell, material) in &scaled_original {
+        if !combat_spaceship_hangar_contains(*cell) {
+            assert_eq!(carrier_cells.get(cell), Some(material));
+        }
+    }
+    let scaled_outline = scaled_original
+        .keys()
+        .map(|cell| (cell.x, cell.z))
+        .collect::<HashSet<_>>();
+    let carrier_outline = carrier_cells
+        .keys()
+        .map(|cell| (cell.x, cell.z))
+        .collect::<HashSet<_>>();
+    assert_eq!(carrier_outline, scaled_outline);
+
+    let original_min = original.keys().copied().reduce(IVec3::min).unwrap();
+    let original_max = original.keys().copied().reduce(IVec3::max).unwrap();
+    let scaled_min = scaled_original.keys().copied().reduce(IVec3::min).unwrap();
+    let scaled_max = scaled_original.keys().copied().reduce(IVec3::max).unwrap();
+    assert_eq!(scaled_min, scale_combat_spaceship_cell(original_min));
+    assert_eq!(
+        scaled_max,
+        scale_combat_spaceship_cell(original_max)
+            + IVec3::splat(ARROGANCE_SCALE - 1)
+    );
+
+    for x in HANGAR_MIN_X..=HANGAR_MAX_X {
+        for y in HANGAR_PARKING_Y..HANGAR_CEILING_Y {
+            for z in HANGAR_REAR_Z..=HANGAR_MOUTH_Z {
+                assert!(
+                    !carrier.contains(&IVec3::new(x, y, z)),
+                    "the carved hangar contains an internal parking box at {x}, {y}, {z}"
+                );
+            }
+        }
+    }
+
     let mut parked = Vec::with_capacity(SMALL_SPACESHIP_COUNT + 1);
     parked.push((
         MEDIUM_SPACESHIP_ID,
@@ -273,6 +323,19 @@ fn enlarged_arrogance_carrier_holds_the_fleet_and_has_clear_launch_sweeps() {
                 "{name} overlaps another parked ship at {cell:?}"
             );
         }
+        for cell in world_cells
+            .iter()
+            .filter(|cell| cell.y == HANGAR_PARKING_Y)
+        {
+            assert!(
+                carrier.contains(&IVec3::new(cell.x, HANGAR_PARKING_Y - 1, cell.z)),
+                "{name} is not parked on 狂妄号's real deck below {cell:?}"
+            );
+            assert!(
+                carrier.contains(&IVec3::new(cell.x, HANGAR_CEILING_Y, cell.z)),
+                "{name} is not inside 狂妄号's real roof below {cell:?}"
+            );
+        }
 
         // Sweep every real occupied cell forward until the back of the vessel
         // is beyond the deck edge. This proves the opening is flyable, rather
@@ -286,38 +349,6 @@ fn enlarged_arrogance_carrier_holds_the_fleet_and_has_clear_launch_sweeps() {
                 );
             }
         }
-    }
-
-    let workbook_min_x = -((ARROGANCE.width as i32 - 1) / 2);
-    let workbook_max_x = workbook_min_x + ARROGANCE.width as i32 - 1;
-    let workbook_min_z = -((ARROGANCE.height as i32 - 1) / 2);
-    let workbook_max_z = workbook_min_z + ARROGANCE.height as i32 - 1;
-    assert!(-CARRIER_MAX_HALF_WIDTH <= workbook_min_x - 40);
-    assert!(CARRIER_MAX_HALF_WIDTH >= workbook_max_x + 40);
-    assert!(CARRIER_NOSE_Z <= workbook_min_z - 70);
-    assert!(HANGAR_MOUTH_Z >= workbook_max_z + 80);
-    assert_eq!(
-        combat_spaceship_half_width(CARRIER_SHOULDER_Z),
-        CARRIER_MAX_HALF_WIDTH
-    );
-    assert!(
-        combat_spaceship_half_width(CARRIER_NOSE_Z)
-            < combat_spaceship_half_width(CARRIER_SHOULDER_Z) / 4
-    );
-    assert!(combat_spaceship_half_width(HANGAR_MOUTH_Z) < CARRIER_MAX_HALF_WIDTH);
-    assert!(carrier.contains(&IVec3::new(
-        0,
-        CARRIER_BOTTOM_Y,
-        CARRIER_NOSE_Z
-    )));
-    assert!(carrier.contains(&IVec3::new(0, 0, HANGAR_MOUTH_Z)));
-    assert!(carrier.contains(&IVec3::new(
-        0,
-        HANGAR_CEILING_Y,
-        HANGAR_MOUTH_Z,
-    )));
-    for y in 1..HANGAR_CEILING_Y - 1 {
-        assert!(!carrier.contains(&IVec3::new(0, y, HANGAR_MOUTH_Z + 1)));
     }
 }
 
@@ -357,7 +388,7 @@ fn old_fleet_layout_migrates_into_the_hangar_and_adds_the_medium_ship() {
         .path(temporary.path().join("spaceships.toml"))
         .default(VoxelSpaceshipStore {
             ships: old_ships,
-            layout_revision: 1,
+            layout_revision: 2,
         })
         .build()
         .unwrap();
