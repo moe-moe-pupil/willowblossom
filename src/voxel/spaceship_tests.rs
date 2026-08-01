@@ -143,7 +143,7 @@ fn hangar_parked_cell(cell: IVec3, berth: IVec3) -> IVec3 {
 }
 
 #[test]
-fn arrogance_hangar_holds_the_fleet_and_each_ship_has_a_clear_launch_sweep() {
+fn enlarged_arrogance_carrier_holds_the_fleet_and_has_clear_launch_sweeps() {
     let carrier = combat_spaceship_voxel_cells()
         .into_iter()
         .filter_map(|(cell, material)| TrpgVoxelConnector::solid(&material).then_some(cell))
@@ -204,14 +204,28 @@ fn arrogance_hangar_holds_the_fleet_and_each_ship_has_a_clear_launch_sweep() {
         }
     }
 
+    let workbook_min_x = -((ARROGANCE.width as i32 - 1) / 2);
+    let workbook_max_x = workbook_min_x + ARROGANCE.width as i32 - 1;
+    let workbook_min_z = -((ARROGANCE.height as i32 - 1) / 2);
+    let workbook_max_z = workbook_min_z + ARROGANCE.height as i32 - 1;
+    assert!(-CARRIER_MAX_HALF_WIDTH <= workbook_min_x - 40);
+    assert!(CARRIER_MAX_HALF_WIDTH >= workbook_max_x + 40);
+    assert!(CARRIER_NOSE_Z <= workbook_min_z - 70);
+    assert!(HANGAR_MOUTH_Z >= workbook_max_z + 80);
     assert_eq!(
-        HANGAR_MIN_X,
-        -((ARROGANCE.width as i32 - 1) / 2)
+        combat_spaceship_half_width(CARRIER_SHOULDER_Z),
+        CARRIER_MAX_HALF_WIDTH
     );
-    assert_eq!(
-        HANGAR_MAX_X,
-        HANGAR_MIN_X + ARROGANCE.width as i32 - 1
+    assert!(
+        combat_spaceship_half_width(CARRIER_NOSE_Z)
+            < combat_spaceship_half_width(CARRIER_SHOULDER_Z) / 4
     );
+    assert!(combat_spaceship_half_width(HANGAR_MOUTH_Z) < CARRIER_MAX_HALF_WIDTH);
+    assert!(carrier.contains(&IVec3::new(
+        0,
+        CARRIER_BOTTOM_Y,
+        CARRIER_NOSE_Z
+    )));
     assert!(carrier.contains(&IVec3::new(0, 0, HANGAR_MOUTH_Z)));
     assert!(carrier.contains(&IVec3::new(
         0,
@@ -248,6 +262,7 @@ fn old_fleet_layout_migrates_into_the_hangar_and_adds_the_medium_ship() {
         .collect::<Vec<_>>();
     for ship in &mut old_ships {
         ship.translation = [999.0, 999.0, 999.0];
+        ship.docking = None;
     }
     old_ships[1].pilot_user_id = Some(42);
 
@@ -258,7 +273,7 @@ fn old_fleet_layout_migrates_into_the_hangar_and_adds_the_medium_ship() {
         .path(temporary.path().join("spaceships.toml"))
         .default(VoxelSpaceshipStore {
             ships: old_ships,
-            layout_revision: 0,
+            layout_revision: 1,
         })
         .build()
         .unwrap();
@@ -289,6 +304,7 @@ fn old_fleet_layout_migrates_into_the_hangar_and_adds_the_medium_ship() {
             persisted.translation,
             spec.transform.translation.to_array()
         );
+        assert_eq!(persisted.docking, spec.docking);
     }
     assert_eq!(
         migrated
@@ -298,6 +314,162 @@ fn old_fleet_layout_migrates_into_the_hangar_and_adds_the_medium_ship() {
             .unwrap()
             .pilot_user_id,
         Some(42)
+    );
+}
+
+#[test]
+fn docked_ships_follow_carrier_launch_with_inertia_and_can_park_again() {
+    let specs = default_voxel_spaceship_specs();
+    let carrier_ship = specs[0].ship.clone();
+    let docked_spec = &specs[1];
+    let docking = docked_spec.docking.clone().unwrap();
+    let carrier_transform = Transform::from_translation(Vec3::new(31.0, 6.0, -17.0))
+        .with_rotation(Quat::from_rotation_y(0.63));
+    let carrier_linear = Vec3::new(4.0, -0.5, 2.25);
+    let carrier_angular = Vec3::new(0.0, 0.42, 0.0);
+
+    let mut app = App::new();
+    app.init_resource::<VoxelSpaceshipControlState>()
+        .add_systems(
+            Update,
+            (
+                release_controlled_docked_spaceship,
+                dock_idle_voxel_spaceships,
+                sync_docked_voxel_spaceships,
+            )
+                .chain(),
+        );
+    let carrier = app
+        .world_mut()
+        .spawn((
+            carrier_ship,
+            carrier_transform,
+            LinearVelocity(carrier_linear),
+            AngularVelocity(carrier_angular),
+            RigidBody::Dynamic,
+        ))
+        .id();
+    let docked = app
+        .world_mut()
+        .spawn((
+            docked_spec.ship.clone(),
+            Transform::IDENTITY,
+            LinearVelocity::ZERO,
+            AngularVelocity::ZERO,
+            RigidBody::Kinematic,
+            docking.clone(),
+            docked_voxel_spaceship_collision_layers(),
+        ))
+        .id();
+
+    app.update();
+
+    let expected = docked_voxel_spaceship_world_transform(&carrier_transform, &docking).unwrap();
+    let expected_velocity = docked_voxel_spaceship_point_velocity(
+        &carrier_transform,
+        carrier_linear,
+        carrier_angular,
+        expected.translation,
+    );
+    let parked = app.world().entity(docked);
+    assert!(parked
+        .get::<Transform>()
+        .unwrap()
+        .translation
+        .abs_diff_eq(expected.translation, 0.000_01));
+    assert!(parked
+        .get::<Transform>()
+        .unwrap()
+        .rotation
+        .abs_diff_eq(expected.rotation, 0.000_01));
+    assert!(parked
+        .get::<LinearVelocity>()
+        .unwrap()
+        .0
+        .abs_diff_eq(expected_velocity, 0.000_01));
+    assert_eq!(
+        *parked.get::<RigidBody>().unwrap(),
+        RigidBody::Kinematic
+    );
+    let docked_layers = *parked.get::<CollisionLayers>().unwrap();
+    assert!(!docked_layers.interacts_with(carrier_collision_layers()));
+    assert!(docked_layers.interacts_with(CollisionLayers::DEFAULT));
+    assert!(SpatialQueryFilter::default().test(docked, docked_layers));
+
+    let moved_transform = Transform::from_translation(Vec3::new(-9.0, 11.0, 23.0))
+        .with_rotation(Quat::from_rotation_y(-1.1));
+    let moved_linear = Vec3::new(-3.0, 1.0, 5.0);
+    let moved_angular = Vec3::new(0.0, -0.7, 0.0);
+    *app.world_mut()
+        .entity_mut(carrier)
+        .get_mut::<Transform>()
+        .unwrap() = moved_transform;
+    app.world_mut()
+        .entity_mut(carrier)
+        .get_mut::<LinearVelocity>()
+        .unwrap()
+        .0 = moved_linear;
+    app.world_mut()
+        .entity_mut(carrier)
+        .get_mut::<AngularVelocity>()
+        .unwrap()
+        .0 = moved_angular;
+
+    app.update();
+
+    let expected_moved =
+        docked_voxel_spaceship_world_transform(&moved_transform, &docking).unwrap();
+    assert!(app
+        .world()
+        .entity(docked)
+        .get::<Transform>()
+        .unwrap()
+        .translation
+        .abs_diff_eq(expected_moved.translation, 0.000_01));
+
+    app.world_mut()
+        .resource_mut::<VoxelSpaceshipControlState>()
+        .driving_ship_id = Some(docked_spec.ship.id.clone());
+    app.update();
+
+    let expected_launch_velocity = docked_voxel_spaceship_point_velocity(
+        &moved_transform,
+        moved_linear,
+        moved_angular,
+        expected_moved.translation,
+    );
+    let launched = app.world().entity(docked);
+    assert_eq!(
+        *launched.get::<RigidBody>().unwrap(),
+        RigidBody::Dynamic
+    );
+    assert!(!launched.contains::<VoxelSpaceshipDocked>());
+    assert!(!launched.contains::<CollisionLayers>());
+    assert!(launched
+        .get::<LinearVelocity>()
+        .unwrap()
+        .0
+        .abs_diff_eq(expected_launch_velocity, 0.000_01));
+    assert!(launched
+        .get::<AngularVelocity>()
+        .unwrap()
+        .0
+        .abs_diff_eq(moved_angular, 0.000_01));
+
+    app.world_mut()
+        .resource_mut::<VoxelSpaceshipControlState>()
+        .driving_ship_id = None;
+    app.update();
+
+    let parked_again = app.world().entity(docked);
+    assert_eq!(
+        *parked_again.get::<RigidBody>().unwrap(),
+        RigidBody::Kinematic
+    );
+    assert!(parked_again.contains::<VoxelSpaceshipDocked>());
+    assert_eq!(
+        parked_again.get::<CollisionLayers>().copied(),
+        Some(docked_voxel_spaceship_collision_layers())
     );
 }
 

@@ -193,20 +193,29 @@ const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
 const VOXEL_SPACESHIP_SAVE_SECONDS: f32 = 1.0;
-const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 1;
+const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 2;
 const COMBAT_SPACESHIP_ID: &str = "usi-arrogance";
 const MEDIUM_SPACESHIP_ID: &str = "medium-ship-01";
 const SMALL_SPACESHIP_COUNT: usize = 6;
-const HANGAR_MIN_X: i32 = -((ARROGANCE.width as i32 - 1) / 2);
-const HANGAR_MAX_X: i32 = HANGAR_MIN_X + ARROGANCE.width as i32 - 1;
-const HANGAR_REAR_Z: i32 = 20;
-const HANGAR_MOUTH_Z: i32 = 76;
-const HANGAR_CEILING_Y: i32 = 12;
+const CARRIER_NOSE_Z: i32 = -112;
+const CARRIER_SHOULDER_Z: i32 = -42;
+const CARRIER_AFT_TAPER_Z: i32 = 72;
+const CARRIER_MAX_HALF_WIDTH: i32 = 154;
+const CARRIER_MOUTH_HALF_WIDTH: i32 = 144;
+const CARRIER_BOTTOM_Y: i32 = -6;
+const HANGAR_REAR_Z: i32 = 44;
+const HANGAR_MOUTH_Z: i32 = 128;
+const HANGAR_CEILING_Y: i32 = 18;
 const HANGAR_PARKING_Y: i32 = 1;
-const HANGAR_PARKING_Z: i32 = 46;
-const HANGAR_DIVIDER_X: [i32; 2] = [-23, 23];
+const HANGAR_PARKING_Z: i32 = 82;
+const HANGAR_DOCK_CLEARANCE_CELLS: f32 = 28.0;
+const HANGAR_DOCK_MAX_RELATIVE_SPEED: f32 = 1.0;
+const HANGAR_DOCK_MAX_RELATIVE_ANGULAR_SPEED: f32 = 0.35;
+const DEFAULT_COLLISION_LAYER_BITS: u32 = 1 << 0;
+const CARRIER_COLLISION_LAYER_BITS: u32 = 1 << 1;
+const DOCKED_SPACESHIP_COLLISION_LAYER_BITS: u32 = 1 << 2;
 const SMALL_SPACESHIP_BERTH_X: [i32; SMALL_SPACESHIP_COUNT] =
-    [-91, -65, -39, 39, 65, 91];
+    [-120, -80, -42, 42, 80, 120];
 const ORBITAL_LAYOUT_SCALE: i32 = 5;
 const RESEARCH_STATION_CENTER: IVec3 =
     IVec3::new(100 * ORBITAL_LAYOUT_SCALE, 0, 100 * ORBITAL_LAYOUT_SCALE);
@@ -630,6 +639,14 @@ struct VoxelSpaceshipSpec {
     micro_tiles: Vec<VoxelMicroTile>,
     workbook_features: Option<VoxelWorkbookFeatureAnnotations>,
     transform: Transform,
+    docking: Option<VoxelSpaceshipDocked>,
+}
+
+#[derive(Component, Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct VoxelSpaceshipDocked {
+    carrier_id: String,
+    local_translation: [f32; 3],
+    local_rotation: [f32; 4],
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -641,6 +658,8 @@ struct PersistedVoxelSpaceship {
     rotation: [f32; 4],
     linear_velocity: [f32; 3],
     angular_velocity: [f32; 3],
+    #[serde(default)]
+    docking: Option<VoxelSpaceshipDocked>,
 }
 
 #[derive(Resource, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2001,7 +2020,10 @@ impl Plugin for TrpgVoxelPlugin {
                         sync_voxel_radiance_volume,
                         sync_voxel_lighting,
                         apply_voxel_teleport,
+                        release_controlled_docked_spaceship,
                         control_voxel_spaceships,
+                        dock_idle_voxel_spaceships,
+                        sync_docked_voxel_spaceships,
                         control_first_person_player,
                         control_voxel_camera
                             .run_if(crate::replay::replay_mouse_interaction_inactive),
@@ -4187,11 +4209,86 @@ fn add_combat_spaceship_hangar(cells: &mut HashMap<IVec3, u8>) {
         .chain(SMALL_SPACESHIP_BERTH_X)
         .collect::<Vec<_>>();
 
-    // A common deck and roof tie all three bays into the workbook hull. The
-    // colored deck cells are flush guidance markings, so they never reduce a
-    // vessel's canonical launch clearance.
+    // Build a single large, tapered shell around the workbook interior and
+    // flight deck. Its stepped outline reads as a carrier hull instead of a
+    // rectangular room attached to the old map.
+    for z in CARRIER_NOSE_Z..=HANGAR_MOUTH_Z {
+        let half_width = combat_spaceship_half_width(z);
+        let previous_half_width = combat_spaceship_half_width((z - 1).max(CARRIER_NOSE_Z));
+        for x in -half_width..=half_width {
+            let armor_band = z.rem_euclid(18) <= 1 || x.abs() >= half_width - 3;
+            cells.insert(
+                IVec3::new(x, CARRIER_BOTTOM_Y, z),
+                if armor_band { 7 } else { 6 },
+            );
+            let roof_material = if z >= HANGAR_REAR_Z
+                && z < HANGAR_MOUTH_Z - 3
+                && (8..=14).contains(&x.rem_euclid(30))
+            {
+                8
+            } else if armor_band {
+                7
+            } else {
+                6
+            };
+            cells.insert(IVec3::new(x, HANGAR_CEILING_Y, z), roof_material);
+        }
+
+        // Fill each step between successive widths so the diagonal sides are
+        // watertight rather than a row of disconnected vertical strips.
+        let inner_side = previous_half_width.min(half_width);
+        let outer_side = previous_half_width.max(half_width);
+        for side_x in inner_side..=outer_side {
+            for y in CARRIER_BOTTOM_Y + 1..HANGAR_CEILING_Y {
+                let material = if matches!(y, -5 | 0 | 6 | 12 | 17)
+                    || z.rem_euclid(14) == 0
+                {
+                    7
+                } else {
+                    6
+                };
+                cells.insert(IVec3::new(side_x, y, z), material);
+                cells.insert(IVec3::new(-side_x, y, z), material);
+            }
+        }
+    }
+
+    // Cap the narrow bow, then add a raised dorsal spine so the silhouette has
+    // a clear keel and command section when viewed from outside.
+    let nose_half_width = combat_spaceship_half_width(CARRIER_NOSE_Z);
+    for x in -nose_half_width..=nose_half_width {
+        for y in CARRIER_BOTTOM_Y..=HANGAR_CEILING_Y {
+            cells.insert(
+                IVec3::new(x, y, CARRIER_NOSE_Z),
+                if x.abs() == nose_half_width
+                    || matches!(y, CARRIER_BOTTOM_Y | 0 | 12 | HANGAR_CEILING_Y)
+                {
+                    7
+                } else {
+                    6
+                },
+            );
+        }
+    }
+    for z in CARRIER_NOSE_Z + 10..HANGAR_REAR_Z - 4 {
+        let spine_half_width = ((z - CARRIER_NOSE_Z) / 12 + 2).clamp(2, 9);
+        for x in -spine_half_width..=spine_half_width {
+            cells.insert(IVec3::new(x, HANGAR_CEILING_Y + 1, z), 7);
+        }
+        for x in -2..=2 {
+            cells.insert(
+                IVec3::new(x, HANGAR_CEILING_Y + 2, z),
+                if z.rem_euclid(12) <= 2 { 10 } else { 6 },
+            );
+        }
+    }
+
+    // The hangar is one broad, unobstructed internal flight deck. Flush lane
+    // and berth markings identify all seven parking positions without putting
+    // divider walls in their launch paths.
     for z in HANGAR_REAR_Z..=HANGAR_MOUTH_Z {
-        for x in HANGAR_MIN_X..=HANGAR_MAX_X {
+        let half_width = combat_spaceship_half_width(z) - 2;
+        for x in -half_width..=half_width {
             let on_launch_line = launch_lane_centers
                 .iter()
                 .any(|center| (x - center).abs() <= 1);
@@ -4203,50 +4300,29 @@ fn add_combat_spaceship_hangar(cells: &mut HashMap<IVec3, u8>) {
                 7
             };
             cells.insert(IVec3::new(x, 0, z), deck_material);
-
-            let skylight = (9..=16).contains(&x.rem_euclid(26))
-                && (HANGAR_REAR_Z + 3..=HANGAR_MOUTH_Z - 3).contains(&z);
-            cells.insert(
-                IVec3::new(x, HANGAR_CEILING_Y, z),
-                if skylight { 8 } else { 6 },
-            );
         }
     }
 
-    // The outer hull and the two longitudinal bulkheads form port, medium,
-    // and starboard bays. Their aft ends stay open as a cross-bay service area.
-    for z in HANGAR_REAR_Z..=HANGAR_MOUTH_Z {
-        for y in 1..HANGAR_CEILING_Y {
-            let material = if matches!(y, 1 | 6 | 11) || z.rem_euclid(9) == 0 {
-                7
-            } else {
-                6
-            };
-            cells.insert(IVec3::new(HANGAR_MIN_X, y, z), material);
-            cells.insert(IVec3::new(HANGAR_MAX_X, y, z), material);
-        }
-    }
-    for divider_x in HANGAR_DIVIDER_X {
-        for z in HANGAR_REAR_Z + 5..=HANGAR_MOUTH_Z {
-            for y in 1..HANGAR_CEILING_Y {
-                cells.insert(
-                    IVec3::new(divider_x, y, z),
-                    if matches!(y, 1 | 6 | 11) { 7 } else { 6 },
-                );
-            }
-        }
-    }
-
-    // Close the forward end against the original cruiser while leaving a
-    // gallery behind the dividers. The opposite end is a full-height launch
-    // mouth, with only an overhead brace above every ship's flight envelope.
-    for x in HANGAR_MIN_X..=HANGAR_MAX_X {
+    // A forward pressure bulkhead closes the flight deck against the workbook
+    // rooms. The aft face remains a full-width, full-height fly-through mouth;
+    // only overhead ribs cross it, safely above every parked craft.
+    let rear_half_width = combat_spaceship_half_width(HANGAR_REAR_Z) - 2;
+    for x in -rear_half_width..=rear_half_width {
         for y in 1..HANGAR_CEILING_Y {
             cells.insert(
                 IVec3::new(x, y, HANGAR_REAR_Z),
-                if matches!(y, 1 | 6 | 11) { 7 } else { 6 },
+                if matches!(y, 1 | 6 | 12 | 17) { 7 } else { 6 },
             );
         }
+    }
+    for rib_z in (HANGAR_REAR_Z + 12..=HANGAR_MOUTH_Z).step_by(16) {
+        let half_width = combat_spaceship_half_width(rib_z) - 1;
+        for x in -half_width..=half_width {
+            cells.insert(IVec3::new(x, HANGAR_CEILING_Y - 1, rib_z), 7);
+        }
+    }
+    let mouth_half_width = combat_spaceship_half_width(HANGAR_MOUTH_Z) - 1;
+    for x in -mouth_half_width..=mouth_half_width {
         cells.insert(
             IVec3::new(x, HANGAR_CEILING_Y - 1, HANGAR_MOUTH_Z),
             7,
@@ -4553,6 +4629,54 @@ fn medium_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
     cells
 }
 
+fn combat_spaceship_half_width(z: i32) -> i32 {
+    const NOSE_HALF_WIDTH: i32 = 8;
+    if z <= CARRIER_NOSE_Z {
+        return NOSE_HALF_WIDTH;
+    }
+    if z < CARRIER_SHOULDER_Z {
+        return NOSE_HALF_WIDTH
+            + (z - CARRIER_NOSE_Z) * (CARRIER_MAX_HALF_WIDTH - NOSE_HALF_WIDTH)
+                / (CARRIER_SHOULDER_Z - CARRIER_NOSE_Z);
+    }
+    if z <= CARRIER_AFT_TAPER_Z {
+        return CARRIER_MAX_HALF_WIDTH;
+    }
+    if z < HANGAR_MOUTH_Z {
+        return CARRIER_MAX_HALF_WIDTH
+            - (z - CARRIER_AFT_TAPER_Z)
+                * (CARRIER_MAX_HALF_WIDTH - CARRIER_MOUTH_HALF_WIDTH)
+                / (HANGAR_MOUTH_Z - CARRIER_AFT_TAPER_Z);
+    }
+    CARRIER_MOUTH_HALF_WIDTH
+}
+
+fn default_voxel_spaceship_docking(berth: IVec3) -> VoxelSpaceshipDocked {
+    VoxelSpaceshipDocked {
+        carrier_id: COMBAT_SPACESHIP_ID.to_owned(),
+        local_translation: (berth.as_vec3() * VOXEL_SIZE).to_array(),
+        local_rotation: Quat::from_rotation_y(std::f32::consts::PI).to_array(),
+    }
+}
+
+fn carrier_collision_layers() -> CollisionLayers {
+    CollisionLayers::from_bits(CARRIER_COLLISION_LAYER_BITS, u32::MAX)
+}
+
+fn docked_voxel_spaceship_collision_layers() -> CollisionLayers {
+    CollisionLayers::from_bits(
+        DOCKED_SPACESHIP_COLLISION_LAYER_BITS,
+        DEFAULT_COLLISION_LAYER_BITS,
+    )
+}
+
+fn default_docked_voxel_spaceship_transform(berth: IVec3) -> Transform {
+    Transform::from_translation(
+        (COMBAT_SPACESHIP_CENTER + berth).as_vec3() * VOXEL_SIZE,
+    )
+    .with_rotation(Quat::from_rotation_y(std::f32::consts::PI))
+}
+
 fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
     let arrogance_decoded = ARROGANCE.decode();
     let mut specs = vec![VoxelSpaceshipSpec {
@@ -4579,7 +4703,9 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
         transform: Transform::from_translation(
             COMBAT_SPACESHIP_CENTER.as_vec3() * VOXEL_SIZE,
         ),
+        docking: None,
     }];
+    let medium_berth = IVec3::new(0, HANGAR_PARKING_Y, HANGAR_PARKING_Z);
     specs.push(VoxelSpaceshipSpec {
         ship: VoxelSpaceship {
             id: MEDIUM_SPACESHIP_ID.to_owned(),
@@ -4594,13 +4720,8 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
         cells: medium_spaceship_voxel_cells(),
         micro_tiles: Vec::new(),
         workbook_features: None,
-        transform: Transform::from_translation(
-            (COMBAT_SPACESHIP_CENTER
-                + IVec3::new(0, HANGAR_PARKING_Y, HANGAR_PARKING_Z))
-            .as_vec3()
-                * VOXEL_SIZE,
-        )
-        .with_rotation(Quat::from_rotation_y(std::f32::consts::PI)),
+        transform: default_docked_voxel_spaceship_transform(medium_berth),
+        docking: Some(default_voxel_spaceship_docking(medium_berth)),
     });
     let names = [
         "WB-01 雨燕号",
@@ -4619,6 +4740,11 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
         VoxelSpaceshipClass::Scout,
     ];
     for index in 0..SMALL_SPACESHIP_COUNT {
+        let berth = IVec3::new(
+            SMALL_SPACESHIP_BERTH_X[index],
+            HANGAR_PARKING_Y,
+            HANGAR_PARKING_Z,
+        );
         let class = classes[index];
         let (thrust_acceleration, vertical_acceleration, turn_speed, max_speed) = match class {
             VoxelSpaceshipClass::Shuttle => (8.0, 6.0, 1.35, 26.0),
@@ -4640,17 +4766,8 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
             cells: small_spaceship_voxel_cells(index),
             micro_tiles: Vec::new(),
             workbook_features: None,
-            transform: Transform::from_translation(
-                (COMBAT_SPACESHIP_CENTER
-                    + IVec3::new(
-                        SMALL_SPACESHIP_BERTH_X[index],
-                        HANGAR_PARKING_Y,
-                        HANGAR_PARKING_Z,
-                    ))
-                .as_vec3()
-                    * VOXEL_SIZE,
-            )
-            .with_rotation(Quat::from_rotation_y(std::f32::consts::PI)),
+            transform: default_docked_voxel_spaceship_transform(berth),
+            docking: Some(default_voxel_spaceship_docking(berth)),
         });
     }
     specs
@@ -4667,11 +4784,50 @@ fn persisted_voxel_spaceship_from_spec(
         rotation: spec.transform.rotation.to_array(),
         linear_velocity: [0.0; 3],
         angular_velocity: [0.0; 3],
+        docking: spec.docking.clone(),
     }
 }
 
 fn finite_array<const N: usize>(values: [f32; N]) -> bool {
     values.into_iter().all(f32::is_finite)
+}
+
+impl VoxelSpaceshipDocked {
+    fn local_transform(&self) -> Option<Transform> {
+        if !finite_array(self.local_translation) || !finite_array(self.local_rotation) {
+            return None;
+        }
+        let rotation = Quat::from_array(self.local_rotation);
+        (rotation.length_squared() > f32::EPSILON).then(|| Transform {
+            translation: Vec3::from_array(self.local_translation),
+            rotation: rotation.normalize(),
+            scale: Vec3::ONE,
+        })
+    }
+}
+
+fn docked_voxel_spaceship_world_transform(
+    carrier_transform: &Transform,
+    docking: &VoxelSpaceshipDocked,
+) -> Option<Transform> {
+    let local_transform = docking.local_transform()?;
+    Some(Transform {
+        translation: carrier_transform
+            .compute_affine()
+            .transform_point3(local_transform.translation),
+        rotation: (carrier_transform.rotation * local_transform.rotation).normalize(),
+        scale: Vec3::ONE,
+    })
+}
+
+fn docked_voxel_spaceship_point_velocity(
+    carrier_transform: &Transform,
+    carrier_linear_velocity: Vec3,
+    carrier_angular_velocity: Vec3,
+    docked_translation: Vec3,
+) -> Vec3 {
+    carrier_linear_velocity
+        + carrier_angular_velocity.cross(docked_translation - carrier_transform.translation)
 }
 
 fn voxel_spaceship_runtime_pose(
@@ -4714,6 +4870,7 @@ fn spawn_voxel_spaceship(
     transform: Transform,
     linear_velocity: LinearVelocity,
     angular_velocity: AngularVelocity,
+    docking: Option<VoxelSpaceshipDocked>,
 ) -> Entity {
     let collider_cells = spec
         .cells
@@ -4734,6 +4891,11 @@ fn spawn_voxel_spaceship(
         (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE;
     let (material_meshes, _) = build_voxel_meshes_from_cells(&spec.cells);
     let micro_meshes = build_micro_tile_meshes(&spec.micro_tiles);
+    let rigid_body = if docking.is_some() {
+        RigidBody::Kinematic
+    } else {
+        RigidBody::Dynamic
+    };
     let entity = commands
         .spawn((
             Name::new(spec.ship.name.clone()),
@@ -4742,7 +4904,7 @@ fn spawn_voxel_spaceship(
                 local_center,
                 cells: spec.cells.clone(),
             },
-            RigidBody::Dynamic,
+            rigid_body,
             canonical_voxel_collider(&collider_cells),
             GravityScale(0.0),
             Friction::new(0.25),
@@ -4770,6 +4932,17 @@ fn spawn_voxel_spaceship(
             }
         })
         .id();
+    if let Some(docking) = docking {
+        // The docking layer remains visible to spatial ray queries and collides
+        // with default-layer players, but not with the carrier or other berths.
+        commands
+            .entity(entity)
+            .insert((docking, docked_voxel_spaceship_collision_layers()));
+    } else if spec.ship.id == COMBAT_SPACESHIP_ID {
+        commands
+            .entity(entity)
+            .insert(carrier_collision_layers());
+    }
     if let Some(features) = &spec.workbook_features {
         commands.entity(entity).insert(features.clone());
     }
@@ -4818,6 +4991,7 @@ fn spawn_default_voxel_spaceships(
             transform,
             linear_velocity,
             angular_velocity,
+            persisted.docking.clone(),
         );
     }
     if changed {
@@ -4877,6 +5051,207 @@ fn begin_voxel_spaceship_takeover(
     editor.creative_inventory_open = false;
     editor.teleport_menu_open = false;
     editor.first_person_cursor_released = true;
+}
+
+fn release_controlled_docked_spaceship(
+    mut commands: Commands,
+    control: Res<VoxelSpaceshipControlState>,
+    carriers: Query<
+        (
+            &VoxelSpaceship,
+            &Transform,
+            &LinearVelocity,
+            &AngularVelocity,
+        ),
+        Without<VoxelSpaceshipDocked>,
+    >,
+    mut docked_spaceships: Query<
+        (
+            Entity,
+            &VoxelSpaceship,
+            &mut Transform,
+            &VoxelSpaceshipDocked,
+            &mut LinearVelocity,
+            &mut AngularVelocity,
+        ),
+        With<VoxelSpaceshipDocked>,
+    >,
+) {
+    let Some(driving_ship_id) = control.driving_ship_id.as_deref() else {
+        return;
+    };
+    let Some((entity, _, mut transform, docking, mut linear, mut angular)) =
+        docked_spaceships
+            .iter_mut()
+            .find(|(_, ship, ..)| ship.id == driving_ship_id)
+    else {
+        return;
+    };
+    let Some((_, carrier_transform, carrier_linear, carrier_angular)) = carriers
+        .iter()
+        .find(|(carrier, ..)| carrier.id == docking.carrier_id)
+    else {
+        return;
+    };
+    let Some(world_transform) =
+        docked_voxel_spaceship_world_transform(carrier_transform, docking)
+    else {
+        return;
+    };
+
+    linear.0 = docked_voxel_spaceship_point_velocity(
+        carrier_transform,
+        carrier_linear.0,
+        carrier_angular.0,
+        world_transform.translation,
+    );
+    angular.0 = carrier_angular.0;
+    *transform = world_transform;
+    commands
+        .entity(entity)
+        .insert(RigidBody::Dynamic)
+        .remove::<VoxelSpaceshipDocked>()
+        .remove::<CollisionLayers>();
+}
+
+fn sync_docked_voxel_spaceships(
+    control: Res<VoxelSpaceshipControlState>,
+    carriers: Query<
+        (
+            &VoxelSpaceship,
+            &Transform,
+            &LinearVelocity,
+            &AngularVelocity,
+        ),
+        Without<VoxelSpaceshipDocked>,
+    >,
+    mut docked_spaceships: Query<
+        (
+            &VoxelSpaceship,
+            &mut Transform,
+            &VoxelSpaceshipDocked,
+            &mut LinearVelocity,
+            &mut AngularVelocity,
+        ),
+        With<VoxelSpaceshipDocked>,
+    >,
+) {
+    for (ship, mut transform, docking, mut linear, mut angular) in &mut docked_spaceships {
+        // Removal is deferred until the release system finishes. Do not snap a
+        // craft selected for launch back into its berth in that same frame.
+        if control.driving_ship_id.as_deref() == Some(ship.id.as_str()) {
+            continue;
+        }
+        let Some((_, carrier_transform, carrier_linear, carrier_angular)) = carriers
+            .iter()
+            .find(|(carrier, ..)| carrier.id == docking.carrier_id)
+        else {
+            continue;
+        };
+        let Some(world_transform) =
+            docked_voxel_spaceship_world_transform(carrier_transform, docking)
+        else {
+            continue;
+        };
+        linear.0 = docked_voxel_spaceship_point_velocity(
+            carrier_transform,
+            carrier_linear.0,
+            carrier_angular.0,
+            world_transform.translation,
+        );
+        angular.0 = carrier_angular.0;
+        *transform = world_transform;
+    }
+}
+
+fn voxel_spaceship_inside_hangar_docking_zone(local_translation: Vec3) -> bool {
+    if !local_translation.is_finite() {
+        return false;
+    }
+    let local_cell = local_translation / VOXEL_SIZE;
+    let z = local_cell.z.round() as i32;
+    let half_width = combat_spaceship_half_width(z) as f32 - HANGAR_DOCK_CLEARANCE_CELLS;
+    local_cell.x.abs() <= half_width
+        && (0.5..=4.0).contains(&local_cell.y)
+        && local_cell.z >= HANGAR_REAR_Z as f32 + HANGAR_DOCK_CLEARANCE_CELLS
+        && local_cell.z <= HANGAR_MOUTH_Z as f32 - HANGAR_DOCK_CLEARANCE_CELLS
+}
+
+fn dock_idle_voxel_spaceships(
+    mut commands: Commands,
+    control: Res<VoxelSpaceshipControlState>,
+    mut spaceships: ParamSet<(
+        Query<
+            (
+                &VoxelSpaceship,
+                &Transform,
+                &LinearVelocity,
+                &AngularVelocity,
+            ),
+            Without<VoxelSpaceshipDocked>,
+        >,
+        Query<
+            (
+                Entity,
+                &VoxelSpaceship,
+                &Transform,
+                &mut LinearVelocity,
+                &mut AngularVelocity,
+            ),
+            Without<VoxelSpaceshipDocked>,
+        >,
+    )>,
+) {
+    let carrier_state = spaceships
+        .p0()
+        .iter()
+        .find(|(ship, ..)| ship.id == COMBAT_SPACESHIP_ID)
+        .map(|(_, transform, linear, angular)| (*transform, linear.0, angular.0));
+    let Some((carrier_transform, carrier_linear, carrier_angular)) = carrier_state else {
+        return;
+    };
+    let inverse_carrier = carrier_transform.compute_affine().inverse();
+
+    for (entity, ship, transform, mut linear, mut angular) in spaceships.p1().iter_mut() {
+        if ship.id == COMBAT_SPACESHIP_ID
+            || control.driving_ship_id.as_deref() == Some(ship.id.as_str())
+        {
+            continue;
+        }
+        let local_translation = inverse_carrier.transform_point3(transform.translation);
+        if !voxel_spaceship_inside_hangar_docking_zone(local_translation) {
+            continue;
+        }
+        let carrier_point_velocity = docked_voxel_spaceship_point_velocity(
+            &carrier_transform,
+            carrier_linear,
+            carrier_angular,
+            transform.translation,
+        );
+        if (linear.0 - carrier_point_velocity).length_squared()
+            > HANGAR_DOCK_MAX_RELATIVE_SPEED.powi(2)
+            || (angular.0 - carrier_angular).length_squared()
+                > HANGAR_DOCK_MAX_RELATIVE_ANGULAR_SPEED.powi(2)
+        {
+            continue;
+        }
+        let local_rotation =
+            (carrier_transform.rotation.inverse() * transform.rotation).normalize();
+        let docking = VoxelSpaceshipDocked {
+            carrier_id: COMBAT_SPACESHIP_ID.to_owned(),
+            local_translation: local_translation.to_array(),
+            local_rotation: local_rotation.to_array(),
+        };
+        linear.0 = carrier_point_velocity;
+        angular.0 = carrier_angular;
+        commands
+            .entity(entity)
+            .insert((
+                RigidBody::Kinematic,
+                docking,
+                docked_voxel_spaceship_collision_layers(),
+            ));
+    }
 }
 
 fn control_voxel_spaceships(
@@ -5018,6 +5393,7 @@ fn persist_voxel_spaceships(
         &Transform,
         &LinearVelocity,
         &AngularVelocity,
+        Option<&VoxelSpaceshipDocked>,
     )>,
     mut store: ResMut<Persistent<VoxelSpaceshipStore>>,
 ) {
@@ -5028,7 +5404,7 @@ fn persist_voxel_spaceships(
     }
     persistence.elapsed_seconds = 0.0;
     let mut changed = false;
-    for (ship, transform, linear_velocity, angular_velocity) in &spaceships {
+    for (ship, transform, linear_velocity, angular_velocity, docking) in &spaceships {
         let Some(record) = store.ships.iter_mut().find(|record| record.id == ship.id) else {
             continue;
         };
@@ -5039,6 +5415,7 @@ fn persist_voxel_spaceships(
             rotation: transform.rotation.to_array(),
             linear_velocity: linear_velocity.0.to_array(),
             angular_velocity: angular_velocity.0.to_array(),
+            docking: docking.cloned(),
         };
         if *record != snapshot {
             *record = snapshot;
@@ -15489,15 +15866,24 @@ mod tests {
         assert!(specs[1..]
             .iter()
             .all(|spec| spec.workbook_features.is_none()));
-
-        let min_x = -((ARROGANCE.width as i32 - 1) / 2);
-        let max_x = min_x + ARROGANCE.width as i32 - 1;
-        let min_z = -((ARROGANCE.height as i32 - 1) / 2);
-        let max_z = min_z + ARROGANCE.height as i32 - 1;
-        assert!(specs[0].cells.iter().all(|(cell, _)| {
-            (min_x..=max_x).contains(&cell.x)
-                && (min_z..=HANGAR_MOUTH_Z).contains(&cell.z)
+        assert!(specs[0].docking.is_none());
+        assert!(specs[1..].iter().all(|spec| {
+            spec.docking
+                .as_ref()
+                .is_some_and(|docking| docking.carrier_id == COMBAT_SPACESHIP_ID)
         }));
+
+        let workbook_min_x = -((ARROGANCE.width as i32 - 1) / 2);
+        let workbook_max_x = workbook_min_x + ARROGANCE.width as i32 - 1;
+        let workbook_min_z = -((ARROGANCE.height as i32 - 1) / 2);
+        let max_z = workbook_min_z + ARROGANCE.height as i32 - 1;
+        assert!(specs[0].cells.iter().all(|(cell, _)| {
+            (-CARRIER_MAX_HALF_WIDTH..=CARRIER_MAX_HALF_WIDTH).contains(&cell.x)
+                && (CARRIER_NOSE_Z..=HANGAR_MOUTH_Z).contains(&cell.z)
+        }));
+        assert!(-CARRIER_MAX_HALF_WIDTH < workbook_min_x);
+        assert!(CARRIER_MAX_HALF_WIDTH > workbook_max_x);
+        assert!(CARRIER_NOSE_Z < workbook_min_z);
         assert!(specs[0]
             .cells
             .iter()
@@ -15505,7 +15891,7 @@ mod tests {
     }
 
     #[test]
-    fn spawned_spaceships_are_dynamic_canonical_voxels_with_zero_gravity() {
+    fn spawned_fleet_uses_canonical_voxels_and_docked_body_state() {
         fn spawn_test_spaceship(
             mut commands: Commands,
             mut meshes: ResMut<Assets<Mesh>>,
@@ -15520,6 +15906,7 @@ mod tests {
                     spec.transform,
                     LinearVelocity::ZERO,
                     AngularVelocity::ZERO,
+                    spec.docking.clone(),
                 );
             }
         }
@@ -15534,14 +15921,28 @@ mod tests {
         app.update();
 
         let mut query = app.world_mut().query_filtered::<(
+            &VoxelSpaceship,
             &RigidBody,
             &GravityScale,
             &Collider,
+            Option<&VoxelSpaceshipDocked>,
+            Option<&CollisionLayers>,
         ), With<VoxelSpaceship>>();
         let bodies = query.iter(app.world()).collect::<Vec<_>>();
         assert_eq!(bodies.len(), SMALL_SPACESHIP_COUNT + 2);
-        for (body, gravity_scale, collider) in bodies {
-            assert_eq!(*body, RigidBody::Dynamic);
+        for (ship, body, gravity_scale, collider, docking, collision_layers) in bodies {
+            if ship.id == COMBAT_SPACESHIP_ID {
+                assert_eq!(*body, RigidBody::Dynamic);
+                assert!(docking.is_none());
+                assert_eq!(collision_layers.copied(), Some(carrier_collision_layers()));
+            } else {
+                assert_eq!(*body, RigidBody::Kinematic);
+                assert!(docking.is_some());
+                assert_eq!(
+                    collision_layers.copied(),
+                    Some(docked_voxel_spaceship_collision_layers())
+                );
+            }
             assert_eq!(gravity_scale.0, 0.0);
             assert_eq!(
                 collider
