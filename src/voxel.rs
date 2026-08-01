@@ -168,7 +168,7 @@ const VOXEL_SCENE_AUTOSAVE_SECONDS: f32 = 30.0;
 const VOXEL_SCENE_LAYOUT_REVISION: u32 = 3;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
 pub(crate) const VOXEL_GLASS_MATERIAL: u8 = 11;
-const VOXEL_GLASS_OPACITY: f32 = 0.10;
+const VOXEL_GLASS_OPACITY: f32 = 0.05;
 const VOXEL_MATERIAL_COUNT: usize = VOXEL_GLASS_MATERIAL as usize;
 const MICRO_TILE_SUBDIVISIONS: u32 = 16;
 const WORKBOOK_FEATURE_HOVER_MIN_Y_CELLS: f32 = 1.0;
@@ -3117,7 +3117,13 @@ fn build_workbook_orbital_location(
         }
         if wall {
             for y in 1..WORKBOOK_ROOM_HEIGHT {
-                grid.set(base + IVec3::Y * y, 6);
+                let material = if workbook_station_wall_is_glass(design, &decoded, index, y)
+                {
+                    VOXEL_GLASS_MATERIAL
+                } else {
+                    6
+                };
+                grid.set(base + IVec3::Y * y, material);
             }
             continue;
         }
@@ -3529,6 +3535,35 @@ fn workbook_cell_is_exterior(
         || decoded.exterior[sheet_z as usize * design.width + sheet_x as usize]
 }
 
+fn workbook_station_wall_is_glass(
+    design: WorkbookMapDesign,
+    decoded: &DecodedWorkbookMap,
+    index: usize,
+    y: i32,
+) -> bool {
+    if workbook_hull_style(design) == WorkbookHullStyle::CombatCruiser
+        || decoded.styles[index] != 11
+        || !(2..WORKBOOK_ROOM_HEIGHT - 1).contains(&y)
+    {
+        return false;
+    }
+
+    let palette = workbook_hull_palette(workbook_hull_style(design));
+    let sheet_x = (index % design.width) as i32;
+    let sheet_z = (index / design.width) as i32;
+    let [x, z] = design.centered_offset(index);
+    [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        .into_iter()
+        .filter(|(dx, dz)| {
+            workbook_cell_is_exterior(design, decoded, sheet_x + dx, sheet_z + dz)
+        })
+        .any(|(dx, _)| {
+            let longitudinal = if dx != 0 { z } else { x };
+            let pattern = longitudinal.rem_euclid(palette.rib_spacing);
+            (2..=palette.rib_spacing - 3).contains(&pattern)
+        })
+}
+
 fn add_workbook_hull_micro_tiles(
     tiles: &mut Vec<VoxelMicroTile>,
     design: WorkbookMapDesign,
@@ -3593,7 +3628,11 @@ fn add_workbook_hull_micro_tiles(
             let outside = base + direction;
             if style == 11 {
                 for y in 0..=WORKBOOK_ROOM_HEIGHT {
-                    let material = if matches!(y, 3 | 4) && matches!(pattern, 4 | 5) {
+                    let material = if workbook_station_wall_is_glass(
+                        design, decoded, index, y,
+                    ) {
+                        VOXEL_GLASS_MATERIAL
+                    } else if matches!(y, 3 | 4) && matches!(pattern, 4 | 5) {
                         palette.window
                     } else if y == 1 || y == WORKBOOK_ROOM_HEIGHT - 1 {
                         palette.trim
@@ -13297,7 +13336,7 @@ mod tests {
     }
 
     #[test]
-    fn voxel_glass_is_solid_two_sided_and_ten_percent_opaque() {
+    fn voxel_glass_is_solid_two_sided_and_five_percent_opaque() {
         let material = voxel_glass_material();
 
         assert_eq!(material.base_color.alpha(), VOXEL_GLASS_OPACITY);
@@ -13305,6 +13344,39 @@ mod tests {
         assert_eq!(material.cull_mode, None);
         assert!(TrpgVoxelConnector::solid(&VOXEL_GLASS_MATERIAL));
         assert_eq!(radiance_voxel_color(VOXEL_GLASS_MATERIAL), [0; 4]);
+    }
+
+    #[test]
+    fn workbook_space_stations_have_panoramic_glass_with_metal_frames() {
+        for design in [NIFFY, KYO, ARBITRATOR, ABANDONED] {
+            let mut world = World::new();
+            let entity = world.spawn(Grid::<u8>::new()).id();
+            {
+                let mut entity_mut = world.entity_mut(entity);
+                let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
+                build_workbook_orbital_location(&mut grid, IVec3::ZERO, design);
+            }
+            let grid = world.entity(entity).get::<Grid<u8>>().unwrap();
+            let glass_columns = voxel_cells(grid)
+                .into_iter()
+                .filter(|(_, material)| *material == VOXEL_GLASS_MATERIAL)
+                .map(|(cell, _)| (cell.x, cell.z))
+                .collect::<HashSet<_>>();
+
+            assert!(
+                glass_columns.len() >= 8,
+                "{} needs multiple panoramic glass bays",
+                design.name
+            );
+            for (x, z) in glass_columns {
+                assert_eq!(grid.get(IVec3::new(x, 1, z)).copied(), Some(6));
+                assert_eq!(
+                    grid.get(IVec3::new(x, WORKBOOK_ROOM_HEIGHT - 1, z))
+                        .copied(),
+                    Some(6)
+                );
+            }
+        }
     }
 
     #[test]
