@@ -129,6 +129,9 @@ use crate::{
 // Compact, geometry-only campaign layouts decoded from the group's workbook.
 mod map_design;
 
+#[cfg(test)]
+mod spaceship_tests;
+
 use map_design::{
     DecodedWorkbookMap,
     WorkbookMapDesign,
@@ -870,6 +873,7 @@ pub(crate) enum VoxelCreativeItem {
     Mode(VoxelEditMode),
     ToolGun,
     PlayerPossessionTool,
+    SpaceshipPossessionTool,
     TeleportTool,
 }
 
@@ -1529,7 +1533,8 @@ impl VoxelEditorState {
                 self.light_tool = None;
                 self.selected_light = None;
             },
-            VoxelCreativeItem::PlayerPossessionTool => {
+            VoxelCreativeItem::PlayerPossessionTool
+            | VoxelCreativeItem::SpaceshipPossessionTool => {
                 self.light_tool = None;
                 self.selected_light = None;
             },
@@ -1609,6 +1614,9 @@ impl VoxelEditorState {
         if self.is_player_possession_tool_equipped() {
             return "PL接管器".to_owned();
         }
+        if self.is_spaceship_possession_tool_equipped() {
+            return "舰船接管器".to_owned();
+        }
         if self.is_teleport_tool_equipped() {
             return "传送器".to_owned();
         }
@@ -1626,6 +1634,10 @@ impl VoxelEditorState {
 
     pub(crate) fn is_player_possession_tool_equipped(&self) -> bool {
         self.equipped_item == Some(VoxelCreativeItem::PlayerPossessionTool)
+    }
+
+    pub(crate) fn is_spaceship_possession_tool_equipped(&self) -> bool {
+        self.equipped_item == Some(VoxelCreativeItem::SpaceshipPossessionTool)
     }
 
     pub(crate) fn is_teleport_tool_equipped(&self) -> bool {
@@ -1874,6 +1886,8 @@ impl Plugin for TrpgVoxelPlugin {
                     voxel_editor_shortcuts,
                     handle_editor_requests,
                     use_player_possession_tool
+                        .run_if(crate::replay::replay_mouse_interaction_inactive),
+                    use_spaceship_possession_tool
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
                     place_creative_light
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
@@ -4016,51 +4030,134 @@ fn remove_static_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
 }
 
 fn small_spaceship_voxel_cells(variant: usize) -> Vec<(IVec3, u8)> {
-    let half_width = 2 + (variant % 2) as i32;
-    let nose = -8 - (variant % 3) as i32;
-    let tail = 5 + (variant % 2) as i32;
-    let wing_span = half_width + 2 + (variant % 3 == 2) as i32;
+    let half_width = 5 + (variant % 2) as i32;
+    let nose = -13 - (variant % 3) as i32;
+    let tail = 9 + (variant % 2) as i32;
+    let wing_span = half_width + 4 + (variant % 3 == 2) as i32;
     let mut cells = HashMap::<IVec3, u8>::new();
 
     for z in nose..=tail {
-        let taper = if z < -4 {
-            ((z - nose) / 2 + 1).min(half_width)
-        } else if z > tail - 2 {
-            (tail - z + 1).max(1).min(half_width)
+        let section_half_width = if z < -5 {
+            let run = (-5 - nose).max(1);
+            1 + (z - nose) * (half_width - 1) / run
+        } else if z > 6 {
+            let run = (tail - 6).max(1);
+            1 + (tail - z) * (half_width - 1) / run
         } else {
             half_width
         };
-        for x in -taper..=taper {
-            let edge = x.abs() == taper;
+
+        for x in -section_half_width..=section_half_width {
+            let edge = x.abs() == section_half_width;
             cells.insert(
                 IVec3::new(x, 0, z),
                 if edge { 7 } else { 6 },
             );
-            if !edge && (-5..=tail - 1).contains(&z) {
-                cells.insert(
-                    IVec3::new(x, 1, z),
-                    if (-4..=-1).contains(&z) { 8 } else { 6 },
-                );
+            let canopy = (-6..=-2).contains(&z) && x.abs() <= 2;
+            cells.insert(
+                IVec3::new(x, 5, z),
+                if canopy {
+                    8
+                } else if edge {
+                    7
+                } else {
+                    6
+                },
+            );
+        }
+
+        for y in 1..=4 {
+            let window = (-6..=-2).contains(&z) && matches!(y, 2 | 3);
+            let wall_material = if window {
+                8
+            } else if y == 1 || y == 4 {
+                7
+            } else {
+                6
+            };
+            cells.insert(
+                IVec3::new(-section_half_width, y, z),
+                wall_material,
+            );
+            cells.insert(
+                IVec3::new(section_half_width, y, z),
+                wall_material,
+            );
+        }
+
+        if z == nose || z == tail {
+            for x in -section_half_width..=section_half_width {
+                for y in 1..=4 {
+                    cells.insert(
+                        IVec3::new(x, y, z),
+                        if y == 2 { 7 } else { 6 },
+                    );
+                }
             }
         }
     }
 
-    for z in -1_i32..=3 {
+    // Swept wings preserve a recognizable silhouette without turning the ship
+    // into a rectangular room floating in space.
+    for z in -2_i32..=4 {
         let span = wing_span - (z - 1).abs() / 2;
         for x in -span..=span {
-            cells.entry(IVec3::new(x, 0, z)).or_insert(7);
+            let material = if x.abs() >= span - 1 { 9 } else { 7 };
+            cells.entry(IVec3::new(x, 0, z)).or_insert(material);
         }
     }
-    for x in [-half_width + 1, half_width - 1] {
-        cells.insert(IVec3::new(x, 0, tail + 1), 9);
-        cells.insert(IVec3::new(x, 1, tail), 9);
+
+    // The cabin is furnished entirely with canonical voxel cells: flight
+    // console, paired seats, side terminals, cargo lockers, and ceiling lamps.
+    cells.insert(IVec3::new(0, 1, -5), 10);
+    cells.insert(IVec3::new(0, 2, -5), 8);
+    for x in [-2, 2] {
+        cells.insert(IVec3::new(x, 1, -1), 9);
+        cells.insert(IVec3::new(x, 1, 2), 9);
     }
-    cells.insert(IVec3::new(0, 2, -2), 8);
-    cells.insert(IVec3::new(0, 1, nose), 7);
+    for x in [-(half_width - 1), half_width - 1] {
+        for z in -4..=0 {
+            cells.insert(IVec3::new(x, 1, z), 8);
+        }
+        for z in 3..=5 {
+            cells.insert(IVec3::new(x, 1, z), 10);
+        }
+    }
+    for z in [-3, 1, 5] {
+        cells.insert(IVec3::new(0, 5, z), 10);
+    }
+
+    // Twin engine pods and dorsal fins vary by hull while remaining connected
+    // to the main voxel body.
+    for x in [-2, 2] {
+        for z in tail - 1..=tail + 1 {
+            cells.insert(IVec3::new(x, 1, z), 9);
+            cells.insert(IVec3::new(x, 2, z), 8);
+        }
+    }
     if variant % 2 == 1 {
-        for z in -2..=2 {
+        for z in 0..=4 {
             cells.insert(IVec3::new(-wing_span, 1, z), 10);
             cells.insert(IVec3::new(wing_span, 1, z), 10);
+        }
+    }
+
+    // Keep the cockpit and central aisle genuinely hollow, then cut a broad
+    // aft hatch and extend a short boarding ramp into space.
+    for x in -1..=1 {
+        for y in 1..=4 {
+            for z in -3..=tail {
+                cells.remove(&IVec3::new(x, y, z));
+            }
+        }
+    }
+    for step in 1_i32..=3 {
+        let ramp_half_width = (3 - step).max(1);
+        for x in -ramp_half_width..=ramp_half_width {
+            cells.insert(
+                IVec3::new(x, 0, tail + step),
+                if x.abs() == ramp_half_width { 10 } else { 7 },
+            );
         }
     }
 
@@ -4336,6 +4433,29 @@ fn voxel_spaceship_driver_authorized(
         Some(pilot_user_id) => active_user_id == Some(pilot_user_id),
         None => active_user_id.is_none(),
     }
+}
+
+fn begin_voxel_spaceship_takeover(
+    ship_id: &str,
+    pilot_user_id: Option<u64>,
+    editor: &mut VoxelEditorState,
+    possession: &mut VoxelPossessionState,
+    control: &mut VoxelSpaceshipControlState,
+) {
+    control.driving_ship_id = Some(ship_id.to_owned());
+    control.selected_ship_id = Some(ship_id.to_owned());
+    control.exit_pending = false;
+    if let Some(user_id) = pilot_user_id {
+        possession.possess(user_id);
+    } else {
+        possession.release();
+    }
+    editor.camera_yaw = 0.0;
+    editor.camera_pitch = 0.0;
+    editor.first_person_enabled = true;
+    editor.creative_inventory_open = false;
+    editor.teleport_menu_open = false;
+    editor.first_person_cursor_released = true;
 }
 
 fn control_voxel_spaceships(
@@ -5304,20 +5424,13 @@ fn voxel_spaceship_panel(
                         )
                         .clicked()
                     {
-                        control.driving_ship_id = Some(selected.id.clone());
-                        control.exit_pending = false;
-                        control.selected_ship_id = Some(selected.id.clone());
-                        if let Some(user_id) = pilot_user_id {
-                            possession.possess(user_id);
-                        } else {
-                            possession.release();
-                        }
-                        voxel_editor.camera_yaw = 0.0;
-                        voxel_editor.camera_pitch = 0.0;
-                        voxel_editor.first_person_enabled = true;
-                        voxel_editor.creative_inventory_open = false;
-                        voxel_editor.teleport_menu_open = false;
-                        voxel_editor.first_person_cursor_released = true;
+                        begin_voxel_spaceship_takeover(
+                            &selected.id,
+                            pilot_user_id,
+                            &mut voxel_editor,
+                            &mut possession,
+                            &mut control,
+                        );
                     }
                 }
                 if ui
@@ -6751,6 +6864,85 @@ fn use_player_possession_tool(
             editor.physics_status = Some("没有瞄准玩家立绘".to_owned());
         },
     }
+}
+
+fn use_spaceship_possession_tool(
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
+    spaceships: Query<&VoxelSpaceship>,
+    spatial_query: SpatialQuery,
+    store: Res<Persistent<VoxelSpaceshipStore>>,
+    mut editor: ResMut<VoxelEditorState>,
+    mut possession: ResMut<VoxelPossessionState>,
+    mut control: ResMut<VoxelSpaceshipControlState>,
+    egui_input: Res<EguiWantsInput>,
+) {
+    if !spaceship_possession_tool_can_target(
+        editor.is_spaceship_possession_tool_equipped(),
+        possession.active_user_id,
+    ) || editor.creative_inventory_open
+        || !mouse.just_pressed(MouseButton::Right)
+        || egui_input.wants_any_pointer_input()
+    {
+        return;
+    }
+    let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single()) else {
+        return;
+    };
+    let Some(ray) = viewport_ray(
+        window,
+        camera,
+        camera_transform,
+        &editor,
+    ) else {
+        return;
+    };
+    let selected = spatial_query
+        .cast_ray_predicate(
+            ray.origin,
+            ray.direction,
+            MAX_RAY_DISTANCE,
+            true,
+            &SpatialQueryFilter::default(),
+            &|entity| spaceships.contains(entity),
+        )
+        .and_then(|hit| spaceships.get(hit.entity).ok())
+        .map(|ship| (ship.id.clone(), ship.name.clone()));
+
+    match selected {
+        Some((ship_id, ship_name))
+            if control.driving_ship_id.as_deref() == Some(ship_id.as_str()) =>
+        {
+            control.stop_driving();
+            editor.physics_status = Some(format!("已解除舰船 {ship_name} 的接管"));
+        },
+        Some((ship_id, ship_name)) => {
+            let pilot_user_id = store
+                .ships
+                .iter()
+                .find(|ship| ship.id == ship_id)
+                .and_then(|ship| ship.pilot_user_id);
+            begin_voxel_spaceship_takeover(
+                &ship_id,
+                pilot_user_id,
+                &mut editor,
+                &mut possession,
+                &mut control,
+            );
+            editor.physics_status = Some(pilot_user_id.map_or_else(
+                || format!("GM已接管舰船 {ship_name}"),
+                |user_id| format!("已让PL {user_id}接管舰船 {ship_name}"),
+            ));
+        },
+        None => {
+            editor.physics_status = Some("没有瞄准可驾驶舰船".to_owned());
+        },
+    }
+}
+
+fn spaceship_possession_tool_can_target(tool_equipped: bool, active_user_id: Option<u64>) -> bool {
+    tool_equipped && active_user_id.is_none()
 }
 
 fn possession_tool_can_target(tool_equipped: bool, active_user_id: Option<u64>) -> bool {
@@ -8561,7 +8753,10 @@ fn place_creative_light(
         mut editor,
         mut dirty_chunks,
     } = edit_runtime;
-    if possession.active_user_id.is_some() || editor.is_player_possession_tool_equipped() {
+    if possession.active_user_id.is_some()
+        || editor.is_player_possession_tool_equipped()
+        || editor.is_spaceship_possession_tool_equipped()
+    {
         return;
     }
     let Some(tool) = editor.light_tool else {
@@ -8853,6 +9048,7 @@ fn edit_voxel_grid(
     }
     if possession.active_user_id.is_some()
         || editor.is_player_possession_tool_equipped()
+        || editor.is_spaceship_possession_tool_equipped()
         || editor.is_teleport_tool_equipped()
     {
         return;

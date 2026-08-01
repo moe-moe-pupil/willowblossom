@@ -394,6 +394,18 @@ fn paint_voxel_creative_item_icon(
             thin_line((0.58, 0.0), (0.92, 0.0));
             thin_line((0.0, -0.92), (0.0, -0.68));
         },
+        VoxelCreativeItem::SpaceshipPossessionTool => {
+            line((0.0, -0.92), (-0.82, 0.38));
+            line((-0.82, 0.38), (-0.3, 0.24));
+            line((-0.3, 0.24), (-0.18, 0.82));
+            line((-0.18, 0.82), (0.18, 0.82));
+            line((0.18, 0.82), (0.3, 0.24));
+            line((0.3, 0.24), (0.82, 0.38));
+            line((0.82, 0.38), (0.0, -0.92));
+            box_outline((-0.18, -0.2), (0.18, 0.18));
+            dot(-0.48, 0.58, 0.09);
+            dot(0.48, 0.58, 0.09);
+        },
         VoxelCreativeItem::TeleportTool => {
             circle(0.0, 0.0, 0.76);
             circle(0.0, 0.0, 0.42);
@@ -547,6 +559,10 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
         VoxelCreativeItem::PlayerPossessionTool => (
             "PL接管器",
             egui::Color32::from_rgb(116, 82, 238),
+        ),
+        VoxelCreativeItem::SpaceshipPossessionTool => (
+            "舰船接管器",
+            egui::Color32::from_rgb(38, 166, 205),
         ),
         VoxelCreativeItem::TeleportTool => (
             "传送器",
@@ -14944,6 +14960,30 @@ pub fn ui_system(
                                     .clicked()
                                     {
                                         picked_item = Some(possession_tool);
+                                    }
+                                    ui.small(name);
+                                });
+                                let spaceship_tool =
+                                    VoxelCreativeItem::SpaceshipPossessionTool;
+                                let (name, _) = voxel_creative_item_visual(spaceship_tool);
+                                ui.vertical_centered(|ui| {
+                                    if voxel_creative_drag_source(
+                                        ui,
+                                        egui::Id::new("voxel_catalog_spaceship_possession_tool"),
+                                        VoxelCreativeDragPayload::Catalog(spaceship_tool),
+                                        spaceship_tool,
+                                        voxel_editor.creative_hotbar
+                                            [voxel_editor.selected_hotbar_slot]
+                                            == Some(spaceship_tool),
+                                        48.0,
+                                        None,
+                                    )
+                                    .on_hover_text(
+                                        "GM右键舰船体素即可接管驾驶；已分配舰船会切换到对应PL身份",
+                                    )
+                                    .clicked()
+                                    {
+                                        picked_item = Some(spaceship_tool);
                                     }
                                     ui.small(name);
                                 });
