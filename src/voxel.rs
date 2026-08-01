@@ -3282,17 +3282,18 @@ fn add_space_station_docking_areas(
 
 
 fn populate_default_grid(grid: &mut Mut<Grid<u8>>) {
-    for (center, design) in workbook_orbital_locations() {
+    for (center, design) in static_workbook_orbital_locations() {
         build_workbook_orbital_location(grid, center, design);
         add_space_station_docking_areas(grid, center, design);
     }
-    for door in voxel_auto_doors() {
+    for door in static_voxel_auto_doors() {
         for cell in door.cells {
             grid.set(cell, 0);
         }
     }
 }
 
+#[cfg(test)]
 fn workbook_orbital_locations() -> [(IVec3, WorkbookMapDesign); 5] {
     [
         (RESEARCH_STATION_CENTER, NIFFY),
@@ -4110,6 +4111,7 @@ fn workbook_micro_tiles(
     tiles
 }
 
+#[cfg(test)]
 fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
     let mut doors = Vec::new();
     for (center, design) in workbook_orbital_locations() {
@@ -4715,7 +4717,10 @@ fn combat_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
 }
 
 fn remove_static_combat_spaceship(grid: &mut Mut<Grid<u8>>) {
-    for (cell, _) in combat_spaceship_voxel_cells() {
+    // Old scene snapshots contain the original 1x workbook hull in the static
+    // grid. The enlarged 3x carrier is a separate dynamic VoxelSpaceship, so
+    // remove the legacy workbook cells rather than subtracting its new shape.
+    for (cell, _) in original_combat_spaceship_voxel_cells() {
         grid.set(COMBAT_SPACESHIP_CENTER + cell, 0);
     }
 }
@@ -14043,7 +14048,7 @@ mod tests {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
 
-        for (center, design) in workbook_orbital_locations() {
+        for (center, design) in static_workbook_orbital_locations() {
             let spawn = center + IVec3::new(design.spawn[0], 0, design.spawn[1]);
             assert!(
                 matches!(grid.get(spawn).copied(), Some(2 | 7)),
@@ -14079,6 +14084,42 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn legacy_static_arrogance_is_removed_and_only_the_enlarged_carrier_is_controllable() {
+        let original = original_combat_spaceship_voxel_cells();
+        let mut world = World::new();
+        let grid_entity = world.spawn(Grid::<u8>::new()).id();
+        {
+            let mut entity = world.entity_mut(grid_entity);
+            let mut grid = entity.get_mut::<Grid<u8>>().unwrap();
+            for (cell, material) in &original {
+                grid.set(COMBAT_SPACESHIP_CENTER + *cell, *material);
+            }
+            assert!(original.iter().all(|(cell, material)| {
+                grid.get(COMBAT_SPACESHIP_CENTER + *cell).copied() == Some(*material)
+            }));
+            remove_static_combat_spaceship(&mut grid);
+        }
+        let grid = world.entity(grid_entity).get::<Grid<u8>>().unwrap();
+        assert!(original.iter().all(|(cell, _)| {
+            !grid
+                .get(COMBAT_SPACESHIP_CENTER + *cell)
+                .is_some_and(TrpgVoxelConnector::solid)
+        }));
+
+        let specs = default_voxel_spaceship_specs();
+        let carriers = specs
+            .iter()
+            .filter(|spec| spec.ship.id == COMBAT_SPACESHIP_ID)
+            .collect::<Vec<_>>();
+        assert_eq!(carriers.len(), 1);
+        assert_eq!(carriers[0].ship.name, "U.S.I 狂妄号");
+        assert!(carriers[0].docking.is_none());
+        assert_eq!(carriers[0].cells, combat_spaceship_voxel_cells());
+        assert!(carriers[0].cells.len() > original.len());
+    }
+
 
     #[test]
     fn space_station_docks_are_separated_open_and_fit_medium_ships() {
