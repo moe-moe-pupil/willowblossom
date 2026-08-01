@@ -158,9 +158,10 @@ const ORBITAL_PLANET_CAP_RADIUS: i32 = 128;
 const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const VOXEL_SCENE_AUTOSAVE_SECONDS: f32 = 30.0;
-const VOXEL_SCENE_LAYOUT_REVISION: u32 = 2;
+const VOXEL_SCENE_LAYOUT_REVISION: u32 = 3;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
 const VOXEL_MATERIAL_COUNT: usize = 10;
+const MICRO_TILE_SUBDIVISIONS: u32 = 16;
 const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
 const VOXEL_RADIANCE_VOLUME_DIMENSION: i32 = 96;
 const VOXEL_RADIANCE_REBUILD_STEP: i32 = 16;
@@ -463,6 +464,35 @@ struct VoxelGeometry {
     chunk: IVec3,
 }
 
+#[derive(Component)]
+struct VoxelMicroDecoration;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VoxelMicroTileKind {
+    Hull,
+    Fixture,
+}
+
+/// A render-only box measured in sixteenths of one canonical voxel.
+///
+/// `owner` is always a canonical gameplay cell. Removing that cell removes the
+/// detail on the next chunk rebuild; micro tiles never create a second editing,
+/// collision, persistence, or raycast grid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VoxelMicroTile {
+    owner: IVec3,
+    cell: IVec3,
+    min: UVec3,
+    max: UVec3,
+    material: u8,
+    kind: VoxelMicroTileKind,
+}
+
+#[derive(Resource, Clone, Debug, Default)]
+struct VoxelMicroDecorations {
+    tiles: Vec<VoxelMicroTile>,
+}
+
 #[derive(Resource, Default)]
 struct VoxelGeometryDirtyChunks {
     chunks: HashSet<IVec3>,
@@ -535,6 +565,7 @@ struct VoxelSpaceship {
 struct VoxelSpaceshipSpec {
     ship: VoxelSpaceship,
     cells: Vec<(IVec3, u8)>,
+    micro_tiles: Vec<VoxelMicroTile>,
     transform: Transform,
 }
 
@@ -1792,6 +1823,7 @@ impl Plugin for TrpgVoxelPlugin {
         // sufficient and avoids repeating the solver when explosions create many fragments.
         .insert_resource(SubstepCount(TRPG_PHYSICS_SUBSTEPS))
         .insert_resource(Gravity::ZERO)
+        .insert_resource(static_workbook_micro_decorations())
         .init_resource::<VoxelEditorState>()
         .init_resource::<VoxelPossessionState>()
         .init_resource::<VoxelTargetingPreview>()
@@ -2858,21 +2890,46 @@ fn static_workbook_orbital_locations() -> [(IVec3, WorkbookMapDesign); 4] {
     ]
 }
 
+fn static_workbook_micro_decorations() -> VoxelMicroDecorations {
+    let mut tiles = Vec::new();
+    for (center, design) in static_workbook_orbital_locations() {
+        let decoded = design.decode();
+        tiles.extend(
+            workbook_micro_tiles(design, &decoded)
+                .into_iter()
+                .map(|mut tile| {
+                    tile.owner += center;
+                    tile.cell += center;
+                    tile
+                }),
+        );
+    }
+    VoxelMicroDecorations { tiles }
+}
+
 fn workbook_fixture(style: u8) -> Option<(u8, i32)> {
     Some(match style {
         13 => (10, 3),
-        16 => (9, 2),
-        17 | 18 => (3, 2),
-        25 => (8, 2),
         26 => (4, 1),
-        27 => (8, 1),
-        32 => (1, 1),
         33 => (6, WORKBOOK_ROOM_HEIGHT - 1),
         34 => (7, WORKBOOK_ROOM_HEIGHT - 1),
         35 | 36 => (6, WORKBOOK_ROOM_HEIGHT - 1),
         37 => (9, 4),
         38 => (5, 3),
         _ => return None,
+    })
+}
+
+fn workbook_planet_fixture(style: u8) -> Option<(u8, i32)> {
+    workbook_fixture(style).or_else(|| {
+        Some(match style {
+            16 => (9, 2),
+            17 | 18 => (3, 2),
+            25 => (8, 2),
+            27 => (8, 1),
+            32 => (1, 1),
+            _ => return None,
+        })
     })
 }
 
@@ -2914,9 +2971,6 @@ fn build_workbook_orbital_location(
         for y in 1..=height {
             grid.set(base + IVec3::Y * y, material);
         }
-    }
-    for (cell, material) in workbook_hull_cells(design, &decoded) {
-        grid.set(center + cell, material);
     }
 }
 
@@ -2989,464 +3043,544 @@ fn workbook_hull_palette(style: WorkbookHullStyle) -> WorkbookHullPalette {
     }
 }
 
-fn workbook_hull_cells(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum WorkbookFeatureKind {
+    ControlConsole = 1,
+    EnergyPlatform = 2,
+    SupplyRack = 3,
+    ArmorLocker = 4,
+    CargoRack = 5,
+    OutpostTerminal = 6,
+    EscapePod = 7,
+    ThermiteFactory = 8,
+    Teleporter = 9,
+    MedicalAnalyzer = 10,
+    Furniture = 11,
+    ExperimentBench = 12,
+    Crate = 13,
+    RadarConsole = 14,
+    InstrumentPanel = 15,
+}
+
+impl WorkbookFeatureKind {
+    fn from_id(id: u8) -> Option<Self> {
+        Some(match id {
+            1 => Self::ControlConsole,
+            2 => Self::EnergyPlatform,
+            3 => Self::SupplyRack,
+            4 => Self::ArmorLocker,
+            5 => Self::CargoRack,
+            6 => Self::OutpostTerminal,
+            7 => Self::EscapePod,
+            8 => Self::ThermiteFactory,
+            9 => Self::Teleporter,
+            10 => Self::MedicalAnalyzer,
+            11 => Self::Furniture,
+            12 => Self::ExperimentBench,
+            13 => Self::Crate,
+            14 => Self::RadarConsole,
+            15 => Self::InstrumentPanel,
+            _ => return None,
+        })
+    }
+
+    #[cfg(test)]
+    fn workbook_label(self) -> &'static str {
+        match self {
+            Self::ControlConsole => "控制台",
+            Self::EnergyPlatform => "能量台",
+            Self::SupplyRack => "补给品",
+            Self::ArmorLocker => "防护服",
+            Self::CargoRack => "集装货物",
+            Self::OutpostTerminal => "前哨站",
+            Self::EscapePod => "逃生舱",
+            Self::ThermiteFactory => "热熔炸弹工厂",
+            Self::Teleporter => "传送门",
+            Self::MedicalAnalyzer => "验血 / GIT",
+            Self::Furniture => "桌椅",
+            Self::ExperimentBench => "实验品",
+            Self::Crate => "木箱",
+            Self::RadarConsole => "雷达控制台",
+            Self::InstrumentPanel => "仪表",
+        }
+    }
+}
+
+fn push_micro_box(
+    tiles: &mut Vec<VoxelMicroTile>,
+    owner: IVec3,
+    cell: IVec3,
+    min: [u32; 3],
+    max: [u32; 3],
+    material: u8,
+    kind: VoxelMicroTileKind,
+) {
+    let min = UVec3::from_array(min);
+    let max = UVec3::from_array(max);
+    debug_assert!(min.cmplt(max).all());
+    debug_assert!(max.cmpge(UVec3::splat(1)).all());
+    debug_assert!(max.cmple(UVec3::splat(MICRO_TILE_SUBDIVISIONS)).all());
+    debug_assert!((1..=VOXEL_MATERIAL_COUNT as u8).contains(&material));
+    tiles.push(VoxelMicroTile {
+        owner,
+        cell,
+        min,
+        max,
+        material,
+        kind,
+    });
+}
+
+fn push_fixture_box(
+    tiles: &mut Vec<VoxelMicroTile>,
+    owner: IVec3,
+    height_cell: i32,
+    min: [u32; 3],
+    max: [u32; 3],
+    material: u8,
+) {
+    push_micro_box(
+        tiles,
+        owner,
+        owner + IVec3::Y * height_cell,
+        min,
+        max,
+        material,
+        VoxelMicroTileKind::Fixture,
+    );
+}
+
+fn workbook_feature_floor_material(kind: WorkbookFeatureKind) -> u8 {
+    match kind {
+        WorkbookFeatureKind::ControlConsole => 7,
+        WorkbookFeatureKind::EnergyPlatform => 8,
+        WorkbookFeatureKind::SupplyRack => 3,
+        WorkbookFeatureKind::ArmorLocker => 6,
+        WorkbookFeatureKind::CargoRack => 3,
+        WorkbookFeatureKind::OutpostTerminal => 9,
+        WorkbookFeatureKind::EscapePod => 7,
+        WorkbookFeatureKind::ThermiteFactory => 5,
+        WorkbookFeatureKind::Teleporter => 8,
+        WorkbookFeatureKind::MedicalAnalyzer => 3,
+        WorkbookFeatureKind::Furniture => 3,
+        WorkbookFeatureKind::ExperimentBench => 1,
+        WorkbookFeatureKind::Crate => 3,
+        WorkbookFeatureKind::RadarConsole => 8,
+        WorkbookFeatureKind::InstrumentPanel => 9,
+    }
+}
+
+fn workbook_feature_fixture_spacing(kind: WorkbookFeatureKind) -> usize {
+    match kind {
+        WorkbookFeatureKind::EnergyPlatform
+        | WorkbookFeatureKind::Teleporter => 4,
+        WorkbookFeatureKind::ControlConsole
+        | WorkbookFeatureKind::OutpostTerminal
+        | WorkbookFeatureKind::ThermiteFactory
+        | WorkbookFeatureKind::MedicalAnalyzer
+        | WorkbookFeatureKind::Furniture
+        | WorkbookFeatureKind::RadarConsole
+        | WorkbookFeatureKind::InstrumentPanel => 3,
+        WorkbookFeatureKind::SupplyRack
+        | WorkbookFeatureKind::ArmorLocker
+        | WorkbookFeatureKind::CargoRack
+        | WorkbookFeatureKind::EscapePod
+        | WorkbookFeatureKind::ExperimentBench
+        | WorkbookFeatureKind::Crate => 2,
+    }
+}
+
+fn add_workbook_feature_floor_micro_tile(
+    tiles: &mut Vec<VoxelMicroTile>,
+    owner: IVec3,
+    kind: WorkbookFeatureKind,
+) {
+    push_fixture_box(
+        tiles,
+        owner,
+        1,
+        [1, 0, 1],
+        [15, 1, 15],
+        workbook_feature_floor_material(kind),
+    );
+}
+
+fn add_workbook_fixture_micro_tiles(
+    tiles: &mut Vec<VoxelMicroTile>,
+    owner: IVec3,
+    kind: WorkbookFeatureKind,
+) {
+    match kind {
+        WorkbookFeatureKind::ControlConsole => {
+            push_fixture_box(tiles, owner, 1, [1, 0, 2], [15, 3, 14], 7);
+            push_fixture_box(tiles, owner, 1, [2, 3, 5], [14, 10, 14], 6);
+            push_fixture_box(tiles, owner, 1, [3, 7, 2], [13, 14, 5], 8);
+            push_fixture_box(tiles, owner, 1, [5, 11, 1], [7, 13, 2], 9);
+            push_fixture_box(tiles, owner, 1, [9, 11, 1], [11, 13, 2], 5);
+        },
+        WorkbookFeatureKind::EnergyPlatform => {
+            push_fixture_box(tiles, owner, 1, [0, 0, 0], [16, 2, 16], 7);
+            push_fixture_box(tiles, owner, 1, [1, 2, 6], [15, 4, 10], 8);
+            push_fixture_box(tiles, owner, 1, [6, 2, 1], [10, 4, 15], 8);
+            push_fixture_box(tiles, owner, 1, [6, 4, 6], [10, 15, 10], 9);
+        },
+        WorkbookFeatureKind::SupplyRack => {
+            push_fixture_box(tiles, owner, 1, [1, 0, 13], [15, 16, 15], 7);
+            push_fixture_box(tiles, owner, 2, [1, 0, 13], [15, 14, 15], 7);
+            for shelf_y in [2, 8, 14] {
+                push_fixture_box(tiles, owner, 1, [1, shelf_y, 2], [15, shelf_y + 2, 15], 6);
+            }
+            push_fixture_box(tiles, owner, 1, [2, 4, 3], [7, 8, 12], 3);
+            push_fixture_box(tiles, owner, 1, [9, 4, 3], [14, 8, 12], 9);
+            push_fixture_box(tiles, owner, 1, [3, 10, 3], [13, 14, 12], 10);
+        },
+        WorkbookFeatureKind::ArmorLocker => {
+            push_fixture_box(tiles, owner, 1, [2, 0, 2], [14, 16, 14], 6);
+            push_fixture_box(tiles, owner, 2, [2, 0, 2], [14, 12, 14], 6);
+            push_fixture_box(tiles, owner, 1, [4, 3, 1], [12, 14, 2], 7);
+            push_fixture_box(tiles, owner, 2, [4, 1, 1], [12, 9, 2], 8);
+            push_fixture_box(tiles, owner, 2, [11, 5, 0], [13, 7, 1], 9);
+        },
+        WorkbookFeatureKind::CargoRack => {
+            push_fixture_box(tiles, owner, 1, [1, 0, 1], [15, 14, 15], 3);
+            for x in [2, 7, 12] {
+                push_fixture_box(tiles, owner, 1, [x, 1, 0], [x + 2, 13, 1], 7);
+            }
+            push_fixture_box(tiles, owner, 1, [1, 5, 0], [15, 7, 1], 7);
+            push_fixture_box(tiles, owner, 1, [1, 11, 0], [15, 13, 1], 7);
+        },
+        WorkbookFeatureKind::OutpostTerminal => {
+            push_fixture_box(tiles, owner, 1, [1, 0, 1], [15, 3, 15], 9);
+            push_fixture_box(tiles, owner, 1, [3, 3, 5], [13, 12, 14], 6);
+            push_fixture_box(tiles, owner, 1, [4, 7, 2], [12, 14, 5], 8);
+            push_fixture_box(tiles, owner, 2, [7, 0, 7], [9, 12, 9], 7);
+            push_fixture_box(tiles, owner, 2, [4, 10, 4], [12, 12, 12], 8);
+        },
+        WorkbookFeatureKind::EscapePod => {
+            push_fixture_box(tiles, owner, 1, [2, 0, 3], [14, 16, 13], 7);
+            push_fixture_box(tiles, owner, 2, [2, 0, 3], [14, 16, 13], 6);
+            push_fixture_box(tiles, owner, 3, [4, 0, 5], [12, 8, 11], 7);
+            push_fixture_box(tiles, owner, 2, [4, 3, 2], [12, 13, 3], 8);
+            push_fixture_box(tiles, owner, 1, [5, 5, 2], [7, 8, 3], 5);
+        },
+        WorkbookFeatureKind::ThermiteFactory => {
+            push_fixture_box(tiles, owner, 1, [1, 0, 1], [15, 5, 15], 7);
+            push_fixture_box(tiles, owner, 1, [2, 5, 3], [7, 16, 13], 6);
+            push_fixture_box(tiles, owner, 1, [9, 5, 3], [14, 16, 13], 6);
+            push_fixture_box(tiles, owner, 2, [3, 0, 4], [6, 13, 12], 5);
+            push_fixture_box(tiles, owner, 2, [10, 0, 4], [13, 13, 12], 5);
+            push_fixture_box(tiles, owner, 1, [7, 8, 7], [9, 11, 9], 9);
+        },
+        WorkbookFeatureKind::Teleporter => {
+            push_fixture_box(tiles, owner, 1, [0, 0, 0], [16, 2, 16], 7);
+            push_fixture_box(tiles, owner, 1, [2, 2, 2], [14, 4, 14], 8);
+            for (x, z) in [(1, 1), (12, 1), (1, 12), (12, 12)] {
+                push_fixture_box(tiles, owner, 1, [x, 4, z], [x + 3, 16, z + 3], 9);
+                push_fixture_box(tiles, owner, 2, [x, 0, z], [x + 3, 14, z + 3], 8);
+            }
+        },
+        WorkbookFeatureKind::MedicalAnalyzer => {
+            push_fixture_box(tiles, owner, 1, [0, 0, 1], [16, 3, 15], 6);
+            push_fixture_box(tiles, owner, 1, [2, 3, 4], [14, 7, 14], 3);
+            push_fixture_box(tiles, owner, 1, [2, 7, 12], [14, 16, 15], 7);
+            push_fixture_box(tiles, owner, 2, [2, 0, 12], [14, 10, 15], 7);
+            push_fixture_box(tiles, owner, 2, [3, 1, 11], [13, 8, 12], 8);
+            for x in [4, 7, 10] {
+                push_fixture_box(tiles, owner, 2, [x, 3, 10], [x + 1, 6, 11], 5);
+            }
+        },
+        WorkbookFeatureKind::Furniture => {
+            for (x, z) in [(2, 2), (11, 2), (2, 11), (11, 11)] {
+                push_fixture_box(tiles, owner, 1, [x, 0, z], [x + 3, 10, z + 3], 3);
+            }
+            push_fixture_box(tiles, owner, 1, [1, 9, 1], [15, 12, 15], 3);
+            push_fixture_box(tiles, owner, 1, [5, 3, 0], [11, 8, 3], 7);
+        },
+        WorkbookFeatureKind::ExperimentBench => {
+            push_fixture_box(tiles, owner, 1, [1, 0, 2], [4, 10, 14], 7);
+            push_fixture_box(tiles, owner, 1, [12, 0, 2], [15, 10, 14], 7);
+            push_fixture_box(tiles, owner, 1, [1, 9, 1], [15, 12, 15], 6);
+            push_fixture_box(tiles, owner, 1, [3, 12, 4], [7, 16, 9], 8);
+            push_fixture_box(tiles, owner, 2, [9, 0, 5], [13, 8, 11], 1);
+        },
+        WorkbookFeatureKind::Crate => {
+            push_fixture_box(tiles, owner, 1, [1, 0, 1], [15, 14, 15], 3);
+            for x in [1, 7, 13] {
+                push_fixture_box(tiles, owner, 1, [x, 1, 0], [x + 2, 13, 1], 7);
+            }
+            push_fixture_box(tiles, owner, 1, [1, 5, 0], [15, 7, 1], 7);
+            push_fixture_box(tiles, owner, 1, [1, 11, 0], [15, 13, 1], 7);
+        },
+        WorkbookFeatureKind::RadarConsole => {
+            push_fixture_box(tiles, owner, 1, [1, 0, 1], [15, 3, 15], 7);
+            push_fixture_box(tiles, owner, 1, [3, 3, 6], [13, 11, 14], 6);
+            push_fixture_box(tiles, owner, 1, [4, 7, 3], [12, 14, 6], 8);
+            push_fixture_box(tiles, owner, 2, [7, 0, 7], [9, 12, 9], 9);
+            push_fixture_box(tiles, owner, 2, [3, 9, 7], [13, 11, 9], 8);
+        },
+        WorkbookFeatureKind::InstrumentPanel => {
+            push_fixture_box(tiles, owner, 1, [1, 0, 10], [15, 16, 15], 7);
+            push_fixture_box(tiles, owner, 2, [1, 0, 10], [15, 10, 15], 6);
+            push_fixture_box(tiles, owner, 1, [3, 5, 9], [6, 8, 10], 8);
+            push_fixture_box(tiles, owner, 1, [8, 5, 9], [10, 8, 10], 5);
+            push_fixture_box(tiles, owner, 1, [12, 5, 9], [14, 8, 10], 9);
+        },
+    }
+}
+
+fn workbook_cell_is_exterior(
     design: WorkbookMapDesign,
     decoded: &DecodedWorkbookMap,
-) -> Vec<(IVec3, u8)> {
-    let style = workbook_hull_style(design);
-    let palette = workbook_hull_palette(style);
-    let mut cells = HashMap::new();
+    sheet_x: i32,
+    sheet_z: i32,
+) -> bool {
+    sheet_x < 0
+        || sheet_z < 0
+        || sheet_x >= design.width as i32
+        || sheet_z >= design.height as i32
+        || decoded.exterior[sheet_z as usize * design.width + sheet_x as usize]
+}
+
+fn add_workbook_hull_micro_tiles(
+    tiles: &mut Vec<VoxelMicroTile>,
+    design: WorkbookMapDesign,
+    decoded: &DecodedWorkbookMap,
+) {
+    let palette = workbook_hull_palette(workbook_hull_style(design));
     let directions = [
         (IVec3::NEG_X, -1, 0),
         (IVec3::X, 1, 0),
         (IVec3::NEG_Z, 0, -1),
         (IVec3::Z, 0, 1),
     ];
+    for (index, style) in decoded.styles.iter().copied().enumerate() {
+        let sheet_x = (index % design.width) as i32;
+        let sheet_z = (index / design.width) as i32;
+        let [x, z] = design.centered_offset(index);
+        let base = IVec3::new(x, 0, z);
 
-    // Preserve the exact workbook outline, but give every exposed wall the
-    // layered shell, window bands, armor, and ribs used by the previous map.
-    for (index, cell_style) in decoded.styles.iter().copied().enumerate() {
-        if !matches!(cell_style, 11 | 15) {
+        if decoded.enclosed[index]
+            && (x.rem_euclid(palette.rib_spacing) == 0
+                || z.rem_euclid(palette.rib_spacing) == 0)
+        {
+            let (min, max) = if x.rem_euclid(palette.rib_spacing) == 0 {
+                ([7, 0, 0], [9, 1, 16])
+            } else {
+                ([0, 0, 7], [16, 1, 9])
+            };
+            push_micro_box(
+                tiles,
+                base + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
+                base + IVec3::Y * (WORKBOOK_ROOM_HEIGHT + 1),
+                min,
+                max,
+                palette.trim,
+                VoxelMicroTileKind::Hull,
+            );
+        }
+
+        if !matches!(style, 11 | 15) {
             continue;
         }
-        let sheet_x = index % design.width;
-        let sheet_z = index / design.width;
-        let [local_x, local_z] = design.centered_offset(index);
-        let wall = cell_style == 11;
         for (direction, dx, dz) in directions {
-            let neighbor_x = sheet_x as i32 + dx;
-            let neighbor_z = sheet_z as i32 + dz;
-            let exterior = if neighbor_x < 0
-                || neighbor_z < 0
-                || neighbor_x >= design.width as i32
-                || neighbor_z >= design.height as i32
-            {
-                true
-            } else {
-                decoded.exterior[neighbor_z as usize * design.width + neighbor_x as usize]
-            };
-            if !exterior {
+            if !workbook_cell_is_exterior(
+                design,
+                decoded,
+                sheet_x + dx,
+                sheet_z + dz,
+            ) {
                 continue;
             }
-
-            let outside = IVec3::new(local_x + dx, 0, local_z + dz);
-            let longitudinal = if dx != 0 { local_z } else { local_x };
+            let longitudinal = if dx != 0 { z } else { x };
             let pattern = longitudinal.rem_euclid(palette.rib_spacing);
             let rib = pattern == 0;
-            if wall {
-                cells.insert(outside, palette.hull);
-                for y in 1..WORKBOOK_ROOM_HEIGHT {
-                    let material = if matches!(y, 3 | 4)
-                        && matches!(pattern, 4 | 5)
-                    {
+            let thickness = if rib { 4 } else { 2 };
+            let (min, max) = match direction {
+                IVec3::NEG_X => ([16 - thickness, 0, 0], [16, 16, 16]),
+                IVec3::X => ([0, 0, 0], [thickness, 16, 16]),
+                IVec3::NEG_Z => ([0, 0, 16 - thickness], [16, 16, 16]),
+                IVec3::Z => ([0, 0, 0], [16, 16, thickness]),
+                _ => unreachable!(),
+            };
+            let outside = base + direction;
+            if style == 11 {
+                for y in 0..=WORKBOOK_ROOM_HEIGHT {
+                    let material = if matches!(y, 3 | 4) && matches!(pattern, 4 | 5) {
                         palette.window
                     } else if y == 1 || y == WORKBOOK_ROOM_HEIGHT - 1 {
                         palette.trim
                     } else if y == 2 && pattern == 7 {
                         palette.armor
+                    } else if rib {
+                        palette.trim
                     } else {
                         palette.hull
                     };
-                    cells.insert(outside + IVec3::Y * y, material);
-                }
-                cells.insert(
-                    outside + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
-                    palette.hull,
-                );
-                cells.insert(
-                    IVec3::new(local_x, WORKBOOK_ROOM_HEIGHT + 1, local_z),
-                    if rib { palette.armor } else { palette.trim },
-                );
-                if rib {
-                    let outer_rib = outside + direction;
-                    for y in 0..=WORKBOOK_ROOM_HEIGHT {
-                        cells.insert(
-                            outer_rib + IVec3::Y * y,
-                            if y == 3 { palette.armor } else { palette.trim },
-                        );
-                    }
+                    push_micro_box(
+                        tiles,
+                        base + IVec3::Y * y,
+                        outside + IVec3::Y * y,
+                        min,
+                        max,
+                        material,
+                        VoxelMicroTileKind::Hull,
+                    );
                 }
             } else {
-                // Keep exterior doors usable while extending their threshold
-                // and canopy through the thicker shell.
-                cells.insert(outside, 2);
-                cells.insert(
-                    outside + IVec3::Y * (WORKBOOK_ROOM_HEIGHT - 1),
-                    palette.trim,
-                );
-                cells.insert(
-                    outside + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
-                    palette.trim,
-                );
-            }
-        }
-    }
-
-    match style {
-        WorkbookHullStyle::ResearchStation => {
-            let crown_anchor =
-                workbook_roof_anchor(design, decoded, IVec2::new(14, 10));
-            add_workbook_roof_crown(
-                &mut cells,
-                crown_anchor,
-                IVec2::new(14, 10),
-                8,
-                palette,
-            );
-            add_workbook_sensor_mast(
-                &mut cells,
-                crown_anchor + IVec3::Y * 17,
-                11,
-                7,
-                palette,
-            );
-        },
-        WorkbookHullStyle::SensorStation => {
-            let crown_anchor =
-                workbook_roof_anchor(design, decoded, IVec2::new(12, 12));
-            add_workbook_roof_crown(
-                &mut cells,
-                crown_anchor,
-                IVec2::new(12, 12),
-                7,
-                palette,
-            );
-            add_workbook_sensor_mast(
-                &mut cells,
-                crown_anchor + IVec3::Y * 16,
-                18,
-                11,
-                palette,
-            );
-        },
-        WorkbookHullStyle::CannonStation => {
-            let crown_anchor =
-                workbook_roof_anchor(design, decoded, IVec2::new(14, 9));
-            add_workbook_roof_crown(
-                &mut cells,
-                crown_anchor,
-                IVec2::new(14, 9),
-                7,
-                palette,
-            );
-            add_workbook_cannon_hull(
-                &mut cells,
-                design,
-                crown_anchor,
-                palette,
-            );
-        },
-        WorkbookHullStyle::CombatCruiser => {
-            let crown_anchor =
-                workbook_roof_anchor(design, decoded, IVec2::new(20, 5));
-            add_workbook_roof_crown(
-                &mut cells,
-                crown_anchor,
-                IVec2::new(20, 5),
-                5,
-                palette,
-            );
-            add_workbook_cruiser_hull(
-                &mut cells,
-                design,
-                decoded,
-                palette,
-            );
-        },
-        WorkbookHullStyle::AbandonedStation => {
-            add_workbook_abandoned_hull(&mut cells, palette);
-        },
-    }
-
-    let mut cells = cells.into_iter().collect::<Vec<_>>();
-    cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
-    cells
-}
-
-fn workbook_roof_anchor(
-    design: WorkbookMapDesign,
-    decoded: &DecodedWorkbookMap,
-    half_size: IVec2,
-) -> IVec3 {
-    let stride = design.width + 1;
-    let mut prefix = vec![0_usize; stride * (design.height + 1)];
-    for z in 0..design.height {
-        let mut row_sum = 0;
-        for x in 0..design.width {
-            let index = z * design.width + x;
-            row_sum += usize::from(
-                decoded.enclosed[index]
-                    || matches!(decoded.styles[index], 11 | 15),
-            );
-            prefix[(z + 1) * stride + x + 1] =
-                prefix[z * stride + x + 1] + row_sum;
-        }
-    }
-
-    let half_width = half_size.x as usize;
-    let half_depth = half_size.y as usize;
-    let center_x = (design.width - 1) / 2;
-    let center_z = (design.height - 1) / 2;
-    let mut best = (0_usize, usize::MAX, center_x, center_z);
-    for z in half_depth..design.height.saturating_sub(half_depth) {
-        for x in half_width..design.width.saturating_sub(half_width) {
-            let min_x = x - half_width;
-            let max_x = x + half_width + 1;
-            let min_z = z - half_depth;
-            let max_z = z + half_depth + 1;
-            let supported = prefix[max_z * stride + max_x]
-                + prefix[min_z * stride + min_x]
-                - prefix[min_z * stride + max_x]
-                - prefix[max_z * stride + min_x];
-            let center_distance =
-                x.abs_diff(center_x).pow(2) + z.abs_diff(center_z).pow(2);
-            if supported > best.0
-                || (supported == best.0 && center_distance < best.1)
-            {
-                best = (supported, center_distance, x, z);
-            }
-        }
-    }
-    let index = best.3 * design.width + best.2;
-    let [x, z] = design.centered_offset(index);
-    IVec3::new(x, 0, z)
-}
-
-fn add_workbook_roof_crown(
-    cells: &mut HashMap<IVec3, u8>,
-    center: IVec3,
-    half_size: IVec2,
-    height: i32,
-    palette: WorkbookHullPalette,
-) {
-    let base_y = WORKBOOK_ROOM_HEIGHT + 1;
-    let top_y = base_y + height;
-    for x in -half_size.x..=half_size.x {
-        for z in -half_size.y..=half_size.y {
-            for y in base_y..=top_y {
-                let side = x.abs() == half_size.x || z.abs() == half_size.y;
-                if y != base_y && y != top_y && !side {
-                    continue;
-                }
-                let corner = x.abs() == half_size.x && z.abs() == half_size.y;
-                let material = if side
-                    && !corner
-                    && (base_y + 3..=base_y + 5).contains(&y)
-                    && (x + z).rem_euclid(5) != 0
-                {
-                    palette.window
-                } else if y == base_y || y == top_y || corner {
-                    palette.trim
-                } else {
-                    palette.hull
+                // A thin sill and canopy preserve the automatic door opening.
+                let (sill_min, sill_max) = match direction {
+                    IVec3::NEG_X | IVec3::X => (
+                        [min[0], 0, 1],
+                        [max[0], 2, 15],
+                    ),
+                    _ => ([1, 0, min[2]], [15, 2, max[2]]),
                 };
-                cells.insert(center + IVec3::new(x, y, z), material);
-            }
-        }
-    }
-}
-
-fn add_workbook_sensor_mast(
-    cells: &mut HashMap<IVec3, u8>,
-    base: IVec3,
-    height: i32,
-    arm_length: i32,
-    palette: WorkbookHullPalette,
-) {
-    for y in 0..=height {
-        cells.insert(base + IVec3::Y * y, palette.trim);
-        if y > 0 && y % 5 == 0 {
-            for offset in -arm_length..=arm_length {
-                cells.insert(
-                    base + IVec3::new(offset, y, 0),
-                    if offset.abs() == arm_length {
-                        palette.window
-                    } else {
-                        palette.armor
-                    },
+                push_micro_box(
+                    tiles,
+                    base,
+                    outside,
+                    sill_min,
+                    sill_max,
+                    palette.trim,
+                    VoxelMicroTileKind::Hull,
                 );
-                cells.insert(
-                    base + IVec3::new(0, y, offset),
-                    if offset.abs() == arm_length {
-                        palette.window
-                    } else {
-                        palette.armor
-                    },
+                push_micro_box(
+                    tiles,
+                    base + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
+                    outside + IVec3::Y * (WORKBOOK_ROOM_HEIGHT - 1),
+                    min,
+                    max,
+                    palette.trim,
+                    VoxelMicroTileKind::Hull,
+                );
+                push_micro_box(
+                    tiles,
+                    base + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
+                    outside + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
+                    min,
+                    max,
+                    palette.armor,
+                    VoxelMicroTileKind::Hull,
                 );
             }
+            push_micro_box(
+                tiles,
+                base + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
+                base + IVec3::Y * (WORKBOOK_ROOM_HEIGHT + 1),
+                [0, 0, 0],
+                [16, 1, 16],
+                if rib { palette.armor } else { palette.trim },
+                VoxelMicroTileKind::Hull,
+            );
         }
     }
 }
 
-fn add_workbook_cannon_hull(
-    cells: &mut HashMap<IVec3, u8>,
-    design: WorkbookMapDesign,
-    crown_anchor: IVec3,
-    palette: WorkbookHullPalette,
-) {
-    let sheet_min_z = -((design.height as i32 - 1) / 2);
-    let muzzle_z = sheet_min_z - 58;
-    let axis_y = WORKBOOK_ROOM_HEIGHT + 7;
-    for z in muzzle_z..=crown_anchor.z {
-        let radius: i32 = if z < sheet_min_z - 34 { 4 } else { 5 };
-        for x in -radius..=radius {
-            for y in -radius..=radius {
-                let edge = x.abs().max(y.abs()) == radius;
-                let brace = (z - muzzle_z).rem_euclid(9) == 0
-                    && x.abs().max(y.abs()) >= radius - 1;
-                let energy_rail =
-                    (x == 0 && y.abs() == radius) || (y == 0 && x.abs() == radius);
-                if edge || brace || energy_rail {
-                    cells.insert(
-                        IVec3::new(
-                            crown_anchor.x + x,
-                            axis_y + y,
-                            z,
-                        ),
-                        if energy_rail {
-                            palette.window
-                        } else if brace {
-                            palette.armor
-                        } else {
-                            palette.hull
-                        },
-                    );
-                }
-            }
-        }
-    }
-    for z in muzzle_z - 3..=muzzle_z + 3 {
-        for x in -8_i32..=8 {
-            for y in -8_i32..=8 {
-                if x.abs().max(y.abs()) >= 6 {
-                    cells.insert(
-                        IVec3::new(
-                            crown_anchor.x + x,
-                            axis_y + y,
-                            z,
-                        ),
-                        if z == muzzle_z {
-                            palette.armor
-                        } else {
-                            palette.trim
-                        },
-                    );
-                }
-            }
-        }
-        cells.insert(
-            IVec3::new(crown_anchor.x, axis_y, z),
-            palette.window,
-        );
-    }
-}
-
-fn add_workbook_cruiser_hull(
-    cells: &mut HashMap<IVec3, u8>,
+fn workbook_micro_tiles(
     design: WorkbookMapDesign,
     decoded: &DecodedWorkbookMap,
-    palette: WorkbookHullPalette,
-) {
-    // Frame the exhaust cells authored in the workbook instead of inventing
-    // disconnected engines. This keeps every drive exactly on the Excel hull.
-    for (index, style) in decoded.styles.iter().copied().enumerate() {
-        if style != 38 || !decoded.exterior[index] {
+) -> Vec<VoxelMicroTile> {
+    let mut tiles = Vec::new();
+    let mut seen = vec![false; decoded.features.len()];
+    for start in 0..decoded.features.len() {
+        let feature = decoded.features[start];
+        let Some(kind) = WorkbookFeatureKind::from_id(feature) else {
+            continue;
+        };
+        if seen[start] || !decoded.enclosed[start] {
             continue;
         }
-        let sheet_x = index % design.width;
-        let sheet_z = index / design.width;
-        let [x, z] = design.centered_offset(index);
-        let exhaust = IVec3::new(x, 0, z);
-        cells.insert(exhaust + IVec3::Y * 4, palette.window);
-        for (direction, dx, dz) in [
-            (IVec3::NEG_X, -1, 0),
-            (IVec3::X, 1, 0),
-            (IVec3::NEG_Z, 0, -1),
-            (IVec3::Z, 0, 1),
-        ] {
-            let neighbor_x = sheet_x as i32 + dx;
-            let neighbor_z = sheet_z as i32 + dz;
-            let exterior = if neighbor_x < 0
-                || neighbor_z < 0
-                || neighbor_x >= design.width as i32
-                || neighbor_z >= design.height as i32
+        let mut pending = vec![start];
+        let mut component = Vec::new();
+        seen[start] = true;
+        while let Some(index) = pending.pop() {
+            component.push(index);
+            let x = index % design.width;
+            let z = index / design.width;
+            for neighbor in [
+                x.checked_sub(1).map(|x| z * design.width + x),
+                (x + 1 < design.width).then_some(z * design.width + x + 1),
+                z.checked_sub(1).map(|z| z * design.width + x),
+                (z + 1 < design.height).then_some((z + 1) * design.width + x),
+            ]
+            .into_iter()
+            .flatten()
             {
-                true
-            } else {
-                let neighbor =
-                    neighbor_z as usize * design.width + neighbor_x as usize;
-                decoded.exterior[neighbor] && decoded.styles[neighbor] != 38
-            };
-            if exterior {
-                for y in 0..=4 {
-                    cells.insert(
-                        exhaust + direction + IVec3::Y * y,
-                        if y == 2 {
-                            palette.armor
-                        } else {
-                            palette.trim
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    // Broad dorsal armor fields echo the previous corvette without covering
-    // or narrowing any workbook room below the roof.
-    for (start_x, end_x) in [(-76, -48), (-28, 2), (30, 62)] {
-        for x in start_x..=end_x {
-            for z in -13_i32..=13 {
-                if matches!(z.abs(), 12 | 13)
-                    || x == start_x
-                    || x == end_x
+                if !seen[neighbor]
+                    && decoded.enclosed[neighbor]
+                    && decoded.features[neighbor] == feature
                 {
-                    cells.insert(
-                        IVec3::new(x, WORKBOOK_ROOM_HEIGHT + 1, z),
-                        palette.armor,
-                    );
+                    seen[neighbor] = true;
+                    pending.push(neighbor);
                 }
             }
         }
-    }
-}
 
-fn add_workbook_abandoned_hull(
-    cells: &mut HashMap<IVec3, u8>,
-    palette: WorkbookHullPalette,
-) {
-    let roof_y = WORKBOOK_ROOM_HEIGHT + 1;
-    for x in -18_i32..=18 {
-        if x.rem_euclid(4) != 1 {
-            cells.insert(
-                IVec3::new(x, roof_y, -9),
-                if x.rem_euclid(9) == 0 {
-                    palette.armor
-                } else {
-                    palette.trim
-                },
+        let min_x = component.iter().map(|index| index % design.width).min().unwrap();
+        let min_z = component.iter().map(|index| index / design.width).min().unwrap();
+        for index in component.iter().copied() {
+            let [x, z] = design.centered_offset(index);
+            add_workbook_feature_floor_micro_tile(
+                &mut tiles,
+                IVec3::new(x, 0, z),
+                kind,
             );
         }
-    }
-    for z in -9_i32..=11 {
-        if z.rem_euclid(5) != 2 {
-            cells.insert(
-                IVec3::new(-18, roof_y + 2, z),
-                palette.hull,
+
+        let spacing = workbook_feature_fixture_spacing(kind);
+        let offset = spacing / 2;
+        let mut fixture_cells = component
+            .iter()
+            .copied()
+            .filter(|index| {
+                let x = index % design.width;
+                let z = index / design.width;
+                (x - min_x) % spacing == offset && (z - min_z) % spacing == offset
+            })
+            .collect::<Vec<_>>();
+        if fixture_cells.is_empty() {
+            let center_x = component
+                .iter()
+                .map(|index| index % design.width)
+                .sum::<usize>()
+                / component.len();
+            let center_z = component
+                .iter()
+                .map(|index| index / design.width)
+                .sum::<usize>()
+                / component.len();
+            fixture_cells.push(
+                component
+                    .iter()
+                    .copied()
+                    .min_by_key(|index| {
+                        let x = index % design.width;
+                        let z = index / design.width;
+                        x.abs_diff(center_x).pow(2) + z.abs_diff(center_z).pow(2)
+                    })
+                    .unwrap(),
             );
         }
+        for index in fixture_cells {
+            let [x, z] = design.centered_offset(index);
+            add_workbook_fixture_micro_tiles(&mut tiles, IVec3::new(x, 0, z), kind);
+        }
     }
-    for y in 0..=13 {
-        let drift = y / 4;
-        cells.insert(
-            IVec3::new(4 + drift, roof_y + y, 3),
-            if y % 4 == 0 {
-                palette.armor
-            } else {
-                palette.trim
-            },
-        );
-    }
+    add_workbook_hull_micro_tiles(&mut tiles, design, decoded);
+    tiles.sort_unstable_by_key(|tile| {
+        (
+            tile.cell.y,
+            tile.cell.z,
+            tile.cell.x,
+            tile.material,
+            tile.min.y,
+            tile.min.z,
+            tile.min.x,
+        )
+    });
+    tiles.dedup();
+    tiles
 }
 
 fn voxel_auto_doors() -> Vec<VoxelAutoDoor> {
@@ -3711,7 +3845,9 @@ fn workbook_interior_lights() -> Vec<(Vec3, Color)> {
             .iter()
             .enumerate()
             .filter_map(|(index, enclosed)| {
-                (*enclosed && workbook_fixture(decoded.styles[index]).is_none())
+                (*enclosed
+                    && decoded.features[index] == 0
+                    && workbook_fixture(decoded.styles[index]).is_none())
                     .then_some(index)
             })
             .collect::<Vec<_>>();
@@ -3781,7 +3917,9 @@ fn voxel_physics_prop_specs() -> Vec<(Vec<(IVec3, u8)>, Transform)> {
             .iter()
             .enumerate()
             .filter_map(|(index, enclosed)| {
-                (*enclosed && workbook_fixture(decoded.styles[index]).is_none())
+                (*enclosed
+                    && decoded.features[index] == 0
+                    && workbook_fixture(decoded.styles[index]).is_none())
                     .then_some(index)
             })
             .collect::<Vec<_>>();
@@ -3948,6 +4086,7 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
             max_speed: 14.0,
         },
         cells: combat_spaceship_voxel_cells(),
+        micro_tiles: workbook_micro_tiles(ARROGANCE, &ARROGANCE.decode()),
         transform: Transform::from_translation(
             COMBAT_SPACESHIP_CENTER.as_vec3() * VOXEL_SIZE,
         ),
@@ -3996,6 +4135,7 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
                 max_speed,
             },
             cells: small_spaceship_voxel_cells(index),
+            micro_tiles: Vec::new(),
             transform: Transform::from_translation(
                 (COMBAT_SPACESHIP_CENTER + offsets[index]).as_vec3() * VOXEL_SIZE,
             )
@@ -4084,6 +4224,7 @@ fn spawn_voxel_spaceship(
     let local_center =
         (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE;
     let (material_meshes, _) = build_voxel_meshes_from_cells(&spec.cells);
+    let micro_meshes = build_micro_tile_meshes(&spec.micro_tiles);
     commands
         .spawn((
             Name::new(spec.ship.name.clone()),
@@ -4109,6 +4250,13 @@ fn spawn_voxel_spaceship(
                 parent.spawn((
                     Mesh3d(meshes.add(mesh)),
                     MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
+                ));
+            }
+            for (material_id, mesh) in micro_meshes {
+                parent.spawn((
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
+                    VoxelMicroDecoration,
                 ));
             }
         })
@@ -6194,7 +6342,7 @@ fn xy_planet_map_cells() -> Vec<(IVec3, u8)> {
                 ));
             }
         } else if enclosed {
-            if let Some((material, height)) = workbook_fixture(style) {
+            if let Some((material, height)) = workbook_planet_fixture(style) {
                 for y in 1..=height {
                     cells.push((
                         IVec3::new(x, PLANET_SCIENCE_LAB_FLOOR_Y + y, z),
@@ -6743,6 +6891,7 @@ fn rebuild_voxel_geometry(
     mut dirty_chunks: ResMut<VoxelGeometryDirtyChunks>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
+    micro_decorations: Res<VoxelMicroDecorations>,
 ) {
     let Ok(grid) = grids.single() else {
         return;
@@ -6770,6 +6919,23 @@ fn rebuild_voxel_geometry(
                 Mesh3d(meshes.add(mesh)),
                 MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
                 VoxelGeometry { chunk },
+            ));
+        }
+        let live_micro_tiles = micro_decorations
+            .tiles
+            .iter()
+            .copied()
+            .filter(|tile| {
+                tile.owner.div_euclid(DIMS) == chunk
+                    && grid.get(tile.owner).copied().unwrap_or(0) != 0
+            })
+            .collect::<Vec<_>>();
+        for (material_id, mesh) in build_micro_tile_meshes(&live_micro_tiles) {
+            commands.spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
+                VoxelGeometry { chunk },
+                VoxelMicroDecoration,
             ));
         }
         if !collider_voxels.is_empty() {
@@ -6896,6 +7062,103 @@ fn build_voxel_meshes_from_cells_with_occupied(
     }
 
     (material_meshes, collider_voxels)
+}
+
+fn build_micro_tile_meshes(tiles: &[VoxelMicroTile]) -> Vec<(u8, Mesh)> {
+    let mut material_meshes = Vec::new();
+    for material in 1..=VOXEL_MATERIAL_COUNT as u8 {
+        let mut positions = Vec::<[f32; 3]>::new();
+        let mut normals = Vec::<[f32; 3]>::new();
+        let mut uvs = Vec::<[f32; 2]>::new();
+        let mut indices = Vec::<u32>::new();
+        for tile in tiles.iter().filter(|tile| tile.material == material) {
+            append_micro_tile_faces(
+                *tile,
+                &mut positions,
+                &mut normals,
+                &mut uvs,
+                &mut indices,
+            );
+        }
+        if positions.is_empty() {
+            continue;
+        }
+        material_meshes.push((material, {
+            let colors = vec![[1.0, 1.0, 1.0, 1.0]; positions.len()];
+            Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+            )
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+            .with_inserted_indices(Indices::U32(indices))
+        }));
+    }
+    material_meshes
+}
+
+fn append_micro_tile_faces(
+    tile: VoxelMicroTile,
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    indices: &mut Vec<u32>,
+) {
+    let subdivisions = MICRO_TILE_SUBDIVISIONS as f32;
+    let min = tile.cell.as_vec3() + tile.min.as_vec3() / subdivisions;
+    let max = tile.cell.as_vec3() + tile.max.as_vec3() / subdivisions;
+    let faces = [
+        (IVec3::X, [
+            [max.x, min.y, min.z],
+            [max.x, max.y, min.z],
+            [max.x, max.y, max.z],
+            [max.x, min.y, max.z],
+        ]),
+        (IVec3::NEG_X, [
+            [min.x, min.y, max.z],
+            [min.x, max.y, max.z],
+            [min.x, max.y, min.z],
+            [min.x, min.y, min.z],
+        ]),
+        (IVec3::Y, [
+            [min.x, max.y, max.z],
+            [max.x, max.y, max.z],
+            [max.x, max.y, min.z],
+            [min.x, max.y, min.z],
+        ]),
+        (IVec3::NEG_Y, [
+            [min.x, min.y, min.z],
+            [max.x, min.y, min.z],
+            [max.x, min.y, max.z],
+            [min.x, min.y, max.z],
+        ]),
+        (IVec3::Z, [
+            [max.x, min.y, max.z],
+            [max.x, max.y, max.z],
+            [min.x, max.y, max.z],
+            [min.x, min.y, max.z],
+        ]),
+        (IVec3::NEG_Z, [
+            [min.x, min.y, min.z],
+            [min.x, max.y, min.z],
+            [max.x, max.y, min.z],
+            [max.x, min.y, min.z],
+        ]),
+    ];
+    for (normal, corners) in faces {
+        let base = positions.len() as u32;
+        for (corner, uv) in corners
+            .into_iter()
+            .zip([[0., 1.], [0., 0.], [1., 0.], [1., 1.]])
+        {
+            positions.push((Vec3::from(corner) * VOXEL_SIZE).to_array());
+            normals.push(normal.as_vec3().to_array());
+            uvs.push(uv);
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
 }
 
 fn append_voxel_faces(
@@ -11569,6 +11832,132 @@ mod tests {
     }
 
     #[test]
+    fn workbook_micro_tiles_are_sixteenth_scale_and_owned_by_canonical_cells() {
+        assert_eq!(MICRO_TILE_SUBDIVISIONS, 16);
+        assert_eq!(VOXEL_SIZE / MICRO_TILE_SUBDIVISIONS as f32, 0.015625);
+
+        for design in [ARROGANCE, NIFFY, KYO, ARBITRATOR, ABANDONED] {
+            let decoded = design.decode();
+            let tiles = workbook_micro_tiles(design, &decoded);
+            assert!(tiles.iter().any(|tile| tile.kind == VoxelMicroTileKind::Hull));
+            assert!(tiles.iter().any(|tile| tile.kind == VoxelMicroTileKind::Fixture));
+
+            let mut world = World::new();
+            let entity = world.spawn(Grid::<u8>::new()).id();
+            {
+                let mut entity_mut = world.entity_mut(entity);
+                let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
+                build_workbook_orbital_location(&mut grid, IVec3::ZERO, design);
+            }
+            let grid = world.entity(entity).get::<Grid<u8>>().unwrap();
+            for tile in tiles {
+                assert!(tile.min.cmplt(tile.max).all(), "{} bounds", design.name);
+                assert!(
+                    tile.max.cmple(UVec3::splat(MICRO_TILE_SUBDIVISIONS)).all(),
+                    "{} subdivision bounds",
+                    design.name
+                );
+                assert_ne!(
+                    grid.get(tile.owner).copied().unwrap_or(0),
+                    0,
+                    "{} owner {:?}",
+                    design.name,
+                    tile.owner
+                );
+                if tile.kind == VoxelMicroTileKind::Hull {
+                    assert!(
+                        (tile.cell - tile.owner).abs().max_element() <= 1,
+                        "{} hull detail must stay on its authored contour",
+                        design.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn workbook_semantic_cells_are_micro_fixtures_instead_of_solid_columns() {
+        for design in [ARROGANCE, NIFFY, KYO, ARBITRATOR, ABANDONED] {
+            let decoded = design.decode();
+            let decorated_owners = workbook_micro_tiles(design, &decoded)
+                .into_iter()
+                .filter(|tile| tile.kind == VoxelMicroTileKind::Fixture)
+                .map(|tile| tile.owner)
+                .collect::<HashSet<_>>();
+            let mut world = World::new();
+            let entity = world.spawn(Grid::<u8>::new()).id();
+            {
+                let mut entity_mut = world.entity_mut(entity);
+                let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
+                build_workbook_orbital_location(&mut grid, IVec3::ZERO, design);
+            }
+            let grid = world.entity(entity).get::<Grid<u8>>().unwrap();
+            for (index, feature) in decoded.features.iter().copied().enumerate() {
+                if feature == 0 || !decoded.enclosed[index] {
+                    continue;
+                }
+                let [x, z] = design.centered_offset(index);
+                let owner = IVec3::new(x, 0, z);
+                assert_ne!(grid.get(owner).copied().unwrap_or(0), 0);
+                assert!(
+                    decorated_owners.contains(&owner),
+                    "{} feature {} lost its workbook floor marker",
+                    design.name,
+                    feature
+                );
+                assert_eq!(
+                    grid.get(owner + IVec3::Y).copied().unwrap_or(0),
+                    0,
+                    "{} feature {} remained a full voxel monolith",
+                    design.name,
+                    feature
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn medical_analyzer_and_every_other_workbook_label_have_distinct_semantics() {
+        let decoded = NIFFY.decode();
+        assert_eq!(
+            decoded.features.iter().filter(|feature| **feature == 10).count(),
+            36
+        );
+        let labels = (1..=15)
+            .map(|id| WorkbookFeatureKind::from_id(id).unwrap().workbook_label())
+            .collect::<HashSet<_>>();
+        assert_eq!(labels.len(), 15);
+        assert!(labels.contains("验血 / GIT"));
+        assert!(labels.contains("能量台"));
+        assert!(labels.contains("前哨站"));
+        assert!(labels.contains("补给品"));
+    }
+
+    #[test]
+    fn one_micro_tile_mesh_occupies_exactly_one_sixteenth_voxel() {
+        let meshes = build_micro_tile_meshes(&[VoxelMicroTile {
+            owner: IVec3::ZERO,
+            cell: IVec3::ZERO,
+            min: UVec3::ZERO,
+            max: UVec3::ONE,
+            material: 1,
+            kind: VoxelMicroTileKind::Fixture,
+        }]);
+        let VertexAttributeValues::Float32x3(positions) = meshes[0]
+            .1
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .unwrap()
+        else {
+            panic!("micro tile positions must be Float32x3");
+        };
+        let extent = positions
+            .iter()
+            .flat_map(|position| position.iter().copied())
+            .fold(0.0_f32, f32::max);
+        assert_eq!(extent, VOXEL_SIZE / MICRO_TILE_SUBDIVISIONS as f32);
+    }
+
+    #[test]
     fn orbital_layout_is_five_times_wider_and_clear_of_the_planet() {
         assert_eq!(ORBITAL_LAYOUT_SCALE, 5);
         assert_eq!(RESEARCH_STATION_CENTER, IVec3::new(500, 0, 500));
@@ -11789,7 +12178,7 @@ mod tests {
     }
 
     #[test]
-    fn arrogance_cruiser_preserves_workbook_walls_doors_and_fixtures() {
+    fn arrogance_cruiser_preserves_workbook_walls_doors_and_semantics() {
         let decoded = ARROGANCE.decode();
         assert_eq!((ARROGANCE.width, ARROGANCE.height), (216, 84));
         assert_eq!(
@@ -11800,150 +12189,13 @@ mod tests {
             decoded.styles.iter().filter(|style| **style == 15).count(),
             42
         );
-        assert!(decoded
-            .styles
-            .iter()
-            .copied()
-            .any(|style| workbook_fixture(style).is_some()));
-    }
-
-    #[test]
-    fn workbook_hulls_leave_authored_interiors_untouched() {
-        for design in [NIFFY, ARBITRATOR, KYO, ARROGANCE, ABANDONED] {
-            let decoded = design.decode();
-            let hull = workbook_hull_cells(design, &decoded);
-            assert!(
-                hull.len() > 500,
-                "{} should receive a detailed exterior hull",
-                design.name
-            );
-            let sheet_origin_x = (design.width as i32 - 1) / 2;
-            let sheet_origin_z = (design.height as i32 - 1) / 2;
-            for (cell, material) in hull {
-                assert!(
-                    matches!(material, 2 | 6 | 7 | 8 | 9 | 10),
-                    "{} hull used noncanonical material {material}",
-                    design.name
-                );
-                if cell.y > WORKBOOK_ROOM_HEIGHT {
-                    continue;
-                }
-                let sheet_x = cell.x + sheet_origin_x;
-                let sheet_z = cell.z + sheet_origin_z;
-                if sheet_x < 0
-                    || sheet_z < 0
-                    || sheet_x >= design.width as i32
-                    || sheet_z >= design.height as i32
-                {
-                    continue;
-                }
-                let index = sheet_z as usize * design.width + sheet_x as usize;
-                assert!(
-                    decoded.exterior[index],
-                    "{} hull decoration entered an authored room at {cell:?}",
-                    design.name
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn workbook_hulls_restore_each_previous_exterior_motif() {
-        let hull_map = |design: WorkbookMapDesign| {
-            workbook_hull_cells(design, &design.decode())
-                .into_iter()
-                .collect::<HashMap<_, _>>()
-        };
-
-        let niffy = hull_map(NIFFY);
-        let niffy_anchor =
-            workbook_roof_anchor(NIFFY, &NIFFY.decode(), IVec2::new(14, 10));
         assert_eq!(
-            niffy.get(&(niffy_anchor + IVec3::new(14, 11, 0))),
-            Some(&8)
+            decoded.features.iter().filter(|feature| **feature != 0).count(),
+            464
         );
-        assert!(niffy.contains_key(&(niffy_anchor + IVec3::Y * 28)));
-
-        let arbitrator = hull_map(ARBITRATOR);
-        let arbitrator_anchor = workbook_roof_anchor(
-            ARBITRATOR,
-            &ARBITRATOR.decode(),
-            IVec2::new(12, 12),
-        );
-        assert!(arbitrator.contains_key(
-            &(arbitrator_anchor + IVec3::new(11, 31, 0))
-        ));
-
-        let kyo = hull_map(KYO);
-        let kyo_anchor =
-            workbook_roof_anchor(KYO, &KYO.decode(), IVec2::new(14, 9));
-        let kyo_muzzle_z = -((KYO.height as i32 - 1) / 2) - 58;
-        assert_eq!(
-            kyo.get(&IVec3::new(
-                kyo_anchor.x,
-                WORKBOOK_ROOM_HEIGHT + 7,
-                kyo_muzzle_z
-            )),
-            Some(&8)
-        );
-
-        let arrogance = hull_map(ARROGANCE);
-        let arrogance_decoded = ARROGANCE.decode();
-        let exhaust_index = arrogance_decoded
-            .styles
-            .iter()
-            .enumerate()
-            .position(|(index, style)| {
-                *style == 38 && arrogance_decoded.exterior[index]
-            })
-            .unwrap();
-        let [exhaust_x, exhaust_z] = ARROGANCE.centered_offset(exhaust_index);
-        assert_eq!(
-            arrogance.get(&IVec3::new(exhaust_x, 4, exhaust_z)),
-            Some(&8)
-        );
-
-        let abandoned = hull_map(ABANDONED);
-        assert!(abandoned.contains_key(&IVec3::new(
-            7,
-            WORKBOOK_ROOM_HEIGHT + 14,
-            3
-        )));
-    }
-
-    #[test]
-    fn workbook_roof_crowns_choose_supported_authored_roofs() {
-        for (design, half_size) in [
-            (NIFFY, IVec2::new(14, 10)),
-            (ARBITRATOR, IVec2::new(12, 12)),
-            (KYO, IVec2::new(14, 9)),
-            (ARROGANCE, IVec2::new(20, 5)),
-        ] {
-            let decoded = design.decode();
-            let anchor = workbook_roof_anchor(design, &decoded, half_size);
-            let origin_x = (design.width as i32 - 1) / 2;
-            let origin_z = (design.height as i32 - 1) / 2;
-            let mut supported = 0;
-            let mut total = 0;
-            for x in -half_size.x..=half_size.x {
-                for z in -half_size.y..=half_size.y {
-                    total += 1;
-                    let sheet_x = anchor.x + x + origin_x;
-                    let sheet_z = anchor.z + z + origin_z;
-                    let index =
-                        sheet_z as usize * design.width + sheet_x as usize;
-                    supported += usize::from(
-                        decoded.enclosed[index]
-                            || matches!(decoded.styles[index], 11 | 15),
-                    );
-                }
-            }
-            assert!(
-                supported * 10 >= total * 7,
-                "{} crown support was only {supported}/{total}",
-                design.name
-            );
-        }
+        assert!((1..=15).all(|feature| {
+            WorkbookFeatureKind::from_id(feature).is_some()
+        }));
     }
 
     #[test]
@@ -12627,6 +12879,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<Assets<Mesh>>()
             .init_resource::<VoxelGeometryDirtyChunks>()
+            .init_resource::<VoxelMicroDecorations>()
             .insert_resource(VoxelMaterials {
                 handles: std::array::from_fn(|_| Handle::default()),
                 planet_ocean: Handle::default(),
@@ -13798,6 +14051,23 @@ mod tests {
                     .iter()
                     .any(|(_, material)| TrpgVoxelConnector::solid(material))
         }));
+        assert!(specs[0]
+            .micro_tiles
+            .iter()
+            .any(|tile| tile.kind == VoxelMicroTileKind::Hull));
+        assert!(specs[0]
+            .micro_tiles
+            .iter()
+            .any(|tile| tile.kind == VoxelMicroTileKind::Fixture));
+        assert!(specs[1..].iter().all(|spec| spec.micro_tiles.is_empty()));
+
+        let min_x = -((ARROGANCE.width as i32 - 1) / 2);
+        let max_x = min_x + ARROGANCE.width as i32 - 1;
+        let min_z = -((ARROGANCE.height as i32 - 1) / 2);
+        let max_z = min_z + ARROGANCE.height as i32 - 1;
+        assert!(specs[0].cells.iter().all(|(cell, _)| {
+            (min_x..=max_x).contains(&cell.x) && (min_z..=max_z).contains(&cell.z)
+        }));
     }
 
     #[test]
@@ -13859,6 +14129,10 @@ mod tests {
                 "spaceships must not receive the walking/prop gravity acceleration"
             );
         }
+        let mut micro_tiles = app
+            .world_mut()
+            .query_filtered::<Entity, With<VoxelMicroDecoration>>();
+        assert!(micro_tiles.iter(app.world()).next().is_some());
     }
 
     #[test]
