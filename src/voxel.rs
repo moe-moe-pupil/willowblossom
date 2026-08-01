@@ -44,7 +44,10 @@ use bevy::{
         MouseMotion,
         MouseWheel,
     },
-    math::Affine2,
+    math::{
+        Affine2,
+        Affine3A,
+    },
     mesh::{
         Indices,
         PrimitiveTopology,
@@ -165,6 +168,9 @@ const VOXEL_SCENE_LAYOUT_REVISION: u32 = 3;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
 const VOXEL_MATERIAL_COUNT: usize = 10;
 const MICRO_TILE_SUBDIVISIONS: u32 = 16;
+const WORKBOOK_FEATURE_HOVER_MIN_Y_CELLS: f32 = 1.0;
+const WORKBOOK_FEATURE_HOVER_MAX_Y_CELLS: f32 = 4.0;
+const WORKBOOK_FEATURE_LABEL_Y_CELLS: f32 = 5.25;
 const VOXEL_EMISSIVE_SCALE: f32 = 0.3;
 const VOXEL_RADIANCE_VOLUME_DIMENSION: i32 = 96;
 const VOXEL_RADIANCE_REBUILD_STEP: i32 = 16;
@@ -569,6 +575,7 @@ struct VoxelSpaceshipSpec {
     ship: VoxelSpaceship,
     cells: Vec<(IVec3, u8)>,
     micro_tiles: Vec<VoxelMicroTile>,
+    workbook_features: Option<VoxelWorkbookFeatureAnnotations>,
     transform: Transform,
 }
 
@@ -1836,6 +1843,7 @@ impl Plugin for TrpgVoxelPlugin {
         .insert_resource(SubstepCount(TRPG_PHYSICS_SUBSTEPS))
         .insert_resource(Gravity::ZERO)
         .insert_resource(static_workbook_micro_decorations())
+        .insert_resource(static_workbook_feature_annotations())
         .init_resource::<VoxelEditorState>()
         .init_resource::<VoxelPossessionState>()
         .init_resource::<VoxelTargetingPreview>()
@@ -1959,10 +1967,12 @@ impl Plugin for TrpgVoxelPlugin {
         .add_systems(
             EguiPrimaryContextPass,
             (
+                voxel_workbook_feature_overlay,
                 voxel_player_camera_panel,
                 voxel_spaceship_panel,
             )
                 .chain()
+                .after(crate::ui::ui_system)
                 .run_if(crate::replay::replay_video_capture_inactive),
         );
     }
@@ -2921,6 +2931,23 @@ fn static_workbook_micro_decorations() -> VoxelMicroDecorations {
     VoxelMicroDecorations { tiles }
 }
 
+fn static_workbook_feature_annotations() -> StaticWorkbookFeatureAnnotations {
+    let mut entries = Vec::new();
+    for (center, design) in static_workbook_orbital_locations() {
+        let decoded = design.decode();
+        entries.extend(
+            workbook_feature_regions(design, &decoded)
+                .into_iter()
+                .map(|region| StaticWorkbookFeatureAnnotation {
+                    map_name: design.name,
+                    center,
+                    region,
+                }),
+        );
+    }
+    StaticWorkbookFeatureAnnotations { entries }
+}
+
 fn workbook_fixture(style: u8) -> Option<(u8, i32)> {
     Some(match style {
         13 => (10, 3),
@@ -3099,8 +3126,7 @@ impl WorkbookFeatureKind {
         })
     }
 
-    #[cfg(test)]
-    fn workbook_label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::ControlConsole => "控制台",
             Self::EnergyPlatform => "能量台",
@@ -3119,6 +3145,33 @@ impl WorkbookFeatureKind {
             Self::InstrumentPanel => "仪表",
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkbookFeatureRegion {
+    kind: WorkbookFeatureKind,
+    /// Canonical floor-owner cells in workbook-local coordinates.
+    cells: Vec<IVec3>,
+    /// One real member cell nearest the region centroid, used by the map label.
+    anchor: IVec3,
+}
+
+#[derive(Clone, Debug)]
+struct StaticWorkbookFeatureAnnotation {
+    map_name: &'static str,
+    center: IVec3,
+    region: WorkbookFeatureRegion,
+}
+
+#[derive(Resource, Clone, Debug, Default)]
+struct StaticWorkbookFeatureAnnotations {
+    entries: Vec<StaticWorkbookFeatureAnnotation>,
+}
+
+#[derive(Component, Clone, Debug)]
+struct VoxelWorkbookFeatureAnnotations {
+    map_name: &'static str,
+    regions: Vec<WorkbookFeatureRegion>,
 }
 
 fn push_micro_box(
@@ -3491,11 +3544,11 @@ fn add_workbook_hull_micro_tiles(
     }
 }
 
-fn workbook_micro_tiles(
+fn workbook_feature_regions(
     design: WorkbookMapDesign,
     decoded: &DecodedWorkbookMap,
-) -> Vec<VoxelMicroTile> {
-    let mut tiles = Vec::new();
+) -> Vec<WorkbookFeatureRegion> {
+    let mut regions = Vec::new();
     let mut seen = vec![false; decoded.features.len()];
     for start in 0..decoded.features.len() {
         let feature = decoded.features[start];
@@ -3531,54 +3584,77 @@ fn workbook_micro_tiles(
             }
         }
 
-        let min_x = component.iter().map(|index| index % design.width).min().unwrap();
-        let min_z = component.iter().map(|index| index / design.width).min().unwrap();
-        for index in component.iter().copied() {
-            let [x, z] = design.centered_offset(index);
+        let mut cells = component
+            .into_iter()
+            .map(|index| {
+                let [x, z] = design.centered_offset(index);
+                IVec3::new(x, 0, z)
+            })
+            .collect::<Vec<_>>();
+        cells.sort_unstable_by_key(|cell| (cell.z, cell.x));
+        let count = cells.len() as i64;
+        let sum_x = cells.iter().map(|cell| i64::from(cell.x)).sum::<i64>();
+        let sum_z = cells.iter().map(|cell| i64::from(cell.z)).sum::<i64>();
+        let anchor = cells
+            .iter()
+            .copied()
+            .min_by_key(|cell| {
+                let dx = i64::from(cell.x) * count - sum_x;
+                let dz = i64::from(cell.z) * count - sum_z;
+                dx * dx + dz * dz
+            })
+            .expect("workbook feature components cannot be empty");
+        regions.push(WorkbookFeatureRegion {
+            kind,
+            cells,
+            anchor,
+        });
+    }
+    regions
+}
+
+fn workbook_feature_annotations(
+    design: WorkbookMapDesign,
+    decoded: &DecodedWorkbookMap,
+) -> VoxelWorkbookFeatureAnnotations {
+    VoxelWorkbookFeatureAnnotations {
+        map_name: design.name,
+        regions: workbook_feature_regions(design, decoded),
+    }
+}
+
+fn workbook_micro_tiles(
+    design: WorkbookMapDesign,
+    decoded: &DecodedWorkbookMap,
+) -> Vec<VoxelMicroTile> {
+    let mut tiles = Vec::new();
+    for region in workbook_feature_regions(design, decoded) {
+        for owner in region.cells.iter().copied() {
             add_workbook_feature_floor_micro_tile(
                 &mut tiles,
-                IVec3::new(x, 0, z),
-                kind,
+                owner,
+                region.kind,
             );
         }
 
-        let spacing = workbook_feature_fixture_spacing(kind);
+        let min_x = region.cells.iter().map(|cell| cell.x).min().unwrap();
+        let min_z = region.cells.iter().map(|cell| cell.z).min().unwrap();
+        let spacing = workbook_feature_fixture_spacing(region.kind) as i32;
         let offset = spacing / 2;
-        let mut fixture_cells = component
+        let mut fixture_cells = region
+            .cells
             .iter()
             .copied()
-            .filter(|index| {
-                let x = index % design.width;
-                let z = index / design.width;
-                (x - min_x) % spacing == offset && (z - min_z) % spacing == offset
+            .filter(|cell| {
+                (cell.x - min_x).rem_euclid(spacing) == offset
+                    && (cell.z - min_z).rem_euclid(spacing) == offset
             })
             .collect::<Vec<_>>();
         if fixture_cells.is_empty() {
-            let center_x = component
-                .iter()
-                .map(|index| index % design.width)
-                .sum::<usize>()
-                / component.len();
-            let center_z = component
-                .iter()
-                .map(|index| index / design.width)
-                .sum::<usize>()
-                / component.len();
-            fixture_cells.push(
-                component
-                    .iter()
-                    .copied()
-                    .min_by_key(|index| {
-                        let x = index % design.width;
-                        let z = index / design.width;
-                        x.abs_diff(center_x).pow(2) + z.abs_diff(center_z).pow(2)
-                    })
-                    .unwrap(),
-            );
+            fixture_cells.push(region.anchor);
         }
-        for index in fixture_cells {
-            let [x, z] = design.centered_offset(index);
-            add_workbook_fixture_micro_tiles(&mut tiles, IVec3::new(x, 0, z), kind);
+        for owner in fixture_cells {
+            add_workbook_fixture_micro_tiles(&mut tiles, owner, region.kind);
         }
     }
     add_workbook_hull_micro_tiles(&mut tiles, design, decoded);
@@ -3995,6 +4071,37 @@ fn spawn_default_voxel_physics_props(
     }
 }
 
+fn combat_spaceship_cabin_footprint() -> Vec<IVec3> {
+    let decoded = ARROGANCE.decode();
+    let min_x = ARROGANCE.spawn[0] - 4;
+    let max_x = ARROGANCE.spawn[0] + 4;
+    let min_z = ARROGANCE.spawn[1] - 6;
+    let max_z = ARROGANCE.spawn[1];
+    decoded
+        .styles
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, style)| {
+            let [x, z] = ARROGANCE.centered_offset(index);
+            (decoded.enclosed[index]
+                && !matches!(style, 11 | 15)
+                && (min_x..=max_x).contains(&x)
+                && (min_z..=max_z).contains(&z))
+            .then_some(IVec3::new(x, 0, z))
+        })
+        .collect()
+}
+
+fn enclose_combat_spaceship_cabin(cells: &mut HashMap<IVec3, u8>) {
+    for floor in combat_spaceship_cabin_footprint() {
+        // Give the bridge a clearly readable metal deck instead of inheriting
+        // the generic workbook floor material, and guarantee a structural roof.
+        cells.insert(floor, 7);
+        cells.insert(floor + IVec3::Y * WORKBOOK_ROOM_HEIGHT, 7);
+    }
+}
+
 fn combat_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
     let mut world = World::new();
     let grid_entity = world.spawn(Grid::<u8>::new()).id();
@@ -4018,7 +4125,9 @@ fn combat_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
         .entity(grid_entity)
         .get::<Grid<u8>>()
         .expect("temporary spaceship grid must still exist");
-    let mut cells = voxel_cells(grid);
+    let mut occupied = voxel_cells(grid).into_iter().collect::<HashMap<_, _>>();
+    enclose_combat_spaceship_cabin(&mut occupied);
+    let mut cells = occupied.into_iter().collect::<Vec<_>>();
     cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
     cells
 }
@@ -4167,6 +4276,7 @@ fn small_spaceship_voxel_cells(variant: usize) -> Vec<(IVec3, u8)> {
 }
 
 fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
+    let arrogance_decoded = ARROGANCE.decode();
     let mut specs = vec![VoxelSpaceshipSpec {
         ship: VoxelSpaceship {
             id: COMBAT_SPACESHIP_ID.to_owned(),
@@ -4183,7 +4293,11 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
             max_speed: 14.0,
         },
         cells: combat_spaceship_voxel_cells(),
-        micro_tiles: workbook_micro_tiles(ARROGANCE, &ARROGANCE.decode()),
+        micro_tiles: workbook_micro_tiles(ARROGANCE, &arrogance_decoded),
+        workbook_features: Some(workbook_feature_annotations(
+            ARROGANCE,
+            &arrogance_decoded,
+        )),
         transform: Transform::from_translation(
             COMBAT_SPACESHIP_CENTER.as_vec3() * VOXEL_SIZE,
         ),
@@ -4233,6 +4347,7 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
             },
             cells: small_spaceship_voxel_cells(index),
             micro_tiles: Vec::new(),
+            workbook_features: None,
             transform: Transform::from_translation(
                 (COMBAT_SPACESHIP_CENTER + offsets[index]).as_vec3() * VOXEL_SIZE,
             )
@@ -4322,7 +4437,7 @@ fn spawn_voxel_spaceship(
         (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE;
     let (material_meshes, _) = build_voxel_meshes_from_cells(&spec.cells);
     let micro_meshes = build_micro_tile_meshes(&spec.micro_tiles);
-    commands
+    let entity = commands
         .spawn((
             Name::new(spec.ship.name.clone()),
             spec.ship.clone(),
@@ -4357,7 +4472,11 @@ fn spawn_voxel_spaceship(
                 ));
             }
         })
-        .id()
+        .id();
+    if let Some(features) = &spec.workbook_features {
+        commands.entity(entity).insert(features.clone());
+    }
+    entity
 }
 
 fn spawn_default_voxel_spaceships(
@@ -4850,6 +4969,309 @@ fn sync_voxel_player_cameras(
         if let Err(err) = store.persist() {
             eprintln!("failed to persist voxel player cameras: {err}");
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HoveredWorkbookFeature {
+    kind: WorkbookFeatureKind,
+    map_name: &'static str,
+    distance: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedWorkbookFeatureLabel {
+    kind: WorkbookFeatureKind,
+    position: egui::Pos2,
+    depth: f32,
+}
+
+fn workbook_feature_anchor_local(region: &WorkbookFeatureRegion) -> Vec3 {
+    (region.anchor.as_vec3()
+        + Vec3::new(
+            0.5,
+            WORKBOOK_FEATURE_LABEL_Y_CELLS,
+            0.5,
+        ))
+        * VOXEL_SIZE
+}
+
+fn raycast_workbook_feature_region(
+    ray: Ray3d,
+    local_to_world: Affine3A,
+    region: &WorkbookFeatureRegion,
+) -> Option<f32> {
+    let world_to_local = local_to_world.inverse();
+    let local_origin = world_to_local.transform_point3(ray.origin);
+    let local_direction = world_to_local.transform_vector3(*ray.direction);
+    if !local_origin.is_finite()
+        || !local_direction.is_finite()
+        || local_direction.length_squared() <= f32::EPSILON
+    {
+        return None;
+    }
+    let local_direction = local_direction.normalize();
+    region
+        .cells
+        .iter()
+        .filter_map(|cell| {
+            let min = (cell.as_vec3()
+                + Vec3::new(
+                    0.0,
+                    WORKBOOK_FEATURE_HOVER_MIN_Y_CELLS,
+                    0.0,
+                ))
+                * VOXEL_SIZE;
+            let max = (cell.as_vec3()
+                + Vec3::new(
+                    1.0,
+                    WORKBOOK_FEATURE_HOVER_MAX_Y_CELLS,
+                    1.0,
+                ))
+                * VOXEL_SIZE;
+            let (near, _) = ray_aabb_distance_range(
+                local_origin,
+                local_direction,
+                min,
+                max,
+                MAX_RAY_DISTANCE,
+            )?;
+            let local_hit = local_origin + local_direction * near;
+            let world_hit = local_to_world.transform_point3(local_hit);
+            Some(ray.origin.distance(world_hit))
+        })
+        .min_by(f32::total_cmp)
+}
+
+fn workbook_feature_pointer_position(
+    window: &Window,
+    editor: &VoxelEditorState,
+    pixels_per_point: f32,
+) -> Option<Vec2> {
+    let pixels_per_point = pixels_per_point.max(f32::EPSILON);
+    let viewport_min = editor.viewport_min / pixels_per_point;
+    let viewport_max = editor.viewport_max / pixels_per_point;
+    let contains = |position: Vec2| {
+        position.cmpge(viewport_min).all() && position.cmple(viewport_max).all()
+    };
+    if editor.first_person_enabled && !editor.first_person_cursor_released {
+        Some((viewport_min + viewport_max) * 0.5)
+    } else {
+        window
+            .cursor_position()
+            .filter(|position| contains(*position))
+    }
+}
+
+fn workbook_feature_label_color(kind: WorkbookFeatureKind) -> egui::Color32 {
+    match kind {
+        WorkbookFeatureKind::EnergyPlatform
+        | WorkbookFeatureKind::Teleporter
+        | WorkbookFeatureKind::RadarConsole => egui::Color32::from_rgb(96, 225, 255),
+        WorkbookFeatureKind::MedicalAnalyzer
+        | WorkbookFeatureKind::ExperimentBench => egui::Color32::from_rgb(145, 240, 190),
+        WorkbookFeatureKind::ThermiteFactory => egui::Color32::from_rgb(255, 156, 92),
+        WorkbookFeatureKind::EscapePod
+        | WorkbookFeatureKind::ArmorLocker
+        | WorkbookFeatureKind::CargoRack => egui::Color32::from_rgb(255, 208, 112),
+        _ => egui::Color32::from_rgb(210, 224, 244),
+    }
+}
+
+fn project_workbook_feature_label(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    local_to_world: Affine3A,
+    region: &WorkbookFeatureRegion,
+    editor: &VoxelEditorState,
+    pixels_per_point: f32,
+) -> Option<ProjectedWorkbookFeatureLabel> {
+    let world_anchor = local_to_world.transform_point3(workbook_feature_anchor_local(region));
+    let projected = camera
+        .world_to_viewport_with_depth(camera_transform, world_anchor)
+        .ok()?;
+    let screen = projected.truncate();
+    let pixels_per_point = pixels_per_point.max(f32::EPSILON);
+    let viewport_min = editor.viewport_min / pixels_per_point;
+    let viewport_max = editor.viewport_max / pixels_per_point;
+    if !screen.cmpge(viewport_min).all() || !screen.cmple(viewport_max).all() {
+        return None;
+    }
+    Some(ProjectedWorkbookFeatureLabel {
+        kind: region.kind,
+        position: egui::pos2(screen.x, screen.y),
+        depth: projected.z,
+    })
+}
+
+fn paint_workbook_map_label(
+    painter: &egui::Painter,
+    label: ProjectedWorkbookFeatureLabel,
+) {
+    let color = workbook_feature_label_color(label.kind);
+    let galley = painter.layout_no_wrap(
+        label.kind.label().to_owned(),
+        egui::FontId::proportional(13.0),
+        color,
+    );
+    let padding = egui::vec2(6.0, 3.0);
+    let label_center = label.position - egui::vec2(0.0, galley.size().y * 0.5 + 8.0);
+    let rect = egui::Rect::from_center_size(label_center, galley.size() + padding * 2.0);
+    painter.line_segment(
+        [label.position, rect.center_bottom()],
+        egui::Stroke::new(1.0, color.gamma_multiply(0.8)),
+    );
+    painter.circle_filled(label.position, 2.0, color);
+    painter.rect_filled(
+        rect,
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(5, 12, 20, 210),
+    );
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, color.gamma_multiply(0.72)),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.min + padding, galley, color);
+}
+
+fn draw_workbook_feature_hover_hud(
+    ctx: &egui::Context,
+    pointer: Vec2,
+    hovered: HoveredWorkbookFeature,
+) {
+    let screen = ctx.content_rect();
+    let size = egui::vec2(205.0, 54.0);
+    let mut position = egui::pos2(pointer.x + 16.0, pointer.y + 18.0);
+    if position.x + size.x > screen.right() {
+        position.x = pointer.x - size.x - 16.0;
+    }
+    if position.y + size.y > screen.bottom() {
+        position.y = pointer.y - size.y - 18.0;
+    }
+    let accent = workbook_feature_label_color(hovered.kind);
+    egui::Area::new(egui::Id::new("voxel_workbook_feature_hover"))
+        .fixed_pos(position)
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(4, 11, 18, 238))
+                .stroke(egui::Stroke::new(1.5, accent))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(10, 7))
+                .show(ui, |ui| {
+                    ui.colored_label(accent, hovered.kind.label());
+                    ui.small(format!("位置：{}", hovered.map_name));
+                });
+        });
+}
+
+fn voxel_workbook_feature_overlay(
+    mut contexts: EguiContexts,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<
+        (&Camera, &GlobalTransform),
+        (
+            With<VoxelViewportCamera>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
+    editor: Res<VoxelEditorState>,
+    static_annotations: Res<StaticWorkbookFeatureAnnotations>,
+    moving_annotations: Query<(&GlobalTransform, &VoxelWorkbookFeatureAnnotations)>,
+    egui_input: Res<EguiWantsInput>,
+) {
+    let (Ok(ctx), Ok(window), Ok((camera, camera_transform))) = (
+        contexts.ctx_mut(),
+        windows.single(),
+        cameras.single(),
+    ) else {
+        return;
+    };
+
+    let mut labels = Vec::new();
+    let pixels_per_point = ctx.pixels_per_point();
+    for entry in &static_annotations.entries {
+        let local_to_world = Affine3A::from_translation(entry.center.as_vec3() * VOXEL_SIZE);
+        if let Some(label) = project_workbook_feature_label(
+            camera,
+            camera_transform,
+            local_to_world,
+            &entry.region,
+            &editor,
+            pixels_per_point,
+        ) {
+            labels.push(label);
+        }
+    }
+    for (transform, annotations) in &moving_annotations {
+        for region in &annotations.regions {
+            if let Some(label) = project_workbook_feature_label(
+                camera,
+                camera_transform,
+                transform.affine(),
+                region,
+                &editor,
+                pixels_per_point,
+            ) {
+                labels.push(label);
+            }
+        }
+    }
+    // Paint distant annotations first so a nearby room label remains readable.
+    labels.sort_by(|left, right| right.depth.total_cmp(&left.depth));
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new("voxel_workbook_map_labels"),
+    ));
+    for label in labels {
+        paint_workbook_map_label(&painter, label);
+    }
+
+    if egui_input.wants_any_pointer_input() {
+        return;
+    }
+    let Some(pointer) = workbook_feature_pointer_position(window, &editor, pixels_per_point) else {
+        return;
+    };
+    let Ok(ray) = camera.viewport_to_world(camera_transform, pointer) else {
+        return;
+    };
+    let mut hovered = None::<HoveredWorkbookFeature>;
+    let mut consider = |kind, map_name, distance| {
+        if hovered.is_none_or(|current| distance < current.distance) {
+            hovered = Some(HoveredWorkbookFeature {
+                kind,
+                map_name,
+                distance,
+            });
+        }
+    };
+    for entry in &static_annotations.entries {
+        let local_to_world = Affine3A::from_translation(entry.center.as_vec3() * VOXEL_SIZE);
+        if let Some(distance) = raycast_workbook_feature_region(
+            ray,
+            local_to_world,
+            &entry.region,
+        ) {
+            consider(entry.region.kind, entry.map_name, distance);
+        }
+    }
+    for (transform, annotations) in &moving_annotations {
+        for region in &annotations.regions {
+            if let Some(distance) = raycast_workbook_feature_region(
+                ray,
+                transform.affine(),
+                region,
+            ) {
+                consider(region.kind, annotations.map_name, distance);
+            }
+        }
+    }
+    if let Some(hovered) = hovered {
+        draw_workbook_feature_hover_hud(ctx, pointer, hovered);
     }
 }
 
@@ -12120,13 +12542,98 @@ mod tests {
             36
         );
         let labels = (1..=15)
-            .map(|id| WorkbookFeatureKind::from_id(id).unwrap().workbook_label())
+            .map(|id| WorkbookFeatureKind::from_id(id).unwrap().label())
             .collect::<HashSet<_>>();
         assert_eq!(labels.len(), 15);
         assert!(labels.contains("验血 / GIT"));
         assert!(labels.contains("能量台"));
         assert!(labels.contains("前哨站"));
         assert!(labels.contains("补给品"));
+    }
+
+    #[test]
+    fn workbook_feature_regions_cover_each_labeled_cell_once_and_use_real_anchors() {
+        for design in [ARROGANCE, NIFFY, KYO, ARBITRATOR, ABANDONED] {
+            let decoded = design.decode();
+            let regions = workbook_feature_regions(design, &decoded);
+            let expected_count = decoded
+                .features
+                .iter()
+                .zip(&decoded.enclosed)
+                .filter(|(feature, enclosed)| **feature != 0 && **enclosed)
+                .count();
+            let region_cells = regions
+                .iter()
+                .flat_map(|region| region.cells.iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(region_cells.len(), expected_count, "{}", design.name);
+            assert_eq!(
+                region_cells.iter().copied().collect::<HashSet<_>>().len(),
+                expected_count,
+                "{} feature regions overlap",
+                design.name
+            );
+            assert!(regions.iter().all(|region| {
+                !region.cells.is_empty()
+                    && region.cells.contains(&region.anchor)
+                    && !region.kind.label().is_empty()
+            }));
+        }
+    }
+
+    #[test]
+    fn hover_raycast_follows_canonical_feature_cells_and_moving_ship_transform() {
+        let decoded = NIFFY.decode();
+        let region = workbook_feature_regions(NIFFY, &decoded)
+            .into_iter()
+            .find(|region| region.kind == WorkbookFeatureKind::MedicalAnalyzer)
+            .expect("Niffy must retain its 验血 / GIT region");
+        let local_origin = (region.anchor.as_vec3() + Vec3::new(0.5, 20.0, 0.5)) * VOXEL_SIZE;
+        let identity_hit = raycast_workbook_feature_region(
+            Ray3d::new(local_origin, Dir3::NEG_Y),
+            Affine3A::IDENTITY,
+            &region,
+        );
+        let identity_hit = identity_hit.unwrap();
+
+        let translation = Vec3::new(37.0, 4.0, -19.0);
+        let moving_transform = Affine3A::from_translation(translation);
+        let moving_hit = raycast_workbook_feature_region(
+            Ray3d::new(local_origin + translation, Dir3::NEG_Y),
+            moving_transform,
+            &region,
+        );
+        assert!((identity_hit - moving_hit.unwrap()).abs() < 0.0001);
+        assert!(raycast_workbook_feature_region(
+            Ray3d::new(local_origin + Vec3::X * 100.0, Dir3::NEG_Y),
+            Affine3A::IDENTITY,
+            &region,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn arrogance_cabin_has_a_canonical_metal_floor_and_ceiling() {
+        let footprint = combat_spaceship_cabin_footprint();
+        assert!(!footprint.is_empty());
+        assert!(footprint.contains(&IVec3::new(
+            ARROGANCE.spawn[0],
+            0,
+            ARROGANCE.spawn[1],
+        )));
+        let cells = combat_spaceship_voxel_cells()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        for floor in footprint {
+            assert_eq!(cells.get(&floor), Some(&7), "missing cabin floor at {floor:?}");
+            assert_eq!(
+                cells.get(&(floor + IVec3::Y * WORKBOOK_ROOM_HEIGHT)),
+                Some(&7),
+                "missing cabin ceiling at {floor:?}"
+            );
+        }
+        let spawn = IVec3::new(ARROGANCE.spawn[0], 0, ARROGANCE.spawn[1]);
+        assert!((1..WORKBOOK_ROOM_HEIGHT).all(|y| !cells.contains_key(&(spawn + IVec3::Y * y))));
     }
 
     #[test]
@@ -14255,7 +14762,16 @@ mod tests {
             .micro_tiles
             .iter()
             .any(|tile| tile.kind == VoxelMicroTileKind::Fixture));
+        let workbook_features = specs[0]
+            .workbook_features
+            .as_ref()
+            .expect("狂妄号 must carry its labels as it moves");
+        assert_eq!(workbook_features.map_name, ARROGANCE.name);
+        assert!(!workbook_features.regions.is_empty());
         assert!(specs[1..].iter().all(|spec| spec.micro_tiles.is_empty()));
+        assert!(specs[1..]
+            .iter()
+            .all(|spec| spec.workbook_features.is_none()));
 
         let min_x = -((ARROGANCE.width as i32 - 1) / 2);
         let max_x = min_x + ARROGANCE.width as i32 - 1;
@@ -14329,6 +14845,12 @@ mod tests {
             .world_mut()
             .query_filtered::<Entity, With<VoxelMicroDecoration>>();
         assert!(micro_tiles.iter(app.world()).next().is_some());
+        let mut workbook_annotations = app
+            .world_mut()
+            .query_filtered::<&VoxelWorkbookFeatureAnnotations, With<VoxelSpaceship>>();
+        let annotations = workbook_annotations.iter(app.world()).collect::<Vec<_>>();
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].map_name, ARROGANCE.name);
     }
 
     #[test]
