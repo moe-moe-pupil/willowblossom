@@ -167,7 +167,7 @@ const ORBITAL_PLANET_GRAVITY_ACCELERATION: f32 = 9.81;
 const ORBITAL_PLANET_GRAVITY_MAX_ALTITUDE: f32 = 32.0;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const VOXEL_SCENE_AUTOSAVE_SECONDS: f32 = 30.0;
-const VOXEL_SCENE_LAYOUT_REVISION: u32 = 3;
+const VOXEL_SCENE_LAYOUT_REVISION: u32 = 4;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
 pub(crate) const VOXEL_GLASS_MATERIAL: u8 = 11;
 const VOXEL_GLASS_OPACITY: f32 = 0.05;
@@ -229,6 +229,12 @@ const COMBAT_SPACESHIP_CENTER: IVec3 =
 const ABANDONED_STATION_CENTER: IVec3 =
     IVec3::new(0, 0, 200 * ORBITAL_LAYOUT_SCALE);
 const WORKBOOK_ROOM_HEIGHT: i32 = 7;
+const STATION_DOCK_PAD_HALF_WIDTH: i32 = 22;
+const STATION_DOCK_PAD_HALF_LENGTH: i32 = 25;
+const STATION_DOCK_HULL_GAP: i32 = 8;
+const STATION_DOCK_BRIDGE_HALF_WIDTH: i32 = 2;
+const STATION_DOCK_CLEAR_HEIGHT: i32 = 10;
+const STATION_DOCK_MIN_SEPARATION: i32 = 64;
 const FIRST_PERSON_START: Vec3 = Vec3::new(
     (COMBAT_SPACESHIP_CENTER.x + ARROGANCE.spawn[0] * ARROGANCE_SCALE) as f32
         * VOXEL_SIZE,
@@ -3012,9 +3018,268 @@ fn populate_voxel_grid(mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>) {
     populate_default_grid(&mut grid);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpaceStationDockEdge {
+    West,
+    East,
+    North,
+    South,
+}
+
+impl SpaceStationDockEdge {
+    fn direction(self) -> IVec3 {
+        match self {
+            Self::West => IVec3::NEG_X,
+            Self::East => IVec3::X,
+            Self::North => IVec3::NEG_Z,
+            Self::South => IVec3::Z,
+        }
+    }
+
+    fn tangent(self) -> IVec3 {
+        match self {
+            Self::West | Self::East => IVec3::Z,
+            Self::North | Self::South => IVec3::X,
+        }
+    }
+
+    fn sheet_offset(self) -> (i32, i32) {
+        match self {
+            Self::West => (-1, 0),
+            Self::East => (1, 0),
+            Self::North => (0, -1),
+            Self::South => (0, 1),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SpaceStationDockSpec {
+    edge: SpaceStationDockEdge,
+    along: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SpaceStationDockingPort {
+    edge: SpaceStationDockEdge,
+    entrance: IVec3,
+    pad_center: IVec3,
+}
+
+const NIFFY_DOCKS: [SpaceStationDockSpec; 3] = [
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::West,
+        along: -22,
+    },
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::East,
+        along: 21,
+    },
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::South,
+        along: 5,
+    },
+];
+const ARBITRATOR_DOCKS: [SpaceStationDockSpec; 3] = [
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::North,
+        along: -47,
+    },
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::East,
+        along: 2,
+    },
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::South,
+        along: 0,
+    },
+];
+const KYO_DOCKS: [SpaceStationDockSpec; 3] = [
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::West,
+        along: 19,
+    },
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::North,
+        along: 43,
+    },
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::South,
+        along: -42,
+    },
+];
+const ABANDONED_DOCKS: [SpaceStationDockSpec; 3] = [
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::West,
+        along: -31,
+    },
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::East,
+        along: 32,
+    },
+    SpaceStationDockSpec {
+        edge: SpaceStationDockEdge::North,
+        along: 3,
+    },
+];
+
+fn space_station_docking_specs(design: WorkbookMapDesign) -> &'static [SpaceStationDockSpec] {
+    match design.name {
+        "U.S.I Niffy女皇号空间站" => &NIFFY_DOCKS,
+        "U.S.I 女仲裁者号空间站" => &ARBITRATOR_DOCKS,
+        "U.S.I Kyo空间站" => &KYO_DOCKS,
+        "废弃太空站" => &ABANDONED_DOCKS,
+        _ => &[],
+    }
+}
+
+fn workbook_column_occupied(decoded: &DecodedWorkbookMap, index: usize) -> bool {
+    decoded.enclosed[index] || matches!(decoded.styles[index], 11 | 15)
+}
+
+fn space_station_docking_ports(design: WorkbookMapDesign) -> Vec<SpaceStationDockingPort> {
+    let decoded = design.decode();
+    let ports = space_station_docking_specs(design)
+        .iter()
+        .filter_map(|spec| {
+            let direction = spec.edge.direction();
+            let tangent = spec.edge.tangent();
+            let (sheet_dx, sheet_dz) = spec.edge.sheet_offset();
+            let entrance = decoded
+                .styles
+                .iter()
+                .enumerate()
+                .filter_map(|(index, style)| {
+                    if !matches!(*style, 11 | 15) {
+                        return None;
+                    }
+                    let sheet_x = (index % design.width) as i32;
+                    let sheet_z = (index / design.width) as i32;
+                    if !workbook_cell_is_exterior(
+                        design,
+                        &decoded,
+                        sheet_x + sheet_dx,
+                        sheet_z + sheet_dz,
+                    ) {
+                        return None;
+                    }
+                    let [x, z] = design.centered_offset(index);
+                    let cell = IVec3::new(x, 0, z);
+                    let along_distance = (cell.dot(tangent) - spec.along).abs();
+                    Some((
+                        (along_distance, -cell.dot(direction)),
+                        cell,
+                    ))
+                })
+                .min_by_key(|(key, _)| *key)
+                .map(|(_, cell)| cell)?;
+            let entrance_along = entrance.dot(tangent);
+            let outermost = decoded
+                .styles
+                .iter()
+                .enumerate()
+                .filter_map(|(index, _)| {
+                    if !workbook_column_occupied(&decoded, index) {
+                        return None;
+                    }
+                    let [x, z] = design.centered_offset(index);
+                    let cell = IVec3::new(x, 0, z);
+                    ((cell.dot(tangent) - entrance_along).abs() <= STATION_DOCK_PAD_HALF_WIDTH + 2)
+                        .then_some(cell.dot(direction))
+                })
+                .max()
+                .unwrap_or_else(|| entrance.dot(direction));
+            let pad_center = entrance
+                + direction
+                    * (outermost - entrance.dot(direction)
+                        + STATION_DOCK_HULL_GAP
+                        + STATION_DOCK_PAD_HALF_LENGTH);
+            Some(SpaceStationDockingPort {
+                edge: spec.edge,
+                entrance,
+                pad_center,
+            })
+        })
+        .collect::<Vec<_>>();
+    for (index, port) in ports.iter().enumerate() {
+        for other in &ports[index + 1..] {
+            debug_assert!(
+                (port.pad_center - other.pad_center).length_squared()
+                    >= STATION_DOCK_MIN_SEPARATION.pow(2),
+                "{} docking pads at {:?} and {:?} are too close",
+                design.name,
+                port.pad_center,
+                other.pad_center
+            );
+        }
+    }
+    ports
+}
+
+fn add_space_station_docking_areas(
+    grid: &mut Mut<Grid<u8>>,
+    center: IVec3,
+    design: WorkbookMapDesign,
+) {
+    for port in space_station_docking_ports(design) {
+        let direction = port.edge.direction();
+        let tangent = port.edge.tangent();
+        let pad_inner_step =
+            (port.pad_center - port.entrance).dot(direction) - STATION_DOCK_PAD_HALF_LENGTH;
+
+        // Cut only a narrow personnel entrance through the existing hull and
+        // connect it to the pad. The landing surface itself stays roofless and
+        // wall-free so ships can approach from open space.
+        for inward_step in -1..=1 {
+            for lateral in -STATION_DOCK_BRIDGE_HALF_WIDTH..=STATION_DOCK_BRIDGE_HALF_WIDTH {
+                let column = center + port.entrance + direction * inward_step + tangent * lateral;
+                grid.set(column, 7);
+                for y in 1..=WORKBOOK_ROOM_HEIGHT - 2 {
+                    grid.set(column + IVec3::Y * y, 0);
+                }
+            }
+        }
+        for step in 0..pad_inner_step {
+            for lateral in -STATION_DOCK_BRIDGE_HALF_WIDTH..=STATION_DOCK_BRIDGE_HALF_WIDTH {
+                let column = center + port.entrance + direction * step + tangent * lateral;
+                grid.set(
+                    column,
+                    if lateral == 0 { 10 } else { 7 },
+                );
+                for y in 1..=STATION_DOCK_CLEAR_HEIGHT {
+                    grid.set(column + IVec3::Y * y, 0);
+                }
+            }
+        }
+
+        for radial in -STATION_DOCK_PAD_HALF_LENGTH..=STATION_DOCK_PAD_HALF_LENGTH {
+            for lateral in -STATION_DOCK_PAD_HALF_WIDTH..=STATION_DOCK_PAD_HALF_WIDTH {
+                let column = center + port.pad_center + direction * radial + tangent * lateral;
+                let material = if radial.abs() == STATION_DOCK_PAD_HALF_LENGTH
+                    || lateral.abs() == STATION_DOCK_PAD_HALF_WIDTH
+                {
+                    7
+                } else if lateral.abs() <= 1 {
+                    10
+                } else if radial == 0 {
+                    9
+                } else {
+                    6
+                };
+                grid.set(column, material);
+                for y in 1..=STATION_DOCK_CLEAR_HEIGHT {
+                    grid.set(column + IVec3::Y * y, 0);
+                }
+            }
+        }
+    }
+}
+
+
 fn populate_default_grid(grid: &mut Mut<Grid<u8>>) {
     for (center, design) in workbook_orbital_locations() {
         build_workbook_orbital_location(grid, center, design);
+        add_space_station_docking_areas(grid, center, design);
     }
     for door in voxel_auto_doors() {
         for cell in door.cells {
@@ -13708,7 +13973,15 @@ mod tests {
             let wall_index = decoded
                 .styles
                 .iter()
-                .position(|style| *style == 11)
+                .enumerate()
+                .find_map(|(index, style)| {
+                    if *style != 11 {
+                        return None;
+                    }
+                    let [wall_x, wall_z] = design.centered_offset(index);
+                    (grid.get(center + IVec3::new(wall_x, 1, wall_z)).copied() == Some(6))
+                        .then_some(index)
+                })
                 .unwrap();
             let [wall_x, wall_z] = design.centered_offset(wall_index);
             assert_eq!(
@@ -13719,6 +13992,91 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn space_station_docks_are_separated_open_and_fit_medium_ships() {
+        let (app, entity) = test_grid();
+        let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
+        let medium_ship = medium_spaceship_voxel_cells()
+            .into_iter()
+            .filter_map(|(cell, material)| TrpgVoxelConnector::solid(&material).then_some(cell))
+            .collect::<Vec<_>>();
+
+        for (station_center, design) in static_workbook_orbital_locations() {
+            let ports = space_station_docking_ports(design);
+            assert_eq!(
+                ports.len(),
+                3,
+                "{} docking port count",
+                design.name
+            );
+            for (index, port) in ports.iter().enumerate() {
+                for other in &ports[index + 1..] {
+                    assert!(
+                        (port.pad_center - other.pad_center).length_squared()
+                            >= STATION_DOCK_MIN_SEPARATION.pow(2),
+                        "{} docking pads must not be clustered",
+                        design.name
+                    );
+                    assert_ne!(
+                        port.edge, other.edge,
+                        "{} docking entries must face different directions",
+                        design.name
+                    );
+                }
+
+                let direction = port.edge.direction();
+                let tangent = port.edge.tangent();
+                let parked_origin = station_center + port.pad_center + IVec3::Y;
+
+                for cell in &medium_ship {
+                    let parked =
+                        parked_origin + tangent * cell.x + IVec3::Y * cell.y + direction * cell.z;
+                    assert!(
+                        !grid.get(parked).is_some_and(TrpgVoxelConnector::solid),
+                        "{} medium ship must fit on its docking pad at {:?}",
+                        design.name,
+                        port.pad_center
+                    );
+                    if cell.y == 0 {
+                        assert!(
+                            grid.get(parked - IVec3::Y)
+                                .is_some_and(TrpgVoxelConnector::solid),
+                            "{} docking pad must support the medium ship",
+                            design.name
+                        );
+                    }
+                    for launch_step in 1..=STATION_DOCK_PAD_HALF_LENGTH * 2 {
+                        assert!(
+                            !grid
+                                .get(parked + direction * launch_step)
+                                .is_some_and(TrpgVoxelConnector::solid),
+                            "{} must have a clear outward launch lane",
+                            design.name
+                        );
+                    }
+                }
+
+                for lateral in -STATION_DOCK_BRIDGE_HALF_WIDTH..=STATION_DOCK_BRIDGE_HALF_WIDTH {
+                    let entry = station_center + port.entrance + tangent * lateral;
+                    assert!(
+                        grid.get(entry).is_some_and(TrpgVoxelConnector::solid),
+                        "{} docking entry needs a walkable floor",
+                        design.name
+                    );
+                    for y in 1..=WORKBOOK_ROOM_HEIGHT - 2 {
+                        assert_eq!(
+                            grid.get(entry + IVec3::Y * y).copied().unwrap_or(0),
+                            0,
+                            "{} docking entry must remain open",
+                            design.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
 
     #[test]
     fn workbook_micro_tiles_are_sixteenth_scale_and_owned_by_canonical_cells() {
