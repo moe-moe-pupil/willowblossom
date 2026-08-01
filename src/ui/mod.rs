@@ -168,6 +168,12 @@ fn voxel_material_choices() -> [(u8, &'static str, egui::Color32); 10] {
     ]
 }
 
+const VOXEL_CREATIVE_STANDALONE_MODES: [VoxelEditMode; 3] = [
+    VoxelEditMode::Add,
+    VoxelEditMode::Remove,
+    VoxelEditMode::Paint,
+];
+
 fn paint_voxel_creative_item_icon(
     ui: &Ui,
     rect: egui::Rect,
@@ -14983,7 +14989,13 @@ pub fn ui_system(
                                     }
                                     ui.small(name);
                                 });
-                                for (index, mode) in VoxelEditMode::ALL.into_iter().enumerate() {
+                                for (index, mode) in VoxelEditMode::ALL
+                                    .into_iter()
+                                    .filter(|mode| {
+                                        VOXEL_CREATIVE_STANDALONE_MODES.contains(mode)
+                                    })
+                                    .enumerate()
+                                {
                                     let item = VoxelCreativeItem::Mode(mode);
                                     let (name, _) = voxel_creative_item_visual(item);
                                     ui.vertical_centered(|ui| {
@@ -15441,6 +15453,24 @@ fn append_local_sent_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creative_catalog_omits_modes_provided_by_the_tool_gun() {
+        assert_eq!(VOXEL_CREATIVE_STANDALONE_MODES, [
+            VoxelEditMode::Add,
+            VoxelEditMode::Remove,
+            VoxelEditMode::Paint,
+        ]);
+        for tool_gun_mode in [
+            VoxelEditMode::Physics,
+            VoxelEditMode::Drag,
+            VoxelEditMode::Push,
+            VoxelEditMode::Pull,
+            VoxelEditMode::Explode,
+        ] {
+            assert!(!VOXEL_CREATIVE_STANDALONE_MODES.contains(&tool_gun_mode));
+        }
+    }
 
     #[test]
     fn chat_windows_can_use_the_full_available_width() {
