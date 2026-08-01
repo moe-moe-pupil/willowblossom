@@ -163,6 +163,8 @@ const ORBITAL_PLANET_CENTER: Vec3 = Vec3::new(0.0, -251.125, 0.0);
 const ORBITAL_PLANET_VOXEL_RADIUS: i32 = 485;
 const ORBITAL_PLANET_CAP_RADIUS: i32 = 128;
 const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
+const ORBITAL_PLANET_GRAVITY_ACCELERATION: f32 = 9.81;
+const ORBITAL_PLANET_GRAVITY_MAX_ALTITUDE: f32 = 32.0;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const VOXEL_SCENE_AUTOSAVE_SECONDS: f32 = 30.0;
 const VOXEL_SCENE_LAYOUT_REVISION: u32 = 3;
@@ -1070,6 +1072,9 @@ struct VoxelPlacedLight {
 
 #[derive(Component)]
 struct VoxelFirstPersonPlayer;
+
+#[derive(Component)]
+struct VoxelPlanetGravityBody;
 
 #[derive(Resource)]
 pub(crate) struct VoxelPossessionState {
@@ -2058,6 +2063,10 @@ impl Plugin for TrpgVoxelPlugin {
             draw_possessed_player_targeting
                 .after(VoxelPlayerStandeeSynced)
                 .run_if(crate::replay::replay_video_capture_inactive),
+        )
+        .add_systems(
+            PhysicsSchedule,
+            apply_voxel_planet_gravity.before(PhysicsStepSystems::First),
         )
         .add_systems(
             PostUpdate,
@@ -8094,6 +8103,38 @@ fn planet_material_handle(materials: &VoxelMaterials, material_id: u8) -> Handle
     }
 }
 
+fn voxel_planet_gravity_acceleration(position: Vec3, planet_center: Vec3) -> Vec3 {
+    let toward_center = planet_center - position;
+    let distance_squared = toward_center.length_squared();
+    let maximum_distance = ORBITAL_PLANET_RADIUS + ORBITAL_PLANET_GRAVITY_MAX_ALTITUDE;
+    if !distance_squared.is_finite()
+        || distance_squared <= f32::EPSILON
+        || distance_squared > maximum_distance * maximum_distance
+    {
+        return Vec3::ZERO;
+    }
+    toward_center / distance_squared.sqrt() * ORBITAL_PLANET_GRAVITY_ACCELERATION
+}
+
+fn apply_voxel_planet_gravity(
+    planets: Query<&Transform, With<VoxelOrbitalPlanet>>,
+    mut bodies: Query<Forces, With<VoxelPlanetGravityBody>>,
+) {
+    let Ok(planet_transform) = planets.single() else {
+        return;
+    };
+
+    for mut forces in &mut bodies {
+        let acceleration = voxel_planet_gravity_acceleration(
+            forces.position().0,
+            planet_transform.translation,
+        );
+        if acceleration != Vec3::ZERO {
+            forces.apply_linear_acceleration(acceleration);
+        }
+    }
+}
+
 fn spawn_voxel_orbital_planet(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -9791,9 +9832,9 @@ fn spawn_voxel_physics_body_at(
                 local_center,
                 cells,
             },
+            VoxelPlanetGravityBody,
             RigidBody::Dynamic,
             canonical_voxel_collider(&collider_voxels),
-            ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
             Friction::new(0.8),
             linear_velocity,
             angular_velocity,
@@ -10220,13 +10261,13 @@ fn spawn_voxel_placed_light(
                 ),
                 MeshMaterial3d(materials.handles[7].clone()),
                 Transform::from_translation(position),
+                VoxelPlanetGravityBody,
                 RigidBody::Dynamic,
                 Collider::cuboid(
                     VOXEL_SIZE * 0.8,
                     VOXEL_SIZE * 0.8,
                     VOXEL_SIZE * 0.8,
                 ),
-                ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
                 LinearDamping(0.2),
                 AngularDamping(0.35),
                 light,
@@ -11522,6 +11563,11 @@ fn control_first_person_player(
         }
     }
 
+    acceleration.0 = if editor.first_person_flying {
+        Vec3::ZERO
+    } else {
+        Vec3::new(0.0, -9.81, 0.0)
+    };
     if !editor.first_person_enabled {
         editor.first_person_flying = false;
         editor.first_person_space_tap_elapsed = f32::INFINITY;
@@ -13968,6 +14014,52 @@ mod tests {
     }
 
     #[test]
+    fn planet_gravity_is_radial_and_ends_before_orbital_installations() {
+        let gravity_edge = ORBITAL_PLANET_CENTER
+            + Vec3::Y * (ORBITAL_PLANET_RADIUS + ORBITAL_PLANET_GRAVITY_MAX_ALTITUDE);
+        let edge_acceleration =
+            voxel_planet_gravity_acceleration(gravity_edge, ORBITAL_PLANET_CENTER);
+        assert!(edge_acceleration.abs_diff_eq(
+            Vec3::NEG_Y * ORBITAL_PLANET_GRAVITY_ACCELERATION,
+            0.0001,
+        ));
+        assert_eq!(
+            voxel_planet_gravity_acceleration(
+                gravity_edge + Vec3::Y * 0.001,
+                ORBITAL_PLANET_CENTER,
+            ),
+            Vec3::ZERO,
+        );
+
+        let science_lab = VoxelTeleportDestination::PlanetScienceLab
+            .player_position()
+            .unwrap();
+        let lab_acceleration =
+            voxel_planet_gravity_acceleration(science_lab, ORBITAL_PLANET_CENTER);
+        assert!(
+            (lab_acceleration.length() - ORBITAL_PLANET_GRAVITY_ACCELERATION).abs() < 0.0001
+        );
+        assert!(lab_acceleration.dot(ORBITAL_PLANET_CENTER - science_lab) > 0.0);
+
+        for orbital_center in [
+            RESEARCH_STATION_CENTER,
+            SENSOR_STATION_CENTER,
+            CANNON_STATION_CENTER,
+            COMBAT_SPACESHIP_CENTER,
+            ABANDONED_STATION_CENTER,
+        ] {
+            assert_eq!(
+                voxel_planet_gravity_acceleration(
+                    orbital_center.as_vec3() * VOXEL_SIZE,
+                    ORBITAL_PLANET_CENTER,
+                ),
+                Vec3::ZERO,
+                "orbital installation at {orbital_center:?} entered the planet gravity field",
+            );
+        }
+    }
+
+    #[test]
     fn xy_planet_base_is_canonical_editable_workbook_geometry() {
         let lab_cells = xy_planet_map_cells()
             .into_iter()
@@ -15358,6 +15450,14 @@ mod tests {
         app.update();
 
         assert!(app.world().entity(player).contains::<Sensor>());
+        assert_eq!(
+            app.world()
+                .entity(player)
+                .get::<ConstantLinearAcceleration>()
+                .unwrap()
+                .0,
+            Vec3::ZERO,
+        );
 
         app.world_mut()
             .resource_mut::<VoxelEditorState>()
@@ -15365,6 +15465,14 @@ mod tests {
         app.update();
 
         assert!(!app.world().entity(player).contains::<Sensor>());
+        assert_eq!(
+            app.world()
+                .entity(player)
+                .get::<ConstantLinearAcceleration>()
+                .unwrap()
+                .0,
+            Vec3::new(0.0, -9.81, 0.0),
+        );
     }
 
     #[test]
@@ -15927,19 +16035,30 @@ mod tests {
             VoxelPlayerCaptureCamera { user_id: 42 },
             player_view,
         ));
-        app.world_mut().spawn((
-            VoxelFirstPersonPlayer,
-            ShapeHits::default(),
-            Transform::default(),
-            LinearVelocity::ZERO,
-            ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
-        ));
+        let player = app
+            .world_mut()
+            .spawn((
+                VoxelFirstPersonPlayer,
+                ShapeHits::default(),
+                Transform::default(),
+                LinearVelocity::ZERO,
+                ConstantLinearAcceleration::new(0.0, 0.0, 0.0),
+            ))
+            .id();
 
         app.update();
 
         let editor = app.world().resource::<VoxelEditorState>();
         assert!(editor.first_person_enabled);
         assert!(!editor.first_person_flying);
+        assert_eq!(
+            app.world()
+                .entity(player)
+                .get::<ConstantLinearAcceleration>()
+                .unwrap()
+                .0,
+            Vec3::new(0.0, -9.81, 0.0),
+        );
 
         app.world_mut()
             .resource_mut::<VoxelPossessionState>()
@@ -16163,6 +16282,12 @@ mod tests {
                     .entity(entity)
                     .contains::<ConstantLinearAcceleration>(),
                 "spaceships must not receive the walking/prop gravity acceleration"
+            );
+            assert!(
+                !app.world()
+                    .entity(entity)
+                    .contains::<VoxelPlanetGravityBody>(),
+                "spaceships must not enter the planet-only gravity force query"
             );
         }
         let mut micro_tiles = app
