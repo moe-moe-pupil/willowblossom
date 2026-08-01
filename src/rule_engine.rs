@@ -64,7 +64,7 @@ impl Plugin for RuleEnginePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<RuleEngineState>().add_systems(
             EguiPrimaryContextPass,
-            rule_engine_panel,
+            rule_engine_panel.run_if(crate::replay::replay_video_capture_inactive),
         );
     }
 }
