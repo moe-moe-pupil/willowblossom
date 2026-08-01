@@ -63,6 +63,9 @@ use crate::voxel::{
     clear_campaign_possession_movement,
     clear_player_camera,
     clear_player_possession_movement,
+    has_voxel_unit_standee,
+    place_voxel_unit_standee,
+    remove_voxel_unit_standee,
     VoxelCreativeItem,
     VoxelEditMode,
     VoxelEditorState,
@@ -74,6 +77,7 @@ use crate::voxel::{
     VoxelPossessionState,
     VoxelTargetingPreview,
     VoxelTeleportDestination,
+    VoxelUnitStandeeStore,
     MAX_VOXEL_BRUSH_RADIUS,
 };
 
@@ -801,13 +805,11 @@ use crate::{
     },
     scene::{
         has_legacy_area_marker,
-        has_unit_template_standee,
         has_unit_template_token,
         legacy_area_marker_id,
         place_legacy_area_marker,
         place_legacy_area_unit_token,
         place_legacy_world_unit_token,
-        place_unit_template_standee,
         place_unit_template_token,
         prune_legacy_area_unit_tokens,
         prune_legacy_world_unit_tokens,
@@ -990,6 +992,7 @@ pub struct UiSystemLocals<'w, 's> {
     possession_movement_store: ResMut<'w, Persistent<VoxelPossessionMovementStore>>,
     replay_movement_history: ResMut<'w, Persistent<ReplayPlayerMovementHistory>>,
     player_camera_store: ResMut<'w, Persistent<VoxelPlayerCameraStore>>,
+    unit_standee_store: ResMut<'w, Persistent<VoxelUnitStandeeStore>>,
     player_standees: Query<
         'w,
         's,
@@ -1375,6 +1378,8 @@ fn pool_management_window(
     deepseek_sender: Option<&DeepseekIOSender>,
     deepseek_manager: &mut DeepseekManager,
     ime: &mut ImeManager,
+    unit_standee_store: &mut Persistent<VoxelUnitStandeeStore>,
+    voxel_editor: &VoxelEditorState,
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
 ) {
     if !state.pool_window_open {
@@ -1474,6 +1479,8 @@ fn pool_management_window(
                             manager,
                             state,
                             &player_targets,
+                            unit_standee_store,
+                            voxel_editor,
                             scene_store.as_deref_mut(),
                         )
                     },
@@ -10294,6 +10301,8 @@ fn unit_pool_settings_ui(
     manager: &mut NapcatMessageManager,
     state: &mut TrpgGroupSettingsState,
     player_targets: &[String],
+    unit_standee_store: &mut Persistent<VoxelUnitStandeeStore>,
+    voxel_editor: &VoxelEditorState,
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
 ) -> bool {
     let mut changed = false;
@@ -10418,50 +10427,52 @@ fn unit_pool_settings_ui(
                     if ui.button("删除单位").clicked() {
                         unit_to_delete = Some(unit_id.clone());
                     }
-                    if let Some(store) = scene_store.as_deref_mut() {
-                        let image_source = unit.character.image.trim().to_owned();
-                        let has_standee = has_unit_template_standee(store, &unit_id);
-                        let place_label =
-                            if has_standee { "更新场景立绘" } else { "放入场景立绘" };
-                        if ui
-                            .add_enabled(
-                                !image_source.is_empty(),
-                                egui::Button::new(place_label),
-                            )
-                            .on_disabled_hover_text("单位模板还没有立绘")
-                            .clicked()
-                        {
-                            let status = match place_unit_template_standee(
-                                &mut *store,
-                                &unit_id,
-                                &image_source,
-                            ) {
-                                Ok(scene_changed) => match store.persist() {
-                                    Ok(()) => {
-                                        if scene_changed {
-                                            "已写入场景立绘".to_owned()
-                                        } else {
-                                            "场景立绘已是最新".to_owned()
-                                        }
-                                    },
-                                    Err(err) => format!("场景立绘保存失败：{err}"),
+                    let image_source = unit.character.image.trim().to_owned();
+                    let has_standee = has_voxel_unit_standee(unit_standee_store, &unit_id);
+                    if has_standee {
+                        ui.small("NPC立绘已在场景中（图片修改会自动同步）");
+                    } else if ui
+                        .add_enabled(
+                            !image_source.is_empty(),
+                            egui::Button::new("创建NPC立绘"),
+                        )
+                        .on_hover_text("在当前GM视野焦点创建单位立绘")
+                        .on_disabled_hover_text("单位模板还没有立绘图片")
+                        .clicked()
+                    {
+                        let status = match place_voxel_unit_standee(
+                            &mut *unit_standee_store,
+                            &unit_id,
+                            &image_source,
+                            voxel_editor,
+                        ) {
+                            Ok(scene_changed) => match unit_standee_store.persist() {
+                                Ok(()) => {
+                                    if scene_changed {
+                                        "已在当前GM视野焦点创建NPC立绘".to_owned()
+                                    } else {
+                                        "NPC立绘已在场景中".to_owned()
+                                    }
                                 },
-                                Err(err) => format!("场景立绘失败：{err}"),
-                            };
-                            state.unit_pool_scene_status.insert(unit_id.clone(), status);
-                        }
-                        if has_standee && ui.button("移出场景").clicked() {
-                            let removed = remove_unit_template_standee(&mut *store, &unit_id);
-                            let status = if removed {
-                                match store.persist() {
-                                    Ok(()) => "已移出场景立绘".to_owned(),
-                                    Err(err) => format!("移出场景保存失败：{err}"),
-                                }
-                            } else {
-                                "场景里没有这个单位立绘".to_owned()
-                            };
-                            state.unit_pool_scene_status.insert(unit_id.clone(), status);
-                        }
+                                Err(err) => format!("NPC立绘保存失败：{err}"),
+                            },
+                            Err(err) => format!("NPC立绘失败：{err}"),
+                        };
+                        state.unit_pool_scene_status.insert(unit_id.clone(), status);
+                    }
+                    if has_standee && ui.button("移出NPC立绘").clicked() {
+                        let removed = remove_voxel_unit_standee(&mut *unit_standee_store, &unit_id);
+                        let status = if removed {
+                            match unit_standee_store.persist() {
+                                Ok(()) => "已移出NPC立绘".to_owned(),
+                                Err(err) => format!("移出NPC立绘保存失败：{err}"),
+                            }
+                        } else {
+                            "场景里没有这个NPC立绘".to_owned()
+                        };
+                        state.unit_pool_scene_status.insert(unit_id.clone(), status);
+                    }
+                    if let Some(store) = scene_store.as_deref_mut() {
                         let has_token = has_unit_template_token(store, &unit_id);
                         let token_label =
                             if has_token { "更新场景标记" } else { "放入场景标记" };
@@ -10499,8 +10510,6 @@ fn unit_pool_settings_ui(
                             };
                             state.unit_pool_scene_status.insert(unit_id.clone(), status);
                         }
-                    } else {
-                        ui.small("场景未就绪");
                     }
                     if let Some(status) = state.unit_pool_scene_status.get(&unit_id) {
                         ui.small(status);
@@ -10513,6 +10522,14 @@ fn unit_pool_settings_ui(
 
     if let Some(unit_id) = unit_to_delete {
         manager.unit_pool.remove(&unit_id);
+        if remove_voxel_unit_standee(&mut *unit_standee_store, &unit_id) {
+            if let Err(err) = unit_standee_store.persist() {
+                state.unit_pool_scene_status.insert(
+                    unit_id.clone(),
+                    format!("单位已删除；NPC立绘保存失败：{err}"),
+                );
+            }
+        }
         if let Some(store) = scene_store.as_deref_mut() {
             let removed_standee = remove_unit_template_standee(&mut *store, &unit_id);
             let removed_token = remove_unit_template_token(&mut *store, &unit_id);
@@ -10664,6 +10681,16 @@ fn unit_character_template_editor_ui(
         ui.label("昵称");
         changed |= ui
             .add(egui::TextEdit::singleline(&mut character.nickname).desired_width(120.0))
+            .changed();
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("立绘图片");
+        changed |= ui
+            .add(
+                egui::TextEdit::singleline(&mut character.image)
+                    .hint_text("本地图片路径或 http(s) URL")
+                    .desired_width(CHARACTER_FIELD_MAX_WIDTH),
+            )
             .changed();
     });
 
@@ -14090,6 +14117,7 @@ pub fn ui_system(
     let possession_movement_store = &mut locals.possession_movement_store;
     let replay_movement_history = &mut locals.replay_movement_history;
     let player_camera_store = &mut locals.player_camera_store;
+    let unit_standee_store = &mut locals.unit_standee_store;
     let player_standees = &locals.player_standees;
 
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -14225,6 +14253,8 @@ pub fn ui_system(
         deepseek_sender,
         &mut deepseek_manager,
         &mut ime,
+        unit_standee_store,
+        voxel_editor,
         scene_store.as_deref_mut(),
     );
 
