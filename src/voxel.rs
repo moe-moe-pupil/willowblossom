@@ -197,7 +197,7 @@ const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
 const VOXEL_SPACESHIP_SAVE_SECONDS: f32 = 1.0;
-const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 3;
+const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 4;
 const COMBAT_SPACESHIP_ID: &str = "usi-arrogance";
 const MEDIUM_SPACESHIP_ID: &str = "medium-ship-01";
 const SMALL_SPACESHIP_COUNT: usize = 6;
@@ -212,6 +212,11 @@ const HANGAR_PARKING_Z: i32 = -20;
 const HANGAR_DOCK_CLEARANCE_CELLS: f32 = 6.0;
 const HANGAR_DOCK_MAX_RELATIVE_SPEED: f32 = 1.0;
 const HANGAR_DOCK_MAX_RELATIVE_ANGULAR_SPEED: f32 = 0.35;
+const ARROGANCE_CAB_FLOOR_Y: i32 = 3;
+const ARROGANCE_CAB_CEILING_Y: i32 = 12;
+const ARROGANCE_CAB_FRONT_Z: i32 = HANGAR_REAR_Z - 24;
+const ARROGANCE_CAB_REAR_Z: i32 = HANGAR_REAR_Z - 4;
+const ARROGANCE_CAB_MAX_HALF_WIDTH: i32 = 12;
 const DEFAULT_COLLISION_LAYER_BITS: u32 = 1 << 0;
 const CARRIER_COLLISION_LAYER_BITS: u32 = 1 << 1;
 const DOCKED_SPACESHIP_COLLISION_LAYER_BITS: u32 = 1 << 2;
@@ -4503,56 +4508,138 @@ fn spawn_default_voxel_physics_props(
     }
 }
 
-fn combat_spaceship_cabin_footprint() -> Vec<IVec3> {
-    let decoded = ARROGANCE.decode();
-    let min_x = ARROGANCE.spawn[0] - 4;
-    let max_x = ARROGANCE.spawn[0] + 4;
-    let min_z = ARROGANCE.spawn[1] - 6;
-    let max_z = ARROGANCE.spawn[1];
-    decoded
-        .styles
-        .iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(index, style)| {
-            let [x, z] = ARROGANCE.centered_offset(index);
-            (decoded.enclosed[index]
-                && !matches!(style, 11 | 15)
-                && (min_x..=max_x).contains(&x)
-                && (min_z..=max_z).contains(&z))
-            .then_some(IVec3::new(x, 0, z))
-        })
-        .collect()
+fn combat_spaceship_cab_half_width(z: i32) -> i32 {
+    let taper_length = 7;
+    if z < ARROGANCE_CAB_FRONT_Z + taper_length {
+        6 + (z - ARROGANCE_CAB_FRONT_Z) * (ARROGANCE_CAB_MAX_HALF_WIDTH - 6) / taper_length
+    } else {
+        ARROGANCE_CAB_MAX_HALF_WIDTH
+    }
 }
 
-fn enclose_combat_spaceship_cabin(cells: &mut HashMap<IVec3, u8>) {
-    let footprint = combat_spaceship_cabin_footprint();
-    let forward_edge_z = footprint
-        .iter()
-        .map(|floor| floor.z)
-        .min()
-        .unwrap_or(ARROGANCE.spawn[1]);
-    for floor in footprint {
-        // Keep a structural deck and aft roof while opening the forward bridge
-        // into a broad glass canopy around the cockpit camera.
-        cells.insert(floor, 7);
-        cells.insert(
-            floor + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
-            if floor.z < ARROGANCE.spawn[1] {
+fn combat_spaceship_cab_interior_contains(cell: IVec3) -> bool {
+    let clear_height =
+        (ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y).contains(&cell.y);
+    if !clear_height {
+        return false;
+    }
+    if (ARROGANCE_CAB_FRONT_Z + 1..=ARROGANCE_CAB_REAR_Z).contains(&cell.z) {
+        return cell.x.abs() < combat_spaceship_cab_half_width(cell.z);
+    }
+    (ARROGANCE_CAB_REAR_Z + 1..HANGAR_REAR_Z).contains(&cell.z) && cell.x.abs() < 2
+}
+
+fn combat_spaceship_cab_cells() -> HashMap<IVec3, u8> {
+    let mut cells = HashMap::new();
+    for z in ARROGANCE_CAB_FRONT_Z..=ARROGANCE_CAB_REAR_Z {
+        let half_width = combat_spaceship_cab_half_width(z);
+        for x in -half_width..=half_width {
+            let edge = x.abs() == half_width;
+            cells.insert(
+                IVec3::new(x, ARROGANCE_CAB_FLOOR_Y, z),
+                if edge { 7 } else { 6 },
+            );
+            cells.insert(
+                IVec3::new(x, ARROGANCE_CAB_CEILING_Y, z),
+                if edge { 7 } else { 6 },
+            );
+        }
+
+        for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
+            let window =
+                (ARROGANCE_CAB_FLOOR_Y + 3..=ARROGANCE_CAB_CEILING_Y - 3).contains(&y);
+            let material = if window { VOXEL_GLASS_MATERIAL } else { 7 };
+            cells.insert(IVec3::new(-half_width, y, z), material);
+            cells.insert(IVec3::new(half_width, y, z), material);
+        }
+    }
+
+    // A broad forward windscreen, with a solid sill and header, closes the
+    // tapered nose while retaining a clear seated sightline.
+    let front_half_width = combat_spaceship_cab_half_width(ARROGANCE_CAB_FRONT_Z);
+    for x in -front_half_width..=front_half_width {
+        for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
+            let material = if (ARROGANCE_CAB_FLOOR_Y + 3..=ARROGANCE_CAB_CEILING_Y - 3).contains(&y)
+            {
                 VOXEL_GLASS_MATERIAL
             } else {
                 7
-            },
-        );
-        if floor.z == forward_edge_z {
-            for y in 2..WORKBOOK_ROOM_HEIGHT - 1 {
+            };
+            cells.insert(
+                IVec3::new(x, y, ARROGANCE_CAB_FRONT_Z),
+                material,
+            );
+        }
+    }
+
+    // Close the rear around a three-cell-wide personnel door, then bridge the
+    // short armored neck to the hangar without intruding into its flight path.
+    for x in -ARROGANCE_CAB_MAX_HALF_WIDTH..=ARROGANCE_CAB_MAX_HALF_WIDTH {
+        for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
+            if x.abs() > 1 || y >= ARROGANCE_CAB_CEILING_Y - 2 {
                 cells.insert(
-                    floor + IVec3::NEG_Z + IVec3::Y * y,
-                    VOXEL_GLASS_MATERIAL,
+                    IVec3::new(x, y, ARROGANCE_CAB_REAR_Z),
+                    7,
                 );
             }
         }
     }
+    for z in ARROGANCE_CAB_REAR_Z + 1..HANGAR_REAR_Z {
+        for x in -2..=2 {
+            cells.insert(
+                IVec3::new(x, ARROGANCE_CAB_FLOOR_Y, z),
+                7,
+            );
+            cells.insert(
+                IVec3::new(x, ARROGANCE_CAB_CEILING_Y, z),
+                7,
+            );
+        }
+        for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
+            cells.insert(IVec3::new(-2, y, z), 7);
+            cells.insert(IVec3::new(2, y, z), 7);
+        }
+    }
+
+    // Flight console, two pilot chairs, side terminals, and inset ceiling
+    // lamps make the enclosed volume read as a working bridge.
+    for x in -4..=4 {
+        cells.insert(
+            IVec3::new(
+                x,
+                ARROGANCE_CAB_FLOOR_Y + 1,
+                ARROGANCE_CAB_FRONT_Z + 3,
+            ),
+            10,
+        );
+    }
+    for x in [-4, 4] {
+        cells.insert(
+            IVec3::new(
+                x,
+                ARROGANCE_CAB_FLOOR_Y + 1,
+                ARROGANCE_CAB_FRONT_Z + 8,
+            ),
+            9,
+        );
+    }
+    for x in [-10, 10] {
+        for z in ARROGANCE_CAB_FRONT_Z + 8..=ARROGANCE_CAB_REAR_Z - 4 {
+            cells.insert(
+                IVec3::new(x, ARROGANCE_CAB_FLOOR_Y + 1, z),
+                8,
+            );
+        }
+    }
+    for z in [ARROGANCE_CAB_FRONT_Z + 7, ARROGANCE_CAB_REAR_Z - 5] {
+        for x in -2..=2 {
+            cells.insert(
+                IVec3::new(x, ARROGANCE_CAB_CEILING_Y, z),
+                10,
+            );
+        }
+    }
+    cells
 }
 
 fn scale_combat_spaceship_cell(cell: IVec3) -> IVec3 {
@@ -4613,15 +4700,15 @@ fn original_combat_spaceship_voxel_cells() -> HashMap<IVec3, u8> {
         .entity(grid_entity)
         .get::<Grid<u8>>()
         .expect("temporary spaceship grid must still exist");
-    let mut occupied = voxel_cells(grid).into_iter().collect::<HashMap<_, _>>();
-    enclose_combat_spaceship_cabin(&mut occupied);
-    occupied
+    voxel_cells(grid).into_iter().collect()
 }
 
 fn combat_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
     let original = original_combat_spaceship_voxel_cells();
     let mut occupied = scale_combat_spaceship_cells(&original);
     carve_combat_spaceship_hangar(&mut occupied);
+    occupied.retain(|cell, _| !combat_spaceship_cab_interior_contains(*cell));
+    occupied.extend(combat_spaceship_cab_cells());
     let mut cells = occupied.into_iter().collect::<Vec<_>>();
     cells.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
     cells
@@ -5079,9 +5166,9 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
             name: "U.S.I 狂妄号".to_owned(),
             class: VoxelSpaceshipClass::Cruiser,
             cockpit_eye_local: Vec3::new(
-                (ARROGANCE.spawn[0] as f32 + 0.5) * ARROGANCE_SCALE as f32,
-                2.5 * ARROGANCE_SCALE as f32,
-                (ARROGANCE.spawn[1] as f32 + 0.5) * ARROGANCE_SCALE as f32,
+                0.0,
+                ARROGANCE_CAB_FLOOR_Y as f32 + 3.5,
+                ARROGANCE_CAB_FRONT_Z as f32 + 9.5,
             ) * VOXEL_SIZE,
             thrust_acceleration: 2.4,
             vertical_acceleration: 1.4,
@@ -14258,52 +14345,6 @@ mod tests {
             camera + Vec3::X * 20.001,
         ));
         assert!(!workbook_feature_label_in_range(camera, Vec3::NAN));
-    }
-
-    #[test]
-    fn arrogance_bridge_has_a_clear_forward_view_and_panorama_glass_canopy() {
-        let footprint = combat_spaceship_cabin_footprint();
-        assert!(!footprint.is_empty());
-        assert!(footprint.contains(&IVec3::new(
-            ARROGANCE.spawn[0],
-            0,
-            ARROGANCE.spawn[1],
-        )));
-        let cells = combat_spaceship_voxel_cells()
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-        let forward_edge_z = footprint.iter().map(|floor| floor.z).min().unwrap();
-        for floor in &footprint {
-            let expected_roof = if floor.z < ARROGANCE.spawn[1] {
-                VOXEL_GLASS_MATERIAL
-            } else {
-                7
-            };
-            assert_eq!(cells.get(floor), Some(&7), "missing cabin floor at {floor:?}");
-            assert_eq!(
-                cells.get(&(*floor + IVec3::Y * WORKBOOK_ROOM_HEIGHT)),
-                Some(&expected_roof),
-                "missing cabin ceiling at {floor:?}"
-            );
-        }
-        for floor in footprint
-            .iter()
-            .filter(|floor| floor.z == forward_edge_z)
-        {
-            for y in 2..WORKBOOK_ROOM_HEIGHT - 1 {
-                let windscreen = *floor + IVec3::NEG_Z + IVec3::Y * y;
-                assert_eq!(
-                    cells.get(&windscreen),
-                    Some(&VOXEL_GLASS_MATERIAL),
-                    "missing bridge windscreen at {windscreen:?}"
-                );
-            }
-        }
-        let spawn = IVec3::new(ARROGANCE.spawn[0], 0, ARROGANCE.spawn[1]);
-        assert!((1..WORKBOOK_ROOM_HEIGHT).all(|y| !cells.contains_key(&(spawn + IVec3::Y * y))));
-        assert!((forward_edge_z..ARROGANCE.spawn[1]).all(|z| {
-            !cells.contains_key(&IVec3::new(ARROGANCE.spawn[0], 2, z))
-        }));
     }
 
     #[test]

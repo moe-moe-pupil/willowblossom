@@ -227,9 +227,63 @@ fn hangar_parked_cell(cell: IVec3, berth: IVec3) -> IVec3 {
 }
 
 #[test]
+fn arrogance_has_an_enclosed_furnished_cab_forward_of_the_hangar() {
+    let cells = combat_spaceship_voxel_cells()
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+    for z in ARROGANCE_CAB_FRONT_Z..=ARROGANCE_CAB_REAR_Z {
+        let half_width = combat_spaceship_cab_half_width(z);
+        for x in -half_width + 1..half_width {
+            assert!(
+                cells
+                    .get(&IVec3::new(x, ARROGANCE_CAB_FLOOR_Y, z))
+                    .is_some_and(TrpgVoxelConnector::solid),
+                "cab needs a solid floor at ({x}, {z})"
+            );
+            assert!(
+                cells
+                    .get(&IVec3::new(
+                        x,
+                        ARROGANCE_CAB_CEILING_Y,
+                        z
+                    ))
+                    .is_some_and(TrpgVoxelConnector::solid),
+                "cab needs a solid ceiling at ({x}, {z})"
+            );
+        }
+    }
+
+    for y in ARROGANCE_CAB_FLOOR_Y + 3..=ARROGANCE_CAB_CEILING_Y - 3 {
+        for x in -6..=6 {
+            assert_eq!(
+                cells.get(&IVec3::new(x, y, ARROGANCE_CAB_FRONT_Z)),
+                Some(&VOXEL_GLASS_MATERIAL),
+                "cab needs a panoramic forward windscreen at ({x}, {y})"
+            );
+        }
+    }
+
+    let eye = default_voxel_spaceship_specs()[0].ship.cockpit_eye_local / VOXEL_SIZE;
+    assert!(eye.z < HANGAR_REAR_Z as f32);
+    assert!(eye.y > ARROGANCE_CAB_FLOOR_Y as f32);
+    assert!(eye.y < ARROGANCE_CAB_CEILING_Y as f32);
+    assert!(!cells.contains_key(&eye.floor().as_ivec3()));
+    for z in ARROGANCE_CAB_FRONT_Z + 4..ARROGANCE_CAB_REAR_Z {
+        for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
+            assert!(
+                !cells.contains_key(&IVec3::new(0, y, z)),
+                "cab center aisle is blocked at y={y}, z={z}"
+            );
+        }
+    }
+}
+
+#[test]
 fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
     let original = original_combat_spaceship_voxel_cells();
     let scaled_original = scale_combat_spaceship_cells(&original);
+    let cab = combat_spaceship_cab_cells();
     let carrier_cells = combat_spaceship_voxel_cells()
         .into_iter()
         .collect::<HashMap<_, _>>();
@@ -239,15 +293,23 @@ fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
         .copied()
         .collect::<HashSet<_>>();
 
-    // The corrected carrier is only the old detailed hull enlarged in place.
-    // The hangar is carved out of it; no outer shell or parking box is added.
-    assert!(carrier_cells.len() < scaled_original.len());
+    // The carrier remains the enlarged workbook hull, with only its hangar
+    // carved out and a compact bridge fitted forward of the hangar.
     for (cell, material) in &carrier_cells {
-        assert_eq!(scaled_original.get(cell), Some(material));
+        assert!(
+            scaled_original.get(cell) == Some(material) || cab.get(cell) == Some(material),
+            "carrier gained an unrelated cell at {cell:?}"
+        );
     }
     for (cell, material) in &scaled_original {
-        if !combat_spaceship_hangar_contains(*cell) {
-            assert_eq!(carrier_cells.get(cell), Some(material));
+        if !combat_spaceship_hangar_contains(*cell)
+            && !combat_spaceship_cab_interior_contains(*cell)
+        {
+            assert_eq!(
+                carrier_cells.get(cell),
+                cab.get(cell).or(Some(material)),
+                "carrier lost workbook hull outside the fitted cab at {cell:?}"
+            );
         }
     }
     let scaled_outline = scaled_original
