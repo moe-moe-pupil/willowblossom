@@ -6,7 +6,7 @@ use std::collections::{
 use super::*;
 
 #[test]
-fn small_spaceships_have_shaped_walkable_decorated_cabins() {
+fn small_spaceships_have_walkable_panorama_glass_cabins() {
     for variant in 0..SMALL_SPACESHIP_COUNT {
         let cells = small_spaceship_voxel_cells(variant)
             .into_iter()
@@ -46,9 +46,10 @@ fn small_spaceships_have_shaped_walkable_decorated_cabins() {
             Some(&10)
         );
         assert_eq!(
-            cells.get(&IVec3::new(0, 2, -5)),
+            cells.get(&IVec3::new(1, 2, -5)),
             Some(&8)
         );
+        assert!(!cells.contains_key(&IVec3::new(0, 2, -5)));
         assert_eq!(
             cells.get(&IVec3::new(half_width - 1, 1, -2)),
             Some(&8)
@@ -56,6 +57,48 @@ fn small_spaceships_have_shaped_walkable_decorated_cabins() {
         assert_eq!(
             cells.get(&IVec3::new(-(half_width - 1), 1, 4)),
             Some(&10)
+        );
+
+        // The neutral cockpit sightline stays clear until it reaches a broad
+        // forward windscreen, with continuous glass above and on both sides.
+        for z in nose + 1..=-2 {
+            assert!(
+                !cells.contains_key(&IVec3::new(0, 2, z)),
+                "variant {variant} cockpit sightline was blocked at z={z}"
+            );
+        }
+        for x in -1..=1 {
+            for y in 2..=4 {
+                assert_eq!(
+                    cells.get(&IVec3::new(x, y, nose)),
+                    Some(&VOXEL_GLASS_MATERIAL),
+                    "variant {variant} needs forward glass at ({x}, {y}, {nose})"
+                );
+            }
+        }
+        for side_x in [-half_width, half_width] {
+            for y in 2..=4 {
+                assert_eq!(
+                    cells.get(&IVec3::new(side_x, y, -4)),
+                    Some(&VOXEL_GLASS_MATERIAL),
+                    "variant {variant} needs side glass at x={side_x}, y={y}"
+                );
+            }
+        }
+        for x in -2..=2 {
+            assert_eq!(
+                cells.get(&IVec3::new(x, 5, -4)),
+                Some(&VOXEL_GLASS_MATERIAL),
+                "variant {variant} needs overhead glass at x={x}"
+            );
+        }
+        assert!(
+            cells
+                .values()
+                .filter(|material| **material == VOXEL_GLASS_MATERIAL)
+                .count()
+                > 80,
+            "variant {variant} needs a panoramic amount of glass"
         );
 
         // The aft opening and ramp make the room enterable rather than a
@@ -81,7 +124,7 @@ fn small_spaceships_have_shaped_walkable_decorated_cabins() {
 }
 
 #[test]
-fn medium_spaceship_has_a_larger_walkable_furnished_cabin_and_aft_ramp() {
+fn medium_spaceship_has_a_larger_walkable_panorama_glass_cabin_and_aft_ramp() {
     let cells = medium_spaceship_voxel_cells()
         .into_iter()
         .collect::<HashMap<_, _>>();
@@ -127,6 +170,38 @@ fn medium_spaceship_has_a_larger_walkable_furnished_cabin_and_aft_ramp() {
     );
     assert!(cells.contains_key(&IVec3::new(18, 0, 2)));
 
+    for z in -20..=-5 {
+        assert!(
+            !cells.contains_key(&IVec3::new(0, 3, z)),
+            "medium cockpit sightline was blocked at z={z}"
+        );
+    }
+    for x in -2..=2 {
+        for y in 2..=6 {
+            assert_eq!(
+                cells.get(&IVec3::new(x, y, -21)),
+                Some(&VOXEL_GLASS_MATERIAL),
+                "medium ship needs forward glass at ({x}, {y})"
+            );
+        }
+    }
+    for side_x in [-13, 13] {
+        for y in 2..=6 {
+            assert_eq!(
+                cells.get(&IVec3::new(side_x, y, -10)),
+                Some(&VOXEL_GLASS_MATERIAL),
+                "medium ship needs side glass at x={side_x}, y={y}"
+            );
+        }
+    }
+    for x in -4..=4 {
+        assert_eq!(
+            cells.get(&IVec3::new(x, 8, -10)),
+            Some(&VOXEL_GLASS_MATERIAL),
+            "medium ship needs overhead glass at x={x}"
+        );
+    }
+
     for x in -2..=2 {
         for y in 1..=7 {
             assert!(!cells.contains_key(&IVec3::new(x, y, 14)));
@@ -136,6 +211,15 @@ fn medium_spaceship_has_a_larger_walkable_furnished_cabin_and_aft_ramp() {
 
     let small_cell_count = small_spaceship_voxel_cells(0).len();
     assert!(cells.len() > small_cell_count * 2);
+    let medium_glass_count = cells
+        .values()
+        .filter(|material| **material == VOXEL_GLASS_MATERIAL)
+        .count();
+    let small_glass_count = small_spaceship_voxel_cells(0)
+        .into_iter()
+        .filter(|(_, material)| *material == VOXEL_GLASS_MATERIAL)
+        .count();
+    assert!(medium_glass_count > small_glass_count * 2);
 }
 
 fn hangar_parked_cell(cell: IVec3, berth: IVec3) -> IVec3 {

@@ -79,6 +79,7 @@ use crate::voxel::{
     VoxelTeleportDestination,
     VoxelUnitStandeeStore,
     MAX_VOXEL_BRUSH_RADIUS,
+    VOXEL_GLASS_MATERIAL,
 };
 
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
@@ -117,7 +118,7 @@ const VOXEL_SCENE_EXPORT_DEFAULT_PATH: &str = ".data/willowblossom/exports/voxel
 const BATTLE_ROUND_EXPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/exports/battle_rounds_export.json";
 
-fn voxel_material_choices() -> [(u8, &'static str, egui::Color32); 10] {
+fn voxel_material_choices() -> [(u8, &'static str, egui::Color32); 11] {
     [
         (
             1,
@@ -168,6 +169,11 @@ fn voxel_material_choices() -> [(u8, &'static str, egui::Color32); 10] {
             10,
             "发光舱门",
             egui::Color32::from_rgb(205, 92, 24),
+        ),
+        (
+            VOXEL_GLASS_MATERIAL,
+            "舰船玻璃",
+            egui::Color32::from_rgb(122, 235, 255),
         ),
     ]
 }
@@ -335,6 +341,11 @@ fn paint_voxel_creative_item_icon(
             line((0.0, -0.86), (0.0, 0.86));
             dot(-0.28, 0.08, 0.09);
             dot(0.28, 0.08, 0.09);
+        },
+        VoxelCreativeItem::Material(VOXEL_GLASS_MATERIAL) => {
+            box_outline((-0.82, -0.82), (0.82, 0.82));
+            thin_line((-0.62, 0.55), (0.22, -0.72));
+            thin_line((0.05, 0.72), (0.62, -0.12));
         },
         VoxelCreativeItem::Material(_) => cross(0.0, 0.0, 0.65),
         VoxelCreativeItem::Light(VoxelLightTool::Point) => {
@@ -15540,6 +15551,23 @@ mod tests {
         ] {
             assert!(!VOXEL_CREATIVE_STANDALONE_MODES.contains(&tool_gun_mode));
         }
+    }
+
+    #[test]
+    fn creative_catalog_exposes_the_canonical_glass_voxel() {
+        let glass = voxel_material_choices()
+            .into_iter()
+            .find(|(material, ..)| *material == VOXEL_GLASS_MATERIAL)
+            .expect("glass must be available in the creative catalog");
+
+        assert_eq!(glass.1, "舰船玻璃");
+        assert_eq!(
+            voxel_creative_item_visual(VoxelCreativeItem::Material(
+                VOXEL_GLASS_MATERIAL,
+            ))
+            .0,
+            "舰船玻璃"
+        );
     }
 
     #[test]

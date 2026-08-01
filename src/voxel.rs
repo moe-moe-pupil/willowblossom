@@ -167,7 +167,9 @@ const MAX_SCENE_SNAPSHOTS: usize = 20;
 const VOXEL_SCENE_AUTOSAVE_SECONDS: f32 = 30.0;
 const VOXEL_SCENE_LAYOUT_REVISION: u32 = 3;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
-const VOXEL_MATERIAL_COUNT: usize = 10;
+pub(crate) const VOXEL_GLASS_MATERIAL: u8 = 11;
+const VOXEL_GLASS_OPACITY: f32 = 0.10;
+const VOXEL_MATERIAL_COUNT: usize = VOXEL_GLASS_MATERIAL as usize;
 const MICRO_TILE_SUBDIVISIONS: u32 = 16;
 const WORKBOOK_FEATURE_HOVER_MIN_Y_CELLS: f32 = 1.0;
 const WORKBOOK_FEATURE_HOVER_MAX_Y_CELLS: f32 = 4.0;
@@ -312,7 +314,9 @@ fn voxel_emissive(red: f32, green: f32, blue: f32) -> LinearRgba {
 impl Connector for TrpgVoxelConnector {
     type Item = u8;
 
-    fn solid(voxel: &Self::Item) -> bool { matches!(*voxel, 1..=3 | 6..=10) }
+    fn solid(voxel: &Self::Item) -> bool {
+        matches!(*voxel, 1..=3 | 6..=VOXEL_GLASS_MATERIAL)
+    }
 }
 
 #[derive(Component)]
@@ -2531,6 +2535,17 @@ fn activate_player_hotbar_slot(
     }
 }
 
+fn voxel_glass_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::srgba(0.48, 0.92, 1.0, VOXEL_GLASS_OPACITY),
+        alpha_mode: AlphaMode::Blend,
+        perceptual_roughness: 0.08,
+        reflectance: 0.8,
+        cull_mode: None,
+        ..default()
+    }
+}
+
 fn setup_voxel_materials(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -2603,7 +2618,7 @@ fn setup_voxel_materials(
                 perceptual_roughness: 0.44,
                 ..default()
             }
-        } else {
+        } else if index == 9 {
             StandardMaterial {
                 base_color: Color::srgb(0.46, 0.12, 0.018),
                 emissive: voxel_emissive(0.42, 0.075, 0.008),
@@ -2611,6 +2626,8 @@ fn setup_voxel_materials(
                 perceptual_roughness: 0.32,
                 ..default()
             }
+        } else {
+            voxel_glass_material()
         };
         match index {
             0 => {
@@ -2716,6 +2733,7 @@ fn radiance_voxel_color(material: u8) -> [u8; 4] {
         5 => [255, 72, 8, 255],
         8 => [34, 176, 220, 255],
         10 => [196, 78, 18, 255],
+        VOXEL_GLASS_MATERIAL => [0, 0, 0, 0],
         _ if TrpgVoxelConnector::solid(&material) => [0, 0, 0, 255],
         _ => [0, 0, 0, 0],
     }
@@ -4196,11 +4214,32 @@ fn combat_spaceship_cabin_footprint() -> Vec<IVec3> {
 }
 
 fn enclose_combat_spaceship_cabin(cells: &mut HashMap<IVec3, u8>) {
-    for floor in combat_spaceship_cabin_footprint() {
-        // Give the bridge a clearly readable metal deck instead of inheriting
-        // the generic workbook floor material, and guarantee a structural roof.
+    let footprint = combat_spaceship_cabin_footprint();
+    let forward_edge_z = footprint
+        .iter()
+        .map(|floor| floor.z)
+        .min()
+        .unwrap_or(ARROGANCE.spawn[1]);
+    for floor in footprint {
+        // Keep a structural deck and aft roof while opening the forward bridge
+        // into a broad glass canopy around the cockpit camera.
         cells.insert(floor, 7);
-        cells.insert(floor + IVec3::Y * WORKBOOK_ROOM_HEIGHT, 7);
+        cells.insert(
+            floor + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
+            if floor.z < ARROGANCE.spawn[1] {
+                VOXEL_GLASS_MATERIAL
+            } else {
+                7
+            },
+        );
+        if floor.z == forward_edge_z {
+            for y in 2..WORKBOOK_ROOM_HEIGHT - 1 {
+                cells.insert(
+                    floor + IVec3::NEG_Z + IVec3::Y * y,
+                    VOXEL_GLASS_MATERIAL,
+                );
+            }
+        }
     }
 }
 
@@ -4391,11 +4430,13 @@ fn small_spaceship_voxel_cells(variant: usize) -> Vec<(IVec3, u8)> {
                 IVec3::new(x, 0, z),
                 if edge { 7 } else { 6 },
             );
-            let canopy = (-6..=-2).contains(&z) && x.abs() <= 2;
+            let canopy_half_width = (section_half_width - 1).clamp(0, 3);
+            let canopy = (nose + 1..=1).contains(&z)
+                && x.abs() <= canopy_half_width;
             cells.insert(
                 IVec3::new(x, 5, z),
                 if canopy {
-                    8
+                    VOXEL_GLASS_MATERIAL
                 } else if edge {
                     7
                 } else {
@@ -4405,9 +4446,9 @@ fn small_spaceship_voxel_cells(variant: usize) -> Vec<(IVec3, u8)> {
         }
 
         for y in 1..=4 {
-            let window = (-6..=-2).contains(&z) && matches!(y, 2 | 3);
+            let window = (nose + 1..=1).contains(&z) && (2..=4).contains(&y);
             let wall_material = if window {
-                8
+                VOXEL_GLASS_MATERIAL
             } else if y == 1 || y == 4 {
                 7
             } else {
@@ -4428,7 +4469,13 @@ fn small_spaceship_voxel_cells(variant: usize) -> Vec<(IVec3, u8)> {
                 for y in 1..=4 {
                     cells.insert(
                         IVec3::new(x, y, z),
-                        if y == 2 { 7 } else { 6 },
+                        if z == nose && (2..=4).contains(&y) {
+                            VOXEL_GLASS_MATERIAL
+                        } else if y == 2 {
+                            7
+                        } else {
+                            6
+                        },
                     );
                 }
             }
@@ -4448,7 +4495,7 @@ fn small_spaceship_voxel_cells(variant: usize) -> Vec<(IVec3, u8)> {
     // The cabin is furnished entirely with canonical voxel cells: flight
     // console, paired seats, side terminals, cargo lockers, and ceiling lamps.
     cells.insert(IVec3::new(0, 1, -5), 10);
-    cells.insert(IVec3::new(0, 2, -5), 8);
+    cells.insert(IVec3::new(1, 2, -5), 8);
     for x in [-2, 2] {
         cells.insert(IVec3::new(x, 1, -1), 9);
         cells.insert(IVec3::new(x, 1, 2), 9);
@@ -4526,10 +4573,13 @@ fn medium_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
                 IVec3::new(x, 0, z),
                 if x.abs() == section_half_width { 7 } else { 6 },
             );
+            let canopy_half_width = (section_half_width - 2).clamp(1, 7);
             cells.insert(
                 IVec3::new(x, ROOF_Y, z),
-                if (-12..=-5).contains(&z) && x.abs() <= 4 {
-                    8
+                if (NOSE_Z + 2..=1).contains(&z)
+                    && x.abs() <= canopy_half_width
+                {
+                    VOXEL_GLASS_MATERIAL
                 } else if x.abs() == section_half_width {
                     7
                 } else {
@@ -4539,8 +4589,10 @@ fn medium_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
         }
 
         for y in 1..ROOF_Y {
-            let material = if matches!(y, 3 | 4) && (-13..=5).contains(&z) {
-                8
+            let material = if (2..=6).contains(&y)
+                && (NOSE_Z + 2..=2).contains(&z)
+            {
+                VOXEL_GLASS_MATERIAL
             } else if matches!(y, 1 | 7) {
                 7
             } else {
@@ -4555,7 +4607,13 @@ fn medium_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
                 for y in 1..ROOF_Y {
                     cells.insert(
                         IVec3::new(x, y, z),
-                        if matches!(y, 3 | 4) { 8 } else { 6 },
+                        if z == NOSE_Z && (2..=6).contains(&y) {
+                            VOXEL_GLASS_MATERIAL
+                        } else if z == TAIL_Z && matches!(y, 3 | 4) {
+                            8
+                        } else {
+                            6
+                        },
                     );
                 }
             }
@@ -13239,6 +13297,17 @@ mod tests {
     }
 
     #[test]
+    fn voxel_glass_is_solid_two_sided_and_ten_percent_opaque() {
+        let material = voxel_glass_material();
+
+        assert_eq!(material.base_color.alpha(), VOXEL_GLASS_OPACITY);
+        assert!(matches!(material.alpha_mode, AlphaMode::Blend));
+        assert_eq!(material.cull_mode, None);
+        assert!(TrpgVoxelConnector::solid(&VOXEL_GLASS_MATERIAL));
+        assert_eq!(radiance_voxel_color(VOXEL_GLASS_MATERIAL), [0; 4]);
+    }
+
+    #[test]
     fn player_capture_hides_self_but_shows_unassigned_peers() {
         assert!(!voxel_player_standee_visible_for_access(42, 42, false, None, None,));
         assert!(voxel_player_standee_visible_for_access(
@@ -13696,7 +13765,7 @@ mod tests {
     }
 
     #[test]
-    fn arrogance_cabin_has_a_canonical_metal_floor_and_ceiling() {
+    fn arrogance_bridge_has_a_clear_forward_view_and_panorama_glass_canopy() {
         let footprint = combat_spaceship_cabin_footprint();
         assert!(!footprint.is_empty());
         assert!(footprint.contains(&IVec3::new(
@@ -13707,16 +13776,38 @@ mod tests {
         let cells = combat_spaceship_voxel_cells()
             .into_iter()
             .collect::<HashMap<_, _>>();
-        for floor in footprint {
-            assert_eq!(cells.get(&floor), Some(&7), "missing cabin floor at {floor:?}");
+        let forward_edge_z = footprint.iter().map(|floor| floor.z).min().unwrap();
+        for floor in &footprint {
+            let expected_roof = if floor.z < ARROGANCE.spawn[1] {
+                VOXEL_GLASS_MATERIAL
+            } else {
+                7
+            };
+            assert_eq!(cells.get(floor), Some(&7), "missing cabin floor at {floor:?}");
             assert_eq!(
-                cells.get(&(floor + IVec3::Y * WORKBOOK_ROOM_HEIGHT)),
-                Some(&7),
+                cells.get(&(*floor + IVec3::Y * WORKBOOK_ROOM_HEIGHT)),
+                Some(&expected_roof),
                 "missing cabin ceiling at {floor:?}"
             );
         }
+        for floor in footprint
+            .iter()
+            .filter(|floor| floor.z == forward_edge_z)
+        {
+            for y in 2..WORKBOOK_ROOM_HEIGHT - 1 {
+                let windscreen = *floor + IVec3::NEG_Z + IVec3::Y * y;
+                assert_eq!(
+                    cells.get(&windscreen),
+                    Some(&VOXEL_GLASS_MATERIAL),
+                    "missing bridge windscreen at {windscreen:?}"
+                );
+            }
+        }
         let spawn = IVec3::new(ARROGANCE.spawn[0], 0, ARROGANCE.spawn[1]);
         assert!((1..WORKBOOK_ROOM_HEIGHT).all(|y| !cells.contains_key(&(spawn + IVec3::Y * y))));
+        assert!((forward_edge_z..ARROGANCE.spawn[1]).all(|z| {
+            !cells.contains_key(&IVec3::new(ARROGANCE.spawn[0], 2, z))
+        }));
     }
 
     #[test]
@@ -14230,7 +14321,7 @@ mod tests {
     }
 
     #[test]
-    fn default_space_map_uses_all_materials_and_internal_auto_doors() {
+    fn default_static_space_map_uses_valid_materials_and_internal_auto_doors() {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
         let materials = voxel_cells(grid)
@@ -14238,9 +14329,14 @@ mod tests {
             .map(|(_, material)| material)
             .collect::<HashSet<_>>();
         assert!(voxel_cells(grid).len() >= 20_000);
-        assert_eq!(
-            materials,
-            HashSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        assert!(
+            materials
+                .iter()
+                .all(|material| (1..=VOXEL_MATERIAL_COUNT as u8).contains(material))
+        );
+        assert!(
+            HashSet::from([2, 4, 5, 6, 7, 9, 10]).is_subset(&materials),
+            "static stations must retain their terrain, fluid, hull, armor, and door palette"
         );
 
         let doors = voxel_auto_doors();
@@ -14588,7 +14684,20 @@ mod tests {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
         let (meshes, colliders) = build_voxel_meshes(grid);
-        assert_eq!(meshes.len(), VOXEL_MATERIAL_COUNT);
+        let populated_materials = voxel_cells(grid)
+            .into_iter()
+            .map(|(_, material)| material)
+            .collect::<HashSet<_>>();
+        let mesh_materials = meshes
+            .iter()
+            .map(|(material, _)| *material)
+            .collect::<HashSet<_>>();
+        assert_eq!(mesh_materials, populated_materials);
+        assert!(
+            mesh_materials
+                .iter()
+                .all(|material| (1..=VOXEL_MATERIAL_COUNT as u8).contains(material))
+        );
         assert!(!colliders.is_empty());
         for (_, mesh) in meshes {
             assert!(mesh.attribute(Mesh::ATTRIBUTE_POSITION).is_some());
