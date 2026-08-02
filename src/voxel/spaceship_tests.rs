@@ -227,7 +227,7 @@ fn hangar_parked_cell(cell: IVec3, berth: IVec3) -> IVec3 {
 }
 
 #[test]
-fn arrogance_has_an_enclosed_furnished_cab_at_the_requested_port_coordinates() {
+fn arrogance_has_an_enclosed_furnished_cab_at_the_requested_port_bow() {
     let cells = combat_spaceship_voxel_cells()
         .into_iter()
         .collect::<HashMap<_, _>>();
@@ -237,15 +237,21 @@ fn arrogance_has_an_enclosed_furnished_cab_at_the_requested_port_coordinates() {
         for x in -half_width + 1..half_width {
             assert!(
                 cells
-                    .get(&(IVec3::new(x, ARROGANCE_CAB_FLOOR_Y, z)
-                        + ARROGANCE_CAB_TRANSLATION_CELLS))
+                    .get(&combat_spaceship_cab_cell(IVec3::new(
+                        x,
+                        ARROGANCE_CAB_FLOOR_Y,
+                        z,
+                    )))
                     .is_some_and(TrpgVoxelConnector::solid),
                 "cab needs a solid floor at ({x}, {z})"
             );
             assert!(
                 cells
-                    .get(&(IVec3::new(x, ARROGANCE_CAB_CEILING_Y, z)
-                        + ARROGANCE_CAB_TRANSLATION_CELLS))
+                    .get(&combat_spaceship_cab_cell(IVec3::new(
+                        x,
+                        ARROGANCE_CAB_CEILING_Y,
+                        z,
+                    )))
                     .is_some_and(TrpgVoxelConnector::solid),
                 "cab needs a solid ceiling at ({x}, {z})"
             );
@@ -256,8 +262,11 @@ fn arrogance_has_an_enclosed_furnished_cab_at_the_requested_port_coordinates() {
         for x in -6..=6 {
             assert_eq!(
                 cells.get(
-                    &(IVec3::new(x, y, ARROGANCE_CAB_FRONT_Z)
-                        + ARROGANCE_CAB_TRANSLATION_CELLS)
+                    &combat_spaceship_cab_cell(IVec3::new(
+                        x,
+                        y,
+                        ARROGANCE_CAB_FRONT_Z,
+                    ))
                 ),
                 Some(&VOXEL_GLASS_MATERIAL),
                 "cab needs a panoramic forward windscreen at ({x}, {y})"
@@ -265,17 +274,12 @@ fn arrogance_has_an_enclosed_furnished_cab_at_the_requested_port_coordinates() {
         }
     }
 
-    assert_eq!(
-        ARROGANCE_CAB_TRANSLATION_CELLS.as_vec3() * VOXEL_SIZE,
-        Vec3::new(-72.0, 3.0, -1.0)
-    );
     let roof_center_world = (COMBAT_SPACESHIP_CENTER
-        + ARROGANCE_CAB_TRANSLATION_CELLS
-        + IVec3::new(
+        + combat_spaceship_cab_cell(IVec3::new(
             0,
             ARROGANCE_CAB_CEILING_Y,
-            (ARROGANCE_CAB_FRONT_Z + ARROGANCE_CAB_REAR_Z) / 2,
-        ))
+            ARROGANCE_CAB_TEMPLATE_CENTER_Z,
+        )))
     .as_vec3()
         * VOXEL_SIZE;
     assert!(roof_center_world.abs_diff_eq(Vec3::new(-197.0, 6.0, 115.5), 0.000_01));
@@ -288,7 +292,7 @@ fn arrogance_has_an_enclosed_furnished_cab_at_the_requested_port_coordinates() {
         for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
             assert!(
                 !cells.contains_key(
-                    &(IVec3::new(0, y, z) + ARROGANCE_CAB_TRANSLATION_CELLS)
+                    &combat_spaceship_cab_cell(IVec3::new(0, y, z))
                 ),
                 "cab center aisle is blocked at y={y}, z={z}"
             );
@@ -345,8 +349,8 @@ fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
         .copied()
         .collect::<HashSet<_>>();
 
-    // The carrier remains the enlarged workbook hull, with only its hangar
-    // carved out and a compact bridge fitted at the requested port location.
+    // The carrier remains the enlarged workbook hull, with its hangar and old
+    // three-wall port enclosure removed and a connected bow cab fitted there.
     for (cell, material) in &carrier_cells {
         assert!(
             scaled_original.get(cell) == Some(material) || cab.get(cell) == Some(material),
@@ -355,6 +359,7 @@ fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
     }
     for (cell, material) in &scaled_original {
         if !combat_spaceship_hangar_contains(*cell)
+            && !combat_spaceship_obsolete_port_bow_wall_contains(*cell)
             && !combat_spaceship_cab_interior_contains(*cell)
         {
             assert_eq!(
@@ -376,10 +381,65 @@ fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
         .keys()
         .map(|cell| (cell.x, cell.z))
         .collect::<HashSet<_>>();
-    assert!(scaled_outline.is_subset(&carrier_outline));
+    assert!(scaled_outline.difference(&carrier_outline).all(|(x, z)| {
+        combat_spaceship_obsolete_port_bow_wall_contains(IVec3::new(*x, 0, *z))
+    }));
     assert!(carrier_outline
         .difference(&scaled_outline)
         .all(|cell| cab_outline.contains(cell)));
+
+    for cell in scaled_original
+        .keys()
+        .filter(|cell| combat_spaceship_obsolete_port_bow_wall_contains(**cell))
+        .filter(|cell| !cab.contains_key(*cell))
+    {
+        assert!(
+            !carrier.contains(cell),
+            "obsolete port enclosure wall remains at {cell:?}"
+        );
+    }
+
+    let mut carved_hull = scaled_original.clone();
+    carve_combat_spaceship_hangar(&mut carved_hull);
+    carved_hull.retain(|cell, _| !combat_spaceship_cab_interior_contains(*cell));
+    let directions = [
+        IVec3::X,
+        IVec3::NEG_X,
+        IVec3::Y,
+        IVec3::NEG_Y,
+        IVec3::Z,
+        IVec3::NEG_Z,
+    ];
+    let attachment_faces = cab
+        .keys()
+        .flat_map(|cell| directions.map(|direction| *cell + direction))
+        .filter(|neighbor| carved_hull.contains_key(neighbor))
+        .count();
+    assert!(attachment_faces > 0, "cab must be face-connected to the main hull");
+
+    let cab_nose = combat_spaceship_cab_cell(IVec3::new(
+        0,
+        ARROGANCE_CAB_FLOOR_Y,
+        ARROGANCE_CAB_FRONT_Z,
+    ));
+    let cab_rear = combat_spaceship_cab_cell(IVec3::new(
+        0,
+        ARROGANCE_CAB_FLOOR_Y,
+        ARROGANCE_CAB_REAR_Z,
+    ));
+    assert!(cab_nose.x < cab_rear.x, "cab nose must point out from the port bow");
+    for x in cab_rear.x + 1..=ARROGANCE_CAB_CONNECTOR_BODY_X {
+        for y in ARROGANCE_CAB_FLOOR_Y + ARROGANCE_CAB_Y_OFFSET + 1
+            ..ARROGANCE_CAB_CEILING_Y + ARROGANCE_CAB_Y_OFFSET
+        {
+            for z in ARROGANCE_CAB_CENTER_Z - 1..=ARROGANCE_CAB_CENTER_Z + 1 {
+                assert!(
+                    !carrier.contains(&IVec3::new(x, y, z)),
+                    "cab-to-hull passage is blocked at {x}, {y}, {z}"
+                );
+            }
+        }
+    }
 
     let original_min = original.keys().copied().reduce(IVec3::min).unwrap();
     let original_max = original.keys().copied().reduce(IVec3::max).unwrap();

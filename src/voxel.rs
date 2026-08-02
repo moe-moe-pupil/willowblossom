@@ -197,7 +197,7 @@ const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
 const VOXEL_SPACESHIP_SAVE_SECONDS: f32 = 1.0;
-const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 6;
+const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 7;
 const COMBAT_SPACESHIP_ID: &str = "usi-arrogance";
 const MEDIUM_SPACESHIP_ID: &str = "medium-ship-01";
 const SMALL_SPACESHIP_COUNT: usize = 6;
@@ -237,9 +237,17 @@ const ARROGANCE_CAB_CEILING_Y: i32 = 12;
 const ARROGANCE_CAB_FRONT_Z: i32 = HANGAR_REAR_Z + 4;
 const ARROGANCE_CAB_REAR_Z: i32 = ARROGANCE_CAB_FRONT_Z + 20;
 const ARROGANCE_CAB_MAX_HALF_WIDTH: i32 = 12;
-// Move the complete cab by (-72, +3, -1) world units while keeping every
-// surface, fixture, collider voxel, and cockpit point on the canonical grid.
-const ARROGANCE_CAB_TRANSLATION_CELLS: IVec3 = IVec3::new(-288, 12, -4);
+const ARROGANCE_CAB_TEMPLATE_CENTER_Z: i32 =
+    (ARROGANCE_CAB_FRONT_Z + ARROGANCE_CAB_REAR_Z) / 2;
+const ARROGANCE_CAB_CENTER_X: i32 = -288;
+const ARROGANCE_CAB_CENTER_Z: i32 = -38;
+const ARROGANCE_CAB_Y_OFFSET: i32 = 12;
+const ARROGANCE_CAB_CONNECTOR_BODY_X: i32 = -258;
+const ARROGANCE_PORT_BOW_MIN_X: i32 = -321;
+const ARROGANCE_PORT_BOW_MAX_X: i32 = -262;
+const ARROGANCE_PORT_BOW_MIN_Z: i32 = -51;
+const ARROGANCE_PORT_BOW_MAX_Z: i32 = -1;
+
 const DEFAULT_COLLISION_LAYER_BITS: u32 = 1 << 0;
 const CARRIER_COLLISION_LAYER_BITS: u32 = 1 << 1;
 const DOCKED_SPACESHIP_COLLISION_LAYER_BITS: u32 = 1 << 2;
@@ -4617,8 +4625,44 @@ fn combat_spaceship_cab_half_width(z: i32) -> i32 {
     }
 }
 
+fn combat_spaceship_cab_cell(cell: IVec3) -> IVec3 {
+    IVec3::new(
+        ARROGANCE_CAB_CENTER_X + cell.z - ARROGANCE_CAB_TEMPLATE_CENTER_Z,
+        cell.y + ARROGANCE_CAB_Y_OFFSET,
+        ARROGANCE_CAB_CENTER_Z - cell.x,
+    )
+}
+
+fn combat_spaceship_cab_point(point: Vec3) -> Vec3 {
+    Vec3::new(
+        ARROGANCE_CAB_CENTER_X as f32 + point.z - ARROGANCE_CAB_TEMPLATE_CENTER_Z as f32,
+        point.y + ARROGANCE_CAB_Y_OFFSET as f32,
+        ARROGANCE_CAB_CENTER_Z as f32 - point.x,
+    )
+}
+
+fn combat_spaceship_cab_local_cell(cell: IVec3) -> IVec3 {
+    IVec3::new(
+        ARROGANCE_CAB_CENTER_Z - cell.z,
+        cell.y - ARROGANCE_CAB_Y_OFFSET,
+        ARROGANCE_CAB_TEMPLATE_CENTER_Z + cell.x - ARROGANCE_CAB_CENTER_X,
+    )
+}
+
+fn combat_spaceship_cab_connector_interior_contains(cell: IVec3) -> bool {
+    let rear_x = combat_spaceship_cab_cell(IVec3::new(0, 0, ARROGANCE_CAB_REAR_Z)).x;
+    (rear_x + 1..=ARROGANCE_CAB_CONNECTOR_BODY_X).contains(&cell.x)
+        && (ARROGANCE_CAB_FLOOR_Y + ARROGANCE_CAB_Y_OFFSET + 1
+            ..ARROGANCE_CAB_CEILING_Y + ARROGANCE_CAB_Y_OFFSET)
+            .contains(&cell.y)
+        && (ARROGANCE_CAB_CENTER_Z - 1..=ARROGANCE_CAB_CENTER_Z + 1).contains(&cell.z)
+}
+
 fn combat_spaceship_cab_interior_contains(cell: IVec3) -> bool {
-    let cell = cell - ARROGANCE_CAB_TRANSLATION_CELLS;
+    if combat_spaceship_cab_connector_interior_contains(cell) {
+        return true;
+    }
+    let cell = combat_spaceship_cab_local_cell(cell);
     let clear_height =
         (ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y).contains(&cell.y);
     clear_height
@@ -4669,8 +4713,8 @@ fn combat_spaceship_cab_cells() -> HashMap<IVec3, u8> {
         }
     }
 
-    // Close the rear around a three-cell-wide personnel door. The cab now sits
-    // directly in the carved hangar, so the door opens straight into the bay.
+    // Close the rear around a three-cell-wide personnel door. After the cab is
+    // rotated into the bow, this door faces the main hull and its connector.
     for x in -ARROGANCE_CAB_MAX_HALF_WIDTH..=ARROGANCE_CAB_MAX_HALF_WIDTH {
         for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
             if x.abs() > 1 || y >= ARROGANCE_CAB_CEILING_Y - 2 {
@@ -4720,11 +4764,27 @@ fn combat_spaceship_cab_cells() -> HashMap<IVec3, u8> {
             );
         }
     }
-    cells
+    let mut cells = cells
         .into_iter()
-        .map(|(cell, material)| (cell + ARROGANCE_CAB_TRANSLATION_CELLS, material))
-        .collect()
+        .map(|(cell, material)| (combat_spaceship_cab_cell(cell), material))
+        .collect::<HashMap<_, _>>();
+
+    let rear_x = combat_spaceship_cab_cell(IVec3::new(0, 0, ARROGANCE_CAB_REAR_Z)).x;
+    let floor_y = ARROGANCE_CAB_FLOOR_Y + ARROGANCE_CAB_Y_OFFSET;
+    let ceiling_y = ARROGANCE_CAB_CEILING_Y + ARROGANCE_CAB_Y_OFFSET;
+    for x in rear_x + 1..=ARROGANCE_CAB_CONNECTOR_BODY_X {
+        for z in ARROGANCE_CAB_CENTER_Z - 2..=ARROGANCE_CAB_CENTER_Z + 2 {
+            cells.insert(IVec3::new(x, floor_y, z), 7);
+            cells.insert(IVec3::new(x, ceiling_y, z), 7);
+        }
+        for y in floor_y + 1..ceiling_y {
+            cells.insert(IVec3::new(x, y, ARROGANCE_CAB_CENTER_Z - 2), 7);
+            cells.insert(IVec3::new(x, y, ARROGANCE_CAB_CENTER_Z + 2), 7);
+        }
+    }
+    cells
 }
+
 
 fn scale_combat_spaceship_cell(cell: IVec3) -> IVec3 {
     cell * ARROGANCE_SCALE
@@ -4755,10 +4815,24 @@ fn combat_spaceship_hangar_contains(cell: IVec3) -> bool {
         && (HANGAR_REAR_Z..=HANGAR_MOUTH_Z).contains(&cell.z)
 }
 
+fn combat_spaceship_obsolete_port_bow_wall_contains(cell: IVec3) -> bool {
+    let inside_bow = (ARROGANCE_PORT_BOW_MIN_X..=ARROGANCE_PORT_BOW_MAX_X).contains(&cell.x)
+        && (ARROGANCE_PORT_BOW_MIN_Z..=ARROGANCE_PORT_BOW_MAX_Z).contains(&cell.z);
+    let outer_wall = (ARROGANCE_PORT_BOW_MIN_X..=ARROGANCE_PORT_BOW_MIN_X + 2)
+        .contains(&cell.x);
+    let end_walls = (ARROGANCE_PORT_BOW_MIN_Z..=ARROGANCE_PORT_BOW_MIN_Z + 5)
+        .contains(&cell.z)
+        || (ARROGANCE_PORT_BOW_MAX_Z - 2..=ARROGANCE_PORT_BOW_MAX_Z).contains(&cell.z);
+    inside_bow && (outer_wall || end_walls)
+}
+
 fn carve_combat_spaceship_hangar(cells: &mut HashMap<IVec3, u8>) {
     // This is a subtraction from the proportionally enlarged workbook hull.
     // It does not add a parking shell, room, divider, deck, roof, or outer box.
-    cells.retain(|cell, _| !combat_spaceship_hangar_contains(*cell));
+    cells.retain(|cell, _| {
+        !combat_spaceship_hangar_contains(*cell)
+            && !combat_spaceship_obsolete_port_bow_wall_contains(*cell)
+    });
 }
 
 fn original_combat_spaceship_voxel_cells() -> HashMap<IVec3, u8> {
@@ -5252,12 +5326,11 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
             id: COMBAT_SPACESHIP_ID.to_owned(),
             name: "U.S.I 狂妄号".to_owned(),
             class: VoxelSpaceshipClass::Cruiser,
-            cockpit_eye_local: (Vec3::new(
+            cockpit_eye_local: combat_spaceship_cab_point(Vec3::new(
                 0.0,
                 ARROGANCE_CAB_FLOOR_Y as f32 + 3.5,
                 ARROGANCE_CAB_FRONT_Z as f32 + 9.5,
-            ) + ARROGANCE_CAB_TRANSLATION_CELLS.as_vec3())
-                * VOXEL_SIZE,
+            )) * VOXEL_SIZE,
             thrust_acceleration: 2.4,
             vertical_acceleration: 1.4,
             turn_speed: 0.32,
