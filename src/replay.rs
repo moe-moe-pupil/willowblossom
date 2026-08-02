@@ -532,7 +532,9 @@ pub(crate) fn clear_player_replay_movement_history(
     user_id: u64,
 ) -> usize {
     let previous_len = history.sessions.len();
-    history.sessions.retain(|session| session.user_id != user_id);
+    history
+        .sessions
+        .retain(|session| session.user_id != user_id);
     previous_len - history.sessions.len()
 }
 

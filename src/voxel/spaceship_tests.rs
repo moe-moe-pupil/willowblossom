@@ -308,9 +308,16 @@ fn arrogance_has_panorama_glass_in_its_workbook_hull_and_bridge() {
         "Arrogance needs multiple panoramic glass bays in its workbook hull"
     );
     for (x, z) in hull_glass_columns {
-        assert_eq!(original.get(&IVec3::new(x, 1, z)), Some(&6));
         assert_eq!(
-            original.get(&IVec3::new(x, WORKBOOK_ROOM_HEIGHT - 1, z)),
+            original.get(&IVec3::new(x, 1, z)),
+            Some(&6)
+        );
+        assert_eq!(
+            original.get(&IVec3::new(
+                x,
+                WORKBOOK_ROOM_HEIGHT - 1,
+                z
+            )),
             Some(&6)
         );
     }
@@ -836,11 +843,8 @@ fn players_follow_the_innermost_ship_without_needing_a_floor_contact() {
     // The player is floating inside both volumes, with no floor/collision query.
     let player = Transform::from_translation(Vec3::new(0.0, 1.5, 0.0));
 
-    let carried = carried_transform_in_innermost_spaceship(
-        &player,
-        &[carrier, parked_ship.clone()],
-    )
-    .unwrap();
+    let carried =
+        carried_transform_in_innermost_spaceship(&player, &[carrier, parked_ship.clone()]).unwrap();
     let expected = parked_ship
         .current
         .compute_affine()
@@ -861,8 +865,14 @@ fn spaceship_occupant_bounds_use_canonical_voxel_extents() {
 
     let (min, max) = voxel_spaceship_local_bounds(&body).unwrap();
 
-    assert_eq!(min, IVec3::new(-2, 1, 4).as_vec3() * VOXEL_SIZE);
-    assert_eq!(max, IVec3::new(4, 6, 9).as_vec3() * VOXEL_SIZE);
+    assert_eq!(
+        min,
+        IVec3::new(-2, 1, 4).as_vec3() * VOXEL_SIZE
+    );
+    assert_eq!(
+        max,
+        IVec3::new(4, 6, 9).as_vec3() * VOXEL_SIZE
+    );
 }
 
 #[test]
@@ -913,4 +923,54 @@ fn spaceship_takeover_item_uses_the_assigned_pilot_identity() {
         control.driving_ship_id.as_deref(),
         Some("small-ship-02")
     );
+}
+
+#[test]
+fn spaceship_chase_camera_stays_behind_and_above_the_canonical_hull() {
+    let body = VoxelPhysicsBody {
+        local_center: Vec3::ZERO,
+        cells: vec![(IVec3::new(-4, -1, -8), 1), (IVec3::new(4, 3, 8), 1)],
+    };
+    let ship_transform = Transform::from_rotation(Quat::from_rotation_y(0.7));
+
+    let camera = voxel_spaceship_chase_camera_transform(&ship_transform, &body).unwrap();
+    let local_camera = ship_transform
+        .compute_affine()
+        .inverse()
+        .transform_point3(camera.translation);
+    let (_, local_max) = voxel_spaceship_chase_bounds(&body).unwrap();
+
+    assert!(local_camera.y > local_max.y);
+    assert!(local_camera.z > local_max.z);
+    assert!((camera.rotation * Vec3::NEG_Z).dot(ship_transform.rotation * Vec3::NEG_Z) > 0.5);
+}
+
+#[test]
+fn spaceship_chase_camera_distance_scales_with_voxel_hull_size() {
+    let small = VoxelPhysicsBody {
+        local_center: Vec3::ZERO,
+        cells: vec![(IVec3::new(-2, 0, -4), 1), (IVec3::new(2, 2, 4), 1)],
+    };
+    let large = VoxelPhysicsBody {
+        local_center: Vec3::ZERO,
+        cells: vec![(IVec3::new(-20, 0, -40), 1), (IVec3::new(20, 16, 40), 1)],
+    };
+    let ship_transform = Transform::IDENTITY;
+
+    let small_camera = voxel_spaceship_chase_camera_transform(&ship_transform, &small).unwrap();
+    let large_camera = voxel_spaceship_chase_camera_transform(&ship_transform, &large).unwrap();
+
+    assert!(large_camera.translation.z > small_camera.translation.z);
+    assert!(large_camera.translation.y > small_camera.translation.y);
+}
+
+#[test]
+fn stopping_spaceship_control_returns_to_cockpit_view() {
+    let mut control = VoxelSpaceshipControlState::default();
+    control.driving_ship_id = Some("small-ship-01".to_owned());
+    control.third_person_view = true;
+
+    control.stop_driving();
+
+    assert!(!control.third_person_view);
 }

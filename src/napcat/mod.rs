@@ -9858,18 +9858,23 @@ mod tests {
                 ChatTargetExportKind::Private,
             );
         }
-        manager
-            .chat_targets
-            .insert("99".to_owned(), ChatTargetMetadata::default());
-        manager
-            .chat_target_kinds
-            .insert("99".to_owned(), ChatTargetExportKind::Group);
+        manager.chat_targets.insert(
+            "99".to_owned(),
+            ChatTargetMetadata::default(),
+        );
+        manager.chat_target_kinds.insert(
+            "99".to_owned(),
+            ChatTargetExportKind::Group,
+        );
 
         assert!(manager.sync_chat_targets());
         let first_color = manager.player_chat_window_color("2").unwrap();
         let second_color = manager.player_chat_window_color("3").unwrap();
         assert_ne!(first_color, second_color);
-        assert_eq!(manager.player_chat_window_color("99"), None);
+        assert_eq!(
+            manager.player_chat_window_color("99"),
+            None
+        );
         assert!(!manager.sync_chat_targets());
 
         let persistent = Persistent::<NapcatMessageManager>::builder()

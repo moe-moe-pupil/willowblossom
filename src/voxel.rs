@@ -194,6 +194,9 @@ const FIRST_PERSON_SPEED: f32 = 2.8;
 const FIRST_PERSON_JUMP_SPEED: f32 = 3.4;
 const FIRST_PERSON_FLY_SPEED: f32 = 3.5;
 const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
+const SPACESHIP_CHASE_FOV_RADIANS: f32 = 78.0_f32.to_radians();
+const SPACESHIP_CHASE_MIN_DISTANCE: f32 = 12.0 * VOXEL_SIZE;
+const SPACESHIP_CHASE_SMOOTHING: f32 = 8.0;
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
 const VOXEL_SPACESHIP_SAVE_SECONDS: f32 = 1.0;
@@ -247,23 +250,32 @@ const ARROGANCE_PORT_BOW_MIN_X: i32 = -321;
 const ARROGANCE_PORT_BOW_MAX_X: i32 = -262;
 const ARROGANCE_PORT_BOW_MIN_Z: i32 = -51;
 const ARROGANCE_PORT_BOW_MAX_Z: i32 = -1;
-
 const DEFAULT_COLLISION_LAYER_BITS: u32 = 1 << 0;
 const CARRIER_COLLISION_LAYER_BITS: u32 = 1 << 1;
 const DOCKED_SPACESHIP_COLLISION_LAYER_BITS: u32 = 1 << 2;
-const SMALL_SPACESHIP_BERTH_X: [i32; SMALL_SPACESHIP_COUNT] =
-    [-88, -60, -32, 36, 64, 92];
+const SMALL_SPACESHIP_BERTH_X: [i32; SMALL_SPACESHIP_COUNT] = [-88, -60, -32, 36, 64, 92];
 const ORBITAL_LAYOUT_SCALE: i32 = 5;
-const RESEARCH_STATION_CENTER: IVec3 =
-    IVec3::new(100 * ORBITAL_LAYOUT_SCALE, 0, 100 * ORBITAL_LAYOUT_SCALE);
-const SENSOR_STATION_CENTER: IVec3 =
-    IVec3::new(100 * ORBITAL_LAYOUT_SCALE, 0, -100 * ORBITAL_LAYOUT_SCALE);
-const CANNON_STATION_CENTER: IVec3 =
-    IVec3::new(-100 * ORBITAL_LAYOUT_SCALE, 0, -100 * ORBITAL_LAYOUT_SCALE);
-const COMBAT_SPACESHIP_CENTER: IVec3 =
-    IVec3::new(-100 * ORBITAL_LAYOUT_SCALE, 0, 100 * ORBITAL_LAYOUT_SCALE);
-const ABANDONED_STATION_CENTER: IVec3 =
-    IVec3::new(0, 0, 200 * ORBITAL_LAYOUT_SCALE);
+const RESEARCH_STATION_CENTER: IVec3 = IVec3::new(
+    100 * ORBITAL_LAYOUT_SCALE,
+    0,
+    100 * ORBITAL_LAYOUT_SCALE,
+);
+const SENSOR_STATION_CENTER: IVec3 = IVec3::new(
+    100 * ORBITAL_LAYOUT_SCALE,
+    0,
+    -100 * ORBITAL_LAYOUT_SCALE,
+);
+const CANNON_STATION_CENTER: IVec3 = IVec3::new(
+    -100 * ORBITAL_LAYOUT_SCALE,
+    0,
+    -100 * ORBITAL_LAYOUT_SCALE,
+);
+const COMBAT_SPACESHIP_CENTER: IVec3 = IVec3::new(
+    -100 * ORBITAL_LAYOUT_SCALE,
+    0,
+    100 * ORBITAL_LAYOUT_SCALE,
+);
+const ABANDONED_STATION_CENTER: IVec3 = IVec3::new(0, 0, 200 * ORBITAL_LAYOUT_SCALE);
 const WORKBOOK_ROOM_HEIGHT: i32 = 7;
 const STATION_DOCK_PAD_HALF_WIDTH: i32 = 22;
 const STATION_DOCK_PAD_HALF_LENGTH: i32 = 25;
@@ -272,11 +284,9 @@ const STATION_DOCK_BRIDGE_HALF_WIDTH: i32 = 2;
 const STATION_DOCK_CLEAR_HEIGHT: i32 = 10;
 const STATION_DOCK_MIN_SEPARATION: i32 = 64;
 const FIRST_PERSON_START: Vec3 = Vec3::new(
-    (COMBAT_SPACESHIP_CENTER.x + ARROGANCE.spawn[0] * ARROGANCE_SCALE) as f32
-        * VOXEL_SIZE,
+    (COMBAT_SPACESHIP_CENTER.x + ARROGANCE.spawn[0] * ARROGANCE_SCALE) as f32 * VOXEL_SIZE,
     (HANGAR_PARKING_Y as f32 + 1.0) * VOXEL_SIZE,
-    (COMBAT_SPACESHIP_CENTER.z + ARROGANCE.spawn[1] * ARROGANCE_SCALE) as f32
-        * VOXEL_SIZE,
+    (COMBAT_SPACESHIP_CENTER.z + ARROGANCE.spawn[1] * ARROGANCE_SCALE) as f32 * VOXEL_SIZE,
 );
 const DEFAULT_SCENE_CAMERA_FOCUS: Vec3 = Vec3::new(
     COMBAT_SPACESHIP_CENTER.x as f32 * VOXEL_SIZE,
@@ -357,9 +367,7 @@ fn voxel_emissive(red: f32, green: f32, blue: f32) -> LinearRgba {
 impl Connector for TrpgVoxelConnector {
     type Item = u8;
 
-    fn solid(voxel: &Self::Item) -> bool {
-        matches!(*voxel, 1..=3 | 6..=VOXEL_GLASS_MATERIAL)
-    }
+    fn solid(voxel: &Self::Item) -> bool { matches!(*voxel, 1..=3 | 6..=VOXEL_GLASS_MATERIAL) }
 }
 
 #[derive(Component)]
@@ -747,6 +755,7 @@ struct VoxelSpaceshipControlState {
     driving_ship_id: Option<String>,
     cockpit_eye: Option<Vec3>,
     cockpit_rotation: Quat,
+    third_person_view: bool,
     thrust_input: f32,
     vertical_input: f32,
     boost_active: bool,
@@ -762,6 +771,7 @@ impl Default for VoxelSpaceshipControlState {
             driving_ship_id: None,
             cockpit_eye: None,
             cockpit_rotation: Quat::IDENTITY,
+            third_person_view: false,
             thrust_input: 0.0,
             vertical_input: 0.0,
             boost_active: false,
@@ -777,6 +787,7 @@ impl VoxelSpaceshipControlState {
         self.exit_pending |= self.driving_ship_id.is_some();
         self.driving_ship_id = None;
         self.cockpit_eye = None;
+        self.third_person_view = false;
         self.thrust_input = 0.0;
         self.vertical_input = 0.0;
         self.boost_active = false;
@@ -1072,28 +1083,33 @@ impl VoxelTeleportDestination {
             Vec3::Y * (VOXEL_SIZE + FIRST_PERSON_RADIUS + FIRST_PERSON_BODY_LENGTH * 0.5);
         Some(match self {
             Self::ResearchStation => {
-                (RESEARCH_STATION_CENTER
-                    + IVec3::new(NIFFY.spawn[0], 0, NIFFY.spawn[1]))
-                .as_vec3()
+                (RESEARCH_STATION_CENTER + IVec3::new(NIFFY.spawn[0], 0, NIFFY.spawn[1])).as_vec3()
                     * VOXEL_SIZE
                     + floor_offset
             },
             Self::SensorStation => {
                 (SENSOR_STATION_CENTER
-                    + IVec3::new(ARBITRATOR.spawn[0], 0, ARBITRATOR.spawn[1]))
+                    + IVec3::new(
+                        ARBITRATOR.spawn[0],
+                        0,
+                        ARBITRATOR.spawn[1],
+                    ))
                 .as_vec3()
                     * VOXEL_SIZE
                     + floor_offset
             },
             Self::CannonStation => {
-                (CANNON_STATION_CENTER + IVec3::new(KYO.spawn[0], 0, KYO.spawn[1]))
-                    .as_vec3()
+                (CANNON_STATION_CENTER + IVec3::new(KYO.spawn[0], 0, KYO.spawn[1])).as_vec3()
                     * VOXEL_SIZE
                     + floor_offset
             },
             Self::AbandonedStation => {
                 (ABANDONED_STATION_CENTER
-                    + IVec3::new(ABANDONED.spawn[0], 0, ABANDONED.spawn[1]))
+                    + IVec3::new(
+                        ABANDONED.spawn[0],
+                        0,
+                        ABANDONED.spawn[1],
+                    ))
                 .as_vec3()
                     * VOXEL_SIZE
                     + floor_offset
@@ -2461,12 +2477,15 @@ fn persist_voxel_scene(
     grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
     planets: Query<&VoxelOrbitalPlanet>,
     physics_loader: Res<VoxelPhysicsChunkLoader>,
-    physics_bodies: Query<(
-        &VoxelPhysicsBody,
-        &Transform,
-        &LinearVelocity,
-        &AngularVelocity,
-    ), Without<VoxelSpaceship>>,
+    physics_bodies: Query<
+        (
+            &VoxelPhysicsBody,
+            &Transform,
+            &LinearVelocity,
+            &AngularVelocity,
+        ),
+        Without<VoxelSpaceship>,
+    >,
     placed_lights: Query<(
         &VoxelPlacedLight,
         &Transform,
@@ -2804,8 +2823,7 @@ fn setup_voxel_materials(
     });
     let planet_ocean_material = opaque_planet_ocean_material(textures[3].clone());
     let mut fade_planet_ocean_material = planet_ocean_material.clone();
-    fade_planet_ocean_material.base_color =
-        fade_planet_ocean_material.base_color.with_alpha(0.0);
+    fade_planet_ocean_material.base_color = fade_planet_ocean_material.base_color.with_alpha(0.0);
     fade_planet_ocean_material.alpha_mode = AlphaMode::Blend;
     let fade_planet_ocean = materials.add(fade_planet_ocean_material);
     let planet_ocean = materials.add(planet_ocean_material);
@@ -3387,7 +3405,6 @@ fn add_space_station_docking_areas(
     }
 }
 
-
 fn populate_default_grid(grid: &mut Mut<Grid<u8>>) {
     for (center, design) in static_workbook_orbital_locations() {
         build_workbook_orbital_location(grid, center, design);
@@ -3444,11 +3461,13 @@ fn static_workbook_feature_annotations() -> StaticWorkbookFeatureAnnotations {
         entries.extend(
             workbook_feature_regions(design, &decoded)
                 .into_iter()
-                .map(|region| StaticWorkbookFeatureAnnotation {
-                    map_name: design.name,
-                    center,
-                    region,
-                }),
+                .map(
+                    |region| StaticWorkbookFeatureAnnotation {
+                        map_name: design.name,
+                        center,
+                        region,
+                    },
+                ),
         );
     }
     StaticWorkbookFeatureAnnotations { entries }
@@ -3480,9 +3499,7 @@ fn workbook_planet_fixture(style: u8) -> Option<(u8, i32)> {
     })
 }
 
-fn workbook_exterior_fixture(style: u8) -> bool {
-    matches!(style, 13 | 33..=38)
-}
+fn workbook_exterior_fixture(style: u8) -> bool { matches!(style, 13 | 33..=38) }
 
 fn build_workbook_orbital_location(
     grid: &mut Mut<Grid<u8>>,
@@ -3499,12 +3516,14 @@ fn build_workbook_orbital_location(
 
         if wall || door || enclosed {
             grid.set(base, if style == 12 { 7 } else { 2 });
-            grid.set(base + IVec3::Y * WORKBOOK_ROOM_HEIGHT, 6);
+            grid.set(
+                base + IVec3::Y * WORKBOOK_ROOM_HEIGHT,
+                6,
+            );
         }
         if wall {
             for y in 1..WORKBOOK_ROOM_HEIGHT {
-                let material = if workbook_station_wall_is_glass(design, &decoded, index, y)
-                {
+                let material = if workbook_station_wall_is_glass(design, &decoded, index, y) {
                     VOXEL_GLASS_MATERIAL
                 } else {
                     6
@@ -3520,7 +3539,10 @@ fn build_workbook_orbital_location(
         if !enclosed && !workbook_exterior_fixture(style) {
             continue;
         }
-        grid.set(base, if enclosed { 2 } else { material });
+        grid.set(
+            base,
+            if enclosed { 2 } else { material },
+        );
         for y in 1..=height {
             grid.set(base + IVec3::Y * y, material);
         }
@@ -3752,8 +3774,7 @@ fn workbook_feature_floor_material(kind: WorkbookFeatureKind) -> u8 {
 
 fn workbook_feature_fixture_spacing(kind: WorkbookFeatureKind) -> usize {
     match kind {
-        WorkbookFeatureKind::EnergyPlatform
-        | WorkbookFeatureKind::Teleporter => 4,
+        WorkbookFeatureKind::EnergyPlatform | WorkbookFeatureKind::Teleporter => 4,
         WorkbookFeatureKind::ControlConsole
         | WorkbookFeatureKind::OutpostTerminal
         | WorkbookFeatureKind::ThermiteFactory
@@ -3792,118 +3813,615 @@ fn add_workbook_fixture_micro_tiles(
 ) {
     match kind {
         WorkbookFeatureKind::ControlConsole => {
-            push_fixture_box(tiles, owner, 1, [1, 0, 2], [15, 3, 14], 7);
-            push_fixture_box(tiles, owner, 1, [2, 3, 5], [14, 10, 14], 6);
-            push_fixture_box(tiles, owner, 1, [3, 7, 2], [13, 14, 5], 8);
-            push_fixture_box(tiles, owner, 1, [5, 11, 1], [7, 13, 2], 9);
-            push_fixture_box(tiles, owner, 1, [9, 11, 1], [11, 13, 2], 5);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 0, 2],
+                [15, 3, 14],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [2, 3, 5],
+                [14, 10, 14],
+                6,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [3, 7, 2],
+                [13, 14, 5],
+                8,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [5, 11, 1],
+                [7, 13, 2],
+                9,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [9, 11, 1],
+                [11, 13, 2],
+                5,
+            );
         },
         WorkbookFeatureKind::EnergyPlatform => {
-            push_fixture_box(tiles, owner, 1, [0, 0, 0], [16, 2, 16], 7);
-            push_fixture_box(tiles, owner, 1, [1, 2, 6], [15, 4, 10], 8);
-            push_fixture_box(tiles, owner, 1, [6, 2, 1], [10, 4, 15], 8);
-            push_fixture_box(tiles, owner, 1, [6, 4, 6], [10, 15, 10], 9);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [0, 0, 0],
+                [16, 2, 16],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 2, 6],
+                [15, 4, 10],
+                8,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [6, 2, 1],
+                [10, 4, 15],
+                8,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [6, 4, 6],
+                [10, 15, 10],
+                9,
+            );
         },
         WorkbookFeatureKind::SupplyRack => {
-            push_fixture_box(tiles, owner, 1, [1, 0, 13], [15, 16, 15], 7);
-            push_fixture_box(tiles, owner, 2, [1, 0, 13], [15, 14, 15], 7);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 0, 13],
+                [15, 16, 15],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [1, 0, 13],
+                [15, 14, 15],
+                7,
+            );
             for shelf_y in [2, 8, 14] {
-                push_fixture_box(tiles, owner, 1, [1, shelf_y, 2], [15, shelf_y + 2, 15], 6);
+                push_fixture_box(
+                    tiles,
+                    owner,
+                    1,
+                    [1, shelf_y, 2],
+                    [15, shelf_y + 2, 15],
+                    6,
+                );
             }
-            push_fixture_box(tiles, owner, 1, [2, 4, 3], [7, 8, 12], 3);
-            push_fixture_box(tiles, owner, 1, [9, 4, 3], [14, 8, 12], 9);
-            push_fixture_box(tiles, owner, 1, [3, 10, 3], [13, 14, 12], 10);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [2, 4, 3],
+                [7, 8, 12],
+                3,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [9, 4, 3],
+                [14, 8, 12],
+                9,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [3, 10, 3],
+                [13, 14, 12],
+                10,
+            );
         },
         WorkbookFeatureKind::ArmorLocker => {
-            push_fixture_box(tiles, owner, 1, [2, 0, 2], [14, 16, 14], 6);
-            push_fixture_box(tiles, owner, 2, [2, 0, 2], [14, 12, 14], 6);
-            push_fixture_box(tiles, owner, 1, [4, 3, 1], [12, 14, 2], 7);
-            push_fixture_box(tiles, owner, 2, [4, 1, 1], [12, 9, 2], 8);
-            push_fixture_box(tiles, owner, 2, [11, 5, 0], [13, 7, 1], 9);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [2, 0, 2],
+                [14, 16, 14],
+                6,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [2, 0, 2],
+                [14, 12, 14],
+                6,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [4, 3, 1],
+                [12, 14, 2],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [4, 1, 1],
+                [12, 9, 2],
+                8,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [11, 5, 0],
+                [13, 7, 1],
+                9,
+            );
         },
         WorkbookFeatureKind::CargoRack => {
-            push_fixture_box(tiles, owner, 1, [1, 0, 1], [15, 14, 15], 3);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 0, 1],
+                [15, 14, 15],
+                3,
+            );
             for x in [2, 7, 12] {
-                push_fixture_box(tiles, owner, 1, [x, 1, 0], [x + 2, 13, 1], 7);
+                push_fixture_box(
+                    tiles,
+                    owner,
+                    1,
+                    [x, 1, 0],
+                    [x + 2, 13, 1],
+                    7,
+                );
             }
-            push_fixture_box(tiles, owner, 1, [1, 5, 0], [15, 7, 1], 7);
-            push_fixture_box(tiles, owner, 1, [1, 11, 0], [15, 13, 1], 7);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 5, 0],
+                [15, 7, 1],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 11, 0],
+                [15, 13, 1],
+                7,
+            );
         },
         WorkbookFeatureKind::OutpostTerminal => {
-            push_fixture_box(tiles, owner, 1, [1, 0, 1], [15, 3, 15], 9);
-            push_fixture_box(tiles, owner, 1, [3, 3, 5], [13, 12, 14], 6);
-            push_fixture_box(tiles, owner, 1, [4, 7, 2], [12, 14, 5], 8);
-            push_fixture_box(tiles, owner, 2, [7, 0, 7], [9, 12, 9], 7);
-            push_fixture_box(tiles, owner, 2, [4, 10, 4], [12, 12, 12], 8);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 0, 1],
+                [15, 3, 15],
+                9,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [3, 3, 5],
+                [13, 12, 14],
+                6,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [4, 7, 2],
+                [12, 14, 5],
+                8,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [7, 0, 7],
+                [9, 12, 9],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [4, 10, 4],
+                [12, 12, 12],
+                8,
+            );
         },
         WorkbookFeatureKind::EscapePod => {
-            push_fixture_box(tiles, owner, 1, [2, 0, 3], [14, 16, 13], 7);
-            push_fixture_box(tiles, owner, 2, [2, 0, 3], [14, 16, 13], 6);
-            push_fixture_box(tiles, owner, 3, [4, 0, 5], [12, 8, 11], 7);
-            push_fixture_box(tiles, owner, 2, [4, 3, 2], [12, 13, 3], 8);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [2, 0, 3],
+                [14, 16, 13],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [2, 0, 3],
+                [14, 16, 13],
+                6,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                3,
+                [4, 0, 5],
+                [12, 8, 11],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [4, 3, 2],
+                [12, 13, 3],
+                8,
+            );
             push_fixture_box(tiles, owner, 1, [5, 5, 2], [7, 8, 3], 5);
         },
         WorkbookFeatureKind::ThermiteFactory => {
-            push_fixture_box(tiles, owner, 1, [1, 0, 1], [15, 5, 15], 7);
-            push_fixture_box(tiles, owner, 1, [2, 5, 3], [7, 16, 13], 6);
-            push_fixture_box(tiles, owner, 1, [9, 5, 3], [14, 16, 13], 6);
-            push_fixture_box(tiles, owner, 2, [3, 0, 4], [6, 13, 12], 5);
-            push_fixture_box(tiles, owner, 2, [10, 0, 4], [13, 13, 12], 5);
-            push_fixture_box(tiles, owner, 1, [7, 8, 7], [9, 11, 9], 9);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 0, 1],
+                [15, 5, 15],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [2, 5, 3],
+                [7, 16, 13],
+                6,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [9, 5, 3],
+                [14, 16, 13],
+                6,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [3, 0, 4],
+                [6, 13, 12],
+                5,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [10, 0, 4],
+                [13, 13, 12],
+                5,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [7, 8, 7],
+                [9, 11, 9],
+                9,
+            );
         },
         WorkbookFeatureKind::Teleporter => {
-            push_fixture_box(tiles, owner, 1, [0, 0, 0], [16, 2, 16], 7);
-            push_fixture_box(tiles, owner, 1, [2, 2, 2], [14, 4, 14], 8);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [0, 0, 0],
+                [16, 2, 16],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [2, 2, 2],
+                [14, 4, 14],
+                8,
+            );
             for (x, z) in [(1, 1), (12, 1), (1, 12), (12, 12)] {
-                push_fixture_box(tiles, owner, 1, [x, 4, z], [x + 3, 16, z + 3], 9);
-                push_fixture_box(tiles, owner, 2, [x, 0, z], [x + 3, 14, z + 3], 8);
+                push_fixture_box(
+                    tiles,
+                    owner,
+                    1,
+                    [x, 4, z],
+                    [x + 3, 16, z + 3],
+                    9,
+                );
+                push_fixture_box(
+                    tiles,
+                    owner,
+                    2,
+                    [x, 0, z],
+                    [x + 3, 14, z + 3],
+                    8,
+                );
             }
         },
         WorkbookFeatureKind::MedicalAnalyzer => {
-            push_fixture_box(tiles, owner, 1, [0, 0, 1], [16, 3, 15], 6);
-            push_fixture_box(tiles, owner, 1, [2, 3, 4], [14, 7, 14], 3);
-            push_fixture_box(tiles, owner, 1, [2, 7, 12], [14, 16, 15], 7);
-            push_fixture_box(tiles, owner, 2, [2, 0, 12], [14, 10, 15], 7);
-            push_fixture_box(tiles, owner, 2, [3, 1, 11], [13, 8, 12], 8);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [0, 0, 1],
+                [16, 3, 15],
+                6,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [2, 3, 4],
+                [14, 7, 14],
+                3,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [2, 7, 12],
+                [14, 16, 15],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [2, 0, 12],
+                [14, 10, 15],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [3, 1, 11],
+                [13, 8, 12],
+                8,
+            );
             for x in [4, 7, 10] {
-                push_fixture_box(tiles, owner, 2, [x, 3, 10], [x + 1, 6, 11], 5);
+                push_fixture_box(
+                    tiles,
+                    owner,
+                    2,
+                    [x, 3, 10],
+                    [x + 1, 6, 11],
+                    5,
+                );
             }
         },
         WorkbookFeatureKind::Furniture => {
             for (x, z) in [(2, 2), (11, 2), (2, 11), (11, 11)] {
-                push_fixture_box(tiles, owner, 1, [x, 0, z], [x + 3, 10, z + 3], 3);
+                push_fixture_box(
+                    tiles,
+                    owner,
+                    1,
+                    [x, 0, z],
+                    [x + 3, 10, z + 3],
+                    3,
+                );
             }
-            push_fixture_box(tiles, owner, 1, [1, 9, 1], [15, 12, 15], 3);
-            push_fixture_box(tiles, owner, 1, [5, 3, 0], [11, 8, 3], 7);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 9, 1],
+                [15, 12, 15],
+                3,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [5, 3, 0],
+                [11, 8, 3],
+                7,
+            );
         },
         WorkbookFeatureKind::ExperimentBench => {
-            push_fixture_box(tiles, owner, 1, [1, 0, 2], [4, 10, 14], 7);
-            push_fixture_box(tiles, owner, 1, [12, 0, 2], [15, 10, 14], 7);
-            push_fixture_box(tiles, owner, 1, [1, 9, 1], [15, 12, 15], 6);
-            push_fixture_box(tiles, owner, 1, [3, 12, 4], [7, 16, 9], 8);
-            push_fixture_box(tiles, owner, 2, [9, 0, 5], [13, 8, 11], 1);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 0, 2],
+                [4, 10, 14],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [12, 0, 2],
+                [15, 10, 14],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 9, 1],
+                [15, 12, 15],
+                6,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [3, 12, 4],
+                [7, 16, 9],
+                8,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [9, 0, 5],
+                [13, 8, 11],
+                1,
+            );
         },
         WorkbookFeatureKind::Crate => {
-            push_fixture_box(tiles, owner, 1, [1, 0, 1], [15, 14, 15], 3);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 0, 1],
+                [15, 14, 15],
+                3,
+            );
             for x in [1, 7, 13] {
-                push_fixture_box(tiles, owner, 1, [x, 1, 0], [x + 2, 13, 1], 7);
+                push_fixture_box(
+                    tiles,
+                    owner,
+                    1,
+                    [x, 1, 0],
+                    [x + 2, 13, 1],
+                    7,
+                );
             }
-            push_fixture_box(tiles, owner, 1, [1, 5, 0], [15, 7, 1], 7);
-            push_fixture_box(tiles, owner, 1, [1, 11, 0], [15, 13, 1], 7);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 5, 0],
+                [15, 7, 1],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 11, 0],
+                [15, 13, 1],
+                7,
+            );
         },
         WorkbookFeatureKind::RadarConsole => {
-            push_fixture_box(tiles, owner, 1, [1, 0, 1], [15, 3, 15], 7);
-            push_fixture_box(tiles, owner, 1, [3, 3, 6], [13, 11, 14], 6);
-            push_fixture_box(tiles, owner, 1, [4, 7, 3], [12, 14, 6], 8);
-            push_fixture_box(tiles, owner, 2, [7, 0, 7], [9, 12, 9], 9);
-            push_fixture_box(tiles, owner, 2, [3, 9, 7], [13, 11, 9], 8);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 0, 1],
+                [15, 3, 15],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [3, 3, 6],
+                [13, 11, 14],
+                6,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [4, 7, 3],
+                [12, 14, 6],
+                8,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [7, 0, 7],
+                [9, 12, 9],
+                9,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [3, 9, 7],
+                [13, 11, 9],
+                8,
+            );
         },
         WorkbookFeatureKind::InstrumentPanel => {
-            push_fixture_box(tiles, owner, 1, [1, 0, 10], [15, 16, 15], 7);
-            push_fixture_box(tiles, owner, 2, [1, 0, 10], [15, 10, 15], 6);
-            push_fixture_box(tiles, owner, 1, [3, 5, 9], [6, 8, 10], 8);
-            push_fixture_box(tiles, owner, 1, [8, 5, 9], [10, 8, 10], 5);
-            push_fixture_box(tiles, owner, 1, [12, 5, 9], [14, 8, 10], 9);
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [1, 0, 10],
+                [15, 16, 15],
+                7,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                2,
+                [1, 0, 10],
+                [15, 10, 15],
+                6,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [3, 5, 9],
+                [6, 8, 10],
+                8,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [8, 5, 9],
+                [10, 8, 10],
+                5,
+            );
+            push_fixture_box(
+                tiles,
+                owner,
+                1,
+                [12, 5, 9],
+                [14, 8, 10],
+                9,
+            );
         },
     }
 }
@@ -3927,9 +4445,7 @@ fn workbook_station_wall_is_glass(
     index: usize,
     y: i32,
 ) -> bool {
-    if decoded.styles[index] != 11
-        || !(2..WORKBOOK_ROOM_HEIGHT - 1).contains(&y)
-    {
+    if decoded.styles[index] != 11 || !(2..WORKBOOK_ROOM_HEIGHT - 1).contains(&y) {
         return false;
     }
 
@@ -3940,7 +4456,12 @@ fn workbook_station_wall_is_glass(
     [(-1, 0), (1, 0), (0, -1), (0, 1)]
         .into_iter()
         .filter(|(dx, dz)| {
-            workbook_cell_is_exterior(design, decoded, sheet_x + dx, sheet_z + dz)
+            workbook_cell_is_exterior(
+                design,
+                decoded,
+                sheet_x + dx,
+                sheet_z + dz,
+            )
         })
         .any(|(dx, _)| {
             let longitudinal = if dx != 0 { z } else { x };
@@ -3968,8 +4489,7 @@ fn add_workbook_hull_micro_tiles(
         let base = IVec3::new(x, 0, z);
 
         if decoded.enclosed[index]
-            && (x.rem_euclid(palette.rib_spacing) == 0
-                || z.rem_euclid(palette.rib_spacing) == 0)
+            && (x.rem_euclid(palette.rib_spacing) == 0 || z.rem_euclid(palette.rib_spacing) == 0)
         {
             let (min, max) = if x.rem_euclid(palette.rib_spacing) == 0 {
                 ([7, 0, 0], [9, 1, 16])
@@ -4013,9 +4533,7 @@ fn add_workbook_hull_micro_tiles(
             let outside = base + direction;
             if style == 11 {
                 for y in 0..=WORKBOOK_ROOM_HEIGHT {
-                    let material = if workbook_station_wall_is_glass(
-                        design, decoded, index, y,
-                    ) {
+                    let material = if workbook_station_wall_is_glass(design, decoded, index, y) {
                         VOXEL_GLASS_MATERIAL
                     } else if matches!(y, 3 | 4) && matches!(pattern, 4 | 5) {
                         palette.window
@@ -4041,10 +4559,7 @@ fn add_workbook_hull_micro_tiles(
             } else {
                 // A thin sill and canopy preserve the automatic door opening.
                 let (sill_min, sill_max) = match direction {
-                    IVec3::NEG_X | IVec3::X => (
-                        [min[0], 0, 1],
-                        [max[0], 2, 15],
-                    ),
+                    IVec3::NEG_X | IVec3::X => ([min[0], 0, 1], [max[0], 2, 15]),
                     _ => ([1, 0, min[2]], [15, 2, max[2]]),
                 };
                 push_micro_box(
@@ -4174,11 +4689,7 @@ fn workbook_micro_tiles(
     let mut tiles = Vec::new();
     for region in workbook_feature_regions(design, decoded) {
         for owner in region.cells.iter().copied() {
-            add_workbook_feature_floor_micro_tile(
-                &mut tiles,
-                owner,
-                region.kind,
-            );
+            add_workbook_feature_floor_micro_tile(&mut tiles, owner, region.kind);
         }
 
         let min_x = region.cells.iter().map(|cell| cell.x).min().unwrap();
@@ -4275,8 +4786,7 @@ fn workbook_auto_doors(center: IVec3, design: WorkbookMapDesign) -> Vec<VoxelAut
         let depth = max_z - min_z + 1;
         let width_axis = if width >= depth { IVec3::X } else { IVec3::Z };
         let span = width.max(depth) as i32;
-        let center_index =
-            ((min_z + max_z) / 2) * design.width + (min_x + max_x) / 2;
+        let center_index = ((min_z + max_z) / 2) * design.width + (min_x + max_x) / 2;
         let [x, z] = design.centered_offset(center_index);
         doors.push(make_voxel_auto_door(
             center + IVec3::new(x, 0, z),
@@ -4500,7 +5010,7 @@ fn workbook_interior_lights() -> Vec<(Vec3, Color)> {
                 (*enclosed
                     && decoded.features[index] == 0
                     && workbook_fixture(decoded.styles[index]).is_none())
-                    .then_some(index)
+                .then_some(index)
             })
             .collect::<Vec<_>>();
         let mut selected = HashSet::new();
@@ -4572,13 +5082,13 @@ fn voxel_physics_prop_specs() -> Vec<(Vec<(IVec3, u8)>, Transform)> {
                 (*enclosed
                     && decoded.features[index] == 0
                     && workbook_fixture(decoded.styles[index]).is_none())
-                    .then_some(index)
+                .then_some(index)
             })
             .collect::<Vec<_>>();
-        for (ordinal, target) in [
-            [design.spawn[0] - 5, design.spawn[1] + 4],
-            [design.spawn[0] + 5, design.spawn[1] + 4],
-        ]
+        for (ordinal, target) in [[design.spawn[0] - 5, design.spawn[1] + 4], [
+            design.spawn[0] + 5,
+            design.spawn[1] + 4,
+        ]]
         .into_iter()
         .enumerate()
         {
@@ -4600,7 +5110,9 @@ fn voxel_physics_prop_specs() -> Vec<(Vec<(IVec3, u8)>, Transform)> {
                     VOXEL_SIZE * 1.1,
                     (center.z + z) as f32 * VOXEL_SIZE,
                 ))
-                .with_rotation(Quat::from_rotation_y(ordinal as f32 * 0.35)),
+                .with_rotation(Quat::from_rotation_y(
+                    ordinal as f32 * 0.35,
+                )),
             ));
         }
     }
@@ -4820,13 +5332,10 @@ fn combat_spaceship_cab_cells() -> HashMap<IVec3, u8> {
     cells
 }
 
-fn scale_combat_spaceship_cell(cell: IVec3) -> IVec3 {
-    cell * ARROGANCE_SCALE
-}
+fn scale_combat_spaceship_cell(cell: IVec3) -> IVec3 { cell * ARROGANCE_SCALE }
 
 fn scale_combat_spaceship_cells(cells: &HashMap<IVec3, u8>) -> HashMap<IVec3, u8> {
-    let mut scaled =
-        HashMap::with_capacity(cells.len() * ARROGANCE_SCALE.pow(3) as usize);
+    let mut scaled = HashMap::with_capacity(cells.len() * ARROGANCE_SCALE.pow(3) as usize);
     for (cell, material) in cells {
         let origin = scale_combat_spaceship_cell(*cell);
         for offset_x in 0..ARROGANCE_SCALE {
@@ -4852,10 +5361,8 @@ fn combat_spaceship_hangar_contains(cell: IVec3) -> bool {
 fn combat_spaceship_obsolete_port_bow_wall_contains(cell: IVec3) -> bool {
     let inside_bow = (ARROGANCE_PORT_BOW_MIN_X..=ARROGANCE_PORT_BOW_MAX_X).contains(&cell.x)
         && (ARROGANCE_PORT_BOW_MIN_Z..=ARROGANCE_PORT_BOW_MAX_Z).contains(&cell.z);
-    let outer_wall = (ARROGANCE_PORT_BOW_MIN_X..=ARROGANCE_PORT_BOW_MIN_X + 2)
-        .contains(&cell.x);
-    let end_walls = (ARROGANCE_PORT_BOW_MIN_Z..=ARROGANCE_PORT_BOW_MIN_Z + 5)
-        .contains(&cell.z)
+    let outer_wall = (ARROGANCE_PORT_BOW_MIN_X..=ARROGANCE_PORT_BOW_MIN_X + 2).contains(&cell.x);
+    let end_walls = (ARROGANCE_PORT_BOW_MIN_Z..=ARROGANCE_PORT_BOW_MIN_Z + 5).contains(&cell.z)
         || (ARROGANCE_PORT_BOW_MAX_Z - 2..=ARROGANCE_PORT_BOW_MAX_Z).contains(&cell.z);
     inside_bow && (outer_wall || end_walls)
 }
@@ -4877,11 +5384,7 @@ fn original_combat_spaceship_voxel_cells() -> HashMap<IVec3, u8> {
         let mut grid = entity
             .get_mut::<Grid<u8>>()
             .expect("temporary spaceship grid must exist");
-        build_workbook_orbital_location(
-            &mut grid,
-            IVec3::ZERO,
-            ARROGANCE,
-        );
+        build_workbook_orbital_location(&mut grid, IVec3::ZERO, ARROGANCE);
         for door in workbook_auto_doors(IVec3::ZERO, ARROGANCE) {
             for cell in door.cells {
                 grid.set(cell, 0);
@@ -4940,8 +5443,7 @@ fn small_spaceship_voxel_cells(variant: usize) -> Vec<(IVec3, u8)> {
                 if edge { 7 } else { 6 },
             );
             let canopy_half_width = (section_half_width - 1).clamp(0, 3);
-            let canopy = (nose + 1..=1).contains(&z)
-                && x.abs() <= canopy_half_width;
+            let canopy = (nose + 1..=1).contains(&z) && x.abs() <= canopy_half_width;
             cells.insert(
                 IVec3::new(x, 5, z),
                 if canopy {
@@ -5085,9 +5587,7 @@ fn medium_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
             let canopy_half_width = (section_half_width - 2).clamp(1, 7);
             cells.insert(
                 IVec3::new(x, ROOF_Y, z),
-                if (NOSE_Z + 2..=1).contains(&z)
-                    && x.abs() <= canopy_half_width
-                {
+                if (NOSE_Z + 2..=1).contains(&z) && x.abs() <= canopy_half_width {
                     VOXEL_GLASS_MATERIAL
                 } else if x.abs() == section_half_width {
                     7
@@ -5098,17 +5598,21 @@ fn medium_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
         }
 
         for y in 1..ROOF_Y {
-            let material = if (2..=6).contains(&y)
-                && (NOSE_Z + 2..=2).contains(&z)
-            {
+            let material = if (2..=6).contains(&y) && (NOSE_Z + 2..=2).contains(&z) {
                 VOXEL_GLASS_MATERIAL
             } else if matches!(y, 1 | 7) {
                 7
             } else {
                 6
             };
-            cells.insert(IVec3::new(-section_half_width, y, z), material);
-            cells.insert(IVec3::new(section_half_width, y, z), material);
+            cells.insert(
+                IVec3::new(-section_half_width, y, z),
+                material,
+            );
+            cells.insert(
+                IVec3::new(section_half_width, y, z),
+                material,
+            );
         }
 
         if z == NOSE_Z || z == TAIL_Z {
@@ -5134,11 +5638,9 @@ fn medium_spaceship_voxel_cells() -> Vec<(IVec3, u8)> {
     for z in -3_i32..=8 {
         let span = WING_SPAN - (z - 2).abs() / 3;
         for x in -span..=span {
-            cells.entry(IVec3::new(x, 0, z)).or_insert(if x.abs() >= span - 1 {
-                10
-            } else {
-                7
-            });
+            cells
+                .entry(IVec3::new(x, 0, z))
+                .or_insert(if x.abs() >= span - 1 { 10 } else { 7 });
         }
     }
     for x in [-11, 11] {
@@ -5242,10 +5744,10 @@ fn scale_combat_spaceship_micro_tiles(
                         continue;
                     }
                     let cell_min = cell * subdivisions;
-                    let min = (scaled_min - cell_min)
-                        .clamp(IVec3::ZERO, IVec3::splat(subdivisions));
-                    let max = (scaled_max - cell_min)
-                        .clamp(IVec3::ZERO, IVec3::splat(subdivisions));
+                    let min =
+                        (scaled_min - cell_min).clamp(IVec3::ZERO, IVec3::splat(subdivisions));
+                    let max =
+                        (scaled_max - cell_min).clamp(IVec3::ZERO, IVec3::splat(subdivisions));
                     scaled.push(VoxelMicroTile {
                         owner,
                         cell,
@@ -5287,9 +5789,8 @@ fn scale_combat_spaceship_feature_annotations(
                 .flat_map(|cell| {
                     let origin = scale_combat_spaceship_cell(cell);
                     (0..ARROGANCE_SCALE).flat_map(move |offset_x| {
-                        (0..ARROGANCE_SCALE).map(move |offset_z| {
-                            origin + IVec3::new(offset_x, 0, offset_z)
-                        })
+                        (0..ARROGANCE_SCALE)
+                            .map(move |offset_z| origin + IVec3::new(offset_x, 0, offset_z))
                     })
                 })
                 .filter(|cell| {
@@ -5339,10 +5840,10 @@ fn docked_voxel_spaceship_collision_layers() -> CollisionLayers {
 }
 
 fn default_docked_voxel_spaceship_transform(berth: IVec3) -> Transform {
-    Transform::from_translation(
-        (COMBAT_SPACESHIP_CENTER + berth).as_vec3() * VOXEL_SIZE,
-    )
-    .with_rotation(Quat::from_rotation_y(std::f32::consts::PI))
+    Transform::from_translation((COMBAT_SPACESHIP_CENTER + berth).as_vec3() * VOXEL_SIZE)
+        .with_rotation(Quat::from_rotation_y(
+            std::f32::consts::PI,
+        ))
 }
 
 fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
@@ -5380,9 +5881,7 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
         cells: arrogance_cells,
         micro_tiles: arrogance_micro_tiles,
         workbook_features: Some(arrogance_features),
-        transform: Transform::from_translation(
-            COMBAT_SPACESHIP_CENTER.as_vec3() * VOXEL_SIZE,
-        ),
+        transform: Transform::from_translation(COMBAT_SPACESHIP_CENTER.as_vec3() * VOXEL_SIZE),
         docking: None,
     }];
     let medium_berth = IVec3::new(0, HANGAR_PARKING_Y, HANGAR_PARKING_Z);
@@ -5401,7 +5900,9 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
         micro_tiles: Vec::new(),
         workbook_features: None,
         transform: default_docked_voxel_spaceship_transform(medium_berth),
-        docking: Some(default_voxel_spaceship_docking(medium_berth)),
+        docking: Some(default_voxel_spaceship_docking(
+            medium_berth,
+        )),
     });
     let names = [
         "WB-01 雨燕号",
@@ -5468,9 +5969,7 @@ fn persisted_voxel_spaceship_from_spec(
     }
 }
 
-fn finite_array<const N: usize>(values: [f32; N]) -> bool {
-    values.into_iter().all(f32::is_finite)
-}
+fn finite_array<const N: usize>(values: [f32; N]) -> bool { values.into_iter().all(f32::is_finite) }
 
 impl VoxelSpaceshipDocked {
     fn local_transform(&self) -> Option<Transform> {
@@ -5513,18 +6012,21 @@ fn docked_voxel_spaceship_point_velocity(
 fn voxel_spaceship_runtime_pose(
     persisted: &PersistedVoxelSpaceship,
     fallback: &VoxelSpaceshipSpec,
-) -> (Transform, LinearVelocity, AngularVelocity) {
+) -> (
+    Transform,
+    LinearVelocity,
+    AngularVelocity,
+) {
     let translation = finite_array(persisted.translation)
         .then(|| Vec3::from_array(persisted.translation))
         .unwrap_or(fallback.transform.translation);
     let saved_rotation = Quat::from_array(persisted.rotation);
-    let rotation = if finite_array(persisted.rotation)
-        && saved_rotation.length_squared() > f32::EPSILON
-    {
-        saved_rotation.normalize()
-    } else {
-        fallback.transform.rotation
-    };
+    let rotation =
+        if finite_array(persisted.rotation) && saved_rotation.length_squared() > f32::EPSILON {
+            saved_rotation.normalize()
+        } else {
+            fallback.transform.rotation
+        };
     let linear_velocity = finite_array(persisted.linear_velocity)
         .then(|| Vec3::from_array(persisted.linear_velocity))
         .unwrap_or(Vec3::ZERO);
@@ -5657,23 +6159,20 @@ fn spawn_default_voxel_spaceships(
         store.layout_revision = VOXEL_SPACESHIP_LAYOUT_REVISION;
     }
     for spec in &specs {
-        let persisted = if let Some(existing) = store
-            .ships
-            .iter_mut()
-            .find(|ship| ship.id == spec.ship.id)
-        {
-            if reset_poses {
-                let pilot_user_id = existing.pilot_user_id;
-                *existing = persisted_voxel_spaceship_from_spec(spec, pilot_user_id);
+        let persisted =
+            if let Some(existing) = store.ships.iter_mut().find(|ship| ship.id == spec.ship.id) {
+                if reset_poses {
+                    let pilot_user_id = existing.pilot_user_id;
+                    *existing = persisted_voxel_spaceship_from_spec(spec, pilot_user_id);
+                    changed = true;
+                }
+                existing.clone()
+            } else {
+                let persisted = persisted_voxel_spaceship_from_spec(spec, None);
+                store.ships.push(persisted.clone());
                 changed = true;
-            }
-            existing.clone()
-        } else {
-            let persisted = persisted_voxel_spaceship_from_spec(spec, None);
-            store.ships.push(persisted.clone());
-            changed = true;
-            persisted
-        };
+                persisted
+            };
         let (transform, linear_velocity, angular_velocity) =
             voxel_spaceship_runtime_pose(&persisted, spec);
         spawn_voxel_spaceship(
@@ -5733,6 +6232,7 @@ fn begin_voxel_spaceship_takeover(
     control.driving_ship_id = Some(ship_id.to_owned());
     control.selected_ship_id = Some(ship_id.to_owned());
     control.exit_pending = false;
+    control.third_person_view = false;
     if let Some(user_id) = pilot_user_id {
         possession.possess(user_id);
     } else {
@@ -5773,10 +6273,9 @@ fn release_controlled_docked_spaceship(
     let Some(driving_ship_id) = control.driving_ship_id.as_deref() else {
         return;
     };
-    let Some((entity, _, mut transform, docking, mut linear, mut angular)) =
-        docked_spaceships
-            .iter_mut()
-            .find(|(_, ship, ..)| ship.id == driving_ship_id)
+    let Some((entity, _, mut transform, docking, mut linear, mut angular)) = docked_spaceships
+        .iter_mut()
+        .find(|(_, ship, ..)| ship.id == driving_ship_id)
     else {
         return;
     };
@@ -5786,8 +6285,7 @@ fn release_controlled_docked_spaceship(
     else {
         return;
     };
-    let Some(world_transform) =
-        docked_voxel_spaceship_world_transform(carrier_transform, docking)
+    let Some(world_transform) = docked_voxel_spaceship_world_transform(carrier_transform, docking)
     else {
         return;
     };
@@ -5861,12 +6359,70 @@ fn sync_docked_voxel_spaceships(
 }
 
 fn voxel_spaceship_local_bounds(body: &VoxelPhysicsBody) -> Option<(Vec3, Vec3)> {
-    let min = body.cells.iter().map(|(cell, _)| *cell).reduce(IVec3::min)?;
-    let max = body.cells.iter().map(|(cell, _)| *cell).reduce(IVec3::max)?;
+    let min = body
+        .cells
+        .iter()
+        .map(|(cell, _)| *cell)
+        .reduce(IVec3::min)?;
+    let max = body
+        .cells
+        .iter()
+        .map(|(cell, _)| *cell)
+        .reduce(IVec3::max)?;
     Some((
         min.as_vec3() * VOXEL_SIZE,
         (max + IVec3::ONE).as_vec3() * VOXEL_SIZE,
     ))
+}
+
+fn voxel_spaceship_chase_camera_transform(
+    ship_transform: &Transform,
+    body: &VoxelPhysicsBody,
+) -> Option<Transform> {
+    let (local_min, local_max) = voxel_spaceship_chase_bounds(body)?;
+    let size = local_max - local_min;
+    let focus_local = (local_min + local_max) * 0.5 + Vec3::Y * size.y * 0.1;
+    let distance = (size.z * 0.65 + size.x * 0.45).max(SPACESHIP_CHASE_MIN_DISTANCE);
+    let lift = (size.y * 0.7 + size.z * 0.12).max(6.0 * VOXEL_SIZE);
+    let camera_local = focus_local + Vec3::new(0.0, lift, distance);
+    let affine = ship_transform.compute_affine();
+    let camera_position = affine.transform_point3(camera_local);
+    let focus = affine.transform_point3(focus_local);
+    let up = ship_transform.rotation * Vec3::Y;
+    Some(Transform::from_translation(camera_position).looking_at(focus, up))
+}
+
+fn voxel_spaceship_chase_bounds(body: &VoxelPhysicsBody) -> Option<(Vec3, Vec3)> {
+    let min = body
+        .cells
+        .iter()
+        .map(|(cell, _)| *cell)
+        .reduce(IVec3::min)?;
+    let max = body
+        .cells
+        .iter()
+        .map(|(cell, _)| *cell)
+        .reduce(IVec3::max)?;
+    Some((
+        min.as_vec3() * VOXEL_SIZE,
+        (max + IVec3::ONE).as_vec3() * VOXEL_SIZE,
+    ))
+}
+
+fn smoothed_spaceship_chase_camera(
+    current: &Transform,
+    target: &Transform,
+    delta_seconds: f32,
+) -> Transform {
+    let response = 1.0 - (-SPACESHIP_CHASE_SMOOTHING * delta_seconds.clamp(0.0, 0.05)).exp();
+    Transform {
+        translation: current.translation.lerp(target.translation, response),
+        rotation: current
+            .rotation
+            .slerp(target.rotation, response)
+            .normalize(),
+        scale: Vec3::ONE,
+    }
 }
 
 fn carried_transform_in_innermost_spaceship(
@@ -5885,17 +6441,17 @@ fn carried_transform_in_innermost_spaceship(
                 && local_position.cmple(ship.local_max).all();
             inside.then(|| {
                 let size = ship.local_max - ship.local_min;
-                (size.x * size.y * size.z, ship, local_position)
+                (
+                    size.x * size.y * size.z,
+                    ship,
+                    local_position,
+                )
             })
         })
         .min_by(|left, right| left.0.total_cmp(&right.0))?;
     let rotation_delta = ship.1.current.rotation * ship.1.previous.rotation.inverse();
     Some(Transform {
-        translation: ship
-            .1
-            .current
-            .compute_affine()
-            .transform_point3(ship.2),
+        translation: ship.1.current.compute_affine().transform_point3(ship.2),
         rotation: (rotation_delta * transform.rotation).normalize(),
         scale: transform.scale,
     })
@@ -5905,14 +6461,21 @@ fn carry_voxel_players_with_spaceships(
     time: Res<Time>,
     mut passenger_motion: ResMut<VoxelSpaceshipPassengerMotion>,
     spaceships: Query<
-        (&VoxelSpaceship, &VoxelPhysicsBody, &Transform),
+        (
+            &VoxelSpaceship,
+            &VoxelPhysicsBody,
+            &Transform,
+        ),
         (
             Without<VoxelFirstPersonPlayer>,
             Without<VoxelPlayerCaptureCamera>,
         ),
     >,
     mut capture_cameras: Query<
-        (&VoxelPlayerCaptureCamera, &mut Transform),
+        (
+            &VoxelPlayerCaptureCamera,
+            &mut Transform,
+        ),
         (
             Without<VoxelFirstPersonPlayer>,
             Without<VoxelSpaceship>,
@@ -5953,13 +6516,21 @@ fn carry_voxel_players_with_spaceships(
         let Some(carried) = carried_transform_in_innermost_spaceship(&transform, &motions) else {
             continue;
         };
-        if transform.translation.abs_diff_eq(carried.translation, f32::EPSILON)
-            && transform.rotation.abs_diff_eq(carried.rotation, f32::EPSILON)
+        if transform
+            .translation
+            .abs_diff_eq(carried.translation, f32::EPSILON)
+            && transform
+                .rotation
+                .abs_diff_eq(carried.rotation, f32::EPSILON)
         {
             continue;
         }
         *transform = carried;
-        upsert_voxel_player_camera(&mut camera_store, camera.user_id, &transform);
+        upsert_voxel_player_camera(
+            &mut camera_store,
+            camera.user_id,
+            &transform,
+        );
         passenger_motion.camera_store_dirty = true;
     }
 
@@ -5968,8 +6539,12 @@ fn carry_voxel_players_with_spaceships(
         let Some(carried) = carried_transform_in_innermost_spaceship(&transform, &motions) else {
             continue;
         };
-        if transform.translation.abs_diff_eq(carried.translation, f32::EPSILON)
-            && transform.rotation.abs_diff_eq(carried.rotation, f32::EPSILON)
+        if transform
+            .translation
+            .abs_diff_eq(carried.translation, f32::EPSILON)
+            && transform
+                .rotation
+                .abs_diff_eq(carried.rotation, f32::EPSILON)
         {
             continue;
         }
@@ -6025,8 +6600,7 @@ fn voxel_spaceship_inside_hangar_docking_zone(local_translation: Vec3) -> bool {
     let local_cell = local_translation / VOXEL_SIZE;
     local_cell.x >= HANGAR_MIN_X as f32 + HANGAR_DOCK_CLEARANCE_CELLS
         && local_cell.x <= HANGAR_MAX_X as f32 - HANGAR_DOCK_CLEARANCE_CELLS
-        && (HANGAR_PARKING_Y as f32 - 0.5..=HANGAR_PARKING_Y as f32 + 3.0)
-            .contains(&local_cell.y)
+        && (HANGAR_PARKING_Y as f32 - 0.5..=HANGAR_PARKING_Y as f32 + 3.0).contains(&local_cell.y)
         && local_cell.z >= HANGAR_REAR_Z as f32 + HANGAR_DOCK_CLEARANCE_CELLS
         && local_cell.z <= HANGAR_MOUTH_Z as f32 - HANGAR_DOCK_CLEARANCE_CELLS
 }
@@ -6098,13 +6672,11 @@ fn dock_idle_voxel_spaceships(
         };
         linear.0 = carrier_point_velocity;
         angular.0 = carrier_angular;
-        commands
-            .entity(entity)
-            .insert((
-                RigidBody::Kinematic,
-                docking,
-                docked_voxel_spaceship_collision_layers(),
-            ));
+        commands.entity(entity).insert((
+            RigidBody::Kinematic,
+            docking,
+            docked_voxel_spaceship_collision_layers(),
+        ));
     }
 }
 
@@ -6167,6 +6739,9 @@ fn control_voxel_spaceships(
         possession.applied_user_id = None;
         return;
     }
+    if keyboard.just_pressed(KeyCode::F5) && !egui_input.wants_any_keyboard_input() {
+        control.third_person_view = !control.third_person_view;
+    }
 
     possession.applied_user_id = None;
     control.cockpit_eye = Some(
@@ -6192,24 +6767,20 @@ fn control_voxel_spaceships(
     let thrust_input =
         keyboard.pressed(KeyCode::KeyW) as i8 - keyboard.pressed(KeyCode::KeyS) as i8;
     let vertical_input = keyboard.pressed(KeyCode::Space) as i8
-        - (keyboard.pressed(KeyCode::ControlLeft)
-            || keyboard.pressed(KeyCode::ControlRight)) as i8;
-    let yaw_input =
-        keyboard.pressed(KeyCode::KeyA) as i8 - keyboard.pressed(KeyCode::KeyD) as i8;
-    let pitch_input = keyboard.pressed(KeyCode::ArrowDown) as i8
-        - keyboard.pressed(KeyCode::ArrowUp) as i8;
-    let roll_input =
-        keyboard.pressed(KeyCode::KeyQ) as i8 - keyboard.pressed(KeyCode::KeyE) as i8;
+        - (keyboard.pressed(KeyCode::ControlLeft) || keyboard.pressed(KeyCode::ControlRight)) as i8;
+    let yaw_input = keyboard.pressed(KeyCode::KeyA) as i8 - keyboard.pressed(KeyCode::KeyD) as i8;
+    let pitch_input =
+        keyboard.pressed(KeyCode::ArrowDown) as i8 - keyboard.pressed(KeyCode::ArrowUp) as i8;
+    let roll_input = keyboard.pressed(KeyCode::KeyQ) as i8 - keyboard.pressed(KeyCode::KeyE) as i8;
     let boost = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
     let braking = keyboard.pressed(KeyCode::KeyX);
     let delta_seconds = time.delta_secs().clamp(0.0, 0.05);
     let boost_scale = if boost { 1.75 } else { 1.0 };
     let forward = transform.rotation * Vec3::NEG_Z;
     let up = transform.rotation * Vec3::Y;
-    linear_velocity.0 += (
-        forward * thrust_input as f32 * ship.thrust_acceleration
-            + up * vertical_input as f32 * ship.vertical_acceleration
-    ) * boost_scale
+    linear_velocity.0 += (forward * thrust_input as f32 * ship.thrust_acceleration
+        + up * vertical_input as f32 * ship.vertical_acceleration)
+        * boost_scale
         * delta_seconds;
     if braking {
         let response = (-7.0 * delta_seconds).exp();
@@ -6537,13 +7108,7 @@ struct ProjectedWorkbookFeatureLabel {
 }
 
 fn workbook_feature_anchor_local(region: &WorkbookFeatureRegion) -> Vec3 {
-    (region.anchor.as_vec3()
-        + Vec3::new(
-            0.5,
-            WORKBOOK_FEATURE_LABEL_Y_CELLS,
-            0.5,
-        ))
-        * VOXEL_SIZE
+    (region.anchor.as_vec3() + Vec3::new(0.5, WORKBOOK_FEATURE_LABEL_Y_CELLS, 0.5)) * VOXEL_SIZE
 }
 
 fn raycast_workbook_feature_region(
@@ -6601,9 +7166,8 @@ fn workbook_feature_pointer_position(
     let pixels_per_point = pixels_per_point.max(f32::EPSILON);
     let viewport_min = editor.viewport_min / pixels_per_point;
     let viewport_max = editor.viewport_max / pixels_per_point;
-    let contains = |position: Vec2| {
-        position.cmpge(viewport_min).all() && position.cmple(viewport_max).all()
-    };
+    let contains =
+        |position: Vec2| position.cmpge(viewport_min).all() && position.cmple(viewport_max).all();
     if editor.first_person_enabled && !editor.first_person_cursor_released {
         Some((viewport_min + viewport_max) * 0.5)
     } else {
@@ -6618,8 +7182,9 @@ fn workbook_feature_label_color(kind: WorkbookFeatureKind) -> egui::Color32 {
         WorkbookFeatureKind::EnergyPlatform
         | WorkbookFeatureKind::Teleporter
         | WorkbookFeatureKind::RadarConsole => egui::Color32::from_rgb(96, 225, 255),
-        WorkbookFeatureKind::MedicalAnalyzer
-        | WorkbookFeatureKind::ExperimentBench => egui::Color32::from_rgb(145, 240, 190),
+        WorkbookFeatureKind::MedicalAnalyzer | WorkbookFeatureKind::ExperimentBench => {
+            egui::Color32::from_rgb(145, 240, 190)
+        },
         WorkbookFeatureKind::ThermiteFactory => egui::Color32::from_rgb(255, 156, 92),
         WorkbookFeatureKind::EscapePod
         | WorkbookFeatureKind::ArmorLocker
@@ -6643,7 +7208,10 @@ fn project_workbook_feature_label(
     pixels_per_point: f32,
 ) -> Option<ProjectedWorkbookFeatureLabel> {
     let world_anchor = local_to_world.transform_point3(workbook_feature_anchor_local(region));
-    if !workbook_feature_label_in_range(camera_transform.translation(), world_anchor) {
+    if !workbook_feature_label_in_range(
+        camera_transform.translation(),
+        world_anchor,
+    ) {
         return None;
     }
     let projected = camera
@@ -6663,10 +7231,7 @@ fn project_workbook_feature_label(
     })
 }
 
-fn paint_workbook_map_label(
-    painter: &egui::Painter,
-    label: ProjectedWorkbookFeatureLabel,
-) {
+fn paint_workbook_map_label(painter: &egui::Painter, label: ProjectedWorkbookFeatureLabel) {
     let color = workbook_feature_label_color(label.kind);
     let galley = painter.layout_no_wrap(
         label.kind.label().to_owned(),
@@ -6675,7 +7240,10 @@ fn paint_workbook_map_label(
     );
     let padding = egui::vec2(6.0, 3.0);
     let label_center = label.position - egui::vec2(0.0, galley.size().y * 0.5 + 8.0);
-    let rect = egui::Rect::from_center_size(label_center, galley.size() + padding * 2.0);
+    let rect = egui::Rect::from_center_size(
+        label_center,
+        galley.size() + padding * 2.0,
+    );
     painter.line_segment(
         [label.position, rect.center_bottom()],
         egui::Stroke::new(1.0, color.gamma_multiply(0.8)),
@@ -6710,21 +7278,25 @@ fn draw_workbook_feature_hover_hud(
         position.y = pointer.y - size.y - 18.0;
     }
     let accent = workbook_feature_label_color(hovered.kind);
-    egui::Area::new(egui::Id::new("voxel_workbook_feature_hover"))
-        .fixed_pos(position)
-        .order(egui::Order::Foreground)
-        .interactable(false)
-        .show(ctx, |ui| {
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(4, 11, 18, 238))
-                .stroke(egui::Stroke::new(1.5, accent))
-                .corner_radius(6)
-                .inner_margin(egui::Margin::symmetric(10, 7))
-                .show(ui, |ui| {
-                    ui.colored_label(accent, hovered.kind.label());
-                    ui.small(format!("位置：{}", hovered.map_name));
-                });
-        });
+    egui::Area::new(egui::Id::new(
+        "voxel_workbook_feature_hover",
+    ))
+    .fixed_pos(position)
+    .order(egui::Order::Foreground)
+    .interactable(false)
+    .show(ctx, |ui| {
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgba_unmultiplied(
+                4, 11, 18, 238,
+            ))
+            .stroke(egui::Stroke::new(1.5, accent))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(10, 7))
+            .show(ui, |ui| {
+                ui.colored_label(accent, hovered.kind.label());
+                ui.small(format!("位置：{}", hovered.map_name));
+            });
+    });
 }
 
 fn voxel_workbook_feature_overlay(
@@ -6739,7 +7311,10 @@ fn voxel_workbook_feature_overlay(
     >,
     editor: Res<VoxelEditorState>,
     static_annotations: Res<StaticWorkbookFeatureAnnotations>,
-    moving_annotations: Query<(&GlobalTransform, &VoxelWorkbookFeatureAnnotations)>,
+    moving_annotations: Query<(
+        &GlobalTransform,
+        &VoxelWorkbookFeatureAnnotations,
+    )>,
     egui_input: Res<EguiWantsInput>,
 ) {
     let (Ok(ctx), Ok(window), Ok((camera, camera_transform))) = (
@@ -6810,22 +7385,24 @@ fn voxel_workbook_feature_overlay(
     };
     for entry in &static_annotations.entries {
         let local_to_world = Affine3A::from_translation(entry.center.as_vec3() * VOXEL_SIZE);
-        if let Some(distance) = raycast_workbook_feature_region(
-            ray,
-            local_to_world,
-            &entry.region,
-        ) {
-            consider(entry.region.kind, entry.map_name, distance);
+        if let Some(distance) = raycast_workbook_feature_region(ray, local_to_world, &entry.region)
+        {
+            consider(
+                entry.region.kind,
+                entry.map_name,
+                distance,
+            );
         }
     }
     for (transform, annotations) in &moving_annotations {
         for region in &annotations.regions {
-            if let Some(distance) = raycast_workbook_feature_region(
-                ray,
-                transform.affine(),
-                region,
-            ) {
-                consider(region.kind, annotations.map_name, distance);
+            if let Some(distance) = raycast_workbook_feature_region(ray, transform.affine(), region)
+            {
+                consider(
+                    region.kind,
+                    annotations.map_name,
+                    distance,
+                );
             }
         }
     }
@@ -7119,9 +7696,7 @@ struct VoxelSpaceshipTelemetry {
     rotation: Quat,
 }
 
-fn voxel_spaceship_pilot_user_ids(
-    manager: Option<&Persistent<NapcatMessageManager>>,
-) -> Vec<u64> {
+fn voxel_spaceship_pilot_user_ids(manager: Option<&Persistent<NapcatMessageManager>>) -> Vec<u64> {
     let mut user_ids = manager
         .and_then(|manager| manager.current_group())
         .into_iter()
@@ -7236,7 +7811,7 @@ fn draw_voxel_spaceship_hud(
                     );
                     ui.centered_and_justified(|ui| {
                         ui.small(
-                            "W/S 推进 · A/D 偏航 · ↑/↓ 俯仰 · Q/E 翻滚 · 空格/Ctrl 升降 · Shift 加力 · X 制动 · F 离舰",
+                            "W/S 推进 · A/D 偏航 · ↑/↓ 俯仰 · Q/E 翻滚 · 空格/Ctrl 升降 · Shift 加力 · X 制动 · F5 视角 · F 离舰",
                         );
                     });
                 });
@@ -7260,8 +7835,8 @@ fn voxel_spaceship_panel(
     let Ok(ctx) = contexts.ctx_mut() else { return };
     let mut telemetry = spaceships
         .iter()
-        .map(|(ship, transform, linear_velocity, angular_velocity)| {
-            VoxelSpaceshipTelemetry {
+        .map(
+            |(ship, transform, linear_velocity, angular_velocity)| VoxelSpaceshipTelemetry {
                 id: ship.id.clone(),
                 name: ship.name.clone(),
                 class: ship.class,
@@ -7271,8 +7846,8 @@ fn voxel_spaceship_panel(
                 angular_speed: angular_velocity.length(),
                 translation: transform.translation,
                 rotation: transform.rotation,
-            }
-        })
+            },
+        )
         .collect::<Vec<_>>();
     telemetry.sort_by(|left, right| left.id.cmp(&right.id));
     if telemetry.is_empty() {
@@ -7290,7 +7865,9 @@ fn voxel_spaceship_panel(
     let mut assignment_changed = false;
 
     egui::Window::new("舰船调度台")
-        .id(egui::Id::new("voxel_spaceship_control_window"))
+        .id(egui::Id::new(
+            "voxel_spaceship_control_window",
+        ))
         .default_pos(egui::pos2(324.0, 270.0))
         .default_width(310.0)
         .resizable(false)
@@ -7328,7 +7905,10 @@ fn voxel_spaceship_panel(
                     egui::Color32::from_rgb(95, 205, 245),
                     "● 零重力",
                 );
-                ui.small(format!("{} 方块舰体", selected.class.label()));
+                ui.small(format!(
+                    "{} 方块舰体",
+                    selected.class.label()
+                ));
             });
             ui.small(format!(
                 "位置 X {:.1}  Y {:.1}  Z {:.1} · 速度 {:.1}",
@@ -7352,11 +7932,7 @@ fn voxel_spaceship_panel(
             egui::ComboBox::from_label("驾驶权限")
                 .selected_text(pilot_text)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut pilot_user_id,
-                        None,
-                        "GM / 未分配",
-                    );
+                    ui.selectable_value(&mut pilot_user_id, None, "GM / 未分配");
                     for user_id in &pilot_user_ids {
                         ui.selectable_value(
                             &mut pilot_user_id,
@@ -7366,27 +7942,19 @@ fn voxel_spaceship_panel(
                     }
                 });
             if pilot_user_id != previous_pilot {
-                if let Some(record) = store
-                    .ships
-                    .iter_mut()
-                    .find(|ship| ship.id == selected.id)
-                {
+                if let Some(record) = store.ships.iter_mut().find(|ship| ship.id == selected.id) {
                     record.pilot_user_id = pilot_user_id;
                     assignment_changed = true;
                 }
                 if control.driving_ship_id.as_deref() == Some(selected.id.as_str())
-                    && !voxel_spaceship_driver_authorized(
-                        pilot_user_id,
-                        possession.active_user_id,
-                    )
+                    && !voxel_spaceship_driver_authorized(pilot_user_id, possession.active_user_id)
                 {
                     control.stop_driving();
                 }
             }
             ui.small("只有 GM 可在此分配；玩家身份按 QQ 数字 ID 校验。");
 
-            let driving_selected =
-                control.driving_ship_id.as_deref() == Some(selected.id.as_str());
+            let driving_selected = control.driving_ship_id.as_deref() == Some(selected.id.as_str());
             ui.horizontal(|ui| {
                 if driving_selected {
                     if ui.button("停止驾驶").clicked() {
@@ -7399,10 +7967,7 @@ fn voxel_spaceship_panel(
                         "GM 开始驾驶"
                     };
                     if ui
-                        .add(
-                            egui::Button::new(label)
-                                .fill(egui::Color32::from_rgb(18, 104, 132)),
-                        )
+                        .add(egui::Button::new(label).fill(egui::Color32::from_rgb(18, 104, 132)))
                         .clicked()
                     {
                         begin_voxel_spaceship_takeover(
@@ -9321,13 +9886,16 @@ fn voxel_physics_body_is_loaded(
 fn stream_voxel_physics_bodies(
     mut commands: Commands,
     mut loader: ResMut<VoxelPhysicsChunkLoader>,
-    bodies: Query<(
-        Entity,
-        &VoxelPhysicsBody,
-        &Transform,
-        &LinearVelocity,
-        &AngularVelocity,
-    ), Without<VoxelSpaceship>>,
+    bodies: Query<
+        (
+            Entity,
+            &VoxelPhysicsBody,
+            &Transform,
+            &LinearVelocity,
+            &AngularVelocity,
+        ),
+        Without<VoxelSpaceship>,
+    >,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
@@ -9765,11 +10333,9 @@ fn sync_voxel_occlusion_fade(
     >,
 ) {
     let opacity = fade.opacity.clamp(0.0, 1.0);
-    for handle in fade_materials
-        .handles
-        .iter()
-        .chain(std::iter::once(&fade_materials.planet_ocean))
-    {
+    for handle in fade_materials.handles.iter().chain(std::iter::once(
+        &fade_materials.planet_ocean,
+    )) {
         if let Some(mut material) = materials.get_mut(handle) {
             material.base_color = material.base_color.with_alpha(opacity);
         }
@@ -9781,9 +10347,11 @@ fn sync_voxel_occlusion_fade(
         let original_mesh = occlusion_mesh
             .map(|state| &state.original_mesh)
             .unwrap_or(&current_mesh.0);
-        let Some(fade_handle) =
-            replay_fade_handle(material, &voxel_materials, &fade_materials)
-        else {
+        let Some(fade_handle) = replay_fade_handle(
+            material,
+            &voxel_materials,
+            &fade_materials,
+        ) else {
             continue;
         };
 
@@ -9798,7 +10366,12 @@ fn sync_voxel_occlusion_fade(
                 ))
         {
             if let Some(state) = occlusion_mesh {
-                restore_voxel_occlusion_mesh(&mut commands, &mut meshes, entity, state);
+                restore_voxel_occlusion_mesh(
+                    &mut commands,
+                    &mut meshes,
+                    entity,
+                    state,
+                );
             }
             continue;
         }
@@ -9810,7 +10383,12 @@ fn sync_voxel_occlusion_fade(
             partition_voxel_mesh_for_replay_cast(&source_mesh, transform, &fade)
         else {
             if let Some(state) = occlusion_mesh {
-                restore_voxel_occlusion_mesh(&mut commands, &mut meshes, entity, state);
+                restore_voxel_occlusion_mesh(
+                    &mut commands,
+                    &mut meshes,
+                    entity,
+                    state,
+                );
             }
             continue;
         };
@@ -9834,15 +10412,18 @@ fn sync_voxel_occlusion_fade(
                     VoxelOcclusionTransparentMesh,
                 ))
                 .id();
-            commands.entity(entity).add_child(transparent_entity).insert((
-                Mesh3d(opaque_mesh.clone()),
-                VoxelOcclusionMesh {
-                    original_mesh,
-                    opaque_mesh,
-                    transparent_mesh,
-                    transparent_entity,
-                },
-            ));
+            commands
+                .entity(entity)
+                .add_child(transparent_entity)
+                .insert((
+                    Mesh3d(opaque_mesh.clone()),
+                    VoxelOcclusionMesh {
+                        original_mesh,
+                        opaque_mesh,
+                        transparent_mesh,
+                        transparent_entity,
+                    },
+                ));
         }
     }
 }
@@ -9867,8 +10448,7 @@ fn partition_voxel_mesh_for_replay_cast(
     transform: &GlobalTransform,
     fade: &VoxelReplayOcclusionFade,
 ) -> Option<(Mesh, Mesh)> {
-    let VertexAttributeValues::Float32x3(positions) =
-        mesh.attribute(Mesh::ATTRIBUTE_POSITION)?
+    let VertexAttributeValues::Float32x3(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION)?
     else {
         return None;
     };
@@ -9876,7 +10456,10 @@ fn partition_voxel_mesh_for_replay_cast(
         return None;
     };
     let indices = match mesh.indices()? {
-        Indices::U16(indices) => indices.iter().map(|index| *index as u32).collect::<Vec<_>>(),
+        Indices::U16(indices) => indices
+            .iter()
+            .map(|index| *index as u32)
+            .collect::<Vec<_>>(),
         Indices::U32(indices) => indices.clone(),
     };
     let mut opaque_indices = Vec::with_capacity(indices.len());
@@ -9885,11 +10468,10 @@ fn partition_voxel_mesh_for_replay_cast(
         let first = triangle[0] as usize;
         let second = triangle[1] as usize;
         let third = triangle[2] as usize;
-        let surface_center = (
-            Vec3::from(positions[first])
-                + Vec3::from(positions[second])
-                + Vec3::from(positions[third])
-        ) / 3.0;
+        let surface_center = (Vec3::from(positions[first])
+            + Vec3::from(positions[second])
+            + Vec3::from(positions[third]))
+            / 3.0;
         let surface_normal = Vec3::from(normals[first]);
         let inside_position = surface_center - surface_normal * VOXEL_SIZE * 0.01;
         let cell_center =
@@ -9994,17 +10576,20 @@ fn voxel_occlusion_cast_size_at(fade: &VoxelReplayOcclusionFade, progress: f32) 
 
 fn voxel_occlusion_cast_broadphase_half_extent(fade: &VoxelReplayOcclusionFade) -> f32 {
     voxel_occlusion_cast_width(fade.cast_width_cells)
-        .max(voxel_occlusion_cast_height(fade.cast_height_cells))
-        .max(voxel_occlusion_cast_width(fade.cast_end_width_cells))
-        .max(voxel_occlusion_cast_height(fade.cast_end_height_cells))
+        .max(voxel_occlusion_cast_height(
+            fade.cast_height_cells,
+        ))
+        .max(voxel_occlusion_cast_width(
+            fade.cast_end_width_cells,
+        ))
+        .max(voxel_occlusion_cast_height(
+            fade.cast_end_height_cells,
+        ))
         * 0.5
         + VOXEL_SIZE
 }
 
-fn draw_voxel_occlusion_cast_gizmos(
-    mut gizmos: Gizmos,
-    fade: Res<VoxelReplayOcclusionFade>,
-) {
+fn draw_voxel_occlusion_cast_gizmos(mut gizmos: Gizmos, fade: Res<VoxelReplayOcclusionFade>) {
     if !fade.active || !fade.debug_gizmo {
         return;
     }
@@ -10019,11 +10604,27 @@ fn draw_voxel_occlusion_cast_gizmos(
         let color = Color::srgb(0.1, 0.95, 1.0);
         for index in 0..4 {
             let next = (index + 1) % 4;
-            gizmos.line(start_corners[index], start_corners[next], color);
-            gizmos.line(end_corners[index], end_corners[next], color);
-            gizmos.line(start_corners[index], end_corners[index], color);
+            gizmos.line(
+                start_corners[index],
+                start_corners[next],
+                color,
+            );
+            gizmos.line(
+                end_corners[index],
+                end_corners[next],
+                color,
+            );
+            gizmos.line(
+                start_corners[index],
+                end_corners[index],
+                color,
+            );
         }
-        gizmos.line(fade.camera, *target, Color::srgb(1.0, 0.2, 0.8));
+        gizmos.line(
+            fade.camera,
+            *target,
+            Color::srgb(1.0, 0.2, 0.8),
+        );
         gizmos.sphere(
             Isometry3d::from_translation(*target),
             VOXEL_SIZE * 0.35,
@@ -10644,13 +11245,16 @@ fn process_voxel_scene_history(
     mut physics_loader: ResMut<VoxelPhysicsChunkLoader>,
     mut persistence: ResMut<VoxelScenePersistenceState>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
-    physics_bodies: Query<(
-        Entity,
-        &VoxelPhysicsBody,
-        &Transform,
-        &LinearVelocity,
-        &AngularVelocity,
-    ), Without<VoxelSpaceship>>,
+    physics_bodies: Query<
+        (
+            Entity,
+            &VoxelPhysicsBody,
+            &Transform,
+            &LinearVelocity,
+            &AngularVelocity,
+        ),
+        Without<VoxelSpaceship>,
+    >,
     placed_lights: Query<(Entity, &VoxelPlacedLight)>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
@@ -11867,9 +12471,8 @@ fn apply_voxel_teleport(
         },
         VoxelTeleportDestination::Spaceship(slot) => {
             let Some(ship_id) = TELEPORT_SPACESHIP_IDS.get(slot as usize) else { return };
-            let Some((ship, ship_transform)) = spaceships
-                .iter()
-                .find(|(ship, _)| ship.id == *ship_id)
+            let Some((ship, ship_transform)) =
+                spaceships.iter().find(|(ship, _)| ship.id == *ship_id)
             else {
                 return;
             };
@@ -12120,9 +12723,8 @@ fn control_first_person_player(
         return;
     };
 
-    if let Some((cockpit_eye, cockpit_rotation)) = spaceship_control
-        .as_deref()
-        .and_then(|control| {
+    if let Some((cockpit_eye, cockpit_rotation)) =
+        spaceship_control.as_deref().and_then(|control| {
             control
                 .cockpit_eye
                 .map(|eye| (eye, control.cockpit_rotation))
@@ -12138,8 +12740,7 @@ fn control_first_person_player(
         editor.creative_inventory_open = false;
         editor.teleport_menu_open = false;
         possession.player_inventory_open = false;
-        transform.translation =
-            cockpit_eye - cockpit_rotation * Vec3::Y * FIRST_PERSON_EYE_OFFSET;
+        transform.translation = cockpit_eye - cockpit_rotation * Vec3::Y * FIRST_PERSON_EYE_OFFSET;
         velocity.0 = Vec3::ZERO;
         acceleration.0 = Vec3::ZERO;
         if !is_sensor {
@@ -12309,11 +12910,8 @@ fn control_first_person_player(
         }
     }
 
-    acceleration.0 = if editor.first_person_flying {
-        Vec3::ZERO
-    } else {
-        Vec3::new(0.0, -9.81, 0.0)
-    };
+    acceleration.0 =
+        if editor.first_person_flying { Vec3::ZERO } else { Vec3::new(0.0, -9.81, 0.0) };
     if !editor.first_person_enabled {
         editor.first_person_flying = false;
         editor.first_person_space_tap_elapsed = f32::INFINITY;
@@ -12497,10 +13095,7 @@ pub(crate) fn clear_player_possession_movement(
     previous_len - store.records.len()
 }
 
-pub(crate) fn clear_player_camera(
-    store: &mut VoxelPlayerCameraStore,
-    user_id: u64,
-) -> bool {
+pub(crate) fn clear_player_camera(store: &mut VoxelPlayerCameraStore, user_id: u64) -> bool {
     let previous_len = store.cameras.len();
     store.cameras.retain(|camera| camera.user_id != user_id);
     previous_len != store.cameras.len()
@@ -12673,6 +13268,7 @@ fn orbit_focus_preserving_camera_position(
 }
 
 fn control_voxel_camera(
+    time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut motion: MessageReader<MouseMotion>,
@@ -12691,6 +13287,20 @@ fn control_voxel_camera(
         (
             With<VoxelFirstPersonPlayer>,
             Without<VoxelViewportCamera>,
+        ),
+    >,
+    // The chase camera reads only ship entities; reciprocal exclusions keep all Transform
+    // accesses disjoint from the mutable viewport-camera and player queries above.
+    spaceships: Query<
+        (
+            &VoxelSpaceship,
+            &VoxelPhysicsBody,
+            &Transform,
+        ),
+        (
+            With<VoxelSpaceship>,
+            Without<VoxelViewportCamera>,
+            Without<VoxelFirstPersonPlayer>,
         ),
     >,
     mut editor: ResMut<VoxelEditorState>,
@@ -12783,7 +13393,10 @@ fn control_voxel_camera(
         sum + event.delta
     });
     if editor.first_person_enabled {
-        if !inventory_open && !editor.first_person_cursor_released {
+        let third_person_active = spaceship_control
+            .as_deref()
+            .is_some_and(|control| control.driving_ship_id.is_some() && control.third_person_view);
+        if !third_person_active && !inventory_open && !editor.first_person_cursor_released {
             editor.camera_yaw -= delta.x * 0.0025;
             editor.camera_pitch = (editor.camera_pitch - delta.y * 0.0025).clamp(-1.5, 1.5);
         }
@@ -12816,23 +13429,39 @@ fn control_voxel_camera(
             0.0,
         );
         if let Ok((mut camera_transform, mut projection)) = cameras.single_mut() {
-            if let Some((cockpit_eye, cockpit_rotation)) = spaceship_control
-                .as_deref()
-                .and_then(|control| {
-                    control
-                        .cockpit_eye
-                        .map(|eye| (eye, control.cockpit_rotation))
-                })
-            {
-                camera_transform.translation = cockpit_eye;
-                camera_transform.rotation = cockpit_rotation * rotation;
+            let spaceship_view = spaceship_control.as_deref().and_then(|control| {
+                let driving_ship_id = control.driving_ship_id.as_deref()?;
+                let (_, body, ship_transform) = spaceships
+                    .iter()
+                    .find(|(ship, ..)| ship.id == driving_ship_id)?;
+                Some((control, body, ship_transform))
+            });
+            if let Some((control, body, ship_transform)) = spaceship_view {
+                if control.third_person_view {
+                    if let Some(target) =
+                        voxel_spaceship_chase_camera_transform(ship_transform, body)
+                    {
+                        *camera_transform = smoothed_spaceship_chase_camera(
+                            &camera_transform,
+                            &target,
+                            time.delta_secs(),
+                        );
+                    }
+                } else if let Some(cockpit_eye) = control.cockpit_eye {
+                    camera_transform.translation = cockpit_eye;
+                    camera_transform.rotation = control.cockpit_rotation * rotation;
+                }
             } else {
                 camera_transform.translation =
                     player_transform.translation + Vec3::Y * FIRST_PERSON_EYE_OFFSET;
                 camera_transform.rotation = rotation;
             }
             if let Projection::Perspective(perspective) = &mut *projection {
-                perspective.fov = FIRST_PERSON_FOV_RADIANS;
+                perspective.fov = if third_person_active {
+                    SPACESHIP_CHASE_FOV_RADIANS
+                } else {
+                    FIRST_PERSON_FOV_RADIANS
+                };
             }
         }
         return;
@@ -12908,8 +13537,7 @@ fn selected_voxel_skill_targeting(
                 .get(index)
                 .cloned()
                 .unwrap_or_default();
-            voxel_skill_targeting(note, &metadata)
-                .map(|targeting| (name.to_owned(), targeting))
+            voxel_skill_targeting(note, &metadata).map(|targeting| (name.to_owned(), targeting))
         },
         CharacterHotbarSlot::Item(index) => {
             let item = character.inventory.items.get(index)?;
@@ -13771,9 +14399,7 @@ mod tests {
         assert_eq!(
             VoxelTeleportDestination::ResearchStation.player_position(),
             Some(
-                (RESEARCH_STATION_CENTER
-                    + IVec3::new(NIFFY.spawn[0], 0, NIFFY.spawn[1]))
-                .as_vec3()
+                (RESEARCH_STATION_CENTER + IVec3::new(NIFFY.spawn[0], 0, NIFFY.spawn[1])).as_vec3()
                     * VOXEL_SIZE
                     + Vec3::Y * 0.5
             )
@@ -13782,7 +14408,11 @@ mod tests {
             VoxelTeleportDestination::AbandonedStation.player_position(),
             Some(
                 (ABANDONED_STATION_CENTER
-                    + IVec3::new(ABANDONED.spawn[0], 0, ABANDONED.spawn[1]))
+                    + IVec3::new(
+                        ABANDONED.spawn[0],
+                        0,
+                        ABANDONED.spawn[1]
+                    ))
                 .as_vec3()
                     * VOXEL_SIZE
                     + Vec3::Y * 0.5
@@ -14207,11 +14837,22 @@ mod tests {
     fn voxel_glass_is_solid_two_sided_and_five_percent_opaque() {
         let material = voxel_glass_material();
 
-        assert_eq!(material.base_color.alpha(), VOXEL_GLASS_OPACITY);
-        assert!(matches!(material.alpha_mode, AlphaMode::Blend));
+        assert_eq!(
+            material.base_color.alpha(),
+            VOXEL_GLASS_OPACITY
+        );
+        assert!(matches!(
+            material.alpha_mode,
+            AlphaMode::Blend
+        ));
         assert_eq!(material.cull_mode, None);
-        assert!(TrpgVoxelConnector::solid(&VOXEL_GLASS_MATERIAL));
-        assert_eq!(radiance_voxel_color(VOXEL_GLASS_MATERIAL), [0; 4]);
+        assert!(TrpgVoxelConnector::solid(
+            &VOXEL_GLASS_MATERIAL
+        ));
+        assert_eq!(
+            radiance_voxel_color(VOXEL_GLASS_MATERIAL),
+            [0; 4]
+        );
     }
 
     #[test]
@@ -14237,10 +14878,17 @@ mod tests {
                 design.name
             );
             for (x, z) in glass_columns {
-                assert_eq!(grid.get(IVec3::new(x, 1, z)).copied(), Some(6));
                 assert_eq!(
-                    grid.get(IVec3::new(x, WORKBOOK_ROOM_HEIGHT - 1, z))
-                        .copied(),
+                    grid.get(IVec3::new(x, 1, z)).copied(),
+                    Some(6)
+                );
+                assert_eq!(
+                    grid.get(IVec3::new(
+                        x,
+                        WORKBOOK_ROOM_HEIGHT - 1,
+                        z
+                    ))
+                    .copied(),
                     Some(6)
                 );
             }
@@ -14539,7 +15187,10 @@ mod tests {
             let mut entity = world.entity_mut(grid_entity);
             let mut grid = entity.get_mut::<Grid<u8>>().unwrap();
             for (cell, material) in &original {
-                grid.set(COMBAT_SPACESHIP_CENTER + *cell, *material);
+                grid.set(
+                    COMBAT_SPACESHIP_CENTER + *cell,
+                    *material,
+                );
             }
             assert!(original.iter().all(|(cell, material)| {
                 grid.get(COMBAT_SPACESHIP_CENTER + *cell).copied() == Some(*material)
@@ -14561,10 +15212,12 @@ mod tests {
         assert_eq!(carriers.len(), 1);
         assert_eq!(carriers[0].ship.name, "U.S.I 狂妄号");
         assert!(carriers[0].docking.is_none());
-        assert_eq!(carriers[0].cells, combat_spaceship_voxel_cells());
+        assert_eq!(
+            carriers[0].cells,
+            combat_spaceship_voxel_cells()
+        );
         assert!(carriers[0].cells.len() > original.len());
     }
-
 
     #[test]
     fn space_station_docks_are_separated_open_and_fit_medium_ships() {
@@ -14650,17 +15303,23 @@ mod tests {
         }
     }
 
-
     #[test]
     fn workbook_micro_tiles_are_sixteenth_scale_and_owned_by_canonical_cells() {
         assert_eq!(MICRO_TILE_SUBDIVISIONS, 16);
-        assert_eq!(VOXEL_SIZE / MICRO_TILE_SUBDIVISIONS as f32, 0.015625);
+        assert_eq!(
+            VOXEL_SIZE / MICRO_TILE_SUBDIVISIONS as f32,
+            0.015625
+        );
 
         for design in [ARROGANCE, NIFFY, KYO, ARBITRATOR, ABANDONED] {
             let decoded = design.decode();
             let tiles = workbook_micro_tiles(design, &decoded);
-            assert!(tiles.iter().any(|tile| tile.kind == VoxelMicroTileKind::Hull));
-            assert!(tiles.iter().any(|tile| tile.kind == VoxelMicroTileKind::Fixture));
+            assert!(tiles
+                .iter()
+                .any(|tile| tile.kind == VoxelMicroTileKind::Hull));
+            assert!(tiles
+                .iter()
+                .any(|tile| tile.kind == VoxelMicroTileKind::Fixture));
 
             let mut world = World::new();
             let entity = world.spawn(Grid::<u8>::new()).id();
@@ -14671,7 +15330,11 @@ mod tests {
             }
             let grid = world.entity(entity).get::<Grid<u8>>().unwrap();
             for tile in tiles {
-                assert!(tile.min.cmplt(tile.max).all(), "{} bounds", design.name);
+                assert!(
+                    tile.min.cmplt(tile.max).all(),
+                    "{} bounds",
+                    design.name
+                );
                 assert!(
                     tile.max.cmple(UVec3::splat(MICRO_TILE_SUBDIVISIONS)).all(),
                     "{} subdivision bounds",
@@ -14740,7 +15403,11 @@ mod tests {
     fn medical_analyzer_and_every_other_workbook_label_have_distinct_semantics() {
         let decoded = NIFFY.decode();
         assert_eq!(
-            decoded.features.iter().filter(|feature| **feature == 10).count(),
+            decoded
+                .features
+                .iter()
+                .filter(|feature| **feature == 10)
+                .count(),
             36
         );
         let labels = (1..=15)
@@ -14768,7 +15435,12 @@ mod tests {
                 .iter()
                 .flat_map(|region| region.cells.iter().copied())
                 .collect::<Vec<_>>();
-            assert_eq!(region_cells.len(), expected_count, "{}", design.name);
+            assert_eq!(
+                region_cells.len(),
+                expected_count,
+                "{}",
+                design.name
+            );
             assert_eq!(
                 region_cells.iter().copied().collect::<HashSet<_>>().len(),
                 expected_count,
@@ -14807,7 +15479,10 @@ mod tests {
         );
         assert!((identity_hit - moving_hit.unwrap()).abs() < 0.0001);
         assert!(raycast_workbook_feature_region(
-            Ray3d::new(local_origin + Vec3::X * 100.0, Dir3::NEG_Y),
+            Ray3d::new(
+                local_origin + Vec3::X * 100.0,
+                Dir3::NEG_Y
+            ),
             Affine3A::IDENTITY,
             &region,
         )
@@ -14817,7 +15492,10 @@ mod tests {
     #[test]
     fn workbook_world_labels_use_an_inclusive_twenty_meter_radius() {
         let camera = Vec3::new(4.0, -2.0, 7.0);
-        assert_eq!(WORKBOOK_FEATURE_LABEL_VISIBILITY_RADIUS_METERS, 20.0);
+        assert_eq!(
+            WORKBOOK_FEATURE_LABEL_VISIBILITY_RADIUS_METERS,
+            20.0
+        );
         assert!(workbook_feature_label_in_range(
             camera,
             camera + Vec3::X * 20.0,
@@ -14830,7 +15508,10 @@ mod tests {
             camera,
             camera + Vec3::X * 20.001,
         ));
-        assert!(!workbook_feature_label_in_range(camera, Vec3::NAN));
+        assert!(!workbook_feature_label_in_range(
+            camera,
+            Vec3::NAN
+        ));
     }
 
     #[test]
@@ -14843,10 +15524,8 @@ mod tests {
             material: 1,
             kind: VoxelMicroTileKind::Fixture,
         }]);
-        let VertexAttributeValues::Float32x3(positions) = meshes[0]
-            .1
-            .attribute(Mesh::ATTRIBUTE_POSITION)
-            .unwrap()
+        let VertexAttributeValues::Float32x3(positions) =
+            meshes[0].1.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
         else {
             panic!("micro tile positions must be Float32x3");
         };
@@ -14854,17 +15533,35 @@ mod tests {
             .iter()
             .flat_map(|position| position.iter().copied())
             .fold(0.0_f32, f32::max);
-        assert_eq!(extent, VOXEL_SIZE / MICRO_TILE_SUBDIVISIONS as f32);
+        assert_eq!(
+            extent,
+            VOXEL_SIZE / MICRO_TILE_SUBDIVISIONS as f32
+        );
     }
 
     #[test]
     fn orbital_layout_is_five_times_wider_and_clear_of_the_planet() {
         assert_eq!(ORBITAL_LAYOUT_SCALE, 5);
-        assert_eq!(RESEARCH_STATION_CENTER, IVec3::new(500, 0, 500));
-        assert_eq!(SENSOR_STATION_CENTER, IVec3::new(500, 0, -500));
-        assert_eq!(CANNON_STATION_CENTER, IVec3::new(-500, 0, -500));
-        assert_eq!(COMBAT_SPACESHIP_CENTER, IVec3::new(-500, 0, 500));
-        assert_eq!(ABANDONED_STATION_CENTER, IVec3::new(0, 0, 1_000));
+        assert_eq!(
+            RESEARCH_STATION_CENTER,
+            IVec3::new(500, 0, 500)
+        );
+        assert_eq!(
+            SENSOR_STATION_CENTER,
+            IVec3::new(500, 0, -500)
+        );
+        assert_eq!(
+            CANNON_STATION_CENTER,
+            IVec3::new(-500, 0, -500)
+        );
+        assert_eq!(
+            COMBAT_SPACESHIP_CENTER,
+            IVec3::new(-500, 0, 500)
+        );
+        assert_eq!(
+            ABANDONED_STATION_CENTER,
+            IVec3::new(0, 0, 1_000)
+        );
 
         let planet_top = ORBITAL_PLANET_CENTER.y + ORBITAL_PLANET_RADIUS;
         assert!(planet_top <= -100.0);
@@ -14921,9 +15618,7 @@ mod tests {
             .unwrap();
         let lab_acceleration =
             voxel_planet_gravity_acceleration(science_lab, ORBITAL_PLANET_CENTER);
-        assert!(
-            (lab_acceleration.length() - ORBITAL_PLANET_GRAVITY_ACCELERATION).abs() < 0.0001
-        );
+        assert!((lab_acceleration.length() - ORBITAL_PLANET_GRAVITY_ACCELERATION).abs() < 0.0001);
         assert!(lab_acceleration.dot(ORBITAL_PLANET_CENTER - science_lab) > 0.0);
 
         for orbital_center in [
@@ -14946,9 +15641,7 @@ mod tests {
 
     #[test]
     fn xy_planet_base_is_canonical_editable_workbook_geometry() {
-        let lab_cells = xy_planet_map_cells()
-            .into_iter()
-            .collect::<HashMap<_, _>>();
+        let lab_cells = xy_planet_map_cells().into_iter().collect::<HashMap<_, _>>();
         let planet_cells = voxel_orbital_planet_cells()
             .into_iter()
             .collect::<HashMap<_, _>>();
@@ -14968,8 +15661,16 @@ mod tests {
             .unwrap();
         let [wall_x, wall_z] = XY_PLANET.centered_offset(wall_index);
         let [door_x, door_z] = XY_PLANET.centered_offset(door_index);
-        let wall = IVec3::new(center_x + wall_x, floor_y + 1, center_z + wall_z);
-        let door = IVec3::new(center_x + door_x, floor_y + 1, center_z + door_z);
+        let wall = IVec3::new(
+            center_x + wall_x,
+            floor_y + 1,
+            center_z + wall_z,
+        );
+        let door = IVec3::new(
+            center_x + door_x,
+            floor_y + 1,
+            center_z + door_z,
+        );
         let spawn = IVec3::new(
             center_x + XY_PLANET.spawn[0],
             floor_y,
@@ -14980,7 +15681,10 @@ mod tests {
         assert!(lab_cells
             .iter()
             .all(|(cell, material)| planet_cells.get(cell) == Some(material)));
-        assert!(matches!(lab_cells.get(&spawn), Some(2 | 7)));
+        assert!(matches!(
+            lab_cells.get(&spawn),
+            Some(2 | 7)
+        ));
         assert_eq!(lab_cells.get(&wall), Some(&6));
         assert!(!lab_cells.contains_key(&door));
 
@@ -15126,7 +15830,10 @@ mod tests {
     #[test]
     fn arrogance_cruiser_preserves_workbook_walls_doors_and_semantics() {
         let decoded = ARROGANCE.decode();
-        assert_eq!((ARROGANCE.width, ARROGANCE.height), (216, 84));
+        assert_eq!(
+            (ARROGANCE.width, ARROGANCE.height),
+            (216, 84)
+        );
         assert_eq!(
             decoded.styles.iter().filter(|style| **style == 11).count(),
             1_033
@@ -15136,12 +15843,14 @@ mod tests {
             42
         );
         assert_eq!(
-            decoded.features.iter().filter(|feature| **feature != 0).count(),
+            decoded
+                .features
+                .iter()
+                .filter(|feature| **feature != 0)
+                .count(),
             464
         );
-        assert!((1..=15).all(|feature| {
-            WorkbookFeatureKind::from_id(feature).is_some()
-        }));
+        assert!((1..=15).all(|feature| { WorkbookFeatureKind::from_id(feature).is_some() }));
     }
 
     #[test]
@@ -15226,8 +15935,7 @@ mod tests {
         })
         .add_systems(Update, sync_voxel_occlusion_fade);
         let source_mesh = {
-            let (mut material_meshes, _) =
-                build_voxel_meshes_from_cells(&[(IVec3::ZERO, 1)]);
+            let (mut material_meshes, _) = build_voxel_meshes_from_cells(&[(IVec3::ZERO, 1)]);
             app.world_mut()
                 .resource_mut::<Assets<Mesh>>()
                 .add(material_meshes.remove(0).1)
@@ -15279,7 +15987,10 @@ mod tests {
             .entity(off_axis_voxel)
             .contains::<VoxelOcclusionMesh>());
         let assets = app.world().resource::<Assets<StandardMaterial>>();
-        assert_eq!(assets.get(&fade_handles[0]).unwrap().base_color.alpha(), 0.35);
+        assert_eq!(
+            assets.get(&fade_handles[0]).unwrap().base_color.alpha(),
+            0.35
+        );
         assert!(matches!(
             assets.get(&fade_handles[0]).unwrap().alpha_mode,
             AlphaMode::Blend
@@ -15290,7 +16001,10 @@ mod tests {
             .opacity = 1.0;
         app.update();
         assert!(!app.world().entity(voxel).contains::<VoxelOcclusionMesh>());
-        assert_eq!(app.world().entity(voxel).get::<Mesh3d>().unwrap().0, source_mesh);
+        assert_eq!(
+            app.world().entity(voxel).get::<Mesh3d>().unwrap().0,
+            source_mesh
+        );
         assert!(app.world().get_entity(transparent_entity).is_err());
     }
 
@@ -15398,11 +16112,9 @@ mod tests {
             .map(|(_, material)| material)
             .collect::<HashSet<_>>();
         assert!(voxel_cells(grid).len() >= 20_000);
-        assert!(
-            materials
-                .iter()
-                .all(|material| (1..=VOXEL_MATERIAL_COUNT as u8).contains(material))
-        );
+        assert!(materials
+            .iter()
+            .all(|material| (1..=VOXEL_MATERIAL_COUNT as u8).contains(material)));
         assert!(
             HashSet::from([2, 4, 5, 6, 7, 9, 10]).is_subset(&materials),
             "static stations must retain their terrain, fluid, hull, armor, and door palette"
@@ -15411,8 +16123,7 @@ mod tests {
         let doors = voxel_auto_doors();
         assert_eq!(doors.len(), 30);
         assert!(doors.iter().all(|door| {
-            door.cells.len() >= 5
-                && door.cells.len() % (WORKBOOK_ROOM_HEIGHT as usize - 2) == 0
+            door.cells.len() >= 5 && door.cells.len() % (WORKBOOK_ROOM_HEIGHT as usize - 2) == 0
         }));
         assert!(doors
             .iter()
@@ -15739,7 +16450,11 @@ mod tests {
         let [spawn_x, spawn_z] = NIFFY.spawn;
         let ray = Ray3d::new(
             (RESEARCH_STATION_CENTER.as_vec3()
-                + Vec3::new(spawn_x as f32 + 0.5, 120.0, spawn_z as f32 + 0.5))
+                + Vec3::new(
+                    spawn_x as f32 + 0.5,
+                    120.0,
+                    spawn_z as f32 + 0.5,
+                ))
                 * VOXEL_SIZE,
             Dir3::NEG_Y,
         );
@@ -15762,11 +16477,9 @@ mod tests {
             .map(|(material, _)| *material)
             .collect::<HashSet<_>>();
         assert_eq!(mesh_materials, populated_materials);
-        assert!(
-            mesh_materials
-                .iter()
-                .all(|material| (1..=VOXEL_MATERIAL_COUNT as u8).contains(material))
-        );
+        assert!(mesh_materials
+            .iter()
+            .all(|material| (1..=VOXEL_MATERIAL_COUNT as u8).contains(material)));
         assert!(!colliders.is_empty());
         for (_, mesh) in meshes {
             assert!(mesh.attribute(Mesh::ATTRIBUTE_POSITION).is_some());
@@ -16798,7 +17511,10 @@ mod tests {
         let record = possession_movement_record(&store, "campaign-a", 42, 7).unwrap();
         assert_eq!(record.movement_used, 3.5);
         assert!(record.completed);
-        assert_eq!(restored_possession_movement_used(record, 12.0), 12.0);
+        assert_eq!(
+            restored_possession_movement_used(record, 12.0),
+            12.0
+        );
         assert_eq!(
             Vec3::from_array(record.turn_start_position_cells) * VOXEL_SIZE,
             turn_start
@@ -16835,7 +17551,10 @@ mod tests {
             1
         );
         assert_eq!(store.records.len(), 1);
-        assert_eq!(store.records[0].campaign_id, "campaign-b");
+        assert_eq!(
+            store.records[0].campaign_id,
+            "campaign-b"
+        );
     }
 
     #[test]
@@ -17031,8 +17750,7 @@ mod tests {
             SMALL_SPACESHIP_COUNT
         );
         assert!(specs.iter().any(|spec| {
-            spec.ship.id == MEDIUM_SPACESHIP_ID
-                && spec.ship.class == VoxelSpaceshipClass::Corvette
+            spec.ship.id == MEDIUM_SPACESHIP_ID && spec.ship.class == VoxelSpaceshipClass::Corvette
         }));
         assert_eq!(
             specs
@@ -17065,7 +17783,10 @@ mod tests {
             .workbook_features
             .as_ref()
             .expect("狂妄号 must carry its labels as it moves");
-        assert_eq!(workbook_features.map_name, ARROGANCE.name);
+        assert_eq!(
+            workbook_features.map_name,
+            ARROGANCE.name
+        );
         assert!(!workbook_features.regions.is_empty());
         assert!(specs[1..].iter().all(|spec| spec.micro_tiles.is_empty()));
         assert!(specs[1..]
@@ -17140,7 +17861,10 @@ mod tests {
             if ship.id == COMBAT_SPACESHIP_ID {
                 assert_eq!(*body, RigidBody::Dynamic);
                 assert!(docking.is_none());
-                assert_eq!(collision_layers.copied(), Some(carrier_collision_layers()));
+                assert_eq!(
+                    collision_layers.copied(),
+                    Some(carrier_collision_layers())
+                );
             } else {
                 assert_eq!(*body, RigidBody::Kinematic);
                 assert!(docking.is_some());
@@ -17190,11 +17914,25 @@ mod tests {
 
     #[test]
     fn spaceship_driver_permissions_require_the_assigned_player_identity() {
-        assert!(voxel_spaceship_driver_authorized(None, None));
-        assert!(!voxel_spaceship_driver_authorized(None, Some(42)));
-        assert!(voxel_spaceship_driver_authorized(Some(42), Some(42)));
-        assert!(!voxel_spaceship_driver_authorized(Some(42), Some(7)));
-        assert!(!voxel_spaceship_driver_authorized(Some(42), None));
+        assert!(voxel_spaceship_driver_authorized(
+            None, None
+        ));
+        assert!(!voxel_spaceship_driver_authorized(
+            None,
+            Some(42)
+        ));
+        assert!(voxel_spaceship_driver_authorized(
+            Some(42),
+            Some(42)
+        ));
+        assert!(!voxel_spaceship_driver_authorized(
+            Some(42),
+            Some(7)
+        ));
+        assert!(!voxel_spaceship_driver_authorized(
+            Some(42),
+            None
+        ));
     }
 
     #[test]
@@ -17240,6 +17978,9 @@ mod tests {
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::KeyW);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::F5);
 
         app.update();
 
@@ -17250,11 +17991,8 @@ mod tests {
             .unwrap()
             .0;
         assert!(velocity.dot(*spec.transform.forward()) > 0.0);
-        assert!(
-            app.world()
-                .resource::<VoxelSpaceshipControlState>()
-                .cockpit_eye
-                .is_some()
-        );
+        let control = app.world().resource::<VoxelSpaceshipControlState>();
+        assert!(control.cockpit_eye.is_some());
+        assert!(control.third_person_view);
     }
 }

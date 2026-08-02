@@ -270,12 +270,10 @@ impl BattleRoundStore {
                     .delayed_healing_ticks
                     .retain(|tick| tick.source_id != target_id);
             }
-            encounter.combat_log.retain(|entry| {
-                entry.source_id != target_id && entry.target_id != target_id
-            });
-            encounter.combat_log_start = encounter
-                .combat_log_start
-                .min(encounter.combat_log.len());
+            encounter
+                .combat_log
+                .retain(|entry| entry.source_id != target_id && entry.target_id != target_id);
+            encounter.combat_log_start = encounter.combat_log_start.min(encounter.combat_log.len());
         }
         removed
     }
