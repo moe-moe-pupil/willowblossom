@@ -197,7 +197,7 @@ const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
 const VOXEL_SPACESHIP_SAVE_SECONDS: f32 = 1.0;
-const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 7;
+const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 8;
 const COMBAT_SPACESHIP_ID: &str = "usi-arrogance";
 const MEDIUM_SPACESHIP_ID: &str = "medium-ship-01";
 const SMALL_SPACESHIP_COUNT: usize = 6;
@@ -232,17 +232,17 @@ const HANGAR_PARKING_Z: i32 = -20;
 const HANGAR_DOCK_CLEARANCE_CELLS: f32 = 6.0;
 const HANGAR_DOCK_MAX_RELATIVE_SPEED: f32 = 1.0;
 const HANGAR_DOCK_MAX_RELATIVE_ANGULAR_SPEED: f32 = 0.35;
-const ARROGANCE_CAB_FLOOR_Y: i32 = 3;
-const ARROGANCE_CAB_CEILING_Y: i32 = 12;
-const ARROGANCE_CAB_FRONT_Z: i32 = HANGAR_REAR_Z + 4;
-const ARROGANCE_CAB_REAR_Z: i32 = ARROGANCE_CAB_FRONT_Z + 20;
-const ARROGANCE_CAB_MAX_HALF_WIDTH: i32 = 12;
-const ARROGANCE_CAB_TEMPLATE_CENTER_Z: i32 =
-    (ARROGANCE_CAB_FRONT_Z + ARROGANCE_CAB_REAR_Z) / 2;
-const ARROGANCE_CAB_CENTER_X: i32 = -288;
-const ARROGANCE_CAB_CENTER_Z: i32 = -38;
-const ARROGANCE_CAB_Y_OFFSET: i32 = 12;
-const ARROGANCE_CAB_CONNECTOR_BODY_X: i32 = -258;
+const ARROGANCE_CAB_FRONT_X: i32 = -298;
+const ARROGANCE_CAB_REAR_X: i32 = -258;
+const ARROGANCE_CAB_CENTER_Z: i32 = -26;
+const ARROGANCE_CAB_FRONT_HALF_DEPTH: i32 = 12;
+const ARROGANCE_CAB_REAR_HALF_DEPTH: i32 = 22;
+const ARROGANCE_CAB_FRONT_FLOOR_Y: i32 = 6;
+const ARROGANCE_CAB_REAR_FLOOR_Y: i32 = 0;
+const ARROGANCE_CAB_FRONT_CEILING_Y: i32 = 18;
+const ARROGANCE_CAB_REAR_CEILING_Y: i32 = 24;
+const ARROGANCE_CAB_DOOR_HALF_WIDTH: i32 = 2;
+const ARROGANCE_CAB_DOOR_HEIGHT: i32 = 9;
 const ARROGANCE_PORT_BOW_MIN_X: i32 = -321;
 const ARROGANCE_PORT_BOW_MAX_X: i32 = -262;
 const ARROGANCE_PORT_BOW_MIN_Z: i32 = -51;
@@ -4413,6 +4413,20 @@ fn voxel_auto_door_should_open(door: &VoxelAutoDoor, player_position: Vec3) -> b
         && (player_position.y - door.trigger_center.y).abs() <= door.trigger_half_height
 }
 
+fn voxel_auto_door_player_position(
+    player_position: Vec3,
+    parent_transform: Option<&GlobalTransform>,
+) -> Vec3 {
+    parent_transform
+        .map(|parent_transform| {
+            parent_transform
+                .affine()
+                .inverse()
+                .transform_point3(player_position)
+        })
+        .unwrap_or(player_position)
+}
+
 fn voxel_auto_door_has_support(grid: &Grid<u8>, door_cells: &HashSet<IVec3>) -> bool {
     door_cells.iter().any(|cell| {
         VOXEL_NEIGHBORS.into_iter().any(|offset| {
@@ -4426,11 +4440,14 @@ fn voxel_auto_door_has_support(grid: &Grid<u8>, door_cells: &HashSet<IVec3>) -> 
 fn despawn_unsupported_voxel_auto_doors(
     mut commands: Commands,
     grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
-    doors: Query<(Entity, &VoxelAutoDoor)>,
+    doors: Query<(Entity, &VoxelAutoDoor, Option<&ChildOf>)>,
 ) {
     let Ok(grid) = grids.single() else { return };
     let mut groups = HashMap::<(u32, u32, u32), (Vec<Entity>, HashSet<IVec3>)>::new();
-    for (entity, door) in &doors {
+    for (entity, door, parent) in &doors {
+        if parent.is_some() {
+            continue;
+        }
         let key = (
             door.trigger_center.x.to_bits(),
             door.trigger_center.y.to_bits(),
@@ -4616,175 +4633,192 @@ fn spawn_default_voxel_physics_props(
     }
 }
 
-fn combat_spaceship_cab_half_width(z: i32) -> i32 {
-    let taper_length = 7;
-    if z < ARROGANCE_CAB_FRONT_Z + taper_length {
-        6 + (z - ARROGANCE_CAB_FRONT_Z) * (ARROGANCE_CAB_MAX_HALF_WIDTH - 6) / taper_length
-    } else {
-        ARROGANCE_CAB_MAX_HALF_WIDTH
-    }
+fn arrogance_cab_lerp(front: i32, rear: i32, x: i32) -> i32 {
+    front
+        + (rear - front) * (x - ARROGANCE_CAB_FRONT_X)
+            / (ARROGANCE_CAB_REAR_X - ARROGANCE_CAB_FRONT_X)
 }
 
-fn combat_spaceship_cab_cell(cell: IVec3) -> IVec3 {
-    IVec3::new(
-        ARROGANCE_CAB_CENTER_X + cell.z - ARROGANCE_CAB_TEMPLATE_CENTER_Z,
-        cell.y + ARROGANCE_CAB_Y_OFFSET,
-        ARROGANCE_CAB_CENTER_Z - cell.x,
+fn combat_spaceship_cab_half_depth(x: i32) -> i32 {
+    arrogance_cab_lerp(
+        ARROGANCE_CAB_FRONT_HALF_DEPTH,
+        ARROGANCE_CAB_REAR_HALF_DEPTH,
+        x,
+    )
+}
+
+fn combat_spaceship_cab_floor_y(x: i32) -> i32 {
+    arrogance_cab_lerp(
+        ARROGANCE_CAB_FRONT_FLOOR_Y,
+        ARROGANCE_CAB_REAR_FLOOR_Y,
+        x,
+    )
+}
+
+fn combat_spaceship_cab_ceiling_y(x: i32) -> i32 {
+    arrogance_cab_lerp(
+        ARROGANCE_CAB_FRONT_CEILING_Y,
+        ARROGANCE_CAB_REAR_CEILING_Y,
+        x,
     )
 }
 
 fn combat_spaceship_cab_point(point: Vec3) -> Vec3 {
+    let x = point.x.clamp(
+        ARROGANCE_CAB_FRONT_X as f32,
+        ARROGANCE_CAB_REAR_X as f32,
+    );
     Vec3::new(
-        ARROGANCE_CAB_CENTER_X as f32 + point.z - ARROGANCE_CAB_TEMPLATE_CENTER_Z as f32,
-        point.y + ARROGANCE_CAB_Y_OFFSET as f32,
-        ARROGANCE_CAB_CENTER_Z as f32 - point.x,
+        x,
+        point.y,
+        ARROGANCE_CAB_CENTER_Z as f32 + point.z,
     )
 }
 
-fn combat_spaceship_cab_local_cell(cell: IVec3) -> IVec3 {
-    IVec3::new(
-        ARROGANCE_CAB_CENTER_Z - cell.z,
-        cell.y - ARROGANCE_CAB_Y_OFFSET,
-        ARROGANCE_CAB_TEMPLATE_CENTER_Z + cell.x - ARROGANCE_CAB_CENTER_X,
+fn combat_spaceship_cab_door() -> VoxelAutoDoor {
+    make_voxel_auto_door(
+        IVec3::new(
+            ARROGANCE_CAB_REAR_X,
+            0,
+            ARROGANCE_CAB_CENTER_Z,
+        ),
+        IVec3::Z,
+        ARROGANCE_CAB_DOOR_HALF_WIDTH,
+        ARROGANCE_CAB_DOOR_HEIGHT,
+        2.5,
     )
 }
 
-fn combat_spaceship_cab_connector_interior_contains(cell: IVec3) -> bool {
-    let rear_x = combat_spaceship_cab_cell(IVec3::new(0, 0, ARROGANCE_CAB_REAR_Z)).x;
-    (rear_x + 1..=ARROGANCE_CAB_CONNECTOR_BODY_X).contains(&cell.x)
-        && (ARROGANCE_CAB_FLOOR_Y + ARROGANCE_CAB_Y_OFFSET + 1
-            ..ARROGANCE_CAB_CEILING_Y + ARROGANCE_CAB_Y_OFFSET)
-            .contains(&cell.y)
-        && (ARROGANCE_CAB_CENTER_Z - 1..=ARROGANCE_CAB_CENTER_Z + 1).contains(&cell.z)
+fn combat_spaceship_cab_doorway_contains(cell: IVec3) -> bool {
+    (ARROGANCE_CAB_REAR_X - 1..=ARROGANCE_CAB_REAR_X + 3).contains(&cell.x)
+        && (1..=ARROGANCE_CAB_DOOR_HEIGHT).contains(&cell.y)
+        && (ARROGANCE_CAB_CENTER_Z - ARROGANCE_CAB_DOOR_HALF_WIDTH
+            ..=ARROGANCE_CAB_CENTER_Z + ARROGANCE_CAB_DOOR_HALF_WIDTH)
+            .contains(&cell.z)
 }
 
 fn combat_spaceship_cab_interior_contains(cell: IVec3) -> bool {
-    if combat_spaceship_cab_connector_interior_contains(cell) {
+    if combat_spaceship_cab_doorway_contains(cell) {
         return true;
     }
-    let cell = combat_spaceship_cab_local_cell(cell);
-    let clear_height =
-        (ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y).contains(&cell.y);
-    clear_height
-        && (ARROGANCE_CAB_FRONT_Z + 1..=ARROGANCE_CAB_REAR_Z).contains(&cell.z)
-        && cell.x.abs() < combat_spaceship_cab_half_width(cell.z)
+    (ARROGANCE_CAB_FRONT_X + 1..=ARROGANCE_CAB_REAR_X).contains(&cell.x)
+        && (combat_spaceship_cab_floor_y(cell.x) + 1..combat_spaceship_cab_ceiling_y(cell.x))
+            .contains(&cell.y)
+        && (cell.z - ARROGANCE_CAB_CENTER_Z).abs() < combat_spaceship_cab_half_depth(cell.x)
 }
 
 fn combat_spaceship_cab_cells() -> HashMap<IVec3, u8> {
     let mut cells = HashMap::new();
-    for z in ARROGANCE_CAB_FRONT_Z..=ARROGANCE_CAB_REAR_Z {
-        let half_width = combat_spaceship_cab_half_width(z);
-        for x in -half_width..=half_width {
-            let edge = x.abs() == half_width;
+    for x in ARROGANCE_CAB_FRONT_X..=ARROGANCE_CAB_REAR_X {
+        let half_depth = combat_spaceship_cab_half_depth(x);
+        let floor_y = combat_spaceship_cab_floor_y(x);
+        let ceiling_y = combat_spaceship_cab_ceiling_y(x);
+        for z in ARROGANCE_CAB_CENTER_Z - half_depth..=ARROGANCE_CAB_CENTER_Z + half_depth {
+            let edge = (z - ARROGANCE_CAB_CENTER_Z).abs() == half_depth;
             cells.insert(
-                IVec3::new(x, ARROGANCE_CAB_FLOOR_Y, z),
+                IVec3::new(x, floor_y, z),
                 if edge { 7 } else { 6 },
             );
             cells.insert(
-                IVec3::new(x, ARROGANCE_CAB_CEILING_Y, z),
+                IVec3::new(x, ceiling_y, z),
                 if edge { 7 } else { 6 },
             );
         }
-
-        for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
-            let window =
-                (ARROGANCE_CAB_FLOOR_Y + 3..=ARROGANCE_CAB_CEILING_Y - 3).contains(&y);
+        for y in floor_y + 1..ceiling_y {
+            let window = (floor_y + 3..=ceiling_y - 3).contains(&y);
             let material = if window { VOXEL_GLASS_MATERIAL } else { 7 };
-            cells.insert(IVec3::new(-half_width, y, z), material);
-            cells.insert(IVec3::new(half_width, y, z), material);
+            cells.insert(
+                IVec3::new(
+                    x,
+                    y,
+                    ARROGANCE_CAB_CENTER_Z - half_depth,
+                ),
+                material,
+            );
+            cells.insert(
+                IVec3::new(
+                    x,
+                    y,
+                    ARROGANCE_CAB_CENTER_Z + half_depth,
+                ),
+                material,
+            );
         }
     }
 
-    // A broad forward windscreen, with a solid sill and header, closes the
-    // tapered nose while retaining a clear seated sightline.
-    let front_half_width = combat_spaceship_cab_half_width(ARROGANCE_CAB_FRONT_Z);
-    for x in -front_half_width..=front_half_width {
-        for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
-            let material = if (ARROGANCE_CAB_FLOOR_Y + 3..=ARROGANCE_CAB_CEILING_Y - 3).contains(&y)
+    // The rounded bow stays compact while the rear face grows to the hull's
+    // full height and depth, so the bridge reads as the ship's head rather
+    // than a separate room joined by a neck.
+    for z in ARROGANCE_CAB_CENTER_Z - ARROGANCE_CAB_FRONT_HALF_DEPTH
+        ..=ARROGANCE_CAB_CENTER_Z + ARROGANCE_CAB_FRONT_HALF_DEPTH
+    {
+        for y in ARROGANCE_CAB_FRONT_FLOOR_Y + 1..ARROGANCE_CAB_FRONT_CEILING_Y {
+            let material = if (ARROGANCE_CAB_FRONT_FLOOR_Y + 3..=ARROGANCE_CAB_FRONT_CEILING_Y - 3)
+                .contains(&y)
             {
                 VOXEL_GLASS_MATERIAL
             } else {
                 7
             };
             cells.insert(
-                IVec3::new(x, y, ARROGANCE_CAB_FRONT_Z),
+                IVec3::new(ARROGANCE_CAB_FRONT_X, y, z),
                 material,
             );
         }
     }
 
-    // Close the rear around a three-cell-wide personnel door. After the cab is
-    // rotated into the bow, this door faces the main hull and its connector.
-    for x in -ARROGANCE_CAB_MAX_HALF_WIDTH..=ARROGANCE_CAB_MAX_HALF_WIDTH {
-        for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
-            if x.abs() > 1 || y >= ARROGANCE_CAB_CEILING_Y - 2 {
-                cells.insert(
-                    IVec3::new(x, y, ARROGANCE_CAB_REAR_Z),
-                    7,
-                );
+    for z in ARROGANCE_CAB_CENTER_Z - ARROGANCE_CAB_REAR_HALF_DEPTH
+        ..=ARROGANCE_CAB_CENTER_Z + ARROGANCE_CAB_REAR_HALF_DEPTH
+    {
+        for y in ARROGANCE_CAB_REAR_FLOOR_Y + 1..ARROGANCE_CAB_REAR_CEILING_Y {
+            let cell = IVec3::new(ARROGANCE_CAB_REAR_X, y, z);
+            if !combat_spaceship_cab_doorway_contains(cell) {
+                cells.insert(cell, 7);
             }
         }
     }
 
-    // Flight console, two pilot chairs, side terminals, and inset ceiling
-    // lamps make the enclosed volume read as a working bridge.
-    for x in -4..=4 {
+    let console_x = ARROGANCE_CAB_FRONT_X + 5;
+    let console_floor = combat_spaceship_cab_floor_y(console_x);
+    for z in ARROGANCE_CAB_CENTER_Z - 4..=ARROGANCE_CAB_CENTER_Z + 4 {
         cells.insert(
-            IVec3::new(
-                x,
-                ARROGANCE_CAB_FLOOR_Y + 1,
-                ARROGANCE_CAB_FRONT_Z + 3,
-            ),
+            IVec3::new(console_x, console_floor + 1, z),
             10,
         );
     }
-    for x in [-4, 4] {
+    for z in [ARROGANCE_CAB_CENTER_Z - 4, ARROGANCE_CAB_CENTER_Z + 4] {
+        let chair_x = ARROGANCE_CAB_FRONT_X + 13;
         cells.insert(
             IVec3::new(
-                x,
-                ARROGANCE_CAB_FLOOR_Y + 1,
-                ARROGANCE_CAB_FRONT_Z + 8,
+                chair_x,
+                combat_spaceship_cab_floor_y(chair_x) + 1,
+                z,
             ),
             9,
         );
     }
-    for x in [-10, 10] {
-        for z in ARROGANCE_CAB_FRONT_Z + 8..=ARROGANCE_CAB_REAR_Z - 4 {
-            cells.insert(
-                IVec3::new(x, ARROGANCE_CAB_FLOOR_Y + 1, z),
-                8,
-            );
-        }
-    }
-    for z in [ARROGANCE_CAB_FRONT_Z + 7, ARROGANCE_CAB_REAR_Z - 5] {
-        for x in -2..=2 {
-            cells.insert(
-                IVec3::new(x, ARROGANCE_CAB_CEILING_Y, z),
-                10,
-            );
-        }
-    }
-    let mut cells = cells
-        .into_iter()
-        .map(|(cell, material)| (combat_spaceship_cab_cell(cell), material))
-        .collect::<HashMap<_, _>>();
-
-    let rear_x = combat_spaceship_cab_cell(IVec3::new(0, 0, ARROGANCE_CAB_REAR_Z)).x;
-    let floor_y = ARROGANCE_CAB_FLOOR_Y + ARROGANCE_CAB_Y_OFFSET;
-    let ceiling_y = ARROGANCE_CAB_CEILING_Y + ARROGANCE_CAB_Y_OFFSET;
-    for x in rear_x + 1..=ARROGANCE_CAB_CONNECTOR_BODY_X {
-        for z in ARROGANCE_CAB_CENTER_Z - 2..=ARROGANCE_CAB_CENTER_Z + 2 {
-            cells.insert(IVec3::new(x, floor_y, z), 7);
-            cells.insert(IVec3::new(x, ceiling_y, z), 7);
-        }
-        for y in floor_y + 1..ceiling_y {
-            cells.insert(IVec3::new(x, y, ARROGANCE_CAB_CENTER_Z - 2), 7);
-            cells.insert(IVec3::new(x, y, ARROGANCE_CAB_CENTER_Z + 2), 7);
-        }
+    for x in ARROGANCE_CAB_FRONT_X + 16..=ARROGANCE_CAB_REAR_X - 8 {
+        let half_depth = combat_spaceship_cab_half_depth(x);
+        let y = combat_spaceship_cab_floor_y(x) + 1;
+        cells.insert(
+            IVec3::new(
+                x,
+                y,
+                ARROGANCE_CAB_CENTER_Z - half_depth + 2,
+            ),
+            8,
+        );
+        cells.insert(
+            IVec3::new(
+                x,
+                y,
+                ARROGANCE_CAB_CENTER_Z + half_depth - 2,
+            ),
+            8,
+        );
     }
     cells
 }
-
 
 fn scale_combat_spaceship_cell(cell: IVec3) -> IVec3 {
     cell * ARROGANCE_SCALE
@@ -5326,11 +5360,14 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
             id: COMBAT_SPACESHIP_ID.to_owned(),
             name: "U.S.I 狂妄号".to_owned(),
             class: VoxelSpaceshipClass::Cruiser,
-            cockpit_eye_local: combat_spaceship_cab_point(Vec3::new(
-                0.0,
-                ARROGANCE_CAB_FLOOR_Y as f32 + 3.5,
-                ARROGANCE_CAB_FRONT_Z as f32 + 9.5,
-            )) * VOXEL_SIZE,
+            cockpit_eye_local: {
+                let eye_x = ARROGANCE_CAB_FRONT_X + 10;
+                combat_spaceship_cab_point(Vec3::new(
+                    eye_x as f32,
+                    combat_spaceship_cab_floor_y(eye_x) as f32 + 5.5,
+                    0.0,
+                )) * VOXEL_SIZE
+            },
             thrust_acceleration: 2.4,
             vertical_acceleration: 1.4,
             turn_speed: 0.32,
@@ -5526,15 +5563,10 @@ fn spawn_voxel_spaceship(
         .copied()
         .reduce(IVec3::max)
         .unwrap_or(IVec3::ZERO);
-    let local_center =
-        (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE;
+    let local_center = (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE;
     let (material_meshes, _) = build_voxel_meshes_from_cells(&spec.cells);
     let micro_meshes = build_micro_tile_meshes(&spec.micro_tiles);
-    let rigid_body = if docking.is_some() {
-        RigidBody::Kinematic
-    } else {
-        RigidBody::Dynamic
-    };
+    let rigid_body = if docking.is_some() { RigidBody::Kinematic } else { RigidBody::Dynamic };
     let entity = commands
         .spawn((
             Name::new(spec.ship.name.clone()),
@@ -5569,18 +5601,31 @@ fn spawn_voxel_spaceship(
                     VoxelMicroDecoration,
                 ));
             }
+            if spec.ship.id == COMBAT_SPACESHIP_ID {
+                for panel in voxel_auto_door_panels(&combat_spaceship_cab_door()) {
+                    let size = voxel_auto_door_panel_size(&panel);
+                    let translation = panel.closed_translation;
+                    parent.spawn((
+                        Name::new("Arrogance bridge automatic door"),
+                        Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+                        MeshMaterial3d(materials.handles[panel.material as usize - 1].clone()),
+                        Transform::from_translation(translation),
+                        Collider::cuboid(size.x, size.y, size.z),
+                        panel,
+                    ));
+                }
+            }
         })
         .id();
     if let Some(docking) = docking {
         // The docking layer remains visible to spatial ray queries and collides
         // with default-layer players, but not with the carrier or other berths.
-        commands
-            .entity(entity)
-            .insert((docking, docked_voxel_spaceship_collision_layers()));
+        commands.entity(entity).insert((
+            docking,
+            docked_voxel_spaceship_collision_layers(),
+        ));
     } else if spec.ship.id == COMBAT_SPACESHIP_ID {
-        commands
-            .entity(entity)
-            .insert(carrier_collision_layers());
+        commands.entity(entity).insert(carrier_collision_layers());
     }
     if let Some(features) = &spec.workbook_features {
         commands.entity(entity).insert(features.clone());
@@ -6230,17 +6275,31 @@ fn animate_voxel_auto_doors(
     time: Res<Time>,
     editor: Res<VoxelEditorState>,
     players: Query<
-        &Transform,
+        &GlobalTransform,
         (
             With<VoxelFirstPersonPlayer>,
             Without<VoxelAutoDoor>,
+            Without<VoxelSpaceship>,
+        ),
+    >,
+    spaceships: Query<
+        &GlobalTransform,
+        (
+            With<VoxelSpaceship>,
+            Without<VoxelAutoDoor>,
+            Without<VoxelFirstPersonPlayer>,
         ),
     >,
     mut doors: Query<
-        (&mut VoxelAutoDoor, &mut Transform),
+        (
+            &mut VoxelAutoDoor,
+            &mut Transform,
+            Option<&ChildOf>,
+        ),
         (
             With<VoxelAutoDoor>,
             Without<VoxelFirstPersonPlayer>,
+            Without<VoxelSpaceship>,
         ),
     >,
 ) {
@@ -6248,9 +6307,12 @@ fn animate_voxel_auto_doors(
         return;
     };
     let response = 1.0 - (-14.0 * time.delta_secs()).exp();
-    for (mut door, mut transform) in &mut doors {
+    for (mut door, mut transform, parent) in &mut doors {
+        let parent_transform = parent.and_then(|parent| spaceships.get(parent.0).ok());
+        let player_position =
+            voxel_auto_door_player_position(player.translation(), parent_transform);
         let should_open =
-            editor.first_person_enabled && voxel_auto_door_should_open(&door, player.translation);
+            editor.first_person_enabled && voxel_auto_door_should_open(&door, player_position);
         let target = if should_open { door.open_translation } else { door.closed_translation };
         transform.translation = transform.translation.lerp(target, response);
         if transform.translation.distance_squared(target) < 0.000_001 {

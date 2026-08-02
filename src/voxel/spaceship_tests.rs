@@ -232,69 +232,63 @@ fn arrogance_has_an_enclosed_furnished_cab_at_the_requested_port_bow() {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-    for z in ARROGANCE_CAB_FRONT_Z..=ARROGANCE_CAB_REAR_Z {
-        let half_width = combat_spaceship_cab_half_width(z);
-        for x in -half_width + 1..half_width {
+    for x in ARROGANCE_CAB_FRONT_X..=ARROGANCE_CAB_REAR_X {
+        let half_depth = combat_spaceship_cab_half_depth(x);
+        let floor_y = combat_spaceship_cab_floor_y(x);
+        let ceiling_y = combat_spaceship_cab_ceiling_y(x);
+        for z in ARROGANCE_CAB_CENTER_Z - half_depth + 1..ARROGANCE_CAB_CENTER_Z + half_depth {
             assert!(
                 cells
-                    .get(&combat_spaceship_cab_cell(IVec3::new(
-                        x,
-                        ARROGANCE_CAB_FLOOR_Y,
-                        z,
-                    )))
+                    .get(&IVec3::new(x, floor_y, z))
                     .is_some_and(TrpgVoxelConnector::solid),
                 "cab needs a solid floor at ({x}, {z})"
             );
             assert!(
                 cells
-                    .get(&combat_spaceship_cab_cell(IVec3::new(
-                        x,
-                        ARROGANCE_CAB_CEILING_Y,
-                        z,
-                    )))
+                    .get(&IVec3::new(x, ceiling_y, z))
                     .is_some_and(TrpgVoxelConnector::solid),
                 "cab needs a solid ceiling at ({x}, {z})"
             );
         }
     }
 
-    for y in ARROGANCE_CAB_FLOOR_Y + 3..=ARROGANCE_CAB_CEILING_Y - 3 {
-        for x in -6..=6 {
+    for y in ARROGANCE_CAB_FRONT_FLOOR_Y + 3..=ARROGANCE_CAB_FRONT_CEILING_Y - 3 {
+        for z in ARROGANCE_CAB_CENTER_Z - ARROGANCE_CAB_FRONT_HALF_DEPTH
+            ..=ARROGANCE_CAB_CENTER_Z + ARROGANCE_CAB_FRONT_HALF_DEPTH
+        {
             assert_eq!(
-                cells.get(
-                    &combat_spaceship_cab_cell(IVec3::new(
-                        x,
-                        y,
-                        ARROGANCE_CAB_FRONT_Z,
-                    ))
-                ),
+                cells.get(&IVec3::new(ARROGANCE_CAB_FRONT_X, y, z)),
                 Some(&VOXEL_GLASS_MATERIAL),
-                "cab needs a panoramic forward windscreen at ({x}, {y})"
+                "cab needs a panoramic forward windscreen at ({z}, {y})"
             );
         }
     }
 
-    let roof_center_world = (COMBAT_SPACESHIP_CENTER
-        + combat_spaceship_cab_cell(IVec3::new(
-            0,
-            ARROGANCE_CAB_CEILING_Y,
-            ARROGANCE_CAB_TEMPLATE_CENTER_Z,
-        )))
-    .as_vec3()
-        * VOXEL_SIZE;
-    assert!(roof_center_world.abs_diff_eq(Vec3::new(-197.0, 6.0, 115.5), 0.000_01));
-    assert!(roof_center_world.abs_diff_eq(Vec3::new(-196.0, 7.0, 115.0), 1.0));
+    assert_eq!(
+        combat_spaceship_cab_half_depth(ARROGANCE_CAB_REAR_X),
+        22
+    );
+    assert_eq!(
+        combat_spaceship_cab_floor_y(ARROGANCE_CAB_REAR_X),
+        0
+    );
+    assert_eq!(
+        combat_spaceship_cab_ceiling_y(ARROGANCE_CAB_REAR_X),
+        24
+    );
 
     let eye = default_voxel_spaceship_specs()[0].ship.cockpit_eye_local / VOXEL_SIZE;
     assert!(eye.x < HANGAR_MIN_X as f32);
     assert!(!cells.contains_key(&eye.floor().as_ivec3()));
-    for z in ARROGANCE_CAB_FRONT_Z + 4..ARROGANCE_CAB_REAR_Z {
-        for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
+    for x in ARROGANCE_CAB_FRONT_X + 8..ARROGANCE_CAB_REAR_X {
+        for y in combat_spaceship_cab_floor_y(x) + 1..combat_spaceship_cab_ceiling_y(x) {
             assert!(
-                !cells.contains_key(
-                    &combat_spaceship_cab_cell(IVec3::new(0, y, z))
-                ),
-                "cab center aisle is blocked at y={y}, z={z}"
+                !cells.contains_key(&IVec3::new(
+                    x,
+                    y,
+                    ARROGANCE_CAB_CENTER_Z
+                )),
+                "cab center aisle is blocked at x={x}, y={y}"
             );
         }
     }
@@ -333,6 +327,21 @@ fn arrogance_has_panorama_glass_in_its_workbook_hull_and_bridge() {
         finished_glass_count > bridge_glass_count,
         "the finished Arrogance must retain hull glass beyond its bridge"
     );
+}
+
+#[test]
+fn arrogance_auto_door_trigger_follows_the_moving_ship() {
+    let door = combat_spaceship_cab_door();
+    let ship_transform = GlobalTransform::from(
+        Transform::from_translation(Vec3::new(31.0, -4.0, 17.0))
+            .with_rotation(Quat::from_rotation_y(0.73)),
+    );
+    let player_world = ship_transform.transform_point(door.trigger_center);
+    let player_local = voxel_auto_door_player_position(player_world, Some(&ship_transform));
+
+    assert!(player_local.abs_diff_eq(door.trigger_center, 0.000_01));
+    assert!(voxel_auto_door_should_open(&door, player_local));
+    assert!(!voxel_auto_door_should_open(&door, player_world));
 }
 
 #[test]
@@ -381,9 +390,9 @@ fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
         .keys()
         .map(|cell| (cell.x, cell.z))
         .collect::<HashSet<_>>();
-    assert!(scaled_outline.difference(&carrier_outline).all(|(x, z)| {
-        combat_spaceship_obsolete_port_bow_wall_contains(IVec3::new(*x, 0, *z))
-    }));
+    assert!(scaled_outline
+        .difference(&carrier_outline)
+        .all(|(x, z)| { combat_spaceship_obsolete_port_bow_wall_contains(IVec3::new(*x, 0, *z)) }));
     assert!(carrier_outline
         .difference(&scaled_outline)
         .all(|cell| cab_outline.contains(cell)));
@@ -415,29 +424,52 @@ fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
         .flat_map(|cell| directions.map(|direction| *cell + direction))
         .filter(|neighbor| carved_hull.contains_key(neighbor))
         .count();
-    assert!(attachment_faces > 0, "cab must be face-connected to the main hull");
+    assert!(
+        attachment_faces > 0,
+        "cab must be face-connected to the main hull"
+    );
 
-    let cab_nose = combat_spaceship_cab_cell(IVec3::new(
-        0,
-        ARROGANCE_CAB_FLOOR_Y,
-        ARROGANCE_CAB_FRONT_Z,
-    ));
-    let cab_rear = combat_spaceship_cab_cell(IVec3::new(
-        0,
-        ARROGANCE_CAB_FLOOR_Y,
-        ARROGANCE_CAB_REAR_Z,
-    ));
-    assert!(cab_nose.x < cab_rear.x, "cab nose must point out from the port bow");
-    for x in cab_rear.x + 1..=ARROGANCE_CAB_CONNECTOR_BODY_X {
-        for y in ARROGANCE_CAB_FLOOR_Y + ARROGANCE_CAB_Y_OFFSET + 1
-            ..ARROGANCE_CAB_CEILING_Y + ARROGANCE_CAB_Y_OFFSET
-        {
-            for z in ARROGANCE_CAB_CENTER_Z - 1..=ARROGANCE_CAB_CENTER_Z + 1 {
-                assert!(
-                    !carrier.contains(&IVec3::new(x, y, z)),
-                    "cab-to-hull passage is blocked at {x}, {y}, {z}"
-                );
-            }
+    assert!(
+        ARROGANCE_CAB_FRONT_X < ARROGANCE_CAB_REAR_X,
+        "cab nose must point out from the port bow"
+    );
+    assert!(
+        combat_spaceship_cab_half_depth(ARROGANCE_CAB_FRONT_X)
+            < combat_spaceship_cab_half_depth(ARROGANCE_CAB_REAR_X),
+        "cab must widen through its full depth into the hull face"
+    );
+    for x in ARROGANCE_CAB_FRONT_X..=ARROGANCE_CAB_REAR_X {
+        assert!(
+            carrier.contains(&IVec3::new(
+                x,
+                combat_spaceship_cab_floor_y(x),
+                ARROGANCE_CAB_CENTER_Z,
+            )),
+            "cab floor must remain continuous through x={x}"
+        );
+    }
+    let door = combat_spaceship_cab_door();
+    for cell in &door.cells {
+        assert!(
+            !carrier.contains(cell),
+            "automatic door aperture is blocked at {cell:?}"
+        );
+    }
+    let panels = voxel_auto_door_panels(&door);
+    assert!(panels.iter().all(|panel| {
+        panel.open_translation != panel.closed_translation
+            && panel.trigger_center == door.trigger_center
+    }));
+    for x in ARROGANCE_CAB_REAR_X..=ARROGANCE_CAB_REAR_X + 3 {
+        for y in 1..=ARROGANCE_CAB_DOOR_HEIGHT {
+            assert!(
+                !carrier.contains(&IVec3::new(
+                    x,
+                    y,
+                    ARROGANCE_CAB_CENTER_Z
+                )),
+                "cab-to-hull doorway is blocked at {x}, {y}"
+            );
         }
     }
 
@@ -445,11 +477,13 @@ fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
     let original_max = original.keys().copied().reduce(IVec3::max).unwrap();
     let scaled_min = scaled_original.keys().copied().reduce(IVec3::min).unwrap();
     let scaled_max = scaled_original.keys().copied().reduce(IVec3::max).unwrap();
-    assert_eq!(scaled_min, scale_combat_spaceship_cell(original_min));
+    assert_eq!(
+        scaled_min,
+        scale_combat_spaceship_cell(original_min)
+    );
     assert_eq!(
         scaled_max,
-        scale_combat_spaceship_cell(original_max)
-            + IVec3::splat(ARROGANCE_SCALE - 1)
+        scale_combat_spaceship_cell(original_max) + IVec3::splat(ARROGANCE_SCALE - 1)
     );
 
     for x in HANGAR_MIN_X..=HANGAR_MAX_X {
@@ -504,16 +538,21 @@ fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
                 "{name} overlaps another parked ship at {cell:?}"
             );
         }
-        for cell in world_cells
-            .iter()
-            .filter(|cell| cell.y == HANGAR_PARKING_Y)
-        {
+        for cell in world_cells.iter().filter(|cell| cell.y == HANGAR_PARKING_Y) {
             assert!(
-                carrier.contains(&IVec3::new(cell.x, HANGAR_PARKING_Y - 1, cell.z)),
+                carrier.contains(&IVec3::new(
+                    cell.x,
+                    HANGAR_PARKING_Y - 1,
+                    cell.z
+                )),
                 "{name} is not parked on 狂妄号's real deck below {cell:?}"
             );
             assert!(
-                carrier.contains(&IVec3::new(cell.x, HANGAR_CEILING_Y, cell.z)),
+                carrier.contains(&IVec3::new(
+                    cell.x,
+                    HANGAR_CEILING_Y,
+                    cell.z
+                )),
                 "{name} is not inside 狂妄号's real roof below {cell:?}"
             );
         }
