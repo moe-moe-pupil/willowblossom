@@ -66,15 +66,21 @@ use crate::voxel::{
     has_voxel_unit_standee,
     place_voxel_unit_standee,
     remove_voxel_unit_standee,
+    voxel_spaceship_contains_position,
+    voxel_spaceship_teleport_destination,
+    voxel_spaceship_teleport_name,
+    voxel_teleport_static_area_label,
     VoxelCreativeItem,
     VoxelEditMode,
     VoxelEditorState,
     VoxelLightTool,
     VoxelMinimapSnapshot,
-    VoxelPlayerStandee,
+    VoxelPhysicsBody,
     VoxelPlayerCameraStore,
+    VoxelPlayerStandee,
     VoxelPossessionMovementStore,
     VoxelPossessionState,
+    VoxelSpaceship,
     VoxelTargetingPreview,
     VoxelTeleportDestination,
     VoxelUnitStandeeStore,
@@ -1010,7 +1016,19 @@ pub struct UiSystemLocals<'w, 's> {
         (
             &'static VoxelPlayerStandee,
             &'static bevy::prelude::Visibility,
+            &'static Transform,
         ),
+        Without<VoxelSpaceship>,
+    >,
+    teleport_spaceships: Query<
+        'w,
+        's,
+        (
+            &'static VoxelSpaceship,
+            &'static VoxelPhysicsBody,
+            &'static Transform,
+        ),
+        Without<VoxelPlayerStandee>,
     >,
 }
 
@@ -14130,6 +14148,7 @@ pub fn ui_system(
     let player_camera_store = &mut locals.player_camera_store;
     let unit_standee_store = &mut locals.unit_standee_store;
     let player_standees = &locals.player_standees;
+    let teleport_spaceships = &locals.teleport_spaceships;
 
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -15125,6 +15144,7 @@ pub fn ui_system(
 
             if voxel_editor.teleport_menu_open {
                 let mut window_open = true;
+                let teleport_window_max_height = (ctx.content_rect().height() - 32.0).max(200.0);
                 egui::Window::new("传送器")
                     .id(egui::Id::new("voxel_teleport_tool_window"))
                     .anchor(
@@ -15133,6 +15153,8 @@ pub fn ui_system(
                     )
                     .collapsible(false)
                     .resizable(false)
+                    .max_height(teleport_window_max_height)
+                    .vscroll(true)
                     .open(&mut window_open)
                     .show(ctx, |ui| {
                         ui.label("选择目的地");
@@ -15149,12 +15171,27 @@ pub fn ui_system(
                                 voxel_editor.request_teleport(destination);
                             }
                         }
+                        let mut ship_destinations = teleport_spaceships
+                            .iter()
+                            .filter_map(|(ship, body, transform)| {
+                                Some((
+                                    voxel_spaceship_teleport_name(ship)?,
+                                    voxel_spaceship_teleport_destination(ship)?,
+                                    body,
+                                    transform,
+                                ))
+                            })
+                            .collect::<Vec<_>>();
+                        ship_destinations.sort_by_key(|(_, destination, ..)| match destination {
+                            VoxelTeleportDestination::Spaceship(slot) => *slot,
+                            _ => u8::MAX,
+                        });
                         let mut standee_destinations = player_standees
                             .iter()
-                            .filter(|(_, visibility)| {
+                            .filter(|(_, visibility, _)| {
                                 **visibility != bevy::prelude::Visibility::Hidden
                             })
-                            .map(|(standee, _)| {
+                            .map(|(standee, _, transform)| {
                                 let target_id = standee.user_id.to_string();
                                 let character_name = manager
                                     .player_characters
@@ -15169,20 +15206,64 @@ pub fn ui_system(
                                     .filter(|name| !name.is_empty())
                                     .map(str::to_owned)
                                     .unwrap_or_else(|| target_display_name(&manager, &target_id));
-                                (character_name, standee.user_id)
+                                let area = ship_destinations
+                                    .iter()
+                                    .filter_map(|(ship_name, _, body, ship_transform)| {
+                                        voxel_spaceship_contains_position(
+                                            body,
+                                            ship_transform,
+                                            transform.translation,
+                                        )
+                                        .map(|volume| (volume, *ship_name))
+                                    })
+                                    .min_by(|left, right| left.0.total_cmp(&right.0))
+                                    .map(|(_, ship_name)| ship_name)
+                                    .unwrap_or_else(|| {
+                                        voxel_teleport_static_area_label(transform.translation)
+                                    });
+                                (character_name, standee.user_id, area)
                             })
                             .collect::<Vec<_>>();
                         standee_destinations.sort_by(|left, right| {
-                            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                            left.2
+                                .cmp(right.2)
+                                .then_with(|| left.0.cmp(&right.0))
+                                .then_with(|| left.1.cmp(&right.1))
                         });
-                        if !standee_destinations.is_empty() {
+                        if !ship_destinations.is_empty() {
                             ui.separator();
-                            ui.strong("玩家立牌");
-                            for (name, user_id) in standee_destinations {
+                            ui.strong("舰船");
+                            for (ship_name, destination, ..) in ship_destinations {
+                                let occupants = standee_destinations
+                                    .iter()
+                                    .filter(|(_, _, area)| *area == ship_name)
+                                    .map(|(name, ..)| name.as_str())
+                                    .collect::<Vec<_>>();
+                                let label = if occupants.is_empty() {
+                                    ship_name.to_owned()
+                                } else {
+                                    format!("{ship_name}: {}", occupants.join("、"))
+                                };
                                 if ui
                                     .add_sized(
                                         egui::vec2(220.0, 28.0),
-                                        egui::Button::new(format!("传送到 {name}")),
+                                        egui::Button::new(label),
+                                    )
+                                    .on_hover_text(format!("传送到{ship_name}"))
+                                    .clicked()
+                                {
+                                    voxel_editor.request_teleport(destination);
+                                }
+                            }
+                        }
+                        if !standee_destinations.is_empty() {
+                            ui.separator();
+                            ui.strong("玩家立牌");
+                            for (name, user_id, area) in standee_destinations {
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(220.0, 28.0),
+                                        egui::Button::new(format!("{name}: {area}")),
                                     )
                                     .on_hover_text(format!("QQ：{user_id}"))
                                     .clicked()

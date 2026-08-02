@@ -201,6 +201,26 @@ const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 4;
 const COMBAT_SPACESHIP_ID: &str = "usi-arrogance";
 const MEDIUM_SPACESHIP_ID: &str = "medium-ship-01";
 const SMALL_SPACESHIP_COUNT: usize = 6;
+const TELEPORT_SPACESHIP_IDS: [&str; 8] = [
+    COMBAT_SPACESHIP_ID,
+    MEDIUM_SPACESHIP_ID,
+    "small-ship-01",
+    "small-ship-02",
+    "small-ship-03",
+    "small-ship-04",
+    "small-ship-05",
+    "small-ship-06",
+];
+const TELEPORT_SPACESHIP_NAMES: [&str; 8] = [
+    "狂妄号",
+    "苍鹭号",
+    "雨燕号",
+    "萤火号",
+    "云雀号",
+    "信风号",
+    "渡鸦号",
+    "星槎号",
+];
 const ARROGANCE_SCALE: i32 = 3;
 const HANGAR_MIN_X: i32 = -104;
 const HANGAR_MAX_X: i32 = 112;
@@ -610,7 +630,7 @@ impl VoxelGeometryDirtyChunks {
 }
 
 #[derive(Component, Clone)]
-struct VoxelPhysicsBody {
+pub(crate) struct VoxelPhysicsBody {
     local_center: Vec3,
     cells: Vec<(IVec3, u8)>,
 }
@@ -637,7 +657,7 @@ impl VoxelSpaceshipClass {
 }
 
 #[derive(Component, Clone)]
-struct VoxelSpaceship {
+pub(crate) struct VoxelSpaceship {
     id: String,
     name: String,
     class: VoxelSpaceshipClass,
@@ -1004,19 +1024,18 @@ pub(crate) enum VoxelTeleportDestination {
     ResearchStation,
     SensorStation,
     CannonStation,
-    CombatSpaceship,
     AbandonedStation,
     PlanetScienceLab,
+    Spaceship(u8),
     PlayerStandee(u64),
     MapCell(IVec3),
 }
 
 impl VoxelTeleportDestination {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::ResearchStation,
         Self::SensorStation,
         Self::CannonStation,
-        Self::CombatSpaceship,
         Self::AbandonedStation,
         Self::PlanetScienceLab,
     ];
@@ -1026,9 +1045,12 @@ impl VoxelTeleportDestination {
             Self::ResearchStation => "U.S.I Niffy女皇号科研空间站",
             Self::SensorStation => "U.S.I 女仲裁者号探测空间站",
             Self::CannonStation => "U.S.I Kyo空间防御炮台",
-            Self::CombatSpaceship => "U.S.I 狂妄号战斗巡洋舰",
             Self::AbandonedStation => "废弃空间站",
             Self::PlanetScienceLab => "XY星基地",
+            Self::Spaceship(slot) => TELEPORT_SPACESHIP_NAMES
+                .get(slot as usize)
+                .copied()
+                .unwrap_or("舰船"),
             Self::PlayerStandee(_) => "玩家立牌",
             Self::MapCell(_) => "地图位置",
         }
@@ -1058,13 +1080,6 @@ impl VoxelTeleportDestination {
                     * VOXEL_SIZE
                     + floor_offset
             },
-            Self::CombatSpaceship => {
-                (COMBAT_SPACESHIP_CENTER
-                    + IVec3::new(ARROGANCE.spawn[0], 0, ARROGANCE.spawn[1]))
-                .as_vec3()
-                    * VOXEL_SIZE
-                    + floor_offset
-            },
             Self::AbandonedStation => {
                 (ABANDONED_STATION_CENTER
                     + IVec3::new(ABANDONED.spawn[0], 0, ABANDONED.spawn[1]))
@@ -1081,9 +1096,72 @@ impl VoxelTeleportDestination {
                     ) * VOXEL_SIZE
                     + floor_offset
             },
+            Self::Spaceship(_) => return None,
             Self::PlayerStandee(_) => return None,
             Self::MapCell(cell) => cell.as_vec3() * VOXEL_SIZE + floor_offset,
         })
+    }
+}
+
+pub(crate) fn voxel_spaceship_teleport_destination(
+    ship: &VoxelSpaceship,
+) -> Option<VoxelTeleportDestination> {
+    TELEPORT_SPACESHIP_IDS
+        .iter()
+        .position(|id| *id == ship.id)
+        .map(|slot| VoxelTeleportDestination::Spaceship(slot as u8))
+}
+
+pub(crate) fn voxel_spaceship_teleport_name(ship: &VoxelSpaceship) -> Option<&'static str> {
+    let destination = voxel_spaceship_teleport_destination(ship)?;
+    Some(destination.label())
+}
+
+pub(crate) fn voxel_spaceship_contains_position(
+    body: &VoxelPhysicsBody,
+    transform: &Transform,
+    position: Vec3,
+) -> Option<f32> {
+    let (local_min, local_max) = voxel_spaceship_local_bounds(body)?;
+    let local_position = transform
+        .compute_affine()
+        .inverse()
+        .transform_point3(position);
+    (local_position.cmpge(local_min).all() && local_position.cmple(local_max).all())
+        .then(|| (local_max - local_min).element_product())
+}
+
+pub(crate) fn voxel_teleport_static_area_label(position: Vec3) -> &'static str {
+    let cell = (position / VOXEL_SIZE).round().as_ivec3();
+    for (center, design, label) in [
+        (
+            RESEARCH_STATION_CENTER,
+            NIFFY,
+            "Niffy女皇号空间站",
+        ),
+        (
+            SENSOR_STATION_CENTER,
+            ARBITRATOR,
+            "女仲裁者号空间站",
+        ),
+        (CANNON_STATION_CENTER, KYO, "Kyo空间站"),
+        (
+            ABANDONED_STATION_CENTER,
+            ABANDONED,
+            "废弃空间站",
+        ),
+    ] {
+        let relative = cell - center;
+        let half_width = design.width as i32 / 2 + STATION_DOCK_PAD_HALF_LENGTH;
+        let half_height = design.height as i32 / 2 + STATION_DOCK_PAD_HALF_LENGTH;
+        if relative.x.abs() <= half_width && relative.z.abs() <= half_height {
+            return label;
+        }
+    }
+    if position.distance(ORBITAL_PLANET_CENTER) <= ORBITAL_PLANET_RADIUS + 32.0 * VOXEL_SIZE {
+        "XY星基地"
+    } else {
+        "外部空间"
     }
 }
 
@@ -11652,10 +11730,11 @@ fn apply_voxel_teleport(
             };
             first_person_player_position(standee_transform.translation())
         },
-        VoxelTeleportDestination::CombatSpaceship => {
+        VoxelTeleportDestination::Spaceship(slot) => {
+            let Some(ship_id) = TELEPORT_SPACESHIP_IDS.get(slot as usize) else { return };
             let Some((ship, ship_transform)) = spaceships
                 .iter()
-                .find(|(ship, _)| ship.id == COMBAT_SPACESHIP_ID)
+                .find(|(ship, _)| ship.id == *ship_id)
             else {
                 return;
             };
@@ -13565,16 +13644,6 @@ mod tests {
             )
         );
         assert_eq!(
-            VoxelTeleportDestination::CombatSpaceship.player_position(),
-            Some(
-                (COMBAT_SPACESHIP_CENTER
-                    + IVec3::new(ARROGANCE.spawn[0], 0, ARROGANCE.spawn[1]))
-                .as_vec3()
-                    * VOXEL_SIZE
-                    + Vec3::Y * 0.5
-            )
-        );
-        assert_eq!(
             VoxelTeleportDestination::AbandonedStation.player_position(),
             Some(
                 (ABANDONED_STATION_CENTER
@@ -13595,6 +13664,72 @@ mod tests {
                     ) * VOXEL_SIZE
                     + Vec3::Y * 0.5
             )
+        );
+    }
+
+    #[test]
+    fn teleporter_exposes_the_complete_spaceship_fleet_in_display_order() {
+        let specs = default_voxel_spaceship_specs();
+        let actual = specs
+            .iter()
+            .map(|spec| {
+                (
+                    spec.ship.id.as_str(),
+                    voxel_spaceship_teleport_name(&spec.ship).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            TELEPORT_SPACESHIP_IDS
+                .iter()
+                .copied()
+                .zip(TELEPORT_SPACESHIP_NAMES)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn teleporter_area_prefers_the_smallest_containing_spaceship() {
+        let large_body = VoxelPhysicsBody {
+            local_center: Vec3::ZERO,
+            cells: vec![(IVec3::ZERO, 1), (IVec3::splat(20), 1)],
+        };
+        let small_body = VoxelPhysicsBody {
+            local_center: Vec3::ZERO,
+            cells: vec![(IVec3::ZERO, 1), (IVec3::splat(2), 1)],
+        };
+        let transform = Transform::default();
+        let position = Vec3::splat(VOXEL_SIZE);
+
+        let large_volume =
+            voxel_spaceship_contains_position(&large_body, &transform, position).unwrap();
+        let small_volume =
+            voxel_spaceship_contains_position(&small_body, &transform, position).unwrap();
+
+        assert!(small_volume < large_volume);
+        assert!(voxel_spaceship_contains_position(
+            &small_body,
+            &transform,
+            Vec3::splat(10.0)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn teleporter_labels_static_player_areas() {
+        assert_eq!(
+            voxel_teleport_static_area_label(RESEARCH_STATION_CENTER.as_vec3() * VOXEL_SIZE),
+            "Niffy女皇号空间站"
+        );
+        assert_eq!(
+            voxel_teleport_static_area_label(ABANDONED_STATION_CENTER.as_vec3() * VOXEL_SIZE),
+            "废弃空间站"
+        );
+        assert_eq!(
+            voxel_teleport_static_area_label(Vec3::splat(100_000.0)),
+            "外部空间"
         );
     }
 
