@@ -197,7 +197,7 @@ const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
 const VOXEL_SPACESHIP_SAVE_SECONDS: f32 = 1.0;
-const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 4;
+const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 5;
 const COMBAT_SPACESHIP_ID: &str = "usi-arrogance";
 const MEDIUM_SPACESHIP_ID: &str = "medium-ship-01";
 const SMALL_SPACESHIP_COUNT: usize = 6;
@@ -228,14 +228,14 @@ const HANGAR_REAR_Z: i32 = -48;
 const HANGAR_MOUTH_Z: i32 = 60;
 const HANGAR_CEILING_Y: i32 = WORKBOOK_ROOM_HEIGHT * ARROGANCE_SCALE;
 const HANGAR_PARKING_Y: i32 = ARROGANCE_SCALE;
-const HANGAR_PARKING_Z: i32 = -20;
+const HANGAR_PARKING_Z: i32 = 8;
 const HANGAR_DOCK_CLEARANCE_CELLS: f32 = 6.0;
 const HANGAR_DOCK_MAX_RELATIVE_SPEED: f32 = 1.0;
 const HANGAR_DOCK_MAX_RELATIVE_ANGULAR_SPEED: f32 = 0.35;
 const ARROGANCE_CAB_FLOOR_Y: i32 = 3;
 const ARROGANCE_CAB_CEILING_Y: i32 = 12;
-const ARROGANCE_CAB_FRONT_Z: i32 = HANGAR_REAR_Z - 24;
-const ARROGANCE_CAB_REAR_Z: i32 = HANGAR_REAR_Z - 4;
+const ARROGANCE_CAB_FRONT_Z: i32 = HANGAR_REAR_Z + 4;
+const ARROGANCE_CAB_REAR_Z: i32 = ARROGANCE_CAB_FRONT_Z + 20;
 const ARROGANCE_CAB_MAX_HALF_WIDTH: i32 = 12;
 const DEFAULT_COLLISION_LAYER_BITS: u32 = 1 << 0;
 const CARRIER_COLLISION_LAYER_BITS: u32 = 1 << 1;
@@ -4617,13 +4617,9 @@ fn combat_spaceship_cab_half_width(z: i32) -> i32 {
 fn combat_spaceship_cab_interior_contains(cell: IVec3) -> bool {
     let clear_height =
         (ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y).contains(&cell.y);
-    if !clear_height {
-        return false;
-    }
-    if (ARROGANCE_CAB_FRONT_Z + 1..=ARROGANCE_CAB_REAR_Z).contains(&cell.z) {
-        return cell.x.abs() < combat_spaceship_cab_half_width(cell.z);
-    }
-    (ARROGANCE_CAB_REAR_Z + 1..HANGAR_REAR_Z).contains(&cell.z) && cell.x.abs() < 2
+    clear_height
+        && (ARROGANCE_CAB_FRONT_Z + 1..=ARROGANCE_CAB_REAR_Z).contains(&cell.z)
+        && cell.x.abs() < combat_spaceship_cab_half_width(cell.z)
 }
 
 fn combat_spaceship_cab_cells() -> HashMap<IVec3, u8> {
@@ -4669,8 +4665,8 @@ fn combat_spaceship_cab_cells() -> HashMap<IVec3, u8> {
         }
     }
 
-    // Close the rear around a three-cell-wide personnel door, then bridge the
-    // short armored neck to the hangar without intruding into its flight path.
+    // Close the rear around a three-cell-wide personnel door. The cab now sits
+    // directly in the carved hangar, so the door opens straight into the bay.
     for x in -ARROGANCE_CAB_MAX_HALF_WIDTH..=ARROGANCE_CAB_MAX_HALF_WIDTH {
         for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
             if x.abs() > 1 || y >= ARROGANCE_CAB_CEILING_Y - 2 {
@@ -4679,22 +4675,6 @@ fn combat_spaceship_cab_cells() -> HashMap<IVec3, u8> {
                     7,
                 );
             }
-        }
-    }
-    for z in ARROGANCE_CAB_REAR_Z + 1..HANGAR_REAR_Z {
-        for x in -2..=2 {
-            cells.insert(
-                IVec3::new(x, ARROGANCE_CAB_FLOOR_Y, z),
-                7,
-            );
-            cells.insert(
-                IVec3::new(x, ARROGANCE_CAB_CEILING_Y, z),
-                7,
-            );
-        }
-        for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
-            cells.insert(IVec3::new(-2, y, z), 7);
-            cells.insert(IVec3::new(2, y, z), 7);
         }
     }
 

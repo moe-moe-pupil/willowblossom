@@ -227,7 +227,7 @@ fn hangar_parked_cell(cell: IVec3, berth: IVec3) -> IVec3 {
 }
 
 #[test]
-fn arrogance_has_an_enclosed_furnished_cab_forward_of_the_hangar() {
+fn arrogance_has_an_enclosed_furnished_cab_inside_the_hangar() {
     let cells = combat_spaceship_voxel_cells()
         .into_iter()
         .collect::<HashMap<_, _>>();
@@ -265,10 +265,13 @@ fn arrogance_has_an_enclosed_furnished_cab_forward_of_the_hangar() {
     }
 
     let eye = default_voxel_spaceship_specs()[0].ship.cockpit_eye_local / VOXEL_SIZE;
-    assert!(eye.z < HANGAR_REAR_Z as f32);
+    assert!((HANGAR_REAR_Z as f32..HANGAR_MOUTH_Z as f32).contains(&eye.z));
     assert!(eye.y > ARROGANCE_CAB_FLOOR_Y as f32);
     assert!(eye.y < ARROGANCE_CAB_CEILING_Y as f32);
     assert!(!cells.contains_key(&eye.floor().as_ivec3()));
+    assert!(combat_spaceship_cab_cells()
+        .keys()
+        .all(|cell| combat_spaceship_hangar_contains(*cell)));
     for z in ARROGANCE_CAB_FRONT_Z + 4..ARROGANCE_CAB_REAR_Z {
         for y in ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y {
             assert!(
@@ -329,7 +332,7 @@ fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
         .collect::<HashSet<_>>();
 
     // The carrier remains the enlarged workbook hull, with only its hangar
-    // carved out and a compact bridge fitted forward of the hangar.
+    // carved out and a compact bridge fitted inside its forward end.
     for (cell, material) in &carrier_cells {
         assert!(
             scaled_original.get(cell) == Some(material) || cab.get(cell) == Some(material),
@@ -372,7 +375,8 @@ fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
         for y in HANGAR_PARKING_Y..HANGAR_CEILING_Y {
             for z in HANGAR_REAR_Z..=HANGAR_MOUTH_Z {
                 assert!(
-                    !carrier.contains(&IVec3::new(x, y, z)),
+                    !carrier.contains(&IVec3::new(x, y, z))
+                        || cab.contains_key(&IVec3::new(x, y, z)),
                     "the carved hangar contains an internal parking box at {x}, {y}, {z}"
                 );
             }
