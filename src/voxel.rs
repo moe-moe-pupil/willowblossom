@@ -665,6 +665,22 @@ struct VoxelSpaceshipDocked {
     local_rotation: [f32; 4],
 }
 
+#[derive(Resource, Default)]
+struct VoxelSpaceshipPassengerMotion {
+    previous_ship_transforms: HashMap<String, Transform>,
+    camera_store_dirty: bool,
+    persist_elapsed: f32,
+}
+
+#[derive(Clone)]
+struct VoxelSpaceshipMotion {
+    id: String,
+    previous: Transform,
+    current: Transform,
+    local_min: Vec3,
+    local_max: Vec3,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PersistedVoxelSpaceship {
     id: String,
@@ -1975,6 +1991,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelGeometryDirtyChunks>()
         .init_resource::<VoxelScenePersistenceState>()
         .init_resource::<VoxelSpaceshipControlState>()
+        .init_resource::<VoxelSpaceshipPassengerMotion>()
         .init_resource::<VoxelSpaceshipPersistenceState>()
         .init_resource::<VoxelMinimapSnapshot>()
         .init_resource::<VoxelReplayOcclusionFade>()
@@ -2043,6 +2060,7 @@ impl Plugin for TrpgVoxelPlugin {
                         control_voxel_spaceships,
                         dock_idle_voxel_spaceships,
                         sync_docked_voxel_spaceships,
+                        carry_voxel_players_with_spaceships,
                         control_first_person_player,
                         control_voxel_camera
                             .run_if(crate::replay::replay_mouse_interaction_inactive),
@@ -5643,6 +5661,164 @@ fn sync_docked_voxel_spaceships(
         );
         angular.0 = carrier_angular.0;
         *transform = world_transform;
+    }
+}
+
+fn voxel_spaceship_local_bounds(body: &VoxelPhysicsBody) -> Option<(Vec3, Vec3)> {
+    let min = body.cells.iter().map(|(cell, _)| *cell).reduce(IVec3::min)?;
+    let max = body.cells.iter().map(|(cell, _)| *cell).reduce(IVec3::max)?;
+    Some((
+        min.as_vec3() * VOXEL_SIZE,
+        (max + IVec3::ONE).as_vec3() * VOXEL_SIZE,
+    ))
+}
+
+fn carried_transform_in_innermost_spaceship(
+    transform: &Transform,
+    ships: &[VoxelSpaceshipMotion],
+) -> Option<Transform> {
+    let ship = ships
+        .iter()
+        .filter_map(|ship| {
+            let local_position = ship
+                .previous
+                .compute_affine()
+                .inverse()
+                .transform_point3(transform.translation);
+            let inside = local_position.cmpge(ship.local_min).all()
+                && local_position.cmple(ship.local_max).all();
+            inside.then(|| {
+                let size = ship.local_max - ship.local_min;
+                (size.x * size.y * size.z, ship, local_position)
+            })
+        })
+        .min_by(|left, right| left.0.total_cmp(&right.0))?;
+    let rotation_delta = ship.1.current.rotation * ship.1.previous.rotation.inverse();
+    Some(Transform {
+        translation: ship
+            .1
+            .current
+            .compute_affine()
+            .transform_point3(ship.2),
+        rotation: (rotation_delta * transform.rotation).normalize(),
+        scale: transform.scale,
+    })
+}
+
+fn carry_voxel_players_with_spaceships(
+    time: Res<Time>,
+    mut passenger_motion: ResMut<VoxelSpaceshipPassengerMotion>,
+    spaceships: Query<
+        (&VoxelSpaceship, &VoxelPhysicsBody, &Transform),
+        (
+            Without<VoxelFirstPersonPlayer>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
+    mut capture_cameras: Query<
+        (&VoxelPlayerCaptureCamera, &mut Transform),
+        (
+            Without<VoxelFirstPersonPlayer>,
+            Without<VoxelSpaceship>,
+        ),
+    >,
+    mut players: Query<
+        &mut Transform,
+        (
+            With<VoxelFirstPersonPlayer>,
+            Without<VoxelPlayerCaptureCamera>,
+            Without<VoxelSpaceship>,
+        ),
+    >,
+    mut editor: ResMut<VoxelEditorState>,
+    mut possession: ResMut<VoxelPossessionState>,
+    mut camera_store: ResMut<Persistent<VoxelPlayerCameraStore>>,
+) {
+    let motions = spaceships
+        .iter()
+        .filter_map(|(ship, body, current)| {
+            let (local_min, local_max) = voxel_spaceship_local_bounds(body)?;
+            let previous = passenger_motion
+                .previous_ship_transforms
+                .get(&ship.id)
+                .copied()
+                .unwrap_or(*current);
+            Some(VoxelSpaceshipMotion {
+                id: ship.id.clone(),
+                previous,
+                current: *current,
+                local_min,
+                local_max,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for (camera, mut transform) in &mut capture_cameras {
+        let Some(carried) = carried_transform_in_innermost_spaceship(&transform, &motions) else {
+            continue;
+        };
+        if transform.translation.abs_diff_eq(carried.translation, f32::EPSILON)
+            && transform.rotation.abs_diff_eq(carried.rotation, f32::EPSILON)
+        {
+            continue;
+        }
+        *transform = carried;
+        upsert_voxel_player_camera(&mut camera_store, camera.user_id, &transform);
+        passenger_motion.camera_store_dirty = true;
+    }
+
+    for mut transform in &mut players {
+        let previous_rotation = transform.rotation;
+        let Some(carried) = carried_transform_in_innermost_spaceship(&transform, &motions) else {
+            continue;
+        };
+        if transform.translation.abs_diff_eq(carried.translation, f32::EPSILON)
+            && transform.rotation.abs_diff_eq(carried.rotation, f32::EPSILON)
+        {
+            continue;
+        }
+        let view_rotation = Quat::from_euler(
+            EulerRot::YXZ,
+            editor.camera_yaw,
+            editor.camera_pitch,
+            0.0,
+        );
+        let carried_view = carried.rotation * previous_rotation.inverse() * view_rotation;
+        let (yaw, pitch, _) = carried_view.to_euler(EulerRot::YXZ);
+        editor.camera_yaw = yaw;
+        editor.camera_pitch = pitch.clamp(-1.5, 1.5);
+        if let Some(previous) = possession.last_player_position {
+            if let Some(carried_previous) = carried_transform_in_innermost_spaceship(
+                &Transform::from_translation(previous),
+                &motions,
+            ) {
+                possession.last_player_position = Some(carried_previous.translation);
+            }
+        }
+        if let Some(turn_start) = possession.turn_start_position {
+            if let Some(carried_turn_start) = carried_transform_in_innermost_spaceship(
+                &Transform::from_translation(turn_start),
+                &motions,
+            ) {
+                possession.turn_start_position = Some(carried_turn_start.translation);
+            }
+        }
+        *transform = carried;
+    }
+
+    passenger_motion.previous_ship_transforms = motions
+        .into_iter()
+        .map(|motion| (motion.id, motion.current))
+        .collect();
+    if passenger_motion.camera_store_dirty {
+        passenger_motion.persist_elapsed += time.delta_secs();
+        if passenger_motion.persist_elapsed >= 0.5 {
+            passenger_motion.persist_elapsed = 0.0;
+            passenger_motion.camera_store_dirty = false;
+            if let Err(err) = camera_store.persist() {
+                eprintln!("failed to persist carried voxel player cameras: {err}");
+            }
+        }
     }
 }
 

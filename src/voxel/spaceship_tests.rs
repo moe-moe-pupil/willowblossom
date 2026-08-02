@@ -686,6 +686,55 @@ fn docked_ships_follow_carrier_launch_with_inertia_and_can_park_again() {
 }
 
 #[test]
+fn players_follow_the_innermost_ship_without_needing_a_floor_contact() {
+    let carrier = VoxelSpaceshipMotion {
+        id: COMBAT_SPACESHIP_ID.to_owned(),
+        previous: Transform::IDENTITY,
+        current: Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
+        local_min: Vec3::splat(-20.0),
+        local_max: Vec3::splat(20.0),
+    };
+    let parked_ship = VoxelSpaceshipMotion {
+        id: "small-ship-01".to_owned(),
+        previous: Transform::IDENTITY,
+        current: Transform::from_translation(Vec3::new(10.0, 0.0, 5.0))
+            .with_rotation(Quat::from_rotation_y(0.5)),
+        local_min: Vec3::splat(-2.0),
+        local_max: Vec3::splat(2.0),
+    };
+    // The player is floating inside both volumes, with no floor/collision query.
+    let player = Transform::from_translation(Vec3::new(0.0, 1.5, 0.0));
+
+    let carried = carried_transform_in_innermost_spaceship(
+        &player,
+        &[carrier, parked_ship.clone()],
+    )
+    .unwrap();
+    let expected = parked_ship
+        .current
+        .compute_affine()
+        .transform_point3(player.translation);
+
+    assert!(carried.translation.abs_diff_eq(expected, 0.000_01));
+    assert!(carried
+        .rotation
+        .abs_diff_eq(parked_ship.current.rotation, 0.000_01));
+}
+
+#[test]
+fn spaceship_occupant_bounds_use_canonical_voxel_extents() {
+    let body = VoxelPhysicsBody {
+        local_center: Vec3::ZERO,
+        cells: vec![(IVec3::new(-2, 1, 4), 1), (IVec3::new(3, 5, 8), 1)],
+    };
+
+    let (min, max) = voxel_spaceship_local_bounds(&body).unwrap();
+
+    assert_eq!(min, IVec3::new(-2, 1, 4).as_vec3() * VOXEL_SIZE);
+    assert_eq!(max, IVec3::new(4, 6, 9).as_vec3() * VOXEL_SIZE);
+}
+
+#[test]
 fn spaceship_takeover_item_uses_the_assigned_pilot_identity() {
     let mut editor = VoxelEditorState::default();
     editor.put_in_selected_hotbar(VoxelCreativeItem::SpaceshipPossessionTool);
