@@ -197,7 +197,7 @@ const FIRST_PERSON_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_DOUBLE_TAP_SECONDS: f32 = 0.32;
 const DEFAULT_POSSESSION_MOVEMENT_BONUS: f32 = 10.0;
 const VOXEL_SPACESHIP_SAVE_SECONDS: f32 = 1.0;
-const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 5;
+const VOXEL_SPACESHIP_LAYOUT_REVISION: u32 = 6;
 const COMBAT_SPACESHIP_ID: &str = "usi-arrogance";
 const MEDIUM_SPACESHIP_ID: &str = "medium-ship-01";
 const SMALL_SPACESHIP_COUNT: usize = 6;
@@ -228,7 +228,7 @@ const HANGAR_REAR_Z: i32 = -48;
 const HANGAR_MOUTH_Z: i32 = 60;
 const HANGAR_CEILING_Y: i32 = WORKBOOK_ROOM_HEIGHT * ARROGANCE_SCALE;
 const HANGAR_PARKING_Y: i32 = ARROGANCE_SCALE;
-const HANGAR_PARKING_Z: i32 = 8;
+const HANGAR_PARKING_Z: i32 = -20;
 const HANGAR_DOCK_CLEARANCE_CELLS: f32 = 6.0;
 const HANGAR_DOCK_MAX_RELATIVE_SPEED: f32 = 1.0;
 const HANGAR_DOCK_MAX_RELATIVE_ANGULAR_SPEED: f32 = 0.35;
@@ -237,6 +237,9 @@ const ARROGANCE_CAB_CEILING_Y: i32 = 12;
 const ARROGANCE_CAB_FRONT_Z: i32 = HANGAR_REAR_Z + 4;
 const ARROGANCE_CAB_REAR_Z: i32 = ARROGANCE_CAB_FRONT_Z + 20;
 const ARROGANCE_CAB_MAX_HALF_WIDTH: i32 = 12;
+// Move the complete cab by (-72, +3, -1) world units while keeping every
+// surface, fixture, collider voxel, and cockpit point on the canonical grid.
+const ARROGANCE_CAB_TRANSLATION_CELLS: IVec3 = IVec3::new(-288, 12, -4);
 const DEFAULT_COLLISION_LAYER_BITS: u32 = 1 << 0;
 const CARRIER_COLLISION_LAYER_BITS: u32 = 1 << 1;
 const DOCKED_SPACESHIP_COLLISION_LAYER_BITS: u32 = 1 << 2;
@@ -4615,6 +4618,7 @@ fn combat_spaceship_cab_half_width(z: i32) -> i32 {
 }
 
 fn combat_spaceship_cab_interior_contains(cell: IVec3) -> bool {
+    let cell = cell - ARROGANCE_CAB_TRANSLATION_CELLS;
     let clear_height =
         (ARROGANCE_CAB_FLOOR_Y + 1..ARROGANCE_CAB_CEILING_Y).contains(&cell.y);
     clear_height
@@ -4717,6 +4721,9 @@ fn combat_spaceship_cab_cells() -> HashMap<IVec3, u8> {
         }
     }
     cells
+        .into_iter()
+        .map(|(cell, material)| (cell + ARROGANCE_CAB_TRANSLATION_CELLS, material))
+        .collect()
 }
 
 fn scale_combat_spaceship_cell(cell: IVec3) -> IVec3 {
@@ -5245,11 +5252,12 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
             id: COMBAT_SPACESHIP_ID.to_owned(),
             name: "U.S.I 狂妄号".to_owned(),
             class: VoxelSpaceshipClass::Cruiser,
-            cockpit_eye_local: Vec3::new(
+            cockpit_eye_local: (Vec3::new(
                 0.0,
                 ARROGANCE_CAB_FLOOR_Y as f32 + 3.5,
                 ARROGANCE_CAB_FRONT_Z as f32 + 9.5,
-            ) * VOXEL_SIZE,
+            ) + ARROGANCE_CAB_TRANSLATION_CELLS.as_vec3())
+                * VOXEL_SIZE,
             thrust_acceleration: 2.4,
             vertical_acceleration: 1.4,
             turn_speed: 0.32,
