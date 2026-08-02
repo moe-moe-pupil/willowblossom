@@ -5327,6 +5327,10 @@ fn carrier_collision_layers() -> CollisionLayers {
     CollisionLayers::from_bits(CARRIER_COLLISION_LAYER_BITS, u32::MAX)
 }
 
+fn moving_voxel_spaceship_collision_layers() -> CollisionLayers {
+    CollisionLayers::from_bits(DEFAULT_COLLISION_LAYER_BITS, u32::MAX)
+}
+
 fn docked_voxel_spaceship_collision_layers() -> CollisionLayers {
     CollisionLayers::from_bits(
         DOCKED_SPACESHIP_COLLISION_LAYER_BITS,
@@ -5577,6 +5581,7 @@ fn spawn_voxel_spaceship(
             },
             rigid_body,
             canonical_voxel_collider(&collider_cells),
+            SweptCcd::default(),
             GravityScale(0.0),
             Friction::new(0.25),
             Restitution::new(0.05),
@@ -5626,6 +5631,10 @@ fn spawn_voxel_spaceship(
         ));
     } else if spec.ship.id == COMBAT_SPACESHIP_ID {
         commands.entity(entity).insert(carrier_collision_layers());
+    } else {
+        commands
+            .entity(entity)
+            .insert(moving_voxel_spaceship_collision_layers());
     }
     if let Some(features) = &spec.workbook_features {
         commands.entity(entity).insert(features.clone());
@@ -5793,9 +5802,12 @@ fn release_controlled_docked_spaceship(
     *transform = world_transform;
     commands
         .entity(entity)
-        .insert(RigidBody::Dynamic)
-        .remove::<VoxelSpaceshipDocked>()
-        .remove::<CollisionLayers>();
+        .insert((
+            RigidBody::Dynamic,
+            SweptCcd::default(),
+            moving_voxel_spaceship_collision_layers(),
+        ))
+        .remove::<VoxelSpaceshipDocked>();
 }
 
 fn sync_docked_voxel_spaceships(
@@ -17118,12 +17130,13 @@ mod tests {
             &RigidBody,
             &GravityScale,
             &Collider,
+            &SweptCcd,
             Option<&VoxelSpaceshipDocked>,
             Option<&CollisionLayers>,
         ), With<VoxelSpaceship>>();
         let bodies = query.iter(app.world()).collect::<Vec<_>>();
         assert_eq!(bodies.len(), SMALL_SPACESHIP_COUNT + 2);
-        for (ship, body, gravity_scale, collider, docking, collision_layers) in bodies {
+        for (ship, body, gravity_scale, collider, _, docking, collision_layers) in bodies {
             if ship.id == COMBAT_SPACESHIP_ID {
                 assert_eq!(*body, RigidBody::Dynamic);
                 assert!(docking.is_none());

@@ -779,7 +779,15 @@ fn docked_ships_follow_carrier_launch_with_inertia_and_can_park_again() {
         RigidBody::Dynamic
     );
     assert!(!launched.contains::<VoxelSpaceshipDocked>());
-    assert!(!launched.contains::<CollisionLayers>());
+    assert!(launched.contains::<SweptCcd>());
+    let moving_layers = *launched.get::<CollisionLayers>().unwrap();
+    assert_eq!(
+        moving_layers,
+        moving_voxel_spaceship_collision_layers()
+    );
+    assert!(moving_layers.interacts_with(CollisionLayers::DEFAULT));
+    assert!(moving_layers.interacts_with(carrier_collision_layers()));
+    assert!(moving_layers.interacts_with(moving_voxel_spaceship_collision_layers()));
     assert!(launched
         .get::<LinearVelocity>()
         .unwrap()
