@@ -169,6 +169,10 @@ const MAX_SCENE_SNAPSHOTS: usize = 20;
 const VOXEL_SCENE_AUTOSAVE_SECONDS: f32 = 30.0;
 const VOXEL_SCENE_LAYOUT_REVISION: u32 = 4;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
+/// Spaceship hull voxels are partitioned into chunks of this edge length, so a
+/// local edit only rebuilds the few chunks the brush touched instead of the
+/// whole ship mesh.
+const VOXEL_SPACESHIP_CHUNK_DIMS: i32 = 8;
 pub(crate) const VOXEL_GLASS_MATERIAL: u8 = 11;
 const VOXEL_GLASS_OPACITY: f32 = 0.05;
 const VOXEL_MATERIAL_COUNT: usize = VOXEL_GLASS_MATERIAL as usize;
@@ -584,7 +588,7 @@ struct PendingVoxelPlayerCapture {
 }
 
 #[derive(Component)]
-struct VoxelGeometry {
+pub(crate) struct VoxelGeometry {
     chunk: IVec3,
 }
 
@@ -613,23 +617,26 @@ struct VoxelMicroTile {
 }
 
 #[derive(Resource, Clone, Debug, Default)]
-struct VoxelMicroDecorations {
+pub(crate) struct VoxelMicroDecorations {
     tiles: Vec<VoxelMicroTile>,
 }
 
 #[derive(Resource, Default)]
-struct VoxelGeometryDirtyChunks {
-    chunks: HashSet<IVec3>,
+pub(crate) struct VoxelGeometryDirtyChunks {
+    pub(crate) chunks: HashSet<IVec3>,
 }
 
 #[derive(SystemParam)]
-struct VoxelEditRuntime<'w> {
+struct VoxelEditRuntime<'w, 's> {
     editor: ResMut<'w, VoxelEditorState>,
     dirty_chunks: ResMut<'w, VoxelGeometryDirtyChunks>,
+    occupancy: ResMut<'w, VoxelSpaceshipOccupancyCache>,
+    chunk_parents: Query<'w, 's, &'static ChildOf, With<VoxelSpaceshipChunk>>,
+    scene_recorder: Option<ResMut<'w, crate::replay::ReplaySceneRecorder>>,
 }
 
 impl VoxelGeometryDirtyChunks {
-    fn mark_cell_and_neighbors(&mut self, cell: IVec3) {
+    pub(crate) fn mark_cell_and_neighbors(&mut self, cell: IVec3) {
         let chunk = cell.div_euclid(DIMS);
         self.chunks.insert(chunk);
         let local = cell.rem_euclid(DIMS);
@@ -650,8 +657,8 @@ impl VoxelGeometryDirtyChunks {
 
 #[derive(Component, Clone)]
 pub(crate) struct VoxelPhysicsBody {
-    local_center: Vec3,
-    cells: Vec<(IVec3, u8)>,
+    pub(crate) local_center: Vec3,
+    pub(crate) cells: Vec<(IVec3, u8)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -677,8 +684,8 @@ impl VoxelSpaceshipClass {
 
 #[derive(Component, Clone)]
 pub(crate) struct VoxelSpaceship {
-    id: String,
-    name: String,
+    pub(crate) id: String,
+    pub(crate) name: String,
     class: VoxelSpaceshipClass,
     cockpit_eye_local: Vec3,
     /// Local unit direction from the stern toward the bow. Most ships are
@@ -691,6 +698,126 @@ pub(crate) struct VoxelSpaceship {
     vertical_acceleration: f32,
     turn_speed: f32,
     max_speed: f32,
+}
+
+/// Marker on a spaceship's hull voxel mesh children, so in-place local edits
+/// can rebuild exactly the surfaces derived from `VoxelPhysicsBody.cells`.
+#[derive(Component)]
+struct VoxelSpaceshipHullMesh;
+
+/// The workbook micro tiles owned by a spaceship, plus their mesh children.
+/// Kept on the entity so local hull edits can drop decorations whose owner
+/// voxel was removed.
+#[derive(Component)]
+pub(crate) struct VoxelSpaceshipMicroTiles {
+    tiles: Vec<VoxelMicroTile>,
+    meshes: Vec<Entity>,
+}
+
+/// A hull chunk of a spaceship. Each chunk owns its local voxel mesh children
+/// (`VoxelSpaceshipHullMesh`), so an edit rebuilds only the touched chunks.
+#[derive(Component)]
+pub(crate) struct VoxelSpaceshipChunk {
+    surfaces: Vec<Entity>,
+}
+
+/// Maps each spaceship's chunk grid index to its chunk entity.
+#[derive(Component)]
+pub(crate) struct VoxelSpaceshipChunks(pub(crate) HashMap<IVec3, Entity>);
+
+/// Marks a spaceship whose voxel cells changed this frame. The cheap cell edit
+/// path only inserts this marker; a dedicated system rebuilds the touched hull
+/// chunks and, once the stroke ends, re-syncs the body cells and collider.
+#[derive(Component)]
+pub(crate) struct VoxelSpaceshipNeedsRebuild;
+
+/// Live occupancy for spaceship editing. The editor mutates this map directly
+/// (O(brush^3) per tick) and raycasts against it, so hold-to-edit never
+/// depends on a freshly rebuilt collider. `VoxelPhysicsBody.cells`, the
+/// collider, and the hull meshes are re-synced from this map when the rebuild
+/// system runs.
+#[derive(Resource, Default)]
+pub(crate) struct VoxelSpaceshipOccupancyCache {
+    pub(crate) ships: HashMap<Entity, VoxelSpaceshipOccupancy>,
+}
+
+pub(crate) struct VoxelSpaceshipOccupancy {
+    /// Occupied cells bucketed by hull chunk, so edit ticks and chunk rebuilds
+    /// touch only the cells they actually changed.
+    pub(crate) chunks: HashMap<IVec3, HashMap<IVec3, u8>>,
+    pub(crate) dirty_chunks: HashSet<IVec3>,
+    pub(crate) cells_dirty: bool,
+}
+
+impl VoxelSpaceshipOccupancy {
+    fn empty() -> Self {
+        Self {
+            chunks: HashMap::new(),
+            dirty_chunks: HashSet::new(),
+            cells_dirty: false,
+        }
+    }
+
+    pub(crate) fn contains_cell(&self, cell: IVec3) -> bool {
+        self.chunks
+            .get(&cell.div_euclid(IVec3::splat(VOXEL_SPACESHIP_CHUNK_DIMS)))
+            .is_some_and(|cells| cells.contains_key(&cell))
+    }
+
+    pub(crate) fn cell_material(&self, cell: IVec3) -> Option<u8> {
+        self.chunks
+            .get(&cell.div_euclid(IVec3::splat(VOXEL_SPACESHIP_CHUNK_DIMS)))
+            .and_then(|cells| cells.get(&cell).copied())
+    }
+
+    pub(crate) fn set_cell(&mut self, cell: IVec3, material: u8) {
+        self.chunks
+            .entry(cell.div_euclid(IVec3::splat(VOXEL_SPACESHIP_CHUNK_DIMS)))
+            .or_default()
+            .insert(cell, material);
+        self.dirty_chunks
+            .insert(cell.div_euclid(IVec3::splat(VOXEL_SPACESHIP_CHUNK_DIMS)));
+    }
+
+    pub(crate) fn remove_cell(&mut self, cell: IVec3) {
+        let index = cell.div_euclid(IVec3::splat(VOXEL_SPACESHIP_CHUNK_DIMS));
+        if let Some(chunk) = self.chunks.get_mut(&index) {
+            chunk.remove(&cell);
+            if chunk.is_empty() {
+                self.chunks.remove(&index);
+            }
+        }
+        self.dirty_chunks.insert(index);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool { self.chunks.is_empty() }
+}
+
+impl VoxelSpaceshipOccupancyCache {
+    /// Replaces a ship's live hull occupancy with `cells` (local voxel cells
+    /// in ship space) and marks every touched chunk for a rebuild, so replay
+    /// playback can apply recorded hull destruction to the live ship.
+    pub(crate) fn replace_ship_cells(&mut self, entity: Entity, cells: &[(IVec3, u8)]) {
+        let previous_chunks = self
+            .ships
+            .get(&entity)
+            .map(|entry| entry.chunks.keys().copied().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        let mut entry = VoxelSpaceshipOccupancy::empty();
+        for &(cell, material) in cells {
+            if material != 0 {
+                entry
+                    .chunks
+                    .entry(cell.div_euclid(IVec3::splat(VOXEL_SPACESHIP_CHUNK_DIMS)))
+                    .or_default()
+                    .insert(cell, material);
+            }
+        }
+        entry.dirty_chunks.extend(previous_chunks);
+        entry.dirty_chunks.extend(entry.chunks.keys().copied());
+        entry.cells_dirty = true;
+        self.ships.insert(entity, entry);
+    }
 }
 
 #[derive(Clone)]
@@ -1309,7 +1436,7 @@ struct VoxelAutoDoor {
 }
 
 #[derive(Resource)]
-struct VoxelMaterials {
+pub(crate) struct VoxelMaterials {
     handles: [Handle<StandardMaterial>; VOXEL_MATERIAL_COUNT],
     planet_ocean: Handle<StandardMaterial>,
 }
@@ -2100,6 +2227,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelToolGunDragState>()
         .init_resource::<VoxelPhysicsChunkLoader>()
         .init_resource::<VoxelGeometryDirtyChunks>()
+        .init_resource::<VoxelSpaceshipOccupancyCache>()
         .init_resource::<VoxelScenePersistenceState>()
         .init_resource::<VoxelSpaceshipControlState>()
         .init_resource::<VoxelSpaceshipPassengerMotion>()
@@ -2146,6 +2274,7 @@ impl Plugin for TrpgVoxelPlugin {
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
                     sync_selected_voxel_light,
                     edit_voxel_grid.run_if(crate::replay::replay_mouse_interaction_inactive),
+                    rebuild_dirty_voxel_spaceships,
                     despawn_unsupported_voxel_auto_doors,
                     use_voxel_teleport_tool
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
@@ -5845,6 +5974,21 @@ fn docked_voxel_spaceship_collision_layers() -> CollisionLayers {
     )
 }
 
+/// Applies a collision-layers configuration to a spaceship and every hull
+/// chunk child, so the chunked colliders obey the same carrier/docked/moving
+/// interaction rules as the ship entity itself.
+fn insert_voxel_spaceship_collision_layers(
+    commands: &mut Commands,
+    ship: Entity,
+    chunks: &HashMap<IVec3, Entity>,
+    layers: CollisionLayers,
+) {
+    commands.entity(ship).insert(layers);
+    for chunk in chunks.values() {
+        commands.entity(*chunk).insert(layers);
+    }
+}
+
 fn default_docked_voxel_spaceship_transform(berth: IVec3) -> Transform {
     Transform::from_translation((COMBAT_SPACESHIP_CENTER + berth).as_vec3() * VOXEL_SIZE)
         .with_rotation(Quat::from_rotation_y(
@@ -6079,9 +6223,11 @@ fn spawn_voxel_spaceship(
         .reduce(IVec3::max)
         .unwrap_or(IVec3::ZERO);
     let local_center = (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE;
-    let (material_meshes, _) = build_voxel_meshes_from_cells(&spec.cells);
     let micro_meshes = build_micro_tile_meshes(&spec.micro_tiles);
     let rigid_body = if docking.is_some() { RigidBody::Kinematic } else { RigidBody::Dynamic };
+    let mut chunk_entities = HashMap::new();
+    let mut created_chunks = Vec::new();
+    let mut micro_children = Vec::new();
     let entity = commands
         .spawn((
             Name::new(spec.ship.name.clone()),
@@ -6091,7 +6237,6 @@ fn spawn_voxel_spaceship(
                 cells: spec.cells.clone(),
             },
             rigid_body,
-            canonical_voxel_collider(&collider_cells),
             SweptCcd::default(),
             GravityScale(0.0),
             Friction::new(0.25),
@@ -6104,18 +6249,65 @@ fn spawn_voxel_spaceship(
             Visibility::Visible,
         ))
         .with_children(|parent| {
-            for (material_id, mesh) in material_meshes {
-                parent.spawn((
-                    Mesh3d(meshes.add(mesh)),
-                    MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
-                ));
+            let mut chunk_cells: HashMap<IVec3, Vec<(IVec3, u8)>> = HashMap::new();
+            for &(cell, material) in &spec.cells {
+                chunk_cells
+                    .entry(cell.div_euclid(IVec3::splat(VOXEL_SPACESHIP_CHUNK_DIMS)))
+                    .or_default()
+                    .push((cell, material));
+            }
+            for (index, cells) in chunk_cells {
+                let origin = index * VOXEL_SPACESHIP_CHUNK_DIMS;
+                let mut surfaces = Vec::new();
+                let local_cells = cells
+                    .iter()
+                    .map(|(cell, material)| (*cell - origin, *material))
+                    .collect::<Vec<_>>();
+                let local_solid = local_cells
+                    .iter()
+                    .filter_map(|(cell, material)| {
+                        TrpgVoxelConnector::solid(material).then_some(*cell)
+                    })
+                    .collect::<Vec<_>>();
+                let chunk = parent
+                    .spawn((
+                        Name::new(format!("{} hull chunk {index:?}", spec.ship.name)),
+                        Transform::from_translation(origin.as_vec3() * VOXEL_SIZE),
+                        VoxelSpaceshipChunk {
+                            surfaces: Vec::new(),
+                        },
+                    ))
+                    .with_children(|chunk_parent| {
+                        let (material_meshes, _) =
+                            build_voxel_meshes_from_cells(&local_cells);
+                        for (material_id, mesh) in material_meshes {
+                            surfaces.push(
+                                chunk_parent
+                                    .spawn((
+                                        Mesh3d(meshes.add(mesh)),
+                                        MeshMaterial3d(
+                                            materials.handles[material_id as usize - 1].clone(),
+                                        ),
+                                        VoxelSpaceshipHullMesh,
+                                    ))
+                                    .id(),
+                            );
+                        }
+                    })
+                    .id();
+                chunk_entities.insert(index, chunk);
+                created_chunks.push((index, chunk, surfaces, local_solid));
             }
             for (material_id, mesh) in micro_meshes {
-                parent.spawn((
-                    Mesh3d(meshes.add(mesh)),
-                    MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
-                    VoxelMicroDecoration,
-                ));
+                micro_children.push(
+                    parent
+                        .spawn((
+                            Mesh3d(meshes.add(mesh)),
+                            MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
+                            VoxelMicroDecoration,
+                        ))
+                        .id(),
+                );
             }
             if spec.ship.id == COMBAT_SPACESHIP_ID {
                 for panel in voxel_auto_door_panels(&combat_spaceship_cab_door()) {
@@ -6133,20 +6325,50 @@ fn spawn_voxel_spaceship(
             }
         })
         .id();
+    for (_, chunk, surfaces, local_solid) in created_chunks {
+        commands
+            .entity(chunk)
+            .insert(VoxelSpaceshipChunk { surfaces });
+        if !local_solid.is_empty() {
+            commands
+                .entity(chunk)
+                .insert(canonical_voxel_collider(&local_solid));
+        }
+    }
+    if !spec.micro_tiles.is_empty() {
+        commands.entity(entity).insert(VoxelSpaceshipMicroTiles {
+            tiles: spec.micro_tiles.clone(),
+            meshes: micro_children,
+        });
+    }
     if let Some(docking) = docking {
         // The docking layer remains visible to spatial ray queries and collides
         // with default-layer players, but not with the carrier or other berths.
-        commands.entity(entity).insert((
-            docking,
+        commands.entity(entity).insert(docking);
+        insert_voxel_spaceship_collision_layers(
+            commands,
+            entity,
+            &chunk_entities,
             docked_voxel_spaceship_collision_layers(),
-        ));
+        );
     } else if spec.ship.id == COMBAT_SPACESHIP_ID {
-        commands.entity(entity).insert(carrier_collision_layers());
+        insert_voxel_spaceship_collision_layers(
+            commands,
+            entity,
+            &chunk_entities,
+            carrier_collision_layers(),
+        );
     } else {
-        commands
-            .entity(entity)
-            .insert(moving_voxel_spaceship_collision_layers());
+        insert_voxel_spaceship_collision_layers(
+            commands,
+            entity,
+            &chunk_entities,
+            moving_voxel_spaceship_collision_layers(),
+        );
     }
+    commands
+        .entity(entity)
+        .insert(VoxelSpaceshipChunks(chunk_entities));
     if let Some(features) = &spec.workbook_features {
         commands.entity(entity).insert(features.clone());
     }
@@ -6278,6 +6500,7 @@ fn release_controlled_docked_spaceship(
         ),
         With<VoxelSpaceshipDocked>,
     >,
+    ship_chunks: Query<&VoxelSpaceshipChunks>,
 ) {
     let Some(driving_ship_id) = control.driving_ship_id.as_deref() else {
         return;
@@ -6309,12 +6532,15 @@ fn release_controlled_docked_spaceship(
     *transform = world_transform;
     commands
         .entity(entity)
-        .insert((
-            RigidBody::Dynamic,
-            SweptCcd::default(),
-            moving_voxel_spaceship_collision_layers(),
-        ))
+        .insert((RigidBody::Dynamic, SweptCcd::default()))
         .remove::<VoxelSpaceshipDocked>();
+    let layers = moving_voxel_spaceship_collision_layers();
+    commands.entity(entity).insert(layers);
+    if let Ok(chunk_map) = ship_chunks.get(entity) {
+        for chunk in chunk_map.0.values() {
+            commands.entity(*chunk).insert(layers);
+        }
+    }
 }
 
 fn sync_docked_voxel_spaceships(
@@ -6653,6 +6879,7 @@ fn dock_idle_voxel_spaceships(
             Without<VoxelSpaceshipDocked>,
         >,
     )>,
+    ship_chunks: Query<&VoxelSpaceshipChunks>,
 ) {
     let carrier_state = spaceships
         .p0()
@@ -6696,11 +6923,14 @@ fn dock_idle_voxel_spaceships(
         };
         linear.0 = carrier_point_velocity;
         angular.0 = carrier_angular;
-        commands.entity(entity).insert((
-            RigidBody::Kinematic,
-            docking,
-            docked_voxel_spaceship_collision_layers(),
-        ));
+        commands.entity(entity).insert((RigidBody::Kinematic, docking));
+        let layers = docked_voxel_spaceship_collision_layers();
+        commands.entity(entity).insert(layers);
+        if let Ok(chunk_map) = ship_chunks.get(entity) {
+            for chunk in chunk_map.0.values() {
+                commands.entity(*chunk).insert(layers);
+            }
+        }
     }
 }
 
@@ -9750,6 +9980,7 @@ fn use_spaceship_possession_tool(
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
     spaceships: Query<&VoxelSpaceship>,
+    chunk_parents: Query<&ChildOf, With<VoxelSpaceshipChunk>>,
     spatial_query: SpatialQuery,
     store: Res<Persistent<VoxelSpaceshipStore>>,
     mut editor: ResMut<VoxelEditorState>,
@@ -9784,9 +10015,17 @@ fn use_spaceship_possession_tool(
             MAX_RAY_DISTANCE,
             true,
             &SpatialQueryFilter::default(),
-            &|entity| spaceships.contains(entity),
+            &|entity| {
+                spaceships.contains(entity) || chunk_parents.contains(entity)
+            },
         )
-        .and_then(|hit| spaceships.get(hit.entity).ok())
+        .and_then(|hit| {
+            let ship = chunk_parents
+                .get(hit.entity)
+                .map(|parent| parent.0)
+                .unwrap_or(hit.entity);
+            spaceships.get(ship).ok()
+        })
         .map(|ship| (ship.id.clone(), ship.name.clone()));
 
     match selected {
@@ -9958,7 +10197,7 @@ fn stream_voxel_physics_bodies(
     }
 }
 
-fn rebuild_voxel_geometry(
+pub(crate) fn rebuild_voxel_geometry(
     mut commands: Commands,
     grids: Query<&Grid<u8>, (With<TrpgVoxelGrid>, Changed<Grid<u8>>)>,
     old_geometry: Query<(Entity, &VoxelGeometry)>,
@@ -10772,6 +11011,7 @@ fn handle_editor_requests(
     mut editor: ResMut<VoxelEditorState>,
     mut physics_loader: ResMut<VoxelPhysicsChunkLoader>,
     mut persistence: ResMut<VoxelScenePersistenceState>,
+    mut scene_recorder: Option<ResMut<crate::replay::ReplaySceneRecorder>>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     physics_bodies: Query<Entity, With<VoxelPhysicsBody>>,
     placed_lights: Query<Entity, With<VoxelPlacedLight>>,
@@ -10830,14 +11070,24 @@ fn handle_editor_requests(
     }
     if editor.undo_requested {
         if let Some(stroke) = editor.undo.pop() {
-            apply_stroke(&mut grid, &stroke, false);
+            apply_stroke(
+                &mut grid,
+                &stroke,
+                false,
+                scene_recorder.as_deref_mut(),
+            );
             editor.redo.push(stroke);
         }
         editor.undo_requested = false;
     }
     if editor.redo_requested {
         if let Some(stroke) = editor.redo.pop() {
-            apply_stroke(&mut grid, &stroke, true);
+            apply_stroke(
+                &mut grid,
+                &stroke,
+                true,
+                scene_recorder.as_deref_mut(),
+            );
             editor.undo.push(stroke);
         }
         editor.redo_requested = false;
@@ -10848,6 +11098,7 @@ fn make_selection_physical(
     mut commands: Commands,
     mut editor: ResMut<VoxelEditorState>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    mut scene_recorder: Option<ResMut<crate::replay::ReplaySceneRecorder>>,
     mut planets: Query<(
         &mut VoxelOrbitalPlanet,
         &GlobalTransform,
@@ -10931,6 +11182,11 @@ fn make_selection_physical(
 
     for (cell, _) in &selected_voxels {
         grid.set(*cell, 0);
+        crate::replay::record_replay_grid_cell(
+            scene_recorder.as_deref_mut(),
+            *cell,
+            0,
+        );
     }
     spawn_voxel_physics_body(
         &mut commands,
@@ -10994,6 +11250,228 @@ fn physics_body_intersects_radius(
             .distance_squared(origin)
             <= radius_squared
     })
+}
+
+/// Solid ship voxels whose world-space centers fall inside the explosion
+/// sphere. Uses the same canonical cell-center convention as
+/// [`physics_body_intersects_radius`] and the static-grid explosion picker.
+fn voxel_spaceship_cells_in_radius(
+    occupancy: &VoxelSpaceshipOccupancy,
+    transform: &Transform,
+    origin: Vec3,
+    radius: f32,
+) -> Vec<(IVec3, u8)> {
+    let radius = radius.max(VOXEL_SIZE);
+    let radius_squared = radius * radius;
+    let affine = transform.compute_affine();
+    let mut selected = occupancy
+        .chunks
+        .values()
+        .flat_map(|cells| cells.iter())
+        .filter(|(_, material)| TrpgVoxelConnector::solid(material))
+        .filter(|(cell, _)| {
+            let center = (cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
+            affine.transform_point3(center).distance_squared(origin) <= radius_squared
+        })
+        .map(|(cell, material)| (*cell, *material))
+        .collect::<Vec<_>>();
+    selected.sort_unstable_by_key(|(cell, _)| (cell.y, cell.z, cell.x));
+    selected
+}
+
+/// Recomputes the ship-local physics center from the surviving solid cells,
+/// matching the convention used when a spaceship is first spawned.
+fn voxel_spaceship_local_center(cells: &[(IVec3, u8)]) -> Vec3 {
+    let solid = cells
+        .iter()
+        .filter_map(|(cell, material)| TrpgVoxelConnector::solid(material).then_some(*cell))
+        .collect::<Vec<_>>();
+    let min = solid
+        .iter()
+        .copied()
+        .reduce(IVec3::min)
+        .unwrap_or(IVec3::ZERO);
+    let max = solid
+        .iter()
+        .copied()
+        .reduce(IVec3::max)
+        .unwrap_or(IVec3::ZERO);
+    (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE
+}
+
+/// Maps a point inside a ship's local space to the canonical voxel cell that
+/// owns it, using the same floor convention as the static grid's raycast.
+fn voxel_cell_at_point(point: Vec3) -> IVec3 { (point / VOXEL_SIZE).floor().as_ivec3() }
+
+/// Returns the live occupancy entry for a ship, seeding it from the physics
+/// body's cell list on first contact.
+fn voxel_spaceship_occupancy_mut<'a>(
+    cache: &'a mut HashMap<Entity, VoxelSpaceshipOccupancy>,
+    entity: Entity,
+    body_cells: &[(IVec3, u8)],
+) -> &'a mut VoxelSpaceshipOccupancy {
+    let entry = cache
+        .entry(entity)
+        .or_insert_with(VoxelSpaceshipOccupancy::empty);
+    if entry.is_empty() {
+        for &(cell, material) in body_cells {
+            entry
+                .chunks
+                .entry(cell.div_euclid(IVec3::splat(VOXEL_SPACESHIP_CHUNK_DIMS)))
+                .or_default()
+                .insert(cell, material);
+        }
+    }
+    entry
+}
+
+struct VoxelSpaceshipRayHit {
+    occupied: IVec3,
+    normal: IVec3,
+    distance: f32,
+}
+
+/// Raycasts against a ship's live occupancy map in its local space. This never
+/// depends on the physics collider, so hold-to-edit keeps working while the
+/// collider rebuild is deferred.
+fn raycast_voxel_spaceship_cells(
+    occupancy: &VoxelSpaceshipOccupancy,
+    transform: &Transform,
+    ray: Ray3d,
+) -> Option<VoxelSpaceshipRayHit> {
+    let inverse = transform.compute_affine().inverse();
+    let local_origin = inverse.transform_point3(ray.origin);
+    let local_direction = inverse
+        .transform_vector3(*ray.direction)
+        .normalize_or_zero();
+    if local_direction == Vec3::ZERO {
+        return None;
+    }
+    let step = VOXEL_SIZE * 0.2;
+    let mut previous = voxel_cell_at_point(local_origin);
+    let mut distance = 0.0;
+    while distance <= MAX_RAY_DISTANCE {
+        let point = local_origin + local_direction * distance;
+        let cell = voxel_cell_at_point(point);
+        if occupancy.contains_cell(cell) {
+            let normal = if cell != previous {
+                (cell - previous).clamp(IVec3::splat(-1), IVec3::splat(1))
+            } else {
+                // The ray started inside the voxel; face the dominant axis.
+                let mut dominant = IVec3::ZERO;
+                if local_direction.x.abs() >= local_direction.y.abs()
+                    && local_direction.x.abs() >= local_direction.z.abs()
+                {
+                    dominant.x = if local_direction.x >= 0.0 { 1 } else { -1 };
+                } else if local_direction.y.abs() >= local_direction.z.abs() {
+                    dominant.y = if local_direction.y >= 0.0 { 1 } else { -1 };
+                } else {
+                    dominant.z = if local_direction.z >= 0.0 { 1 } else { -1 };
+                }
+                -dominant
+            };
+            return Some(VoxelSpaceshipRayHit {
+                occupied: cell,
+                normal,
+                distance,
+            });
+        }
+        previous = cell;
+        distance += step;
+    }
+    None
+}
+
+/// Rebuilds one hull chunk's mesh children from its current cells. Chunk meshes
+/// use their own cells only, so a local edit touches at most the few chunks
+/// intersecting the brush instead of the whole ship.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_voxel_spaceship_chunk(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &VoxelMaterials,
+    chunk_entity: Entity,
+    index: IVec3,
+    cells: &[(IVec3, u8)],
+    old_surface_children: &[Entity],
+) {
+    let origin = index * VOXEL_SPACESHIP_CHUNK_DIMS;
+    let local_cells = cells
+        .iter()
+        .map(|(cell, material)| (*cell - origin, *material))
+        .collect::<Vec<_>>();
+    let local_solid = local_cells
+        .iter()
+        .filter_map(|(cell, material)| {
+            TrpgVoxelConnector::solid(material).then_some(*cell)
+        })
+        .collect::<Vec<_>>();
+    let (material_meshes, _) = build_voxel_meshes_from_cells(&local_cells);
+    if local_solid.is_empty() {
+        commands.entity(chunk_entity).remove::<Collider>();
+    } else {
+        commands
+            .entity(chunk_entity)
+            .insert(canonical_voxel_collider(&local_solid));
+    }
+    for &child in old_surface_children {
+        commands.entity(child).despawn();
+    }
+    let mut surfaces = Vec::new();
+    commands.entity(chunk_entity).with_children(|parent| {
+        for (material_id, mesh) in material_meshes {
+            surfaces.push(
+                parent
+                    .spawn((
+                        Mesh3d(meshes.add(mesh)),
+                        MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
+                        VoxelSpaceshipHullMesh,
+                    ))
+                    .id(),
+            );
+        }
+    });
+    commands
+        .entity(chunk_entity)
+        .insert(VoxelSpaceshipChunk { surfaces });
+}
+
+/// Rebuilds the ship-level micro-tile decorations whose owner voxel survives.
+fn rebuild_voxel_spaceship_micro_tiles(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &VoxelMaterials,
+    ship: Entity,
+    tiles: &[VoxelMicroTile],
+    occupancy: &VoxelSpaceshipOccupancy,
+    old_meshes: &[Entity],
+) {
+    for &child in old_meshes {
+        commands.entity(child).despawn();
+    }
+    let live_tiles = tiles
+        .iter()
+        .copied()
+        .filter(|tile| occupancy.contains_cell(tile.owner))
+        .collect::<Vec<_>>();
+    let mut meshes_list = Vec::new();
+    commands.entity(ship).with_children(|parent| {
+        for (material_id, mesh) in build_micro_tile_meshes(&live_tiles) {
+            meshes_list.push(
+                parent
+                    .spawn((
+                        Mesh3d(meshes.add(mesh)),
+                        MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
+                        VoxelMicroDecoration,
+                    ))
+                    .id(),
+            );
+        }
+    });
+    commands.entity(ship).insert(VoxelSpaceshipMicroTiles {
+        tiles: tiles.to_vec(),
+        meshes: meshes_list,
+    });
 }
 
 fn allocate_fragment_parts(source_sizes: &[usize], max_parts: usize) -> Vec<usize> {
@@ -11559,11 +12037,19 @@ fn occupied_cells(grid: &Grid<u8>) -> Vec<IVec3> {
         .collect()
 }
 
-fn apply_stroke(grid: &mut Mut<Grid<u8>>, stroke: &[VoxelChange], forward: bool) {
+fn apply_stroke(
+    grid: &mut Mut<Grid<u8>>,
+    stroke: &[VoxelChange],
+    forward: bool,
+    mut scene_recorder: Option<&mut crate::replay::ReplaySceneRecorder>,
+) {
     for change in stroke {
-        grid.set(
+        let material = if forward { change.after } else { change.before };
+        grid.set(change.position, material);
+        crate::replay::record_replay_grid_cell(
+            scene_recorder.as_deref_mut(),
             change.position,
-            if forward { change.after } else { change.before },
+            material,
         );
     }
 }
@@ -11670,6 +12156,9 @@ fn place_creative_light(
     let VoxelEditRuntime {
         mut editor,
         mut dirty_chunks,
+        occupancy: _,
+        chunk_parents: _,
+        mut scene_recorder,
     } = edit_runtime;
     if possession.active_user_id.is_some()
         || editor.is_player_possession_tool_equipped()
@@ -11747,6 +12236,11 @@ fn place_creative_light(
             if grid.get(light.cell).copied().unwrap_or(0) != 0 {
                 grid.set(light.cell, 0);
                 dirty_chunks.mark_cell_and_neighbors(light.cell);
+                crate::replay::record_replay_grid_cell(
+                    scene_recorder.as_deref_mut(),
+                    light.cell,
+                    0,
+                );
             }
         }
         editor.physics_status = Some(format!("已移除{}", light.kind.label()));
@@ -11775,6 +12269,11 @@ fn place_creative_light(
         if grid.get(cell).copied().unwrap_or(0) != 8 {
             grid.set(cell, 8);
             dirty_chunks.mark_cell_and_neighbors(cell);
+            crate::replay::record_replay_grid_cell(
+                scene_recorder.as_deref_mut(),
+                cell,
+                8,
+            );
         }
     }
     spawn_voxel_placed_light(
@@ -11844,6 +12343,7 @@ fn drag_voxel_physics_body(
         With<VoxelPhysicsBody>,
     >,
     body_entities: Query<(), With<VoxelPhysicsBody>>,
+    chunk_parents: Query<&ChildOf, With<VoxelSpaceshipChunk>>,
     spatial_query: SpatialQuery,
     editor: Res<VoxelEditorState>,
     egui_input: Res<EguiWantsInput>,
@@ -11880,15 +12380,21 @@ fn drag_voxel_physics_body(
             MAX_RAY_DISTANCE,
             true,
             &SpatialQueryFilter::default(),
-            &|entity| body_entities.contains(entity),
+            &|entity| {
+                body_entities.contains(entity) || chunk_parents.contains(entity)
+            },
         ) else {
             return;
         };
-        let Ok((transform, ..)) = bodies.get(hit.entity) else {
+        let hit_entity = chunk_parents
+            .get(hit.entity)
+            .map(|parent| parent.0)
+            .unwrap_or(hit.entity);
+        let Ok((transform, ..)) = bodies.get(hit_entity) else {
             return;
         };
         let hit_point = ray.origin + *ray.direction * hit.distance;
-        drag.target = Some(hit.entity);
+        drag.target = Some(hit_entity);
         drag.distance = hit.distance.max(VOXEL_SIZE * 2.0);
         drag.body_offset = transform.translation - hit_point;
     }
@@ -11925,6 +12431,7 @@ fn edit_voxel_grid(
         &Transform,
         &LinearVelocity,
         &AngularVelocity,
+        Option<&VoxelSpaceship>,
     )>,
     auto_doors: Query<(Entity, &VoxelAutoDoor)>,
     spatial_query: SpatialQuery,
@@ -11938,6 +12445,9 @@ fn edit_voxel_grid(
     let VoxelEditRuntime {
         mut editor,
         mut dirty_chunks,
+        mut occupancy,
+        chunk_parents,
+        mut scene_recorder,
     } = edit_runtime;
     let egui_owns_pointer = egui_input.wants_any_pointer_input();
     if mouse.just_pressed(MouseButton::Left) {
@@ -12014,14 +12524,26 @@ fn edit_voxel_grid(
             return;
         };
         let grid_hit = raycast_grid(&grid, ray);
-        let body_hit = spatial_query.cast_ray_predicate(
-            ray.origin,
-            ray.direction,
-            MAX_RAY_DISTANCE,
-            true,
-            &SpatialQueryFilter::default(),
-            &|entity| physics_bodies.contains(entity),
-        );
+        let body_hit = spatial_query
+            .cast_ray_predicate(
+                ray.origin,
+                ray.direction,
+                MAX_RAY_DISTANCE,
+                true,
+                &SpatialQueryFilter::default(),
+                &|entity| {
+                    physics_bodies.contains(entity) || chunk_parents.contains(entity)
+                },
+            )
+            .map(|mut hit| {
+                // Chunked hull colliders hit the chunk child; resolve to the
+                // ship entity so the force tools keep targeting the body.
+                hit.entity = chunk_parents
+                    .get(hit.entity)
+                    .map(|parent| parent.0)
+                    .unwrap_or(hit.entity);
+                hit
+            });
         let static_distance = grid_hit
             .as_ref()
             .filter(|hit| hit.occupied.is_some())
@@ -12113,18 +12635,124 @@ fn edit_voxel_grid(
                         )
                 })
                 .map(
-                    |(entity, body, transform, linear_velocity, angular_velocity)| {
+                    |(
+                        entity,
+                        body,
+                        transform,
+                        linear_velocity,
+                        angular_velocity,
+                        is_ship,
+                    )| {
                         (
                             entity,
                             body.cells.clone(),
                             *transform,
                             *linear_velocity,
                             *angular_velocity,
+                            is_ship,
                         )
                     },
                 )
                 .collect::<Vec<_>>();
-            let source_sizes = affected_bodies
+            // Spaceships keep their identity, teleport destination, and drive
+            // controls: only voxels inside the blast are removed and the hull
+            // is rebuilt in place, while the removed cells scatter as debris.
+            let mut loose_bodies = Vec::new();
+            let mut ship_bodies = Vec::new();
+            for affected in affected_bodies {
+                if affected.5.is_some() {
+                    ship_bodies.push(affected);
+                } else {
+                    loose_bodies.push(affected);
+                }
+            }
+            for (
+                source_index,
+                (
+                    entity,
+                    cells,
+                    transform,
+                    linear_velocity,
+                    angular_velocity,
+                    is_ship,
+                ),
+            ) in ship_bodies.into_iter().enumerate()
+            {
+                let ship_id = is_ship
+                    .map(|ship| ship.id.clone())
+                    .unwrap_or_default();
+                let removed = {
+                    let entry =
+                        voxel_spaceship_occupancy_mut(&mut occupancy.ships, entity, &cells);
+                    let removed = voxel_spaceship_cells_in_radius(
+                        entry,
+                        &transform,
+                        interaction_point,
+                        explosion_radius,
+                    );
+                    for &(cell, _) in &removed {
+                        entry.remove_cell(cell);
+                        crate::replay::record_replay_ship_hull_cell(
+                            scene_recorder.as_deref_mut(),
+                            &ship_id,
+                            cell,
+                            0,
+                        );
+                    }
+                    removed
+                };
+                if removed.is_empty() {
+                    continue;
+                }
+                if occupancy
+                    .ships
+                    .get(&entity)
+                    .is_some_and(VoxelSpaceshipOccupancy::is_empty)
+                {
+                    occupancy.ships.remove(&entity);
+                    commands.entity(entity).despawn();
+                    if target == Some(entity) {
+                        target = None;
+                    }
+                } else {
+                    if let Some(entry) = occupancy.ships.get_mut(&entity) {
+                        entry.cells_dirty = true;
+                    }
+                    commands.entity(entity).insert(VoxelSpaceshipNeedsRebuild);
+                    target.get_or_insert(entity);
+                }
+                let part_count = removed.len().min(MAX_EXPLOSION_NEW_PHYSICS_BODIES);
+                for cells in split_voxel_cells_randomly(
+                    removed,
+                    part_count,
+                    fragment_seed.wrapping_add(0x5eed + source_index as u64),
+                ) {
+                    let origin = cells
+                        .iter()
+                        .map(|(cell, _)| *cell)
+                        .reduce(IVec3::min)
+                        .unwrap_or(IVec3::ZERO);
+                    let local_cells = cells
+                        .into_iter()
+                        .map(|(cell, material)| (cell - origin, material))
+                        .collect();
+                    let fragment_transform = Transform::from_matrix(
+                        transform.to_matrix()
+                            * Mat4::from_translation(origin.as_vec3() * VOXEL_SIZE),
+                    );
+                    let fragment = spawn_voxel_physics_body_at(
+                        &mut commands,
+                        &mut meshes,
+                        &materials,
+                        local_cells,
+                        fragment_transform,
+                        linear_velocity,
+                        angular_velocity,
+                    );
+                    target.get_or_insert(fragment);
+                }
+            }
+            let source_sizes = loose_bodies
                 .iter()
                 .map(|(_, cells, ..)| cells.len())
                 .chain(std::iter::once(selected.len()))
@@ -12134,11 +12762,11 @@ fn edit_voxel_grid(
                 &source_sizes,
                 MAX_EXPLOSION_NEW_PHYSICS_BODIES,
             );
-            let affected_body_count = affected_bodies.len();
+            let affected_body_count = loose_bodies.len();
             for (
                 source_index,
-                ((entity, cells, transform, linear_velocity, angular_velocity), part_count),
-            ) in affected_bodies
+                ((entity, cells, transform, linear_velocity, angular_velocity, ..), part_count),
+            ) in loose_bodies
                 .into_iter()
                 .zip(part_counts.iter().copied())
                 .enumerate()
@@ -12188,6 +12816,11 @@ fn edit_voxel_grid(
             if static_part_count > 0 {
                 for (cell, _) in &selected {
                     grid.set(*cell, 0);
+                    crate::replay::record_replay_grid_cell(
+                        scene_recorder.as_deref_mut(),
+                        *cell,
+                        0,
+                    );
                 }
                 for cells in split_voxel_cells_randomly(
                     selected,
@@ -12219,6 +12852,11 @@ fn edit_voxel_grid(
             }
             for (cell, _) in &selected {
                 grid.set(*cell, 0);
+                crate::replay::record_replay_grid_cell(
+                    scene_recorder.as_deref_mut(),
+                    *cell,
+                    0,
+                );
             }
             let entity = spawn_voxel_physics_body(
                 &mut commands,
@@ -12318,9 +12956,28 @@ fn edit_voxel_grid(
         .as_ref()
         .filter(|hit| hit.occupied.is_some())
         .map(|hit| hit.distance);
+    let mut ship_hit: Option<(Entity, VoxelSpaceshipRayHit)> = None;
+    for (entity, body, transform, _, _, is_ship, ..) in &physics_bodies {
+        if is_ship.is_none() {
+            continue;
+        }
+        let entry = voxel_spaceship_occupancy_mut(&mut occupancy.ships, entity, &body.cells);
+        let Some(hit) = raycast_voxel_spaceship_cells(entry, transform, ray) else {
+            continue;
+        };
+        if ship_hit
+            .as_ref()
+            .is_none_or(|(_, best)| hit.distance < best.distance)
+        {
+            ship_hit = Some((entity, hit));
+        }
+    }
+    let ship_distance = ship_hit.as_ref().map(|(_, hit)| hit.distance);
     if let Ok((mut planet, planet_transform)) = planets.single_mut() {
-        let planet_hit = raycast_voxel_planet(&planet, planet_transform, ray)
-            .filter(|hit| grid_distance.is_none_or(|distance| hit.distance < distance));
+        let planet_hit = raycast_voxel_planet(&planet, planet_transform, ray).filter(|hit| {
+            grid_distance.is_none_or(|distance| hit.distance < distance)
+                && ship_distance.is_none_or(|distance| hit.distance < distance)
+        });
         if let Some(hit) = planet_hit {
             let center = if input_mode == VoxelEditMode::Add {
                 hit.occupied + hit.normal
@@ -12388,6 +13045,75 @@ fn edit_voxel_grid(
             }
         }
     }
+    if let Some((ship_entity, hit)) =
+        ship_hit.filter(|(_, hit)| grid_distance.is_none_or(|distance| hit.distance < distance))
+    {
+        let Ok((_, body, _, _, _, ship)) = physics_bodies.get(ship_entity) else {
+            return;
+        };
+        let ship_id = ship.map(|ship| ship.id.clone()).unwrap_or_default();
+        let center = if input_mode == VoxelEditMode::Add {
+            hit.occupied + hit.normal
+        } else {
+            hit.occupied
+        };
+        let changed = {
+            let entry =
+                voxel_spaceship_occupancy_mut(&mut occupancy.ships, ship_entity, &body.cells);
+            let mut changed = 0;
+            let brush_radius = editor.brush_radius;
+            for x in -brush_radius..=brush_radius {
+                for y in -brush_radius..=brush_radius {
+                    for z in -brush_radius..=brush_radius {
+                        let position = center + IVec3::new(x, y, z);
+                        let before = entry.cell_material(position).unwrap_or(0);
+                        let Some(after) = edited_voxel(input_mode, before, editor.material) else {
+                            continue;
+                        };
+                        if before == after {
+                            continue;
+                        }
+                        if after == 0 {
+                            entry.remove_cell(position);
+                        } else {
+                            entry.set_cell(position, after);
+                        }
+                        crate::replay::record_replay_ship_hull_cell(
+                            scene_recorder.as_deref_mut(),
+                            &ship_id,
+                            position,
+                            after,
+                        );
+                        changed += 1;
+                    }
+                }
+            }
+            changed
+        };
+        if changed == 0 {
+            return;
+        }
+        if occupancy
+            .ships
+            .get(&ship_entity)
+            .is_some_and(VoxelSpaceshipOccupancy::is_empty)
+        {
+            occupancy.ships.remove(&ship_entity);
+            commands.entity(ship_entity).despawn();
+            editor.physics_status = Some("飞船已被完全拆解".to_owned());
+            return;
+        }
+        if let Some(entry) = occupancy.ships.get_mut(&ship_entity) {
+            entry.cells_dirty = true;
+        }
+        commands
+            .entity(ship_entity)
+            .insert(VoxelSpaceshipNeedsRebuild);
+        editor.physics_status = Some(format!(
+            "已编辑 {changed} 个飞船 0.25 体素"
+        ));
+        return;
+    }
     let Some(hit) = grid_hit else {
         return;
     };
@@ -12420,6 +13146,11 @@ fn edit_voxel_grid(
                 if before != after {
                     grid.set(position, after);
                     dirty_chunks.mark_cell_and_neighbors(position);
+                    crate::replay::record_replay_grid_cell(
+                        scene_recorder.as_deref_mut(),
+                        position,
+                        after,
+                    );
                     stroke.push(VoxelChange {
                         position,
                         before,
@@ -12431,6 +13162,142 @@ fn edit_voxel_grid(
     }
     if !stroke.is_empty() {
         editor.active_stroke.extend(stroke);
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn rebuild_dirty_voxel_spaceships(
+    mut commands: Commands,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
+    mut occupancy: ResMut<VoxelSpaceshipOccupancyCache>,
+    dirty: Query<
+        (
+            Entity,
+            &VoxelSpaceshipChunks,
+            Option<&VoxelSpaceshipMicroTiles>,
+            Option<&CollisionLayers>,
+        ),
+        With<VoxelSpaceshipNeedsRebuild>,
+    >,
+    chunk_components: Query<&VoxelSpaceshipChunk>,
+) {
+    // Part 1: rebuild the hull chunks touched by this frame's edits. Each
+    // chunk is small, so this stays well under a frame even on the largest
+    // ships, and the player sees the hole appear immediately.
+    for (entity, chunks, micro_tiles, ship_layers) in &dirty {
+        let Some(entry) = occupancy.ships.get_mut(&entity) else {
+            continue;
+        };
+        let dirty_chunks = std::mem::take(&mut entry.dirty_chunks);
+        if !dirty_chunks.is_empty() {
+            let mut chunk_map = chunks.0.clone();
+            for index in dirty_chunks {
+                let chunk_cells = entry
+                    .chunks
+                    .get(&index)
+                    .map(|cells| {
+                        cells
+                            .iter()
+                            .map(|(cell, material)| (*cell, *material))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let Some(chunk_entity) = chunk_map.get(&index).copied() else {
+                    if chunk_cells.is_empty() {
+                        continue;
+                    }
+                    let origin = index * VOXEL_SPACESHIP_CHUNK_DIMS;
+                    let created = commands
+                        .spawn((
+                            Name::new("voxel ship hull chunk"),
+                            Transform::from_translation(origin.as_vec3() * VOXEL_SIZE),
+                            VoxelSpaceshipChunk {
+                                surfaces: Vec::new(),
+                            },
+                            ChildOf(entity),
+                        ))
+                        .id();
+                    if let Some(layers) = ship_layers {
+                        commands.entity(created).insert(*layers);
+                    }
+                    chunk_map.insert(index, created);
+                    rebuild_voxel_spaceship_chunk(
+                        &mut commands,
+                        &mut meshes,
+                        &materials,
+                        created,
+                        index,
+                        &chunk_cells,
+                        &[],
+                    );
+                    continue;
+                };
+                if chunk_cells.is_empty() {
+                    commands.entity(chunk_entity).despawn();
+                    chunk_map.remove(&index);
+                    continue;
+                }
+                let old_surfaces = chunk_components
+                    .get(chunk_entity)
+                    .map(|chunk| chunk.surfaces.clone())
+                    .unwrap_or_default();
+                rebuild_voxel_spaceship_chunk(
+                    &mut commands,
+                    &mut meshes,
+                    &materials,
+                    chunk_entity,
+                    index,
+                    &chunk_cells,
+                    &old_surfaces,
+                );
+            }
+            commands.entity(entity).insert(VoxelSpaceshipChunks(chunk_map));
+        }
+        if let Some(micro_tiles) = micro_tiles {
+            rebuild_voxel_spaceship_micro_tiles(
+                &mut commands,
+                &mut meshes,
+                &materials,
+                entity,
+                &micro_tiles.tiles,
+                entry,
+                &micro_tiles.meshes,
+            );
+        }
+        commands
+            .entity(entity)
+            .remove::<VoxelSpaceshipNeedsRebuild>();
+    }
+
+    // Part 2: once the stroke ends, re-sync the physics body cells (bounds,
+    // center, teleport containment) from the live occupancy map. The chunk
+    // colliders were already refreshed in part 1.
+    let editing = mouse.pressed(MouseButton::Left) || mouse.pressed(MouseButton::Right);
+    if editing {
+        return;
+    }
+    for (entity, entry) in occupancy.ships.iter_mut() {
+        if !entry.cells_dirty {
+            continue;
+        }
+        let cells: Vec<(IVec3, u8)> = entry
+            .chunks
+            .values()
+            .flat_map(|cells| cells.iter())
+            .map(|(cell, material)| (*cell, *material))
+            .collect();
+        if cells.is_empty() {
+            continue;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+            entity_commands.insert(VoxelPhysicsBody {
+                local_center: voxel_spaceship_local_center(&cells),
+                cells,
+            });
+        }
+        entry.cells_dirty = false;
     }
 }
 
@@ -13648,6 +14515,7 @@ fn draw_possessed_player_targeting(
         Or<(
             With<VoxelPhysicsBody>,
             With<VoxelAutoDoor>,
+            With<VoxelSpaceshipChunk>,
         )>,
     >,
     standees: Query<
@@ -13800,6 +14668,7 @@ fn draw_voxel_target(
     cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
     grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
     physics_bodies: Query<(), With<VoxelPhysicsBody>>,
+    chunk_entities: Query<(), With<VoxelSpaceshipChunk>>,
     planets: Query<(&VoxelOrbitalPlanet, &GlobalTransform)>,
     placed_lights: Query<(&GlobalTransform, &VoxelPlacedLight)>,
     spatial_query: SpatialQuery,
@@ -13861,7 +14730,9 @@ fn draw_voxel_target(
                 MAX_RAY_DISTANCE,
                 true,
                 &SpatialQueryFilter::default(),
-                &|entity| physics_bodies.contains(entity),
+                &|entity| {
+                    physics_bodies.contains(entity) || chunk_entities.contains(entity)
+                },
             );
             let static_distance = hit
                 .as_ref()
@@ -16463,9 +17334,9 @@ mod tests {
             before: 0,
             after: 2,
         }];
-        apply_stroke(&mut grid, &stroke, true);
+        apply_stroke(&mut grid, &stroke, true, None);
         assert_eq!(grid.get(position), Some(&2));
-        apply_stroke(&mut grid, &stroke, false);
+        apply_stroke(&mut grid, &stroke, false, None);
         assert_eq!(grid.get(position), Some(&0));
     }
 
@@ -17876,14 +18747,13 @@ mod tests {
             &VoxelSpaceship,
             &RigidBody,
             &GravityScale,
-            &Collider,
             &SweptCcd,
             Option<&VoxelSpaceshipDocked>,
             Option<&CollisionLayers>,
         ), With<VoxelSpaceship>>();
         let bodies = query.iter(app.world()).collect::<Vec<_>>();
         assert_eq!(bodies.len(), SMALL_SPACESHIP_COUNT + 2);
-        for (ship, body, gravity_scale, collider, _, docking, collision_layers) in bodies {
+        for (ship, body, gravity_scale, _, docking, collision_layers) in bodies {
             if ship.id == COMBAT_SPACESHIP_ID {
                 assert_eq!(*body, RigidBody::Dynamic);
                 assert!(docking.is_none());
@@ -17900,11 +18770,21 @@ mod tests {
                 );
             }
             assert_eq!(gravity_scale.0, 0.0);
+        }
+        let mut chunk_query = app
+            .world_mut()
+            .query_filtered::<(&Collider, &CollisionLayers), With<VoxelSpaceshipChunk>>();
+        let chunk_colliders = chunk_query.iter(app.world()).collect::<Vec<_>>();
+        assert!(
+            chunk_colliders.len() >= SMALL_SPACESHIP_COUNT + 2,
+            "every spawned ship must own hull chunks with voxel colliders"
+        );
+        for (collider, _) in &chunk_colliders {
             assert_eq!(
                 collider
                     .shape()
                     .as_voxels()
-                    .expect("spaceship collider must retain voxel geometry")
+                    .expect("chunk colliders must retain voxel geometry")
                     .voxel_size(),
                 Vec3::splat(VOXEL_SIZE)
             );

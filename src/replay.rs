@@ -48,7 +48,9 @@ use base64::{
     engine::general_purpose::STANDARD as BASE64,
     Engine,
 };
+use avian3d::prelude::{AngularVelocity, LinearVelocity};
 use bevy::{
+    ecs::system::SystemParam,
     prelude::*,
     render::view::screenshot::{
         Screenshot,
@@ -102,10 +104,15 @@ use crate::{
     voxel::{
         cached_or_local_voxel_standee_path,
         TrpgVoxelGrid,
+        VoxelGeometryDirtyChunks,
+        VoxelPhysicsBody,
         VoxelPlayerStandee,
         VoxelPlayerStandeeSynced,
         VoxelPossessionState,
         VoxelReplayOcclusionFade,
+        VoxelSpaceship,
+        VoxelSpaceshipNeedsRebuild,
+        VoxelSpaceshipOccupancyCache,
         VoxelViewportCamera,
         DEFAULT_VOXEL_OCCLUSION_CAST_END_HEIGHT_CELLS,
         DEFAULT_VOXEL_OCCLUSION_CAST_END_WIDTH_CELLS,
@@ -117,12 +124,13 @@ use crate::{
     },
 };
 
-const REPLAY_FORMAT_VERSION: u32 = 2;
+const REPLAY_FORMAT_VERSION: u32 = 3;
 const LEGACY_REPLAY_FORMAT_VERSION: u32 = 1;
 const DEFAULT_AREA_RADIUS_CELLS: u32 = 12;
 const AREA_BLOCK_TURN_LIMIT: usize = 3;
 const CAMERA_SAMPLE_SECONDS: f32 = 0.1;
-const MIN_DIALOGUE_MS: u64 = 2_700;
+const SHIP_TRAJECTORY_SAMPLE_SECONDS: f32 = 0.1;
+const MIN_DIALOGUE_MS: u64 = 1_500;
 const MAX_DIALOGUE_MS: u64 = 9_750;
 const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
@@ -156,6 +164,8 @@ const MIN_PLAYER_MOVEMENT_CURVE: f32 = 0.0;
 const MAX_PLAYER_MOVEMENT_CURVE: f32 = 1.0;
 const MAX_PERSISTED_MOVEMENT_SESSIONS: usize = 256;
 const MOVEMENT_HISTORY_PERSIST_SECONDS: f32 = 0.5;
+const MAX_PERSISTED_SHIP_TRAJECTORY_SESSIONS: usize = 128;
+const SHIP_TRAJECTORY_HISTORY_PERSIST_SECONDS: f32 = 0.5;
 
 pub struct ReplayPlugin;
 
@@ -190,21 +200,46 @@ impl Plugin for ReplayPlugin {
             .revert_to_default_on_deserialization_errors(true)
             .build()
             .expect("failed to initialize replay player movement history");
+        let ship_trajectory_history = Persistent::<ReplayShipTrajectoryHistory>::builder()
+            .name("replay_ship_trajectory_history")
+            .format(StorageFormat::Toml)
+            .path(
+                Path::new(".data")
+                    .join("willowblossom")
+                    .join("replay_ship_trajectories.toml"),
+            )
+            .default(ReplayShipTrajectoryHistory::default())
+            .revertible(true)
+            .revert_to_default_on_deserialization_errors(true)
+            .build()
+            .expect("failed to initialize replay ship trajectory history");
         app.init_resource::<ReplayStudio>()
             .init_resource::<ReplayVideoCaptureActive>()
             .init_resource::<PreviewSpeechController>()
             .init_resource::<ReplaySnapshotTracker>()
             .init_resource::<ReplayMovementHistoryRecorder>()
+            .init_resource::<ReplaySceneRecorder>()
+            .init_resource::<ReplayShipTrajectoryRecorder>()
             .insert_resource(voice_favorites)
             .insert_resource(player_movement_history)
+            .insert_resource(ship_trajectory_history)
             .add_systems(
                 Update,
                 (
                     snapshot_new_replay_messages,
                     record_player_movement_history.after(VoxelPlayerStandeeSynced),
+                    record_ship_trajectory_history.after(VoxelPlayerStandeeSynced),
                     record_replay
                         .after(snapshot_new_replay_messages)
                         .after(VoxelPlayerStandeeSynced),
+                    apply_replay_terrain_changes
+                        .after(advance_replay)
+                        .after(render_video_frames)
+                        .before(crate::voxel::rebuild_voxel_geometry),
+                    apply_replay_ship_hull_changes
+                        .after(advance_replay)
+                        .after(render_video_frames)
+                        .before(crate::voxel::rebuild_dirty_voxel_spaceships),
                     advance_replay,
                     preview_replay_speech
                         .after(advance_replay)
@@ -217,6 +252,7 @@ impl Plugin for ReplayPlugin {
                 PostUpdate,
                 (
                     apply_replay_standee_positions,
+                    apply_replay_ship_positions,
                     apply_replay_camera,
                 )
                     .chain()
@@ -411,6 +447,14 @@ struct ReplayFile {
     player_movements: Vec<ReplayPlayerMovement>,
     #[serde(default)]
     player_movement_history_cursor_unix_ms: u64,
+    #[serde(default)]
+    ship_trajectories: Vec<ReplayShipTrajectory>,
+    #[serde(default)]
+    terrain_changes: Vec<ReplayTerrainChange>,
+    #[serde(default)]
+    ship_hull_changes: Vec<ReplayShipHullChange>,
+    #[serde(default)]
+    ship_trajectory_history_cursor_unix_ms: u64,
     dialogue: Vec<ReplayDialogue>,
     #[serde(default)]
     area_blocks: Vec<ReplayAreaBlock>,
@@ -489,6 +533,101 @@ struct ReplayPlayerMovementKeyframe {
     position_cells: [f32; 3],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplayShipTrajectory {
+    ship_id: String,
+    ship_name: String,
+    keyframes: Vec<ReplayShipKeyframe>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ReplayShipKeyframe {
+    time_ms: u64,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ReplayTerrainChange {
+    time_ms: u64,
+    position: [i32; 3],
+    material: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplayShipHullChange {
+    time_ms: u64,
+    ship_id: String,
+    position: [i32; 3],
+    material: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayGridCellEvent {
+    pub(crate) cell: IVec3,
+    pub(crate) material: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplayShipHullCellEvent {
+    pub(crate) ship_id: String,
+    pub(crate) cell: IVec3,
+    pub(crate) material: u8,
+}
+
+/// Per-frame buffer used by the voxel editor to report terrain and ship hull
+/// cell mutations while a replay is being recorded. `record_replay` drains it
+/// once per frame and stamps the events with the current record time.
+#[derive(Default, Resource)]
+pub(crate) struct ReplaySceneRecorder {
+    pub(crate) grid_cells: Vec<ReplayGridCellEvent>,
+    pub(crate) ship_hull_cells: Vec<ReplayShipHullCellEvent>,
+}
+
+pub(crate) fn record_replay_grid_cell(
+    recorder: Option<&mut ReplaySceneRecorder>,
+    cell: IVec3,
+    material: u8,
+) {
+    if let Some(recorder) = recorder {
+        recorder.grid_cells.push(ReplayGridCellEvent { cell, material });
+    }
+}
+
+pub(crate) fn record_replay_ship_hull_cell(
+    recorder: Option<&mut ReplaySceneRecorder>,
+    ship_id: &str,
+    cell: IVec3,
+    material: u8,
+) {
+    if let Some(recorder) = recorder {
+        if !ship_id.is_empty() {
+            recorder
+                .ship_hull_cells
+                .push(ReplayShipHullCellEvent {
+                    ship_id: ship_id.to_owned(),
+                    cell,
+                    material,
+                });
+        }
+    }
+}
+
+impl ReplaySceneRecorder {
+    pub(crate) fn clear(&mut self) {
+        self.grid_cells.clear();
+        self.ship_hull_cells.clear();
+    }
+}
+
+/// Bundled persistent histories passed from the replay UI system to the plain
+/// UI helpers, keeping the system parameter count within Bevy's limit.
+#[derive(SystemParam)]
+struct ReplayHistoryParams<'w> {
+    player_movement_history: ResMut<'w, Persistent<ReplayPlayerMovementHistory>>,
+    ship_trajectory_history: ResMut<'w, Persistent<ReplayShipTrajectoryHistory>>,
+}
+
 #[derive(Resource, Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ReplayPlayerMovementHistory {
     #[serde(default)]
@@ -514,6 +653,57 @@ struct PersistedPlayerMovementSession {
 struct PersistedPlayerMovementKeyframe {
     source_unix_ms: u64,
     position_cells: [f32; 3],
+}
+
+/// Continuously persisted ship trajectory history, mirroring the player
+/// movement history: ships are sampled whenever a campaign is active, with no
+/// need to press "开始录制", and replays anchor the samples onto their dialogue
+/// timeline by real message time.
+#[derive(Resource, Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct ReplayShipTrajectoryHistory {
+    #[serde(default)]
+    sessions: Vec<PersistedShipTrajectorySession>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedShipTrajectorySession {
+    campaign_id: String,
+    ship_id: String,
+    ship_name: String,
+    #[serde(default)]
+    turn_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_after_source_time: Option<u64>,
+    #[serde(default)]
+    start_delay_ms: u64,
+    keyframes: Vec<PersistedShipKeyframe>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct PersistedShipKeyframe {
+    source_unix_ms: u64,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+}
+
+/// Live bookkeeping for `record_ship_trajectory_history`; the session index
+/// cache is rebuilt whenever the session list is trimmed.
+#[derive(Resource, Default)]
+struct ReplayShipTrajectoryRecorder {
+    sessions: HashMap<(String, String), usize>,
+    sample_accumulators: HashMap<(String, String), f32>,
+    persist_accumulator: f32,
+}
+
+pub(crate) fn clear_campaign_replay_ship_trajectory_history(
+    history: &mut ReplayShipTrajectoryHistory,
+    campaign_id: &str,
+) -> usize {
+    let previous_len = history.sessions.len();
+    history
+        .sessions
+        .retain(|session| session.campaign_id != campaign_id);
+    previous_len - history.sessions.len()
 }
 
 pub(crate) fn clear_campaign_replay_movement_history(
@@ -703,7 +893,10 @@ pub(crate) struct ReplayStudio {
     player_movement_sample_accumulator: f32,
     recorded_possession_user_id: Option<u64>,
     recorded_player_movement_index: Option<usize>,
+    turn_playback_enabled: bool,
     message_counts: HashMap<String, usize>,
+    pending_terrain_changes: Vec<(u64, IVec3, u8)>,
+    pending_ship_hull_changes: Vec<(u64, String, IVec3, u8)>,
     pre_playback_scene: Option<ReplayScene>,
     video_path: String,
     video_fps: u32,
@@ -816,7 +1009,10 @@ impl Default for ReplayStudio {
             player_movement_sample_accumulator: 0.0,
             recorded_possession_user_id: None,
             recorded_player_movement_index: None,
+            turn_playback_enabled: true,
             message_counts: HashMap::new(),
+            pending_terrain_changes: Vec::new(),
+            pending_ship_hull_changes: Vec::new(),
             pre_playback_scene: None,
             video_path: DEFAULT_VIDEO_PATH.to_owned(),
             video_fps: 15,
@@ -931,6 +1127,124 @@ fn record_player_movement_history(
     }
 }
 
+/// Continuously samples every voxel spaceship pose into the persisted
+/// `ReplayShipTrajectoryHistory` while a campaign is active, regardless of
+/// whether a replay is being recorded. The recorder is paused while a replay
+/// is playing or rendering, because ship transforms are then replay-driven.
+fn record_ship_trajectory_history(
+    time: Res<Time>,
+    manager: Res<Persistent<NapcatMessageManager>>,
+    studio: Res<ReplayStudio>,
+    spaceships: Query<(&VoxelSpaceship, &Transform), Without<VoxelViewportCamera>>,
+    mut history: ResMut<Persistent<ReplayShipTrajectoryHistory>>,
+    mut recorder: ResMut<ReplayShipTrajectoryRecorder>,
+) {
+    let active_campaign = if replay_scene_dynamics_active(&studio) {
+        None
+    } else {
+        manager.active_campaign_id()
+    };
+    if active_campaign.is_none() {
+        recorder.sessions.clear();
+        recorder.sample_accumulators.clear();
+        return;
+    }
+    let campaign_id = active_campaign.unwrap();
+    recorder.persist_accumulator += time.delta_secs();
+    for (ship, transform) in &spaceships {
+        let key = (campaign_id.clone(), ship.id.clone());
+        let accumulator = recorder
+            .sample_accumulators
+            .entry(key.clone())
+            .or_insert(0.0);
+        *accumulator += time.delta_secs();
+        if *accumulator < SHIP_TRAJECTORY_SAMPLE_SECONDS {
+            continue;
+        }
+        *accumulator %= SHIP_TRAJECTORY_SAMPLE_SECONDS;
+        let keyframe = PersistedShipKeyframe {
+            source_unix_ms: unix_time_ms(),
+            translation: transform.translation.to_array(),
+            rotation: transform.rotation.to_array(),
+        };
+        let session_index = if let Some(&index) = recorder.sessions.get(&key) {
+            index
+        } else {
+            let found = history
+                .sessions
+                .iter()
+                .position(|session| {
+                    session.campaign_id == campaign_id && session.ship_id == ship.id
+                });
+            if let Some(index) = found {
+                recorder.sessions.insert(key, index);
+                index
+            } else {
+                if history.sessions.len() >= MAX_PERSISTED_SHIP_TRAJECTORY_SESSIONS {
+                    history.sessions.remove(0);
+                    recorder.sessions = history
+                        .sessions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, session)| {
+                            ((session.campaign_id.clone(), session.ship_id.clone()), index)
+                        })
+                        .collect();
+                }
+                let world_turn = manager
+                    .current_group()
+                    .map(|group| group.world_turn)
+                    .unwrap_or_default();
+                history.sessions.push(PersistedShipTrajectorySession {
+                    campaign_id: campaign_id.clone(),
+                    ship_id: ship.id.clone(),
+                    ship_name: ship.name.clone(),
+                    turn_index: world_turn,
+                    start_after_source_time: latest_campaign_line_time(&manager, &campaign_id),
+                    start_delay_ms: 0,
+                    keyframes: Vec::new(),
+                });
+                let index = history.sessions.len() - 1;
+                recorder.sessions.insert(key, index);
+                index
+            }
+        };
+        let session = &mut history.sessions[session_index];
+        session.ship_name = ship.name.clone();
+        let unchanged = session.keyframes.last().is_some_and(|last| {
+            last.translation == keyframe.translation
+                && last.rotation == keyframe.rotation
+                && keyframe.source_unix_ms.saturating_sub(last.source_unix_ms) < 5_000
+        });
+        if !unchanged {
+            session.keyframes.push(keyframe);
+        }
+    }
+    if recorder.persist_accumulator >= SHIP_TRAJECTORY_HISTORY_PERSIST_SECONDS {
+        recorder.persist_accumulator %= SHIP_TRAJECTORY_HISTORY_PERSIST_SECONDS;
+        if let Err(err) = history.persist() {
+            eprintln!("failed to persist replay ship trajectory history: {err}");
+        }
+    }
+}
+
+fn latest_campaign_line_time(
+    manager: &NapcatMessageManager,
+    campaign_id: &str,
+) -> Option<u64> {
+    manager
+        .messages
+        .iter()
+        .flat_map(|(target, messages)| {
+            messages
+                .iter()
+                .map(move |message| manager.campaign_message_for_target(target, message))
+        })
+        .filter(|message| message.campaign_id == campaign_id)
+        .map(|message| message.time)
+        .max()
+}
+
 fn movement_turn_index(manager: &NapcatMessageManager, user_id: u64) -> u32 {
     manager
         .current_group()
@@ -980,12 +1294,19 @@ fn record_replay(
     standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     mut studio: ResMut<ReplayStudio>,
     mut speech: ResMut<PreviewSpeechController>,
+    mut scene_recorder: ResMut<ReplaySceneRecorder>,
 ) {
     if studio.mode != ReplayMode::Recording {
         return;
     }
 
     let delta_seconds = time.delta_secs();
+    if studio.record_elapsed_ms == 0 {
+        // First recording frame: drop any terrain events recorded before
+        // "开始录制" was pressed; ship trajectories come from the continuous
+        // `ReplayShipTrajectoryHistory` instead.
+        scene_recorder.clear();
+    }
     studio.record_elapsed_ms = studio
         .record_elapsed_ms
         .saturating_add((delta_seconds * 1_000.0).round() as u64);
@@ -1012,6 +1333,19 @@ fn record_replay(
             ));
         }
     }
+    let drained_grid_cells = std::mem::take(&mut scene_recorder.grid_cells);
+    let drained_ship_hull_cells = std::mem::take(&mut scene_recorder.ship_hull_cells);
+    let source_unix_ms = unix_time_ms();
+    studio
+        .pending_terrain_changes
+        .extend(drained_grid_cells.into_iter().map(|event| {
+            (source_unix_ms, event.cell, event.material)
+        }));
+    studio
+        .pending_ship_hull_changes
+        .extend(drained_ship_hull_cells.into_iter().map(|event| {
+            (source_unix_ms, event.ship_id, event.cell, event.material)
+        }));
 
     let audience = studio.audience.clone();
     let mut next_turn_ms = studio
@@ -1197,6 +1531,36 @@ fn push_player_movement_keyframe(
     }
 }
 
+fn interpolated_ship_pose(
+    trajectory: &ReplayShipTrajectory,
+    time_ms: u64,
+) -> Option<(Vec3, Quat)> {
+    let keyframes = &trajectory.keyframes;
+    let first = keyframes.first()?;
+    if time_ms <= first.time_ms {
+        return Some((
+            Vec3::from_array(first.translation),
+            Quat::from_array(first.rotation),
+        ));
+    }
+    let last = keyframes.last()?;
+    if time_ms >= last.time_ms {
+        return Some((
+            Vec3::from_array(last.translation),
+            Quat::from_array(last.rotation),
+        ));
+    }
+    let right_index = keyframes.partition_point(|keyframe| keyframe.time_ms <= time_ms);
+    let left = &keyframes[right_index - 1];
+    let right = &keyframes[right_index];
+    let fraction = ((time_ms - left.time_ms) as f32 / (right.time_ms - left.time_ms).max(1) as f32)
+        .clamp(0.0, 1.0);
+    Some((
+        Vec3::from_array(left.translation).lerp(Vec3::from_array(right.translation), fraction),
+        Quat::from_array(left.rotation).slerp(Quat::from_array(right.rotation), fraction),
+    ))
+}
+
 fn advance_replay(
     time: Res<Time>,
     speech: Res<PreviewSpeechController>,
@@ -1253,6 +1617,29 @@ fn advance_replay(
     }
     if studio.status == REPLAY_SPEECH_PREPARING_STATUS {
         studio.status = REPLAY_PLAYING_STATUS.to_owned();
+    }
+    if studio.turn_playback_enabled {
+        if let Some(replay) = studio.replay.as_ref() {
+            let turns = replay_turns(replay);
+            if let Some(turn) = turns
+                .iter()
+                .find(|turn| studio.playback_ms < turn.end_ms)
+                .filter(|turn| proposed_ms >= turn.end_ms)
+            {
+                studio.playback_ms = turn.end_ms;
+                studio.mode = ReplayMode::Paused;
+                let speakers = if turn.speaker_names.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", turn.speaker_names.join("、"))
+                };
+                studio.status = format!(
+                    "已暂停：第 {} 段{speakers}结束；点击“继续”进入下一回合",
+                    turn.ordinal
+                );
+                return;
+            }
+        }
     }
     studio.playback_ms = proposed_ms;
     if studio.playback_ms >= duration_ms {
@@ -2218,7 +2605,7 @@ fn replay_studio_ui(
     mut deepseek_manager: ResMut<Persistent<DeepseekManager>>,
     mut studio: ResMut<ReplayStudio>,
     mut voice_favorites: ResMut<Persistent<ReplayVoiceFavorites>>,
-    mut player_movement_history: ResMut<Persistent<ReplayPlayerMovementHistory>>,
+    mut replay_histories: ReplayHistoryParams,
     speech: Res<PreviewSpeechController>,
     camera: Query<&Transform, With<VoxelViewportCamera>>,
     standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
@@ -2288,7 +2675,8 @@ fn replay_studio_ui(
                             &mut deepseek_manager,
                             &mut studio,
                             &voice_favorites,
-                            &mut player_movement_history,
+                            &mut replay_histories.player_movement_history,
+                            &mut replay_histories.ship_trajectory_history,
                             &speech,
                             &camera,
                             &standees,
@@ -2359,6 +2747,7 @@ fn replay_controls(
     studio: &mut ReplayStudio,
     voice_favorites: &ReplayVoiceFavorites,
     player_movement_history: &mut Persistent<ReplayPlayerMovementHistory>,
+    ship_trajectory_history: &mut Persistent<ReplayShipTrajectoryHistory>,
     speech: &PreviewSpeechController,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
@@ -2373,7 +2762,7 @@ fn replay_controls(
     occlusion_debug_gizmo: &mut bool,
 ) {
     ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
-    ui.small("DM 使用玩家接管工具时会自动保存移动轨迹，无需先点击“开始录制”；回放生成后录到的新轨迹会在按“播放”时自动追加。");
+    ui.small("飞船轨迹、地形变化和玩家接管移动都会常态化自动记录，无需先点击“开始录制”；回放生成后新录到的内容会在按“播放”时自动并入时间轴。");
     ui.separator();
     ui.collapsing("录制、镜头与遮挡设置", |ui| {
         ui.horizontal(|ui| {
@@ -2604,7 +2993,7 @@ fn replay_controls(
                 format_time(studio.record_elapsed_ms)
             ));
             if ui.button("停止录制").clicked() {
-                stop_recording(studio);
+                stop_recording(studio, ship_trajectory_history);
             }
         },
         ReplayMode::Playing | ReplayMode::Paused => {
@@ -2645,6 +3034,7 @@ fn replay_controls(
                     manager,
                     voice_favorites,
                     player_movement_history,
+                    ship_trajectory_history,
                     camera,
                     standees,
                     grids,
@@ -2659,12 +3049,18 @@ fn replay_controls(
             .iter()
             .map(|movement| movement.keyframes.len())
             .sum::<usize>();
+        let ship_count = replay.ship_trajectories.len();
+        let terrain_change_count = replay.terrain_changes.len();
+        let hull_change_count = replay.ship_hull_changes.len();
         ui.label(format!(
-            "{} · {} · {} 个镜头帧 · {} 帧玩家移动 · {} 条对话 · {} 个体素",
+            "{} · {} · {} 个镜头帧 · {} 帧玩家移动 · {} 艘飞船轨迹 · {} 条地形变化 · {} 条船体变化 · {} 条对话 · {} 个体素",
             replay.title,
             format_time(replay.duration_ms),
             replay.camera.len(),
             movement_frame_count,
+            ship_count,
+            terrain_change_count,
+            hull_change_count,
             replay.dialogue.len(),
             replay.scene.voxels.len(),
         ));
@@ -2696,10 +3092,26 @@ fn replay_controls(
                         append_new_player_movements_from_history(replay, player_movement_history)
                     })
                     .unwrap_or_default();
+                let imported_ships = studio
+                    .replay
+                    .as_mut()
+                    .map(|replay| {
+                        append_new_ship_trajectories_from_history(
+                            replay,
+                            ship_trajectory_history,
+                        )
+                    })
+                    .unwrap_or_default();
                 start_playback(studio, grids);
                 if imported > 0 {
                     studio.playback_ms = newly_recorded_movement_start;
-                    studio.status = format!("正在回放（已跳转到刚载入的 {imported} 段玩家移动）");
+                    studio.status = format!(
+                        "正在回放（已载入 {imported} 段玩家移动和 {imported_ships} 艘飞船的常态化轨迹）"
+                    );
+                } else if imported_ships > 0 {
+                    studio.status = format!(
+                        "正在回放（已并入 {imported_ships} 艘飞船的常态化轨迹）"
+                    );
                 }
             }
             ui.add(
@@ -2723,6 +3135,69 @@ fn replay_controls(
                 );
             }
         });
+        ui.checkbox(
+            &mut studio.turn_playback_enabled,
+            "按回合播放（每回合结束暂停，如同 GM 带团）",
+        );
+        if let Some(replay) = studio.replay.as_ref() {
+            let turns = replay_turns(replay);
+            if !turns.is_empty() {
+                let current_turn = current_replay_turn(&turns, studio.playback_ms);
+                ui.horizontal(|ui| {
+                    let previous = current_turn
+                        .and_then(|index| index.checked_sub(1))
+                        .or_else(|| previous_replay_turn(&turns, studio.playback_ms));
+                    if ui
+                        .add_enabled(
+                            previous.is_some(),
+                            egui::Button::new("⏮ 上一回合"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(index) = previous {
+                            jump_replay_to_turn(studio, &turns, index);
+                        }
+                    }
+                    let next = next_replay_turn(&turns, studio.playback_ms);
+                    if ui
+                        .add_enabled(
+                            next.is_some(),
+                            egui::Button::new("下一回合 ⏭"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(index) = next {
+                            jump_replay_to_turn(studio, &turns, index);
+                        }
+                    }
+                    if let Some(index) = current_turn {
+                        let turn = &turns[index];
+                        ui.label(format!(
+                            "第 {} 段 {}（{}）",
+                            turn.ordinal,
+                            turn.label(),
+                            turn.speaker_names
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or("等待中"),
+                        ));
+                    } else {
+                        ui.label("尚未进入回合时间轴");
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    for (index, turn) in turns.iter().enumerate() {
+                        let selected = current_turn == Some(index);
+                        if ui
+                            .selectable_label(selected, format!("{}.{}", turn.ordinal, turn.turn_index))
+                            .clicked()
+                        {
+                            jump_replay_to_turn(studio, &turns, index);
+                        }
+                    }
+                });
+            }
+        }
     }
 
     ui.separator();
@@ -2779,6 +3254,7 @@ fn replay_controls(
                         manager,
                         voice_favorites,
                         player_movement_history,
+                        ship_trajectory_history,
                         camera,
                         standees,
                         grids,
@@ -3138,6 +3614,7 @@ fn replay_controls(
             manager,
             voice_favorites,
             player_movement_history,
+            ship_trajectory_history,
             camera,
             standees,
             grids,
@@ -3549,6 +4026,8 @@ fn start_recording(
     studio.record_elapsed_ms = 0;
     studio.camera_sample_accumulator = 0.0;
     studio.player_movement_sample_accumulator = 0.0;
+    studio.pending_terrain_changes.clear();
+    studio.pending_ship_hull_changes.clear();
     studio.recorded_possession_user_id = None;
     studio.recorded_player_movement_index = None;
     studio.playback_ms = 0;
@@ -3558,14 +4037,29 @@ fn start_recording(
     studio.replay = Some(replay);
     studio.mode = ReplayMode::Recording;
     studio.status = if studio.record_camera_enabled {
-        "开始录制场景、可见消息、DM 自由镜头和接管玩家移动".to_owned()
+        "开始录制场景、可见消息和 DM 自由镜头；飞船轨迹与地形变化由常态化记录自动并入".to_owned()
     } else {
-        "开始录制场景、可见消息和接管玩家移动；DM 镜头采集保持关闭".to_owned()
+        "开始录制场景和可见消息；飞船轨迹与地形变化由常态化记录自动并入，DM 镜头采集保持关闭".to_owned()
     };
 }
 
-fn stop_recording(studio: &mut ReplayStudio) {
+fn stop_recording(
+    studio: &mut ReplayStudio,
+    ship_trajectory_history: &ReplayShipTrajectoryHistory,
+) {
     if let Some(replay) = studio.replay.as_mut() {
+        let cutoff_unix_ms = replay
+            .ship_trajectory_history_cursor_unix_ms
+            .max(replay.created_at_unix_ms);
+        let imported_ships = compile_scene_dynamics_timeline(
+            replay,
+            ship_trajectory_history,
+            cutoff_unix_ms,
+            &studio.pending_terrain_changes,
+            &studio.pending_ship_hull_changes,
+        );
+        replay.ship_trajectory_history_cursor_unix_ms = unix_time_ms();
+        extend_replay_for_speech(replay);
         let dialogue_end = replay
             .dialogue
             .last()
@@ -3573,11 +4067,21 @@ fn stop_recording(studio: &mut ReplayStudio) {
             .unwrap_or(5_000);
         replay.duration_ms = if studio.record_camera_enabled || !replay.player_movements.is_empty()
         {
-            studio.record_elapsed_ms.max(dialogue_end)
+            studio
+                .record_elapsed_ms
+                .max(dialogue_end)
+                .max(replay.duration_ms)
         } else {
-            dialogue_end
+            dialogue_end.max(replay.duration_ms)
         };
-        extend_replay_for_speech(replay);
+        studio.status = if imported_ships > 0 {
+            format!(
+                "录制已停止，已把 {imported_ships} 艘飞船的常态化轨迹并入时间轴，可以预览或导出"
+            )
+        } else {
+            "录制已停止，可以预览或导出".to_owned()
+        };
+        return;
     }
     studio.mode = ReplayMode::Idle;
     studio.playback_ms = 0;
@@ -3589,6 +4093,7 @@ fn build_from_history(
     manager: &NapcatMessageManager,
     voice_favorites: &ReplayVoiceFavorites,
     player_movement_history: &ReplayPlayerMovementHistory,
+    ship_trajectory_history: &ReplayShipTrajectoryHistory,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
@@ -3677,7 +4182,14 @@ fn build_from_history(
     }
     auto_group_replay_areas(&mut replay);
     rebuild_area_blocks(&mut replay);
-    replay.duration_ms = compile_area_block_timeline(&mut replay);
+    compile_scene_dynamics_timeline(
+        &mut replay,
+        ship_trajectory_history,
+        0,
+        &[],
+        &[],
+    );
+    replay.ship_trajectory_history_cursor_unix_ms = unix_time_ms();
     extend_replay_for_speech(&mut replay);
     replay.player_movements = replay_player_movements_from_history(
         player_movement_history,
@@ -3693,6 +4205,15 @@ fn build_from_history(
         .max()
     {
         replay.duration_ms = replay.duration_ms.max(movement_end);
+    }
+    if let Some(trajectory_end) = replay
+        .ship_trajectories
+        .iter()
+        .filter_map(|trajectory| trajectory.keyframes.last())
+        .map(|frame| frame.time_ms)
+        .max()
+    {
+        replay.duration_ms = replay.duration_ms.max(trajectory_end);
     }
     if let Ok(transform) = camera.single() {
         let obstacles = ReplayCameraObstacles::from_scene(&replay.scene);
@@ -4111,6 +4632,10 @@ fn new_replay(
         player_movement_curve: normalized_player_movement_curve(player_movement_curve),
         player_movements: Vec::new(),
         player_movement_history_cursor_unix_ms: unix_time_ms(),
+        ship_trajectories: Vec::new(),
+        terrain_changes: Vec::new(),
+        ship_hull_changes: Vec::new(),
+        ship_trajectory_history_cursor_unix_ms: unix_time_ms(),
         dialogue: Vec::new(),
         area_blocks: Vec::new(),
         area_radius_cells: default_area_radius_cells(),
@@ -5725,6 +6250,17 @@ fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
             frame.time_ms = stretched_replay_time(frame.time_ms, &segments);
         }
     }
+    for trajectory in &mut replay.ship_trajectories {
+        for frame in &mut trajectory.keyframes {
+            frame.time_ms = stretched_replay_time(frame.time_ms, &segments);
+        }
+    }
+    for change in &mut replay.terrain_changes {
+        change.time_ms = stretched_replay_time(change.time_ms, &segments);
+    }
+    for change in &mut replay.ship_hull_changes {
+        change.time_ms = stretched_replay_time(change.time_ms, &segments);
+    }
     replay.duration_ms = stretched_replay_time(replay.duration_ms, &segments);
     true
 }
@@ -5828,6 +6364,17 @@ fn retime_replay(replay: &mut ReplayFile, previous: f32, requested: f32) {
         for frame in &mut movement.keyframes {
             frame.time_ms = scaled_millis(frame.time_ms, ratio);
         }
+    }
+    for trajectory in &mut replay.ship_trajectories {
+        for frame in &mut trajectory.keyframes {
+            frame.time_ms = scaled_millis(frame.time_ms, ratio);
+        }
+    }
+    for change in &mut replay.terrain_changes {
+        change.time_ms = scaled_millis(change.time_ms, ratio);
+    }
+    for change in &mut replay.ship_hull_changes {
+        change.time_ms = scaled_millis(change.time_ms, ratio);
     }
     replay.duration_ms = scaled_millis(replay.duration_ms, ratio).max(1);
 }
@@ -6327,6 +6874,322 @@ fn replay_standee_facing_rotation(standee_position: Vec3, camera_position: Vec3)
     ))
 }
 
+fn replay_scene_dynamics_active(studio: &ReplayStudio) -> bool {
+    matches!(
+        studio.mode,
+        ReplayMode::Playing | ReplayMode::Paused
+    ) || studio.video_render.is_some()
+}
+
+#[derive(Default)]
+struct ReplayTerrainPlaybackState {
+    replay_key: Option<u64>,
+    baseline: HashMap<IVec3, u8>,
+    applied: HashMap<IVec3, u8>,
+    next_change: usize,
+    covered_time_ms: u64,
+}
+
+/// Applies recorded grid terrain changes to the live voxel grid as playback
+/// time advances. Rewinding (timeline drag or turn jump) rebuilds the target
+/// state from the scene baseline so cells can be restored deterministically.
+fn apply_replay_terrain_changes(
+    mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    mut dirty_chunks: ResMut<VoxelGeometryDirtyChunks>,
+    studio: Res<ReplayStudio>,
+    mut state: Local<ReplayTerrainPlaybackState>,
+) {
+    if !replay_scene_dynamics_active(&studio) {
+        if state.replay_key.is_some() {
+            *state = ReplayTerrainPlaybackState::default();
+        }
+        return;
+    }
+    let Some(replay) = studio.replay.as_ref() else {
+        return;
+    };
+    let Ok(mut grid) = grids.single_mut() else {
+        return;
+    };
+    let replay_key = replay.created_at_unix_ms;
+    if state.replay_key != Some(replay_key) {
+        state.replay_key = Some(replay_key);
+        state.baseline = replay
+            .scene
+            .voxels
+            .iter()
+            .map(|voxel| (IVec3::from_array(voxel.position), voxel.material))
+            .collect();
+        state.applied = state.baseline.clone();
+        state.next_change = 0;
+        state.covered_time_ms = 0;
+    }
+    apply_terrain_changes_at(
+        &mut grid,
+        &mut dirty_chunks,
+        &mut state,
+        &replay.terrain_changes,
+        studio.playback_ms,
+    );
+}
+
+fn apply_terrain_changes_at(
+    grid: &mut Mut<Grid<u8>>,
+    dirty_chunks: &mut VoxelGeometryDirtyChunks,
+    state: &mut ReplayTerrainPlaybackState,
+    changes: &[ReplayTerrainChange],
+    time_ms: u64,
+) {
+    if time_ms < state.covered_time_ms {
+        let mut target = state.baseline.clone();
+        let mut count = 0;
+        for change in changes {
+            if change.time_ms > time_ms {
+                break;
+            }
+            target.insert(IVec3::from_array(change.position), change.material);
+            count += 1;
+        }
+        state.next_change = count;
+        apply_terrain_target_diff(grid, dirty_chunks, &state.applied, &target);
+        state.applied = target;
+        state.covered_time_ms = time_ms;
+        return;
+    }
+    while let Some(change) = changes.get(state.next_change) {
+        if change.time_ms > time_ms {
+            break;
+        }
+        let cell = IVec3::from_array(change.position);
+        grid.set(cell, change.material);
+        dirty_chunks.mark_cell_and_neighbors(cell);
+        state.applied.insert(cell, change.material);
+        state.next_change += 1;
+    }
+    state.covered_time_ms = state.covered_time_ms.max(time_ms);
+}
+
+fn apply_terrain_target_diff(
+    grid: &mut Mut<Grid<u8>>,
+    dirty_chunks: &mut VoxelGeometryDirtyChunks,
+    applied: &HashMap<IVec3, u8>,
+    target: &HashMap<IVec3, u8>,
+) {
+    for (cell, material) in target {
+        if applied.get(cell) != Some(material) {
+            grid.set(*cell, *material);
+            dirty_chunks.mark_cell_and_neighbors(*cell);
+        }
+    }
+    for cell in applied.keys() {
+        if !target.contains_key(cell) {
+            grid.set(*cell, 0);
+            dirty_chunks.mark_cell_and_neighbors(*cell);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReplayShipHullPlaybackState {
+    replay_key: Option<u64>,
+    original_cells: HashMap<Entity, Vec<(IVec3, u8)>>,
+    applied: HashMap<Entity, HashMap<IVec3, u8>>,
+    next_change: usize,
+    covered_time_ms: u64,
+    active: bool,
+}
+
+/// Applies recorded ship hull cell changes (e.g. explosions blasting parts of
+/// a dynamic voxel ship away) to the live occupancy cache, so the chunked hull
+/// meshes are rebuilt exactly like the original session. On stop, the original
+/// hull cells are restored.
+fn apply_replay_ship_hull_changes(
+    mut commands: Commands,
+    mut occupancy: ResMut<VoxelSpaceshipOccupancyCache>,
+    ships: Query<(Entity, &VoxelSpaceship, &VoxelPhysicsBody)>,
+    studio: Res<ReplayStudio>,
+    mut state: Local<ReplayShipHullPlaybackState>,
+) {
+    let active = replay_scene_dynamics_active(&studio);
+    if !active {
+        if state.active {
+            for (entity, cells) in &state.original_cells {
+                occupancy.replace_ship_cells(*entity, cells);
+                if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+                    entity_commands.insert(VoxelSpaceshipNeedsRebuild);
+                }
+            }
+            *state = ReplayShipHullPlaybackState::default();
+        }
+        return;
+    }
+    let Some(replay) = studio.replay.as_ref() else {
+        return;
+    };
+    let replay_key = replay.created_at_unix_ms;
+    if state.replay_key != Some(replay_key) {
+        state.replay_key = Some(replay_key);
+        state.original_cells = ships
+            .iter()
+            .map(|(entity, _, body)| (entity, body.cells.clone()))
+            .collect();
+        state.applied = state
+            .original_cells
+            .iter()
+            .map(|(entity, cells)| (*entity, cells.iter().copied().collect()))
+            .collect();
+        state.next_change = 0;
+        state.covered_time_ms = 0;
+    }
+    state.active = true;
+    let mut id_to_entity = HashMap::new();
+    for (entity, ship, _) in &ships {
+        id_to_entity.insert(ship.id.clone(), entity);
+    }
+    apply_ship_hull_changes_at(
+        &mut commands,
+        &mut occupancy,
+        &mut state,
+        &id_to_entity,
+        &replay.ship_hull_changes,
+        studio.playback_ms,
+    );
+}
+
+fn apply_ship_hull_changes_at(
+    commands: &mut Commands,
+    occupancy: &mut VoxelSpaceshipOccupancyCache,
+    state: &mut ReplayShipHullPlaybackState,
+    id_to_entity: &HashMap<String, Entity>,
+    changes: &[ReplayShipHullChange],
+    time_ms: u64,
+) {
+    if time_ms < state.covered_time_ms {
+        let mut count = 0;
+        for change in changes {
+            if change.time_ms > time_ms {
+                break;
+            }
+            count += 1;
+        }
+        state.next_change = count;
+        for (entity, original) in &state.original_cells {
+            let mut target = original.iter().copied().collect::<HashMap<_, _>>();
+            for change in &changes[..count] {
+                if id_to_entity.get(&change.ship_id) == Some(entity) {
+                    target.insert(IVec3::from_array(change.position), change.material);
+                }
+            }
+            let applied = state.applied.get(entity).cloned().unwrap_or_default();
+            if applied != target {
+                let cells = target.iter().map(|(cell, material)| (*cell, *material)).collect::<Vec<_>>();
+                occupancy.replace_ship_cells(*entity, &cells);
+                if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+                    entity_commands.insert(VoxelSpaceshipNeedsRebuild);
+                }
+                state.applied.insert(*entity, target);
+            }
+        }
+        state.covered_time_ms = time_ms;
+        return;
+    }
+
+    let mut changed_ships = HashSet::new();
+    while let Some(change) = changes.get(state.next_change) {
+        if change.time_ms > time_ms {
+            break;
+        }
+        if let Some(&entity) = id_to_entity.get(&change.ship_id) {
+            state
+                .applied
+                .entry(entity)
+                .or_default()
+                .insert(IVec3::from_array(change.position), change.material);
+            changed_ships.insert(entity);
+        }
+        state.next_change += 1;
+    }
+    for entity in changed_ships {
+        let target = state
+            .applied
+            .get(&entity)
+            .cloned()
+            .unwrap_or_default();
+        let cells = target.iter().map(|(cell, material)| (*cell, *material)).collect::<Vec<_>>();
+        occupancy.replace_ship_cells(entity, &cells);
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.insert(VoxelSpaceshipNeedsRebuild);
+        }
+    }
+    state.covered_time_ms = state.covered_time_ms.max(time_ms);
+}
+
+#[derive(Default)]
+struct ReplayShipPlaybackState {
+    active: bool,
+    original: HashMap<String, (Transform, LinearVelocity, AngularVelocity)>,
+}
+
+/// Drives the recorded ship trajectories during playback: each ship's world
+/// transform is interpolated from its keyframes and physics velocities are
+/// zeroed so the deterministic track wins over live simulation. Original poses
+/// are restored when playback stops.
+fn apply_replay_ship_positions(
+    studio: Res<ReplayStudio>,
+    mut ships: Query<(
+        &VoxelSpaceship,
+        &mut Transform,
+        &mut LinearVelocity,
+        &mut AngularVelocity,
+    )>,
+    mut state: Local<ReplayShipPlaybackState>,
+) {
+    let active = replay_scene_dynamics_active(&studio);
+    if active && !state.active {
+        state.original = ships
+            .iter()
+            .map(|(ship, transform, linear, angular)| {
+                (
+                    ship.id.clone(),
+                    (*transform, *linear, *angular),
+                )
+            })
+            .collect();
+    }
+    if active {
+        if let Some(replay) = studio.replay.as_ref() {
+            for (ship, mut transform, mut linear, mut angular) in &mut ships {
+                if let Some(trajectory) = replay
+                    .ship_trajectories
+                    .iter()
+                    .find(|trajectory| trajectory.ship_id == ship.id)
+                {
+                    if let Some((translation, rotation)) =
+                        interpolated_ship_pose(trajectory, studio.playback_ms)
+                    {
+                        transform.translation = translation;
+                        transform.rotation = rotation;
+                        linear.0 = Vec3::ZERO;
+                        angular.0 = Vec3::ZERO;
+                    }
+                }
+            }
+        }
+    } else if state.active {
+        for (ship, mut transform, mut linear, mut angular) in &mut ships {
+            if let Some((original_transform, original_linear, original_angular)) =
+                state.original.get(&ship.id)
+            {
+                *transform = *original_transform;
+                *linear = *original_linear;
+                *angular = *original_angular;
+            }
+        }
+        state.original.clear();
+    }
+    state.active = active;
+}
+
 fn auto_group_replay_areas(replay: &mut ReplayFile) {
     let radius_squared = replay.area_radius_cells.max(1).pow(2) as i64;
     let mut remaining = replay
@@ -6485,6 +7348,101 @@ fn compile_area_block_timeline(replay: &mut ReplayFile) -> u64 {
     timeline_ms
         .saturating_sub(HISTORY_DIALOGUE_GAP_MS)
         .max(5_000)
+}
+
+#[derive(Debug, Clone)]
+struct ReplayTurn {
+    ordinal: usize,
+    turn_index: u32,
+    start_ms: u64,
+    end_ms: u64,
+    speaker_names: Vec<String>,
+}
+
+impl ReplayTurn {
+    fn label(&self) -> String {
+        format!("回合 {}", self.turn_index)
+    }
+}
+
+/// Splits the compiled dialogue timeline into contiguous playback turns by
+/// grouping consecutive lines that share the same `turn_index`, so the GM can
+/// review the session one round at a time like at the table.
+fn replay_turns(replay: &ReplayFile) -> Vec<ReplayTurn> {
+    let mut turns: Vec<ReplayTurn> = Vec::new();
+    for line in replay
+        .dialogue
+        .iter()
+        .filter(|line| line.included && line.time_ms != u64::MAX)
+    {
+        let end_ms = line.time_ms.saturating_add(line.duration_ms);
+        if let Some(turn) = turns.last_mut() {
+            if turn.turn_index == line.turn_index {
+                turn.end_ms = turn.end_ms.max(end_ms);
+                if !line.name.is_empty()
+                    && !turn.speaker_names.iter().any(|name| name == &line.name)
+                {
+                    turn.speaker_names.push(line.name.clone());
+                }
+                continue;
+            }
+        }
+        turns.push(ReplayTurn {
+            ordinal: turns.len().saturating_add(1),
+            turn_index: line.turn_index,
+            start_ms: line.time_ms,
+            end_ms,
+            speaker_names: if line.name.is_empty() {
+                Vec::new()
+            } else {
+                vec![line.name.clone()]
+            },
+        });
+    }
+    turns
+}
+
+fn current_replay_turn(turns: &[ReplayTurn], playback_ms: u64) -> Option<usize> {
+    turns
+        .iter()
+        .position(|turn| playback_ms >= turn.start_ms && playback_ms < turn.end_ms)
+        .or_else(|| turns.iter().position(|turn| playback_ms < turn.start_ms))
+        .or_else(|| turns.len().checked_sub(1))
+}
+
+fn previous_replay_turn(turns: &[ReplayTurn], playback_ms: u64) -> Option<usize> {
+    turns
+        .iter()
+        .rposition(|turn| turn.start_ms < playback_ms)
+}
+
+fn next_replay_turn(turns: &[ReplayTurn], playback_ms: u64) -> Option<usize> {
+    turns
+        .iter()
+        .position(|turn| turn.start_ms > playback_ms)
+}
+
+fn jump_replay_to_turn(studio: &mut ReplayStudio, turns: &[ReplayTurn], index: usize) {
+    let Some(turn) = turns.get(index) else {
+        return;
+    };
+    studio.playback_ms = turn.start_ms;
+    if matches!(
+        studio.mode,
+        ReplayMode::Playing | ReplayMode::Paused
+    ) {
+        studio.mode = ReplayMode::Paused;
+    }
+    let speakers = if turn.speaker_names.is_empty() {
+        String::new()
+    } else {
+        format!("（{}）", turn.speaker_names.join("、"))
+    };
+    studio.status = format!(
+        "已跳转到第 {} 段 {}{speakers}",
+        turn.ordinal,
+        turn.label()
+    );
 }
 
 fn standee_positions(
@@ -6712,6 +7670,427 @@ fn append_new_player_movements_from_history(
     replay.duration_ms = replay.duration_ms.max(timeline_cursor);
     replay.player_movement_history_cursor_unix_ms = imported_through;
     imported_count
+}
+
+const MIN_MOVEMENT_SEGMENT_MS: u64 = 800;
+const MAX_MOVEMENT_SEGMENT_MS: u64 = 6_000;
+const MOTION_EVENT_GAP_MS: u64 = 3_000;
+
+/// One contiguous ship motion from the persistent trajectory history. A
+/// session is split into events whenever the ship stopped moving for longer
+/// than `MOTION_EVENT_GAP_MS`.
+struct ShipMotionEvent {
+    ship_id: String,
+    ship_name: String,
+    start_source_ms: u64,
+    end_source_ms: u64,
+    keyframes: Vec<PersistedShipKeyframe>,
+}
+
+/// A replay-timeline slice with its real-world source range, used to map
+/// terrain/hull edits onto the compiled dialogue + ship-motion timeline.
+struct TimelineSegment {
+    source_start_ms: u64,
+    source_end_ms: u64,
+    replay_start_ms: u64,
+    replay_end_ms: u64,
+}
+
+fn ship_motion_events(
+    history: &ReplayShipTrajectoryHistory,
+    campaign_id: &str,
+    cutoff_unix_ms: u64,
+) -> Vec<ShipMotionEvent> {
+    let mut events = Vec::new();
+    for session in history
+        .sessions
+        .iter()
+        .filter(|session| session.campaign_id == campaign_id)
+    {
+        let mut frames = session
+            .keyframes
+            .iter()
+            .filter(|frame| frame.source_unix_ms > cutoff_unix_ms)
+            .copied()
+            .collect::<Vec<_>>();
+        if frames.is_empty() {
+            continue;
+        }
+        if let Some(previous) = session
+            .keyframes
+            .iter()
+            .rev()
+            .find(|frame| {
+                frame.source_unix_ms <= cutoff_unix_ms
+                    && frames
+                        .first()
+                        .is_some_and(|first| {
+                            first.source_unix_ms.saturating_sub(frame.source_unix_ms)
+                                <= MOTION_EVENT_GAP_MS
+                        })
+            })
+            .copied()
+        {
+            frames.insert(0, previous);
+        }
+        let mut run = Vec::new();
+        let mut previous_source = frames.first().map(|frame| frame.source_unix_ms).unwrap_or_default();
+        for frame in frames {
+            if !run.is_empty()
+                && frame
+                    .source_unix_ms
+                    .saturating_sub(previous_source)
+                    > MOTION_EVENT_GAP_MS
+            {
+                events.push(make_ship_motion_event(session, std::mem::take(&mut run)));
+            }
+            run.push(frame);
+            previous_source = frame.source_unix_ms;
+        }
+        if !run.is_empty() {
+            events.push(make_ship_motion_event(session, run));
+        }
+    }
+    events.sort_by_key(|event| event.start_source_ms);
+    events
+}
+
+fn make_ship_motion_event(
+    session: &PersistedShipTrajectorySession,
+    keyframes: Vec<PersistedShipKeyframe>,
+) -> ShipMotionEvent {
+    let start_source_ms = keyframes
+        .first()
+        .map(|frame| frame.source_unix_ms)
+        .unwrap_or_default();
+    let end_source_ms = keyframes
+        .last()
+        .map(|frame| frame.source_unix_ms)
+        .unwrap_or(start_source_ms);
+    ShipMotionEvent {
+        ship_id: session.ship_id.clone(),
+        ship_name: session.ship_name.clone(),
+        start_source_ms,
+        end_source_ms,
+        keyframes,
+    }
+}
+
+/// Rebuilds the replay timeline by interleaving dialogue lines with ship
+/// motion events in real-world order: each motion is inserted right after the
+/// dialogue line that was current when the ship started moving, so "the ship
+/// moved, then the player spoke" plays back in the same order. Pending
+/// terrain/hull edits are mapped onto the resulting timeline by real time, and
+/// ship trajectories are merged into `replay.ship_trajectories`.
+fn compile_scene_dynamics_timeline(
+    replay: &mut ReplayFile,
+    ship_history: &ReplayShipTrajectoryHistory,
+    cutoff_unix_ms: u64,
+    pending_terrain: &[(u64, IVec3, u8)],
+    pending_hull: &[(u64, String, IVec3, u8)],
+) -> usize {
+    compile_area_block_timeline(replay);
+    let playable = replay
+        .dialogue
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.included && line.time_ms != u64::MAX)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let events = ship_motion_events(ship_history, &replay.campaign_id, cutoff_unix_ms);
+
+    let mut before_first = Vec::new();
+    let mut events_by_anchor = HashMap::<usize, Vec<ShipMotionEvent>>::new();
+    for event in events {
+        let anchor = playable.iter().rposition(|&line_index| {
+            let line = &replay.dialogue[line_index];
+            line.source_time > 0
+                && line.source_time.saturating_mul(1_000) <= event.start_source_ms
+        });
+        if let Some(position) = anchor {
+            events_by_anchor.entry(position).or_default().push(event);
+        } else {
+            before_first.push(event);
+        }
+    }
+
+    let mut cursor = 350_u64;
+    let mut segments = Vec::<TimelineSegment>::new();
+    let mut imported_keyframes = HashMap::<String, (String, Vec<ReplayShipKeyframe>)>::new();
+    for event in before_first {
+        place_motion_event(event, &mut cursor, &mut segments, &mut imported_keyframes);
+    }
+    for (position, &line_index) in playable.iter().enumerate() {
+        let line = &mut replay.dialogue[line_index];
+        line.time_ms = cursor;
+        let line_end = line.time_ms.saturating_add(line.duration_ms);
+        segments.push(TimelineSegment {
+            source_start_ms: line.source_time.saturating_mul(1_000),
+            source_end_ms: 0,
+            replay_start_ms: line.time_ms,
+            replay_end_ms: line_end,
+        });
+        cursor = line_end.saturating_add(HISTORY_DIALOGUE_GAP_MS);
+        if let Some(mut anchored) = events_by_anchor.remove(&position) {
+            anchored.sort_by_key(|event| event.start_source_ms);
+            for event in anchored {
+                place_motion_event(event, &mut cursor, &mut segments, &mut imported_keyframes);
+            }
+        }
+    }
+    fill_segment_sources(&mut segments);
+    let max_pending_source = pending_terrain
+        .iter()
+        .map(|(source, _, _)| *source)
+        .chain(pending_hull.iter().map(|(source, _, _, _)| *source))
+        .max()
+        .unwrap_or_default();
+    if let Some(last) = segments.last_mut() {
+        last.source_end_ms = last
+            .source_end_ms
+            .max(max_pending_source.saturating_add(1));
+    }
+
+    let imported_ships = merge_ship_trajectories(replay, imported_keyframes);
+    let scene_end = map_pending_scene_changes(replay, &segments, pending_terrain, pending_hull);
+    let timeline_end = segments
+        .iter()
+        .map(|segment| segment.replay_end_ms)
+        .max()
+        .unwrap_or_default()
+        .max(cursor)
+        .max(scene_end);
+    replay.duration_ms = replay.duration_ms.max(timeline_end);
+    imported_ships
+}
+
+/// Appends ship trajectories recorded since the replay's last import cursor to
+/// the end of the existing timeline, mirroring the player-movement append so a
+/// replay keeps its already-compiled dialogue and camera track untouched.
+fn append_new_ship_trajectories_from_history(
+    replay: &mut ReplayFile,
+    history: &ReplayShipTrajectoryHistory,
+) -> usize {
+    let cutoff_unix_ms = replay
+        .ship_trajectory_history_cursor_unix_ms
+        .max(replay.created_at_unix_ms);
+    let mut imported = 0_usize;
+    let mut next_start = replay.duration_ms;
+    for session in history
+        .sessions
+        .iter()
+        .filter(|session| session.campaign_id == replay.campaign_id)
+    {
+        let frames = session
+            .keyframes
+            .iter()
+            .filter(|frame| frame.source_unix_ms > cutoff_unix_ms)
+            .copied()
+            .collect::<Vec<_>>();
+        if frames.is_empty() {
+            continue;
+        }
+        let first_source_unix_ms = frames[0].source_unix_ms;
+        let movement_start = next_start.saturating_add(HISTORY_DIALOGUE_GAP_MS);
+        let keyframes = frames
+            .into_iter()
+            .map(|frame| ReplayShipKeyframe {
+                time_ms: movement_start.saturating_add(
+                    frame.source_unix_ms.saturating_sub(first_source_unix_ms),
+                ),
+                translation: frame.translation,
+                rotation: frame.rotation,
+            })
+            .collect::<Vec<_>>();
+        next_start = keyframes
+            .last()
+            .map(|frame| frame.time_ms)
+            .unwrap_or(movement_start);
+        if let Some(existing) = replay
+            .ship_trajectories
+            .iter_mut()
+            .find(|trajectory| trajectory.ship_id == session.ship_id)
+        {
+            existing.ship_name = session.ship_name.clone();
+            existing.keyframes.extend(keyframes);
+            existing.keyframes.sort_by_key(|frame| frame.time_ms);
+        } else {
+            replay.ship_trajectories.push(ReplayShipTrajectory {
+                ship_id: session.ship_id.clone(),
+                ship_name: session.ship_name.clone(),
+                keyframes,
+            });
+        }
+        imported = imported.saturating_add(1);
+    }
+    replay.duration_ms = replay.duration_ms.max(next_start);
+    replay.ship_trajectory_history_cursor_unix_ms = unix_time_ms();
+    imported
+}
+
+fn place_motion_event(
+    event: ShipMotionEvent,
+    cursor: &mut u64,
+    segments: &mut Vec<TimelineSegment>,
+    imported_keyframes: &mut HashMap<String, (String, Vec<ReplayShipKeyframe>)>,
+) {
+    let real_duration = event.end_source_ms.saturating_sub(event.start_source_ms);
+    let segment_ms = real_duration.clamp(MIN_MOVEMENT_SEGMENT_MS, MAX_MOVEMENT_SEGMENT_MS);
+    let replay_start_ms = *cursor;
+    let replay_end_ms = replay_start_ms.saturating_add(segment_ms);
+    segments.push(TimelineSegment {
+        source_start_ms: event.start_source_ms,
+        source_end_ms: 0,
+        replay_start_ms,
+        replay_end_ms,
+    });
+    *cursor = replay_end_ms.saturating_add(HISTORY_DIALOGUE_GAP_MS);
+    let entry = imported_keyframes
+        .entry(event.ship_id.clone())
+        .or_insert_with(|| (event.ship_name.clone(), Vec::new()));
+    entry.0 = event.ship_name.clone();
+    for keyframe in event.keyframes {
+        let fraction = if real_duration > 0 {
+            (keyframe.source_unix_ms.saturating_sub(event.start_source_ms) as f64
+                / real_duration as f64)
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let frame_ms = replay_start_ms.saturating_add(
+            ((replay_end_ms - replay_start_ms) as f64 * fraction) as u64,
+        );
+        entry.1.push(ReplayShipKeyframe {
+            time_ms: frame_ms,
+            translation: keyframe.translation,
+            rotation: keyframe.rotation,
+        });
+    }
+}
+
+/// Closes the source range of every segment from the next segment's start, so
+/// terrain edits can be mapped onto the whole timeline by real time.
+fn fill_segment_sources(segments: &mut [TimelineSegment]) {
+    for index in 0..segments.len() {
+        let next_start = segments
+            .get(index + 1)
+            .map(|next| next.source_start_ms)
+            .unwrap_or_else(|| {
+                segments[index]
+                    .source_start_ms
+                    .saturating_add(10_000)
+            });
+        segments[index].source_end_ms = next_start.max(segments[index].source_start_ms);
+    }
+}
+
+/// Merges the freshly placed ship keyframes into `replay.ship_trajectories`,
+/// keeping previously imported frames whose segment times are unchanged.
+fn merge_ship_trajectories(
+    replay: &mut ReplayFile,
+    imported_keyframes: HashMap<String, (String, Vec<ReplayShipKeyframe>)>,
+) -> usize {
+    let imported_ships = imported_keyframes.len();
+    for (ship_id, (ship_name, mut keyframes)) in imported_keyframes {
+        keyframes.sort_by_key(|frame| frame.time_ms);
+        keyframes.dedup_by(|right, left| {
+            if right.time_ms == left.time_ms {
+                *left = *right;
+                true
+            } else {
+                false
+            }
+        });
+        if let Some(existing) = replay
+            .ship_trajectories
+            .iter_mut()
+            .find(|trajectory| trajectory.ship_id == ship_id)
+        {
+            existing.ship_name = ship_name;
+            for frame in keyframes {
+                if let Some(last) = existing
+                    .keyframes
+                    .iter_mut()
+                    .find(|last| last.time_ms == frame.time_ms)
+                {
+                    *last = frame;
+                } else {
+                    existing.keyframes.push(frame);
+                }
+            }
+            existing.keyframes.sort_by_key(|frame| frame.time_ms);
+            existing
+                .keyframes
+                .dedup_by(|right, left| {
+                    if right.time_ms == left.time_ms {
+                        *left = *right;
+                        true
+                    } else {
+                        false
+                    }
+                });
+        } else {
+            replay.ship_trajectories.push(ReplayShipTrajectory {
+                ship_id,
+                ship_name,
+                keyframes,
+            });
+        }
+    }
+    imported_ships
+}
+
+/// Maps pending terrain/hull edits onto the compiled dialogue + motion
+/// timeline proportionally to their real message time.
+fn map_pending_scene_changes(
+    replay: &mut ReplayFile,
+    segments: &[TimelineSegment],
+    pending_terrain: &[(u64, IVec3, u8)],
+    pending_hull: &[(u64, String, IVec3, u8)],
+) -> u64 {
+    let mut scene_end = 0_u64;
+    for (source_unix_ms, cell, material) in pending_terrain {
+        let time_ms = map_source_via_segments(segments, *source_unix_ms);
+        replay.terrain_changes.push(ReplayTerrainChange {
+            time_ms,
+            position: cell.to_array(),
+            material: *material,
+        });
+        scene_end = scene_end.max(time_ms);
+    }
+    for (source_unix_ms, ship_id, cell, material) in pending_hull {
+        let time_ms = map_source_via_segments(segments, *source_unix_ms);
+        replay.ship_hull_changes.push(ReplayShipHullChange {
+            time_ms,
+            ship_id: ship_id.clone(),
+            position: cell.to_array(),
+            material: *material,
+        });
+        scene_end = scene_end.max(time_ms);
+    }
+    scene_end
+}
+
+fn map_source_via_segments(segments: &[TimelineSegment], source_unix_ms: u64) -> u64 {
+    for segment in segments {
+        if source_unix_ms >= segment.source_start_ms && source_unix_ms < segment.source_end_ms {
+            let span = segment.source_end_ms.saturating_sub(segment.source_start_ms);
+            let fraction = if span > 0 {
+                (source_unix_ms.saturating_sub(segment.source_start_ms) as f64 / span as f64)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            return segment.replay_start_ms.saturating_add(
+                ((segment.replay_end_ms.saturating_sub(segment.replay_start_ms)) as f64
+                    * fraction) as u64,
+            );
+        }
+    }
+    segments
+        .first()
+        .map(|segment| segment.replay_start_ms)
+        .unwrap_or(350)
 }
 
 fn replay_camera_focus_at(
@@ -8287,8 +9666,8 @@ fn import_replay(path: &str) -> Result<ReplayFile, String> {
         }
         replay.duration_ms = compact_duration_ms;
         extend_replay_for_speech(&mut replay);
-        replay.format_version = REPLAY_FORMAT_VERSION;
     }
+    replay.format_version = REPLAY_FORMAT_VERSION;
     Ok(replay)
 }
 
@@ -9971,7 +11350,7 @@ mod tests {
     #[test]
     fn historical_dialogue_transition_is_brief() {
         assert_eq!(HISTORY_DIALOGUE_GAP_MS, 270);
-        assert_eq!(MIN_DIALOGUE_MS, 2_700);
+        assert_eq!(MIN_DIALOGUE_MS, 1_500);
         assert_eq!(MAX_DIALOGUE_MS, 9_750);
     }
 
@@ -10927,6 +12306,10 @@ mod tests {
             player_movement_curve: default_player_movement_curve(),
             player_movements: Vec::new(),
             player_movement_history_cursor_unix_ms: 1,
+            ship_trajectories: Vec::new(),
+            terrain_changes: Vec::new(),
+            ship_hull_changes: Vec::new(),
+            ship_trajectory_history_cursor_unix_ms: 1,
             dialogue,
             area_blocks: Vec::new(),
             area_radius_cells: DEFAULT_AREA_RADIUS_CELLS,
@@ -10934,5 +12317,333 @@ mod tests {
             master_dialogue_duration: default_master_dialogue_duration(),
             speaker_voice_settings: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn ship_trajectory_interpolates_and_holds_pose() {
+        let trajectory = ReplayShipTrajectory {
+            ship_id: "ship-1".to_owned(),
+            ship_name: "测试舰".to_owned(),
+            keyframes: vec![
+                ReplayShipKeyframe {
+                    time_ms: 0,
+                    translation: [0.0, 0.0, 0.0],
+                    rotation: Quat::IDENTITY.to_array(),
+                },
+                ReplayShipKeyframe {
+                    time_ms: 1_000,
+                    translation: [10.0, 0.0, 0.0],
+                    rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)
+                        .to_array(),
+                },
+            ],
+        };
+
+        let (translation, _) = interpolated_ship_pose(&trajectory, 500).unwrap();
+        assert!((translation - Vec3::new(5.0, 0.0, 0.0)).length() < 0.001);
+
+        let (translation, rotation) = interpolated_ship_pose(&trajectory, 0).unwrap();
+        assert_eq!(translation, Vec3::ZERO);
+        assert_eq!(rotation, Quat::IDENTITY);
+
+        let (translation, rotation) = interpolated_ship_pose(&trajectory, 5_000).unwrap();
+        assert_eq!(translation, Vec3::new(10.0, 0.0, 0.0));
+        assert!(
+            (rotation - Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)).length()
+                < 0.001
+        );
+    }
+
+    #[test]
+    fn replay_turns_group_consecutive_lines_by_turn_index() {
+        let mut lines = vec![
+            positioned_dialogue(1, 1, 1_000, [0, 0, 0]),
+            positioned_dialogue(2, 1, 1_100, [0, 0, 0]),
+            positioned_dialogue(3, 2, 1_200, [0, 0, 0]),
+            positioned_dialogue(4, 2, 1_300, [0, 0, 0]),
+        ];
+        let mut replay = test_replay(lines.clone());
+        let mut timeline = 350;
+        for line in &mut replay.dialogue {
+            line.time_ms = timeline;
+            timeline += 700;
+        }
+        let mut turns = replay_turns(&replay);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn_index, 1);
+        assert_eq!(turns[1].turn_index, 2);
+        assert!(turns[0].end_ms < turns[1].start_ms);
+        assert_eq!(current_replay_turn(&turns, 400), Some(0));
+        assert_eq!(next_replay_turn(&turns, 400), Some(1));
+        assert_eq!(previous_replay_turn(&turns, 1_100), Some(0));
+
+        // A later segment with the same turn index becomes its own segment.
+        lines.push(positioned_dialogue(5, 1, 1_400, [0, 0, 0]));
+        let mut replay = test_replay(lines);
+        let mut timeline = 350;
+        for line in &mut replay.dialogue {
+            line.time_ms = timeline;
+            timeline += 700;
+        }
+        turns = replay_turns(&replay);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[2].turn_index, 1);
+    }
+
+    #[test]
+    fn replay_terrain_changes_apply_forward_and_rewind() {
+        let mut world = World::new();
+        let entity = world.spawn(Grid::<u8>::new()).id();
+        let mut dirty = VoxelGeometryDirtyChunks::default();
+        let mut state = ReplayTerrainPlaybackState {
+            replay_key: Some(1),
+            baseline: HashMap::from([(IVec3::ZERO, 1_u8)]),
+            applied: HashMap::from([(IVec3::ZERO, 1_u8)]),
+            next_change: 0,
+            covered_time_ms: 0,
+        };
+        let changes = vec![ReplayTerrainChange {
+            time_ms: 300,
+            position: [1, 0, 0],
+            material: 2,
+        }];
+
+        let mut entity_mut = world.entity_mut(entity);
+        let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
+        grid.set(IVec3::ZERO, 1);
+        apply_terrain_changes_at(&mut grid, &mut dirty, &mut state, &changes, 500);
+        assert_eq!(grid.get(IVec3::new(1, 0, 0)), Some(&2));
+        assert_eq!(state.next_change, 1);
+
+        apply_terrain_changes_at(&mut grid, &mut dirty, &mut state, &changes, 0);
+        assert_eq!(grid.get(IVec3::new(1, 0, 0)), Some(&0));
+        assert_eq!(grid.get(IVec3::ZERO), Some(&1));
+        assert_eq!(state.next_change, 0);
+
+        apply_terrain_changes_at(&mut grid, &mut dirty, &mut state, &changes, 500);
+        assert_eq!(grid.get(IVec3::new(1, 0, 0)), Some(&2));
+    }
+
+    #[test]
+    fn replay_ship_hull_changes_destroy_and_restore_cells() {
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let mut commands = Commands::new(&mut queue, &mut world);
+        let mut occupancy = VoxelSpaceshipOccupancyCache::default();
+        let original = vec![(IVec3::ZERO, 1_u8), (IVec3::X, 2_u8)];
+        let mut state = ReplayShipHullPlaybackState {
+            replay_key: Some(1),
+            original_cells: HashMap::from([(entity, original)]),
+            applied: HashMap::from([(
+                entity,
+                HashMap::from([(IVec3::ZERO, 1_u8), (IVec3::X, 2_u8)]),
+            )]),
+            next_change: 0,
+            covered_time_ms: 0,
+            active: true,
+        };
+        let id_to_entity = HashMap::from([("ship-1".to_owned(), entity)]);
+        let changes = vec![ReplayShipHullChange {
+            time_ms: 500,
+            ship_id: "ship-1".to_owned(),
+            position: [1, 0, 0],
+            material: 0,
+        }];
+
+        apply_ship_hull_changes_at(
+            &mut commands,
+            &mut occupancy,
+            &mut state,
+            &id_to_entity,
+            &changes,
+            1_000,
+        );
+        let entry = occupancy.ships.get(&entity).expect("ship occupancy");
+        assert!(entry.contains_cell(IVec3::ZERO));
+        assert!(!entry.contains_cell(IVec3::X));
+
+        apply_ship_hull_changes_at(
+            &mut commands,
+            &mut occupancy,
+            &mut state,
+            &id_to_entity,
+            &changes,
+            0,
+        );
+        let entry = occupancy.ships.get(&entity).expect("ship occupancy");
+        assert!(entry.contains_cell(IVec3::ZERO));
+        assert!(entry.contains_cell(IVec3::X));
+    }
+
+    #[test]
+    fn ship_motion_events_split_at_stationary_gaps() {
+        let history = ReplayShipTrajectoryHistory {
+            sessions: vec![PersistedShipTrajectorySession {
+                campaign_id: "campaign".to_owned(),
+                ship_id: "ship-1".to_owned(),
+                ship_name: "测试舰".to_owned(),
+                turn_index: 1,
+                start_after_source_time: Some(100),
+                start_delay_ms: 0,
+                keyframes: vec![
+                    PersistedShipKeyframe {
+                        source_unix_ms: 100_000,
+                        translation: [0.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                    PersistedShipKeyframe {
+                        source_unix_ms: 101_000,
+                        translation: [1.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                    PersistedShipKeyframe {
+                        source_unix_ms: 110_000,
+                        translation: [2.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                ],
+            }],
+        };
+
+        let events = ship_motion_events(&history, "campaign", 0);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].start_source_ms, 100_000);
+        assert_eq!(events[0].end_source_ms, 101_000);
+        assert_eq!(events[1].start_source_ms, 110_000);
+    }
+
+    #[test]
+    fn dynamic_timeline_inserts_ship_motion_between_dialogue_lines() {
+        let mut lines = vec![
+            positioned_dialogue(1, 1, 100, [0, 0, 0]),
+            positioned_dialogue(2, 1, 200, [0, 0, 0]),
+        ];
+        assign_replay_line_ids(&mut lines);
+        let mut replay = test_replay(lines);
+        auto_group_replay_areas(&mut replay);
+        rebuild_area_blocks(&mut replay);
+        let history = ReplayShipTrajectoryHistory {
+            sessions: vec![PersistedShipTrajectorySession {
+                campaign_id: "campaign".to_owned(),
+                ship_id: "ship-1".to_owned(),
+                ship_name: "测试舰".to_owned(),
+                turn_index: 1,
+                start_after_source_time: Some(100),
+                start_delay_ms: 0,
+                keyframes: vec![
+                    PersistedShipKeyframe {
+                        source_unix_ms: 150_000,
+                        translation: [0.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                    PersistedShipKeyframe {
+                        source_unix_ms: 160_000,
+                        translation: [10.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                ],
+            }],
+        };
+
+        let imported = compile_scene_dynamics_timeline(
+            &mut replay,
+            &history,
+            0,
+            &[],
+            &[],
+        );
+
+        assert_eq!(imported, 1);
+        let first = &replay.dialogue[0];
+        let second = &replay.dialogue[1];
+        assert!(second.time_ms > first.time_ms.saturating_add(first.duration_ms));
+        let trajectory = replay
+            .ship_trajectories
+            .iter()
+            .find(|trajectory| trajectory.ship_id == "ship-1")
+            .expect("ship trajectory");
+        assert_eq!(trajectory.keyframes.len(), 2);
+        for frame in &trajectory.keyframes {
+            assert!(frame.time_ms >= first.time_ms.saturating_add(first.duration_ms));
+            assert!(frame.time_ms < second.time_ms);
+        }
+        assert!(trajectory.keyframes[1].time_ms > trajectory.keyframes[0].time_ms);
+    }
+
+    #[test]
+    fn pending_terrain_maps_into_the_motion_segment() {
+        let mut lines = vec![
+            positioned_dialogue(1, 1, 100, [0, 0, 0]),
+            positioned_dialogue(2, 1, 200, [0, 0, 0]),
+        ];
+        assign_replay_line_ids(&mut lines);
+        let mut replay = test_replay(lines);
+        auto_group_replay_areas(&mut replay);
+        rebuild_area_blocks(&mut replay);
+        let history = ReplayShipTrajectoryHistory {
+            sessions: vec![PersistedShipTrajectorySession {
+                campaign_id: "campaign".to_owned(),
+                ship_id: "ship-1".to_owned(),
+                ship_name: "测试舰".to_owned(),
+                turn_index: 1,
+                start_after_source_time: Some(100),
+                start_delay_ms: 0,
+                keyframes: vec![
+                    PersistedShipKeyframe {
+                        source_unix_ms: 150_000,
+                        translation: [0.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                    PersistedShipKeyframe {
+                        source_unix_ms: 160_000,
+                        translation: [10.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                ],
+            }],
+        };
+        let pending_terrain = vec![(155_000_u64, IVec3::new(3, 0, 0), 5_u8)];
+
+        compile_scene_dynamics_timeline(
+            &mut replay,
+            &history,
+            0,
+            &pending_terrain,
+            &[],
+        );
+
+        let first = &replay.dialogue[0];
+        let second = &replay.dialogue[1];
+        let change = replay.terrain_changes.first().expect("terrain change");
+        assert!(change.time_ms > first.time_ms.saturating_add(first.duration_ms));
+        assert!(change.time_ms < second.time_ms);
+        assert_eq!(change.position, [3, 0, 0]);
+    }
+
+    #[test]
+    fn clearing_ship_trajectory_history_removes_only_matching_campaign() {
+        let mut history = ReplayShipTrajectoryHistory {
+            sessions: vec![
+                PersistedShipTrajectorySession {
+                    campaign_id: "campaign-a".to_owned(),
+                    ship_id: "ship-1".to_owned(),
+                    ..default()
+                },
+                PersistedShipTrajectorySession {
+                    campaign_id: "campaign-b".to_owned(),
+                    ship_id: "ship-1".to_owned(),
+                    ..default()
+                },
+            ],
+        };
+
+        assert_eq!(
+            clear_campaign_replay_ship_trajectory_history(&mut history, "campaign-a"),
+            1
+        );
+        assert_eq!(history.sessions.len(), 1);
+        assert_eq!(history.sessions[0].campaign_id, "campaign-b");
     }
 }

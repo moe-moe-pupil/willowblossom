@@ -347,8 +347,14 @@ fn arrogance_auto_door_trigger_follows_the_moving_ship() {
     let player_local = voxel_auto_door_player_position(player_world, Some(&ship_transform));
 
     assert!(player_local.abs_diff_eq(door.trigger_center, 0.000_01));
-    assert!(voxel_auto_door_should_open(&door, player_local));
-    assert!(!voxel_auto_door_should_open(&door, player_world));
+    assert!(voxel_auto_door_should_open(
+        &door,
+        player_local
+    ));
+    assert!(!voxel_auto_door_should_open(
+        &door,
+        player_world
+    ));
 }
 
 #[test]
@@ -1025,4 +1031,420 @@ fn stopping_spaceship_control_returns_to_cockpit_view() {
     control.stop_driving();
 
     assert!(!control.third_person_view);
+}
+
+#[test]
+fn spaceship_explosion_removes_only_cells_inside_the_blast_radius() {
+    let transform = Transform::from_translation(Vec3::new(4.0, 2.0, -3.0)).with_rotation(
+        Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+    );
+    let cells = HashMap::from([
+        (IVec3::ZERO, 1),
+        (IVec3::X, 2),
+        (IVec3::new(8, 0, 0), 3),
+        (IVec3::new(0, 0, 2), 4),
+    ]);
+    let blast_origin = transform
+        .compute_affine()
+        .transform_point3(Vec3::splat(0.5) * VOXEL_SIZE);
+    let mut occupancy = VoxelSpaceshipOccupancy::empty();
+    for (cell, material) in &cells {
+        occupancy.set_cell(*cell, *material);
+    }
+
+    // The explosion radius is clamped to one canonical voxel; the neighbour
+    // sits exactly one voxel away and is included, while cells farther out
+    // survive and the fluid cell is never selected as debris.
+    let removed =
+        voxel_spaceship_cells_in_radius(&occupancy, &transform, blast_origin, VOXEL_SIZE);
+    assert_eq!(removed, vec![
+        (IVec3::ZERO, 1),
+        (IVec3::X, 2)
+    ]);
+
+    for &(cell, _) in &removed {
+        occupancy.remove_cell(cell);
+    }
+    assert!(occupancy.cell_material(IVec3::new(8, 0, 0)).is_some());
+    assert!(occupancy.cell_material(IVec3::new(0, 0, 2)).is_some());
+    assert!(occupancy.cell_material(IVec3::ZERO).is_none());
+    assert!(occupancy.cell_material(IVec3::X).is_none());
+
+    // After the crater, a larger radius reaches the far solid survivor while
+    // the fluid cell at (0,0,2) is still never selected as debris.
+    let local = voxel_spaceship_cells_in_radius(
+        &occupancy,
+        &transform,
+        blast_origin,
+        VOXEL_SIZE * 8.5,
+    );
+    assert_eq!(
+        local.iter().map(|(cell, _)| *cell).collect::<HashSet<_>>(),
+        HashSet::from([IVec3::new(8, 0, 0)])
+    );
+}
+
+#[test]
+fn spaceship_local_edit_rebuilds_hull_and_keeps_the_ship_identity() {
+    #[derive(Resource, Default)]
+    struct TestShipHandle(Option<Entity>);
+
+    fn spawn_ship(
+        mut commands: Commands,
+        mut meshes: ResMut<Assets<Mesh>>,
+        materials: Res<VoxelMaterials>,
+        mut handle: ResMut<TestShipHandle>,
+        mut spawned: Local<bool>,
+    ) {
+        if *spawned {
+            return;
+        }
+        *spawned = true;
+        let spec = default_voxel_spaceship_specs().remove(1);
+        handle.0 = Some(spawn_voxel_spaceship(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            &spec,
+            Transform::IDENTITY,
+            LinearVelocity::ZERO,
+            AngularVelocity::ZERO,
+            None,
+        ));
+    }
+
+    fn edit_ship(
+        mut commands: Commands,
+        mut occupancy: ResMut<VoxelSpaceshipOccupancyCache>,
+        handle: ResMut<TestShipHandle>,
+        mut applied: Local<bool>,
+        ships: Query<&VoxelPhysicsBody>,
+    ) {
+        if *applied {
+            return;
+        }
+        let Some(ship) = handle.0 else {
+            return;
+        };
+        let Ok(body) = ships.get(ship) else {
+            return;
+        };
+        let removed = body
+            .cells
+            .iter()
+            .copied()
+            .find(|(_, material)| TrpgVoxelConnector::solid(material))
+            .unwrap();
+        let entry = occupancy
+            .ships
+            .entry(ship)
+            .or_insert_with(VoxelSpaceshipOccupancy::empty);
+        for &(cell, material) in &body.cells {
+            entry.set_cell(cell, material);
+        }
+        entry.remove_cell(removed.0);
+        entry.cells_dirty = true;
+        commands.entity(ship).insert(VoxelSpaceshipNeedsRebuild);
+        *applied = true;
+    }
+
+    let mut app = App::new();
+    app.init_resource::<Assets<Mesh>>()
+        .insert_resource(VoxelMaterials {
+            handles: std::array::from_fn(|_| Handle::default()),
+            planet_ocean: Handle::default(),
+        })
+        .init_resource::<TestShipHandle>()
+        .init_resource::<VoxelSpaceshipOccupancyCache>()
+        .init_resource::<Time>()
+        .init_resource::<ButtonInput<MouseButton>>()
+        .add_systems(
+            Update,
+            (
+                spawn_ship,
+                edit_ship,
+                rebuild_dirty_voxel_spaceships,
+            )
+                .chain(),
+        );
+    app.update();
+    app.update();
+
+    let ship = app.world().resource::<TestShipHandle>().0.unwrap();
+    let original_len = default_voxel_spaceship_specs()[1].cells.len();
+    {
+        let entity = app.world().entity(ship);
+        assert_eq!(
+            entity.get::<VoxelPhysicsBody>().unwrap().cells.len(),
+            original_len - 1
+        );
+        assert!(
+            entity.contains::<VoxelSpaceship>(),
+            "a locally damaged ship must keep its teleport/drive identity"
+        );
+        assert!(
+            entity.get::<VoxelSpaceshipChunks>().unwrap().0.len() > 0,
+            "the ship must keep its hull chunk registry"
+        );
+    }
+    let mut chunk_colliders = app
+        .world_mut()
+        .query_filtered::<&Collider, With<VoxelSpaceshipChunk>>();
+    assert!(
+        chunk_colliders
+            .iter(app.world())
+            .all(|collider| collider.shape().as_voxels().is_some()),
+        "edited chunk colliders must stay canonical voxel colliders"
+    );
+    let mut hull_children = app
+        .world_mut()
+        .query_filtered::<Entity, With<VoxelSpaceshipHullMesh>>();
+    let rebuilt_hull_count = hull_children.iter(app.world()).count();
+    assert!(
+        rebuilt_hull_count > 0,
+        "the edited chunk must respawn hull meshes from the surviving voxels"
+    );
+}
+
+#[test]
+fn spaceship_hull_chunks_rebuild_during_a_stroke_and_body_syncs_on_release() {
+    #[derive(Resource, Default)]
+    struct TestShipHandle(Option<Entity>);
+
+    fn spawn_ship(
+        mut commands: Commands,
+        mut meshes: ResMut<Assets<Mesh>>,
+        materials: Res<VoxelMaterials>,
+        mut handle: ResMut<TestShipHandle>,
+        mut spawned: Local<bool>,
+    ) {
+        if *spawned {
+            return;
+        }
+        *spawned = true;
+        let spec = default_voxel_spaceship_specs().remove(1);
+        handle.0 = Some(spawn_voxel_spaceship(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            &spec,
+            Transform::IDENTITY,
+            LinearVelocity::ZERO,
+            AngularVelocity::ZERO,
+            None,
+        ));
+    }
+
+    fn edit_ship(
+        mut commands: Commands,
+        mut occupancy: ResMut<VoxelSpaceshipOccupancyCache>,
+        handle: ResMut<TestShipHandle>,
+        mut applied: Local<bool>,
+        ships: Query<&VoxelPhysicsBody>,
+    ) {
+        if *applied {
+            return;
+        }
+        let Some(ship) = handle.0 else {
+            return;
+        };
+        let Ok(body) = ships.get(ship) else {
+            return;
+        };
+        let removed = body
+            .cells
+            .iter()
+            .copied()
+            .find(|(_, material)| TrpgVoxelConnector::solid(material))
+            .unwrap();
+        let entry = occupancy
+            .ships
+            .entry(ship)
+            .or_insert_with(VoxelSpaceshipOccupancy::empty);
+        for &(cell, material) in &body.cells {
+            entry.set_cell(cell, material);
+        }
+        entry.remove_cell(removed.0);
+        entry.cells_dirty = true;
+        commands.entity(ship).insert(VoxelSpaceshipNeedsRebuild);
+        *applied = true;
+    }
+
+    let mut app = App::new();
+    app.init_resource::<Assets<Mesh>>()
+        .insert_resource(VoxelMaterials {
+            handles: std::array::from_fn(|_| Handle::default()),
+            planet_ocean: Handle::default(),
+        })
+        .init_resource::<TestShipHandle>()
+        .init_resource::<VoxelSpaceshipOccupancyCache>()
+        .init_resource::<Time>()
+        .init_resource::<ButtonInput<MouseButton>>()
+        .add_systems(
+            Update,
+            (
+                spawn_ship,
+                edit_ship,
+                rebuild_dirty_voxel_spaceships,
+            )
+                .chain(),
+        );
+    app.world_mut()
+        .resource_mut::<ButtonInput<MouseButton>>()
+        .press(MouseButton::Left);
+    app.update();
+
+    let ship = app.world().resource::<TestShipHandle>().0.unwrap();
+    let original_len = default_voxel_spaceship_specs()[1].cells.len();
+    assert!(
+        app.world()
+            .entity(ship)
+            .get::<VoxelPhysicsBody>()
+            .unwrap()
+            .cells
+            .len()
+            == original_len,
+        "a held stroke must not rebuild the body collider on every edit tick"
+    );
+    assert!(
+        !app
+            .world()
+            .entity(ship)
+            .contains::<VoxelSpaceshipNeedsRebuild>(),
+        "the touched hull chunk must rebuild immediately, not wait for release"
+    );
+    let mut hull_children = app
+        .world_mut()
+        .query_filtered::<Entity, With<VoxelSpaceshipHullMesh>>();
+    assert!(
+        hull_children.iter(app.world()).next().is_some(),
+        "the edited chunk must still own rebuilt hull meshes"
+    );
+
+    app.world_mut()
+        .resource_mut::<ButtonInput<MouseButton>>()
+        .release(MouseButton::Left);
+    app.update();
+    assert_eq!(
+        app.world()
+            .entity(ship)
+            .get::<VoxelPhysicsBody>()
+            .unwrap()
+            .cells
+            .len(),
+        original_len - 1,
+        "releasing the stroke must re-sync the physics body cells once"
+    );
+}
+
+#[test]
+fn spawned_spaceships_track_hull_surface_children_and_micro_tiles() {
+    #[derive(Resource, Default)]
+    struct TestShipHandle(Option<Entity>);
+
+    fn spawn_ship(
+        mut commands: Commands,
+        mut meshes: ResMut<Assets<Mesh>>,
+        materials: Res<VoxelMaterials>,
+        mut handle: ResMut<TestShipHandle>,
+        mut spawned: Local<bool>,
+    ) {
+        if *spawned {
+            return;
+        }
+        *spawned = true;
+        let spec = default_voxel_spaceship_specs().remove(0);
+        handle.0 = Some(spawn_voxel_spaceship(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            &spec,
+            Transform::IDENTITY,
+            LinearVelocity::ZERO,
+            AngularVelocity::ZERO,
+            None,
+        ));
+    }
+
+    let mut app = App::new();
+    app.init_resource::<Assets<Mesh>>()
+        .insert_resource(VoxelMaterials {
+            handles: std::array::from_fn(|_| Handle::default()),
+            planet_ocean: Handle::default(),
+        })
+        .init_resource::<TestShipHandle>()
+        .add_systems(Update, spawn_ship);
+    app.update();
+
+    let ship = app.world().resource::<TestShipHandle>().0.unwrap();
+    let entity = app.world().entity(ship);
+    assert!(entity.contains::<VoxelSpaceshipMicroTiles>());
+    assert!(
+        entity.get::<VoxelSpaceshipChunks>().unwrap().0.len() > 0,
+        "a spawned ship must partition its hull into chunks"
+    );
+    let mut hull_children = app
+        .world_mut()
+        .query_filtered::<Entity, With<VoxelSpaceshipHullMesh>>();
+    let mut micro_children = app
+        .world_mut()
+        .query_filtered::<Entity, With<VoxelMicroDecoration>>();
+    let hull_count = hull_children.iter(app.world()).count();
+    let micro_count = micro_children.iter(app.world()).count();
+    assert!(hull_count > 0);
+    assert!(micro_count > 0);
+}
+
+#[test]
+fn spawned_hull_chunks_never_carry_empty_voxel_colliders() {
+    fn spawn_fleet(
+        mut commands: Commands,
+        mut meshes: ResMut<Assets<Mesh>>,
+        materials: Res<VoxelMaterials>,
+    ) {
+        for spec in default_voxel_spaceship_specs() {
+            spawn_voxel_spaceship(
+                &mut commands,
+                &mut meshes,
+                &materials,
+                &spec,
+                spec.transform,
+                LinearVelocity::ZERO,
+                AngularVelocity::ZERO,
+                spec.docking.clone(),
+            );
+        }
+    }
+
+    let mut app = App::new();
+    app.init_resource::<Assets<Mesh>>()
+        .insert_resource(VoxelMaterials {
+            handles: std::array::from_fn(|_| Handle::default()),
+            planet_ocean: Handle::default(),
+        })
+        .add_systems(Update, spawn_fleet);
+    app.update();
+
+    let mut chunks = app
+        .world_mut()
+        .query_filtered::<(Entity, Option<&Collider>), With<VoxelSpaceshipChunk>>();
+    let mut solid_chunk_count = 0;
+    for (_, collider) in chunks.iter(app.world()) {
+        let Some(collider) = collider else {
+            continue;
+        };
+        solid_chunk_count += 1;
+        let voxels = collider
+            .shape()
+            .as_voxels()
+            .expect("chunk colliders must stay voxel colliders");
+        assert!(
+            voxels.voxels().next().is_some(),
+            "a chunk collider must never be empty: Avian panics on empty voxel AABBs"
+        );
+    }
+    assert!(
+        solid_chunk_count > 0,
+        "the fleet must own solid hull chunks"
+    );
 }
