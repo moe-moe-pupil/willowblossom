@@ -933,7 +933,8 @@ fn spaceship_chase_camera_stays_behind_and_above_the_canonical_hull() {
     };
     let ship_transform = Transform::from_rotation(Quat::from_rotation_y(0.7));
 
-    let camera = voxel_spaceship_chase_camera_transform(&ship_transform, &body).unwrap();
+    let camera =
+        voxel_spaceship_chase_camera_transform(&ship_transform, &body, Vec3::NEG_Z).unwrap();
     let local_camera = ship_transform
         .compute_affine()
         .inverse()
@@ -943,6 +944,55 @@ fn spaceship_chase_camera_stays_behind_and_above_the_canonical_hull() {
     assert!(local_camera.y > local_max.y);
     assert!(local_camera.z > local_max.z);
     assert!((camera.rotation * Vec3::NEG_Z).dot(ship_transform.rotation * Vec3::NEG_Z) > 0.5);
+}
+
+#[test]
+fn spaceship_chase_camera_follows_a_forward_axis_other_than_local_z() {
+    let body = VoxelPhysicsBody {
+        local_center: Vec3::ZERO,
+        cells: vec![(IVec3::new(-20, -1, -6), 1), (IVec3::new(20, 3, 6), 1)],
+    };
+    let ship_transform = Transform::from_rotation(Quat::from_rotation_y(0.7));
+
+    let camera =
+        voxel_spaceship_chase_camera_transform(&ship_transform, &body, Vec3::NEG_X).unwrap();
+    let local_camera = ship_transform
+        .compute_affine()
+        .inverse()
+        .transform_point3(camera.translation);
+    let (_, local_max) = voxel_spaceship_chase_bounds(&body).unwrap();
+
+    assert!(local_camera.x > local_max.x);
+    assert!(local_camera.y > local_max.y);
+    assert!((camera.rotation * Vec3::NEG_Z).dot(ship_transform.rotation * Vec3::NEG_X) > 0.5);
+}
+
+#[test]
+fn spaceship_heading_yaw_maps_view_forward_onto_the_bow_axis() {
+    for axis in [Vec3::NEG_Z, Vec3::NEG_X] {
+        let view_forward = voxel_spaceship_heading_yaw(axis) * Vec3::NEG_Z;
+        assert!(
+            view_forward.dot(axis) > 0.999_9,
+            "heading yaw for {axis:?} looks along {view_forward:?} instead of {axis:?}"
+        );
+    }
+}
+
+#[test]
+fn default_spaceship_specs_author_forward_axes_matching_each_hull() {
+    let specs = default_voxel_spaceship_specs();
+    assert_eq!(
+        specs.len(),
+        TELEPORT_SPACESHIP_IDS.len()
+    );
+    for spec in &specs {
+        let expected = if spec.ship.id == COMBAT_SPACESHIP_ID { Vec3::NEG_X } else { Vec3::NEG_Z };
+        assert_eq!(
+            spec.ship.forward_axis, expected,
+            "{} bow axis must be {expected:?}",
+            spec.ship.name
+        );
+    }
 }
 
 #[test]
@@ -957,8 +1007,10 @@ fn spaceship_chase_camera_distance_scales_with_voxel_hull_size() {
     };
     let ship_transform = Transform::IDENTITY;
 
-    let small_camera = voxel_spaceship_chase_camera_transform(&ship_transform, &small).unwrap();
-    let large_camera = voxel_spaceship_chase_camera_transform(&ship_transform, &large).unwrap();
+    let small_camera =
+        voxel_spaceship_chase_camera_transform(&ship_transform, &small, Vec3::NEG_Z).unwrap();
+    let large_camera =
+        voxel_spaceship_chase_camera_transform(&ship_transform, &large, Vec3::NEG_Z).unwrap();
 
     assert!(large_camera.translation.z > small_camera.translation.z);
     assert!(large_camera.translation.y > small_camera.translation.y);

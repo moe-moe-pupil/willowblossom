@@ -681,6 +681,12 @@ pub(crate) struct VoxelSpaceship {
     name: String,
     class: VoxelSpaceshipClass,
     cockpit_eye_local: Vec3,
+    /// Local unit direction from the stern toward the bow. Most ships are
+    /// authored with their bow on local `-Z` (the Bevy camera forward), but
+    /// the Arrogance's bridge and bow face local `-X`, so thrust, telemetry,
+    /// the chase camera, and the cockpit view must follow this axis instead
+    /// of assuming `-Z`.
+    forward_axis: Vec3,
     thrust_acceleration: f32,
     vertical_acceleration: f32,
     turn_speed: f32,
@@ -5873,6 +5879,7 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
                     0.0,
                 )) * VOXEL_SIZE
             },
+            forward_axis: Vec3::NEG_X,
             thrust_acceleration: 2.4,
             vertical_acceleration: 1.4,
             turn_speed: 0.32,
@@ -5891,6 +5898,7 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
             name: "WB-M1 苍鹭号".to_owned(),
             class: VoxelSpaceshipClass::Corvette,
             cockpit_eye_local: Vec3::new(0.5, 3.5, -9.5) * VOXEL_SIZE,
+            forward_axis: Vec3::NEG_Z,
             thrust_acceleration: 5.5,
             vertical_acceleration: 3.8,
             turn_speed: 0.78,
@@ -5939,6 +5947,7 @@ fn default_voxel_spaceship_specs() -> Vec<VoxelSpaceshipSpec> {
                 name: names[index].to_owned(),
                 class,
                 cockpit_eye_local: Vec3::new(0.5, 2.8, -1.5) * VOXEL_SIZE,
+                forward_axis: Vec3::NEG_Z,
                 thrust_acceleration,
                 vertical_acceleration,
                 turn_speed,
@@ -6378,18 +6387,33 @@ fn voxel_spaceship_local_bounds(body: &VoxelPhysicsBody) -> Option<(Vec3, Vec3)>
 fn voxel_spaceship_chase_camera_transform(
     ship_transform: &Transform,
     body: &VoxelPhysicsBody,
+    forward_axis: Vec3,
 ) -> Option<Transform> {
     let (local_min, local_max) = voxel_spaceship_chase_bounds(body)?;
     let size = local_max - local_min;
     let focus_local = (local_min + local_max) * 0.5 + Vec3::Y * size.y * 0.1;
-    let distance = (size.z * 0.65 + size.x * 0.45).max(SPACESHIP_CHASE_MIN_DISTANCE);
-    let lift = (size.y * 0.7 + size.z * 0.12).max(6.0 * VOXEL_SIZE);
-    let camera_local = focus_local + Vec3::new(0.0, lift, distance);
+    let forward_extent = size * forward_axis.abs();
+    let forward_component = forward_extent.x + forward_extent.y + forward_extent.z;
+    let lateral_extent = size - forward_extent;
+    let distance = (forward_component * 0.65 + lateral_extent.max_element() * 0.45)
+        .max(SPACESHIP_CHASE_MIN_DISTANCE);
+    let lift = (size.y * 0.7 + forward_component * 0.12).max(6.0 * VOXEL_SIZE);
+    let camera_local = focus_local - forward_axis * distance + Vec3::Y * lift;
     let affine = ship_transform.compute_affine();
     let camera_position = affine.transform_point3(camera_local);
     let focus = affine.transform_point3(focus_local);
     let up = ship_transform.rotation * Vec3::Y;
     Some(Transform::from_translation(camera_position).looking_at(focus, up))
+}
+
+/// Yaw that maps the canonical camera/view forward `-Z` onto the ship's bow
+/// axis, so the cockpit camera and chase framing share one heading convention
+/// no matter how the hull was authored.
+fn voxel_spaceship_heading_yaw(forward_axis: Vec3) -> Quat {
+    Quat::from_rotation_y(f32::atan2(
+        -forward_axis.x,
+        -forward_axis.z,
+    ))
 }
 
 fn voxel_spaceship_chase_bounds(body: &VoxelPhysicsBody) -> Option<(Vec3, Vec3)> {
@@ -6749,7 +6773,7 @@ fn control_voxel_spaceships(
             .compute_affine()
             .transform_point3(ship.cockpit_eye_local),
     );
-    control.cockpit_rotation = transform.rotation;
+    control.cockpit_rotation = transform.rotation * voxel_spaceship_heading_yaw(ship.forward_axis);
     if control.emergency_stop_requested {
         linear_velocity.0 = Vec3::ZERO;
         angular_velocity.0 = Vec3::ZERO;
@@ -6776,7 +6800,7 @@ fn control_voxel_spaceships(
     let braking = keyboard.pressed(KeyCode::KeyX);
     let delta_seconds = time.delta_secs().clamp(0.0, 0.05);
     let boost_scale = if boost { 1.75 } else { 1.0 };
-    let forward = transform.rotation * Vec3::NEG_Z;
+    let forward = transform.rotation * ship.forward_axis;
     let up = transform.rotation * Vec3::Y;
     linear_velocity.0 += (forward * thrust_input as f32 * ship.thrust_acceleration
         + up * vertical_input as f32 * ship.vertical_acceleration)
@@ -7842,7 +7866,7 @@ fn voxel_spaceship_panel(
                 class: ship.class,
                 max_speed: ship.max_speed,
                 speed: linear_velocity.length(),
-                forward_speed: linear_velocity.dot(transform.rotation * Vec3::NEG_Z),
+                forward_speed: linear_velocity.dot(transform.rotation * ship.forward_axis),
                 angular_speed: angular_velocity.length(),
                 translation: transform.translation,
                 rotation: transform.rotation,
@@ -13431,16 +13455,18 @@ fn control_voxel_camera(
         if let Ok((mut camera_transform, mut projection)) = cameras.single_mut() {
             let spaceship_view = spaceship_control.as_deref().and_then(|control| {
                 let driving_ship_id = control.driving_ship_id.as_deref()?;
-                let (_, body, ship_transform) = spaceships
+                let (ship, body, ship_transform) = spaceships
                     .iter()
                     .find(|(ship, ..)| ship.id == driving_ship_id)?;
-                Some((control, body, ship_transform))
+                Some((control, ship, body, ship_transform))
             });
-            if let Some((control, body, ship_transform)) = spaceship_view {
+            if let Some((control, ship, body, ship_transform)) = spaceship_view {
                 if control.third_person_view {
-                    if let Some(target) =
-                        voxel_spaceship_chase_camera_transform(ship_transform, body)
-                    {
+                    if let Some(target) = voxel_spaceship_chase_camera_transform(
+                        ship_transform,
+                        body,
+                        ship.forward_axis,
+                    ) {
                         *camera_transform = smoothed_spaceship_chase_camera(
                             &camera_transform,
                             &target,
