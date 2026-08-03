@@ -792,9 +792,14 @@ use crate::{
         NAPCAT_MANAGER_EXPORT_VERSION,
     },
     replay::{
-        clear_campaign_replay_movement_history,
+        clear_campaign_replay_data,
         clear_player_replay_movement_history,
+        ReplayMovementHistoryRecorder,
         ReplayPlayerMovementHistory,
+        ReplayShipTrajectoryHistory,
+        ReplayShipTrajectoryRecorder,
+        ReplaySnapshotTracker,
+        ReplayStudio,
     },
     rule_engine::{
         apply_skill_type_damage_default,
@@ -1012,6 +1017,11 @@ pub struct UiSystemLocals<'w, 's> {
     battle_store: Option<ResMut<'w, Persistent<BattleRoundStore>>>,
     possession_movement_store: ResMut<'w, Persistent<VoxelPossessionMovementStore>>,
     replay_movement_history: ResMut<'w, Persistent<ReplayPlayerMovementHistory>>,
+    replay_ship_trajectory_history: ResMut<'w, Persistent<ReplayShipTrajectoryHistory>>,
+    replay_studio: ResMut<'w, ReplayStudio>,
+    replay_snapshot_tracker: ResMut<'w, ReplaySnapshotTracker>,
+    replay_movement_recorder: ResMut<'w, ReplayMovementHistoryRecorder>,
+    replay_ship_recorder: ResMut<'w, ReplayShipTrajectoryRecorder>,
     player_camera_store: ResMut<'w, Persistent<VoxelPlayerCameraStore>>,
     unit_standee_store: ResMut<'w, Persistent<VoxelUnitStandeeStore>>,
     player_standees: Query<
@@ -13128,6 +13138,11 @@ fn trpg_group_settings_window(
     mut battle_store: Option<&mut Persistent<BattleRoundStore>>,
     possession_movement_store: &mut Persistent<VoxelPossessionMovementStore>,
     replay_movement_history: &mut Persistent<ReplayPlayerMovementHistory>,
+    replay_ship_trajectory_history: &mut Persistent<ReplayShipTrajectoryHistory>,
+    replay_studio: &mut ReplayStudio,
+    replay_snapshot_tracker: &mut ReplaySnapshotTracker,
+    replay_movement_recorder: &mut ReplayMovementHistoryRecorder,
+    replay_ship_recorder: &mut ReplayShipTrajectoryRecorder,
     player_camera_store: &mut Persistent<VoxelPlayerCameraStore>,
     player_view_request: Option<&mut ScenePlayerViewRequest>,
     napcat_sender: Option<&NapcatIOSender>,
@@ -13389,7 +13404,7 @@ fn trpg_group_settings_window(
                                     if ui
                                         .button("确认清空测试进度")
                                         .on_hover_text(
-                                            "恢复玩家首轮前状态、轮次归零，并清空本活动聊天、DeepSeek总结、战斗轮和玩家移动；保留角色、团设和场景",
+                                            "恢复玩家首轮前状态、轮次归零，并清空本活动聊天、DeepSeek总结、战斗轮、玩家移动、飞船轨迹和已生成的回放镜头；保留角色、团设和场景",
                                         )
                                         .clicked()
                                     {
@@ -13402,7 +13417,7 @@ fn trpg_group_settings_window(
                                 } else if ui
                                     .button("清空测试进度")
                                     .on_hover_text(
-                                        "需要再次确认；保留玩家角色、TRPG组设置和体素场景",
+                                        "需要再次确认；会连同当前回放与镜头帧一起清空，保留玩家角色、TRPG组设置和体素场景",
                                     )
                                     .clicked()
                                 {
@@ -14020,16 +14035,27 @@ fn trpg_group_settings_window(
             let removed_movements =
                 clear_campaign_possession_movement(possession_movement_store, &campaign_id);
             possession_movement_store.persist().ok();
-            let removed_replay_movements =
-                clear_campaign_replay_movement_history(replay_movement_history, &campaign_id);
+            let removed_replay_sessions = clear_campaign_replay_data(
+                replay_studio,
+                replay_snapshot_tracker,
+                replay_movement_recorder,
+                replay_ship_recorder,
+                replay_movement_history,
+                replay_ship_trajectory_history,
+                &campaign_id,
+            );
             replay_movement_history.persist().ok();
+            replay_ship_trajectory_history.persist().ok();
+            for target_id in &target_ids {
+                manager.replay_snapshots.remove(target_id);
+            }
             deepseek_manager.persist().ok();
             chat_input_msgs.retain(|target_id, _| !target_ids.contains(target_id));
             changed = true;
             state.group_reset_status.insert(
                 group_name,
                 format!(
-                    "测试进度已清空：恢复 {restored} 个玩家（缺少首轮前快照 {missing}），轮次{}，删除 {removed_messages} 条聊天、{removed_summaries} 个 DeepSeek 总结、{removed_battles} 个战斗轮、{removed_movements} 条移动状态、{removed_replay_movements} 条回放轨迹；角色、团设和场景已保留",
+                    "测试进度已清空：恢复 {restored} 个玩家（缺少首轮前快照 {missing}），轮次{}，删除 {removed_messages} 条聊天、{removed_summaries} 个 DeepSeek 总结、{removed_battles} 个战斗轮、{removed_movements} 条移动状态，并清空 {removed_replay_sessions} 段回放轨迹（含飞船轨迹与已生成镜头帧）；角色、团设和场景已保留",
                     if turns_reset { "已归零" } else { "原本就是0" }
                 ),
             );
@@ -14204,6 +14230,11 @@ pub fn ui_system(
     let battle_store = &mut locals.battle_store;
     let possession_movement_store = &mut locals.possession_movement_store;
     let replay_movement_history = &mut locals.replay_movement_history;
+    let replay_ship_trajectory_history = &mut locals.replay_ship_trajectory_history;
+    let replay_studio = &mut locals.replay_studio;
+    let replay_snapshot_tracker = &mut locals.replay_snapshot_tracker;
+    let replay_movement_recorder = &mut locals.replay_movement_recorder;
+    let replay_ship_recorder = &mut locals.replay_ship_recorder;
     let player_camera_store = &mut locals.player_camera_store;
     let unit_standee_store = &mut locals.unit_standee_store;
     let player_standees = &locals.player_standees;
@@ -14297,6 +14328,11 @@ pub fn ui_system(
         battle_store.as_deref_mut(),
         possession_movement_store,
         replay_movement_history,
+        replay_ship_trajectory_history,
+        replay_studio,
+        replay_snapshot_tracker,
+        replay_movement_recorder,
+        replay_ship_recorder,
         player_camera_store,
         player_view_request.as_deref_mut(),
         napcat_sender,
