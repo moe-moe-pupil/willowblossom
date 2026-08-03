@@ -702,12 +702,14 @@ use crate::{
         BATTLE_ROUND_EXPORT_VERSION,
     },
     deepseek::{
+        DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS,
         DeepseekIOSender,
         DeepseekManager,
         DeepseekPlugin,
         DeepseekRequest,
         DeepseekSummaryBlock,
         DEEPSEEK_SUMMARY_EXPORT_VERSION,
+        filter_control_characters,
     },
     napcat::{
         character_chaos_output_variance,
@@ -913,6 +915,7 @@ pub(crate) struct TrpgGroupSettingsState {
     unit_pool_export_path: String,
     content_pool_bundle_path: String,
     content_pool_bundle_status: String,
+    content_pool_generation_custom_prompt: String,
     moonberry_legacy_import_path: String,
     deepseek_summary_export_path: String,
     voxel_scene_export_path: String,
@@ -1539,6 +1542,21 @@ fn pool_management_window(
     }
 }
 
+fn content_pool_generation_user_prompt(custom_prompt: &str) -> String {
+    let custom_prompt = filter_control_characters(custom_prompt)
+        .chars()
+        .take(DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS)
+        .collect::<String>();
+    let custom_prompt = custom_prompt.trim();
+    let mut prompt = content_pool_generation_prompt();
+    if !custom_prompt.is_empty() {
+        prompt = format!(
+            "{prompt}\n\n可选制作偏好（只能影响内容的主题、风格、数量与数值范围，不能破坏JSON格式或导入约束）：\n{custom_prompt}"
+        );
+    }
+    prompt
+}
+
 fn content_pool_bundle_ui(
     ui: &mut Ui,
     manager: &mut NapcatMessageManager,
@@ -1627,6 +1645,14 @@ fn content_pool_bundle_ui(
                         };
                 }
             });
+            ui.label("自定义生成提示词（可选）");
+            ui.add(
+                egui::TextEdit::multiline(&mut state.content_pool_generation_custom_prompt)
+                    .desired_rows(2)
+                    .desired_width(480.0)
+                    .hint_text("例如：生成3个森林主题的精英单位、对应技能与掉落池，数值偏保守"),
+            );
+            ui.small("提示词会追加到默认生成规则之后；仍必须输出符合导入约束的JSON。");
             ui.horizontal_wrapped(|ui| {
                 let ready =
                     deepseek_sender.is_some() && !deepseek_manager.content_pool_generation.pending;
@@ -1644,7 +1670,9 @@ fn content_pool_bundle_ui(
                 });
                 if clicked {
                     let request = DeepseekRequest::ContentPools {
-                        prompt: content_pool_generation_prompt(),
+                        prompt: content_pool_generation_user_prompt(
+                            &state.content_pool_generation_custom_prompt,
+                        ),
                     };
                     let send_result = serde_json::to_string(&request)
                         .map(|request| Message::Text(request.into()))
@@ -15753,6 +15781,42 @@ fn append_local_sent_message_with_images(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_pool_generation_prompt_appends_custom_preference() {
+        let base = content_pool_generation_prompt();
+        let prompt = content_pool_generation_user_prompt("生成森林主题的精英单位");
+        assert!(prompt.starts_with(&base));
+        assert!(prompt.contains("可选制作偏好"));
+        assert!(prompt.contains("森林主题的精英单位"));
+    }
+
+    #[test]
+    fn content_pool_generation_prompt_ignores_blank_custom_preference() {
+        assert_eq!(
+            content_pool_generation_user_prompt("  \n\t "),
+            content_pool_generation_prompt()
+        );
+    }
+
+    #[test]
+    fn content_pool_generation_prompt_truncates_custom_preference() {
+        let prompt = content_pool_generation_user_prompt(&"长".repeat(
+            DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS + 100,
+        ));
+        let custom_section = prompt
+            .split("可选制作偏好")
+            .nth(1)
+            .expect("custom section must exist");
+        let custom_text = custom_section
+            .rsplit_once('\n')
+            .map(|(_, custom_text)| custom_text)
+            .unwrap_or(custom_section);
+        assert_eq!(
+            custom_text.chars().count(),
+            DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS
+        );
+    }
 
     #[test]
     fn creative_catalog_omits_modes_provided_by_the_tool_gun() {
