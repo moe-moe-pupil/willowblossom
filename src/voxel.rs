@@ -1172,6 +1172,7 @@ pub(crate) enum VoxelCreativeItem {
     PlayerPossessionTool,
     SpaceshipPossessionTool,
     TeleportTool,
+    DoorLockTool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1433,6 +1434,12 @@ struct VoxelAutoDoor {
     closed_translation: Vec3,
     open_translation: Vec3,
     open: bool,
+    locked: bool,
+}
+
+#[derive(Resource, Default)]
+struct VoxelAutoDoorLockState {
+    all_locked: bool,
 }
 
 #[derive(Resource)]
@@ -1905,6 +1912,10 @@ impl VoxelEditorState {
                 self.light_tool = None;
                 self.selected_light = None;
             },
+            VoxelCreativeItem::DoorLockTool => {
+                self.light_tool = None;
+                self.selected_light = None;
+            },
         }
         if item != VoxelCreativeItem::TeleportTool {
             self.teleport_menu_open = false;
@@ -1983,6 +1994,9 @@ impl VoxelEditorState {
         if self.is_teleport_tool_equipped() {
             return "传送器".to_owned();
         }
+        if self.is_door_lock_tool_equipped() {
+            return "门锁工具".to_owned();
+        }
         self.light_tool
             .map_or_else(
                 || self.mode.label(),
@@ -2005,6 +2019,10 @@ impl VoxelEditorState {
 
     pub(crate) fn is_teleport_tool_equipped(&self) -> bool {
         self.equipped_item == Some(VoxelCreativeItem::TeleportTool)
+    }
+
+    pub(crate) fn is_door_lock_tool_equipped(&self) -> bool {
+        self.equipped_item == Some(VoxelCreativeItem::DoorLockTool)
     }
 
     pub(crate) fn request_teleport(&mut self, destination: VoxelTeleportDestination) {
@@ -2216,6 +2234,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelEditorState>()
         .init_resource::<VoxelPossessionState>()
         .init_resource::<VoxelTargetingPreview>()
+        .init_resource::<VoxelAutoDoorLockState>()
         .init_resource::<VoxelRadianceVolume>()
         .init_resource::<SceneCaptureRequests>()
         .init_resource::<SceneCharacterPositions>()
@@ -2274,6 +2293,8 @@ impl Plugin for TrpgVoxelPlugin {
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
                     sync_selected_voxel_light,
                     edit_voxel_grid.run_if(crate::replay::replay_mouse_interaction_inactive),
+                    use_voxel_door_lock_tool
+                        .run_if(crate::replay::replay_mouse_interaction_inactive),
                     rebuild_dirty_voxel_spaceships,
                     despawn_unsupported_voxel_auto_doors,
                     use_voxel_teleport_tool
@@ -2353,6 +2374,7 @@ impl Plugin for TrpgVoxelPlugin {
                 voxel_workbook_feature_overlay,
                 voxel_player_camera_panel,
                 voxel_spaceship_panel,
+                voxel_auto_door_lock_panel,
             )
                 .chain()
                 .after(crate::ui::ui_system)
@@ -4957,6 +4979,7 @@ fn make_voxel_auto_door(
         closed_translation,
         open_translation: closed_translation,
         open: false,
+        locked: false,
     }
 }
 
@@ -5044,9 +5067,19 @@ fn voxel_auto_door_panels(door: &VoxelAutoDoor) -> [VoxelAutoDoor; 2] {
             open_translation: closed_translation
                 + axis.as_vec3() * direction * (panel_width + VOXEL_SIZE * 0.5),
             open: false,
+            locked: door.locked,
         }
     };
     [make_panel(left_cells, -1.0), make_panel(right_cells, 1.0)]
+}
+
+fn voxel_auto_door_should_animate_open(
+    editor_first_person: bool,
+    all_locked: bool,
+    door_locked: bool,
+    proximity_should_open: bool,
+) -> bool {
+    editor_first_person && !all_locked && !door_locked && proximity_should_open
 }
 
 fn voxel_auto_door_should_open(door: &VoxelAutoDoor, player_position: Vec3) -> bool {
@@ -7117,6 +7150,7 @@ fn persist_voxel_spaceships(
 fn animate_voxel_auto_doors(
     time: Res<Time>,
     editor: Res<VoxelEditorState>,
+    lock_state: Res<VoxelAutoDoorLockState>,
     players: Query<
         &GlobalTransform,
         (
@@ -7154,8 +7188,12 @@ fn animate_voxel_auto_doors(
         let parent_transform = parent.and_then(|parent| spaceships.get(parent.0).ok());
         let player_position =
             voxel_auto_door_player_position(player.translation(), parent_transform);
-        let should_open =
-            editor.first_person_enabled && voxel_auto_door_should_open(&door, player_position);
+        let should_open = voxel_auto_door_should_animate_open(
+            editor.first_person_enabled,
+            lock_state.all_locked,
+            door.locked,
+            voxel_auto_door_should_open(&door, player_position),
+        );
         let target = if should_open { door.open_translation } else { door.closed_translation };
         transform.translation = transform.translation.lerp(target, response);
         if transform.translation.distance_squared(target) < 0.000_001 {
@@ -8073,6 +8111,53 @@ fn draw_voxel_spaceship_hud(
                         ui.small(
                             "W/S 推进 · A/D 偏航 · ↑/↓ 俯仰 · Q/E 翻滚 · 空格/Ctrl 升降 · Shift 加力 · X 制动 · F5 视角 · F 离舰",
                         );
+                    });
+                });
+        });
+}
+
+fn voxel_auto_door_lock_panel(
+    mut contexts: EguiContexts,
+    control: Res<VoxelSpaceshipControlState>,
+    mut lock_state: ResMut<VoxelAutoDoorLockState>,
+) {
+    if control.driving_ship_id.as_deref() != Some(COMBAT_SPACESHIP_ID) {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    egui::Area::new(egui::Id::new("voxel_spaceship_door_lock_panel"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 224.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(5, 18, 30, 232))
+                .stroke(egui::Stroke::new(
+                    1.5,
+                    egui::Color32::from_rgb(55, 205, 235),
+                ))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (label, fill) = if lock_state.all_locked {
+                            ("解锁所有自动门", egui::Color32::from_rgb(42, 136, 96))
+                        } else {
+                            ("锁定所有自动门", egui::Color32::from_rgb(168, 116, 24))
+                        };
+                        if ui
+                            .add(egui::Button::new(label).fill(fill))
+                            .on_hover_text("锁定后所有自动门保持关闭，玩家靠近也不会自动打开")
+                            .clicked()
+                        {
+                            lock_state.all_locked = !lock_state.all_locked;
+                        }
+                        ui.small(if lock_state.all_locked {
+                            "自动门已全部锁定"
+                        } else {
+                            "自动门已全部解锁"
+                        });
                     });
                 });
         });
@@ -12484,6 +12569,7 @@ fn edit_voxel_grid(
         || editor.is_player_possession_tool_equipped()
         || editor.is_spaceship_possession_tool_equipped()
         || editor.is_teleport_tool_equipped()
+        || editor.is_door_lock_tool_equipped()
     {
         return;
     }
@@ -13326,6 +13412,68 @@ fn use_voxel_teleport_tool(
         return;
     }
     editor.teleport_menu_open = true;
+}
+
+fn use_voxel_door_lock_tool(
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
+    possession: Res<VoxelPossessionState>,
+    mut doors: Query<&mut VoxelAutoDoor>,
+    spatial_query: SpatialQuery,
+    mut editor: ResMut<VoxelEditorState>,
+    egui_input: Res<EguiWantsInput>,
+) {
+    if possession.active_user_id.is_some()
+        || !editor.is_door_lock_tool_equipped()
+        || editor.creative_inventory_open
+        || editor.teleport_menu_open
+        || !mouse.just_pressed(MouseButton::Right)
+        || voxel_world_pointer_blocked(
+            egui_input.wants_any_pointer_input(),
+            editor.right_started_over_ui,
+        )
+    {
+        return;
+    }
+    let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single()) else {
+        return;
+    };
+    let Some(ray) = viewport_ray(
+        window,
+        camera,
+        camera_transform,
+        &editor,
+    ) else {
+        return;
+    };
+    let Some(hit) = spatial_query.cast_ray_predicate(
+        ray.origin,
+        ray.direction,
+        MAX_RAY_DISTANCE,
+        true,
+        &SpatialQueryFilter::default(),
+        &|entity| doors.contains(entity),
+    ) else {
+        editor.physics_status = Some("没有瞄准自动门".to_owned());
+        return;
+    };
+    let (trigger_center, locked) = {
+        let Ok(clicked) = doors.get(hit.entity) else {
+            return;
+        };
+        (clicked.trigger_center, !clicked.locked)
+    };
+    for mut door in &mut doors {
+        if door.trigger_center == trigger_center {
+            door.locked = locked;
+        }
+    }
+    editor.physics_status = Some(if locked {
+        "已锁定自动门（靠近不会自动打开）".to_owned()
+    } else {
+        "已解锁自动门".to_owned()
+    });
 }
 
 fn apply_voxel_teleport(
@@ -17063,6 +17211,59 @@ mod tests {
         let lights = workbook_interior_lights();
         assert!(lights.len() >= 20);
         assert!(lights.iter().all(|(position, _)| position.y > 0.0));
+    }
+
+    #[test]
+    fn locked_auto_doors_never_animate_open() {
+        assert!(voxel_auto_door_should_animate_open(
+            true, false, false, true
+        ));
+        assert!(!voxel_auto_door_should_animate_open(
+            false, false, false, true
+        ));
+        assert!(!voxel_auto_door_should_animate_open(
+            true, true, false, true
+        ));
+        assert!(!voxel_auto_door_should_animate_open(
+            true, false, true, true
+        ));
+        assert!(!voxel_auto_door_should_animate_open(
+            true, false, false, false
+        ));
+        assert!(!voxel_auto_door_should_animate_open(
+            true, true, true, true
+        ));
+    }
+
+    #[test]
+    fn auto_door_panels_share_one_lock_state_across_trigger_groups() {
+        let door = make_voxel_auto_door(IVec3::new(8, 0, -3), IVec3::X, 2, 8, 1.75);
+        assert!(!door.locked);
+        let mut panels = voxel_auto_door_panels(&door);
+        assert!(panels.iter().all(|panel| !panel.locked));
+        assert_eq!(panels[0].trigger_center, panels[1].trigger_center);
+
+        // The GM tool toggles every panel of the clicked door in one press.
+        let sliding = panels
+            .iter()
+            .map(|panel| panel.open_translation != panel.closed_translation)
+            .collect::<Vec<_>>();
+        let locked = !panels[0].locked;
+        let trigger_center = panels[0].trigger_center;
+        for panel in &mut panels {
+            if panel.trigger_center == trigger_center {
+                panel.locked = locked;
+            }
+        }
+        assert!(panels.iter().all(|panel| panel.locked));
+        assert_eq!(
+            panels
+                .iter()
+                .map(|panel| panel.open_translation != panel.closed_translation)
+                .collect::<Vec<_>>(),
+            sliding,
+            "locking a door must not change its slide geometry"
+        );
     }
 
     #[test]

@@ -441,6 +441,14 @@ fn paint_voxel_creative_item_icon(
                 stroke,
             );
         },
+        VoxelCreativeItem::DoorLockTool => {
+            box_outline((-0.78, -0.34), (0.78, 0.82));
+            line((-0.34, 0.82), (-0.34, 0.34));
+            line((0.34, 0.82), (0.34, 0.34));
+            line((-0.34, 0.34), (0.34, 0.34));
+            dot(0.0, 0.14, 0.1);
+            line((0.0, 0.02), (0.0, -0.22));
+        },
         VoxelCreativeItem::Mode(VoxelEditMode::Add) => {
             box_outline((-0.75, -0.75), (0.35, 0.35));
             plus(0.48, 0.48, 0.4);
@@ -588,6 +596,10 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
         VoxelCreativeItem::TeleportTool => (
             "传送器",
             egui::Color32::from_rgb(50, 184, 210),
+        ),
+        VoxelCreativeItem::DoorLockTool => (
+            "门锁工具",
+            egui::Color32::from_rgb(230, 176, 42),
         ),
         VoxelCreativeItem::Mode(mode) => match mode {
             VoxelEditMode::Add => (
@@ -15215,6 +15227,30 @@ pub fn ui_system(
                                     .clicked()
                                     {
                                         picked_item = Some(tool_gun);
+                                    }
+                                    ui.small(name);
+                                });
+                                let door_lock_tool = VoxelCreativeItem::DoorLockTool;
+                                let (name, _) =
+                                    voxel_creative_item_visual(door_lock_tool);
+                                ui.vertical_centered(|ui| {
+                                    if voxel_creative_drag_source(
+                                        ui,
+                                        egui::Id::new("voxel_catalog_door_lock_tool"),
+                                        VoxelCreativeDragPayload::Catalog(door_lock_tool),
+                                        door_lock_tool,
+                                        voxel_editor.creative_hotbar
+                                            [voxel_editor.selected_hotbar_slot]
+                                            == Some(door_lock_tool),
+                                        48.0,
+                                        None,
+                                    )
+                                    .on_hover_text(
+                                        "GM右键自动门即可锁定/解锁；锁定的门不会自动打开",
+                                    )
+                                    .clicked()
+                                    {
+                                        picked_item = Some(door_lock_tool);
                                     }
                                     ui.small(name);
                                 });
