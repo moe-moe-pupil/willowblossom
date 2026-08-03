@@ -8768,6 +8768,12 @@ struct DirectedCameraRig {
 
 impl DirectedCameraRig {
     const LINE_MARGIN: f32 = 0.25;
+    /// Maximum push applied to pull a candidate back across the scene axis.
+    /// The correction only nudges cameras that are slightly over the line;
+    /// when subjects are spread far apart the candidate near the speaker is
+    /// legitimately deep on the "wrong" side of the centroid axis, and
+    /// teleporting it across the whole scene would lose the standee entirely.
+    const MAX_SIDE_PUSH: f32 = 2.5;
     /// Maximum horizontal distance between composition subjects that still
     /// uses the group-center framing for 3+ players. Beyond this, the group
     /// cannot fit in one shot, so each line frames the actual speaker instead
@@ -8950,7 +8956,8 @@ impl DirectedCameraRig {
                         + Vec3::Y * (height * height_scale);
                     let signed_side = self.signed_side(candidate);
                     if signed_side < Self::LINE_MARGIN {
-                        candidate += self.camera_side * (Self::LINE_MARGIN - signed_side);
+                        candidate += self.camera_side
+                            * (Self::LINE_MARGIN - signed_side).min(Self::MAX_SIDE_PUSH);
                     }
                     if !obstacles.camera_is_clear(candidate) {
                         continue;
@@ -8969,7 +8976,8 @@ impl DirectedCameraRig {
                 target + self.camera_side * (VOXEL_SIZE * 2.0) + Vec3::Y * VOXEL_SIZE;
             let signed_side = self.signed_side(fallback);
             if signed_side < Self::LINE_MARGIN {
-                fallback += self.camera_side * (Self::LINE_MARGIN - signed_side);
+                fallback += self.camera_side
+                    * (Self::LINE_MARGIN - signed_side).min(Self::MAX_SIDE_PUSH);
             }
             fallback
         })
@@ -11079,6 +11087,49 @@ mod tests {
     }
 
     #[test]
+    fn spread_out_standees_keep_the_camera_on_the_speaker() {
+        // Three standees far apart: the centroid axis passes hundreds of units
+        // from any single speaker, so the side-of-axis correction must never
+        // teleport the camera across the scene.
+        let base = Transform::from_xyz(0.0, 10.0, 100.0);
+        let dialogue = [test_dialogue(350, 2_700, DialogueSide::Right)];
+        let positions = HashMap::from([
+            (1, Vec3::new(-150.0, 2.0, -160.0)),
+            (2, Vec3::new(0.0, 2.0, 0.0)),
+            (3, Vec3::new(150.0, 2.0, 160.0)),
+        ]);
+        let rig = DirectedCameraRig::for_dialogue(
+            &base,
+            &dialogue,
+            &positions,
+            default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
+        );
+        assert!(
+            rig.group_spread > DirectedCameraRig::GROUP_SPREAD_LIMIT,
+            "test setup requires a spread-out group"
+        );
+
+        let shot = rig.speaker_shot(
+            positions[&1],
+            DirectorShot::SpeakerMedium,
+            0.0,
+            &ReplayCameraObstacles::default(),
+        );
+        let distance = horizontal(shot.translation - positions[&1]).length();
+        assert!(
+            distance < 15.0,
+            "camera must stay near the speaker, ended {distance:.1} units away"
+        );
+        assert!(
+            (shot.rotation * Vec3::NEG_Z)
+                .dot((positions[&1] - shot.translation).normalize())
+                > 0.999,
+            "camera must keep the speaker centered"
+        );
+    }
+
+    #[test]
     fn speaker_change_cuts_instead_of_sliding_or_rotating_between_subjects() {
         let base = Transform::from_xyz(0.0, 4.0, 12.0);
         let mut dialogue = [
@@ -11414,7 +11465,12 @@ mod tests {
         assert!(arrival
             .translation
             .abs_diff_eq(settled.translation, f32::EPSILON));
-        assert!(rig.signed_side(settled.translation) >= DirectedCameraRig::LINE_MARGIN);
+        // The dolly must not cross the scene line, and the camera must stay
+        // close enough to frame the off-axis speaker instead of being pushed
+        // across the whole scene to the "correct" side.
+        assert!(
+            horizontal(settled.translation - off_axis_target).length() < 15.0
+        );
     }
 
     #[test]
@@ -13042,6 +13098,133 @@ mod tests {
         assert!(ship_history.sessions.is_empty());
     }
 
+    /// Loads the on-disk ship trajectory history and verifies that every
+    /// recorded ship — including the Arrogance carrier — is merged into a
+    /// freshly generated replay, and that a GM line addressing a player cuts
+    /// the camera onto that player's standee. Skipped without local data.
+    #[test]
+    fn real_history_imports_arrogance_and_gm_focuses_the_player_standee() {
+        let history_path =
+            std::path::Path::new(".data/willowblossom/replay_ship_trajectories.toml");
+        if !history_path.is_file() {
+            return;
+        }
+        let history_text = std::fs::read_to_string(history_path).expect("read ship history");
+        let history: ReplayShipTrajectoryHistory =
+            toml::from_str(&history_text).expect("parse ship history");
+        assert!(
+            history
+                .sessions
+                .iter()
+                .any(|session| session.ship_id == "usi-arrogance"),
+            "Arrogance session must exist in the on-disk history"
+        );
+
+        // A GM line addressing a player and that player's reply.
+        let mut gm = test_dialogue(350, 2_400, DialogueSide::Left);
+        gm.sender_id = 0;
+        gm.camera_focus_id = Some(1_670_426_821);
+        gm.snapshot_recorded = true;
+        gm.metadata_estimated = false;
+        let mut player = test_dialogue(3_020, 2_400, DialogueSide::Right);
+        player.sender_id = 1_670_426_821;
+        player.snapshot_recorded = true;
+        player.metadata_estimated = false;
+        player.position_cells = [-415, 43, -722];
+        let mut replay = test_replay(vec![gm, player]);
+        replay.campaign_id = "default".to_owned();
+        assign_replay_line_ids(&mut replay.dialogue);
+        auto_group_replay_areas(&mut replay);
+        rebuild_area_blocks(&mut replay);
+
+        let imported = compile_scene_dynamics_timeline(
+            &mut replay,
+            &history,
+            0,
+            &[],
+            &[],
+        );
+        assert!(imported > 0, "ship history must import into the replay");
+        assert!(
+            replay
+                .ship_trajectories
+                .iter()
+                .any(|trajectory| trajectory.ship_id == "usi-arrogance"),
+            "Arrogance trajectory must be in the replay"
+        );
+        let arrogance = replay
+            .ship_trajectories
+            .iter()
+            .find(|trajectory| trajectory.ship_id == "usi-arrogance")
+            .expect("arrogance trajectory");
+        assert!(
+            arrogance.keyframes.len() > 100,
+            "Arrogance trajectory should carry its recorded motion frames"
+        );
+
+        // Append path: a replay created before the fleet flight imports the
+        // newly recorded Arrogance trajectory when 播放 is pressed.
+        let mut append_replay = test_replay(Vec::new());
+        append_replay.campaign_id = "default".to_owned();
+        append_replay.created_at_unix_ms = 1_785_749_275_000;
+        append_replay.ship_trajectory_history_cursor_unix_ms = 1_785_749_275_000;
+        let appended =
+            append_new_ship_trajectories_from_history(&mut append_replay, &history);
+        assert!(appended > 0, "newly recorded trajectories must append on play");
+        let appended_arrogance = append_replay
+            .ship_trajectories
+            .iter()
+            .find(|trajectory| trajectory.ship_id == "usi-arrogance")
+            .expect("appended Arrogance trajectory");
+        let start_pose = interpolated_ship_pose(appended_arrogance, 0)
+            .expect("start pose")
+            .0;
+        let end_pose = interpolated_ship_pose(appended_arrogance, append_replay.duration_ms)
+            .expect("end pose")
+            .0;
+        assert!(
+            horizontal(start_pose - end_pose).length() > 10.0,
+            "Arrogance must visibly move during playback (start {start_pose:?}, end {end_pose:?})"
+        );
+
+        // Camera: the GM line must frame the player standee.
+        let standee_position = Vec3::new(-122.419_174, -21.016_474, 41.071_274);
+        let speaker_positions = HashMap::from([(1_670_426_821, standee_position)]);
+        let camera = turn_based_camera_track(
+            &Transform::from_xyz(29.004_196, 24.248_276, 221.935),
+            &replay.dialogue,
+            replay.duration_ms,
+            &speaker_positions,
+            default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
+            &ReplayCameraObstacles::default(),
+        );
+        let mut anchor = standee_position;
+        for frame in &camera {
+            if let Some(line) = replay
+                .dialogue
+                .iter()
+                .filter(|line| {
+                    line.included
+                        && line.snapshot_recorded
+                        && line.time_ms <= frame.time_ms
+                        && line.sender_id == 1_670_426_821
+                        && line.position_cells != [0; 3]
+                })
+                .last()
+            {
+                anchor = IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE;
+            }
+            let distance =
+                horizontal(Vec3::from_array(frame.translation) - anchor).length();
+            assert!(
+                distance < 25.0,
+                "camera frame at {:?} is {distance:.1} units from the player standee",
+                frame.translation
+            );
+        }
+    }
+
     #[test]
     fn real_gm_player_exchange_camera_focuses_the_standee() {
         // Reproduce the on-disk session: one GM line addressing player
@@ -13091,10 +13274,6 @@ mod tests {
             {
                 anchor = IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE;
             }
-            eprintln!(
-                "frame t={} pos={:?} anchor={:?}",
-                frame.time_ms, frame.translation, anchor
-            );
             let distance = horizontal(Vec3::from_array(frame.translation) - anchor).length();
             assert!(
                 distance < 20.0,
@@ -13233,23 +13412,9 @@ mod tests {
             "camera track is empty for {} dialogue lines",
             replay.dialogue.len()
         );
-        for (index, line) in replay.dialogue.iter().enumerate() {
-            eprintln!(
-                "dialogue[{index}] sender={} focus_id={:?} pos={:?} t={}..{}",
-                line.sender_id,
-                line.camera_focus_id,
-                line.position_cells,
-                line.time_ms,
-                line.time_ms + line.duration_ms
-            );
-        }
         let mut standee_anchor =
             HashMap::<u64, Vec3>::new();
         for frame in &camera {
-            eprintln!(
-                "camera t={} pos={:?}",
-                frame.time_ms, frame.translation
-            );
             for line in replay
                 .dialogue
                 .iter()
