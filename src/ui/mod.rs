@@ -837,6 +837,9 @@ use crate::{
         remove_unit_template_token,
         stamp_legacy_area_marker_voxel_fill,
         stamp_legacy_area_marker_voxel_outline,
+        SceneCaptureKind,
+        SceneCaptureRequest,
+        SceneCaptureRequests,
         SceneCharacterPositions,
         ScenePlayerCameraPositions,
         ScenePlayerViewRequest,
@@ -999,6 +1002,7 @@ pub struct UiSystemLocals<'w, 's> {
     group_broadcast_scopes: Local<'s, HashMap<String, String>>,
     chat_player_visible_previews: Local<'s, HashMap<String, String>>,
     chat_list_player_visible_filter: Local<'s, Option<String>>,
+    scene_capture_requests: Option<ResMut<'w, SceneCaptureRequests>>,
     voxel_editor: ResMut<'w, VoxelEditorState>,
     voxel_possession: ResMut<'w, VoxelPossessionState>,
     voxel_targeting_preview: Res<'w, VoxelTargetingPreview>,
@@ -1850,6 +1854,7 @@ fn chat_window(
     chat_player_visible_previews: &mut Local<HashMap<String, String>>,
     rule_engine_state: &mut RuleEngineState,
     mut player_view_request: Option<&mut ScenePlayerViewRequest>,
+    mut scene_capture_requests: Option<&mut SceneCaptureRequests>,
 ) {
     let mut window_open = true;
     let mut leave_group = false;
@@ -1995,6 +2000,55 @@ fn chat_window(
                             player_view_request.as_deref_mut(),
                         ) {
                             request.view_with_capture_camera(user_id);
+                        }
+                    }
+                    let capture_user_id = target_id.parse::<u64>().ok();
+                    let capture_campaign = capture_user_id
+                        .and_then(|user_id| manager.scene_capture_campaign_for_user(user_id));
+                    let can_capture =
+                        capture_campaign.is_some() && scene_capture_requests.is_some();
+                    if ui
+                        .add_enabled(
+                            can_capture,
+                            egui::Button::new("发送当前pl观察"),
+                        )
+                        .on_hover_text(
+                            "像该玩家私聊发送 .gc 一样，抓取其当前场景视角画面并私聊发送",
+                        )
+                        .clicked()
+                    {
+                        if let (Some(user_id), Some(campaign_id), Some(requests)) = (
+                            capture_user_id,
+                            capture_campaign.clone(),
+                            scene_capture_requests.as_deref_mut(),
+                        ) {
+                            requests.requests.push(SceneCaptureRequest {
+                                user_id,
+                                campaign_id,
+                                kind: SceneCaptureKind::Image,
+                            });
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            can_capture,
+                            egui::Button::new("发送当前pl视频观察"),
+                        )
+                        .on_hover_text(
+                            "像该玩家私聊发送 .gc2 一样，抓取其当前场景360度观察视频并私聊发送",
+                        )
+                        .clicked()
+                    {
+                        if let (Some(user_id), Some(campaign_id), Some(requests)) = (
+                            capture_user_id,
+                            capture_campaign.clone(),
+                            scene_capture_requests.as_deref_mut(),
+                        ) {
+                            requests.requests.push(SceneCaptureRequest {
+                                user_id,
+                                campaign_id,
+                                kind: SceneCaptureKind::PanoramaVideo,
+                            });
                         }
                     }
                 }
@@ -14140,6 +14194,7 @@ pub fn ui_system(
         &mut locals.chat_player_visible_previews;
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
+    let scene_capture_requests = &mut locals.scene_capture_requests;
     let map_toggle_requested = locals.keyboard.just_pressed(KeyCode::KeyM);
     let voxel_minimap: &VoxelMinimapSnapshot = &locals.voxel_minimap;
     let voxel_map_ui_state: &mut VoxelMapUiState = &mut locals.voxel_map_ui;
@@ -15503,6 +15558,7 @@ pub fn ui_system(
                     chat_player_visible_previews,
                     &mut rule_engine_state,
                     player_view_request.as_deref_mut(),
+                    scene_capture_requests.as_deref_mut(),
                 );
             }
         });
