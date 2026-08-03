@@ -8257,10 +8257,6 @@ fn append_new_player_movements_from_history(
 }
 
 const MOTION_EVENT_GAP_MS: u64 = 3_000;
-/// Motions whose real times are within this window are treated as one shared
-/// replay segment (e.g. a whole fleet flying together), instead of inflating
-/// the timeline with one segment per ship or per pause.
-const MOTION_CLUSTER_GAP_MS: u64 = 60_000;
 
 /// One contiguous ship motion from the persistent trajectory history. A
 /// session is split into events whenever the ship stopped moving for longer
@@ -8459,15 +8455,15 @@ fn compile_scene_dynamics_timeline(
     let motion_at_end = !replay.dialogue_waits_for_ship_motion;
     let mut end_motion = Vec::new();
     if motion_at_end {
-        end_motion.extend(motion_clusters(before_first));
+        end_motion.extend(before_first);
         for (_, mut anchored) in events_by_anchor.drain() {
             anchored.sort_by_key(|event| event.start_source_ms);
-            end_motion.extend(motion_clusters(anchored));
+            end_motion.extend(anchored);
         }
     } else {
-        for cluster in motion_clusters(before_first) {
+        for event in before_first {
             place_motion_cluster(
-                cluster,
+                vec![event],
                 &mut cursor,
                 &mut segments,
                 &mut imported_keyframes,
@@ -8489,11 +8485,11 @@ fn compile_scene_dynamics_timeline(
         if !motion_at_end {
             if let Some(mut anchored) = events_by_anchor.remove(&position) {
                 // Order by real time so motions after the same line play in
-                // order within one shared window.
+                // order.
                 anchored.sort_by_key(|event| event.start_source_ms);
-                for cluster in motion_clusters(anchored) {
+                for event in anchored {
                     place_motion_cluster(
-                        cluster,
+                        vec![event],
                         &mut cursor,
                         &mut segments,
                         &mut imported_keyframes,
@@ -8505,7 +8501,7 @@ fn compile_scene_dynamics_timeline(
     }
     for cluster in end_motion {
         place_motion_cluster(
-            cluster,
+            vec![cluster],
             &mut cursor,
             &mut segments,
             &mut imported_keyframes,
@@ -8556,17 +8552,11 @@ fn append_new_ship_trajectories_from_history(
     let mut segments = Vec::<TimelineSegment>::new();
     let mut imported_keyframes = HashMap::<String, (String, Vec<ReplayShipKeyframe>)>::new();
     let ship_motion_speed = replay.ship_motion_speed.max(0.1);
-    let mut clusters = motion_clusters(events);
-    clusters.sort_by_key(|cluster| {
-        cluster
-            .iter()
-            .map(|event| event.start_source_ms)
-            .min()
-            .unwrap_or_default()
-    });
-    for cluster in clusters {
+    let mut events = events;
+    events.sort_by_key(|event| event.start_source_ms);
+    for event in events {
         place_motion_cluster(
-            cluster,
+            vec![event],
             &mut next_start,
             &mut segments,
             &mut imported_keyframes,
@@ -8577,28 +8567,6 @@ fn append_new_ship_trajectories_from_history(
     replay.duration_ms = replay.duration_ms.max(next_start);
     replay.ship_trajectory_history_cursor_unix_ms = unix_time_ms();
     imported
-}
-
-/// Groups motion events whose real times overlap into shared clusters, so a
-/// fleet flying together occupies one replay segment instead of one segment
-/// per ship.
-fn motion_clusters(events: Vec<ShipMotionEvent>) -> Vec<Vec<ShipMotionEvent>> {
-    let mut clusters = Vec::<Vec<ShipMotionEvent>>::new();
-    for event in events {
-        if let Some(last) = clusters.last_mut() {
-            let cluster_end = last
-                .iter()
-                .map(|event| event.end_source_ms)
-                .max()
-                .unwrap_or_default();
-            if event.start_source_ms.saturating_sub(cluster_end) <= MOTION_CLUSTER_GAP_MS {
-                last.push(event);
-                continue;
-            }
-        }
-        clusters.push(vec![event]);
-    }
-    clusters
 }
 
 fn place_motion_cluster(
@@ -14066,6 +14034,45 @@ mod tests {
         assert!(
             fast_span < slow_span,
             "faster ship motion must compress the segment ({fast_span} vs {slow_span})"
+        );
+    }
+
+    #[test]
+    fn long_ship_flight_keeps_a_visible_motion_segment() {
+        let history = ReplayShipTrajectoryHistory {
+            sessions: vec![PersistedShipTrajectorySession {
+                campaign_id: "default".to_owned(),
+                ship_id: "ship-1".to_owned(),
+                ship_name: "测试舰".to_owned(),
+                turn_index: 1,
+                start_after_source_time: None,
+                start_delay_ms: 0,
+                keyframes: (0..200)
+                    .map(|index| PersistedShipKeyframe {
+                        source_unix_ms: 100_000 + index as u64 * 100,
+                        translation: [index as f32 * 0.5, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    })
+                    .collect(),
+            }],
+        };
+        let mut replay = test_replay(Vec::new());
+        replay.campaign_id = "default".to_owned();
+        compile_scene_dynamics_timeline(&mut replay, &history, 0, &[], &[]);
+        let trajectory = replay
+            .ship_trajectories
+            .first()
+            .expect("ship trajectory");
+        let first = trajectory.keyframes.first().expect("first frame").time_ms;
+        let last = trajectory.keyframes.last().expect("last frame").time_ms;
+        let span = last.saturating_sub(first);
+        assert!(
+            span >= 2_000,
+            "a long flight must keep a visible playback span instead of a teleport, got {span} ms"
+        );
+        assert!(
+            trajectory.keyframes.len() > 100,
+            "the compressed segment should still carry the flight frames"
         );
     }
 
