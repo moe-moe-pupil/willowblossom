@@ -831,7 +831,7 @@ struct VoxelSpaceshipSpec {
 }
 
 #[derive(Component, Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct VoxelSpaceshipDocked {
+pub(crate) struct VoxelSpaceshipDocked {
     carrier_id: String,
     local_translation: [f32; 3],
     local_rotation: [f32; 4],

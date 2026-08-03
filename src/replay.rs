@@ -112,6 +112,7 @@ use crate::{
         VoxelReplayOcclusionFade,
         VoxelSpaceship,
         VoxelSpaceshipControlState,
+        VoxelSpaceshipDocked,
         VoxelSpaceshipNeedsRebuild,
         VoxelSpaceshipOccupancyCache,
         VoxelToolGunDragState,
@@ -134,6 +135,10 @@ const CAMERA_SAMPLE_SECONDS: f32 = 0.1;
 const SHIP_TRAJECTORY_SAMPLE_SECONDS: f32 = 0.1;
 const MIN_DIALOGUE_MS: u64 = 1_500;
 const MAX_DIALOGUE_MS: u64 = 9_750;
+/// Lines at or under this duration are treated as quick table exchanges: they
+/// are never stretched to fit synthesized audio and never block playback on
+/// it, so a short GM prompt does not stall the turn for seconds.
+const SHORT_DIALOGUE_MAX_MS: u64 = 2_500;
 const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
 const DIRECTOR_CACHE_FINGERPRINT_VERSION: &str = "deepseek-director-v2";
@@ -160,6 +165,9 @@ const DEFAULT_CAMERA_TRANSITION_CURVE: f32 = 2.0;
 const MIN_CAMERA_TRANSITION_CURVE: f32 = 1.0;
 const MAX_CAMERA_TRANSITION_CURVE: f32 = 4.0;
 const FOCUS_TRANSITION_MS: u64 = 900;
+const STANDEE_POSITION_SAMPLE_SECONDS: f32 = 0.1;
+const MIN_MOVEMENT_SEGMENT_MS: u64 = 400;
+const MAX_MOVEMENT_SEGMENT_MS: u64 = 2_500;
 /// Camera reposition that is still shown as a smooth dolly instead of a cut.
 /// Larger subject moves (the standee walked across the map) snap with a cut so
 /// the camera never glides through empty space away from the standee.
@@ -456,6 +464,12 @@ struct ReplayFile {
     #[serde(default)]
     ship_trajectories: Vec<ReplayShipTrajectory>,
     #[serde(default)]
+    standee_positions: Vec<ReplayStandeePosition>,
+    #[serde(default = "default_ship_motion_speed")]
+    ship_motion_speed: f32,
+    #[serde(default = "default_dialogue_waits_for_ship_motion")]
+    dialogue_waits_for_ship_motion: bool,
+    #[serde(default)]
     terrain_changes: Vec<ReplayTerrainChange>,
     #[serde(default)]
     ship_hull_changes: Vec<ReplayShipHullChange>,
@@ -551,6 +565,16 @@ struct ReplayShipKeyframe {
     time_ms: u64,
     translation: [f32; 3],
     rotation: [f32; 4],
+}
+
+/// One world-space sample of a player standee during recording, so playback
+/// moves the standee exactly where it was (including on board a moving ship)
+/// instead of converting or estimating.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ReplayStandeePosition {
+    time_ms: u64,
+    user_id: u64,
+    position: [f32; 3],
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -951,6 +975,7 @@ pub(crate) struct ReplayStudio {
     director_request_pending: bool,
     auto_export_after_director: bool,
     camera_sample_accumulator: f32,
+    standee_sample_accumulator: f32,
     player_movement_sample_accumulator: f32,
     recorded_possession_user_id: Option<u64>,
     recorded_player_movement_index: Option<usize>,
@@ -1067,6 +1092,7 @@ impl Default for ReplayStudio {
             director_request_pending: false,
             auto_export_after_director: false,
             camera_sample_accumulator: 0.0,
+            standee_sample_accumulator: 0.0,
             player_movement_sample_accumulator: 0.0,
             recorded_possession_user_id: None,
             recorded_player_movement_index: None,
@@ -1449,6 +1475,20 @@ fn record_replay(
             ));
         }
     }
+    studio.standee_sample_accumulator += delta_seconds;
+    if studio.standee_sample_accumulator >= STANDEE_POSITION_SAMPLE_SECONDS {
+        studio.standee_sample_accumulator %= STANDEE_POSITION_SAMPLE_SECONDS;
+        let record_elapsed_ms = studio.record_elapsed_ms;
+        if let Some(replay) = studio.replay.as_mut() {
+            for (transform, standee) in &standees {
+                replay.standee_positions.push(ReplayStandeePosition {
+                    time_ms: record_elapsed_ms,
+                    user_id: standee.user_id,
+                    position: transform.translation.to_array(),
+                });
+            }
+        }
+    }
     let drained_grid_cells = std::mem::take(&mut scene_recorder.grid_cells);
     let drained_ship_hull_cells = std::mem::take(&mut scene_recorder.ship_hull_cells);
     let source_unix_ms = unix_time_ms();
@@ -1699,25 +1739,35 @@ fn advance_replay(
         if let Some(replay) = studio.replay.as_ref() {
             let current = active_dialogue_index(&replay.dialogue, studio.playback_ms);
             let proposed = active_dialogue_index(&replay.dialogue, proposed_ms);
+            let quick_exchange = |index: usize| {
+                replay
+                    .dialogue
+                    .get(index)
+                    .is_some_and(|line| line.duration_ms <= SHORT_DIALOGUE_MAX_MS)
+            };
             if let Some(index) = current {
-                let signature = replay_voice_signature(replay, studio.speech_volume);
-                let cue = (replay.created_at_unix_ms, index);
-                if !speech.onnx_cue_finished(signature, cue) {
-                    waiting_for_speech = true;
-                } else if proposed != current
-                    && speech.cue_audio_is_pending(cue, &audio_sinks, &audio_players)
-                {
-                    waiting_for_audio = true;
+                if !quick_exchange(index) {
+                    let signature = replay_voice_signature(replay, studio.speech_volume);
+                    let cue = (replay.created_at_unix_ms, index);
+                    if !speech.onnx_cue_finished(signature, cue) {
+                        waiting_for_speech = true;
+                    } else if proposed != current
+                        && speech.cue_audio_is_pending(cue, &audio_sinks, &audio_players)
+                    {
+                        waiting_for_audio = true;
+                    }
                 }
             }
             if proposed != current {
                 if let Some(index) = proposed {
-                    let signature = replay_voice_signature(replay, studio.speech_volume);
-                    if !speech.onnx_cue_finished(
-                        signature,
-                        (replay.created_at_unix_ms, index),
-                    ) {
-                        waiting_for_speech = true;
+                    if !quick_exchange(index) {
+                        let signature = replay_voice_signature(replay, studio.speech_volume);
+                        if !speech.onnx_cue_finished(
+                            signature,
+                            (replay.created_at_unix_ms, index),
+                        ) {
+                            waiting_for_speech = true;
+                        }
                     }
                 }
             }
@@ -3320,6 +3370,45 @@ fn replay_controls(
                 });
             }
         }
+        ui.collapsing("飞船移动节奏", |ui| {
+            ui.small("飞船机动会按此速度压缩播放；关闭“下一句等待”后，机动会移到所有台词之后。");
+            let mut speed = studio
+                .replay
+                .as_ref()
+                .map(|replay| replay.ship_motion_speed)
+                .unwrap_or_else(default_ship_motion_speed);
+            let mut waits = studio
+                .replay
+                .as_ref()
+                .map(|replay| replay.dialogue_waits_for_ship_motion)
+                .unwrap_or_else(default_dialogue_waits_for_ship_motion);
+            let speed_changed = ui
+                .add(
+                    egui::Slider::new(&mut speed, 0.5..=10.0)
+                        .step_by(0.5)
+                        .text("飞船移动速度×"),
+                )
+                .changed();
+            let waits_changed = ui
+                .checkbox(
+                    &mut waits,
+                    "下一句台词等待飞船移动结束",
+                )
+                .changed();
+            if speed_changed || waits_changed {
+                if let Some(replay) = studio.replay.as_mut() {
+                    replay.ship_motion_speed = speed;
+                    replay.dialogue_waits_for_ship_motion = waits;
+                    rebuild_replay_timeline_with_ships(
+                        replay,
+                        ship_trajectory_history,
+                        camera,
+                    );
+                }
+                studio.playback_ms = 0;
+                studio.status = "飞船移动节奏已更新".to_owned();
+            }
+        });
     }
 
     ui.separator();
@@ -4147,6 +4236,7 @@ fn start_recording(
         .collect();
     studio.record_elapsed_ms = 0;
     studio.camera_sample_accumulator = 0.0;
+    studio.standee_sample_accumulator = 0.0;
     studio.player_movement_sample_accumulator = 0.0;
     studio.pending_terrain_changes.clear();
     studio.pending_ship_hull_changes.clear();
@@ -4755,6 +4845,9 @@ fn new_replay(
         player_movements: Vec::new(),
         player_movement_history_cursor_unix_ms: unix_time_ms(),
         ship_trajectories: Vec::new(),
+        standee_positions: Vec::new(),
+        ship_motion_speed: default_ship_motion_speed(),
+        dialogue_waits_for_ship_motion: default_dialogue_waits_for_ship_motion(),
         terrain_changes: Vec::new(),
         ship_hull_changes: Vec::new(),
         ship_trajectory_history_cursor_unix_ms: unix_time_ms(),
@@ -5692,6 +5785,16 @@ fn replay_ship_trajectory_editor(
         return;
     }
     let replay = studio.replay.as_mut().expect("checked above");
+    rebuild_replay_timeline_with_ships(replay, ship_history, camera);
+    studio.playback_ms = 0;
+    studio.status = "已保存飞船轨迹、开始台词与延迟".to_owned();
+}
+
+fn rebuild_replay_timeline_with_ships(
+    replay: &mut ReplayFile,
+    ship_history: &ReplayShipTrajectoryHistory,
+    camera: &Query<&Transform, With<VoxelViewportCamera>>,
+) {
     compile_scene_dynamics_timeline(replay, ship_history, 0, &[], &[]);
     replay.ship_trajectory_history_cursor_unix_ms = unix_time_ms();
     extend_replay_for_speech(replay);
@@ -5723,8 +5826,6 @@ fn replay_ship_trajectory_editor(
             &ReplayCameraObstacles::from_scene(&replay.scene),
         );
     }
-    studio.playback_ms = 0;
-    studio.status = "已保存飞船轨迹、开始台词与延迟".to_owned();
 }
 
 fn stop_playback(studio: &mut ReplayStudio, grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>) {
@@ -6548,7 +6649,13 @@ fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
             settings.speech_rate,
             replay.master_speech_speed,
         );
-        let new_duration = line.duration_ms.max(required_duration);
+        let new_duration = if line.duration_ms <= SHORT_DIALOGUE_MAX_MS {
+            // Quick exchanges stay quick: a short line keeps its reading
+            // duration instead of being stretched to fit synthesized audio.
+            line.duration_ms
+        } else {
+            line.duration_ms.max(required_duration)
+        };
         let new_start = line.time_ms.saturating_add(accumulated_extension);
         let old_end = line.time_ms.saturating_add(line.duration_ms);
         let new_end = new_start.saturating_add(new_duration);
@@ -6595,6 +6702,8 @@ fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
 }
 
 fn default_master_speech_speed() -> f32 { 1.10 }
+fn default_ship_motion_speed() -> f32 { 3.0 }
+fn default_dialogue_waits_for_ship_motion() -> bool { true }
 
 fn default_directed_camera_distance_scale() -> f32 { DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE }
 
@@ -7111,6 +7220,8 @@ fn assign_replay_line_ids(dialogue: &mut [ReplayDialogue]) {
 #[derive(Default)]
 struct ReplayStandeePlaybackState {
     active: bool,
+    replay_key: Option<u64>,
+    track: HashMap<u64, Vec<ReplayStandeePosition>>,
     original_positions: HashMap<u64, Vec3>,
     original_rotations: HashMap<u64, Quat>,
 }
@@ -7147,6 +7258,14 @@ fn apply_replay_standee_positions(
 
     if active {
         if let Some(replay) = studio.replay.as_ref() {
+            if state.replay_key != Some(replay.created_at_unix_ms) {
+                state.replay_key = Some(replay.created_at_unix_ms);
+                let mut track = HashMap::<u64, Vec<ReplayStandeePosition>>::new();
+                for sample in &replay.standee_positions {
+                    track.entry(sample.user_id).or_default().push(*sample);
+                }
+                state.track = track;
+            }
             let camera_position = interpolated_camera(
                 &replay.camera,
                 studio.playback_ms,
@@ -7175,31 +7294,49 @@ fn apply_replay_standee_positions(
                     ))
                 })
                 .collect::<HashMap<_, _>>();
+            let mut first_positions = HashMap::<u64, Vec3>::new();
             let positions = replay
                 .dialogue
                 .iter()
                 .filter(|line| {
-                    line.included && line.snapshot_recorded && line.time_ms <= studio.playback_ms
+                    line.included
+                        && line.snapshot_recorded
+                        && line.position_cells != [0; 3]
                 })
                 .fold(HashMap::new(), |mut positions: HashMap<u64, (Vec3, u64)>, line| {
-                    positions.insert(
-                        line.sender_id,
-                        (
-                            IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE,
-                            line.time_ms,
-                        ),
-                    );
+                    let position = IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE;
+                    first_positions
+                        .entry(line.sender_id)
+                        .or_insert(position);
+                    if line.time_ms <= studio.playback_ms {
+                        positions.insert(line.sender_id, (position, line.time_ms));
+                    }
                     positions
                 });
             for (mut transform, standee) in &mut standees {
-                let movement_position = interpolated_player_position(
+                let tracked_position = state
+                    .track
+                    .get(&standee.user_id)
+                    .and_then(|samples| {
+                        interpolated_standee_position(samples, studio.playback_ms)
+                    });
+                let dialogue_position = positions
+                    .get(&standee.user_id)
+                    .copied()
+                    .or_else(|| {
+                        first_positions
+                            .get(&standee.user_id)
+                            .copied()
+                            .map(|position| (position, 0))
+                    });
+                let resolved = if let Some(position) = tracked_position {
+                    Some((position, studio.playback_ms))
+                } else if let Some(position) = interpolated_player_position(
                     &replay.player_movements,
                     standee.user_id,
                     studio.playback_ms,
                     replay.player_movement_curve,
-                );
-                let dialogue_position = positions.get(&standee.user_id).copied();
-                let resolved = if let Some(position) = movement_position {
+                ) {
                     // Movement keyframes recorded live already follow a moving
                     // ship; once they go stale (the player stopped being
                     // moved), the ship carry takes over from the last frame.
@@ -7570,7 +7707,7 @@ fn apply_replay_ship_positions(
         &mut Transform,
         &mut LinearVelocity,
         &mut AngularVelocity,
-    )>,
+    ), Without<VoxelSpaceshipDocked>>,
     mut state: Local<ReplayShipPlaybackState>,
 ) {
     let active = replay_scene_dynamics_active(&studio);
@@ -8119,13 +8256,11 @@ fn append_new_player_movements_from_history(
     imported_count
 }
 
-const MIN_MOVEMENT_SEGMENT_MS: u64 = 800;
-const MAX_MOVEMENT_SEGMENT_MS: u64 = 6_000;
 const MOTION_EVENT_GAP_MS: u64 = 3_000;
 /// Motions whose real times are within this window are treated as one shared
 /// replay segment (e.g. a whole fleet flying together), instead of inflating
-/// the timeline with one segment per ship.
-const MOTION_CLUSTER_GAP_MS: u64 = 15_000;
+/// the timeline with one segment per ship or per pause.
+const MOTION_CLUSTER_GAP_MS: u64 = 60_000;
 
 /// One contiguous ship motion from the persistent trajectory history. A
 /// session is split into events whenever the ship stopped moving for longer
@@ -8320,8 +8455,25 @@ fn compile_scene_dynamics_timeline(
     let mut cursor = 350_u64;
     let mut segments = Vec::<TimelineSegment>::new();
     let mut imported_keyframes = HashMap::<String, (String, Vec<ReplayShipKeyframe>)>::new();
-    for cluster in motion_clusters(before_first) {
-        place_motion_cluster(cluster, &mut cursor, &mut segments, &mut imported_keyframes);
+    let ship_motion_speed = replay.ship_motion_speed.max(0.1);
+    let motion_at_end = !replay.dialogue_waits_for_ship_motion;
+    let mut end_motion = Vec::new();
+    if motion_at_end {
+        end_motion.extend(motion_clusters(before_first));
+        for (_, mut anchored) in events_by_anchor.drain() {
+            anchored.sort_by_key(|event| event.start_source_ms);
+            end_motion.extend(motion_clusters(anchored));
+        }
+    } else {
+        for cluster in motion_clusters(before_first) {
+            place_motion_cluster(
+                cluster,
+                &mut cursor,
+                &mut segments,
+                &mut imported_keyframes,
+                ship_motion_speed,
+            );
+        }
     }
     for (position, &line_index) in playable.iter().enumerate() {
         let line = &mut replay.dialogue[line_index];
@@ -8334,17 +8486,31 @@ fn compile_scene_dynamics_timeline(
             replay_end_ms: line_end,
         });
         cursor = line_end.saturating_add(HISTORY_DIALOGUE_GAP_MS);
-        if let Some(mut anchored) = events_by_anchor.remove(&position) {
-            anchored.sort_by_key(|event| event.start_source_ms);
-            for cluster in motion_clusters(anchored) {
-                place_motion_cluster(
-                    cluster,
-                    &mut cursor,
-                    &mut segments,
-                    &mut imported_keyframes,
-                );
+        if !motion_at_end {
+            if let Some(mut anchored) = events_by_anchor.remove(&position) {
+                // Order by real time so motions after the same line play in
+                // order within one shared window.
+                anchored.sort_by_key(|event| event.start_source_ms);
+                for cluster in motion_clusters(anchored) {
+                    place_motion_cluster(
+                        cluster,
+                        &mut cursor,
+                        &mut segments,
+                        &mut imported_keyframes,
+                        ship_motion_speed,
+                    );
+                }
             }
         }
+    }
+    for cluster in end_motion {
+        place_motion_cluster(
+            cluster,
+            &mut cursor,
+            &mut segments,
+            &mut imported_keyframes,
+            ship_motion_speed,
+        );
     }
     fill_segment_sources(&mut segments);
     let max_pending_source = pending_terrain
@@ -8389,6 +8555,7 @@ fn append_new_ship_trajectories_from_history(
     let mut next_start = replay.duration_ms;
     let mut segments = Vec::<TimelineSegment>::new();
     let mut imported_keyframes = HashMap::<String, (String, Vec<ReplayShipKeyframe>)>::new();
+    let ship_motion_speed = replay.ship_motion_speed.max(0.1);
     let mut clusters = motion_clusters(events);
     clusters.sort_by_key(|cluster| {
         cluster
@@ -8403,6 +8570,7 @@ fn append_new_ship_trajectories_from_history(
             &mut next_start,
             &mut segments,
             &mut imported_keyframes,
+            ship_motion_speed,
         );
     }
     let imported = merge_ship_trajectories(replay, imported_keyframes);
@@ -8438,6 +8606,7 @@ fn place_motion_cluster(
     cursor: &mut u64,
     segments: &mut Vec<TimelineSegment>,
     imported_keyframes: &mut HashMap<String, (String, Vec<ReplayShipKeyframe>)>,
+    ship_motion_speed: f32,
 ) {
     let window_start = events
         .iter()
@@ -8450,7 +8619,9 @@ fn place_motion_cluster(
         .max()
         .unwrap_or_default();
     let real_duration = window_end.saturating_sub(window_start);
-    let segment_ms = real_duration.clamp(MIN_MOVEMENT_SEGMENT_MS, MAX_MOVEMENT_SEGMENT_MS);
+    let scaled_duration =
+        (real_duration as f64 / ship_motion_speed.max(0.1) as f64).round() as u64;
+    let segment_ms = scaled_duration.clamp(MIN_MOVEMENT_SEGMENT_MS, MAX_MOVEMENT_SEGMENT_MS);
     let cluster_delay = events
         .iter()
         .map(|event| event.start_delay_ms)
@@ -8851,6 +9022,22 @@ fn replay_standee_position_at(
         })
         .last()
         .map(|line| IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE)
+        .or_else(|| {
+            // Before the player's first recorded line, the standee starts at
+            // its earliest recorded position during playback, so early GM
+            // lines frame the conversation location instead of the standee's
+            // current scene position.
+            dialogue
+                .iter()
+                .filter(|line| {
+                    line.included
+                        && line.snapshot_recorded
+                        && line.sender_id == subject_id
+                        && line.position_cells != [0; 3]
+                })
+                .next()
+                .map(|line| IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE)
+        })
         .or_else(|| speaker_positions.get(&subject_id).copied())
 }
 
@@ -9454,6 +9641,27 @@ fn interpolated_player_movement(
     Some(smoothed * VOXEL_SIZE)
 }
 
+fn interpolated_standee_position(
+    samples: &[ReplayStandeePosition],
+    time_ms: u64,
+) -> Option<Vec3> {
+    let first = samples.first()?;
+    if time_ms <= first.time_ms {
+        return Some(Vec3::from_array(first.position));
+    }
+    let index = samples.partition_point(|sample| sample.time_ms <= time_ms);
+    if index >= samples.len() {
+        return Some(Vec3::from_array(samples.last()?.position));
+    }
+    let left = &samples[index - 1];
+    let right = &samples[index];
+    let span = right.time_ms.saturating_sub(left.time_ms).max(1);
+    let fraction = ((time_ms - left.time_ms) as f32 / span as f32).clamp(0.0, 1.0);
+    Some(
+        Vec3::from_array(left.position).lerp(Vec3::from_array(right.position), fraction),
+    )
+}
+
 fn frame_transform(frame: &ReplayCameraKeyframe) -> Transform {
     Transform {
         translation: Vec3::from_array(frame.translation),
@@ -9649,18 +9857,19 @@ fn dialogue_identity(
 }
 
 fn dialogue_duration_ms(text: &str) -> u64 {
-    let reading_ms = text.chars().fold(350_u64, |total, character| {
+    let reading_ms = text.chars().fold(300_u64, |total, character| {
         let character_ms = match character {
             '。' | '！' | '？' | '!' | '?' | '；' | ';' => 110,
             '，' | ',' | '、' | '：' | ':' => 50,
             character if character.is_whitespace() => 8,
-            character if is_cjk_character(character) => 53,
+            character if is_cjk_character(character) => 62,
             _ => 23,
         };
         total.saturating_add(character_ms)
     });
     reading_ms
-        .saturating_mul(3)
+        .saturating_mul(5)
+        .saturating_div(2)
         .clamp(MIN_DIALOGUE_MS, MAX_DIALOGUE_MS)
 }
 
@@ -12943,6 +13152,9 @@ mod tests {
             player_movements: Vec::new(),
             player_movement_history_cursor_unix_ms: 1,
             ship_trajectories: Vec::new(),
+            standee_positions: Vec::new(),
+            ship_motion_speed: default_ship_motion_speed(),
+            dialogue_waits_for_ship_motion: default_dialogue_waits_for_ship_motion(),
             terrain_changes: Vec::new(),
             ship_hull_changes: Vec::new(),
             ship_trajectory_history_cursor_unix_ms: 1,
@@ -13621,7 +13833,9 @@ mod tests {
             default_directed_camera_yaw_degrees(),
             &ReplayCameraObstacles::default(),
         );
-        let mut anchor = standee_position;
+        // During playback the standee starts at its earliest recorded
+        // position, so the opening GM shot frames that location.
+        let mut anchor = IVec3::from_array(replay.dialogue[1].position_cells).as_vec3() * VOXEL_SIZE;
         for frame in &camera {
             if let Some(line) = replay
                 .dialogue
@@ -13757,6 +13971,105 @@ mod tests {
     }
 
     #[test]
+    fn standee_world_track_interpolates() {
+        let samples = vec![
+            ReplayStandeePosition {
+                time_ms: 0,
+                user_id: 42,
+                position: [0.0, 0.0, 0.0],
+            },
+            ReplayStandeePosition {
+                time_ms: 1_000,
+                user_id: 42,
+                position: [10.0, 0.0, 0.0],
+            },
+            ReplayStandeePosition {
+                time_ms: 2_000,
+                user_id: 42,
+                position: [10.0, 0.0, 5.0],
+            },
+        ];
+        assert_eq!(
+            interpolated_standee_position(&samples, 0),
+            Some(Vec3::ZERO)
+        );
+        let mid = interpolated_standee_position(&samples, 500).unwrap();
+        assert!((mid - Vec3::new(5.0, 0.0, 0.0)).length() < 0.001);
+        assert_eq!(
+            interpolated_standee_position(&samples, 3_000),
+            Some(Vec3::new(10.0, 0.0, 5.0))
+        );
+    }
+
+    #[test]
+    fn short_lines_keep_their_reading_duration() {
+        let mut replay = test_replay(Vec::new());
+        let mut line = test_dialogue(350, 1_500, DialogueSide::Left);
+        line.text = "你是狂妄号的船长。".to_owned();
+        line.snapshot_recorded = true;
+        line.duration_ms = dialogue_duration_ms(&line.text);
+        replay.dialogue.push(line.clone());
+        let required = minimum_speech_window_ms(&line.text, 18, 1.10);
+        assert!(
+            required > line.duration_ms,
+            "test requires speech longer than the reading duration"
+        );
+
+        extend_replay_for_speech(&mut replay);
+
+        assert!(
+            replay.dialogue[0].duration_ms <= SHORT_DIALOGUE_MAX_MS,
+            "short line must not be stretched to fit speech, got {} ms",
+            replay.dialogue[0].duration_ms
+        );
+    }
+
+    #[test]
+    fn ship_motion_speed_compresses_the_segment() {
+        let history = ReplayShipTrajectoryHistory {
+            sessions: vec![PersistedShipTrajectorySession {
+                campaign_id: "default".to_owned(),
+                ship_id: "ship-1".to_owned(),
+                ship_name: "测试舰".to_owned(),
+                turn_index: 1,
+                start_after_source_time: None,
+                start_delay_ms: 0,
+                keyframes: (0..20)
+                    .map(|index| PersistedShipKeyframe {
+                        source_unix_ms: 100_000 + index as u64 * 100,
+                        translation: [index as f32 * 2.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    })
+                    .collect(),
+            }],
+        };
+        let mut fast = test_replay(Vec::new());
+        fast.campaign_id = "default".to_owned();
+        fast.ship_motion_speed = 4.0;
+        compile_scene_dynamics_timeline(&mut fast, &history, 0, &[], &[]);
+        let mut slow = test_replay(Vec::new());
+        slow.campaign_id = "default".to_owned();
+        slow.ship_motion_speed = 0.5;
+        compile_scene_dynamics_timeline(&mut slow, &history, 0, &[], &[]);
+        let fast_span = fast
+            .ship_trajectories
+            .first()
+            .and_then(|trajectory| trajectory.keyframes.last())
+            .map(|frame| frame.time_ms)
+            .unwrap_or_default();
+        let slow_span = slow
+            .ship_trajectories
+            .first()
+            .and_then(|trajectory| trajectory.keyframes.last())
+            .map(|frame| frame.time_ms)
+            .unwrap_or_default();
+        assert!(
+            fast_span < slow_span,
+            "faster ship motion must compress the segment ({fast_span} vs {slow_span})"
+        );
+    }
+
+    #[test]
     fn real_gm_player_exchange_camera_focuses_the_standee() {
         // Reproduce the on-disk session: one GM line addressing player
         // 1670426821 and one line from that player, with the snapshot
@@ -13790,7 +14103,7 @@ mod tests {
         );
 
         assert!(!camera.is_empty());
-        let mut anchor = standee_position;
+        let mut anchor = IVec3::from_array(dialogue[1].position_cells).as_vec3() * VOXEL_SIZE;
         for frame in &camera {
             if let Some(line) = dialogue
                 .iter()
@@ -13943,8 +14256,24 @@ mod tests {
             "camera track is empty for {} dialogue lines",
             replay.dialogue.len()
         );
-        let mut standee_anchor =
-            HashMap::<u64, Vec3>::new();
+        // Standees start at their earliest recorded position, matching the
+        // opening camera shots.
+        let mut standee_anchor = HashMap::<u64, Vec3>::new();
+        for line in replay
+            .dialogue
+            .iter()
+            .filter(|line| {
+                line.included
+                    && line.snapshot_recorded
+                    && line.position_cells != [0; 3]
+            })
+        {
+            standee_anchor
+                .entry(line.sender_id)
+                .or_insert_with(|| {
+                    IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE
+                });
+        }
         for frame in &camera {
             for line in replay
                 .dialogue
