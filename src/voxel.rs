@@ -1442,6 +1442,12 @@ struct VoxelAutoDoorLockState {
     all_locked: bool,
 }
 
+#[derive(Resource, Default)]
+struct VoxelLockedDoorMaterials {
+    normal: Handle<StandardMaterial>,
+    fade: Handle<StandardMaterial>,
+}
+
 #[derive(Resource)]
 pub(crate) struct VoxelMaterials {
     handles: [Handle<StandardMaterial>; VOXEL_MATERIAL_COUNT],
@@ -2235,6 +2241,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPossessionState>()
         .init_resource::<VoxelTargetingPreview>()
         .init_resource::<VoxelAutoDoorLockState>()
+        .init_resource::<VoxelLockedDoorMaterials>()
         .init_resource::<VoxelRadianceVolume>()
         .init_resource::<SceneCaptureRequests>()
         .init_resource::<SceneCharacterPositions>()
@@ -2313,6 +2320,7 @@ impl Plugin for TrpgVoxelPlugin {
                         update_loaded_voxel_physics_chunks,
                         stream_voxel_physics_bodies,
                         animate_voxel_auto_doors,
+                        sync_voxel_auto_door_lock_materials,
                         rebuild_voxel_geometry,
                         sync_voxel_radiance_volume,
                         sync_voxel_lighting,
@@ -2984,6 +2992,16 @@ fn setup_voxel_materials(
     fade_planet_ocean_material.alpha_mode = AlphaMode::Blend;
     let fade_planet_ocean = materials.add(fade_planet_ocean_material);
     let planet_ocean = materials.add(planet_ocean_material);
+    let locked_door_material = StandardMaterial {
+        base_color: Color::srgb(0.82, 0.045, 0.035),
+        emissive: voxel_emissive(2.6, 0.05, 0.02),
+        metallic: 0.6,
+        perceptual_roughness: 0.32,
+        ..default()
+    };
+    let mut fade_locked_door_material = locked_door_material.clone();
+    fade_locked_door_material.base_color = fade_locked_door_material.base_color.with_alpha(0.0);
+    fade_locked_door_material.alpha_mode = AlphaMode::Blend;
     commands.insert_resource(VoxelMaterials {
         handles,
         planet_ocean,
@@ -2991,6 +3009,10 @@ fn setup_voxel_materials(
     commands.insert_resource(VoxelReplayFadeMaterials {
         handles: fade_handles,
         planet_ocean: fade_planet_ocean,
+    });
+    commands.insert_resource(VoxelLockedDoorMaterials {
+        normal: materials.add(locked_door_material),
+        fade: materials.add(fade_locked_door_material),
     });
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.48, 0.56, 0.68),
@@ -7203,6 +7225,27 @@ fn animate_voxel_auto_doors(
     }
 }
 
+fn sync_voxel_auto_door_lock_materials(
+    lock_state: Res<VoxelAutoDoorLockState>,
+    voxel_materials: Res<VoxelMaterials>,
+    locked_door_materials: Res<VoxelLockedDoorMaterials>,
+    mut doors: Query<(
+        &VoxelAutoDoor,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
+) {
+    for (door, mut material) in &mut doors {
+        let target = if door.locked || lock_state.all_locked {
+            locked_door_materials.normal.clone()
+        } else {
+            voxel_materials.handles[door.material as usize - 1].clone()
+        };
+        if material.0 != target {
+            material.0 = target;
+        }
+    }
+}
+
 fn setup_voxel_view(
     mut commands: Commands,
     mut gizmo_config: ResMut<GizmoConfigStore>,
@@ -10632,6 +10675,7 @@ fn animate_voxel_materials(
     time: Res<Time>,
     voxel_materials: Res<VoxelMaterials>,
     fade_materials: Res<VoxelReplayFadeMaterials>,
+    locked_door_materials: Res<VoxelLockedDoorMaterials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let seconds = time.elapsed_secs();
@@ -10665,6 +10709,15 @@ fn animate_voxel_materials(
         let pulse = 4.5 + (seconds * 2.4).sin() * 1.2;
         lava.emissive = voxel_emissive(pulse, pulse * 0.11, 0.015);
     }
+    for handle in [
+        &locked_door_materials.normal,
+        &locked_door_materials.fade,
+    ] {
+        if let Some(mut locked_door) = materials.get_mut(handle) {
+            let pulse = 2.8 + (seconds * 2.6).sin() * 1.0;
+            locked_door.emissive = voxel_emissive(pulse, pulse * 0.035, 0.018);
+        }
+    }
 }
 
 fn sync_voxel_occlusion_fade(
@@ -10672,6 +10725,7 @@ fn sync_voxel_occlusion_fade(
     fade: Res<VoxelReplayOcclusionFade>,
     voxel_materials: Res<VoxelMaterials>,
     fade_materials: Res<VoxelReplayFadeMaterials>,
+    locked_door_materials: Res<VoxelLockedDoorMaterials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
     voxel_meshes: Query<
@@ -10687,9 +10741,12 @@ fn sync_voxel_occlusion_fade(
     >,
 ) {
     let opacity = fade.opacity.clamp(0.0, 1.0);
-    for handle in fade_materials.handles.iter().chain(std::iter::once(
-        &fade_materials.planet_ocean,
-    )) {
+    for handle in fade_materials
+        .handles
+        .iter()
+        .chain(std::iter::once(&fade_materials.planet_ocean))
+        .chain(std::iter::once(&locked_door_materials.fade))
+    {
         if let Some(mut material) = materials.get_mut(handle) {
             material.base_color = material.base_color.with_alpha(opacity);
         }
@@ -10705,6 +10762,7 @@ fn sync_voxel_occlusion_fade(
             material,
             &voxel_materials,
             &fade_materials,
+            &locked_door_materials,
         ) else {
             continue;
         };
@@ -11085,6 +11143,7 @@ fn replay_fade_handle(
     material: &MeshMaterial3d<StandardMaterial>,
     voxel_materials: &VoxelMaterials,
     fade_materials: &VoxelReplayFadeMaterials,
+    locked_door_materials: &VoxelLockedDoorMaterials,
 ) -> Option<Handle<StandardMaterial>> {
     voxel_materials
         .handles
@@ -11094,6 +11153,10 @@ fn replay_fade_handle(
         .or_else(|| {
             (material.0 == voxel_materials.planet_ocean)
                 .then(|| fade_materials.planet_ocean.clone())
+        })
+        .or_else(|| {
+            (material.0 == locked_door_materials.normal)
+                .then(|| locked_door_materials.fade.clone())
         })
 }
 
@@ -16969,6 +17032,7 @@ mod tests {
             handles: normal_handles.clone(),
             planet_ocean: normal_planet_ocean,
         })
+        .init_resource::<VoxelLockedDoorMaterials>()
         .insert_resource(VoxelReplayFadeMaterials {
             handles: fade_handles.clone(),
             planet_ocean: fade_planet_ocean.clone(),
@@ -17263,6 +17327,122 @@ mod tests {
                 .collect::<Vec<_>>(),
             sliding,
             "locking a door must not change its slide geometry"
+        );
+    }
+
+    #[test]
+    fn locked_auto_doors_swap_to_the_red_glow_material_and_back() {
+        let mut app = App::new();
+        let mut asset_store = Assets::<StandardMaterial>::default();
+        let handles = std::array::from_fn(|_| {
+            asset_store.add(StandardMaterial::default())
+        });
+        let planet_ocean = asset_store.add(StandardMaterial::default());
+        // A station automatic door (not the Arrogance cab door) must receive
+        // the same lock visuals as every other automatic door.
+        let door = make_voxel_auto_door(IVec3::new(3, 0, -2), IVec3::X, 2, 8, 1.75);
+        let panel = voxel_auto_door_panels(&door)[0].clone();
+        let original_handle = handles[panel.material as usize - 1].clone();
+        app.init_resource::<VoxelAutoDoorLockState>()
+            .init_resource::<VoxelLockedDoorMaterials>()
+            .insert_resource(VoxelMaterials {
+                handles,
+                planet_ocean,
+            })
+            .add_systems(Update, sync_voxel_auto_door_lock_materials);
+        let entity = app
+            .world_mut()
+            .spawn((
+                panel,
+                MeshMaterial3d(original_handle.clone()),
+            ))
+            .id();
+
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0,
+            original_handle
+        );
+
+        app.world_mut()
+            .resource_mut::<VoxelAutoDoorLockState>()
+            .all_locked = true;
+        app.update();
+        let locked_handle = app
+            .world()
+            .entity(entity)
+            .get::<MeshMaterial3d<StandardMaterial>>()
+            .unwrap()
+            .0
+            .clone();
+        assert_ne!(locked_handle, original_handle);
+
+        app.world_mut()
+            .resource_mut::<VoxelAutoDoorLockState>()
+            .all_locked = false;
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0,
+            original_handle
+        );
+
+        app.world_mut()
+            .entity_mut(entity)
+            .get_mut::<VoxelAutoDoor>()
+            .unwrap()
+            .locked = true;
+        app.update();
+        assert_ne!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0,
+            original_handle
+        );
+    }
+
+    #[test]
+    fn locked_door_material_keeps_replay_fade_parity() {
+        let mut asset_store = Assets::<StandardMaterial>::default();
+        let locked = asset_store.add(StandardMaterial::default());
+        let locked_fade = asset_store.add(StandardMaterial::default());
+        let handles = std::array::from_fn(|_| {
+            asset_store.add(StandardMaterial::default())
+        });
+        let planet_ocean = asset_store.add(StandardMaterial::default());
+        let fade_handles = std::array::from_fn(|_| {
+            asset_store.add(StandardMaterial::default())
+        });
+        let fade_planet_ocean = asset_store.add(StandardMaterial::default());
+        let locked_door_materials = VoxelLockedDoorMaterials {
+            normal: locked.clone(),
+            fade: locked_fade.clone(),
+        };
+        let voxel_materials = VoxelMaterials {
+            handles,
+            planet_ocean,
+        };
+        let fade_materials = VoxelReplayFadeMaterials {
+            handles: fade_handles,
+            planet_ocean: fade_planet_ocean,
+        };
+        assert_eq!(
+            replay_fade_handle(
+                &MeshMaterial3d(locked),
+                &voxel_materials,
+                &fade_materials,
+                &locked_door_materials,
+            ),
+            Some(locked_fade)
         );
     }
 
