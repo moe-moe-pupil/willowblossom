@@ -7683,7 +7683,7 @@ fn format_private_attribute_help() -> String {
         "体质（VIT）：每点体质提供3点生命值；脱战后且非重伤时提供1点/轮生命回复；减少1%因受伤状态遭受的属性惩罚。",
         "智力（INT）：每点智力提供5点魔法值、1%魔法额外消耗、2%法术伤害和1%治疗加成。达到10点可感知周围环境的魔力并接入魔网；达到15点可模糊感知周围存在的法术类buff或正在释放的法术类技能，不受视野阻碍限制；达到20点可使用侦测魔法，基础半径50米，之后每点智力增加2米侦测半径。",
         "智慧（WIS）：每点智慧提供2.5点魔法值、脱战后1点/轮魔法回复、更好的精神力引导与控制，以及2%治疗加成。",
-        "知识（K）：每点知识提供额外线索、情报和操作部分设备的能力。达到10点可完整认识自身，得知自己的具体生命值和自己对目标造成的具体伤害；达到20点可消耗一个观察小动作，分析buff或技能的伤害/治疗数值与持续时间。",
+        "知识（K）：每点知识提供额外线索、情报和操作部分设备的能力。达到5点可完整认识自身，得知自己的具体生命值和自己对目标造成的具体伤害；达到20点可消耗一个观察小动作，分析buff或技能的伤害/治疗数值与持续时间。",
         "魅力（CHA）：每点魅力提供额外的NPC交流好感、0.05召唤物上限和2%召唤物伤害加成。",
     ]
     .join("\n")
@@ -8049,7 +8049,7 @@ fn format_private_character_status(manager: &NapcatMessageManager, target_id: &s
 
     let total_status = character_total_status(character);
     let hp_status = private_character_hp_status(character.hp, character.max_hp);
-    let health = if total_status.k >= 10 {
+    let health = if total_status.k >= 5 {
         format!(
             "生命：{} / {} 【{}】",
             format_character_number(character.hp),
@@ -12713,10 +12713,9 @@ position_cells = [4, 5, 6]
     #[test]
     fn private_status_command_reports_completed_character() {
         let mut manager = empty_manager();
-        manager.player_characters.insert(
-            "2".to_owned(),
-            completed_character("晨星"),
-        );
+        let mut character = completed_character("晨星");
+        character.status.k = 4;
+        manager.player_characters.insert("2".to_owned(), character);
 
         let response = handle_character_creation_message(
             &mut manager,
@@ -12734,12 +12733,12 @@ position_cells = [4, 5, 6]
     }
 
     #[test]
-    fn private_status_reveals_exact_health_at_ten_total_knowledge() {
+    fn private_status_reveals_exact_health_at_five_total_knowledge() {
         let mut manager = empty_manager();
         let mut character = completed_character("观星者");
         character.hp = 4.0;
         character.max_hp = 10.0;
-        character.status.k = 7;
+        character.status.k = 2;
         character.extra_status.k = 3;
         manager.player_characters.insert("2".to_owned(), character);
 
@@ -12767,7 +12766,7 @@ position_cells = [4, 5, 6]
             for attribute in ["STR", "AGI", "DEX", "VIT", "INT", "WIS", "K", "CHA"] {
                 assert!(response.contains(attribute));
             }
-            assert!(response.contains("达到10点可完整认识自身"));
+            assert!(response.contains("达到5点可完整认识自身"));
             assert!(response.contains("达到20点可消耗一个观察小动作"));
         }
     }
