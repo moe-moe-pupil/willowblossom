@@ -3164,6 +3164,12 @@ fn replay_controls(
         player_movement_history,
         camera,
     );
+    replay_ship_trajectory_editor(
+        ui,
+        studio,
+        ship_trajectory_history,
+        camera,
+    );
     if !matches!(studio.mode, ReplayMode::Recording) && studio.replay.is_some() {
         let duration = studio.replay.as_ref().unwrap().duration_ms.max(1);
         ui.horizontal(|ui| {
@@ -5490,6 +5496,213 @@ fn replay_movement_timing_editor(
     studio.status = "已保存玩家移动轨迹、开始台词与延迟".to_owned();
 }
 
+fn replay_ship_trajectory_editor(
+    ui: &mut egui::Ui,
+    studio: &mut ReplayStudio,
+    ship_history: &mut Persistent<ReplayShipTrajectoryHistory>,
+    camera: &Query<&Transform, With<VoxelViewportCamera>>,
+) {
+    let Some(replay) = studio.replay.as_ref() else { return };
+    let campaign_id = replay.campaign_id.clone();
+    let line_options = replay
+        .dialogue
+        .iter()
+        .filter(|line| line.included && line.source_time > 0)
+        .map(|line| {
+            (
+                line.source_time,
+                format!(
+                    "#{} {}：{}",
+                    line.line_id,
+                    line.name,
+                    line.text.chars().take(28).collect::<String>()
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let session_indices = ship_history
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, session)| {
+            session.campaign_id == campaign_id && !session.keyframes.is_empty()
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    let mut deleted_sessions = Vec::new();
+    ui.collapsing(
+        format!("飞船轨迹数据与时序（{} 条）", session_indices.len()),
+        |ui| {
+            ui.small("DM 可编辑轨迹帧、开始台词和延迟；重新“从现有聊天生成”仍会应用这些持久数据。坐标单位为世界单位。");
+            if session_indices.is_empty() {
+                ui.label("当前回放没有已保存的飞船轨迹数据。");
+            }
+            for (display_index, session_index) in session_indices.iter().copied().enumerate() {
+                let session = &mut ship_history.sessions[session_index];
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{}. {}（{}）· 回合 {} · {} 帧",
+                            display_index + 1,
+                            session.ship_name,
+                            session.ship_id,
+                            session.turn_index,
+                            session.keyframes.len()
+                        ));
+                        if ui.button("删除轨迹").clicked() {
+                            deleted_sessions.push(session_index);
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("开始于台词");
+                        let mut selected_source_time = session.start_after_source_time;
+                        let selected_text = line_options
+                            .iter()
+                            .find(|(source_time, _)| {
+                                selected_source_time == Some(*source_time)
+                            })
+                            .map(|(_, label)| label.as_str())
+                            .unwrap_or("自动：按移动发生时间");
+                        egui::ComboBox::from_id_salt((
+                            "replay-ship-anchor",
+                            session_index,
+                        ))
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut selected_source_time,
+                                None,
+                                "自动：按移动发生时间",
+                            );
+                            for (source_time, label) in &line_options {
+                                ui.selectable_value(
+                                    &mut selected_source_time,
+                                    Some(*source_time),
+                                    label,
+                                );
+                            }
+                        });
+                        if selected_source_time != session.start_after_source_time {
+                            session.start_after_source_time = selected_source_time;
+                            changed = true;
+                        }
+                        ui.label("延迟");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut session.start_delay_ms)
+                                    .range(0..=600_000)
+                                    .speed(100)
+                                    .suffix(" ms"),
+                            )
+                            .changed();
+                    });
+                    let first_source_unix_ms = session
+                        .keyframes
+                        .first()
+                        .map(|frame| frame.source_unix_ms)
+                        .unwrap_or_default();
+                    egui::CollapsingHeader::new("轨迹帧")
+                        .id_salt(("replay-ship-keyframes", session_index))
+                        .show(ui, |ui| {
+                            let mut minimum_offset_ms = 0;
+                            for (frame_index, frame) in
+                                session.keyframes.iter_mut().enumerate()
+                            {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.monospace(format!("#{}", frame_index + 1));
+                                    let mut offset_ms = frame
+                                        .source_unix_ms
+                                        .saturating_sub(first_source_unix_ms);
+                                    if frame_index == 0 {
+                                        ui.label("+0 ms");
+                                    } else {
+                                        let response = ui.add(
+                                            egui::DragValue::new(&mut offset_ms)
+                                                .range(minimum_offset_ms..=600_000)
+                                                .speed(50)
+                                                .prefix("+")
+                                                .suffix(" ms"),
+                                        );
+                                        if response.changed() {
+                                            frame.source_unix_ms =
+                                                first_source_unix_ms.saturating_add(offset_ms);
+                                            changed = true;
+                                        }
+                                    }
+                                    for (axis, label) in
+                                        ["X", "Y", "Z"].into_iter().enumerate()
+                                    {
+                                        ui.label(label);
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut frame.translation[axis],
+                                                )
+                                                .range(-1_000_000.0..=1_000_000.0)
+                                                .speed(0.25)
+                                                .fixed_decimals(2),
+                                            )
+                                            .changed();
+                                    }
+                                    minimum_offset_ms = offset_ms;
+                                });
+                            }
+                        });
+                });
+            }
+        },
+    );
+    deleted_sessions.sort_unstable();
+    deleted_sessions.dedup();
+    for session_index in deleted_sessions.into_iter().rev() {
+        ship_history.sessions.remove(session_index);
+        changed = true;
+    }
+
+    if !changed {
+        return;
+    }
+    if let Err(err) = ship_history.persist() {
+        studio.status = format!("无法保存飞船轨迹时序：{err}");
+        return;
+    }
+    let replay = studio.replay.as_mut().expect("checked above");
+    compile_scene_dynamics_timeline(replay, ship_history, 0, &[], &[]);
+    replay.ship_trajectory_history_cursor_unix_ms = unix_time_ms();
+    extend_replay_for_speech(replay);
+    let dialogue_end = replay
+        .dialogue
+        .iter()
+        .filter(|line| line.included && line.time_ms != u64::MAX)
+        .map(|line| line.time_ms.saturating_add(line.duration_ms))
+        .max()
+        .unwrap_or_default()
+        .max(5_000);
+    let trajectory_end = replay
+        .ship_trajectories
+        .iter()
+        .filter_map(|trajectory| trajectory.keyframes.last())
+        .map(|frame| frame.time_ms)
+        .max()
+        .unwrap_or_default();
+    replay.duration_ms = dialogue_end.max(trajectory_end);
+    if let Ok(base) = camera.single() {
+        let positions = replay_speaker_positions(&replay.dialogue);
+        replay.camera = turn_based_camera_track(
+            base,
+            &replay.dialogue,
+            replay.duration_ms,
+            &positions,
+            replay.camera_distance_scale,
+            replay.camera_yaw_degrees,
+            &ReplayCameraObstacles::from_scene(&replay.scene),
+        );
+    }
+    studio.playback_ms = 0;
+    studio.status = "已保存飞船轨迹、开始台词与延迟".to_owned();
+}
+
 fn stop_playback(studio: &mut ReplayStudio, grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>) {
     if let Some(scene) = studio.pre_playback_scene.take() {
         if let Ok(mut grid) = grids.single_mut() {
@@ -6955,26 +7168,45 @@ fn apply_replay_standee_positions(
                     positions
                 });
             for (mut transform, standee) in &mut standees {
-                if let Some(position) = interpolated_player_position(
+                let movement_position = interpolated_player_position(
                     &replay.player_movements,
                     standee.user_id,
                     studio.playback_ms,
                     replay.player_movement_curve,
-                )
-                .or_else(|| {
-                    positions.get(&standee.user_id).map(|(position, source_time)| {
-                        replay_carried_standee_position(
-                            replay,
-                            &ship_bounds,
-                            *position,
-                            *source_time,
-                            studio.playback_ms,
-                        )
-                        .unwrap_or(*position)
-                    })
-                })
-                {
-                    transform.translation = position;
+                );
+                let dialogue_position = positions.get(&standee.user_id).copied();
+                let resolved = if let Some(position) = movement_position {
+                    // Movement keyframes recorded live already follow a moving
+                    // ship; once they go stale (the player stopped being
+                    // moved), the ship carry takes over from the last frame.
+                    let last_frame_time = replay
+                        .player_movements
+                        .iter()
+                        .find(|movement| movement.user_id == standee.user_id)
+                        .and_then(|movement| movement.keyframes.last())
+                        .map(|frame| frame.time_ms)
+                        .unwrap_or(studio.playback_ms);
+                    Some((
+                        position,
+                        last_frame_time.min(studio.playback_ms),
+                    ))
+                } else if let Some((position, source_time)) = dialogue_position {
+                    Some((position, source_time))
+                } else {
+                    None
+                };
+                if let Some((position, source_time)) = resolved {
+                    if let Some(carried) = replay_carried_standee_position(
+                        replay,
+                        &ship_bounds,
+                        position,
+                        source_time,
+                        studio.playback_ms,
+                    ) {
+                        transform.translation = carried;
+                    } else {
+                        transform.translation = position;
+                    }
                 }
                 if let Some(rotation) = camera_position.and_then(|camera_position| {
                     replay_standee_facing_rotation(transform.translation, camera_position)
@@ -7879,6 +8111,8 @@ struct ShipMotionEvent {
     ship_name: String,
     start_source_ms: u64,
     end_source_ms: u64,
+    anchor_source_time: Option<u64>,
+    start_delay_ms: u64,
     keyframes: Vec<PersistedShipKeyframe>,
 }
 
@@ -8006,6 +8240,8 @@ fn make_ship_motion_event(
         ship_name: session.ship_name.clone(),
         start_source_ms,
         end_source_ms,
+        anchor_source_time: session.start_after_source_time,
+        start_delay_ms: session.start_delay_ms,
         keyframes,
     }
 }
@@ -8036,11 +8272,20 @@ fn compile_scene_dynamics_timeline(
     let mut before_first = Vec::new();
     let mut events_by_anchor = HashMap::<usize, Vec<ShipMotionEvent>>::new();
     for event in events {
-        let anchor = playable.iter().rposition(|&line_index| {
-            let line = &replay.dialogue[line_index];
-            line.source_time > 0
-                && line.source_time.saturating_mul(1_000) <= event.start_source_ms
-        });
+        let anchor = event
+            .anchor_source_time
+            .and_then(|source_time| {
+                playable.iter().position(|&line_index| {
+                    replay.dialogue[line_index].source_time == source_time
+                })
+            })
+            .or_else(|| {
+                playable.iter().rposition(|&line_index| {
+                    let line = &replay.dialogue[line_index];
+                    line.source_time > 0
+                        && line.source_time.saturating_mul(1_000) <= event.start_source_ms
+                })
+            });
         if let Some(position) = anchor {
             events_by_anchor.entry(position).or_default().push(event);
         } else {
@@ -8182,7 +8427,12 @@ fn place_motion_cluster(
         .unwrap_or_default();
     let real_duration = window_end.saturating_sub(window_start);
     let segment_ms = real_duration.clamp(MIN_MOVEMENT_SEGMENT_MS, MAX_MOVEMENT_SEGMENT_MS);
-    let replay_start_ms = *cursor;
+    let cluster_delay = events
+        .iter()
+        .map(|event| event.start_delay_ms)
+        .max()
+        .unwrap_or_default();
+    let replay_start_ms = cursor.saturating_add(cluster_delay);
     let replay_end_ms = replay_start_ms.saturating_add(segment_ms);
     segments.push(TimelineSegment {
         source_start_ms: window_start,
@@ -13385,6 +13635,63 @@ mod tests {
                 5_000,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn ship_anchor_line_and_delay_are_respected_on_import() {
+        let mut lines = vec![
+            positioned_dialogue(1, 1, 100, [0, 0, 0]),
+            positioned_dialogue(2, 1, 200, [0, 0, 0]),
+        ];
+        assign_replay_line_ids(&mut lines);
+        let mut replay = test_replay(lines);
+        replay.campaign_id = "default".to_owned();
+        auto_group_replay_areas(&mut replay);
+        rebuild_area_blocks(&mut replay);
+        let history = ReplayShipTrajectoryHistory {
+            sessions: vec![PersistedShipTrajectorySession {
+                campaign_id: "default".to_owned(),
+                ship_id: "ship-1".to_owned(),
+                ship_name: "测试舰".to_owned(),
+                turn_index: 1,
+                start_after_source_time: Some(100),
+                start_delay_ms: 500,
+                keyframes: vec![
+                    PersistedShipKeyframe {
+                        source_unix_ms: 150_000,
+                        translation: [0.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                    PersistedShipKeyframe {
+                        source_unix_ms: 150_100,
+                        translation: [10.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                ],
+            }],
+        };
+
+        compile_scene_dynamics_timeline(&mut replay, &history, 0, &[], &[]);
+
+        let anchor_line = replay
+            .dialogue
+            .iter()
+            .find(|line| line.source_time == 100)
+            .expect("anchor line");
+        let trajectory = replay
+            .ship_trajectories
+            .iter()
+            .find(|trajectory| trajectory.ship_id == "ship-1")
+            .expect("ship trajectory");
+        let anchor_end = anchor_line
+            .time_ms
+            .saturating_add(anchor_line.duration_ms);
+        assert!(
+            trajectory.keyframes[0].time_ms >= anchor_end.saturating_add(500),
+            "ship motion must start after the chosen line plus its delay, got {} (anchor end {})",
+            trajectory.keyframes[0].time_ms,
+            anchor_end
         );
     }
 
