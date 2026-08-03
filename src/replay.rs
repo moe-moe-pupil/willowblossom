@@ -6887,6 +6887,10 @@ fn apply_replay_standee_positions(
             Without<VoxelViewportCamera>,
         ),
     >,
+    spaceships: Query<
+        (&VoxelSpaceship, &VoxelPhysicsBody),
+        Without<VoxelViewportCamera>,
+    >,
     mut state: Local<ReplayStandeePlaybackState>,
 ) {
     let active = matches!(
@@ -6912,16 +6916,41 @@ fn apply_replay_standee_positions(
                 replay.camera_transition_curve,
             )
             .map(|transform| transform.translation);
+            let ship_bounds = spaceships
+                .iter()
+                .filter_map(|(ship, body)| {
+                    let min = body
+                        .cells
+                        .iter()
+                        .map(|(cell, _)| *cell)
+                        .reduce(IVec3::min)?;
+                    let max = body
+                        .cells
+                        .iter()
+                        .map(|(cell, _)| *cell)
+                        .reduce(IVec3::max)?;
+                    Some((
+                        ship.id.clone(),
+                        (
+                            min.as_vec3() * VOXEL_SIZE,
+                            (max + IVec3::ONE).as_vec3() * VOXEL_SIZE,
+                        ),
+                    ))
+                })
+                .collect::<HashMap<_, _>>();
             let positions = replay
                 .dialogue
                 .iter()
                 .filter(|line| {
                     line.included && line.snapshot_recorded && line.time_ms <= studio.playback_ms
                 })
-                .fold(HashMap::new(), |mut positions, line| {
+                .fold(HashMap::new(), |mut positions: HashMap<u64, (Vec3, u64)>, line| {
                     positions.insert(
                         line.sender_id,
-                        IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE,
+                        (
+                            IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE,
+                            line.time_ms,
+                        ),
                     );
                     positions
                 });
@@ -6932,7 +6961,18 @@ fn apply_replay_standee_positions(
                     studio.playback_ms,
                     replay.player_movement_curve,
                 )
-                .or_else(|| positions.get(&standee.user_id).copied())
+                .or_else(|| {
+                    positions.get(&standee.user_id).map(|(position, source_time)| {
+                        replay_carried_standee_position(
+                            replay,
+                            &ship_bounds,
+                            *position,
+                            *source_time,
+                            studio.playback_ms,
+                        )
+                        .unwrap_or(*position)
+                    })
+                })
                 {
                     transform.translation = position;
                 }
@@ -6964,6 +7004,47 @@ fn replay_standee_facing_rotation(standee_position: Vec3, camera_position: Vec3)
     Some(Quat::from_rotation_y(
         (-direction.x).atan2(-direction.z),
     ))
+}
+
+/// Carries a standee whose recorded dialogue position was inside a moving
+/// ship: the ship-local offset at the recorded time is applied to the ship's
+/// current replay pose, so the person travels with the vessel exactly like the
+/// live "carry players with spaceships" behavior.
+fn replay_carried_standee_position(
+    replay: &ReplayFile,
+    ship_bounds: &HashMap<String, (Vec3, Vec3)>,
+    recorded_position: Vec3,
+    recorded_time_ms: u64,
+    playback_ms: u64,
+) -> Option<Vec3> {
+    for trajectory in &replay.ship_trajectories {
+        let (local_min, local_max) = ship_bounds.get(&trajectory.ship_id)?;
+        let (source_translation, source_rotation) =
+            interpolated_ship_pose(trajectory, recorded_time_ms)?;
+        let source_affine = Transform {
+            translation: source_translation,
+            rotation: source_rotation,
+            scale: Vec3::ONE,
+        }
+        .compute_affine();
+        let local = source_affine
+            .inverse()
+            .transform_point3(recorded_position);
+        let inside = local.cmpge(*local_min).all() && local.cmple(*local_max).all();
+        if !inside {
+            continue;
+        }
+        let (current_translation, current_rotation) =
+            interpolated_ship_pose(trajectory, playback_ms)?;
+        let current_affine = Transform {
+            translation: current_translation,
+            rotation: current_rotation,
+            scale: Vec3::ONE,
+        }
+        .compute_affine();
+        return Some(current_affine.transform_point3(local));
+    }
+    None
 }
 
 fn replay_scene_dynamics_active(studio: &ReplayStudio) -> bool {
@@ -7785,6 +7866,10 @@ fn append_new_player_movements_from_history(
 const MIN_MOVEMENT_SEGMENT_MS: u64 = 800;
 const MAX_MOVEMENT_SEGMENT_MS: u64 = 6_000;
 const MOTION_EVENT_GAP_MS: u64 = 3_000;
+/// Motions whose real times are within this window are treated as one shared
+/// replay segment (e.g. a whole fleet flying together), instead of inflating
+/// the timeline with one segment per ship.
+const MOTION_CLUSTER_GAP_MS: u64 = 15_000;
 
 /// One contiguous ship motion from the persistent trajectory history. A
 /// session is split into events whenever the ship stopped moving for longer
@@ -7966,8 +8051,8 @@ fn compile_scene_dynamics_timeline(
     let mut cursor = 350_u64;
     let mut segments = Vec::<TimelineSegment>::new();
     let mut imported_keyframes = HashMap::<String, (String, Vec<ReplayShipKeyframe>)>::new();
-    for event in before_first {
-        place_motion_event(event, &mut cursor, &mut segments, &mut imported_keyframes);
+    for cluster in motion_clusters(before_first) {
+        place_motion_cluster(cluster, &mut cursor, &mut segments, &mut imported_keyframes);
     }
     for (position, &line_index) in playable.iter().enumerate() {
         let line = &mut replay.dialogue[line_index];
@@ -7982,8 +8067,13 @@ fn compile_scene_dynamics_timeline(
         cursor = line_end.saturating_add(HISTORY_DIALOGUE_GAP_MS);
         if let Some(mut anchored) = events_by_anchor.remove(&position) {
             anchored.sort_by_key(|event| event.start_source_ms);
-            for event in anchored {
-                place_motion_event(event, &mut cursor, &mut segments, &mut imported_keyframes);
+            for cluster in motion_clusters(anchored) {
+                place_motion_cluster(
+                    cluster,
+                    &mut cursor,
+                    &mut segments,
+                    &mut imported_keyframes,
+                );
             }
         }
     }
@@ -8023,97 +8113,108 @@ fn append_new_ship_trajectories_from_history(
     let cutoff_unix_ms = replay
         .ship_trajectory_history_cursor_unix_ms
         .max(replay.created_at_unix_ms);
-    let mut imported = 0_usize;
-    let mut next_start = replay.duration_ms;
-    for session in history
-        .sessions
-        .iter()
-        .filter(|session| session.campaign_id == replay.campaign_id)
-    {
-        let frames = session
-            .keyframes
-            .iter()
-            .filter(|frame| frame.source_unix_ms > cutoff_unix_ms)
-            .copied()
-            .collect::<Vec<_>>();
-        if frames.is_empty() {
-            continue;
-        }
-        let first_source_unix_ms = frames[0].source_unix_ms;
-        let movement_start = next_start.saturating_add(HISTORY_DIALOGUE_GAP_MS);
-        let keyframes = frames
-            .into_iter()
-            .map(|frame| ReplayShipKeyframe {
-                time_ms: movement_start.saturating_add(
-                    frame.source_unix_ms.saturating_sub(first_source_unix_ms),
-                ),
-                translation: frame.translation,
-                rotation: frame.rotation,
-            })
-            .collect::<Vec<_>>();
-        next_start = keyframes
-            .last()
-            .map(|frame| frame.time_ms)
-            .unwrap_or(movement_start);
-        if let Some(existing) = replay
-            .ship_trajectories
-            .iter_mut()
-            .find(|trajectory| trajectory.ship_id == session.ship_id)
-        {
-            existing.ship_name = session.ship_name.clone();
-            existing.keyframes.extend(keyframes);
-            existing.keyframes.sort_by_key(|frame| frame.time_ms);
-        } else {
-            replay.ship_trajectories.push(ReplayShipTrajectory {
-                ship_id: session.ship_id.clone(),
-                ship_name: session.ship_name.clone(),
-                keyframes,
-            });
-        }
-        imported = imported.saturating_add(1);
+    let events = ship_motion_events(history, &replay.campaign_id, cutoff_unix_ms);
+    if events.is_empty() {
+        return 0;
     }
+    let mut next_start = replay.duration_ms;
+    let mut segments = Vec::<TimelineSegment>::new();
+    let mut imported_keyframes = HashMap::<String, (String, Vec<ReplayShipKeyframe>)>::new();
+    let mut clusters = motion_clusters(events);
+    clusters.sort_by_key(|cluster| {
+        cluster
+            .iter()
+            .map(|event| event.start_source_ms)
+            .min()
+            .unwrap_or_default()
+    });
+    for cluster in clusters {
+        place_motion_cluster(
+            cluster,
+            &mut next_start,
+            &mut segments,
+            &mut imported_keyframes,
+        );
+    }
+    let imported = merge_ship_trajectories(replay, imported_keyframes);
     replay.duration_ms = replay.duration_ms.max(next_start);
     replay.ship_trajectory_history_cursor_unix_ms = unix_time_ms();
     imported
 }
 
-fn place_motion_event(
-    event: ShipMotionEvent,
+/// Groups motion events whose real times overlap into shared clusters, so a
+/// fleet flying together occupies one replay segment instead of one segment
+/// per ship.
+fn motion_clusters(events: Vec<ShipMotionEvent>) -> Vec<Vec<ShipMotionEvent>> {
+    let mut clusters = Vec::<Vec<ShipMotionEvent>>::new();
+    for event in events {
+        if let Some(last) = clusters.last_mut() {
+            let cluster_end = last
+                .iter()
+                .map(|event| event.end_source_ms)
+                .max()
+                .unwrap_or_default();
+            if event.start_source_ms.saturating_sub(cluster_end) <= MOTION_CLUSTER_GAP_MS {
+                last.push(event);
+                continue;
+            }
+        }
+        clusters.push(vec![event]);
+    }
+    clusters
+}
+
+fn place_motion_cluster(
+    events: Vec<ShipMotionEvent>,
     cursor: &mut u64,
     segments: &mut Vec<TimelineSegment>,
     imported_keyframes: &mut HashMap<String, (String, Vec<ReplayShipKeyframe>)>,
 ) {
-    let real_duration = event.end_source_ms.saturating_sub(event.start_source_ms);
+    let window_start = events
+        .iter()
+        .map(|event| event.start_source_ms)
+        .min()
+        .unwrap_or_default();
+    let window_end = events
+        .iter()
+        .map(|event| event.end_source_ms)
+        .max()
+        .unwrap_or_default();
+    let real_duration = window_end.saturating_sub(window_start);
     let segment_ms = real_duration.clamp(MIN_MOVEMENT_SEGMENT_MS, MAX_MOVEMENT_SEGMENT_MS);
     let replay_start_ms = *cursor;
     let replay_end_ms = replay_start_ms.saturating_add(segment_ms);
     segments.push(TimelineSegment {
-        source_start_ms: event.start_source_ms,
+        source_start_ms: window_start,
         source_end_ms: 0,
         replay_start_ms,
         replay_end_ms,
     });
     *cursor = replay_end_ms.saturating_add(HISTORY_DIALOGUE_GAP_MS);
-    let entry = imported_keyframes
-        .entry(event.ship_id.clone())
-        .or_insert_with(|| (event.ship_name.clone(), Vec::new()));
-    entry.0 = event.ship_name.clone();
-    for keyframe in event.keyframes {
-        let fraction = if real_duration > 0 {
-            (keyframe.source_unix_ms.saturating_sub(event.start_source_ms) as f64
-                / real_duration as f64)
-                .clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let frame_ms = replay_start_ms.saturating_add(
-            ((replay_end_ms - replay_start_ms) as f64 * fraction) as u64,
-        );
-        entry.1.push(ReplayShipKeyframe {
-            time_ms: frame_ms,
-            translation: keyframe.translation,
-            rotation: keyframe.rotation,
-        });
+    for event in events {
+        let entry = imported_keyframes
+            .entry(event.ship_id.clone())
+            .or_insert_with(|| (event.ship_name.clone(), Vec::new()));
+        entry.0 = event.ship_name.clone();
+        for keyframe in event.keyframes {
+            let fraction = if real_duration > 0 {
+                (keyframe
+                    .source_unix_ms
+                    .saturating_sub(window_start) as f64
+                    / real_duration as f64)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let frame_ms = replay_start_ms.saturating_add(
+                ((replay_end_ms - replay_start_ms) as f64 * fraction) as u64,
+            );
+            entry.1.push(ReplayShipKeyframe {
+                time_ms: frame_ms,
+                translation: keyframe.translation,
+                rotation: keyframe.rotation,
+            });
+        }
     }
 }
 
@@ -13161,6 +13262,11 @@ mod tests {
             arrogance.keyframes.len() > 100,
             "Arrogance trajectory should carry its recorded motion frames"
         );
+        assert!(
+            replay.duration_ms < 30_000,
+            "two dialogue lines plus one fleet flight must stay short, got {} ms",
+            replay.duration_ms
+        );
 
         // Append path: a replay created before the fleet flight imports the
         // newly recorded Arrogance trajectory when 播放 is pressed.
@@ -13185,6 +13291,11 @@ mod tests {
         assert!(
             horizontal(start_pose - end_pose).length() > 10.0,
             "Arrogance must visibly move during playback (start {start_pose:?}, end {end_pose:?})"
+        );
+        assert!(
+            append_replay.duration_ms < 15_000,
+            "appending the fleet flight must not inflate the timeline, got {} ms",
+            append_replay.duration_ms
         );
 
         // Camera: the GM line must frame the player standee.
@@ -13223,6 +13334,58 @@ mod tests {
                 frame.translation
             );
         }
+    }
+
+    #[test]
+    fn replay_carries_standees_inside_moving_ships() {
+        let mut replay = test_replay(Vec::new());
+        replay.ship_trajectories.push(ReplayShipTrajectory {
+            ship_id: "carrier".to_owned(),
+            ship_name: "运载舰".to_owned(),
+            keyframes: vec![
+                ReplayShipKeyframe {
+                    time_ms: 1_000,
+                    translation: [0.0, 0.0, 0.0],
+                    rotation: Quat::IDENTITY.to_array(),
+                },
+                ReplayShipKeyframe {
+                    time_ms: 5_000,
+                    translation: [100.0, 0.0, 0.0],
+                    rotation: Quat::IDENTITY.to_array(),
+                },
+            ],
+        });
+        let ship_bounds = HashMap::from([(
+            "carrier".to_owned(),
+            (Vec3::new(-2.0, 0.0, -2.0), Vec3::new(2.0, 4.0, 2.0)),
+        )]);
+
+        // The standee stood inside the hull at the recorded time; during
+        // playback it must travel with the ship instead of staying behind.
+        let carried = replay_carried_standee_position(
+            &replay,
+            &ship_bounds,
+            Vec3::new(1.0, 1.0, 0.0),
+            1_000,
+            5_000,
+        )
+        .expect("standee on board must be carried");
+        assert!(
+            (carried - Vec3::new(101.0, 1.0, 0.0)).length() < 0.01,
+            "carried standee should follow the ship, got {carried:?}"
+        );
+
+        // A standee that was never on the ship stays where the replay says.
+        assert!(
+            replay_carried_standee_position(
+                &replay,
+                &ship_bounds,
+                Vec3::new(50.0, 1.0, 0.0),
+                1_000,
+                5_000,
+            )
+            .is_none()
+        );
     }
 
     #[test]
