@@ -883,9 +883,9 @@ impl Default for VoxelSpaceshipStore {
 }
 
 #[derive(Resource)]
-struct VoxelSpaceshipControlState {
+pub(crate) struct VoxelSpaceshipControlState {
     selected_ship_id: Option<String>,
-    driving_ship_id: Option<String>,
+    pub(crate) driving_ship_id: Option<String>,
     cockpit_eye: Option<Vec3>,
     cockpit_rotation: Quat,
     third_person_view: bool,
@@ -954,8 +954,8 @@ struct VoxelPhysicsBodySnapshot {
 }
 
 #[derive(Resource, Default)]
-struct VoxelToolGunDragState {
-    target: Option<Entity>,
+pub(crate) struct VoxelToolGunDragState {
+    pub(crate) target: Option<Entity>,
     distance: f32,
     body_offset: Vec3,
 }
@@ -7067,6 +7067,7 @@ fn persist_voxel_spaceships(
     time: Res<Time>,
     mut app_exit: MessageReader<AppExit>,
     mut persistence: ResMut<VoxelSpaceshipPersistenceState>,
+    studio: Res<crate::replay::ReplayStudio>,
     spaceships: Query<(
         &VoxelSpaceship,
         &Transform,
@@ -7076,6 +7077,11 @@ fn persist_voxel_spaceships(
     )>,
     mut store: ResMut<Persistent<VoxelSpaceshipStore>>,
 ) {
+    // While a replay is playing, ship transforms are driven by the recorded
+    // trajectories; saving them would overwrite the real session positions.
+    if crate::replay::replay_scene_dynamics_active(&studio) {
+        return;
+    }
     persistence.elapsed_seconds += time.delta_secs();
     let exiting = app_exit.read().next().is_some();
     if !exiting && persistence.elapsed_seconds < VOXEL_SPACESHIP_SAVE_SECONDS {

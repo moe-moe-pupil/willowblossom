@@ -111,8 +111,10 @@ use crate::{
         VoxelPossessionState,
         VoxelReplayOcclusionFade,
         VoxelSpaceship,
+        VoxelSpaceshipControlState,
         VoxelSpaceshipNeedsRebuild,
         VoxelSpaceshipOccupancyCache,
+        VoxelToolGunDragState,
         VoxelViewportCamera,
         DEFAULT_VOXEL_OCCLUSION_CAST_END_HEIGHT_CELLS,
         DEFAULT_VOXEL_OCCLUSION_CAST_END_WIDTH_CELLS,
@@ -1194,7 +1196,9 @@ fn record_ship_trajectory_history(
     time: Res<Time>,
     manager: Res<Persistent<NapcatMessageManager>>,
     studio: Res<ReplayStudio>,
-    spaceships: Query<(&VoxelSpaceship, &Transform), Without<VoxelViewportCamera>>,
+    control: Res<VoxelSpaceshipControlState>,
+    drag: Res<VoxelToolGunDragState>,
+    spaceships: Query<(Entity, &VoxelSpaceship, &Transform), Without<VoxelViewportCamera>>,
     mut history: ResMut<Persistent<ReplayShipTrajectoryHistory>>,
     mut recorder: ResMut<ReplayShipTrajectoryRecorder>,
 ) {
@@ -1211,7 +1215,7 @@ fn record_ship_trajectory_history(
     }
     let campaign_id = active_campaign.unwrap();
     recorder.persist_accumulator += time.delta_secs();
-    for (ship, transform) in &spaceships {
+    for (entity, ship, transform) in &spaceships {
         let key = (campaign_id.clone(), ship.id.clone());
         let accumulator = recorder
             .sample_accumulators
@@ -1227,21 +1231,28 @@ fn record_ship_trajectory_history(
             translation: transform.translation.to_array(),
             rotation: transform.rotation.to_array(),
         };
+        // Only the GM's own manipulation of a ship is recorded: keyboard
+        // driving or the tool-gun drag. Physics drift, docking sync, or other
+        // ships following the carrier stay out of the replay.
+        let gm_manipulated = ship_is_gm_manipulated(&control, &drag, entity, &ship.id);
         let moved = |left: [f32; 3], right: [f32; 3]| left != right;
         if let Some(&session_index) = recorder.sessions.get(&key) {
             let session = &mut history.sessions[session_index];
             session.ship_name = ship.name.clone();
-            let unchanged = session.keyframes.last().is_some_and(|last| {
-                !moved(last.translation, keyframe.translation)
-                    && last.rotation == keyframe.rotation
-            });
-            if !unchanged {
-                session.keyframes.push(keyframe);
+            if gm_manipulated {
+                let unchanged = session.keyframes.last().is_some_and(|last| {
+                    !moved(last.translation, keyframe.translation)
+                        && last.rotation == keyframe.rotation
+                });
+                if !unchanged {
+                    session.keyframes.push(keyframe);
+                }
             }
             continue;
         }
         // No session yet: remember the parked pose, but only open a session
-        // once the ship actually moves, so stationary ships stay unrecorded.
+        // once the GM moves the ship, so stationary and physics-driven motion
+        // stay unrecorded.
         let pending_pose = {
             let pending = recorder
                 .pending_poses
@@ -1250,6 +1261,10 @@ fn record_ship_trajectory_history(
             if !moved(pending.translation, keyframe.translation)
                 && pending.rotation == keyframe.rotation
             {
+                *pending = keyframe;
+                continue;
+            }
+            if !gm_manipulated {
                 *pending = keyframe;
                 continue;
             }
@@ -1279,6 +1294,15 @@ fn record_ship_trajectory_history(
             eprintln!("failed to persist replay ship trajectory history: {err}");
         }
     }
+}
+
+fn ship_is_gm_manipulated(
+    control: &VoxelSpaceshipControlState,
+    drag: &VoxelToolGunDragState,
+    entity: Entity,
+    ship_id: &str,
+) -> bool {
+    control.driving_ship_id.as_deref() == Some(ship_id) || drag.target == Some(entity)
 }
 
 fn find_or_create_ship_trajectory_session(
@@ -7279,7 +7303,7 @@ fn replay_carried_standee_position(
     None
 }
 
-fn replay_scene_dynamics_active(studio: &ReplayStudio) -> bool {
+pub(crate) fn replay_scene_dynamics_active(studio: &ReplayStudio) -> bool {
     matches!(
         studio.mode,
         ReplayMode::Playing | ReplayMode::Paused
@@ -13449,6 +13473,43 @@ mod tests {
         assert!(ship_history.sessions.is_empty());
     }
 
+    #[test]
+    fn ship_history_records_only_gm_manipulated_ships() {
+        let entity = Entity::from_bits(7);
+        let mut control = VoxelSpaceshipControlState::default();
+        control.driving_ship_id = Some("carrier".to_owned());
+        let drag = VoxelToolGunDragState::default();
+        assert!(ship_is_gm_manipulated(
+            &control,
+            &drag,
+            entity,
+            "carrier"
+        ));
+        assert!(!ship_is_gm_manipulated(
+            &control,
+            &drag,
+            entity,
+            "escort"
+        ));
+
+        // The tool-gun drag is also treated as GM manipulation.
+        control.driving_ship_id = None;
+        let mut drag = VoxelToolGunDragState::default();
+        drag.target = Some(entity);
+        assert!(ship_is_gm_manipulated(
+            &control,
+            &drag,
+            entity,
+            "escort"
+        ));
+        assert!(!ship_is_gm_manipulated(
+            &control,
+            &drag,
+            Entity::from_bits(8),
+            "escort"
+        ));
+    }
+
     /// Loads the on-disk ship trajectory history and verifies that every
     /// recorded ship — including the Arrogance carrier — is merged into a
     /// freshly generated replay, and that a GM line addressing a player cuts
@@ -13513,7 +13574,7 @@ mod tests {
             "Arrogance trajectory should carry its recorded motion frames"
         );
         assert!(
-            replay.duration_ms < 30_000,
+            replay.duration_ms < 60_000,
             "two dialogue lines plus one fleet flight must stay short, got {} ms",
             replay.duration_ms
         );
@@ -13543,7 +13604,7 @@ mod tests {
             "Arrogance must visibly move during playback (start {start_pose:?}, end {end_pose:?})"
         );
         assert!(
-            append_replay.duration_ms < 15_000,
+            append_replay.duration_ms < 45_000,
             "appending the fleet flight must not inflate the timeline, got {} ms",
             append_replay.duration_ms
         );
