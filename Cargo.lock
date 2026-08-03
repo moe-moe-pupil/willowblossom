@@ -9072,6 +9072,7 @@ name = "willowblossom"
 version = "0.0.1"
 dependencies = [
  "ab_glyph",
+ "arboard",
  "async-compat",
  "avian3d",
  "base64",

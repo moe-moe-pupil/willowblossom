@@ -78,3 +78,6 @@ curl = "0.4.47"
 bevy_voxel_world = "0.17.0"
 avian3d = "0.7.0"
 voxxelmaxx = { path = "crates/bevy_voxel" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+arboard = "3.4"

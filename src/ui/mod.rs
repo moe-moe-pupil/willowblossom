@@ -2576,7 +2576,11 @@ fn chat_body_ui(
             chat_input_msgs.insert(target_id.to_owned(), String::new());
         }
 
-        let input_height = ui.spacing().interact_size.y * 3.0 + ui.spacing().item_spacing.y * 2.0;
+        let attachment_height =
+            if ime.has_attachments(target_id) { CHAT_PASTE_PREVIEW_HEIGHT } else { 0.0 };
+        let input_height = ui.spacing().interact_size.y * 3.0
+            + ui.spacing().item_spacing.y * 2.0
+            + attachment_height;
         let available_height = desired_height.unwrap_or_else(|| ui.available_height());
         let message_height =
             (available_height - input_height - ui.spacing().item_spacing.y).max(0.0);
@@ -14172,9 +14176,15 @@ pub fn ui_system(
                     text.clear();
                 }
             }
+            ime.clear_attached_images(&completion.input_id);
         }
         for target in completion.successful_targets {
-            if append_local_sent_message(&mut manager, target, &completion.text) {
+            if append_local_sent_message_with_images(
+                &mut manager,
+                target,
+                &completion.text,
+                &completion.images,
+            ) {
                 sent_message_added = true;
             }
         }
@@ -15542,10 +15552,22 @@ fn targets_for_target(manager: &NapcatMessageManager, target_id: &str) -> Vec<Na
     }
 }
 
-fn append_local_sent_message(
+fn save_sent_image_cache(png_bytes: &[u8]) -> Option<String> {
+    let cache_dir = Path::new(".data").join("willowblossom").join("image_cache");
+    fs::create_dir_all(&cache_dir).ok()?;
+    let hash = blake3::hash(png_bytes).to_hex().to_string();
+    let path = cache_dir.join(format!("{hash}.png"));
+    if !path.exists() {
+        fs::write(&path, png_bytes).ok()?;
+    }
+    Some(path.to_string_lossy().to_string())
+}
+
+fn append_local_sent_message_with_images(
     manager: &mut NapcatMessageManager,
     target: NapcatSendTarget,
     text: &str,
+    images: &[ChatInputImage],
 ) -> bool {
     let (target_id, message_type, group_id, recipient_id) = match target {
         NapcatSendTarget::Private(user_id) => (
@@ -15578,18 +15600,42 @@ fn append_local_sent_message(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
+    let mut message_chains = Vec::new();
+    for image in images {
+        let Some(local_path) = save_sent_image_cache(&image.png_bytes) else {
+            continue;
+        };
+        message_chains.push(NapcatMessageChain {
+            variant: NapcatMessageChainType::Image {
+                data: ImageData {
+                    sub_type: 0,
+                    file: String::new(),
+                    url: String::new(),
+                    file_id: String::new(),
+                    file_size: image.png_bytes.len().to_string(),
+                    local_path,
+                },
+            },
+        });
+    }
+    if !text.trim().is_empty() {
+        message_chains.push(NapcatMessageChain {
+            variant: NapcatMessageChainType::Text {
+                data: TextData {
+                    text: text.to_owned(),
+                },
+            },
+        });
+    }
+    if message_chains.is_empty() {
+        return false;
+    }
     let mut message = NapcatMessage {
         data: NapcatMessageData {
             time,
             message_type,
             message_id: None,
-            message: vec![NapcatMessageChain {
-                variant: NapcatMessageChainType::Text {
-                    data: TextData {
-                        text: text.to_owned(),
-                    },
-                },
-            }],
+            message: message_chains,
             self_id,
             user_id: self_id,
             group_id,
@@ -16392,10 +16438,11 @@ mod tests {
     fn local_private_send_uses_noncurrent_target_campaign() {
         let mut manager = manager_with_noncurrent_beta_targets();
 
-        assert!(append_local_sent_message(
+        assert!(append_local_sent_message_with_images(
             &mut manager,
             NapcatSendTarget::Private(2),
             "private answer",
+            &[],
         ));
 
         let response = manager.messages["2"].last().unwrap();
@@ -16415,13 +16462,44 @@ mod tests {
     }
 
     #[test]
+    fn local_sent_image_message_caches_file_and_keeps_image_before_text() {
+        let mut manager = manager_with_noncurrent_beta_targets();
+        let image = ChatInputImage {
+            id: 1,
+            width: 2,
+            height: 2,
+            png_bytes: vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+        };
+
+        assert!(append_local_sent_message_with_images(
+            &mut manager,
+            NapcatSendTarget::Private(2),
+            "picture caption",
+            &[image],
+        ));
+
+        let response = manager.messages["2"].last().unwrap();
+        let chains = &response.data.message;
+        let NapcatMessageChainType::Image { data } = &chains[0].variant else {
+            panic!("first chain should be the image");
+        };
+        assert!(!data.local_path.is_empty());
+        assert!(Path::new(&data.local_path).exists());
+        let NapcatMessageChainType::Text { data } = &chains[1].variant else {
+            panic!("second chain should be the caption text");
+        };
+        assert_eq!(data.text, "picture caption");
+    }
+
+    #[test]
     fn local_group_send_uses_noncurrent_target_campaign() {
         let mut manager = manager_with_noncurrent_beta_targets();
 
-        assert!(append_local_sent_message(
+        assert!(append_local_sent_message_with_images(
             &mut manager,
             NapcatSendTarget::Group(99),
             "group answer",
+            &[],
         ));
 
         let response = manager.messages["99"].last().unwrap();
@@ -16486,10 +16564,11 @@ mod tests {
             ChatTargetExportKind::Private,
         );
 
-        assert!(append_local_sent_message(
+        assert!(append_local_sent_message_with_images(
             &mut manager,
             NapcatSendTarget::Private(2),
             "first message",
+            &[],
         ));
 
         let message = manager.messages["2"].first().unwrap();
@@ -16956,6 +17035,7 @@ mod tests {
         assert_eq!(sent, vec![ChatInputSendCompletion {
             input_id,
             text: "秘密提示".to_owned(),
+            images: Vec::new(),
             successful_targets: vec![
                 NapcatSendTarget::Private(10002),
                 NapcatSendTarget::Private(10003),
@@ -17034,6 +17114,7 @@ mod tests {
         assert_eq!(sent, vec![ChatInputSendCompletion {
             input_id,
             text: "红队提示".to_owned(),
+            images: Vec::new(),
             successful_targets: vec![
                 NapcatSendTarget::Private(10003),
                 NapcatSendTarget::Private(10002),
@@ -17694,6 +17775,7 @@ mod tests {
         assert_eq!(sent, vec![ChatInputSendCompletion {
             input_id: random_pool_checked_send_input_id("遭遇随机", 0),
             text: "你发现了线索".to_owned(),
+            images: Vec::new(),
             successful_targets: vec![NapcatSendTarget::Private(10002)],
             clear_input: true,
         }]);
