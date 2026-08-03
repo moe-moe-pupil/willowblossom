@@ -158,6 +158,10 @@ const DEFAULT_CAMERA_TRANSITION_CURVE: f32 = 2.0;
 const MIN_CAMERA_TRANSITION_CURVE: f32 = 1.0;
 const MAX_CAMERA_TRANSITION_CURVE: f32 = 4.0;
 const FOCUS_TRANSITION_MS: u64 = 900;
+/// Camera reposition that is still shown as a smooth dolly instead of a cut.
+/// Larger subject moves (the standee walked across the map) snap with a cut so
+/// the camera never glides through empty space away from the standee.
+const CAMERA_DOLLY_MAX_DISTANCE: f32 = 3.0;
 const PLAYER_MOVEMENT_SAMPLE_SECONDS: f32 = 0.1;
 const DEFAULT_PLAYER_MOVEMENT_CURVE: f32 = 0.75;
 const MIN_PLAYER_MOVEMENT_CURVE: f32 = 0.0;
@@ -692,6 +696,10 @@ struct PersistedShipKeyframe {
 struct ReplayShipTrajectoryRecorder {
     sessions: HashMap<(String, String), usize>,
     sample_accumulators: HashMap<(String, String), f32>,
+    /// Latest sampled pose for ships that have not moved yet. A session is
+    /// only opened once the pose changes, so parked ships never record a
+    /// trajectory.
+    pending_poses: HashMap<(String, String), PersistedShipKeyframe>,
     persist_accumulator: f32,
 }
 
@@ -1147,6 +1155,7 @@ fn record_ship_trajectory_history(
     if active_campaign.is_none() {
         recorder.sessions.clear();
         recorder.sample_accumulators.clear();
+        recorder.pending_poses.clear();
         return;
     }
     let campaign_id = active_campaign.unwrap();
@@ -1167,56 +1176,49 @@ fn record_ship_trajectory_history(
             translation: transform.translation.to_array(),
             rotation: transform.rotation.to_array(),
         };
-        let session_index = if let Some(&index) = recorder.sessions.get(&key) {
-            index
-        } else {
-            let found = history
-                .sessions
-                .iter()
-                .position(|session| {
-                    session.campaign_id == campaign_id && session.ship_id == ship.id
-                });
-            if let Some(index) = found {
-                recorder.sessions.insert(key, index);
-                index
-            } else {
-                if history.sessions.len() >= MAX_PERSISTED_SHIP_TRAJECTORY_SESSIONS {
-                    history.sessions.remove(0);
-                    recorder.sessions = history
-                        .sessions
-                        .iter()
-                        .enumerate()
-                        .map(|(index, session)| {
-                            ((session.campaign_id.clone(), session.ship_id.clone()), index)
-                        })
-                        .collect();
-                }
-                let world_turn = manager
-                    .current_group()
-                    .map(|group| group.world_turn)
-                    .unwrap_or_default();
-                history.sessions.push(PersistedShipTrajectorySession {
-                    campaign_id: campaign_id.clone(),
-                    ship_id: ship.id.clone(),
-                    ship_name: ship.name.clone(),
-                    turn_index: world_turn,
-                    start_after_source_time: latest_campaign_line_time(&manager, &campaign_id),
-                    start_delay_ms: 0,
-                    keyframes: Vec::new(),
-                });
-                let index = history.sessions.len() - 1;
-                recorder.sessions.insert(key, index);
-                index
+        let moved = |left: [f32; 3], right: [f32; 3]| left != right;
+        if let Some(&session_index) = recorder.sessions.get(&key) {
+            let session = &mut history.sessions[session_index];
+            session.ship_name = ship.name.clone();
+            let unchanged = session.keyframes.last().is_some_and(|last| {
+                !moved(last.translation, keyframe.translation)
+                    && last.rotation == keyframe.rotation
+            });
+            if !unchanged {
+                session.keyframes.push(keyframe);
             }
+            continue;
+        }
+        // No session yet: remember the parked pose, but only open a session
+        // once the ship actually moves, so stationary ships stay unrecorded.
+        let pending_pose = {
+            let pending = recorder
+                .pending_poses
+                .entry(key.clone())
+                .or_insert(keyframe);
+            if !moved(pending.translation, keyframe.translation)
+                && pending.rotation == keyframe.rotation
+            {
+                *pending = keyframe;
+                continue;
+            }
+            *pending
         };
+        let session_index = find_or_create_ship_trajectory_session(
+            &mut history,
+            &mut recorder,
+            &campaign_id,
+            ship,
+            &manager,
+        );
+        recorder.sessions.insert(key.clone(), session_index);
+        recorder.pending_poses.remove(&key);
         let session = &mut history.sessions[session_index];
         session.ship_name = ship.name.clone();
-        let unchanged = session.keyframes.last().is_some_and(|last| {
-            last.translation == keyframe.translation
-                && last.rotation == keyframe.rotation
-                && keyframe.source_unix_ms.saturating_sub(last.source_unix_ms) < 5_000
-        });
-        if !unchanged {
+        session.keyframes.push(pending_pose);
+        if moved(pending_pose.translation, keyframe.translation)
+            || pending_pose.rotation != keyframe.rotation
+        {
             session.keyframes.push(keyframe);
         }
     }
@@ -1226,6 +1228,45 @@ fn record_ship_trajectory_history(
             eprintln!("failed to persist replay ship trajectory history: {err}");
         }
     }
+}
+
+fn find_or_create_ship_trajectory_session(
+    history: &mut ReplayShipTrajectoryHistory,
+    recorder: &mut ReplayShipTrajectoryRecorder,
+    campaign_id: &str,
+    ship: &VoxelSpaceship,
+    manager: &Persistent<NapcatMessageManager>,
+) -> usize {
+    if let Some(index) = history.sessions.iter().position(|session| {
+        session.campaign_id == campaign_id && session.ship_id == ship.id
+    }) {
+        return index;
+    }
+    if history.sessions.len() >= MAX_PERSISTED_SHIP_TRAJECTORY_SESSIONS {
+        history.sessions.remove(0);
+        recorder.sessions = history
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(index, session)| {
+                ((session.campaign_id.clone(), session.ship_id.clone()), index)
+            })
+            .collect();
+    }
+    let world_turn = manager
+        .current_group()
+        .map(|group| group.world_turn)
+        .unwrap_or_default();
+    history.sessions.push(PersistedShipTrajectorySession {
+        campaign_id: campaign_id.to_owned(),
+        ship_id: ship.id.clone(),
+        ship_name: ship.name.clone(),
+        turn_index: world_turn,
+        start_after_source_time: latest_campaign_line_time(manager, campaign_id),
+        start_delay_ms: 0,
+        keyframes: Vec::new(),
+    });
+    history.sessions.len() - 1
 }
 
 fn latest_campaign_line_time(
@@ -7399,6 +7440,24 @@ fn replay_turns(replay: &ReplayFile) -> Vec<ReplayTurn> {
             },
         });
     }
+    // A ship movement anchored right after a turn's last line belongs to that
+    // round: extend the turn end past the trailing motion keyframes so the
+    // round-boundary pause happens after the ship visibly moves.
+    for index in 0..turns.len() {
+        let window_end = turns
+            .get(index + 1)
+            .map(|next| next.start_ms)
+            .unwrap_or(u64::MAX);
+        if let Some(trailing) = replay
+            .ship_trajectories
+            .iter()
+            .flat_map(|trajectory| trajectory.keyframes.iter().map(|frame| frame.time_ms))
+            .filter(|time_ms| *time_ms > turns[index].end_ms && *time_ms < window_end)
+            .max()
+        {
+            turns[index].end_ms = trailing;
+        }
+    }
     turns
 }
 
@@ -7733,6 +7792,7 @@ fn ship_motion_events(
         {
             frames.insert(0, previous);
         }
+        let mut runs = Vec::<Vec<PersistedShipKeyframe>>::new();
         let mut run = Vec::new();
         let mut previous_source = frames.first().map(|frame| frame.source_unix_ms).unwrap_or_default();
         for frame in frames {
@@ -7742,13 +7802,51 @@ fn ship_motion_events(
                     .saturating_sub(previous_source)
                     > MOTION_EVENT_GAP_MS
             {
-                events.push(make_ship_motion_event(session, std::mem::take(&mut run)));
+                runs.push(std::mem::take(&mut run));
             }
             run.push(frame);
             previous_source = frame.source_unix_ms;
         }
         if !run.is_empty() {
-            events.push(make_ship_motion_event(session, run));
+            runs.push(run);
+        }
+        // A run counts as motion when any of its poses differs from the pose
+        // the ship had before the run. A discrete reposition that arrives as a
+        // single new pose gets the previous pose prepended as its start frame.
+        let mut previous_pose: Option<([f32; 3], [f32; 4])> = None;
+        for run in &runs {
+            let moved = match previous_pose {
+                Some((translation, rotation)) => run.iter().any(|frame| {
+                    frame.translation != translation || frame.rotation != rotation
+                }),
+                None => run.first().is_some_and(|first| {
+                    run.iter().any(|frame| {
+                        frame.translation != first.translation
+                            || frame.rotation != first.rotation
+                    })
+                }),
+            };
+            if moved {
+                let mut frames = run.clone();
+                if let Some((translation, rotation)) = previous_pose {
+                    if let Some(first) = frames.first() {
+                        if first.translation != translation || first.rotation != rotation {
+                            frames.insert(
+                                0,
+                                PersistedShipKeyframe {
+                                    source_unix_ms: first.source_unix_ms.saturating_sub(1),
+                                    translation,
+                                    rotation,
+                                },
+                            );
+                        }
+                    }
+                }
+                events.push(make_ship_motion_event(session, frames));
+            }
+            if let Some(last) = run.last() {
+                previous_pose = Some((last.translation, last.rotation));
+            }
         }
     }
     events.sort_by_key(|event| event.start_source_ms);
@@ -8201,19 +8299,6 @@ fn rotate_replay_camera_yaw(
     previous_yaw_degrees
 }
 
-fn replay_dialogue_position(
-    line: &ReplayDialogue,
-    speaker_positions: &HashMap<u64, Vec3>,
-) -> Option<Vec3> {
-    let focus_id = line.camera_focus_id.unwrap_or(line.sender_id);
-    let current_position = speaker_positions.get(&focus_id).copied()?;
-    if line.camera_focus_id.is_none() && line.snapshot_recorded {
-        Some(IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE)
-    } else {
-        Some(current_position)
-    }
-}
-
 fn replay_dialogue_focus_id(
     dialogue: &[ReplayDialogue],
     index: usize,
@@ -8300,11 +8385,47 @@ fn replay_dialogue_focus_position(
     speaker_positions: &HashMap<u64, Vec3>,
 ) -> Option<Vec3> {
     let line = dialogue.get(index)?;
-    if let Some(position) = replay_dialogue_position(line, speaker_positions) {
-        return Some(position);
-    }
-    let focus_id = replay_dialogue_focus_id(dialogue, index, speaker_positions)?;
-    speaker_positions.get(&focus_id).copied()
+    let subject_id = line.camera_focus_id.unwrap_or(line.sender_id);
+    replay_standee_position_at(dialogue, subject_id, line.time_ms, speaker_positions).or_else(
+        || {
+            // A GM line without an addressed standee still frames the nearest
+            // speaker standee so the camera never drifts to the base view.
+            if line.side != DialogueSide::Left {
+                return None;
+            }
+            replay_dialogue_focus_id(dialogue, index, speaker_positions).and_then(|focus_id| {
+                replay_standee_position_at(
+                    dialogue,
+                    focus_id,
+                    line.time_ms,
+                    speaker_positions,
+                )
+            })
+        },
+    )
+}
+
+/// Where a standee will actually be during playback: the recorded position of
+/// the speaker's most recent snapshot line at or before `time_ms`, falling
+/// back to the standee's current scene position before any line has moved it.
+fn replay_standee_position_at(
+    dialogue: &[ReplayDialogue],
+    subject_id: u64,
+    time_ms: u64,
+    speaker_positions: &HashMap<u64, Vec3>,
+) -> Option<Vec3> {
+    dialogue
+        .iter()
+        .filter(|line| {
+            line.included
+                && line.snapshot_recorded
+                && line.time_ms <= time_ms
+                && line.sender_id == subject_id
+                && line.position_cells != [0; 3]
+        })
+        .last()
+        .map(|line| IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE)
+        .or_else(|| speaker_positions.get(&subject_id).copied())
 }
 
 fn turn_based_camera_track(
@@ -8352,7 +8473,13 @@ fn turn_based_camera_track(
             let transition_end = line
                 .time_ms
                 .saturating_add(line.duration_ms.min(FOCUS_TRANSITION_MS));
-            if focus == current_focus && camera_facing_is_unchanged(&current, &focused) {
+            if focus == current_focus
+                && camera_facing_is_unchanged(&current, &focused)
+                && current
+                    .translation
+                    .distance(focused.translation)
+                    <= CAMERA_DOLLY_MAX_DISTANCE
+            {
                 frames.push(camera_keyframe(line.time_ms, &current));
                 frames.push(camera_keyframe(
                     transition_end,
@@ -8455,7 +8582,13 @@ fn director_camera_track(
         let transition_end = line
             .time_ms
             .saturating_add(line.duration_ms.min(FOCUS_TRANSITION_MS));
-        if focus == current_focus && camera_facing_is_unchanged(&current, &arrival) {
+        if focus == current_focus
+            && camera_facing_is_unchanged(&current, &arrival)
+            && current
+                .translation
+                .distance(arrival.translation)
+                <= CAMERA_DOLLY_MAX_DISTANCE
+        {
             frames.push(camera_keyframe(line.time_ms, &current));
             frames.push(camera_keyframe(
                 transition_end,
@@ -8579,10 +8712,16 @@ struct DirectedCameraRig {
     distance_scale: f32,
     yaw_degrees: f32,
     subject_count: usize,
+    group_spread: f32,
 }
 
 impl DirectedCameraRig {
     const LINE_MARGIN: f32 = 0.25;
+    /// Maximum horizontal distance between composition subjects that still
+    /// uses the group-center framing for 3+ players. Beyond this, the group
+    /// cannot fit in one shot, so each line frames the actual speaker instead
+    /// of a midpoint that may be far away from everyone.
+    const GROUP_SPREAD_LIMIT: f32 = 16.0;
 
     fn for_dialogue(
         base: &Transform,
@@ -8623,6 +8762,14 @@ impl DirectedCameraRig {
         let composition_origin = (!composition_subjects.is_empty()).then(|| {
             composition_subjects.iter().copied().sum::<Vec3>() / composition_subjects.len() as f32
         });
+        let group_spread = composition_subjects
+            .iter()
+            .flat_map(|first| {
+                composition_subjects.iter().map(move |second| {
+                    horizontal(*first - *second).length()
+                })
+            })
+            .fold(0.0_f32, f32::max);
         let (axis_origin, mut camera_side) = match (first, second) {
             (Some(first), Some(second)) => {
                 let axis = horizontal(second - first)
@@ -8659,6 +8806,7 @@ impl DirectedCameraRig {
             distance_scale: normalized_directed_camera_distance_scale(distance_scale),
             yaw_degrees: normalized_directed_camera_yaw_degrees(yaw_degrees),
             subject_count: composition_subjects.len(),
+            group_spread,
         }
     }
 
@@ -8682,7 +8830,13 @@ impl DirectedCameraRig {
             DirectorShot::SpeakerWide => 2.1,
             DirectorShot::Establishing | DirectorShot::Environment => 3.2,
         } * self.distance_scale;
-        let camera_anchor = if self.subject_count >= 3 { self.axis_origin } else { target };
+        let camera_anchor = if self.subject_count >= 3
+            && self.group_spread <= Self::GROUP_SPREAD_LIMIT
+        {
+            self.axis_origin
+        } else {
+            target
+        };
         let static_position = self.visible_position(
             camera_anchor,
             base_distance,
@@ -12493,7 +12647,7 @@ mod tests {
                         rotation: Quat::IDENTITY.to_array(),
                     },
                     PersistedShipKeyframe {
-                        source_unix_ms: 101_000,
+                        source_unix_ms: 100_100,
                         translation: [1.0, 0.0, 0.0],
                         rotation: Quat::IDENTITY.to_array(),
                     },
@@ -12510,8 +12664,99 @@ mod tests {
 
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].start_source_ms, 100_000);
-        assert_eq!(events[0].end_source_ms, 101_000);
-        assert_eq!(events[1].start_source_ms, 110_000);
+        assert_eq!(events[0].end_source_ms, 100_100);
+        assert_eq!(events[1].start_source_ms, 109_999);
+        assert_eq!(events[1].end_source_ms, 110_000);
+    }
+
+    #[test]
+    fn stationary_ship_records_no_motion_events() {
+        let history = ReplayShipTrajectoryHistory {
+            sessions: vec![PersistedShipTrajectorySession {
+                campaign_id: "campaign".to_owned(),
+                ship_id: "ship-1".to_owned(),
+                ship_name: "测试舰".to_owned(),
+                turn_index: 1,
+                start_after_source_time: Some(100),
+                start_delay_ms: 0,
+                keyframes: vec![
+                    PersistedShipKeyframe {
+                        source_unix_ms: 100_000,
+                        translation: [1.0, 2.0, 3.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                    PersistedShipKeyframe {
+                        source_unix_ms: 105_000,
+                        translation: [1.0, 2.0, 3.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                    PersistedShipKeyframe {
+                        source_unix_ms: 110_000,
+                        translation: [1.0, 2.0, 3.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                ],
+            }],
+        };
+
+        assert!(ship_motion_events(&history, "campaign", 0).is_empty());
+    }
+
+    #[test]
+    fn movement_after_last_dialogue_line_stays_visible_in_the_turn() {
+        let mut lines = vec![
+            positioned_dialogue(1, 1, 100, [0, 0, 0]),
+            positioned_dialogue(2, 1, 200, [0, 0, 0]),
+        ];
+        assign_replay_line_ids(&mut lines);
+        let mut replay = test_replay(lines);
+        auto_group_replay_areas(&mut replay);
+        rebuild_area_blocks(&mut replay);
+        let history = ReplayShipTrajectoryHistory {
+            sessions: vec![PersistedShipTrajectorySession {
+                campaign_id: "campaign".to_owned(),
+                ship_id: "ship-1".to_owned(),
+                ship_name: "测试舰".to_owned(),
+                turn_index: 1,
+                start_after_source_time: Some(200),
+                start_delay_ms: 0,
+                keyframes: vec![
+                    PersistedShipKeyframe {
+                        source_unix_ms: 260_000,
+                        translation: [0.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                    PersistedShipKeyframe {
+                        source_unix_ms: 260_100,
+                        translation: [8.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                ],
+            }],
+        };
+
+        compile_scene_dynamics_timeline(&mut replay, &history, 0, &[], &[]);
+
+        let trajectory = replay
+            .ship_trajectories
+            .iter()
+            .find(|trajectory| trajectory.ship_id == "ship-1")
+            .expect("ship trajectory");
+        let last_line = replay
+            .dialogue
+            .iter()
+            .max_by_key(|line| line.time_ms)
+            .expect("dialogue line");
+        assert!(
+            trajectory.keyframes.last().unwrap().time_ms
+                > last_line.time_ms.saturating_add(last_line.duration_ms)
+        );
+        let turns = replay_turns(&replay);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].end_ms
+                >= trajectory.keyframes.last().unwrap().time_ms
+        );
     }
 
     #[test]
@@ -12539,7 +12784,7 @@ mod tests {
                         rotation: Quat::IDENTITY.to_array(),
                     },
                     PersistedShipKeyframe {
-                        source_unix_ms: 160_000,
+                        source_unix_ms: 150_100,
                         translation: [10.0, 0.0, 0.0],
                         rotation: Quat::IDENTITY.to_array(),
                     },
@@ -12597,14 +12842,14 @@ mod tests {
                         rotation: Quat::IDENTITY.to_array(),
                     },
                     PersistedShipKeyframe {
-                        source_unix_ms: 160_000,
+                        source_unix_ms: 150_100,
                         translation: [10.0, 0.0, 0.0],
                         rotation: Quat::IDENTITY.to_array(),
                     },
                 ],
             }],
         };
-        let pending_terrain = vec![(155_000_u64, IVec3::new(3, 0, 0), 5_u8)];
+        let pending_terrain = vec![(150_050_u64, IVec3::new(3, 0, 0), 5_u8)];
 
         compile_scene_dynamics_timeline(
             &mut replay,
@@ -12645,5 +12890,242 @@ mod tests {
         );
         assert_eq!(history.sessions.len(), 1);
         assert_eq!(history.sessions[0].campaign_id, "campaign-b");
+    }
+
+    #[test]
+    fn real_gm_player_exchange_camera_focuses_the_standee() {
+        // Reproduce the on-disk session: one GM line addressing player
+        // 1670426821 and one line from that player, with the snapshot
+        // positions persisted in messages.toml and the standee at the
+        // position persisted in voxel_player_cameras.toml.
+        let mut gm = test_dialogue(350, 2_400, DialogueSide::Left);
+        gm.sender_id = 0;
+        gm.camera_focus_id = Some(1_670_426_821);
+        gm.snapshot_recorded = true;
+        gm.metadata_estimated = false;
+        gm.position_cells = [-366, 60, 1_375];
+        let mut player = test_dialogue(3_020, 2_400, DialogueSide::Right);
+        player.sender_id = 1_670_426_821;
+        player.snapshot_recorded = true;
+        player.metadata_estimated = false;
+        player.position_cells = [-415, 43, -722];
+        let dialogue = [gm, player];
+        let standee_position = Vec3::new(-122.419_174, -21.016_474, 41.071_274);
+        let speaker_positions =
+            HashMap::from([(1_670_426_821, standee_position)]);
+        let base = Transform::from_xyz(29.004_196, 24.248_276, 221.935);
+
+        let camera = turn_based_camera_track(
+            &base,
+            &dialogue,
+            8_000,
+            &speaker_positions,
+            default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
+            &ReplayCameraObstacles::default(),
+        );
+
+        assert!(!camera.is_empty());
+        let mut anchor = standee_position;
+        for frame in &camera {
+            if let Some(line) = dialogue
+                .iter()
+                .filter(|line| {
+                    line.included
+                        && line.snapshot_recorded
+                        && line.time_ms <= frame.time_ms
+                        && line.sender_id == 1_670_426_821
+                        && line.position_cells != [0; 3]
+                })
+                .last()
+            {
+                anchor = IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE;
+            }
+            eprintln!(
+                "frame t={} pos={:?} anchor={:?}",
+                frame.time_ms, frame.translation, anchor
+            );
+            let distance = horizontal(Vec3::from_array(frame.translation) - anchor).length();
+            assert!(
+                distance < 20.0,
+                "camera frame at {:?} is {distance:.1} units from the standee anchor",
+                frame.translation
+            );
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PlayerCameraStore {
+        cameras: Vec<PlayerCamera>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PlayerCamera {
+        user_id: u64,
+        translation: [f32; 3],
+        #[allow(dead_code)]
+        rotation: [f32; 4],
+    }
+
+    /// Loads the on-disk session (messages + replay snapshots + standee camera
+    /// store) and generates the camera track exactly like "从现有聊天生成",
+    /// then verifies the camera never drifts hundreds of units from the
+    /// standees. Skipped when the local session data is absent.
+    #[test]
+    fn real_chat_generation_camera_stays_near_the_standees() {
+        let manager_path = std::path::Path::new(".data/willowblossom/messages.toml");
+        let camera_path = std::path::Path::new(".data/willowblossom/voxel_player_cameras.toml");
+        if !manager_path.is_file() || !camera_path.is_file() {
+            return;
+        }
+        let manager_text = std::fs::read_to_string(manager_path).expect("read messages.toml");
+        let manager: NapcatMessageManager = toml::from_str(&manager_text).expect("parse messages.toml");
+        let camera_text = std::fs::read_to_string(camera_path).expect("read player cameras");
+        let cameras: PlayerCameraStore =
+            toml::from_str(&camera_text).expect("parse player cameras");
+        let speaker_positions = cameras
+            .cameras
+            .iter()
+            .map(|camera| (camera.user_id, Vec3::from_array(camera.translation)))
+            .collect::<HashMap<_, _>>();
+
+        let campaign_id = manager
+            .active_campaign_id()
+            .unwrap_or_else(|| "default".to_owned());
+        let mut visible = manager
+            .messages
+            .iter()
+            .flat_map(|(target, messages)| {
+                messages.iter().enumerate().map(|(index, message)| {
+                    (
+                        manager.campaign_message_for_target(target, message),
+                        manager
+                            .replay_snapshots
+                            .get(target)
+                            .and_then(|snapshots| snapshots.get(index))
+                            .and_then(Option::as_ref)
+                            .copied(),
+                    )
+                })
+            })
+            .filter(|(message, _)| message.campaign_id == campaign_id)
+            .filter(|(message, _)| !message.text.trim().is_empty())
+            .collect::<Vec<_>>();
+        visible.sort_by_key(|(message, _)| message.time);
+
+        let mut replay = test_replay(Vec::new());
+        let mut timeline_ms = 350_u64;
+        for (message, snapshot) in &visible {
+            let estimated;
+            let (snapshot, metadata_estimated) = if let Some(snapshot) = snapshot.as_ref() {
+                (snapshot, false)
+            } else {
+                estimated = estimated_replay_snapshot(message, &manager, &speaker_positions);
+                (&estimated, true)
+            };
+            if let Some(line) = dialogue_from_message(
+                message,
+                &manager,
+                timeline_ms,
+                snapshot,
+                metadata_estimated,
+            ) {
+                timeline_ms = line
+                    .time_ms
+                    .saturating_add(line.duration_ms)
+                    .saturating_add(HISTORY_DIALOGUE_GAP_MS);
+                replay.dialogue.push(line);
+            }
+        }
+        deduplicate_broadcast_dialogue(&mut replay.dialogue, &manager);
+        assign_replay_line_ids(&mut replay.dialogue);
+        auto_group_replay_areas(&mut replay);
+        rebuild_area_blocks(&mut replay);
+        compile_scene_dynamics_timeline(
+            &mut replay,
+            &ReplayShipTrajectoryHistory::default(),
+            0,
+            &[],
+            &[],
+        );
+        let base = Transform::from_xyz(29.004_196, 24.248_276, 221.935);
+        let scene_replay_path = std::path::Path::new(
+            ".data/willowblossom/replays/latest.willow-replay.json",
+        );
+        let scene = if scene_replay_path.is_file() {
+            let legacy: ReplayFile = serde_json::from_str(
+                &std::fs::read_to_string(scene_replay_path).expect("read legacy replay"),
+            )
+            .expect("parse legacy replay");
+            legacy.scene
+        } else {
+            ReplayScene::default()
+        };
+        replay.scene = scene;
+        let obstacles = ReplayCameraObstacles::from_scene(&replay.scene);
+        let camera = turn_based_camera_track(
+            &base,
+            &replay.dialogue,
+            replay.duration_ms,
+            &speaker_positions,
+            default_directed_camera_distance_scale(),
+            default_directed_camera_yaw_degrees(),
+            &obstacles,
+        );
+
+        assert!(
+            !camera.is_empty(),
+            "camera track is empty for {} dialogue lines",
+            replay.dialogue.len()
+        );
+        for (index, line) in replay.dialogue.iter().enumerate() {
+            eprintln!(
+                "dialogue[{index}] sender={} focus_id={:?} pos={:?} t={}..{}",
+                line.sender_id,
+                line.camera_focus_id,
+                line.position_cells,
+                line.time_ms,
+                line.time_ms + line.duration_ms
+            );
+        }
+        let mut standee_anchor =
+            HashMap::<u64, Vec3>::new();
+        for frame in &camera {
+            eprintln!(
+                "camera t={} pos={:?}",
+                frame.time_ms, frame.translation
+            );
+            for line in replay
+                .dialogue
+                .iter()
+                .filter(|line| {
+                    line.included
+                        && line.snapshot_recorded
+                        && line.time_ms <= frame.time_ms
+                        && line.position_cells != [0; 3]
+                })
+            {
+                standee_anchor.insert(
+                    line.sender_id,
+                    IVec3::from_array(line.position_cells).as_vec3() * VOXEL_SIZE,
+                );
+            }
+            let position = Vec3::from_array(frame.translation);
+            let nearest = speaker_positions
+                .iter()
+                .map(|(user_id, standee)| {
+                    let anchor = standee_anchor
+                        .get(user_id)
+                        .copied()
+                        .unwrap_or(*standee);
+                    horizontal(position - anchor).length()
+                })
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                nearest < 25.0,
+                "camera frame at {:?} is {nearest:.1} units from every standee",
+                frame.translation
+            );
+        }
     }
 }

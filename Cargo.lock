@@ -9102,6 +9102,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "toml",
  "tungstenite",
  "url",
  "voxxelmaxx",
