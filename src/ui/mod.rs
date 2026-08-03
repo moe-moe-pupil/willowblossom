@@ -16362,6 +16362,8 @@ mod tests {
             skill_pool: Vec::new(),
             item_pool: Vec::new(),
             unit_pool: HashMap::default(),
+            pending_talent_choices: HashMap::default(),
+            used_talent_names: HashSet::default(),
         }
     }
 

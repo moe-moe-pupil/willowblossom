@@ -3135,6 +3135,17 @@ pub struct NapcatMessageManager {
     pub item_pool: Vec<InventoryItem>,
     #[serde(default)]
     pub unit_pool: HashMap<String, UnitPoolEntry>,
+    #[serde(default)]
+    pub pending_talent_choices: HashMap<String, PendingTalentChoice>,
+    #[serde(default)]
+    pub used_talent_names: HashSet<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct PendingTalentChoice {
+    pub label: String,
+    pub pool_id: String,
+    pub options: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -6240,6 +6251,8 @@ fn setup(mut commands: Commands) {
         skill_pool: Vec::new(),
         item_pool: Vec::new(),
         unit_pool: HashMap::default(),
+        pending_talent_choices: HashMap::default(),
+        used_talent_names: HashSet::default(),
     };
     let message_manager = Persistent::<NapcatMessageManager>::builder()
         .name("messages")
@@ -7577,7 +7590,7 @@ fn handle_character_creation_message(
             character.creation_step = CharacterCreationStep::Normal;
             update_character_from_status_with_config(character, &stat_config);
             Some(format!(
-                "是吗？「{}」真是个好名字呢，我十分期待您以后的表现。\n——兑换结束——",
+                "是吗？「{}」真是个好名字呢，我十分期待您以后的表现。\n——兑换结束——\n现在可以发送【.抽取天赋】或【.抽取辅助天赋】（命令前缀可混用半角.或全角。）抽取天赋（三选一）；辅助天赋提供15%额外经验获取。",
                 character.nickname
             ))
         },
@@ -7593,6 +7606,9 @@ fn handle_private_player_command(
     text: &str,
     message_time: u64,
 ) -> Option<String> {
+    if let Some(response) = handle_pending_talent_choice(manager, target_id, text) {
+        return Some(response);
+    }
     if let Some((status_key, points)) = parse_post_creation_status_spend(text) {
         let stat_config = manager.character_stat_config_for_target(target_id);
         let Some(character) = manager.player_characters.get_mut(target_id) else {
@@ -7615,14 +7631,14 @@ fn handle_private_player_command(
     }
     match command {
         "属性说明" => Some(format_private_attribute_help()),
-        "抽取天赋" => Some(draw_character_talent(
+        "抽取天赋" => Some(begin_talent_choice(
             manager,
             target_id,
             "天赋",
             NORMAL_TALENT_POOL,
             message_time,
         )),
-        "抽取辅助天赋" => Some(draw_character_talent(
+        "抽取辅助天赋" => Some(begin_talent_choice(
             manager,
             target_id,
             "辅助天赋",
@@ -7666,8 +7682,8 @@ fn format_private_help() -> String {
         "【.频道人员】查看当前可见频道成员",
         "【.指南】查看当前TRPG组指南",
         "【.观察】或【.gc】请求玩家观察画面；【.观察视频】或【.gc2】请求360度观察视频",
-        "【.抽取天赋】抽取普通天赋",
-        "【.抽取辅助天赋】抽取辅助天赋",
+        "【.抽取天赋】抽取普通天赋（三选一）",
+        "【.抽取辅助天赋】抽取辅助天赋（三选一，经验获取+15%）",
         "【.<属性> <点数>】为已完成角色投入属性点，例如 .力量 1 或 。agi 2",
         "建卡过程中：【.】下一步，【..】上一步；属性阶段直接发送数字。",
     ]
@@ -7716,12 +7732,136 @@ fn format_private_weave(manager: &NapcatMessageManager, target_id: &str) -> Stri
     lines.join("\n")
 }
 
-fn draw_character_talent(
+fn begin_talent_choice(
     manager: &mut NapcatMessageManager,
     target_id: &str,
     label: &str,
     pool: &[MoonberryTalent],
     message_time: u64,
+) -> String {
+    let has_character = manager.player_characters.contains_key(target_id);
+    if !has_character {
+        return "你还没有角色卡。输入【.兑换】开始建卡。".to_owned();
+    }
+    if !manager.player_characters[target_id].inited {
+        return "角色卡尚未完成。请先完成建卡流程。".to_owned();
+    }
+    if pool.is_empty() {
+        return format!("{label}池为空，请联系GM配置。");
+    }
+    if character_has_talent(manager, target_id) {
+        return "你已经抽过了！".to_owned();
+    }
+
+    let pool_id = talent_pool_id(label);
+    let granted_names = manager
+        .player_characters
+        .values()
+        .flat_map(character_granted_talent_names)
+        .collect::<HashSet<_>>();
+    let available = pool
+        .iter()
+        .filter(|talent| !manager.used_talent_names.contains(talent.name))
+        .filter(|talent| !granted_names.contains(talent.name))
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        return format!("{label}池中的天赋已被全部抽走，请联系GM重置天赋池。");
+    }
+
+    let count = available.len().min(3);
+    let chosen = stable_talent_option_indices(
+        target_id,
+        label,
+        message_time,
+        available.len(),
+        count,
+    )
+    .into_iter()
+    .map(|index| available[index])
+    .collect::<Vec<_>>();
+
+    manager.pending_talent_choices.insert(
+        target_id.to_owned(),
+        PendingTalentChoice {
+            label: label.to_owned(),
+            pool_id,
+            options: chosen
+                .iter()
+                .map(|talent| talent.name.to_owned())
+                .collect(),
+        },
+    );
+    for talent in &chosen {
+        manager.used_talent_names.insert(talent.name.to_owned());
+    }
+
+    let header = if count == 3 {
+        format!("抽取{label}·三选一")
+    } else {
+        format!("抽取{label}（天赋池仅剩{count}个可选）")
+    };
+    let choice_hint = if count == 1 {
+        "请回复 1 选择这项天赋；未选中的天赋也不会回到天赋池。".to_owned()
+    } else {
+        format!("请回复1~{}选择一项；未选中的天赋也不会回到天赋池。", count)
+    };
+    let mut lines = vec![header, choice_hint];
+    for (index, talent) in chosen.iter().enumerate() {
+        lines.push(format!("{}. {}", index + 1, talent_note(talent)));
+    }
+    lines.join("\n")
+}
+
+fn handle_pending_talent_choice(
+    manager: &mut NapcatMessageManager,
+    target_id: &str,
+    text: &str,
+) -> Option<String> {
+    if !manager.pending_talent_choices.contains_key(target_id) {
+        return None;
+    }
+    let Ok(choice) = text.trim().parse::<usize>() else {
+        return None;
+    };
+    let pending = manager.pending_talent_choices.remove(target_id)?;
+    if choice == 0 || choice > pending.options.len() {
+        let hint = if pending.options.len() == 1 {
+            format!("请回复 1 选择{}。", pending.label)
+        } else {
+            format!(
+                "请输入1~{}之间的数字选择{}。",
+                pending.options.len(),
+                pending.label
+            )
+        };
+        manager
+            .pending_talent_choices
+            .insert(target_id.to_owned(), pending);
+        return Some(hint);
+    }
+
+    let pool = match pending.pool_id.as_str() {
+        "normal_talent" => NORMAL_TALENT_POOL,
+        "support_talent" => SUPPORT_TALENT_POOL,
+        _ => return Some("天赋数据异常，请重新抽取。".to_owned()),
+    };
+    let option_name = pending.options[choice - 1].as_str();
+    let Some(talent) = pool.iter().find(|talent| talent.name == option_name) else {
+        return Some("该天赋已不在当前天赋池中，请重新抽取。".to_owned());
+    };
+    Some(grant_character_talent(
+        manager,
+        target_id,
+        &pending.label,
+        talent,
+    ))
+}
+
+fn grant_character_talent(
+    manager: &mut NapcatMessageManager,
+    target_id: &str,
+    label: &str,
+    talent: &MoonberryTalent,
 ) -> String {
     let stat_config = manager.character_stat_config_for_target(target_id);
     let Some(character) = manager.player_characters.get_mut(target_id) else {
@@ -7729,9 +7869,6 @@ fn draw_character_talent(
     };
     if !character.inited {
         return "角色卡尚未完成。请先完成建卡流程。".to_owned();
-    }
-    if pool.is_empty() {
-        return format!("{label}池为空，请联系GM配置。");
     }
     if character
         .skill_metadata
@@ -7741,12 +7878,7 @@ fn draw_character_talent(
         return "你已经抽过了！".to_owned();
     }
 
-    let talent = &pool[stable_talent_index(
-        target_id,
-        label,
-        message_time,
-        pool.len(),
-    )];
+    manager.used_talent_names.insert(talent.name.to_owned());
     let talent_note = talent_note(talent);
     character.skill_names.push(talent.name.to_owned());
     character.skill_notes.push(talent_note.clone());
@@ -7766,6 +7898,29 @@ fn draw_character_talent(
         response.push_str(&applied_effect);
     }
     response
+}
+
+fn character_has_talent(manager: &NapcatMessageManager, target_id: &str) -> bool {
+    manager
+        .player_characters
+        .get(target_id)
+        .map(|character| {
+            character
+                .skill_metadata
+                .iter()
+                .any(|metadata| metadata.source == CharacterSkillSourceKind::Talent)
+        })
+        .unwrap_or(false)
+}
+
+fn character_granted_talent_names(character: &PlayerCharacter) -> HashSet<&str> {
+    character
+        .skill_metadata
+        .iter()
+        .enumerate()
+        .filter(|(_, metadata)| metadata.source == CharacterSkillSourceKind::Talent)
+        .filter_map(|(index, _)| character.skill_names.get(index).map(String::as_str))
+        .collect()
 }
 
 fn talent_note(talent: &MoonberryTalent) -> String {
@@ -7964,6 +8119,34 @@ fn stable_talent_index(target_id: &str, label: &str, message_time: u64, len: usi
     label.hash(&mut hasher);
     message_time.hash(&mut hasher);
     (hasher.finish() as usize) % len
+}
+
+fn stable_talent_option_indices(
+    target_id: &str,
+    label: &str,
+    message_time: u64,
+    len: usize,
+    count: usize,
+) -> Vec<usize> {
+    let mut indices = Vec::with_capacity(count);
+    let mut salt = 0u64;
+    while indices.len() < count {
+        let index = if salt == 0 {
+            stable_talent_index(target_id, label, message_time, len)
+        } else {
+            let mut hasher = DefaultHasher::new();
+            target_id.hash(&mut hasher);
+            label.hash(&mut hasher);
+            message_time.hash(&mut hasher);
+            salt.hash(&mut hasher);
+            (hasher.finish() as usize) % len
+        };
+        if !indices.contains(&index) {
+            indices.push(index);
+        }
+        salt += 1;
+    }
+    indices
 }
 
 fn private_command_body(text: &str) -> Option<&str> {
@@ -9799,6 +9982,8 @@ mod tests {
             skill_pool: Vec::new(),
             item_pool: Vec::new(),
             unit_pool: HashMap::default(),
+            pending_talent_choices: HashMap::default(),
+            used_talent_names: HashSet::default(),
         }
     }
 
@@ -13176,6 +13361,23 @@ position_cells = [4, 5, 6]
             "2",
         )
         .unwrap();
+        assert!(normal_response.contains("抽取天赋"));
+        assert!(normal_response.contains("三选一"));
+        assert!(normal_response.contains("1."));
+        assert!(normal_response.contains("2."));
+        assert!(normal_response.contains("3."));
+        assert!(manager.pending_talent_choices.contains_key("2"));
+        assert!(manager.player_characters["2"].skill_names.is_empty());
+
+        let choice_response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "2"),
+            "2",
+        )
+        .unwrap();
+        assert!(choice_response.contains("已加入已兑换技能。"));
+        assert!(!manager.pending_talent_choices.contains_key("2"));
+
         let support_response = handle_character_creation_message(
             &mut manager,
             &test_message_with_text(
@@ -13185,11 +13387,9 @@ position_cells = [4, 5, 6]
             "2",
         )
         .unwrap();
-        let character = manager.player_characters.get("2").unwrap();
-
-        assert!(normal_response.contains("抽取天赋"));
-        assert!(normal_response.contains("已加入已兑换技能。"));
         assert!(support_response.contains("你已经抽过了"));
+
+        let character = manager.player_characters.get("2").unwrap();
         assert_eq!(character.skill_names.len(), 1);
         assert!(NORMAL_TALENT_POOL
             .iter()
@@ -13298,7 +13498,16 @@ position_cells = [4, 5, 6]
         let mut message = test_message_with_text(NapcatMessageType::Private, ".抽取天赋");
         message.data.time = message_time;
 
-        let response = handle_character_creation_message(&mut manager, &message, "2").unwrap();
+        let offer = handle_character_creation_message(&mut manager, &message, "2").unwrap();
+        assert!(offer.contains("那美克星之慧"));
+        assert!(manager.player_characters["2"].skill_names.is_empty());
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "1"),
+            "2",
+        )
+        .unwrap();
         let character = manager.player_characters.get("2").unwrap();
 
         assert!(response.contains("知识额外值 +2"));
@@ -13324,7 +13533,7 @@ position_cells = [4, 5, 6]
             completed_character("晨星"),
         );
 
-        let response = handle_character_creation_message(
+        let offer = handle_character_creation_message(
             &mut manager,
             &test_message_with_text(
                 NapcatMessageType::Private,
@@ -13333,9 +13542,16 @@ position_cells = [4, 5, 6]
             "2",
         )
         .unwrap();
+        assert!(offer.contains("抽取辅助天赋"));
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "1"),
+            "2",
+        )
+        .unwrap();
         let character = manager.player_characters.get("2").unwrap();
 
-        assert!(response.contains("抽取辅助天赋"));
+        assert!(response.contains("已加入已兑换技能。"));
         assert_eq!(character.skill_names.len(), 1);
         assert!(SUPPORT_TALENT_POOL
             .iter()
@@ -13347,6 +13563,124 @@ position_cells = [4, 5, 6]
             character.skill_metadata[0].source_pool_id.as_deref(),
             Some("support_talent")
         );
+    }
+
+    #[test]
+    fn private_talent_draw_removes_all_three_options_from_global_pool() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "2".to_owned(),
+            completed_character("晨星"),
+        );
+        manager.player_characters.insert(
+            "3".to_owned(),
+            completed_character("白露"),
+        );
+
+        let first_offer = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".抽取天赋"),
+            "2",
+        )
+        .unwrap();
+        let first_options = manager.pending_talent_choices["2"].options.clone();
+        assert_eq!(first_options.len(), 3);
+        assert!(first_offer.contains("三选一"));
+
+        let picked = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "2"),
+            "2",
+        )
+        .unwrap();
+        assert!(picked.contains("已加入已兑换技能。"));
+        assert!(!manager.pending_talent_choices.contains_key("2"));
+        for name in &first_options {
+            assert!(
+                manager.used_talent_names.contains(name),
+                "{name} should stay removed even if unchosen"
+            );
+        }
+
+        let second_offer = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".抽取天赋"),
+            "3",
+        )
+        .unwrap();
+        let second_options = manager.pending_talent_choices["3"].options.clone();
+        assert_eq!(second_options.len(), 3);
+        assert!(second_offer.contains("三选一"));
+        for name in &second_options {
+            assert!(
+                !first_options.contains(name),
+                "{name} must not repeat across players"
+            );
+        }
+    }
+
+    #[test]
+    fn private_talent_pending_choice_only_accepts_pure_numbers() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "2".to_owned(),
+            completed_character("晨星"),
+        );
+
+        handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".抽取天赋"),
+            "2",
+        )
+        .unwrap();
+        assert!(manager.pending_talent_choices.contains_key("2"));
+
+        let non_number = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "abc"),
+            "2",
+        );
+        assert!(non_number.is_none());
+        assert!(manager.pending_talent_choices.contains_key("2"));
+
+        let out_of_range = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "4"),
+            "2",
+        )
+        .unwrap();
+        assert!(out_of_range.contains("1~3"));
+        assert!(manager.pending_talent_choices.contains_key("2"));
+
+        let picked = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "1"),
+            "2",
+        )
+        .unwrap();
+        assert!(picked.contains("已加入已兑换技能。"));
+        assert!(!manager.pending_talent_choices.contains_key("2"));
+    }
+
+    #[test]
+    fn private_talent_draw_reports_exhausted_pool() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "2".to_owned(),
+            completed_character("晨星"),
+        );
+        manager.used_talent_names = NORMAL_TALENT_POOL
+            .iter()
+            .map(|talent| talent.name.to_owned())
+            .collect();
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".抽取天赋"),
+            "2",
+        )
+        .unwrap();
+        assert!(response.contains("已被全部抽走"));
     }
 
     #[test]
@@ -14861,6 +15195,49 @@ position_cells = [4, 5, 6]
             CharacterCreationStep::Normal
         );
         assert_eq!(character.max_hp, 15.0);
+    }
+
+    #[test]
+    fn private_exchange_completion_reminds_talent_draw_and_support_bonus() {
+        let mut manager = empty_manager();
+        let target_id = "2";
+
+        handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            target_id,
+        )
+        .unwrap();
+        for value in ["2", "1", "1", "1"] {
+            handle_character_creation_message(
+                &mut manager,
+                &test_message_with_text(NapcatMessageType::Private, value),
+                target_id,
+            );
+        }
+        for value in [".", "."] {
+            handle_character_creation_message(
+                &mut manager,
+                &test_message_with_text(NapcatMessageType::Private, value),
+                target_id,
+            );
+        }
+        handle_character_creation_message(
+            &mut manager,
+            &test_private_image("https://example.test/pc.png"),
+            target_id,
+        );
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, "柳生"),
+            target_id,
+        )
+        .unwrap();
+        assert!(response.contains("兑换结束"));
+        assert!(response.contains(".抽取天赋"));
+        assert!(response.contains(".抽取辅助天赋"));
+        assert!(response.contains("15%"));
     }
 
     #[test]
