@@ -1430,6 +1430,7 @@ struct VoxelAutoDoor {
     trigger_radius: f32,
     trigger_half_height: f32,
     width_axis: IVec3,
+    slide_axis: IVec3,
     material: u8,
     closed_translation: Vec3,
     open_translation: Vec3,
@@ -4997,6 +4998,7 @@ fn make_voxel_auto_door(
         trigger_radius,
         trigger_half_height: (height as f32 * VOXEL_SIZE * 0.65).max(VOXEL_SIZE * 3.0),
         width_axis,
+        slide_axis: width_axis,
         material: 10,
         closed_translation,
         open_translation: closed_translation,
@@ -5077,17 +5079,18 @@ fn voxel_auto_door_panels(door: &VoxelAutoDoor) -> [VoxelAutoDoor; 2] {
         .collect::<Vec<_>>();
     let make_panel = |cells: Vec<IVec3>, direction: f32| {
         let (closed_translation, size) = voxel_door_transform_and_size(&cells);
-        let panel_width = size.dot(axis.as_vec3().abs());
+        let panel_width = size.dot(door.slide_axis.as_vec3().abs());
         VoxelAutoDoor {
             cells,
             trigger_center: door.trigger_center,
             trigger_radius: door.trigger_radius,
             trigger_half_height: door.trigger_half_height,
             width_axis: axis,
+            slide_axis: door.slide_axis,
             material: door.material,
             closed_translation,
             open_translation: closed_translation
-                + axis.as_vec3() * direction * (panel_width + VOXEL_SIZE * 0.5),
+                + door.slide_axis.as_vec3() * direction * (panel_width + VOXEL_SIZE * 0.5),
             open: false,
             locked: door.locked,
         }
@@ -5389,6 +5392,75 @@ fn combat_spaceship_cab_door() -> VoxelAutoDoor {
         ARROGANCE_CAB_DOOR_HEIGHT,
         2.5,
     )
+}
+
+fn combat_spaceship_corridor_auto_doors() -> Vec<VoxelAutoDoor> {
+    // Every workbook corridor doorway on the enlarged carrier is a wall
+    // spanning the full corridor cross-section. Reuse the workbook door cells
+    // to detect that cross-section (the sheet door run is one cell thick in x
+    // and spans the corridor width in z), then scale it up and fill the whole
+    // interior height so the closed door seals the passage.
+    let corridor_top = WORKBOOK_ROOM_HEIGHT * ARROGANCE_SCALE - 1;
+    let mut doors = Vec::new();
+    for workbook_door in workbook_auto_doors(IVec3::ZERO, ARROGANCE) {
+        let unscaled_min = workbook_door
+            .cells
+            .iter()
+            .copied()
+            .reduce(IVec3::min)
+            .expect("workbook corridor doors are never empty");
+        let unscaled_max = workbook_door
+            .cells
+            .iter()
+            .copied()
+            .reduce(IVec3::max)
+            .expect("workbook corridor doors are never empty");
+        let min = scale_combat_spaceship_cell(unscaled_min);
+        let max = scale_combat_spaceship_cell(unscaled_max) + IVec3::splat(ARROGANCE_SCALE - 1);
+        let mut cells = Vec::with_capacity(
+            ((max.x - min.x + 1) * (max.z - min.z + 1) * (corridor_top - ARROGANCE_SCALE + 1))
+                as usize,
+        );
+        for x in min.x..=max.x {
+            for z in min.z..=max.z {
+                for y in ARROGANCE_SCALE..=corridor_top {
+                    cells.push(IVec3::new(x, y, z));
+                }
+            }
+        }
+
+        // The cab interior and the hangar carve the workbook hull, so only the
+        // corridor doorways that keep their surrounding wall survive.
+        if cells.iter().any(|cell| {
+            combat_spaceship_cab_interior_contains(*cell)
+                || combat_spaceship_hangar_contains(*cell)
+        }) {
+            continue;
+        }
+
+        let trigger_center =
+            (min.as_vec3() + (max - min + IVec3::ONE).as_vec3() * 0.5) * VOXEL_SIZE;
+        let (closed_translation, _) = voxel_door_transform_and_size(&cells);
+        let height = (corridor_top - ARROGANCE_SCALE + 1) as f32;
+        doors.push(VoxelAutoDoor {
+            cells,
+            trigger_center,
+            trigger_radius: 3.0,
+            trigger_half_height: (height * VOXEL_SIZE * 0.65).max(VOXEL_SIZE * 3.0),
+            width_axis: workbook_door.width_axis,
+            // The corridor is exactly as wide as the doorway, and the hull wall
+            // behind it is only a few cells thick, so a sideways slide would
+            // poke through the outer hull. Slide along the corridor axis into
+            // the open passage instead; both sides stay inside the ship.
+            slide_axis: IVec3::X,
+            material: 10,
+            closed_translation,
+            open_translation: closed_translation,
+            open: false,
+            locked: false,
+        });
+    }
+    doors
 }
 
 fn combat_spaceship_cab_doorway_contains(cell: IVec3) -> bool {
@@ -6376,6 +6448,22 @@ fn spawn_voxel_spaceship(
                         Collider::cuboid(size.x, size.y, size.z),
                         panel,
                     ));
+                }
+                for door in combat_spaceship_corridor_auto_doors() {
+                    for panel in voxel_auto_door_panels(&door) {
+                        let size = voxel_auto_door_panel_size(&panel);
+                        let translation = panel.closed_translation;
+                        parent.spawn((
+                            Name::new("Arrogance corridor automatic door"),
+                            Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+                            MeshMaterial3d(
+                                materials.handles[panel.material as usize - 1].clone(),
+                            ),
+                            Transform::from_translation(translation),
+                            Collider::cuboid(size.x, size.y, size.z),
+                            panel,
+                        ));
+                    }
                 }
             }
         })

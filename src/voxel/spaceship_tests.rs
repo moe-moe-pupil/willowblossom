@@ -358,6 +358,139 @@ fn arrogance_auto_door_trigger_follows_the_moving_ship() {
 }
 
 #[test]
+fn arrogance_corridor_auto_doors_fill_surviving_corridors_and_slide_inside() {
+    let carrier = combat_spaceship_voxel_cells()
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    let carrier_solid = carrier
+        .iter()
+        .filter_map(|(cell, material)| TrpgVoxelConnector::solid(material).then_some(*cell))
+        .collect::<HashSet<_>>();
+    let doors = combat_spaceship_corridor_auto_doors();
+
+    // The workbook has six corridor doorways; the two that fall inside the
+    // fitted cab and the carved hangar lose their surrounding wall, so only
+    // four automatic doors remain on the enlarged carrier.
+    assert_eq!(doors.len(), 4);
+    let door_min_x = doors
+        .iter()
+        .map(|door| {
+            door.cells
+                .iter()
+                .copied()
+                .reduce(IVec3::min)
+                .unwrap()
+                .x
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(door_min_x, vec![-216, -138, 120, 174]);
+
+    for door in &doors {
+        let min = door.cells.iter().copied().reduce(IVec3::min).unwrap();
+        let max = door.cells.iter().copied().reduce(IVec3::max).unwrap();
+        // The door fills the corridor cross-section: the three-cell-thick wall
+        // column, the full corridor width (seven sheet cells scaled by three),
+        // and the whole interior height between the floor and the ceiling.
+        assert_eq!(max.x - min.x + 1, ARROGANCE_SCALE);
+        assert_eq!(max.z - min.z + 1, 7 * ARROGANCE_SCALE);
+        assert_eq!(min.y, ARROGANCE_SCALE);
+        assert_eq!(max.y, WORKBOOK_ROOM_HEIGHT * ARROGANCE_SCALE - 1);
+        assert!(
+            door.cells.iter().all(|cell| !carrier_solid.contains(cell)),
+            "corridor door aperture is blocked at {min:?}..{max:?}"
+        );
+        assert!(voxel_auto_door_should_open(
+            door,
+            door.trigger_center
+        ));
+
+        let panels = voxel_auto_door_panels(door);
+        assert!(panels.iter().all(|panel| {
+            panel.open_translation != panel.closed_translation
+                && (panel.open_translation.y - panel.closed_translation.y).abs()
+                    < f32::EPSILON
+                && panel.trigger_center == door.trigger_center
+        }));
+        let left_delta = panels[0].open_translation - panels[0].closed_translation;
+        let right_delta = panels[1].open_translation - panels[1].closed_translation;
+        assert!(left_delta.dot(door.width_axis.as_vec3()).abs() < f32::EPSILON);
+        assert!(right_delta.dot(door.width_axis.as_vec3()).abs() < f32::EPSILON);
+        assert!(left_delta.dot(door.slide_axis.as_vec3()) < 0.0);
+        assert!(right_delta.dot(door.slide_axis.as_vec3()) > 0.0);
+
+        // The panels split across the corridor width and slide along the
+        // corridor axis. Every swept position up to a four-cell offset must
+        // stay inside open air so an opened door never pokes through the hull.
+        for panel in &panels {
+            let delta = panel.open_translation - panel.closed_translation;
+            let direction = if delta.x < 0.0 { -1 } else { 1 };
+            let panel_min = panel.cells.iter().copied().reduce(IVec3::min).unwrap();
+            let panel_max = panel.cells.iter().copied().reduce(IVec3::max).unwrap();
+            for offset in 1..=4 {
+                let shift = direction * offset;
+                for x in panel_min.x..=panel_max.x {
+                    for y in panel_min.y..=panel_max.y {
+                        for z in panel_min.z..=panel_max.z {
+                            let swept = IVec3::new(x + shift, y, z);
+                            assert!(
+                                !carrier_solid.contains(&swept),
+                                "open corridor door clips the hull at {swept:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn arrogance_spawns_bridge_and_corridor_auto_doors() {
+    #[derive(Resource, Default)]
+    struct TestShipHandle(Option<Entity>);
+
+    fn spawn_ship(
+        mut commands: Commands,
+        mut meshes: ResMut<Assets<Mesh>>,
+        materials: Res<VoxelMaterials>,
+        mut handle: ResMut<TestShipHandle>,
+        mut spawned: Local<bool>,
+    ) {
+        if *spawned {
+            return;
+        }
+        *spawned = true;
+        let spec = default_voxel_spaceship_specs().remove(0);
+        handle.0 = Some(spawn_voxel_spaceship(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            &spec,
+            Transform::IDENTITY,
+            LinearVelocity::ZERO,
+            AngularVelocity::ZERO,
+            None,
+        ));
+    }
+
+    let mut app = App::new();
+    app.init_resource::<Assets<Mesh>>()
+        .insert_resource(VoxelMaterials {
+            handles: std::array::from_fn(|_| Handle::default()),
+            planet_ocean: Handle::default(),
+        })
+        .init_resource::<TestShipHandle>()
+        .add_systems(Update, spawn_ship);
+    app.update();
+
+    // One bridge door and four corridor doors, each split into two panels.
+    let mut doors = app
+        .world_mut()
+        .query_filtered::<Entity, With<VoxelAutoDoor>>();
+    assert_eq!(doors.iter(app.world()).count(), 10);
+}
+
+#[test]
 fn enlarged_arrogance_preserves_its_shape_and_holds_the_fleet_inside() {
     let original = original_combat_spaceship_voxel_cells();
     let scaled_original = scale_combat_spaceship_cells(&original);
