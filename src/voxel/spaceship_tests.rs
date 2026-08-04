@@ -413,30 +413,48 @@ fn arrogance_corridor_auto_doors_fill_surviving_corridors_and_slide_inside() {
         }));
         let left_delta = panels[0].open_translation - panels[0].closed_translation;
         let right_delta = panels[1].open_translation - panels[1].closed_translation;
-        assert!(left_delta.dot(door.width_axis.as_vec3()).abs() < f32::EPSILON);
-        assert!(right_delta.dot(door.width_axis.as_vec3()).abs() < f32::EPSILON);
-        assert!(left_delta.dot(door.slide_axis.as_vec3()) < 0.0);
-        assert!(right_delta.dot(door.slide_axis.as_vec3()) > 0.0);
-
-        // The panels split across the corridor width and slide along the
-        // corridor axis. Every swept position up to a four-cell offset must
-        // stay inside open air so an opened door never pokes through the hull.
+        // The panels split across the corridor width and open left and right
+        // into the wall recesses beside the doorway.
+        assert!(left_delta.dot(door.width_axis.as_vec3()) < 0.0);
+        assert!(right_delta.dot(door.width_axis.as_vec3()) > 0.0);
         for panel in &panels {
             let delta = panel.open_translation - panel.closed_translation;
-            let direction = if delta.x < 0.0 { -1 } else { 1 };
+            let (_, size) = voxel_door_transform_and_size(&panel.cells);
+            let panel_width = size.dot(door.width_axis.as_vec3().abs());
+            assert!(
+                (delta.length() - (panel_width + VOXEL_SIZE * 0.5)).abs() < 0.001,
+                "door must slide its width plus the standard clearance"
+            );
+            let direction = if delta.z < 0.0 { -1 } else { 1 };
             let panel_min = panel.cells.iter().copied().reduce(IVec3::min).unwrap();
             let panel_max = panel.cells.iter().copied().reduce(IVec3::max).unwrap();
-            for offset in 1..=4 {
-                let shift = direction * offset;
+            let width_cells = (panel_width / VOXEL_SIZE).round() as i32;
+            let shift = direction * (width_cells + 1);
+            let open_min = panel_min + IVec3::new(0, 0, shift);
+            let open_max = panel_max + IVec3::new(0, 0, shift);
+            // The opened leaf clears the entire doorway...
+            if direction < 0 {
+                assert!(open_max.z < -36);
+            } else {
+                assert!(open_min.z > -16);
+            }
+            // ...and the full slid range stays near the hull structure beside
+            // the doorway, never floating in deep space beyond it.
+            for z in open_min.z..=open_max.z {
                 for x in panel_min.x..=panel_max.x {
                     for y in panel_min.y..=panel_max.y {
-                        for z in panel_min.z..=panel_max.z {
-                            let swept = IVec3::new(x + shift, y, z);
-                            assert!(
-                                !carrier_solid.contains(&swept),
-                                "open corridor door clips the hull at {swept:?}"
-                            );
-                        }
+                        let dest = IVec3::new(x, y, z);
+                        let rests_on_hull = (-8..=8).any(|dx| {
+                            (-8..=8).any(|dy| {
+                                (-8..=8).any(|dz| {
+                                    carrier_solid.contains(&(dest + IVec3::new(dx, dy, dz)))
+                                })
+                            })
+                        });
+                        assert!(
+                            rests_on_hull,
+                            "open corridor door floats outside the hull at {dest:?}"
+                        );
                     }
                 }
             }

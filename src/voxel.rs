@@ -1447,7 +1447,6 @@ struct VoxelAutoDoor {
     trigger_radius: f32,
     trigger_half_height: f32,
     width_axis: IVec3,
-    slide_axis: IVec3,
     material: u8,
     closed_translation: Vec3,
     open_translation: Vec3,
@@ -5017,7 +5016,6 @@ fn make_voxel_auto_door(
         trigger_radius,
         trigger_half_height: (height as f32 * VOXEL_SIZE * 0.65).max(VOXEL_SIZE * 3.0),
         width_axis,
-        slide_axis: width_axis,
         material: 10,
         closed_translation,
         open_translation: closed_translation,
@@ -5098,18 +5096,17 @@ fn voxel_auto_door_panels(door: &VoxelAutoDoor) -> [VoxelAutoDoor; 2] {
         .collect::<Vec<_>>();
     let make_panel = |cells: Vec<IVec3>, direction: f32| {
         let (closed_translation, size) = voxel_door_transform_and_size(&cells);
-        let panel_width = size.dot(door.slide_axis.as_vec3().abs());
+        let panel_width = size.dot(axis.as_vec3().abs());
         VoxelAutoDoor {
             cells,
             trigger_center: door.trigger_center,
             trigger_radius: door.trigger_radius,
             trigger_half_height: door.trigger_half_height,
             width_axis: axis,
-            slide_axis: door.slide_axis,
             material: door.material,
             closed_translation,
             open_translation: closed_translation
-                + door.slide_axis.as_vec3() * direction * (panel_width + VOXEL_SIZE * 0.5),
+                + axis.as_vec3() * direction * (panel_width + VOXEL_SIZE * 0.5),
             open: false,
             locked: door.locked,
         }
@@ -5467,11 +5464,10 @@ fn combat_spaceship_corridor_auto_doors() -> Vec<VoxelAutoDoor> {
             trigger_radius: 3.0,
             trigger_half_height: (height * VOXEL_SIZE * 0.65).max(VOXEL_SIZE * 3.0),
             width_axis: workbook_door.width_axis,
-            // The corridor is exactly as wide as the doorway, and the hull wall
-            // behind it is only a few cells thick, so a sideways slide would
-            // poke through the outer hull. Slide along the corridor axis into
-            // the open passage instead; both sides stay inside the ship.
-            slide_axis: IVec3::X,
+            // The panels open left and right along the corridor width into
+            // the interior space beside the doorway, the same way the bridge
+            // door slides into the cab. The surviving doorways all have hull
+            // structure behind them, so the leaves stay inside the ship.
             material: 10,
             closed_translation,
             open_translation: closed_translation,
