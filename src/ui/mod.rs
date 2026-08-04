@@ -724,6 +724,7 @@ use crate::{
         filter_control_characters,
     },
     napcat::{
+        campaign_weave_state,
         character_chaos_output_variance,
         character_damage_attribute_multiplier,
         character_damage_dealt_talent_buffs,
@@ -1061,11 +1062,148 @@ pub struct UiSystemLocals<'w, 's> {
     >,
 }
 
-#[derive(Default)]
 struct VoxelMapUiState {
     full_map_open: bool,
     context_cell: Option<IVec3>,
     context_player: Option<u64>,
+    zoom: f32,
+    view_center: Vec2,
+    anonymized_players: HashSet<u64>,
+    show_weave: bool,
+}
+
+impl Default for VoxelMapUiState {
+    fn default() -> Self {
+        Self {
+            full_map_open: false,
+            context_cell: None,
+            context_player: None,
+            zoom: 1.0,
+            view_center: Vec2::splat(0.5),
+            anonymized_players: HashSet::new(),
+            show_weave: false,
+        }
+    }
+}
+
+const VOXEL_MAP_MAX_ZOOM: f32 = 16.0;
+const VOXEL_MAP_SCROLL_ZOOM_FACTOR: f32 = 1.25;
+
+/// Clamp the lower-left corner of a zoomed map view so the view window stays
+/// inside the normalized world fraction range `[0, 1]` on both axes.
+fn clamp_map_view_min(mut min: Vec2, span: f32) -> Vec2 {
+    if span >= 1.0 {
+        return Vec2::ZERO;
+    }
+    min.x = min.x.clamp(0.0, 1.0 - span);
+    min.y = min.y.clamp(0.0, 1.0 - span);
+    min
+}
+
+/// The world-fraction rectangle (`min`, `max`) covered by the map canvas.
+/// `zoom == 1.0` shows the whole world; higher zooms show a centered window.
+fn map_view_window(zoom: f32, center: Vec2) -> (Vec2, Vec2) {
+    let span = (1.0 / zoom).min(1.0);
+    if span >= 1.0 {
+        return (Vec2::ZERO, Vec2::ONE);
+    }
+    let min = clamp_map_view_min(center - Vec2::splat(span * 0.5), span);
+    (min, min + Vec2::splat(span))
+}
+
+/// Screen direction (egui y-down) for a compass direction on the top-down map.
+/// The map renders world +Z (北) toward the top and +X (东) toward the right.
+fn weave_direction_screen_vector(direction: &str) -> Vec2 {
+    let (dx, dy) = match direction {
+        "北方" => (0.0, -1.0),
+        "东北方" => (1.0, -1.0),
+        "东方" => (1.0, 0.0),
+        "东南方" => (1.0, 1.0),
+        "南方" => (0.0, 1.0),
+        "西南方" => (-1.0, 1.0),
+        "西方" => (-1.0, 0.0),
+        "西北方" => (-1.0, -1.0),
+        _ => (0.0, -1.0),
+    };
+    Vec2::new(dx, dy).normalized()
+}
+
+fn draw_weave_overlay(painter: &Painter, rect: Rect, manager: &NapcatMessageManager) {
+    let campaign_id = manager
+        .active_campaign_id()
+        .unwrap_or_else(|| "default".to_owned());
+    let weave = campaign_weave_state(&campaign_id);
+    let center = rect.center();
+    let concentration = f32::from(weave.magic_damage_bonus_percent) / 5.0;
+
+    // Faint lattice spokes along every compass direction.
+    for index in 0..8 {
+        let radians = -std::f32::consts::FRAC_PI_2
+            + index as f32 * std::f32::consts::FRAC_PI_4;
+        let direction = egui::vec2(radians.cos(), -radians.sin());
+        let radius = rect.width().min(rect.height()) * 0.48;
+        painter.line_segment(
+            [
+                center,
+                center + direction * radius,
+            ],
+            Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(120, 90, 255, 24),
+            ),
+        );
+    }
+
+    let strongest = weave_direction_screen_vector(weave.strongest_direction);
+    let arrow_length =
+        rect.width().min(rect.height()) * (0.20 + 0.16 * concentration);
+    let arrow_end = center + strongest * arrow_length;
+    let arrow_color = egui::Color32::from_rgb(178, 138, 255);
+    painter.line_segment(
+        [center, arrow_end],
+        Stroke::new(3.0, arrow_color),
+    );
+    let perpendicular = egui::vec2(-strongest.y, strongest.x);
+    let head_back = arrow_end - strongest * 12.0;
+    painter.line_segment(
+        [arrow_end, head_back + perpendicular * 7.0],
+        Stroke::new(3.0, arrow_color),
+    );
+    painter.line_segment(
+        [arrow_end, head_back - perpendicular * 7.0],
+        Stroke::new(3.0, arrow_color),
+    );
+    painter.circle_filled(center, 4.0, arrow_color);
+    let ring_radius =
+        rect.width().min(rect.height()) * (0.18 + 0.22 * concentration);
+    painter.circle_stroke(
+        center,
+        ring_radius,
+        Stroke::new(
+            1.5,
+            egui::Color32::from_rgba_unmultiplied(178, 138, 255, 110),
+        ),
+    );
+
+    painter.text(
+        center + egui::vec2(0.0, 26.0),
+        egui::Align2::CENTER_CENTER,
+        format!("最强魔网节点：{}", weave.strongest_direction),
+        egui::FontId::proportional(14.0),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        center + egui::vec2(0.0, 48.0),
+        egui::Align2::CENTER_CENTER,
+        format!(
+            "法力浓度 {}% · 法术伤害+{}% · 魔法回复+{}%",
+            weave.magic_damage_bonus_percent,
+            weave.magic_damage_bonus_percent,
+            weave.mp_regen_bonus_percent,
+        ),
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_white_alpha(200),
+    );
 }
 
 fn voxel_map_material_color(material: u8) -> egui::Color32 {
@@ -1084,6 +1222,7 @@ fn voxel_map_ui(
     manager: &NapcatMessageManager,
     state: &mut VoxelMapUiState,
     editor: &mut VoxelEditorState,
+    zoomable: bool,
 ) {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter_at(rect);
@@ -1098,7 +1237,7 @@ fn voxel_map_ui(
         Stroke::new(1.0, egui::Color32::from_gray(90)),
         egui::StrokeKind::Inside,
     );
-    if snapshot.is_empty() {
+    if snapshot.is_empty() && !state.show_weave {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -1109,65 +1248,123 @@ fn voxel_map_ui(
         return;
     }
 
+    let effective_zoom = if zoomable { state.zoom } else { 1.0 };
+    let (view_min, view_max) = map_view_window(effective_zoom, state.view_center);
+    let view_span = (view_max - view_min).max(Vec2::splat(1e-4));
+    let world_to_screen = |fraction: Vec2| -> Pos2 {
+        let sx = (fraction.x - view_min.x) / view_span.x;
+        let sy = (fraction.y - view_min.y) / view_span.y;
+        egui::pos2(
+            egui::lerp(rect.x_range(), sx),
+            egui::lerp(rect.y_range(), 1.0 - sy),
+        )
+    };
+    let screen_to_world = |point: Pos2| -> Vec2 {
+        let sx = (point.x - rect.left()) / rect.width();
+        let sy = 1.0 - (point.y - rect.top()) / rect.height();
+        Vec2::new(
+            view_min.x + sx * view_span.x,
+            view_min.y + sy * view_span.y,
+        )
+    };
+
     let resolution = snapshot.resolution.max(1);
-    let tile_size = rect.size() / resolution as f32;
-    for z in 0..resolution {
-        for x in 0..resolution {
-            let Some(tile) = snapshot.tile(x, z) else {
-                continue;
-            };
-            let screen_z = resolution - 1 - z;
-            let tile_min = rect.min
-                + egui::vec2(
-                    x as f32 * tile_size.x,
-                    screen_z as f32 * tile_size.y,
+    if state.show_weave {
+        draw_weave_overlay(&painter, rect, manager);
+    } else {
+        for z in 0..resolution {
+            for x in 0..resolution {
+                let Some(tile) = snapshot.tile(x, z) else {
+                    continue;
+                };
+                let fraction_min = Vec2::new(
+                    x as f32 / resolution as f32,
+                    z as f32 / resolution as f32,
                 );
-            let density = (tile.voxel_count as f32).ln_1p().min(6.0) / 6.0;
-            let color =
-                voxel_map_material_color(tile.material).gamma_multiply(0.55 + density * 0.45);
-            painter.rect_filled(
-                Rect::from_min_size(
-                    tile_min,
-                    tile_size + egui::vec2(0.5, 0.5),
-                ),
-                0,
-                color,
+                let fraction_max = Vec2::new(
+                    (x + 1) as f32 / resolution as f32,
+                    (z + 1) as f32 / resolution as f32,
+                );
+                if fraction_max.x < view_min.x
+                    || fraction_min.x > view_max.x
+                    || fraction_max.y < view_min.y
+                    || fraction_min.y > view_max.y
+                {
+                    continue;
+                }
+                let density = (tile.voxel_count as f32).ln_1p().min(6.0) / 6.0;
+                let color = voxel_map_material_color(tile.material)
+                    .gamma_multiply(0.55 + density * 0.45);
+                painter.rect_filled(
+                    Rect::from_two_pos(
+                        world_to_screen(fraction_min),
+                        world_to_screen(fraction_max),
+                    )
+                    .expand(0.5),
+                    0,
+                    color,
+                );
+            }
+        }
+        for step in 1..4 {
+            let fraction = step as f32 / 4.0;
+            let x = world_to_screen(Vec2::new(
+                egui::lerp(view_min.x..=view_max.x, fraction),
+                0.0,
+            ))
+            .x;
+            let y = world_to_screen(Vec2::new(
+                0.0,
+                egui::lerp(view_min.y..=view_max.y, fraction),
+            ))
+            .y;
+            let grid_stroke = Stroke::new(0.5, egui::Color32::from_white_alpha(35));
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                grid_stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                grid_stroke,
             );
         }
     }
-    for step in 1..4 {
-        let fraction = step as f32 / 4.0;
-        let x = egui::lerp(rect.x_range(), fraction);
-        let y = egui::lerp(rect.y_range(), fraction);
-        let grid_stroke = Stroke::new(0.5, egui::Color32::from_white_alpha(35));
-        painter.line_segment(
-            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            grid_stroke,
-        );
-        painter.line_segment(
-            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            grid_stroke,
-        );
-    }
 
     let mut player_points = Vec::new();
+    let is_full_view = effective_zoom <= 1.0;
     if let Some(scene_positions) = scene_positions {
         for (target_id, world_position) in &scene_positions.positions {
             let fraction = snapshot.world_fraction(*world_position);
             let on_map = fraction.cmpge(bevy::prelude::Vec2::ZERO).all()
                 && fraction.cmple(bevy::prelude::Vec2::ONE).all();
-            let clamped = fraction.clamp(
-                bevy::prelude::Vec2::ZERO,
-                bevy::prelude::Vec2::ONE,
-            );
-            let point = egui::pos2(
-                egui::lerp(rect.x_range(), clamped.x),
-                egui::lerp(rect.y_range(), 1.0 - clamped.y),
-            );
+            let point = if is_full_view {
+                let clamped = fraction.clamp(
+                    bevy::prelude::Vec2::ZERO,
+                    bevy::prelude::Vec2::ONE,
+                );
+                world_to_screen(Vec2::new(clamped.x, clamped.y))
+            } else {
+                if fraction.x < view_min.x
+                    || fraction.x > view_max.x
+                    || fraction.y < view_min.y
+                    || fraction.y > view_max.y
+                {
+                    continue;
+                }
+                world_to_screen(Vec2::new(fraction.x, fraction.y))
+            };
             let user_id = target_id.parse::<u64>().ok();
-            let name = target_display_name(manager, target_id);
+            let anonymized =
+                user_id.is_some_and(|id| state.anonymized_players.contains(&id));
+            let name = if anonymized {
+                "匿名玩家".to_owned()
+            } else {
+                target_display_name(manager, target_id)
+            };
             player_points.push((user_id, name.clone(), point));
-            let marker_color = if on_map {
+            let marker_color = if anonymized {
+                egui::Color32::from_rgb(150, 150, 150)
+            } else if on_map {
                 egui::Color32::from_rgb(255, 214, 64)
             } else {
                 egui::Color32::from_rgb(255, 126, 48)
@@ -1190,13 +1387,50 @@ fn voxel_map_ui(
         }
     }
 
+    // North marker makes the top-down orientation explicit: +Z (北) is up.
+    let north_anchor = egui::pos2(rect.right() - 18.0, rect.top() + 12.0);
+    painter.text(
+        north_anchor,
+        egui::Align2::CENTER_CENTER,
+        "N",
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_white_alpha(140),
+    );
+    painter.line_segment(
+        [
+            north_anchor + egui::vec2(0.0, 6.0),
+            north_anchor + egui::vec2(0.0, 1.0),
+        ],
+        Stroke::new(1.5, egui::Color32::from_white_alpha(140)),
+    );
+
+    if zoomable && response.hovered() {
+        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+        if scroll != 0.0 {
+            let new_zoom = (state.zoom
+                * VOXEL_MAP_SCROLL_ZOOM_FACTOR.powf(scroll / 120.0))
+                .clamp(1.0, VOXEL_MAP_MAX_ZOOM);
+            if (new_zoom - state.zoom).abs() > f32::EPSILON {
+                if let Some(pointer) = response.hover_pos() {
+                    let anchor = screen_to_world(pointer);
+                    let span = 1.0 / new_zoom;
+                    let sx = (pointer.x - rect.left()) / rect.width();
+                    let sy = 1.0 - (pointer.y - rect.top()) / rect.height();
+                    let min = clamp_map_view_min(anchor - Vec2::new(sx, sy) * span, span);
+                    state.zoom = new_zoom;
+                    state.view_center = min + Vec2::splat(span * 0.5);
+                }
+            }
+        }
+    }
+
     if response.secondary_clicked() {
         if let Some(pointer) = response.interact_pointer_pos() {
-            let fraction = bevy::prelude::Vec2::new(
-                ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
-                (1.0 - (pointer.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
-            );
-            let (x, z) = snapshot.tile_indices(fraction);
+            let fraction = screen_to_world(pointer);
+            let (x, z) = snapshot.tile_indices(bevy::prelude::Vec2::new(
+                fraction.x,
+                fraction.y,
+            ));
             state.context_cell = snapshot.nearest_cell(x, z);
             state.context_player = player_points
                 .iter()
@@ -1212,16 +1446,31 @@ fn voxel_map_ui(
         ui.strong("地图操作");
         if let Some(user_id) = state.context_player {
             let target_id = user_id.to_string();
-            if ui
-                .button(format!(
-                    "传送到 {}",
-                    target_display_name(manager, &target_id)
-                ))
-                .clicked()
-            {
+            let anonymized = state.anonymized_players.contains(&user_id);
+            let name = if anonymized {
+                "匿名玩家".to_owned()
+            } else {
+                target_display_name(manager, &target_id)
+            };
+            if ui.button(format!("传送到 {name}")).clicked() {
                 editor.request_teleport(VoxelTeleportDestination::PlayerStandee(
                     user_id,
                 ));
+                ui.close();
+            }
+            if ui
+                .button(if anonymized {
+                    "取消匿名"
+                } else {
+                    "匿名玩家"
+                })
+                .clicked()
+            {
+                if anonymized {
+                    state.anonymized_players.remove(&user_id);
+                } else {
+                    state.anonymized_players.insert(user_id);
+                }
                 ui.close();
             }
         }
@@ -1234,6 +1483,25 @@ fn voxel_map_ui(
                 "体素坐标：{}, {}, {}",
                 cell.x, cell.y, cell.z
             ));
+        }
+        ui.separator();
+        if ui
+            .button(if state.show_weave {
+                "取消显示魔网分布"
+            } else {
+                "显示魔网分布"
+            })
+            .clicked()
+        {
+            state.show_weave = !state.show_weave;
+            ui.close();
+        }
+        if state.zoom > 1.0 {
+            if ui.button("重置缩放").clicked() {
+                state.zoom = 1.0;
+                state.view_center = Vec2::splat(0.5);
+                ui.close();
+            }
         }
     });
 }
@@ -1265,8 +1533,9 @@ fn dm_voxel_map_windows(
                 manager,
                 state,
                 editor,
+                false,
             );
-            ui.small("右键地图传送 · M 打开大地图");
+            ui.small("右键：传送/匿名/魔网 · M 打开大地图");
         });
 
     if !state.full_map_open {
@@ -1281,10 +1550,18 @@ fn dm_voxel_map_windows(
         .open(&mut open)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.strong("全体玩家与体素俯视图");
+                if state.show_weave {
+                    ui.strong("魔网分布");
+                } else {
+                    ui.strong("全体玩家与体素俯视图");
+                }
                 ui.separator();
                 ui.small("北（+Z）朝上");
             });
+            if state.show_weave {
+                ui.small("当前显示魔网分布，普通体素地图已隐藏。");
+            }
+            ui.small(format!("滚轮缩放：×{:.1}", state.zoom));
             let side = ui
                 .available_width()
                 .min(ui.available_height() - 26.0)
@@ -1297,6 +1574,7 @@ fn dm_voxel_map_windows(
                 manager,
                 state,
                 editor,
+                true,
             );
         });
     state.full_map_open = open;
@@ -20705,5 +20983,71 @@ mod tests {
             },
         ));
         assert!((manager.player_characters["target"].hp - 16.8).abs() < 0.0001);
+    }
+}
+
+#[cfg(test)]
+mod voxel_map_ui_helper_tests {
+    use super::*;
+
+    #[test]
+    fn default_zoom_covers_the_whole_world() {
+        let (min, max) = map_view_window(1.0, Vec2::splat(0.5));
+        assert_eq!(min, Vec2::ZERO);
+        assert_eq!(max, Vec2::ONE);
+    }
+
+    #[test]
+    fn zoom_keeps_view_window_inside_the_world() {
+        let (min, max) = map_view_window(2.0, Vec2::new(0.9, 0.9));
+        assert_eq!(min, Vec2::new(0.5, 0.5));
+        assert_eq!(max, Vec2::ONE);
+
+        let (min, max) = map_view_window(2.0, Vec2::new(0.1, 0.1));
+        assert_eq!(min, Vec2::ZERO);
+        assert_eq!(max, Vec2::new(0.5, 0.5));
+    }
+
+    #[test]
+    fn zoom_centers_on_requested_world_point() {
+        let (min, max) = map_view_window(2.0, Vec2::splat(0.5));
+        let span = max - min;
+        assert!((span.x - 0.5).abs() < 1e-5);
+        assert!((span.y - 0.5).abs() < 1e-5);
+        assert!((min.x - 0.25).abs() < 1e-5);
+        assert!((min.y - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn clamp_map_view_min_resets_for_full_world() {
+        assert_eq!(
+            clamp_map_view_min(Vec2::new(0.3, -0.2), 1.5),
+            Vec2::ZERO
+        );
+        let min = clamp_map_view_min(Vec2::new(-0.5, 0.8), 0.5);
+        assert_eq!(min, Vec2::new(0.0, 0.5));
+    }
+
+    #[test]
+    fn weave_direction_vectors_match_top_down_map() {
+        // The map renders +Z (北) upward and +X (东) rightward, so the weave
+        // overlay arrows follow the same compass orientation.
+        let north = weave_direction_screen_vector("北方");
+        assert!((north.x - 0.0).abs() < 1e-5);
+        assert!((north.y - (-1.0)).abs() < 1e-5);
+
+        let east = weave_direction_screen_vector("东方");
+        assert!((east.x - 1.0).abs() < 1e-5);
+        assert!((east.y - 0.0).abs() < 1e-5);
+
+        let southeast = weave_direction_screen_vector("东南方");
+        let inv = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((southeast.x - inv).abs() < 1e-5);
+        assert!((southeast.y - inv).abs() < 1e-5);
+
+        assert_eq!(
+            weave_direction_screen_vector("未知方向"),
+            weave_direction_screen_vector("北方")
+        );
     }
 }
