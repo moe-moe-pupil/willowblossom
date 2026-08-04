@@ -73,6 +73,7 @@ use crate::voxel::{
     VoxelCreativeItem,
     VoxelEditMode,
     VoxelEditorState,
+    VoxelGmMapState,
     VoxelLightTool,
     VoxelMinimapSnapshot,
     VoxelPhysicsBody,
@@ -1028,6 +1029,7 @@ pub struct UiSystemLocals<'w, 's> {
     voxel_possession: ResMut<'w, VoxelPossessionState>,
     voxel_targeting_preview: Res<'w, VoxelTargetingPreview>,
     voxel_minimap: Res<'w, VoxelMinimapSnapshot>,
+    voxel_gm_map: Res<'w, VoxelGmMapState>,
     keyboard: Res<'w, ButtonInput<KeyCode>>,
     voxel_map_ui: Local<'s, VoxelMapUiState>,
     battle_store: Option<ResMut<'w, Persistent<BattleRoundStore>>>,
@@ -1128,6 +1130,12 @@ fn weave_direction_screen_vector(direction: &str) -> Vec2 {
     Vec2::new(dx, dy).normalized()
 }
 
+/// World XZ facing converted to an egui screen direction. The map renders
+/// +Z (北) upward, so a northward facing (0, 1) points up on screen.
+fn map_facing_screen_vector(facing: Vec2) -> Vec2 {
+    Vec2::new(facing.x, -facing.y)
+}
+
 fn draw_weave_overlay(painter: &Painter, rect: Rect, manager: &NapcatMessageManager) {
     let campaign_id = manager
         .active_campaign_id()
@@ -1223,6 +1231,7 @@ fn voxel_map_ui(
     state: &mut VoxelMapUiState,
     editor: &mut VoxelEditorState,
     zoomable: bool,
+    gm_state: &VoxelGmMapState,
 ) {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter_at(rect);
@@ -1387,6 +1396,61 @@ fn voxel_map_ui(
         }
     }
 
+    let gm_point = gm_state.position.and_then(|position| {
+        let fraction = snapshot.world_fraction(position);
+        if is_full_view {
+            let clamped = fraction.clamp(
+                bevy::prelude::Vec2::ZERO,
+                bevy::prelude::Vec2::ONE,
+            );
+            Some(world_to_screen(Vec2::new(clamped.x, clamped.y)))
+        } else if fraction.x < view_min.x
+            || fraction.x > view_max.x
+            || fraction.y < view_min.y
+            || fraction.y > view_max.y
+        {
+            None
+        } else {
+            Some(world_to_screen(Vec2::new(fraction.x, fraction.y)))
+        }
+    });
+    if let Some(point) = gm_point {
+        let gm_color = egui::Color32::from_rgb(240, 240, 240);
+        let arrow_color = egui::Color32::from_rgb(90, 220, 255);
+        let facing_screen =
+            map_facing_screen_vector(Vec2::new(gm_state.facing.x, gm_state.facing.y));
+        let arrow_end = point + facing_screen * 20.0;
+        let perpendicular = egui::vec2(-facing_screen.y, facing_screen.x);
+        let head_back = arrow_end - facing_screen * 7.0;
+        painter.line_segment(
+            [point, arrow_end],
+            Stroke::new(2.5, arrow_color),
+        );
+        painter.line_segment(
+            [arrow_end, head_back + perpendicular * 5.0],
+            Stroke::new(2.5, arrow_color),
+        );
+        painter.line_segment(
+            [arrow_end, head_back - perpendicular * 5.0],
+            Stroke::new(2.5, arrow_color),
+        );
+        painter.circle_filled(point, 6.0, gm_color);
+        painter.circle_stroke(
+            point,
+            7.0,
+            Stroke::new(1.5, egui::Color32::BLACK),
+        );
+        if size.x >= 400.0 {
+            painter.text(
+                point + egui::vec2(9.0, -8.0),
+                egui::Align2::LEFT_CENTER,
+                "GM",
+                egui::FontId::proportional(12.0),
+                gm_color,
+            );
+        }
+    }
+
     // North marker makes the top-down orientation explicit: +Z (北) is up.
     let north_anchor = egui::pos2(rect.right() - 18.0, rect.top() + 12.0);
     painter.text(
@@ -1513,6 +1577,7 @@ fn dm_voxel_map_windows(
     manager: &NapcatMessageManager,
     state: &mut VoxelMapUiState,
     editor: &mut VoxelEditorState,
+    gm_state: &VoxelGmMapState,
 ) {
     // This desktop egui layer is never part of the player capture-camera render targets.
     egui::Window::new("DM 小地图")
@@ -1534,6 +1599,7 @@ fn dm_voxel_map_windows(
                 state,
                 editor,
                 false,
+                gm_state,
             );
             ui.small("右键：传送/匿名/魔网 · M 打开大地图");
         });
@@ -1575,6 +1641,7 @@ fn dm_voxel_map_windows(
                 state,
                 editor,
                 true,
+                gm_state,
             );
         });
     state.full_map_open = open;
@@ -14541,6 +14608,7 @@ pub fn ui_system(
     let scene_capture_requests = &mut locals.scene_capture_requests;
     let map_toggle_requested = locals.keyboard.just_pressed(KeyCode::KeyM);
     let voxel_minimap: &VoxelMinimapSnapshot = &locals.voxel_minimap;
+    let voxel_gm_map: &VoxelGmMapState = &locals.voxel_gm_map;
     let voxel_map_ui_state: &mut VoxelMapUiState = &mut locals.voxel_map_ui;
     let voxel_editor: &mut VoxelEditorState = &mut locals.voxel_editor;
     let voxel_possession: &mut VoxelPossessionState = &mut locals.voxel_possession;
@@ -15948,6 +16016,7 @@ pub fn ui_system(
         &manager,
         voxel_map_ui_state,
         voxel_editor,
+        voxel_gm_map,
     );
 
     let should_persist_ui_memory = ctx.input(|input| {
@@ -21048,6 +21117,17 @@ mod voxel_map_ui_helper_tests {
         assert_eq!(
             weave_direction_screen_vector("未知方向"),
             weave_direction_screen_vector("北方")
+        );
+    }
+
+    #[test]
+    fn gm_facing_maps_from_world_to_top_down_screen() {
+        // North (+Z) faces up on the egui map; east (+X) faces right.
+        assert_eq!(map_facing_screen_vector(Vec2::new(0.0, 1.0)), Vec2::new(0.0, -1.0));
+        assert_eq!(map_facing_screen_vector(Vec2::new(1.0, 0.0)), Vec2::new(1.0, 0.0));
+        assert_eq!(
+            map_facing_screen_vector(Vec2::new(0.0, -1.0)),
+            Vec2::new(0.0, 1.0)
         );
     }
 }

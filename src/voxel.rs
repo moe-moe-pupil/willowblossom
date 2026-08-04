@@ -392,6 +392,23 @@ pub(crate) struct VoxelMinimapSnapshot {
     pub(crate) tiles: Vec<Option<VoxelMinimapTile>>,
 }
 
+/// GM presence published for the desktop DM map: where the GM stands in the
+/// voxel world and which horizontal direction the GM is facing.
+#[derive(Resource)]
+pub(crate) struct VoxelGmMapState {
+    pub position: Option<Vec3>,
+    pub facing: Vec2,
+}
+
+impl Default for VoxelGmMapState {
+    fn default() -> Self {
+        Self {
+            position: None,
+            facing: Vec2::new(0.0, -1.0),
+        }
+    }
+}
+
 impl VoxelMinimapSnapshot {
     pub(crate) fn is_empty(&self) -> bool { self.tiles.is_empty() }
 
@@ -2260,6 +2277,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelSpaceshipPassengerMotion>()
         .init_resource::<VoxelSpaceshipPersistenceState>()
         .init_resource::<VoxelMinimapSnapshot>()
+        .init_resource::<VoxelGmMapState>()
         .init_resource::<VoxelReplayOcclusionFade>()
         .insert_resource(player_camera_store)
         .insert_resource(unit_standee_store)
@@ -2342,6 +2360,7 @@ impl Plugin for TrpgVoxelPlugin {
                         sync_voxel_player_standees.in_set(VoxelPlayerStandeeSynced),
                         sync_voxel_unit_standees,
                         sync_voxel_scene_character_positions,
+                        sync_voxel_gm_map_state,
                         capture_voxel_player_view,
                         draw_voxel_target.run_if(crate::replay::replay_video_capture_inactive),
                         animate_planet_clouds,
@@ -8866,6 +8885,28 @@ fn sync_voxel_scene_character_positions(
             )
         }),
     );
+}
+
+fn sync_voxel_gm_map_state(
+    mut gm_state: ResMut<VoxelGmMapState>,
+    editor: Res<VoxelEditorState>,
+    cameras: Query<&Transform, With<VoxelViewportCamera>>,
+) {
+    // Only an embodied first-person GM has a meaningful spot on the map; in
+    // orbit mode the camera sits outside the world and would not belong there.
+    if !editor.first_person_enabled {
+        gm_state.position = None;
+        return;
+    }
+    let Ok(camera) = cameras.single() else {
+        gm_state.position = None;
+        return;
+    };
+    let forward = camera.rotation * Vec3::NEG_Z;
+    gm_state.position = Some(camera.translation);
+    gm_state.facing = Vec2::new(forward.x, forward.z)
+        .try_normalize()
+        .unwrap_or(Vec2::new(0.0, -1.0));
 }
 
 fn voxel_player_standee_transform(camera_transform: &Transform) -> Transform { *camera_transform }
@@ -15985,6 +16026,50 @@ mod tests {
                 .positions
                 .get("unit:slime"),
             Some(&Vec3::new(7.0, 2.0, 4.0))
+        );
+    }
+
+    #[test]
+    fn gm_map_state_tracks_embodied_first_person_camera() {
+        let mut app = App::new();
+        app.init_resource::<VoxelGmMapState>()
+            .init_resource::<VoxelEditorState>()
+            .add_systems(Update, sync_voxel_gm_map_state);
+        app.world_mut().spawn((
+            VoxelViewportCamera,
+            Transform::from_translation(Vec3::new(12.0, 3.0, -8.0))
+                .with_rotation(Quat::from_rotation_y(
+                    std::f32::consts::FRAC_PI_2,
+                )),
+        ));
+
+        app.update();
+
+        let gm = app.world().resource::<VoxelGmMapState>();
+        assert_eq!(gm.position, Some(Vec3::new(12.0, 3.0, -8.0)));
+        // yaw 90° turns the default -Z facing toward -X (west).
+        assert!((gm.facing - Vec2::new(-1.0, 0.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn gm_map_state_hides_while_the_dm_orbits_outside_the_world() {
+        let mut app = App::new();
+        app.init_resource::<VoxelGmMapState>()
+            .init_resource::<VoxelEditorState>()
+            .add_systems(Update, sync_voxel_gm_map_state);
+        app.world_mut().spawn((
+            VoxelViewportCamera,
+            Transform::from_xyz(50.0, 120.0, 50.0),
+        ));
+        app.world_mut()
+            .resource_mut::<VoxelEditorState>()
+            .first_person_enabled = false;
+
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<VoxelGmMapState>().position,
+            None
         );
     }
 
