@@ -60,8 +60,12 @@ use serde::{
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::backup::{
+    list_backups,
+    restore_backup,
     BackupSettings,
     BackupState,
+    BACKUP_ROOT,
+    DATA_DIR,
 };
 use crate::voxel::{
     clear_campaign_possession_movement,
@@ -12536,7 +12540,16 @@ fn napcat_import_export_ui(
     });
 }
 
-fn backup_ui(ui: &mut Ui, settings: &mut Persistent<BackupSettings>, state: &mut BackupState) {
+fn backup_ui(
+    ui: &mut Ui,
+    settings: &mut Persistent<BackupSettings>,
+    state: &mut BackupState,
+    manager: &mut Persistent<NapcatMessageManager>,
+    deepseek_manager: &mut Persistent<DeepseekManager>,
+    scene_store: Option<&mut Persistent<VoxelSceneStore>>,
+    scene_runtime: Option<&mut VoxelMapRuntimeState>,
+    battle_store: Option<&mut Persistent<BattleRoundStore>>,
+) {
     ui.collapsing("自动备份", |ui| {
         let mut changed = false;
         changed |= ui
@@ -12575,10 +12588,114 @@ fn backup_ui(ui: &mut Ui, settings: &mut Persistent<BackupSettings>, state: &mut
         } else if !state.last_result.is_empty() {
             ui.small(state.last_result.as_str());
         }
+        ui.separator();
+        ui.strong("恢复备份");
+        match list_backups(Path::new(BACKUP_ROOT)) {
+            Ok(backups) if backups.is_empty() => {
+                ui.label("还没有可恢复的备份。");
+            },
+            Ok(backups) => {
+                egui::ScrollArea::vertical()
+                    .id_salt("backup_restore_list")
+                    .max_height(110.0)
+                    .show(ui, |ui| {
+                        for name in backups.iter().rev() {
+                            let selected =
+                                state.selected_backup.as_deref() == Some(name.as_str());
+                            if ui.selectable_label(selected, name).clicked() {
+                                state.selected_backup = Some(name.clone());
+                                state.pending_restore = false;
+                            }
+                        }
+                    });
+                if let Some(name) = state.selected_backup.clone() {
+                    if state.pending_restore {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            format!("将覆盖 .data/willowblossom 下的当前数据并恢复 {name}。确认继续？"),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("确认恢复").clicked() {
+                                match restore_selected_backup(
+                                    &name,
+                                    manager,
+                                    deepseek_manager,
+                                    scene_store,
+                                    scene_runtime,
+                                    battle_store,
+                                ) {
+                                    Ok((count, reload_errors)) => {
+                                        state.last_result = if reload_errors.is_empty() {
+                                            format!(
+                                                "已恢复 {count} 项：聊天、场景、战斗轮与总结已即时生效；界面记忆等其余状态请重启应用后完全生效"
+                                            )
+                                        } else {
+                                            format!(
+                                                "已恢复 {count} 项，但部分数据重载失败（重启后仍会生效）：{}",
+                                                reload_errors.join("；")
+                                            )
+                                        };
+                                        state.selected_backup = None;
+                                        state.pending_restore = false;
+                                    },
+                                    Err(err) => {
+                                        state.last_result = format!("恢复失败：{err}");
+                                        state.pending_restore = false;
+                                    },
+                                }
+                            }
+                            if ui.button("取消").clicked() {
+                                state.pending_restore = false;
+                            }
+                        });
+                    } else if ui.button(format!("恢复 {name}")).clicked() {
+                        state.pending_restore = true;
+                    }
+                }
+            },
+            Err(err) => {
+                ui.small(format!("读取备份列表失败：{err}"));
+            },
+        }
+        ui.small(
+            "恢复会先复制备份文件回数据目录，并立即重载聊天、场景、战斗轮与总结；界面记忆等其余设置需重启应用后完全生效。",
+        );
         ui.small(
             "备份范围：场景、玩家、聊天等全部顶层数据文件与角色立绘；不含 tts、图片缓存等大目录。保存在 .data/willowblossom/backups。",
         );
     });
+}
+
+fn restore_selected_backup(
+    name: &str,
+    manager: &mut Persistent<NapcatMessageManager>,
+    deepseek_manager: &mut Persistent<DeepseekManager>,
+    scene_store: Option<&mut Persistent<VoxelSceneStore>>,
+    scene_runtime: Option<&mut VoxelMapRuntimeState>,
+    battle_store: Option<&mut Persistent<BattleRoundStore>>,
+) -> Result<(usize, Vec<String>), String> {
+    let files = restore_backup(Path::new(BACKUP_ROOT), name, Path::new(DATA_DIR))?;
+    let mut reload_errors = Vec::new();
+    if let Err(err) = manager.reload() {
+        reload_errors.push(format!("聊天记录：{err}"));
+    }
+    if let Err(err) = deepseek_manager.reload() {
+        reload_errors.push(format!("DeepSeek总结：{err}"));
+    }
+    if let Some(store) = scene_store {
+        if let Err(err) = store.reload() {
+            reload_errors.push(format!("体素场景：{err}"));
+        }
+    }
+    if let Some(runtime) = scene_runtime {
+        runtime.request_reload();
+    }
+    if let Some(store) = battle_store {
+        if let Err(err) = store.reload() {
+            reload_errors.push(format!("战斗轮：{err}"));
+        }
+    }
+    Ok((files.len(), reload_errors))
 }
 
 fn write_napcat_manager_export(manager: &NapcatMessageManager, path: &str) -> Result<(), String> {
@@ -13846,7 +13963,7 @@ fn trpg_group_settings_window(
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
     deepseek_manager: &mut ResMut<Persistent<DeepseekManager>>,
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
-    scene_runtime: Option<&mut VoxelMapRuntimeState>,
+    mut scene_runtime: Option<&mut VoxelMapRuntimeState>,
     mut battle_store: Option<&mut Persistent<BattleRoundStore>>,
     possession_movement_store: &mut Persistent<VoxelPossessionMovementStore>,
     replay_movement_history: &mut Persistent<ReplayPlayerMovementHistory>,
@@ -13911,12 +14028,21 @@ fn trpg_group_settings_window(
                 manager,
                 deepseek_manager,
                 scene_store.as_deref_mut(),
-                scene_runtime,
+                scene_runtime.as_deref_mut(),
                 battle_store.as_deref_mut(),
                 state,
             );
             ui.separator();
-            backup_ui(ui, backup_settings, backup_state);
+            backup_ui(
+                ui,
+                backup_settings,
+                backup_state,
+                manager.as_mut(),
+                deepseek_manager.as_mut(),
+                scene_store.as_deref_mut(),
+                scene_runtime.as_deref_mut(),
+                battle_store.as_deref_mut(),
+            );
             ui.separator();
 
             ui.heading("玩家角色");

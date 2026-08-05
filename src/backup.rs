@@ -69,6 +69,8 @@ pub(crate) struct BackupState {
     elapsed_seconds: f32,
     triggered: bool,
     pub(crate) manual_requested: bool,
+    pub(crate) selected_backup: Option<String>,
+    pub(crate) pending_restore: bool,
     pub(crate) last_backup_name: Option<String>,
     pub(crate) last_result: String,
 }
@@ -79,6 +81,8 @@ impl Default for BackupState {
             elapsed_seconds: 0.0,
             triggered: false,
             manual_requested: false,
+            selected_backup: None,
+            pending_restore: false,
             last_backup_name: None,
             last_result: String::new(),
         }
@@ -213,6 +217,59 @@ fn unique_backup_dir(backup_root: &Path, stamp: &str) -> Result<PathBuf, String>
         suffix += 1;
     }
     Ok(candidate)
+}
+
+pub(crate) fn list_backups(backup_root: &Path) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    if !backup_root.is_dir() {
+        return Ok(names);
+    }
+    for entry in fs::read_dir(backup_root).map_err(|err| format!("读取备份目录失败：{err}"))?
+    {
+        let entry = entry.map_err(|err| format!("读取备份目录条目失败：{err}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.path().is_dir() && is_backup_dir_name(&name) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Copies a snapshot back into the data directory.
+///
+/// The backup's own manifest and the current backup settings are skipped so a
+/// restore never overwrites the backup feature's live configuration.
+pub(crate) fn restore_backup(
+    backup_root: &Path,
+    name: &str,
+    data_dir: &Path,
+) -> Result<Vec<String>, String> {
+    if !is_backup_dir_name(name) {
+        return Err(format!("不是有效的备份目录：{name}"));
+    }
+    let backup_dir = backup_root.join(name);
+    if !backup_dir.is_dir() {
+        return Err(format!("备份不存在：{name}"));
+    }
+    let mut restored = Vec::new();
+    for entry in fs::read_dir(&backup_dir).map_err(|err| format!("读取备份失败：{err}"))? {
+        let entry = entry.map_err(|err| format!("读取备份条目失败：{err}"))?;
+        let entry_name = entry.file_name().to_string_lossy().into_owned();
+        if entry_name == "manifest.json" || entry_name == "backup_settings.toml" {
+            continue;
+        }
+        let source = entry.path();
+        let destination = data_dir.join(&entry_name);
+        if source.is_dir() {
+            copy_dir_recursive(&source, &destination)?;
+        } else {
+            fs::copy(&source, &destination)
+                .map_err(|err| format!("恢复 {entry_name} 失败：{err}"))?;
+        }
+        restored.push(entry_name);
+    }
+    Ok(restored)
 }
 
 fn write_snapshot(data_dir: &Path, backup_dir: &Path, stamp: &str) -> Result<Vec<String>, String> {
@@ -510,5 +567,106 @@ mod tests {
         );
         let entries = fs::read_dir(&backup_root).unwrap().count();
         assert_eq!(entries, 1);
+    }
+
+    #[test]
+    fn list_backups_returns_sorted_snapshot_dirs_only() {
+        let temp = tempdir().unwrap();
+        let backup_root = temp.path().join("backups");
+        fs::create_dir_all(backup_root.join("20260805-020000")).unwrap();
+        fs::create_dir_all(backup_root.join("20260805-000000")).unwrap();
+        fs::create_dir_all(backup_root.join("20260805-010000-2")).unwrap();
+        fs::create_dir_all(backup_root.join("notes")).unwrap();
+
+        let names = list_backups(&backup_root).unwrap();
+
+        assert_eq!(names, vec![
+            "20260805-000000".to_owned(),
+            "20260805-010000-2".to_owned(),
+            "20260805-020000".to_owned(),
+        ]);
+    }
+
+    #[test]
+    fn restore_backup_copies_data_but_skips_manifest_and_settings() {
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let backup_root = temp.path().join("backups");
+        let backup_dir = backup_root.join("20260805-000000");
+        fs::create_dir_all(data_dir.join("character_standees")).unwrap();
+        fs::create_dir_all(backup_dir.join("character_standees")).unwrap();
+        fs::write(
+            data_dir.join("messages.toml"),
+            "old chat",
+        )
+        .unwrap();
+        fs::write(
+            data_dir.join("backup_settings.toml"),
+            "current settings",
+        )
+        .unwrap();
+        fs::write(
+            backup_dir.join("messages.toml"),
+            "restored chat",
+        )
+        .unwrap();
+        fs::write(backup_dir.join("voxel_scene.bin"), [
+            9, 9, 9,
+        ])
+        .unwrap();
+        fs::write(
+            backup_dir.join("character_standees/player.png"),
+            "restored png",
+        )
+        .unwrap();
+        fs::write(backup_dir.join("manifest.json"), "{}").unwrap();
+        fs::write(
+            backup_dir.join("backup_settings.toml"),
+            "old settings",
+        )
+        .unwrap();
+
+        let restored = restore_backup(
+            &backup_root,
+            "20260805-000000",
+            &data_dir,
+        )
+        .unwrap();
+
+        assert!(restored.contains(&"messages.toml".to_owned()));
+        assert!(restored.contains(&"voxel_scene.bin".to_owned()));
+        assert!(restored.contains(&"character_standees".to_owned()));
+        assert!(!restored.contains(&"manifest.json".to_owned()));
+        assert!(!restored.contains(&"backup_settings.toml".to_owned()));
+        assert_eq!(
+            fs::read_to_string(data_dir.join("messages.toml")).unwrap(),
+            "restored chat"
+        );
+        assert_eq!(
+            fs::read_to_string(data_dir.join("backup_settings.toml")).unwrap(),
+            "current settings"
+        );
+        assert_eq!(
+            fs::read_to_string(data_dir.join("character_standees/player.png")).unwrap(),
+            "restored png"
+        );
+        assert!(!data_dir.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn restore_backup_rejects_invalid_names_and_missing_dirs() {
+        let temp = tempdir().unwrap();
+        let backup_root = temp.path().join("backups");
+
+        assert!(restore_backup(&backup_root, "notes", temp.path()).is_err());
+        assert!(
+            restore_backup(
+                &backup_root,
+                "20260805-000000",
+                temp.path()
+            )
+            .is_err(),
+            "a missing snapshot must be reported instead of silently succeeding"
+        );
     }
 }
