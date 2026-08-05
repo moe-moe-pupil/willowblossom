@@ -9663,7 +9663,7 @@ fn dialogue_from_message(
                     .and_then(|character_id| manager.player_characters.get(character_id))
             })
     };
-    let (name, role, avatar) = dialogue_identity(message, character);
+    let (name, role, avatar) = dialogue_identity(manager, message, character);
     let avatar = resolve_character_image_source(manager, &avatar);
     let side = speaker_side(is_gm);
     let camera_focus_id = is_gm
@@ -9797,6 +9797,7 @@ fn speaker_side(is_gm: bool) -> DialogueSide {
 }
 
 fn dialogue_identity(
+    manager: &NapcatMessageManager,
     message: &CampaignMessage,
     character: Option<&PlayerCharacter>,
 ) -> (String, String, String) {
@@ -9821,7 +9822,9 @@ fn dialogue_identity(
     } else {
         String::new()
     };
-    (name, role, character.image.clone())
+    let avatar =
+        crate::napcat::resolve_player_portrait_image(&manager.player_characters, character);
+    (name, role, avatar)
 }
 
 fn dialogue_duration_ms(text: &str) -> u64 {

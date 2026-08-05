@@ -8001,7 +8001,8 @@ fn sync_character_standees(
         .player_characters
         .iter()
         .filter_map(|(target_id, character)| {
-            let image_source = character.image.trim();
+            let image_source =
+                crate::napcat::resolve_player_portrait_image(&manager.player_characters, character);
             (character.inited && !image_source.is_empty()).then(|| {
                 (
                     target_id.clone(),

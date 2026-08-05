@@ -5540,6 +5540,8 @@ fn quick_character_windows(
         let mut open = true;
         let mut changed = false;
         let mut cast_action = None;
+        let portrait_options =
+            crate::napcat::player_portrait_transform_options(&manager.player_characters, &target_id);
         let window_max_width = ctx
             .content_rect()
             .width()
@@ -5601,6 +5603,7 @@ fn quick_character_windows(
                         &target_id,
                         character,
                         &display_name,
+                        &portrait_options,
                         character_edit_state,
                         rule_engine_state,
                         &skill_pool_snapshot,
@@ -6609,11 +6612,27 @@ fn format_character_number(value: f32) -> String {
     }
 }
 
+fn portrait_transform_label(
+    character: &PlayerCharacter,
+    portrait_options: &[(String, String)],
+) -> String {
+    match character.portrait_transform.as_ref() {
+        None => "原立绘".to_owned(),
+        Some(crate::napcat::PortraitTransform::DefaultAvatar) => "默认头像".to_owned(),
+        Some(crate::napcat::PortraitTransform::OtherPlayer(other_id)) => portrait_options
+            .iter()
+            .find(|(option_id, _)| option_id == other_id)
+            .map(|(_, label)| format!("{label}的立绘"))
+            .unwrap_or_else(|| format!("玩家{other_id}的立绘")),
+    }
+}
+
 fn character_editor_ui(
     ui: &mut Ui,
     target_id: &str,
     character: &mut PlayerCharacter,
     chat_display_name: &str,
+    portrait_options: &[(String, String)],
     edit_state: &mut CharacterEditState,
     rule_engine_state: &mut RuleEngineState,
     skill_pool: &[SkillPoolEntry],
@@ -6702,6 +6721,59 @@ fn character_editor_ui(
     });
     ui.label("图片URL");
     changed |= ui.text_edit_singleline(&mut character.image).changed();
+
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.label("立绘变形");
+        egui::ComboBox::from_id_salt(("portrait_transform", target_id))
+            .selected_text(portrait_transform_label(character, portrait_options))
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(
+                        character.portrait_transform.is_none(),
+                        "原立绘",
+                    )
+                    .on_hover_text("恢复为角色自己的立绘")
+                    .clicked()
+                {
+                    character.portrait_transform = None;
+                    changed = true;
+                }
+                if ui
+                    .selectable_label(
+                        matches!(
+                            character.portrait_transform,
+                            Some(crate::napcat::PortraitTransform::DefaultAvatar)
+                        ),
+                        "默认头像",
+                    )
+                    .on_hover_text("显示内置的通用默认头像")
+                    .clicked()
+                {
+                    character.portrait_transform =
+                        Some(crate::napcat::PortraitTransform::DefaultAvatar);
+                    changed = true;
+                }
+                for (option_id, label) in portrait_options {
+                    let active = matches!(
+                        &character.portrait_transform,
+                        Some(crate::napcat::PortraitTransform::OtherPlayer(other_id))
+                            if other_id == option_id
+                    );
+                    if ui
+                        .selectable_label(active, format!("{label}的立绘"))
+                        .on_hover_text("把立绘变成这名玩家的样子")
+                        .clicked()
+                    {
+                        character.portrait_transform =
+                            Some(crate::napcat::PortraitTransform::OtherPlayer(
+                                option_id.clone(),
+                            ));
+                        changed = true;
+                    }
+                }
+            });
+    });
 
     ui.separator();
     let status_unlocked = edit_state.unlocked_status_targets.contains(target_id);
@@ -13800,6 +13872,11 @@ fn trpg_group_settings_window(
                             let skill_pool_snapshot = manager.skill_pool.clone();
                             let item_pool_snapshot = manager.item_pool.clone();
                             let stat_config = manager.character_stat_config_for_target(target_id);
+                            let portrait_options =
+                                crate::napcat::player_portrait_transform_options(
+                                    &manager.player_characters,
+                                    target_id,
+                                );
                             let character = manager
                                 .player_characters
                                 .entry(target_id.clone())
@@ -13841,6 +13918,7 @@ fn trpg_group_settings_window(
                                             target_id,
                                             character,
                                             &display_name,
+                                            &portrait_options,
                                             character_edit_state,
                                             rule_engine_state,
                                             &skill_pool_snapshot,

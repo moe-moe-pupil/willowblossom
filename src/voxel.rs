@@ -8688,11 +8688,12 @@ fn sync_voxel_player_standees(
         .iter()
         .filter_map(|(target_id, character)| {
             let user_id = target_id.parse::<u64>().ok()?;
-            let image_source = character.image.trim();
+            let image_source =
+                crate::napcat::resolve_player_portrait_image(&manager.player_characters, character);
             (character.inited
                 && !image_source.is_empty()
                 && camera_transforms.contains_key(&user_id))
-            .then(|| (user_id, image_source.to_owned()))
+            .then(|| (user_id, image_source))
         })
         .collect::<HashMap<_, _>>();
 

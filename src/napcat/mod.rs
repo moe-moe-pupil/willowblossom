@@ -1254,6 +1254,19 @@ impl CharacterSkillMetadata {
     pub fn is_approved(&self) -> bool { self.pc_approved && self.st_approved }
 }
 
+/// 玩家立绘的变形外观：临时显示为其他玩家的立绘或内置默认头像。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortraitTransform {
+    /// 显示内置的默认头像。
+    DefaultAvatar,
+    /// 显示另一个玩家的立绘（该玩家的 target_id）。
+    OtherPlayer(String),
+}
+
+/// 内置默认头像的图片路径（相对仓库根目录）。
+pub const DEFAULT_AVATAR_IMAGE: &str = "assets/textures/default_avatar.png";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PlayerCharacter {
     #[serde(default)]
@@ -1264,6 +1277,8 @@ pub struct PlayerCharacter {
     pub nickname: String,
     #[serde(default)]
     pub image: String,
+    #[serde(default)]
+    pub portrait_transform: Option<PortraitTransform>,
     #[serde(default)]
     pub creation_step: CharacterCreationStep,
     #[serde(default = "default_status_points")]
@@ -1333,6 +1348,7 @@ impl Default for PlayerCharacter {
             name: String::new(),
             nickname: String::new(),
             image: String::new(),
+            portrait_transform: None,
             creation_step: CharacterCreationStep::Normal,
             status_points: default_status_points(),
             exchange_points: default_exchange_points(),
@@ -1391,6 +1407,53 @@ pub fn reset_character_turn_totals(character: &mut PlayerCharacter) -> bool {
     character.damage_taken_this_turn = 0.0;
     character.healing_taken_this_turn = 0.0;
     changed
+}
+
+/// 解析角色实际显示的立绘图片来源。
+///
+/// - 未变形：使用角色自己的立绘。
+/// - 变形为默认头像：使用内置默认头像。
+/// - 变形为其他玩家：使用该玩家的立绘；对方没有立绘时退回角色自己的立绘。
+pub(crate) fn resolve_player_portrait_image(
+    characters: &HashMap<String, PlayerCharacter>,
+    character: &PlayerCharacter,
+) -> String {
+    match character.portrait_transform.as_ref() {
+        Some(PortraitTransform::DefaultAvatar) => DEFAULT_AVATAR_IMAGE.to_owned(),
+        Some(PortraitTransform::OtherPlayer(other_id)) => characters
+            .get(other_id)
+            .map(|other| other.image.trim().to_owned())
+            .filter(|image| !image.is_empty())
+            .unwrap_or_else(|| character.image.trim().to_owned()),
+        None => character.image.trim().to_owned(),
+    }
+}
+
+/// 可供“立绘变形”选择的其他玩家立绘（排除自己，且需要已有立绘图片）。
+pub(crate) fn player_portrait_transform_options(
+    characters: &HashMap<String, PlayerCharacter>,
+    exclude_target_id: &str,
+) -> Vec<(String, String)> {
+    let mut options = characters
+        .iter()
+        .filter(|(target_id, character)| {
+            target_id.as_str() != exclude_target_id && !character.image.trim().is_empty()
+        })
+        .map(|(target_id, character)| {
+            (
+                target_id.clone(),
+                character_display_name(character, target_id),
+            )
+        })
+        .collect::<Vec<_>>();
+    options.sort_by(
+        |(left_id, left_label), (right_id, right_label)| {
+            left_label
+                .cmp(right_label)
+                .then_with(|| left_id.cmp(right_id))
+        },
+    );
+    options
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -10602,6 +10665,147 @@ position_cells = [4, 5, 6]
         assert!(gm.can_read(&Visibility::Player(2)));
         assert!(gm.can_read(&Visibility::Gm));
         assert!(gm.can_read(&Visibility::System));
+    }
+
+    #[test]
+    fn resolve_player_portrait_image_uses_own_image_by_default() {
+        let mut characters = HashMap::new();
+        let character = PlayerCharacter {
+            inited: true,
+            name: "本人".to_owned(),
+            image: "own.png".to_owned(),
+            ..Default::default()
+        };
+        characters.insert("1".to_owned(), character.clone());
+
+        assert_eq!(
+            resolve_player_portrait_image(&characters, &character),
+            "own.png"
+        );
+    }
+
+    #[test]
+    fn resolve_player_portrait_image_supports_default_avatar_transform() {
+        let character = PlayerCharacter {
+            inited: true,
+            image: "own.png".to_owned(),
+            portrait_transform: Some(PortraitTransform::DefaultAvatar),
+            ..Default::default()
+        };
+        let characters = HashMap::new();
+
+        assert_eq!(
+            resolve_player_portrait_image(&characters, &character),
+            DEFAULT_AVATAR_IMAGE
+        );
+    }
+
+    #[test]
+    fn resolve_player_portrait_image_uses_other_player_portrait() {
+        let mut characters = HashMap::new();
+        characters.insert("1".to_owned(), PlayerCharacter {
+            inited: true,
+            image: "own.png".to_owned(),
+            ..Default::default()
+        });
+        characters.insert("2".to_owned(), PlayerCharacter {
+            inited: true,
+            image: "other.png".to_owned(),
+            ..Default::default()
+        });
+        let character = &characters["1"];
+        let mut transformed = character.clone();
+        transformed.portrait_transform =
+            Some(PortraitTransform::OtherPlayer("2".to_owned()));
+
+        assert_eq!(
+            resolve_player_portrait_image(&characters, &transformed),
+            "other.png"
+        );
+    }
+
+    #[test]
+    fn resolve_player_portrait_image_falls_back_when_target_missing_or_blank() {
+        let mut characters = HashMap::new();
+        characters.insert("1".to_owned(), PlayerCharacter {
+            inited: true,
+            image: "own.png".to_owned(),
+            ..Default::default()
+        });
+        characters.insert("2".to_owned(), PlayerCharacter::default());
+        let character = &characters["1"];
+
+        let mut missing_target = character.clone();
+        missing_target.portrait_transform =
+            Some(PortraitTransform::OtherPlayer("999".to_owned()));
+        assert_eq!(
+            resolve_player_portrait_image(&characters, &missing_target),
+            "own.png"
+        );
+
+        let mut blank_target = character.clone();
+        blank_target.portrait_transform =
+            Some(PortraitTransform::OtherPlayer("2".to_owned()));
+        assert_eq!(
+            resolve_player_portrait_image(&characters, &blank_target),
+            "own.png"
+        );
+    }
+
+    #[test]
+    fn player_portrait_transform_options_excludes_self_and_blank_portraits() {
+        let mut characters = HashMap::new();
+        characters.insert("1".to_owned(), PlayerCharacter {
+            inited: true,
+            nickname: "本人".to_owned(),
+            image: "own.png".to_owned(),
+            ..Default::default()
+        });
+        characters.insert("2".to_owned(), PlayerCharacter {
+            inited: true,
+            nickname: "甲".to_owned(),
+            image: "a.png".to_owned(),
+            ..Default::default()
+        });
+        characters.insert("3".to_owned(), PlayerCharacter {
+            inited: true,
+            nickname: "乙".to_owned(),
+            image: String::new(),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            player_portrait_transform_options(&characters, "1"),
+            vec![("2".to_owned(), "甲".to_owned())]
+        );
+    }
+
+    #[test]
+    fn player_character_portrait_transform_deserializes_from_legacy_json() {
+        let legacy = r#"{"inited":true,"name":"旧角色","image":"own.png"}"#;
+        let character: PlayerCharacter = serde_json::from_str(legacy).unwrap();
+        assert_eq!(character.portrait_transform, None);
+
+        let json = serde_json::to_string(&character).unwrap();
+        let round_tripped: PlayerCharacter = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.portrait_transform, None);
+    }
+
+    #[test]
+    fn player_character_portrait_transform_round_trips_through_json() {
+        let character = PlayerCharacter {
+            inited: true,
+            image: "own.png".to_owned(),
+            portrait_transform: Some(PortraitTransform::OtherPlayer("2".to_owned())),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&character).unwrap();
+        let restored: PlayerCharacter = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.portrait_transform,
+            Some(PortraitTransform::OtherPlayer("2".to_owned()))
+        );
     }
 
     #[test]
