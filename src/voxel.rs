@@ -8809,6 +8809,7 @@ fn sync_voxel_player_standees(
                     MeshMaterial3d(portrait_material.clone()),
                     voxel_player_standee_transform(&camera_transform),
                     Visibility::Visible,
+                    RenderLayers::default(),
                     VoxelPlayerStandee {
                         user_id,
                         image_source,
@@ -8825,6 +8826,7 @@ fn sync_voxel_player_standees(
                         ),
                         MeshMaterial3d(portrait_material),
                         voxel_player_standee_back_transform(),
+                        RenderLayers::default(),
                     ));
                     parent.spawn((
                         Mesh3d(
@@ -8838,6 +8840,7 @@ fn sync_voxel_player_standees(
                         ),
                         MeshMaterial3d(back_label_material),
                         voxel_player_standee_back_label_transform(),
+                        RenderLayers::default(),
                     ));
                 });
                 let entity = entity_commands.id();
@@ -8855,12 +8858,38 @@ fn sync_voxel_player_standees(
 /// mesh child with it), so player cameras and QQ scene captures never show it
 /// while the GM viewport still renders it with its preview frame.
 fn sync_voxel_standee_invisibility_render_layers(
-    mut standees: Query<(Entity, &VoxelPlayerStandee, &Children, &mut RenderLayers)>,
+    mut commands: Commands,
+    missing_layers: Query<
+        (Entity, &VoxelPlayerStandee, Option<&Children>),
+        (Without<VoxelPlayerCaptureCamera>, Without<RenderLayers>),
+    >,
+    mut standees: Query<
+        (Entity, &VoxelPlayerStandee, &Children, &mut RenderLayers),
+        Without<VoxelPlayerCaptureCamera>,
+    >,
     mut child_layers: Query<
         &mut RenderLayers,
         (Without<VoxelPlayerStandee>, Without<VoxelPlayerCaptureCamera>),
     >,
+    missing_child_layers: Query<
+        Entity,
+        (
+            Without<VoxelPlayerStandee>,
+            Without<VoxelPlayerCaptureCamera>,
+            Without<RenderLayers>,
+        ),
+    >,
 ) {
+    for (entity, _, children) in &missing_layers {
+        commands.entity(entity).insert(RenderLayers::default());
+        if let Some(children) = children {
+            for child in children.iter() {
+                if missing_child_layers.contains(child) {
+                    commands.entity(child).insert(RenderLayers::default());
+                }
+            }
+        }
+    }
     for (_, standee, children, mut root_layers) in &mut standees {
         let target = if standee.invisible {
             RenderLayers::layer(VOXEL_DM_GIZMO_RENDER_LAYER)
@@ -16451,14 +16480,10 @@ mod tests {
     fn invisible_standee_switches_to_the_gm_only_render_layer() {
         let mut app = App::new();
         app.add_systems(Update, sync_voxel_standee_invisibility_render_layers);
-        let child_a = app
-            .world_mut()
-            .spawn((Transform::default(), RenderLayers::default()))
-            .id();
-        let child_b = app
-            .world_mut()
-            .spawn((Transform::default(), RenderLayers::default()))
-            .id();
+        // Mirror the real spawn path: standees and their planes are spawned
+        // without RenderLayers, so the sync system has to insert them first.
+        let child_a = app.world_mut().spawn(Transform::default()).id();
+        let child_b = app.world_mut().spawn(Transform::default()).id();
         let standee = app
             .world_mut()
             .spawn((
@@ -16469,13 +16494,13 @@ mod tests {
                     invisible: true,
                 },
                 Transform::default(),
-                RenderLayers::default(),
             ))
             .id();
         app.world_mut()
             .entity_mut(standee)
             .add_children(&[child_a, child_b]);
 
+        app.update();
         app.update();
 
         let gm_only = RenderLayers::layer(VOXEL_DM_GIZMO_RENDER_LAYER);
