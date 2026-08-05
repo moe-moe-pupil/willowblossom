@@ -1,0 +1,37 @@
+jump = [{ Key = "Space" }, { Gamepad = "South" }, "TouchPress"]
+
+[[x_axis]]
+Key = ["D", "A"]
+
+[[x_axis]]
+Gamepad = "LeftStickX"
+
+[[x_axis]]
+Touch = "X"
+
+[[y_axis]]
+Key = ["W", "S"]
+
+[[y_axis]]
+Gamepad = "LeftStickY"
+
+[[interact]]
+Key = "E"
+
+[[interact]]
+Mouse = "Left"
+
+[[interact]]
+Gamepad = "East"
+
+[[inventory]]
+Key = "Tab"
+
+[[inventory]]
+Gamepad = "West"
+
+[[pause]]
+Key = "Escape"
+
+[[pause]]
+Gamepad = "Start"

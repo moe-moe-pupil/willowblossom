@@ -1,0 +1,603 @@
+[[sessions]]
+campaign_id = "default"
+user_id = 540716134
+turn_index = 0
+start_after_source_time = 1785906285
+start_after_sender_id = 540716134
+start_delay_ms = 0
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907688261
+position_cells = [12001.899, 51.999783, 12000.043]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907688367
+position_cells = [12001.899, 51.999813, 12000.043]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907688459
+position_cells = [12001.899, 51.999805, 12000.043]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907688564
+position_cells = [12001.899, 51.999767, 12000.043]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907688660
+position_cells = [12001.899, 51.999767, 12000.043]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907688758
+position_cells = [12001.899, 51.99977, 12000.043]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907688862
+position_cells = [12001.899, 51.999798, 12000.043]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907688987
+position_cells = [12001.825, 51.999783, 11999.548]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907689065
+position_cells = [12001.732, 51.99981, 11998.928]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907689162
+position_cells = [12001.621, 51.79863, 11998.184]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907689259
+position_cells = [12001.51, 51.252563, 11997.439]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907689362
+position_cells = [12001.694, 50.997765, 11996.617]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907689460
+position_cells = [12002.202, 50.99923, 11996.066]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907689564
+position_cells = [12002.202, 50.999638, 11996.066]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907689660
+position_cells = [12002.202, 50.999733, 11996.066]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907689758
+position_cells = [12002.202, 50.99976, 11996.066]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907689867
+position_cells = [12002.818, 50.999794, 11995.97]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907689959
+position_cells = [12003.568, 50.999794, 11995.983]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907690068
+position_cells = [12003.817, 50.999775, 11996.01]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907690162
+position_cells = [12003.817, 50.999775, 11996.01]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907690266
+position_cells = [12003.353, 50.999794, 11995.826]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907690367
+position_cells = [12002.658, 50.999794, 11995.544]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907690459
+position_cells = [12002.658, 50.99979, 11995.544]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907690563
+position_cells = [12002.658, 50.99978, 11995.544]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907690660
+position_cells = [12002.658, 50.99978, 11995.544]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907690760
+position_cells = [12002.658, 50.99978, 11995.544]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907690862
+position_cells = [12002.658, 50.999786, 11995.544]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785907690959
+position_cells = [12002.658, 50.999786, 11995.544]
+
+[[sessions]]
+campaign_id = "default"
+user_id = 1546228974
+turn_index = 0
+start_after_source_time = 1785904861
+start_after_sender_id = 1546228974
+start_delay_ms = 0
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908001093
+position_cells = [11993.466, 50.999783, 12001.403]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908001196
+position_cells = [11993.466, 50.999813, 12001.403]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908001298
+position_cells = [11993.466, 50.999767, 12001.403]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908001398
+position_cells = [11993.466, 50.999767, 12001.403]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908001498
+position_cells = [11993.466, 50.999798, 12001.403]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908001593
+position_cells = [11993.466, 50.999798, 12001.403]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908001696
+position_cells = [11993.466, 50.999794, 12001.403]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908001794
+position_cells = [11993.466, 50.999775, 12001.403]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908001897
+position_cells = [11993.466, 50.999775, 12001.403]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908001994
+position_cells = [11993.739, 50.99978, 12001.821]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908002093
+position_cells = [11994.284, 50.999794, 12002.504]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908002196
+position_cells = [11994.997, 50.99979, 12002.552]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908002294
+position_cells = [11995.865, 50.99978, 12002.445]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908002400
+position_cells = [11996.609, 50.99978, 12002.352]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908002495
+position_cells = [11997.227, 50.99978, 12002.717]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908002598
+position_cells = [11997.227, 50.999786, 12002.717]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908002696
+position_cells = [11997.227, 50.999786, 12002.717]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908002794
+position_cells = [11997.621, 50.99978, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908002900
+position_cells = [11998.114, 51.396038, 12003.402]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908002995
+position_cells = [11998.114, 52.354897, 12003.402]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908003094
+position_cells = [11998.114, 53.03767, 12003.402]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908003199
+position_cells = [11998.114, 53.24928, 12003.402]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908003294
+position_cells = [11998.114, 53.06027, 12003.402]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908003401
+position_cells = [11998.114, 52.52463, 12003.402]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908003496
+position_cells = [11998.114, 51.644115, 12003.402]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908003593
+position_cells = [11997.621, 50.928482, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908003696
+position_cells = [11997.621, 50.979763, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908003794
+position_cells = [11997.621, 50.99521, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908003900
+position_cells = [11997.621, 50.998486, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908003995
+position_cells = [11997.621, 50.99941, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908004097
+position_cells = [11997.621, 50.999714, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908004196
+position_cells = [11997.621, 50.99977, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908004294
+position_cells = [11997.621, 50.999767, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908004397
+position_cells = [11997.621, 50.99977, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908004495
+position_cells = [11997.621, 50.999775, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908004597
+position_cells = [11997.621, 50.99979, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908004696
+position_cells = [11997.621, 50.99979, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908004794
+position_cells = [11997.621, 50.99978, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908004897
+position_cells = [11997.621, 50.99978, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908004994
+position_cells = [11997.621, 50.99978, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908005097
+position_cells = [11997.621, 50.99979, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908005197
+position_cells = [11997.621, 50.99979, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908005295
+position_cells = [11997.621, 50.999783, 12003.021]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785908005398
+position_cells = [11997.621, 50.999783, 12003.021]
+
+[[sessions]]
+campaign_id = "default"
+user_id = 472617872
+turn_index = 0
+start_after_source_time = 1785920138
+start_after_sender_id = 472617872
+start_delay_ms = 0
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926687529
+position_cells = [11999.736, 51.999783, 12000.517]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926687632
+position_cells = [11999.736, 51.999786, 12000.517]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926687730
+position_cells = [11999.736, 51.999786, 12000.517]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926687835
+position_cells = [11999.736, 51.999783, 12000.517]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926687934
+position_cells = [11999.736, 51.999783, 12000.517]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926688032
+position_cells = [11999.736, 51.999786, 12000.517]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926688135
+position_cells = [11999.626, 51.999783, 12000.292]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926688233
+position_cells = [11999.271, 52.048737, 11999.63]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926688335
+position_cells = [11998.81, 51.967163, 11998.888]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926688433
+position_cells = [11998.19, 51.674942, 11998.485]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926688536
+position_cells = [11997.362, 50.89813, 11998.234]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926688635
+position_cells = [11996.677, 50.97114, 11998.032]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926688730
+position_cells = [11995.949, 50.991726, 11997.863]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926688836
+position_cells = [11995.086, 50.997974, 11997.964]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926688933
+position_cells = [11994.861, 50.999287, 11997.249]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926689029
+position_cells = [11995.003, 50.999653, 11996.562]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926689133
+position_cells = [11995.596, 50.99974, 11995.985]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926689230
+position_cells = [11995.596, 50.999767, 11995.985]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926689334
+position_cells = [11995.276, 50.999794, 11996.522]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926689431
+position_cells = [11994.986, 50.999794, 11997.211]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926689531
+position_cells = [11994.95, 50.99979, 11997.331]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926689632
+position_cells = [11994.95, 50.999775, 11997.331]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926689730
+position_cells = [11995.018, 50.99978, 11996.836]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926689834
+position_cells = [11995.437, 50.99979, 11996.15]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926689931
+position_cells = [11996.14, 50.99979, 11996.277]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926690028
+position_cells = [11996.256, 50.999786, 11996.323]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926690133
+position_cells = [11996.256, 50.99978, 11996.323]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926690230
+position_cells = [11996.256, 50.99978, 11996.323]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926690334
+position_cells = [11996.256, 50.999786, 11996.323]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926690431
+position_cells = [11996.256, 50.999786, 11996.323]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926690536
+position_cells = [11996.256, 50.999783, 11996.323]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926690632
+position_cells = [11996.256, 50.999783, 11996.323]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926690730
+position_cells = [11996.256, 50.999783, 11996.323]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926690835
+position_cells = [11996.256, 50.999786, 11996.323]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926690932
+position_cells = [11996.256, 50.999786, 11996.323]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926691040
+position_cells = [11996.256, 50.999783, 11996.323]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785926691132
+position_cells = [11996.256, 50.999783, 11996.323]
+
+[[sessions]]
+campaign_id = "default"
+user_id = 2704372961
+turn_index = 0
+start_after_source_time = 1785930969
+start_after_sender_id = 2704372961
+start_delay_ms = 0
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931033584
+position_cells = [12002.305, 50.999783, 11998.217]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931033685
+position_cells = [12002.305, 50.999813, 11998.217]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931033790
+position_cells = [12002.305, 50.999767, 11998.217]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931033884
+position_cells = [12002.305, 50.999767, 11998.217]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931033986
+position_cells = [12002.305, 50.999798, 11998.217]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931034087
+position_cells = [12002.305, 50.999798, 11998.217]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931034188
+position_cells = [12002.305, 50.99977, 11998.217]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931034290
+position_cells = [12002.127, 51.918594, 11998.646]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931034387
+position_cells = [12002.058, 52.72966, 11999.393]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931034524
+position_cells = [12002.145, 53.299606, 12000.089]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931034588
+position_cells = [12002.145, 53.303833, 12000.089]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931034687
+position_cells = [12002.145, 52.9424, 12000.089]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931034789
+position_cells = [12002.145, 52.258976, 12000.089]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931034888
+position_cells = [12001.411, 51.980312, 12000.242]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931034986
+position_cells = [12000.9375, 51.99538, 12000.405]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931035089
+position_cells = [12000.9375, 51.998558, 12000.405]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931035184
+position_cells = [12000.9375, 51.99945, 12000.405]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931035286
+position_cells = [12000.466, 51.99969, 12000.575]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931035384
+position_cells = [12000.466, 51.99975, 12000.575]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931035485
+position_cells = [12000.63, 51.999786, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931035589
+position_cells = [12000.63, 51.999794, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931035684
+position_cells = [12000.63, 51.999794, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931035788
+position_cells = [12000.63, 51.99978, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931035883
+position_cells = [12000.63, 51.99978, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931035982
+position_cells = [12000.63, 51.99979, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931036088
+position_cells = [12000.63, 51.99979, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931036182
+position_cells = [12000.63, 51.99979, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931036282
+position_cells = [12000.63, 51.99978, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931036389
+position_cells = [12000.63, 51.99978, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931036488
+position_cells = [12000.63, 51.999786, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931036589
+position_cells = [12000.63, 51.999786, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931036688
+position_cells = [12000.63, 51.99978, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931036790
+position_cells = [12000.63, 51.999783, 12000.912]
+
+[[sessions.keyframes]]
+source_unix_ms = 1785931036884
+position_cells = [12000.63, 51.999783, 12000.912]

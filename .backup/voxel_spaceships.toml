@@ -1,0 +1,92 @@
+layout_revision = 8
+
+[[ships]]
+id = "usi-arrogance"
+translation = [-125.0, 0.0, 125.0]
+rotation = [0.0, 0.0, 0.0, 1.0]
+linear_velocity = [0.0, 0.0, 0.0]
+angular_velocity = [0.0, 0.0, 0.0]
+
+[[ships]]
+id = "medium-ship-01"
+translation = [-125.0, 0.75, 120.0]
+rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+linear_velocity = [0.0, 0.0, 0.0]
+angular_velocity = [0.0, 0.0, 0.0]
+
+[ships.docking]
+carrier_id = "usi-arrogance"
+local_translation = [0.0, 0.75, -5.0]
+local_rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+
+[[ships]]
+id = "small-ship-01"
+translation = [-147.0, 0.75, 120.0]
+rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+linear_velocity = [0.0, 0.0, 0.0]
+angular_velocity = [0.0, 0.0, 0.0]
+
+[ships.docking]
+carrier_id = "usi-arrogance"
+local_translation = [-22.0, 0.75, -5.0]
+local_rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+
+[[ships]]
+id = "small-ship-02"
+translation = [-140.0, 0.75, 120.0]
+rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+linear_velocity = [0.0, 0.0, 0.0]
+angular_velocity = [0.0, 0.0, 0.0]
+
+[ships.docking]
+carrier_id = "usi-arrogance"
+local_translation = [-15.0, 0.75, -5.0]
+local_rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+
+[[ships]]
+id = "small-ship-03"
+translation = [-133.0, 0.75, 120.0]
+rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+linear_velocity = [0.0, 0.0, 0.0]
+angular_velocity = [0.0, 0.0, 0.0]
+
+[ships.docking]
+carrier_id = "usi-arrogance"
+local_translation = [-8.0, 0.75, -5.0]
+local_rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+
+[[ships]]
+id = "small-ship-04"
+translation = [-116.0, 0.75, 120.0]
+rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+linear_velocity = [0.0, 0.0, 0.0]
+angular_velocity = [0.0, 0.0, 0.0]
+
+[ships.docking]
+carrier_id = "usi-arrogance"
+local_translation = [9.0, 0.75, -5.0]
+local_rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+
+[[ships]]
+id = "small-ship-05"
+translation = [-109.0, 0.75, 120.0]
+rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+linear_velocity = [0.0, 0.0, 0.0]
+angular_velocity = [0.0, 0.0, 0.0]
+
+[ships.docking]
+carrier_id = "usi-arrogance"
+local_translation = [16.0, 0.75, -5.0]
+local_rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+
+[[ships]]
+id = "small-ship-06"
+translation = [-102.0, 0.75, 120.0]
+rotation = [0.0, 1.0, 0.0, -0.00000004371139]
+linear_velocity = [0.0, 0.0, 0.0]
+angular_velocity = [0.0, 0.0, 0.0]
+
+[ships.docking]
+carrier_id = "usi-arrogance"
+local_translation = [23.0, 0.75, -5.0]
+local_rotation = [0.0, 1.0, 0.0, -0.00000004371139]

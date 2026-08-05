@@ -2693,6 +2693,10 @@ fn load_persisted_voxel_scene(
             );
         }
     }
+    // Scenes saved before the GM island existed contain no island cells.
+    // Stamp the island back in so the GM teleport destination always has
+    // geometry, without touching any other saved edits.
+    ensure_gm_island_in_scene(&mut grid, scene);
     if let (Some(saved_planet), Ok(mut planet)) = (
         scene.planet.as_ref(),
         planets.single_mut(),
@@ -3754,6 +3758,16 @@ fn build_gm_island(grid: &mut Mut<Grid<u8>>) {
             let pad = GM_ISLAND_CENTER + IVec3::new(dx, 1, dz);
             grid.set(pad, if dx == 0 && dz == 0 { 6 } else { 7 });
         }
+    }
+}
+
+fn ensure_gm_island_in_scene(grid: &mut Mut<Grid<u8>>, scene: &PersistedVoxelScene) {
+    let has_island = scene
+        .voxels
+        .iter()
+        .any(|cell| is_gm_island_cell(IVec3::from_array(cell.position)));
+    if !has_island {
+        build_gm_island(grid);
     }
 }
 
@@ -16174,6 +16188,79 @@ mod tests {
             GM_ISLAND_CENTER.y + 2,
             GM_ISLAND_CENTER.z,
         )));
+    }
+
+    #[test]
+    fn gm_island_is_stamped_into_scenes_that_predate_it() {
+        let mut app = App::new();
+        let entity = app.world_mut().spawn(Grid::<u8>::new()).id();
+        let mut entity = app.world_mut().entity_mut(entity);
+        let mut grid = entity.get_mut::<Grid<u8>>().unwrap();
+        let scene = PersistedVoxelScene {
+            voxels: vec![PersistedVoxelCell {
+                position: [0, 0, 0],
+                material: 6,
+            }],
+            ..Default::default()
+        };
+        for cell in &scene.voxels {
+            grid.set(
+                IVec3::from_array(cell.position),
+                cell.material,
+            );
+        }
+
+        ensure_gm_island_in_scene(&mut grid, &scene);
+
+        assert_eq!(
+            grid.get(GM_ISLAND_CENTER),
+            Some(&1),
+            "stamped island grass must exist at the center"
+        );
+        assert_eq!(
+            grid.get(GM_ISLAND_CENTER + IVec3::Y),
+            Some(&6),
+            "stamped pad center must exist"
+        );
+        assert_eq!(
+            grid.get(IVec3::ZERO),
+            Some(&6),
+            "the pre-existing scene cell must survive the stamp"
+        );
+    }
+
+    #[test]
+    fn gm_island_migration_skips_scenes_that_already_know_the_island() {
+        let mut app = App::new();
+        let entity = app.world_mut().spawn(Grid::<u8>::new()).id();
+        let mut entity = app.world_mut().entity_mut(entity);
+        let mut grid = entity.get_mut::<Grid<u8>>().unwrap();
+        let scene = PersistedVoxelScene {
+            voxels: vec![PersistedVoxelCell {
+                position: GM_ISLAND_CENTER.to_array(),
+                material: 8,
+            }],
+            ..Default::default()
+        };
+        for cell in &scene.voxels {
+            grid.set(
+                IVec3::from_array(cell.position),
+                cell.material,
+            );
+        }
+
+        ensure_gm_island_in_scene(&mut grid, &scene);
+
+        assert_eq!(
+            grid.get(GM_ISLAND_CENTER),
+            Some(&8),
+            "a scene that already carries island cells must keep its edits untouched"
+        );
+        assert_eq!(
+            grid.get(GM_ISLAND_CENTER + IVec3::X),
+            Some(&0),
+            "the rest of the island must not be re-stamped"
+        );
     }
 
     #[test]

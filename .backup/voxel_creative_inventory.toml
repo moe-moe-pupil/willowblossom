@@ -1,0 +1,3 @@
+hotbar = ["ToolGun", { Light = "Point" }, "TeleportTool", "SpaceshipPossessionTool", "PlayerPossessionTool", "DoorLockTool", { Light = "Edit" }, { Material = 8 }, { Mode = "Remove" }, { Material = 10 }]
+selected_hotbar_slot = 4
+tool_gun_mode = "Explode"

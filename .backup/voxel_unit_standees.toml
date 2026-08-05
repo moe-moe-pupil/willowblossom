@@ -1,0 +1,7 @@
+[[standees]]
+unit_id = "space-tentacle"
+translation = [-127.218994, -44.258987, 106.35329]
+rotation = [0.0, 0.059190832, 0.0, 0.9982467]
+
+[standees.visibility]
+scope = "public"

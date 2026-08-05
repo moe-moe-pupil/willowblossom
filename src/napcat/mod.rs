@@ -7779,13 +7779,13 @@ fn format_private_help() -> String {
 fn format_private_attribute_help() -> String {
     [
         "属性说明",
-        "力量（STR）：每点力量提供1点生命值、0.5米/秒移动速度、0.1%体型和2.5物理攻击加值。",
+        "力量（STR）：每点力量提供1点生命值、0.5米/秒移动速度、0.1%体型和2.5%物理攻击加值。",
         "敏捷（AGI）：每点敏捷提供1米/秒移动速度和2%攻击速度。100%攻速可一轮行动两次；不足100%的攻速会提供基于力量的基础物理攻击百分比提升。",
         "灵巧（DEX）：每点灵巧提供0.5米/秒移动速度、3远程物理攻击加值和1近战物理攻击加值。",
         "体质（VIT）：每点体质提供3点生命值；脱战后且非重伤时提供1点/轮生命回复；减少1%因受伤状态遭受的属性惩罚。",
-        "智力（INT）：每点智力提供5点魔法值、1%魔法额外消耗、2%法术伤害和1%治疗加成。达到10点可感知周围环境的魔力并接入魔网；达到15点可模糊感知周围存在的法术类buff或正在释放的法术类技能，不受视野阻碍限制；达到20点可使用侦测魔法，基础半径50米，之后每点智力增加2米侦测半径。",
+        "智力（INT）：每点智力提供5点魔法值、1%魔法额外消耗、2%法术伤害和1%治疗加成。达到5点可感知周围环境的魔力并接入魔网；达到10点可模糊感知周围存在的法术类buff或正在释放的法术类技能，不受视野阻碍限制；达到20点可使用侦测魔法，基础半径50米，之后每点智力增加2米侦测半径。",
         "智慧（WIS）：每点智慧提供2.5点魔法值、脱战后1点/轮魔法回复、更好的精神力引导与控制，以及2%治疗加成。",
-        "知识（K）：每点知识提供额外线索、情报和操作部分设备的能力。达到5点可完整认识自身，得知自己的具体生命值和自己对目标造成的具体伤害；达到20点可消耗一个观察小动作，分析buff或技能的伤害/治疗数值与持续时间。",
+        "知识（K）：每点知识提供额外线索、情报和操作部分设备的能力。达到5点可完整认识自身，得知自己的具体生命值和自己对目标造成的具体伤害；达到15点可消耗一个观察小动作，分析buff或技能的伤害/治疗数值与持续时间。",
         "魅力（CHA）：每点魅力提供额外的NPC交流好感、0.05召唤物上限和2%召唤物伤害加成。",
     ]
     .join("\n")
@@ -7799,7 +7799,7 @@ fn format_private_weave(manager: &NapcatMessageManager, target_id: &str) -> Stri
         return "角色卡尚未完成，暂时无法感知魔网。".to_owned();
     }
     let int_ = character_total_status(character).int_;
-    if int_ < 10 {
+    if int_ < 5 {
         return "你的智力尚未达到10点，无法感知魔网。".to_owned();
     }
     let Some(group) = manager.group_for_player_target(target_id) else {
@@ -8822,7 +8822,7 @@ fn character_creation_back(character: &mut PlayerCharacter) -> String {
         CharacterCreationStep::Nickname => {
             character.creation_step = CharacterCreationStep::Image;
             character.image.clear();
-            "已退回图片录入。请发送人物立绘图片链接；如果暂时没有，输入【.】跳过。".to_owned()
+            "已退回图片录入。请发送人物立绘图片或图片链接；如果暂时没有，输入【.】跳过。".to_owned()
         },
         CharacterCreationStep::Normal => "未处于建卡流程。输入【.兑换】开始。".to_owned(),
         CharacterCreationStep::ConfirmStatus

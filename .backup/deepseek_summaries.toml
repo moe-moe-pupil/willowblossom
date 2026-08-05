@@ -1,0 +1,266 @@
+last_post_text = ""
+
+[[summaries."campaign:64656661756c74:460825301".blocks]]
+latest = """
+事件：玩家天晴设定了初始属性（力量5、敏捷2、体质3），询问是否可以抽取天赋，并提到“兑换5”。
+决定/线索：未明确做出任何决定，玩家仅表达抽取天赋意愿及兑换数字“5”。
+待跟进：确认天赋抽取规则，处理玩家天晴的兑换请求。"""
+message_count = 5
+pending = false
+
+[[summaries."campaign:64656661756c74:460825301".blocks]]
+latest = """
+事件：天晴设定初始属性为力量5、敏捷2、体质3，并询问是否可以抽取天赋，随后提到“兑换”及数字5和2。  
+决定/线索：属性分配已明确；可能有兑换相关操作。  
+待跟进：天赋抽取及兑换的具体处理。"""
+message_count = 6
+pending = false
+
+[[summaries."campaign:64656661756c74:460825301".blocks]]
+latest = """
+事件：天晴询问技能兑换是否由自己决定文本，以及技能强度如何确定，指出规则未明确技能强度。随后天晴提出技能“玄空破”的描述（远程触发，对敌方从内部造成恐怖又玄妙的爆炸）。
+决定/线索：无
+待跟进：需解决技能强度确定规则的问题，并确认“玄空破”是否通过。"""
+message_count = 11
+pending = false
+
+[[summaries."campaign:64656661756c74:1546228974".blocks]]
+latest = """
+事件：无  
+决定/线索：无  
+待跟进：无"""
+message_count = 5
+pending = false
+
+[[summaries."campaign:64656661756c74:1546228974".blocks]]
+latest = """
+事件：无
+决定/线索：无
+待跟进：无"""
+message_count = 10
+pending = false
+
+[[summaries."campaign:64656661756c74:1546228974".blocks]]
+latest = """
+事件：老吴执行抽取天赋指令，结果为3，尚未确定角色。  
+决定/线索：无  
+待跟进：指导如何基于当前天赋结果创建技能。"""
+message_count = 15
+pending = false
+
+[[summaries."campaign:64656661756c74:1546228974".blocks]]
+latest = """
+事件：老吴设计角色能力。  
+决定/线索：提出【飞针】(3分)、【吹针术】(3分)、【溜之大吉】(3分)、【针匣】(1分)四个能力。  
+待跟进：需确认规则允许及分数分配是否合理。"""
+message_count = 20
+pending = false
+
+[[summaries."campaign:64656661756c74:472617872".blocks]]
+latest = """
+事件：玩家“豆沙了⁧ ~喵⁦⁦”表示还没有（做某事），下班再看；连续发送“兑换”和“4”。  
+决定/线索：无明确决定或线索。  
+待跟进：无"""
+message_count = 5
+pending = false
+
+[[summaries."campaign:64656661756c74:472617872".blocks]]
+latest = """
+事件：玩家豆沙了⁧ ~喵⁦⁦依次输入 ..、4、3、1、2。  
+决定/线索：无  
+待跟进：无"""
+message_count = 10
+pending = false
+
+[[summaries."campaign:64656661756c74:472617872".blocks]]
+latest = """
+事件：豆沙了⁧ ~喵⁦⁦ 完成帝国政委角色创建，装备链锯剑与爆失枪，并宣告抽取辅助天赋。  
+决定/线索：选定职业政委（技能战吼），装备链锯剑（撕裂流血）与爆失枪。  
+待跟进：辅助天赋抽取结果。"""
+message_count = 15
+pending = false
+
+[[summaries."campaign:64656661756c74:2669486884".blocks]]
+latest = """
+事件：小马在频道中询问“死亡空间团缺人吗？”，表示想申请但无法建立临时对话。  
+决定/线索：无  
+待跟进：小马无法建立临时对话，需联系 GM 或他人协助处理申请。"""
+message_count = 5
+pending = false
+
+[[summaries."campaign:64656661756c74:2669486884".blocks]]
+latest = """
+事件：小马表示从其他群看到转发，询问是否还缺人，并提及没有手册。
+决定/线索：无
+待跟进：确认是否缺人并回复小马。"""
+message_count = 10
+pending = false
+
+[[summaries."campaign:64656661756c74:2669486884".blocks]]
+latest = """
+事件：小马回顾上次辐射团，因部分PL不熟悉辐射设定且另有个人想法，导致团队摆烂。
+决定/线索：无
+待跟进：无"""
+message_count = 15
+pending = false
+
+[[summaries."campaign:64656661756c74:2669486884".blocks]]
+latest = """
+事件：小马提及上次辐射主题团因部分玩家不了解辐射游戏且有各自想法，最终导致摆烂并团灭。  
+决定/线索：小马询问当前团是否能顺利进行。  
+待跟进：当前团的可行性。"""
+message_count = 16
+pending = false
+
+[[summaries."campaign:64656661756c74:2669486884".blocks]]
+latest = """
+事件：小马表示自己通常只参加感兴趣的团，感觉可能来错了，但选择先观察，并提到“兑换”。
+决定/线索：小马决定先看看，并提及“兑换”。
+待跟进：关于“兑换”的具体操作或后续行动。"""
+message_count = 21
+pending = false
+
+[[summaries."campaign:64656661756c74:2704372961".blocks]]
+latest = """
+事件：格林（来自“肥宅安乐窝”群）询问团是否满员，并提及“散邪那看到的”和“。兑换”。  
+决定/线索：无  
+待跟进：确认团是否满员，回应格林询问。"""
+message_count = 5
+pending = false
+
+[[summaries."campaign:64656661756c74:2704372961".blocks]]
+latest = """
+事件：无
+决定/线索：无
+待跟进：无"""
+message_count = 10
+pending = false
+
+[[summaries."campaign:64656661756c74:2704372961".blocks]]
+latest = """
+事件：格林发送了多个数字：0、5、0、0、5。  
+决定/线索：无  
+待跟进：无"""
+message_count = 15
+pending = false
+
+[[summaries."campaign:64656661756c74:2704372961".blocks]]
+latest = """
+事件：无  
+决定/线索：无  
+待跟进：无"""
+message_count = 16
+pending = false
+
+[[summaries."campaign:64656661756c74:2704372961".blocks]]
+latest = """
+事件：格林声明【魔形】10分，描述其可完全控制身体改变外观、模拟特殊能力、复制指纹瞳孔过安检。
+决定/线索：无
+待跟进：无"""
+message_count = 21
+pending = false
+
+[[summaries."campaign:64656661756c74:2704372961".blocks]]
+latest = """
+事件：格林询问辅助是否有负面效果，并提问有无知识类辅助天赋或加强存活的天赋。  
+决定/线索：无  
+待跟进：回应格林关于辅助负面效果和天赋的提问。"""
+message_count = 26
+pending = false
+
+[[summaries."campaign:64656661756c74:2704372961".blocks]]
+latest = """
+事件：格林抽取辅助天赋，并对天赋2效果（正常走路是否触发、是否只加上限不加血）和1效果（选定目标死亡后果）提问。
+决定：无
+待跟进：回答格林关于天赋效果的疑问。"""
+message_count = 31
+pending = false
+
+[[summaries."campaign:64656661756c74:2704372961".blocks]]
+latest = """
+事件：格林提出“但是不会增加了？”的疑问，并表示“董了，锁了人盯着对面杀”，随后做出“选择1”，并提及“册那队长”。
+决定/线索：选择1。
+待跟进：无"""
+message_count = 36
+pending = false
+
+[[summaries."campaign:64656661756c74:2704372961".blocks]]
+latest = """
+事件：格林发现没有图片，发出求助后解释自己用魔形变变色龙隐身了。  
+决定/线索：无  
+待跟进：帮助格林处理图片相关问题。"""
+message_count = 41
+pending = false
+
+[[summaries."campaign:64656661756c74:group:276168175:public".blocks]]
+latest = """
+事件：萌萌小学神宣布复团，说明柳絮软件备战完成，设定默认相互识认规则；玩家间用外貌描写互相调侃（豆沙了⁧ ~喵⁦⁦像老吴、天晴与老吴讨论“闭环”）；天晴询问种族胜利条件，萌萌小学神确认只剩一种种族获胜、每个种族为一个势力；豆沙了⁧ ~喵⁦⁦声称自己是太空死灵并说“大杀四方”。
+决定/线索：默认相识规则成立（除非主动掩饰）；种族胜利条件为单一势力存活；豆沙了⁧ ~喵⁦⁦选择太空死灵种族。
+待跟进：无"""
+message_count = 12
+pending = false
+
+[[summaries."campaign:64656661756c74:540716134".blocks]]
+latest = """
+事件：黑莫格斯加入临时会话，表示参团并询问规则。  
+决定/线索：询问“能兑换神奇道具之类的吗”，以及“属性有初始值的吗，假如我1点力量都不换岂不是伤害9”。  
+待跟进：解答神奇道具兑换与属性初始值问题。"""
+message_count = 5
+pending = false
+
+[[summaries."campaign:64656661756c74:540716134".blocks]]
+latest = """
+事件：无  
+决定/线索：无  
+待跟进：黑莫格斯询问能否兑换神奇道具，属性是否有初始值，以及如果力量不兑换是否会伤害为9。"""
+message_count = 6
+pending = false
+
+[[summaries."campaign:64656661756c74:540716134".blocks]]
+latest = """
+事件：黑莫格斯尝试兑换属性点，具体数值为敏捷3、灵巧3、魅力2、智力1、知识1，并询问“这样子？”。
+决定/线索：玩家希望按上述分配方案进行兑换。
+待跟进：确认兑换是否成功或是否需要进一步操作。"""
+message_count = 11
+pending = false
+
+[[summaries."campaign:64656661756c74:540716134".blocks]]
+latest = """
+事件：无  
+决定/线索：无  
+待跟进：无"""
+message_count = 16
+pending = false
+
+[[summaries."campaign:64656661756c74:540716134".blocks]]
+latest = """
+事件：黑莫格斯掷骰结果为3、3、0、1、0、1。  
+决定/线索：无  
+待跟进：无"""
+message_count = 17
+pending = false
+
+[[summaries."campaign:64656661756c74:540716134".blocks]]
+latest = """
+事件：无  
+决定/线索：黑莫格斯提及他的能力包括随意幻化容貌和隐身  
+待跟进：无"""
+message_count = 22
+pending = false
+
+[[summaries."campaign:64656661756c74:540716134".blocks]]
+latest = """
+事件：黑莫格斯寻找自身、要求链接判定添加http或www.、确认角色名为“黑莫格斯”、输入指令 .抽取天赋。
+决定/线索：链接判定规则调整；角色名固定为“黑莫格斯”。
+待跟进：无"""
+message_count = 27
+pending = false
+
+[director_request_fingerprints]
+"replay-director:default:all:dialogue-count:3" = "b1b7830567b574f4649bd679e6775bfc3c8be00bed0a6155443cbbe3a1b3b3a7"
+"replay-director:default:all:dialogue-count:6" = "8b1ae30ad0c6cc8af966a352378812d689ec6879583c87f6be464c7d03c78535"
+"replay-director:default:all:dialogue-count:7" = "7e2accd2f71fdff24f2e6d39bb817d4447d040d0265da5a3927b07a9aaf24c43"
+"replay-director:default:all:dialogue-count:2" = "be8d7842a76a63280abeedba60ae0eb67003c49e092baecd3cec8e3748d558a4"
+"replay-director:default:all:dialogue-count:20" = "dc6cbff691d04c27b4932668683694f52c416ba0385c5c2519d3841171bf2d45"
+"replay-director:default:all:dialogue-count:19" = "9feaddbf87b9f034eed56a56ca3892010fead837d2d7d155e48eea4bf7f45ec4"
+"replay-director:default:all:dialogue-count:4" = "15513dc24a098e42ae656a5b9141cc2e22a9f4c1016f6cc9cce61a31e57ad501"

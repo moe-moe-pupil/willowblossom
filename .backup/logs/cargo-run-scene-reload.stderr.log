@@ -1,0 +1,451 @@
+warning: field `child` is never read
+  --> crates\bevy_voxel\src\grid.rs:63:5
+   |
+60 | struct Entry<T> {
+   |        ----- field in this struct
+...
+63 |     child: Option<Entity>,
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxxelmaxx` (lib) generated 1 warning
+warning: field `round` is never read
+   --> src\battle_round.rs:438:9
+    |
+434 | pub struct BattleEncounterEntity {
+    |            --------------------- field in this struct
+...
+438 |     pub round: u32,
+    |         ^^^^^
+    |
+    = note: `BattleEncounterEntity` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `encounter_id`, `target_id`, and `display_name` are never read
+   --> src\battle_round.rs:444:9
+    |
+443 | pub struct BattleParticipantEntity {
+    |            ----------------------- fields in this struct
+444 |     pub encounter_id: String,
+    |         ^^^^^^^^^^^^
+445 |     pub target_id: String,
+    |         ^^^^^^^^^
+446 |     pub display_name: String,
+    |         ^^^^^^^^^^^^
+    |
+    = note: `BattleParticipantEntity` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `current` is never read
+   --> src\battle_round.rs:451:9
+    |
+450 | pub struct TurnCounter {
+    |            ----------- field in this struct
+451 |     pub current: u32,
+    |         ^^^^^^^
+    |
+    = note: `TurnCounter` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `alive`, `negative_layers`, and `pending_negative` are never read
+   --> src\battle_round.rs:456:9
+    |
+455 | pub struct BattlePresence {
+    |            -------------- fields in this struct
+456 |     pub alive: bool,
+    |         ^^^^^
+457 |     pub negative_layers: u32,
+    |         ^^^^^^^^^^^^^^^
+458 |     pub pending_negative: bool,
+    |         ^^^^^^^^^^^^^^^^
+    |
+    = note: `BattlePresence` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `hp`, `max_hp`, `mp`, `max_mp`, `hp_regen`, and `mp_regen` are never read
+   --> src\battle_round.rs:463:9
+    |
+462 | pub struct BattleVitals {
+    |            ------------ fields in this struct
+463 |     pub hp: f32,
+    |         ^^
+464 |     pub max_hp: f32,
+    |         ^^^^^^
+465 |     pub mp: f32,
+    |         ^^
+466 |     pub max_mp: f32,
+    |         ^^^^^^
+467 |     pub hp_regen: f32,
+    |         ^^^^^^^^
+468 |     pub mp_regen: f32,
+    |         ^^^^^^^^
+    |
+    = note: `BattleVitals` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: method `advance_participant` is never used
+    --> src\battle_round.rs:4163:8
+     |
+2816 | impl BattleRoundStore {
+     | --------------------- method in this implementation
+...
+4163 |     fn advance_participant(&mut self, encounter_id: &str, target_id: &str, resume: bool) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^
+
+warning: variant `Connected` is never constructed
+  --> src\napcat\mod.rs:91:5
+   |
+88 | pub enum ConnectionState {
+   |          --------------- variant in this enum
+...
+91 |     Connected,
+   |     ^^^^^^^^^
+   |
+   = note: `ConnectionState` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `low_hp_damage_multiplier` is never used
+    --> src\napcat\mod.rs:8008:8
+     |
+8008 | pub fn low_hp_damage_multiplier(hp: f32, max_hp: f32) -> f32 {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `images` is never read
+   --> src\ui\mod.rs:794:5
+    |
+793 | pub struct GIFImages {
+    |            --------- field in this struct
+794 |     images: HashMap<String, Vec<(TextureHandle, u32)>>,
+    |     ^^^^^^
+
+warning: struct `CircleImageButton` is never constructed
+   --> src\ui\mod.rs:919:12
+    |
+919 | pub struct CircleImageButton {
+    |            ^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> src\ui\mod.rs:930:12
+    |
+929 | impl CircleImageButton {
+    | ---------------------- associated function in this implementation
+930 |     pub fn new(image: egui::TextureId, size: f32) -> Self { Self { image, size } }
+    |            ^^^
+
+warning: `willowblossom` (lib) generated 11 warnings
+    Finished `dev` profile [optimized + debuginfo] target(s) in 1.35s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target\debug\willowblossom.exe`
+[2m2026-07-23T08:42:40.710643Z[0m [32m INFO[0m [2mbevy_diagnostic::system_information_diagnostics_plugin::internal[0m[2m:[0m SystemInfo { os: "Windows 11 Pro", kernel: "26200", cpu: "AMD Ryzen 9 7950X 16-Core Processor", core_count: "16", memory: "31.1 GiB" }
+[2m2026-07-23T08:42:41.414635Z[0m [32m INFO[0m [2mbevy_render::renderer[0m[2m:[0m AdapterInfo { name: "NVIDIA GeForce RTX 4070 Ti", vendor: 4318, device: 10114, device_type: DiscreteGpu, device_pci_bus_id: "0000:01:00.0", driver: "NVIDIA", driver_info: "591.86", backend: Vulkan, subgroup_min_size: 32, subgroup_max_size: 32, transient_saves_memory: false }
+[2m2026-07-23T08:42:41.643528Z[0m [32m INFO[0m [2mbevy_pbr::cluster[0m[2m:[0m GPU clustering is supported on this device.
+[2m2026-07-23T08:42:41.643811Z[0m [32m INFO[0m [2mbevy_render::batching::gpu_preprocessing[0m[2m:[0m GPU preprocessing is fully supported on this device.
+[2m2026-07-23T08:42:41.644319Z[0m [32m INFO[0m [2mbevy_egui::render[0m[2m:[0m Using bindless_mode_array_size 16 (Device maximum 1048576)
+[2m2026-07-23T08:42:41.644698Z[0m [32m INFO[0m [2mbevy_winit::system[0m[2m:[0m Creating new window 柳絮，只是另一个跑团软件 (65v0)
+[2m2026-07-23T08:42:42.325858Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 879v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.326132Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 880v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.326238Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 881v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.326330Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 882v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.326394Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 883v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.326471Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 884v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.326525Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 885v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.326579Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 886v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.326752Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 887v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.326823Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 888v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.326919Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 889v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.326995Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 890v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.327082Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 891v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.327257Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 892v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.327327Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 893v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.327402Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 894v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.327465Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 895v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.327551Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 896v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.327645Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 897v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.327720Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 898v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.327805Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 899v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.327872Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 900v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.327936Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 901v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.328020Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 902v0 with the InheritedVisibility component has a parent (878v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.328097Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 1031v0 with the InheritedVisibility component has a parent (868v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.328160Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 1032v0 with the InheritedVisibility component has a parent (868v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.328225Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 1033v0 with the InheritedVisibility component has a parent (868v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.328332Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 1034v0 with the InheritedVisibility component has a parent (868v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.328436Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 1035v0 with the InheritedVisibility component has a parent (868v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.328551Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 1036v0 with the InheritedVisibility component has a parent (868v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.328615Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 1037v0 with the InheritedVisibility component has a parent (868v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T08:42:42.328707Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 1038v0 with the InheritedVisibility component has a parent (868v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+connected to NapCat websocket at ws://localhost:3001
+NapCat websocket response was not a persisted chat message: {"time":1784796193,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796223,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796253,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796283,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+[2m2026-07-23T08:45:12.041177Z[0m [33m WARN[0m [2mavian3d::dynamics::rigid_body::mass_properties[0m[2m:[0m Dynamic rigid body 903v0 has no mass or inertia. This can cause NaN values. Consider adding a `MassPropertiesBundle` or a `Collider` with mass.
+NapCat websocket response was not a persisted chat message: {"time":1784796313,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+[2m2026-07-23T08:45:14.026823Z[0m [33m WARN[0m [2mavian3d::dynamics::rigid_body::mass_properties[0m[2m:[0m Dynamic rigid body 903v0 has no mass or inertia. This can cause NaN values. Consider adding a `MassPropertiesBundle` or a `Collider` with mass.
+[2m2026-07-23T08:45:23.498841Z[0m [33m WARN[0m [2mavian3d::dynamics::rigid_body::mass_properties[0m[2m:[0m Dynamic rigid body 903v0 has no mass or inertia. This can cause NaN values. Consider adding a `MassPropertiesBundle` or a `Collider` with mass.
+[2m2026-07-23T08:45:35.628222Z[0m [33m WARN[0m [2mavian3d::dynamics::rigid_body::mass_properties[0m[2m:[0m Dynamic rigid body 903v0 has no mass or inertia. This can cause NaN values. Consider adding a `MassPropertiesBundle` or a `Collider` with mass.
+NapCat websocket response was not a persisted chat message: {"time":1784796343,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+[2m2026-07-23T08:45:47.374267Z[0m [33m WARN[0m [2mavian3d::dynamics::rigid_body::mass_properties[0m[2m:[0m Dynamic rigid body 903v0 has no mass or inertia. This can cause NaN values. Consider adding a `MassPropertiesBundle` or a `Collider` with mass.
+[2m2026-07-23T08:45:52.887656Z[0m [33m WARN[0m [2mavian3d::dynamics::rigid_body::mass_properties[0m[2m:[0m Dynamic rigid body 903v0 has no mass or inertia. This can cause NaN values. Consider adding a `MassPropertiesBundle` or a `Collider` with mass.
+[2m2026-07-23T08:45:54.669681Z[0m [33m WARN[0m [2mavian3d::dynamics::rigid_body::mass_properties[0m[2m:[0m Dynamic rigid body 903v0 has no mass or inertia. This can cause NaN values. Consider adding a `MassPropertiesBundle` or a `Collider` with mass.
+NapCat websocket response was not a persisted chat message: {"time":1784796373,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+[2m2026-07-23T08:46:27.596278Z[0m [33m WARN[0m [2mavian3d::dynamics::rigid_body::mass_properties[0m[2m:[0m Dynamic rigid body 903v0 has no mass or inertia. This can cause NaN values. Consider adding a `MassPropertiesBundle` or a `Collider` with mass.
+[2m2026-07-23T08:46:43.776679Z[0m [33m WARN[0m [2mavian3d::dynamics::rigid_body::mass_properties[0m[2m:[0m Dynamic rigid body 903v0 has no mass or inertia. This can cause NaN values. Consider adding a `MassPropertiesBundle` or a `Collider` with mass.
+NapCat websocket response was not a persisted chat message: {"time":1784796403,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796433,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796463,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796493,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796523,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796553,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796583,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796613,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796643,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796673,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796703,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796733,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796763,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796794,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796824,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796854,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796884,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796914,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796944,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784796974,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797004,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797034,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797064,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797094,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797124,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797154,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797184,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797214,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797244,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797274,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797304,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797334,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797364,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797394,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797424,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797454,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797484,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797514,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797544,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797574,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797604,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797634,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797664,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797694,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797724,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797754,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797784,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797814,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797844,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797874,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797904,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797934,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797964,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784797994,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798024,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798054,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798084,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798114,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798144,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798174,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798204,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798234,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798264,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798294,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798324,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798354,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798384,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798414,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798444,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798474,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798504,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798534,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798564,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798594,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798624,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798654,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798684,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798714,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798744,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798774,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798804,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798834,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798864,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798894,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798924,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798954,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784798984,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799014,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799044,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+[2m2026-07-23T09:31:03.627748Z[0m [33m WARN[0m [2mavian3d::dynamics::rigid_body::mass_properties[0m[2m:[0m Dynamic rigid body 903v0 has no mass or inertia. This can cause NaN values. Consider adding a `MassPropertiesBundle` or a `Collider` with mass.
+NapCat websocket response was not a persisted chat message: {"time":1784799074,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799104,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799134,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799164,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799194,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799224,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799254,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799284,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799314,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799344,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799374,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799404,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799434,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799464,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799494,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799524,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799554,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799584,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799614,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799644,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799674,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799704,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799734,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799764,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799794,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799824,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799854,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799884,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799914,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799944,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784799974,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800004,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800034,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800064,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800094,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800124,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800154,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800184,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800214,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800244,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800274,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800304,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800334,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800364,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800394,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800424,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800454,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800484,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800514,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800544,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800574,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800604,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800634,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800664,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800694,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800724,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800754,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800784,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800814,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800844,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800874,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800904,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800934,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800964,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784800994,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801024,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801054,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801084,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801114,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801144,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801174,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801204,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801234,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801265,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801295,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801325,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801355,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801385,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801415,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801445,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801475,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801505,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801535,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801565,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801595,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801625,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801655,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801685,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801715,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801745,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801775,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801805,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801835,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801865,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801895,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801925,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801955,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784801985,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802015,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802045,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802075,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802105,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802135,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802165,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802195,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802225,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802255,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802285,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802315,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802345,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802375,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802405,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802435,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802465,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802495,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802525,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802555,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802585,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802615,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802645,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802675,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802705,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802735,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802765,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802795,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802825,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802855,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802885,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802915,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802945,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784802975,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784803005,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784803035,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784803065,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784803095,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784803125,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+NapCat websocket response was not a persisted chat message: {"time":1784803155,"self_id":3432505351,"post_type":"meta_event","meta_event_type":"heartbeat","status":{"online":true,"good":true},"interval":30000}; parse error: Some(Error("missing field `message_type`", line: 1, column: 149))
+[2m2026-07-23T10:39:42.259034Z[0m [32m INFO[0m [2mbevy_window::system[0m[2m:[0m No windows are open, exiting
+[2m2026-07-23T10:39:42.259541Z[0m [32m INFO[0m [2mbevy_winit::system[0m[2m:[0m Closing window 65v0

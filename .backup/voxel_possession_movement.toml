@@ -1,0 +1,31 @@
+[[records]]
+campaign_id = "default"
+user_id = 540716134
+turn = 0
+movement_used = 1.7833173
+completed = true
+turn_start_position_cells = [12001.899, 50.999783, 12000.043]
+
+[[records]]
+campaign_id = "default"
+user_id = 1546228974
+turn = 0
+movement_used = 22.6
+completed = true
+turn_start_position_cells = [11993.466, 49.999783, 12001.403]
+
+[[records]]
+campaign_id = "default"
+user_id = 472617872
+turn = 0
+movement_used = 3.0004644
+completed = true
+turn_start_position_cells = [11999.736, 50.999783, 12000.517]
+
+[[records]]
+campaign_id = "default"
+user_id = 2704372961
+turn = 0
+movement_used = 46.801636
+completed = true
+turn_start_position_cells = [12002.305, 49.999783, 11998.217]

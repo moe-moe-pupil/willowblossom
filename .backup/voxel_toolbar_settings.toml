@@ -1,0 +1,14 @@
+brush_radius = 0
+first_person_speed = 2.0
+placed_light_color = [1.0, 0.78, 0.48]
+placed_light_intensity = 1800.0
+placed_light_range = 8.0
+physics_push_pull_impulse = 4.0
+physics_explosion_impulse = 14.0
+physics_explosion_radius = 0.25
+ambient_brightness = 72.0
+key_light_illuminance = 8500.0
+key_light_color = [1.0, 1.0, 1.0]
+fill_light_illuminance = 1600.0
+fill_light_color = [0.5, 0.65, 1.0]
+radiance_intensity = 0.55

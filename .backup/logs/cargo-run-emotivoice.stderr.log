@@ -1,0 +1,350 @@
+warning: field `child` is never read
+  --> crates\bevy_voxel\src\grid.rs:63:5
+   |
+60 | struct Entry<T> {
+   |        ----- field in this struct
+...
+63 |     child: Option<Entity>,
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxxelmaxx` (lib) generated 1 warning
+   Compiling willowblossom v0.0.1 (D:\rust_repo\willowblossom)
+warning: field `round` is never read
+   --> src\battle_round.rs:438:9
+    |
+434 | pub struct BattleEncounterEntity {
+    |            --------------------- field in this struct
+...
+438 |     pub round: u32,
+    |         ^^^^^
+    |
+    = note: `BattleEncounterEntity` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `encounter_id`, `target_id`, and `display_name` are never read
+   --> src\battle_round.rs:444:9
+    |
+443 | pub struct BattleParticipantEntity {
+    |            ----------------------- fields in this struct
+444 |     pub encounter_id: String,
+    |         ^^^^^^^^^^^^
+445 |     pub target_id: String,
+    |         ^^^^^^^^^
+446 |     pub display_name: String,
+    |         ^^^^^^^^^^^^
+    |
+    = note: `BattleParticipantEntity` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `current` is never read
+   --> src\battle_round.rs:451:9
+    |
+450 | pub struct TurnCounter {
+    |            ----------- field in this struct
+451 |     pub current: u32,
+    |         ^^^^^^^
+    |
+    = note: `TurnCounter` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `alive`, `negative_layers`, and `pending_negative` are never read
+   --> src\battle_round.rs:456:9
+    |
+455 | pub struct BattlePresence {
+    |            -------------- fields in this struct
+456 |     pub alive: bool,
+    |         ^^^^^
+457 |     pub negative_layers: u32,
+    |         ^^^^^^^^^^^^^^^
+458 |     pub pending_negative: bool,
+    |         ^^^^^^^^^^^^^^^^
+    |
+    = note: `BattlePresence` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `hp`, `max_hp`, `mp`, `max_mp`, `hp_regen`, and `mp_regen` are never read
+   --> src\battle_round.rs:463:9
+    |
+462 | pub struct BattleVitals {
+    |            ------------ fields in this struct
+463 |     pub hp: f32,
+    |         ^^
+464 |     pub max_hp: f32,
+    |         ^^^^^^
+465 |     pub mp: f32,
+    |         ^^
+466 |     pub max_mp: f32,
+    |         ^^^^^^
+467 |     pub hp_regen: f32,
+    |         ^^^^^^^^
+468 |     pub mp_regen: f32,
+    |         ^^^^^^^^
+    |
+    = note: `BattleVitals` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: method `advance_participant` is never used
+    --> src\battle_round.rs:4163:8
+     |
+2816 | impl BattleRoundStore {
+     | --------------------- method in this implementation
+...
+4163 |     fn advance_participant(&mut self, encounter_id: &str, target_id: &str, resume: bool) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^
+
+warning: variant `Connected` is never constructed
+  --> src\napcat\mod.rs:91:5
+   |
+88 | pub enum ConnectionState {
+   |          --------------- variant in this enum
+...
+91 |     Connected,
+   |     ^^^^^^^^^
+   |
+   = note: `ConnectionState` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `low_hp_damage_multiplier` is never used
+    --> src\napcat\mod.rs:7977:8
+     |
+7977 | pub fn low_hp_damage_multiplier(hp: f32, max_hp: f32) -> f32 {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `images` is never read
+   --> src\ui\mod.rs:794:5
+    |
+793 | pub struct GIFImages {
+    |            --------- field in this struct
+794 |     images: HashMap<String, Vec<(TextureHandle, u32)>>,
+    |     ^^^^^^
+
+warning: struct `CircleImageButton` is never constructed
+   --> src\ui\mod.rs:919:12
+    |
+919 | pub struct CircleImageButton {
+    |            ^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> src\ui\mod.rs:930:12
+    |
+929 | impl CircleImageButton {
+    | ---------------------- associated function in this implementation
+930 |     pub fn new(image: egui::TextureId, size: f32) -> Self { Self { image, size } }
+    |            ^^^
+
+warning: `willowblossom` (lib) generated 11 warnings
+    Finished `dev` profile [optimized + debuginfo] target(s) in 56.32s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target\debug\willowblossom.exe`
+[2m2026-07-23T07:15:26.803863Z[0m [32m INFO[0m [2mbevy_diagnostic::system_information_diagnostics_plugin::internal[0m[2m:[0m SystemInfo { os: "Windows 11 Pro", kernel: "26200", cpu: "AMD Ryzen 9 7950X 16-Core Processor", core_count: "16", memory: "31.1 GiB" }
+[2m2026-07-23T07:15:27.416511Z[0m [32m INFO[0m [2mbevy_render::renderer[0m[2m:[0m AdapterInfo { name: "NVIDIA GeForce RTX 4070 Ti", vendor: 4318, device: 10114, device_type: DiscreteGpu, device_pci_bus_id: "0000:01:00.0", driver: "NVIDIA", driver_info: "591.86", backend: Vulkan, subgroup_min_size: 32, subgroup_max_size: 32, transient_saves_memory: false }
+[2m2026-07-23T07:15:27.748838Z[0m [32m INFO[0m [2mbevy_pbr::cluster[0m[2m:[0m GPU clustering is supported on this device.
+[2m2026-07-23T07:15:27.749054Z[0m [32m INFO[0m [2mbevy_render::batching::gpu_preprocessing[0m[2m:[0m GPU preprocessing is fully supported on this device.
+[2m2026-07-23T07:15:27.749590Z[0m [32m INFO[0m [2mbevy_egui::render[0m[2m:[0m Using bindless_mode_array_size 16 (Device maximum 1048576)
+[2m2026-07-23T07:15:27.750130Z[0m [32m INFO[0m [2mbevy_winit::system[0m[2m:[0m Creating new window 柳絮，只是另一个跑团软件 (65v0)
+[2m2026-07-23T07:15:28.187727Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 867v0 with the InheritedVisibility component has a parent (865v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.187892Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 868v0 with the InheritedVisibility component has a parent (865v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.187957Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 869v0 with the InheritedVisibility component has a parent (865v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188018Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 870v0 with the InheritedVisibility component has a parent (865v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188078Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 871v0 with the InheritedVisibility component has a parent (865v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188137Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 872v0 with the InheritedVisibility component has a parent (865v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188197Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 873v0 with the InheritedVisibility component has a parent (865v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188303Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 874v0 with the InheritedVisibility component has a parent (865v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188363Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 876v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188423Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 877v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188473Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 878v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188523Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 879v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188572Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 880v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188621Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 881v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188670Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 882v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188719Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 883v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188767Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 884v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188818Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 885v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188868Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 886v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188916Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 887v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.188965Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 888v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.189026Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 889v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.189075Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 890v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.189125Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 891v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.189174Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 892v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.189223Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 893v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.189270Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 894v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.189319Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 895v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.189368Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 896v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.189416Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 897v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.189465Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 898v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+[2m2026-07-23T07:15:28.189512Z[0m [33m WARN[0m [2mbevy_app::hierarchy[0m[2m:[0m warning[B0004]: Entity 899v0 with the InheritedVisibility component has a parent (875v0 entity) without InheritedVisibility.
+This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+failed to connect NapCat websocket: IO error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+[2m2026-07-23T07:29:48.874599Z[0m [32m INFO[0m [2mbevy_window::system[0m[2m:[0m No windows are open, exiting
+[2m2026-07-23T07:29:48.874792Z[0m [32m INFO[0m [2mbevy_winit::system[0m[2m:[0m Closing window 65v0

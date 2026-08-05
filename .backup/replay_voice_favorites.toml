@@ -1,0 +1,20 @@
+[[favorites]]
+name = "萌萌小学神 · 男声 1200 · hosmer_angel"
+
+[favorites.settings]
+voice_name = "1200"
+emotion = "普通"
+pitch = 0
+speech_rate = -1
+volume = 1.0
+
+[[favorites]]
+name = "萌萌小学神 · 男声 1028 · Tim Lundeen"
+sender_id = 1670426821
+
+[favorites.settings]
+voice_name = "1028"
+emotion = "普通"
+pitch = 0
+speech_rate = 21
+volume = 1.0

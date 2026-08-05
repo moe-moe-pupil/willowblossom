@@ -1,0 +1,22 @@
+[font_size]
+title = 48.0
+text = 24.0
+button_text = 19.200000762939453
+
+[color.light.Rgba]
+red = 0.9607843160629272
+green = 0.929411768913269
+blue = 0.7843137383460999
+alpha = 1.0
+
+[color.mid.Rgba]
+red = 0.2705882489681244
+green = 0.6784313917160034
+blue = 0.4627451002597809
+alpha = 1.0
+
+[color.dark.Rgba]
+red = 0.21568627655506134
+green = 0.3294117748737335
+blue = 0.27450981736183167
+alpha = 1.0

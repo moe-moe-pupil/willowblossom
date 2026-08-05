@@ -1,0 +1,544 @@
+{
+  "export_type": "content_pools",
+  "items": [
+    {
+      "category": "消耗品",
+      "description": "回复生命值的测试消耗品。",
+      "equipment_slot": "none",
+      "item_level": 1,
+      "max_stack": 20,
+      "name": "治疗药水",
+      "quality": "common",
+      "soulbound": false,
+      "stack": 5
+    },
+    {
+      "category": "消耗品",
+      "description": "回复魔法值的测试消耗品。",
+      "equipment_slot": "none",
+      "item_level": 2,
+      "max_stack": 15,
+      "name": "魔法药水",
+      "quality": "common",
+      "soulbound": false,
+      "stack": 3
+    },
+    {
+      "category": "武器",
+      "description": "一把普通的铁剑。",
+      "equipment_slot": "main_hand",
+      "item_level": 3,
+      "max_stack": 1,
+      "name": "铁剑",
+      "quality": "common",
+      "soulbound": false,
+      "stack": 1
+    },
+    {
+      "category": "护甲",
+      "description": "轻便的皮甲。",
+      "equipment_slot": "chest",
+      "item_level": 3,
+      "max_stack": 1,
+      "name": "皮甲",
+      "quality": "common",
+      "soulbound": false,
+      "stack": 1
+    },
+    {
+      "category": "饰品",
+      "description": "增加力量的戒指。",
+      "equipment_slot": "finger",
+      "item_level": 5,
+      "max_stack": 1,
+      "name": "力量戒指",
+      "quality": "uncommon",
+      "soulbound": false,
+      "stack": 1
+    },
+    {
+      "category": "饰品",
+      "description": "带来好运的护符。",
+      "equipment_slot": "trinket",
+      "item_level": 7,
+      "max_stack": 1,
+      "name": "幸运护符",
+      "quality": "rare",
+      "soulbound": false,
+      "stack": 1
+    },
+    {
+      "category": "护甲",
+      "description": "法师的华丽长袍。",
+      "equipment_slot": "chest",
+      "item_level": 4,
+      "max_stack": 1,
+      "name": "法师长袍",
+      "quality": "uncommon",
+      "soulbound": false,
+      "stack": 1
+    },
+    {
+      "category": "护甲",
+      "description": "增加移动速度的靴子。",
+      "equipment_slot": "feet",
+      "item_level": 6,
+      "max_stack": 1,
+      "name": "速度之靴",
+      "quality": "rare",
+      "soulbound": false,
+      "stack": 1
+    },
+    {
+      "category": "毒药",
+      "description": "涂抹在武器上，下次攻击附加中毒效果。",
+      "equipment_slot": "none",
+      "item_level": 1,
+      "max_stack": 10,
+      "name": "毒药瓶",
+      "quality": "poor",
+      "soulbound": false,
+      "stack": 10
+    },
+    {
+      "category": "消耗品",
+      "description": "解除中毒状态。",
+      "equipment_slot": "none",
+      "item_level": 2,
+      "max_stack": 10,
+      "name": "解毒剂",
+      "quality": "common",
+      "soulbound": false,
+      "stack": 5
+    },
+    {
+      "category": "消耗品",
+      "description": "投掷后爆炸，造成范围火焰伤害。",
+      "equipment_slot": "none",
+      "item_level": 5,
+      "max_stack": 5,
+      "name": "火焰炸弹",
+      "quality": "uncommon",
+      "soulbound": false,
+      "stack": 3
+    },
+    {
+      "category": "护甲",
+      "description": "穿戴后获得短暂隐身能力。",
+      "equipment_slot": "back",
+      "item_level": 10,
+      "max_stack": 1,
+      "name": "幽灵斗篷",
+      "quality": "epic",
+      "soulbound": false,
+      "stack": 1
+    }
+  ],
+  "random_pools": [
+    {
+      "name": "基础掉落池",
+      "pool": {
+        "category": "掉落",
+        "description": "击败低级敌人可能获得的物品。",
+        "entries": [
+          {
+            "enabled": true,
+            "item": {
+              "category": "消耗品",
+              "description": "回复生命值的测试消耗品。",
+              "equipment_slot": "none",
+              "max_stack": 20,
+              "name": "治疗药水",
+              "quality": "common",
+              "stack": 1
+            },
+            "max_count": 1,
+            "min_count": 1,
+            "result_text": "获得治疗药水。",
+            "weight": 5.0
+          },
+          {
+            "enabled": true,
+            "item": {
+              "category": "消耗品",
+              "description": "回复魔法值的测试消耗品。",
+              "equipment_slot": "none",
+              "max_stack": 15,
+              "name": "魔法药水",
+              "quality": "common",
+              "stack": 1
+            },
+            "max_count": 1,
+            "min_count": 1,
+            "result_text": "获得魔法药水。",
+            "weight": 4.0
+          },
+          {
+            "enabled": true,
+            "item": {
+              "category": "毒药",
+              "description": "涂抹在武器上，下次攻击附加中毒效果。",
+              "equipment_slot": "none",
+              "max_stack": 10,
+              "name": "毒药瓶",
+              "quality": "poor",
+              "stack": 1
+            },
+            "max_count": 1,
+            "min_count": 1,
+            "result_text": "获得毒药瓶。",
+            "weight": 2.0
+          }
+        ]
+      }
+    },
+    {
+      "name": "中级装备池",
+      "pool": {
+        "category": "奖励",
+        "description": "完成中级任务可能获得的装备。",
+        "entries": [
+          {
+            "enabled": true,
+            "item": {
+              "category": "武器",
+              "description": "一把普通的铁剑。",
+              "equipment_slot": "main_hand",
+              "max_stack": 1,
+              "name": "铁剑",
+              "quality": "common",
+              "stack": 1
+            },
+            "max_count": 1,
+            "min_count": 1,
+            "result_text": "获得铁剑。",
+            "weight": 3.0
+          },
+          {
+            "enabled": true,
+            "item": {
+              "category": "护甲",
+              "description": "轻便的皮甲。",
+              "equipment_slot": "chest",
+              "max_stack": 1,
+              "name": "皮甲",
+              "quality": "common",
+              "stack": 1
+            },
+            "max_count": 1,
+            "min_count": 1,
+            "result_text": "获得皮甲。",
+            "weight": 3.0
+          },
+          {
+            "enabled": true,
+            "item": {
+              "category": "饰品",
+              "description": "增加力量的戒指。",
+              "equipment_slot": "finger",
+              "max_stack": 1,
+              "name": "力量戒指",
+              "quality": "uncommon",
+              "stack": 1
+            },
+            "max_count": 1,
+            "min_count": 1,
+            "result_text": "获得力量戒指。",
+            "weight": 2.0
+          }
+        ]
+      }
+    },
+    {
+      "name": "稀有物品池",
+      "pool": {
+        "category": "稀有掉落",
+        "description": "击败强大敌人或开启宝箱可能获得的稀有物品。",
+        "entries": [
+          {
+            "enabled": true,
+            "item": {
+              "category": "饰品",
+              "description": "带来好运的护符。",
+              "equipment_slot": "trinket",
+              "max_stack": 1,
+              "name": "幸运护符",
+              "quality": "rare",
+              "stack": 1
+            },
+            "max_count": 1,
+            "min_count": 1,
+            "result_text": "获得幸运护符。",
+            "weight": 1.0
+          },
+          {
+            "enabled": true,
+            "item": {
+              "category": "护甲",
+              "description": "增加移动速度的靴子。",
+              "equipment_slot": "feet",
+              "max_stack": 1,
+              "name": "速度之靴",
+              "quality": "rare",
+              "stack": 1
+            },
+            "max_count": 1,
+            "min_count": 1,
+            "result_text": "获得速度之靴。",
+            "weight": 1.0
+          },
+          {
+            "enabled": true,
+            "item": {
+              "category": "护甲",
+              "description": "穿戴后获得短暂隐身能力。",
+              "equipment_slot": "back",
+              "max_stack": 1,
+              "name": "幽灵斗篷",
+              "quality": "epic",
+              "stack": 1
+            },
+            "max_count": 1,
+            "min_count": 1,
+            "result_text": "获得幽灵斗篷。",
+            "weight": 0.5
+          }
+        ]
+      }
+    }
+  ],
+  "skills": [
+    {
+      "category": "物理技能",
+      "cooldown_turns": 1,
+      "mp_cost": 5.0,
+      "name": "重击",
+      "note": "造成10点物理伤害。",
+      "tags": [
+        "物理",
+        "近战"
+      ]
+    },
+    {
+      "category": "魔法技能",
+      "cooldown_turns": 2,
+      "mp_cost": 10.0,
+      "name": "火球术",
+      "note": "造成15点火焰伤害。",
+      "tags": [
+        "火焰",
+        "魔法"
+      ]
+    },
+    {
+      "category": "恢复技能",
+      "cooldown_turns": 3,
+      "mp_cost": 8.0,
+      "name": "治疗术",
+      "note": "恢复目标20点生命值。",
+      "tags": [
+        "治疗"
+      ]
+    },
+    {
+      "category": "辅助技能",
+      "cooldown_turns": 5,
+      "mp_cost": 0.0,
+      "name": "潜行",
+      "note": "进入潜行状态，下次攻击伤害翻倍。",
+      "tags": [
+        "潜行"
+      ]
+    },
+    {
+      "category": "陷阱技能",
+      "cooldown_turns": 4,
+      "mp_cost": 6.0,
+      "name": "冰冻陷阱",
+      "note": "放置一个冰冻陷阱，触发后冻结敌人2回合。",
+      "tags": [
+        "陷阱",
+        "冰霜"
+      ]
+    },
+    {
+      "category": "物理技能",
+      "cooldown_turns": 1,
+      "mp_cost": 3.0,
+      "name": "毒刃",
+      "note": "造成6点物理伤害并附加中毒效果，持续3回合。",
+      "tags": [
+        "物理",
+        "毒素"
+      ]
+    },
+    {
+      "category": "魔法技能",
+      "cooldown_turns": 3,
+      "mp_cost": 12.0,
+      "name": "闪电链",
+      "note": "对目标造成12点闪电伤害，并跳跃至附近敌人。",
+      "tags": [
+        "闪电",
+        "魔法"
+      ]
+    },
+    {
+      "category": "召唤技能",
+      "cooldown_turns": 6,
+      "mp_cost": 15.0,
+      "name": "召唤狼",
+      "note": "召唤一只狼协助战斗。",
+      "tags": [
+        "召唤"
+      ]
+    }
+  ],
+  "units": [
+    {
+      "unit": {
+        "base_damage": 0.0,
+        "category": "异星生物",
+        "character": {
+          "hp": 100.0,
+          "inited": true,
+          "level": 1,
+          "max_hp": 100.0,
+          "name": "太空触手怪",
+          "nickname": "太空触手怪"
+        },
+        "label": "太空触手怪",
+        "note": "一种来自深渊的异星生物，触手无攻击力但生命力顽强。",
+        "rarity": "rare_elite"
+      },
+      "unit_id": "space-tentacle"
+    },
+    {
+      "unit": {
+        "base_damage": 4.0,
+        "category": "训练单位",
+        "character": {
+          "hp": 60.0,
+          "inited": true,
+          "level": 5,
+          "max_hp": 60.0,
+          "name": "训练假人",
+          "nickname": "训练假人"
+        },
+        "label": "训练假人",
+        "note": "用于测试基础战斗的假人。",
+        "rarity": "normal"
+      },
+      "unit_id": "training-dummy"
+    },
+    {
+      "unit": {
+        "base_damage": 6.0,
+        "category": "怪物",
+        "character": {
+          "hp": 30.0,
+          "inited": true,
+          "level": 2,
+          "max_hp": 30.0,
+          "name": "哥布林",
+          "nickname": "哥布林"
+        },
+        "label": "哥布林",
+        "note": "弱小的类人生物。",
+        "rarity": "normal"
+      },
+      "unit_id": "goblin"
+    },
+    {
+      "unit": {
+        "base_damage": 8.0,
+        "category": "亡灵",
+        "character": {
+          "hp": 45.0,
+          "inited": true,
+          "level": 3,
+          "max_hp": 45.0,
+          "name": "骷髅战士",
+          "nickname": "骷髅战士"
+        },
+        "label": "骷髅战士",
+        "note": "复生的不死战士。",
+        "rarity": "normal"
+      },
+      "unit_id": "skeleton-warrior"
+    },
+    {
+      "unit": {
+        "base_damage": 12.0,
+        "category": "构造体",
+        "character": {
+          "hp": 80.0,
+          "inited": true,
+          "level": 6,
+          "max_hp": 80.0,
+          "name": "石像鬼",
+          "nickname": "石像鬼"
+        },
+        "label": "石像鬼",
+        "note": "突然活化的石制雕像。",
+        "rarity": "elite"
+      },
+      "unit_id": "gargoyle"
+    },
+    {
+      "unit": {
+        "base_damage": 10.0,
+        "category": "元素生物",
+        "character": {
+          "hp": 50.0,
+          "inited": true,
+          "level": 4,
+          "max_hp": 50.0,
+          "name": "火焰元素",
+          "nickname": "火焰元素"
+        },
+        "label": "火焰元素",
+        "note": "纯粹火焰构成的元素体。",
+        "rarity": "rare"
+      },
+      "unit_id": "fire-elemental"
+    },
+    {
+      "unit": {
+        "base_damage": 15.0,
+        "category": "人形生物",
+        "character": {
+          "hp": 70.0,
+          "inited": true,
+          "level": 7,
+          "max_hp": 70.0,
+          "name": "暗影刺客",
+          "nickname": "暗影刺客"
+        },
+        "label": "暗影刺客",
+        "note": "潜行于黑暗中的致命杀手。",
+        "rarity": "rare_elite"
+      },
+      "unit_id": "shadow-assassin"
+    },
+    {
+      "unit": {
+        "base_damage": 14.0,
+        "category": "怪物",
+        "character": {
+          "hp": 120.0,
+          "inited": true,
+          "level": 8,
+          "max_hp": 120.0,
+          "name": "巨魔",
+          "nickname": "巨魔"
+        },
+        "label": "巨魔",
+        "note": "体型庞大的再生怪物。",
+        "rarity": "elite"
+      },
+      "unit_id": "troll"
+    }
+  ],
+  "version": 1
+}
