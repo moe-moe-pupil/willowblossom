@@ -8839,7 +8839,7 @@ fn reset_character_status_phase(character: &mut PlayerCharacter) {
     character.status = CharacterStatus::default();
 }
 
-fn total_allocated_status_points(status: &CharacterStatus) -> i32 {
+pub(crate) fn total_allocated_status_points(status: &CharacterStatus) -> i32 {
     [
         status.str_,
         status.agi,
@@ -8854,6 +8854,13 @@ fn total_allocated_status_points(status: &CharacterStatus) -> i32 {
     .copied()
     .filter(|value| *value > 0)
     .sum()
+}
+
+/// Apply a GM creation-status edit to the remaining creation points.
+/// A positive delta spends points, a negative delta refunds them, and the
+/// result never goes below zero.
+pub(crate) fn adjust_character_status_points(character: &mut PlayerCharacter, delta: i32) {
+    character.status_points = (character.status_points - delta).max(0);
 }
 
 pub fn update_character_from_status(character: &mut PlayerCharacter) {
@@ -13937,6 +13944,36 @@ position_cells = [4, 5, 6]
         assert_eq!(character.status.str_, 3);
         assert_eq!(character.status_points, 0);
         assert_eq!(character.max_hp, 34.0);
+    }
+
+    #[test]
+    fn adjust_character_status_points_spends_increases() {
+        let mut character = PlayerCharacter::default();
+        character.status_points = 5;
+
+        adjust_character_status_points(&mut character, 3);
+        assert_eq!(character.status_points, 2);
+
+        adjust_character_status_points(&mut character, 2);
+        assert_eq!(character.status_points, 0);
+    }
+
+    #[test]
+    fn adjust_character_status_points_refunds_reductions() {
+        let mut character = PlayerCharacter::default();
+        character.status_points = 1;
+
+        adjust_character_status_points(&mut character, -2);
+        assert_eq!(character.status_points, 3);
+    }
+
+    #[test]
+    fn adjust_character_status_points_never_goes_negative() {
+        let mut character = PlayerCharacter::default();
+        character.status_points = 2;
+
+        adjust_character_status_points(&mut character, 5);
+        assert_eq!(character.status_points, 0);
     }
 
     #[test]

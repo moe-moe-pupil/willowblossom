@@ -725,6 +725,7 @@ use crate::{
         filter_control_characters,
     },
     napcat::{
+        adjust_character_status_points,
         campaign_weave_state,
         character_chaos_output_variance,
         character_damage_attribute_multiplier,
@@ -6717,19 +6718,21 @@ fn character_editor_ui(
             "HP状态：{}",
             character_hp_status(character.hp, character.max_hp)
         ));
-        if status_unlocked {
-            if ui.button("锁定").clicked() {
-                edit_state.unlocked_status_targets.remove(target_id);
-                edit_state.gm_status_drafts.remove(target_id);
+        if character.inited {
+            if status_unlocked {
+                if ui.button("锁定").clicked() {
+                    edit_state.unlocked_status_targets.remove(target_id);
+                    edit_state.gm_status_drafts.remove(target_id);
+                }
+            } else if ui.button("解锁").clicked() {
+                edit_state
+                    .unlocked_status_targets
+                    .insert(target_id.to_owned());
+                edit_state.gm_status_drafts.insert(
+                    target_id.to_owned(),
+                    character.extra_status.clone(),
+                );
             }
-        } else if ui.button("解锁").clicked() {
-            edit_state
-                .unlocked_status_targets
-                .insert(target_id.to_owned());
-            edit_state.gm_status_drafts.insert(
-                target_id.to_owned(),
-                character.extra_status.clone(),
-            );
         }
         let level_response = ui
             .add(
@@ -7820,9 +7823,12 @@ fn character_status_source_ui(
     unlocked: bool,
 ) -> bool {
     let mut changed = false;
+    let in_creation = !character.inited;
     ui.horizontal_wrapped(|ui| {
         ui.label("属性来源");
-        if unlocked {
+        if in_creation {
+            ui.small("建卡阶段可直接修改创建值");
+        } else if unlocked {
             ui.small("GM修正草稿已解锁");
         } else {
             ui.small("已锁定");
@@ -7830,14 +7836,114 @@ fn character_status_source_ui(
     });
     ui.small("创建值来自玩家建卡流程。GM修正值单独记录，并叠加到总值上。");
 
-    if unlocked && !edit_state.gm_status_drafts.contains_key(target_id) {
-        edit_state.gm_status_drafts.insert(
-            target_id.to_owned(),
-            character.extra_status.clone(),
-        );
-    }
-
-    if unlocked {
+    if in_creation {
+        let points_before = character.status_points;
+        let mut grid_changed = false;
+        egui::Grid::new(ui.next_auto_id())
+            .num_columns(4)
+            .spacing([12.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("属性");
+                ui.strong("创建");
+                ui.strong("GM");
+                ui.strong("总值");
+                ui.end_row();
+                let str_delta = creation_status_source_row(
+                    ui,
+                    "STR",
+                    &mut character.status.str_,
+                    character.extra_status.str_,
+                    character.status_points,
+                );
+                if str_delta != 0 {
+                    adjust_character_status_points(character, str_delta);
+                    grid_changed = true;
+                }
+                let agi_delta = creation_status_source_row(
+                    ui,
+                    "AGI",
+                    &mut character.status.agi,
+                    character.extra_status.agi,
+                    character.status_points,
+                );
+                if agi_delta != 0 {
+                    adjust_character_status_points(character, agi_delta);
+                    grid_changed = true;
+                }
+                let dex_delta = creation_status_source_row(
+                    ui,
+                    "DEX",
+                    &mut character.status.dex,
+                    character.extra_status.dex,
+                    character.status_points,
+                );
+                if dex_delta != 0 {
+                    adjust_character_status_points(character, dex_delta);
+                    grid_changed = true;
+                }
+                let vit_delta = creation_status_source_row(
+                    ui,
+                    "VIT",
+                    &mut character.status.vit,
+                    character.extra_status.vit,
+                    character.status_points,
+                );
+                if vit_delta != 0 {
+                    adjust_character_status_points(character, vit_delta);
+                    grid_changed = true;
+                }
+                let int_delta = creation_status_source_row(
+                    ui,
+                    "INT",
+                    &mut character.status.int_,
+                    character.extra_status.int_,
+                    character.status_points,
+                );
+                if int_delta != 0 {
+                    adjust_character_status_points(character, int_delta);
+                    grid_changed = true;
+                }
+                let wis_delta = creation_status_source_row(
+                    ui,
+                    "WIS",
+                    &mut character.status.wis,
+                    character.extra_status.wis,
+                    character.status_points,
+                );
+                if wis_delta != 0 {
+                    adjust_character_status_points(character, wis_delta);
+                    grid_changed = true;
+                }
+                let k_delta = creation_status_source_row(
+                    ui,
+                    "K",
+                    &mut character.status.k,
+                    character.extra_status.k,
+                    character.status_points,
+                );
+                if k_delta != 0 {
+                    adjust_character_status_points(character, k_delta);
+                    grid_changed = true;
+                }
+                let cha_delta = creation_status_source_row(
+                    ui,
+                    "CHA",
+                    &mut character.status.cha,
+                    character.extra_status.cha,
+                    character.status_points,
+                );
+                if cha_delta != 0 {
+                    adjust_character_status_points(character, cha_delta);
+                    grid_changed = true;
+                }
+            });
+        if grid_changed || character.status_points != points_before {
+            changed = true;
+        }
+    } else if unlocked {
+        let points_before = character.status_points;
+        let mut grid_changed = false;
         let draft_for_apply = {
             let draft = edit_state
                 .gm_status_drafts
@@ -7853,65 +7959,124 @@ fn character_status_source_ui(
                     ui.strong("草稿GM");
                     ui.strong("总值");
                     ui.end_row();
-                    status_source_value_ui(
+                    let (str_changed, str_delta) = status_source_value_ui(
                         ui,
                         "STR",
-                        character.status.str_,
+                        &mut character.status.str_,
                         character.extra_status.str_,
                         &mut draft.str_,
+                        character.status_points,
                     );
-                    status_source_value_ui(
+                    if str_changed {
+                        grid_changed = true;
+                    }
+                    if str_delta != 0 {
+                        adjust_character_status_points(character, str_delta);
+                    }
+                    let (agi_changed, agi_delta) = status_source_value_ui(
                         ui,
                         "AGI",
-                        character.status.agi,
+                        &mut character.status.agi,
                         character.extra_status.agi,
                         &mut draft.agi,
+                        character.status_points,
                     );
-                    status_source_value_ui(
+                    if agi_changed {
+                        grid_changed = true;
+                    }
+                    if agi_delta != 0 {
+                        adjust_character_status_points(character, agi_delta);
+                    }
+                    let (dex_changed, dex_delta) = status_source_value_ui(
                         ui,
                         "DEX",
-                        character.status.dex,
+                        &mut character.status.dex,
                         character.extra_status.dex,
                         &mut draft.dex,
+                        character.status_points,
                     );
-                    status_source_value_ui(
+                    if dex_changed {
+                        grid_changed = true;
+                    }
+                    if dex_delta != 0 {
+                        adjust_character_status_points(character, dex_delta);
+                    }
+                    let (vit_changed, vit_delta) = status_source_value_ui(
                         ui,
                         "VIT",
-                        character.status.vit,
+                        &mut character.status.vit,
                         character.extra_status.vit,
                         &mut draft.vit,
+                        character.status_points,
                     );
-                    status_source_value_ui(
+                    if vit_changed {
+                        grid_changed = true;
+                    }
+                    if vit_delta != 0 {
+                        adjust_character_status_points(character, vit_delta);
+                    }
+                    let (int_changed, int_delta) = status_source_value_ui(
                         ui,
                         "INT",
-                        character.status.int_,
+                        &mut character.status.int_,
                         character.extra_status.int_,
                         &mut draft.int_,
+                        character.status_points,
                     );
-                    status_source_value_ui(
+                    if int_changed {
+                        grid_changed = true;
+                    }
+                    if int_delta != 0 {
+                        adjust_character_status_points(character, int_delta);
+                    }
+                    let (wis_changed, wis_delta) = status_source_value_ui(
                         ui,
                         "WIS",
-                        character.status.wis,
+                        &mut character.status.wis,
                         character.extra_status.wis,
                         &mut draft.wis,
+                        character.status_points,
                     );
-                    status_source_value_ui(
+                    if wis_changed {
+                        grid_changed = true;
+                    }
+                    if wis_delta != 0 {
+                        adjust_character_status_points(character, wis_delta);
+                    }
+                    let (k_changed, k_delta) = status_source_value_ui(
                         ui,
                         "K",
-                        character.status.k,
+                        &mut character.status.k,
                         character.extra_status.k,
                         &mut draft.k,
+                        character.status_points,
                     );
-                    status_source_value_ui(
+                    if k_changed {
+                        grid_changed = true;
+                    }
+                    if k_delta != 0 {
+                        adjust_character_status_points(character, k_delta);
+                    }
+                    let (cha_changed, cha_delta) = status_source_value_ui(
                         ui,
                         "CHA",
-                        character.status.cha,
+                        &mut character.status.cha,
                         character.extra_status.cha,
                         &mut draft.cha,
+                        character.status_points,
                     );
+                    if cha_changed {
+                        grid_changed = true;
+                    }
+                    if cha_delta != 0 {
+                        adjust_character_status_points(character, cha_delta);
+                    }
                 });
             draft.clone()
         };
+        if grid_changed || character.status_points != points_before {
+            changed = true;
+        }
         ui.horizontal(|ui| {
             if ui.button("应用GM修正").clicked() {
                 character.extra_status = draft_for_apply.clone();
@@ -7997,25 +8162,59 @@ fn readonly_status_source_row(ui: &mut Ui, label: &str, creation: i32, gm: i32) 
     ui.end_row();
 }
 
+fn creation_status_source_row(
+    ui: &mut Ui,
+    label: &str,
+    creation: &mut i32,
+    current_gm: i32,
+    remaining_points: i32,
+) -> i32 {
+    ui.label(label);
+    let max_creation = remaining_points.max(0) + *creation;
+    let before = *creation;
+    ui.add(
+        egui::DragValue::new(creation)
+            .range(0..=max_creation)
+            .speed(1),
+    );
+    let delta = *creation - before;
+    ui.label(format_signed_status(current_gm));
+    ui.label((*creation + current_gm).to_string());
+    ui.end_row();
+    delta
+}
+
 fn status_source_value_ui(
     ui: &mut Ui,
     label: &str,
-    creation: i32,
+    creation: &mut i32,
     current_gm: i32,
     draft_gm: &mut i32,
-) -> bool {
+    remaining_points: i32,
+) -> (bool, i32) {
     ui.label(label);
-    ui.label(creation.to_string());
+    let max_creation = remaining_points.max(0) + *creation;
+    let before = *creation;
+    let creation_changed = ui
+        .add(
+            egui::DragValue::new(creation)
+                .range(0..=max_creation)
+                .speed(1),
+        )
+        .changed();
+    let creation_delta = *creation - before;
     ui.label(format_signed_status(current_gm));
-    let response = ui.add(
-        egui::DragValue::new(draft_gm)
-            .range(-999..=999)
-            .speed(1)
-            .prefix("GM "),
-    );
-    ui.label((creation + *draft_gm).to_string());
+    let draft_changed = ui
+        .add(
+            egui::DragValue::new(draft_gm)
+                .range(-999..=999)
+                .speed(1)
+                .prefix("GM "),
+        )
+        .changed();
+    ui.label((*creation + *draft_gm).to_string());
     ui.end_row();
-    response.changed()
+    (creation_changed || draft_changed, creation_delta)
 }
 
 fn format_signed_status(value: i32) -> String {
