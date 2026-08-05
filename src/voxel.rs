@@ -1472,6 +1472,14 @@ impl VoxelPossessionState {
         self.movement_limit_bypassed = false;
         self.movement_bypass_confirmation_pending = false;
     }
+
+    // Zero this round's used movement without undoing the round: the player
+    // stays where they are, but gets a fresh movement budget.
+    pub(crate) fn zero_round_movement(&mut self) {
+        self.movement_used = 0.0;
+        self.movement_completed = false;
+        self.movement_happened = false;
+    }
 }
 
 #[derive(Component, Clone)]
@@ -8076,6 +8084,18 @@ fn voxel_player_camera_panel(
                         .clicked()
                     {
                         possession.reset_movement_requested = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            possession.movement_used > f32::EPSILON
+                                || possession.movement_happened
+                                || possession.movement_completed,
+                            egui::Button::new("本轮移动归零0"),
+                        )
+                        .on_hover_text("清零本轮已用移动距离，不改变玩家当前位置，也不撤销本轮移动")
+                        .clicked()
+                    {
+                        possession.zero_round_movement();
                     }
                     if possession.movement_limit_bypassed {
                         if ui.button("恢复移动上限").clicked() {
@@ -19413,6 +19433,26 @@ mod tests {
         let possession = app.world().resource::<VoxelPossessionState>();
         assert_eq!(possession.movement_used, 0.0);
         assert!(!possession.reset_movement_requested);
+    }
+
+    #[test]
+    fn zeroing_round_movement_clears_distance_without_undoing_the_turn() {
+        let turn_start = Vec3::new(2.0, 3.0, 4.0);
+        let mut possession = VoxelPossessionState {
+            active_user_id: Some(42),
+            movement_used: 7.5,
+            movement_completed: true,
+            movement_happened: true,
+            turn_start_position: Some(turn_start),
+            ..default()
+        };
+
+        possession.zero_round_movement();
+
+        assert_eq!(possession.movement_used, 0.0);
+        assert!(!possession.movement_completed);
+        assert!(!possession.movement_happened);
+        assert_eq!(possession.turn_start_position, Some(turn_start));
     }
 
     #[test]
