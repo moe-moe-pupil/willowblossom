@@ -1209,6 +1209,7 @@ pub(crate) enum VoxelCreativeItem {
     SpaceshipPossessionTool,
     TeleportTool,
     DoorLockTool,
+    PortraitTransformTool,
     InvisibilityTool,
 }
 
@@ -1996,7 +1997,8 @@ impl VoxelEditorState {
                 self.selected_light = None;
             },
             VoxelCreativeItem::PlayerPossessionTool
-            | VoxelCreativeItem::SpaceshipPossessionTool => {
+            | VoxelCreativeItem::SpaceshipPossessionTool
+            | VoxelCreativeItem::PortraitTransformTool => {
                 self.light_tool = None;
                 self.selected_light = None;
             },
@@ -2084,6 +2086,9 @@ impl VoxelEditorState {
         if self.is_player_possession_tool_equipped() {
             return "PL接管器".to_owned();
         }
+        if self.is_portrait_transform_tool_equipped() {
+            return "立绘变形器".to_owned();
+        }
         if self.is_spaceship_possession_tool_equipped() {
             return "舰船接管器".to_owned();
         }
@@ -2110,6 +2115,10 @@ impl VoxelEditorState {
 
     pub(crate) fn is_player_possession_tool_equipped(&self) -> bool {
         self.equipped_item == Some(VoxelCreativeItem::PlayerPossessionTool)
+    }
+
+    pub(crate) fn is_portrait_transform_tool_equipped(&self) -> bool {
+        self.equipped_item == Some(VoxelCreativeItem::PortraitTransformTool)
     }
 
     pub(crate) fn is_spaceship_possession_tool_equipped(&self) -> bool {
@@ -2392,6 +2401,8 @@ impl Plugin for TrpgVoxelPlugin {
                     voxel_editor_shortcuts,
                     handle_editor_requests,
                     use_player_possession_tool
+                        .run_if(crate::replay::replay_mouse_interaction_inactive),
+                    use_portrait_transform_tool
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
                     use_spaceship_possession_tool
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
@@ -10425,6 +10436,96 @@ fn use_player_possession_tool(
             editor.physics_status = Some("没有瞄准玩家立绘".to_owned());
         },
     }
+}
+
+fn use_portrait_transform_tool(
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
+    standees: Query<(
+        &VoxelPlayerStandee,
+        &GlobalTransform,
+        &Visibility,
+    )>,
+    mut editor: ResMut<VoxelEditorState>,
+    manager: Option<ResMut<Persistent<NapcatMessageManager>>>,
+    egui_input: Res<EguiWantsInput>,
+) {
+    if !editor.is_portrait_transform_tool_equipped()
+        || editor.creative_inventory_open
+        || !mouse.just_pressed(MouseButton::Right)
+        || egui_input.wants_any_pointer_input()
+    {
+        return;
+    }
+    let Some(mut manager) = manager else {
+        editor.physics_status = Some("没有玩家数据，无法使用立绘变形器".to_owned());
+        return;
+    };
+    let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single()) else {
+        return;
+    };
+    let Some(ray) = viewport_ray(
+        window,
+        camera,
+        camera_transform,
+        &editor,
+    ) else {
+        return;
+    };
+    let selected = standees
+        .iter()
+        .filter_map(|(standee, transform, visibility)| {
+            if *visibility == Visibility::Hidden {
+                return None;
+            }
+            ray_intersects_player_standee(ray, transform, standee.half_size)
+                .map(|distance| (standee.user_id, distance))
+        })
+        .filter(|(_, distance)| *distance <= MAX_RAY_DISTANCE)
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(user_id, _)| user_id);
+
+    let Some(user_id) = selected else {
+        editor.physics_status = Some("没有瞄准玩家立绘".to_owned());
+        return;
+    };
+    let target_id = user_id.to_string();
+    let options = crate::napcat::player_portrait_transform_options(
+        &manager.player_characters,
+        &target_id,
+    );
+    let candidate_ids = options
+        .iter()
+        .map(|(player_id, _)| player_id.clone())
+        .collect::<Vec<_>>();
+    let Some(character) = manager.player_characters.get_mut(&target_id) else {
+        editor.physics_status = Some(format!("PL {user_id}还没有角色数据"));
+        return;
+    };
+    let next = crate::napcat::next_portrait_transform(
+        &character.portrait_transform,
+        &candidate_ids,
+    );
+    character.portrait_transform = next.clone();
+    let status = match &next {
+        None => format!("已将PL {user_id}的立绘恢复原样"),
+        Some(crate::napcat::PortraitTransform::DefaultAvatar) => {
+            format!("已将PL {user_id}的立绘变为默认头像")
+        },
+        Some(crate::napcat::PortraitTransform::OtherPlayer(other_id)) => {
+            let name = options
+                .iter()
+                .find(|(player_id, _)| player_id == other_id)
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| other_id.clone());
+            format!("已将PL {user_id}的立绘变为“{name}”")
+        },
+    };
+    if let Err(err) = manager.persist() {
+        eprintln!("failed to persist portrait transform tool change: {err}");
+    }
+    editor.physics_status = Some(status);
 }
 
 fn use_spaceship_possession_tool(

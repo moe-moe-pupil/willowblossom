@@ -424,6 +424,17 @@ fn paint_voxel_creative_item_icon(
             thin_line((0.58, 0.0), (0.92, 0.0));
             thin_line((0.0, -0.92), (0.0, -0.68));
         },
+        VoxelCreativeItem::PortraitTransformTool => {
+            circle(-0.34, 0.0, 0.4);
+            circle(0.34, 0.0, 0.4);
+            dot(-0.34, -0.06, 0.08);
+            dot(0.34, -0.06, 0.08);
+            thin_line((-0.92, 0.8), (0.92, 0.8));
+            line((0.62, 0.64), (0.92, 0.8));
+            line((0.62, 0.96), (0.92, 0.8));
+            line((-0.62, 0.64), (-0.92, 0.8));
+            line((-0.62, 0.96), (-0.92, 0.8));
+        },
         VoxelCreativeItem::SpaceshipPossessionTool => {
             line((0.0, -0.92), (-0.82, 0.38));
             line((-0.82, 0.38), (-0.3, 0.24));
@@ -606,6 +617,10 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
         VoxelCreativeItem::PlayerPossessionTool => (
             "PL接管器",
             egui::Color32::from_rgb(116, 82, 238),
+        ),
+        VoxelCreativeItem::PortraitTransformTool => (
+            "立绘变形器",
+            egui::Color32::from_rgb(240, 84, 164),
         ),
         VoxelCreativeItem::SpaceshipPossessionTool => (
             "舰船接管器",
@@ -16164,6 +16179,31 @@ pub fn ui_system(
                                     .clicked()
                                     {
                                         picked_item = Some(invisibility_tool);
+                                    }
+                                    ui.small(name);
+                                });
+                                let portrait_transform_tool =
+                                    VoxelCreativeItem::PortraitTransformTool;
+                                let (name, _) =
+                                    voxel_creative_item_visual(portrait_transform_tool);
+                                ui.vertical_centered(|ui| {
+                                    if voxel_creative_drag_source(
+                                        ui,
+                                        egui::Id::new("voxel_catalog_portrait_transform_tool"),
+                                        VoxelCreativeDragPayload::Catalog(portrait_transform_tool),
+                                        portrait_transform_tool,
+                                        voxel_editor.creative_hotbar
+                                            [voxel_editor.selected_hotbar_slot]
+                                            == Some(portrait_transform_tool),
+                                        48.0,
+                                        None,
+                                    )
+                                    .on_hover_text(
+                                        "GM右键玩家立绘循环切换：原立绘 → 默认头像 → 其他玩家 → 原立绘",
+                                    )
+                                    .clicked()
+                                    {
+                                        picked_item = Some(portrait_transform_tool);
                                     }
                                     ui.small(name);
                                 });

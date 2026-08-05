@@ -1479,6 +1479,33 @@ pub(crate) fn apply_item_portrait_transform(
     true
 }
 
+/// 计算“立绘变形器”下一次右键点击应变成的外观：
+/// 原立绘 → 默认头像 → 各玩家立绘 → 回到原立绘。
+pub(crate) fn next_portrait_transform(
+    current: &Option<PortraitTransform>,
+    candidate_player_ids: &[String],
+) -> Option<PortraitTransform> {
+    match current {
+        None => Some(PortraitTransform::DefaultAvatar),
+        Some(PortraitTransform::DefaultAvatar) => candidate_player_ids
+            .first()
+            .cloned()
+            .map(PortraitTransform::OtherPlayer),
+        Some(PortraitTransform::OtherPlayer(player_id)) => {
+            let Some(position) = candidate_player_ids
+                .iter()
+                .position(|candidate| candidate == player_id)
+            else {
+                return Some(PortraitTransform::DefaultAvatar);
+            };
+            candidate_player_ids
+                .get(position + 1)
+                .cloned()
+                .map(PortraitTransform::OtherPlayer)
+        },
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CharacterBuffBaseStats {
     #[serde(default = "default_character_hp")]
@@ -10890,6 +10917,54 @@ position_cells = [4, 5, 6]
         assert_eq!(
             restored.portrait_transform,
             Some(PortraitTransform::OtherPlayer("2".to_owned()))
+        );
+    }
+
+    #[test]
+    fn next_portrait_transform_cycles_through_appearances() {
+        let candidates = vec!["2".to_owned(), "3".to_owned()];
+
+        assert_eq!(
+            next_portrait_transform(&None, &candidates),
+            Some(PortraitTransform::DefaultAvatar)
+        );
+        assert_eq!(
+            next_portrait_transform(
+                &Some(PortraitTransform::DefaultAvatar),
+                &candidates,
+            ),
+            Some(PortraitTransform::OtherPlayer("2".to_owned()))
+        );
+        assert_eq!(
+            next_portrait_transform(
+                &Some(PortraitTransform::OtherPlayer("2".to_owned())),
+                &candidates,
+            ),
+            Some(PortraitTransform::OtherPlayer("3".to_owned()))
+        );
+        assert_eq!(
+            next_portrait_transform(
+                &Some(PortraitTransform::OtherPlayer("3".to_owned())),
+                &candidates,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn next_portrait_transform_handles_missing_candidates() {
+        let candidates = vec!["2".to_owned()];
+
+        assert_eq!(
+            next_portrait_transform(
+                &Some(PortraitTransform::OtherPlayer("999".to_owned())),
+                &candidates,
+            ),
+            Some(PortraitTransform::DefaultAvatar)
+        );
+        assert_eq!(
+            next_portrait_transform(&Some(PortraitTransform::DefaultAvatar), &[]),
+            None
         );
     }
 
