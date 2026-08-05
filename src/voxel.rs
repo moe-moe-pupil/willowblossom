@@ -102,6 +102,7 @@ use crate::{
     napcat::{
         CharacterHotbarSlot,
         CharacterSkillMetadata,
+        InventoryItem,
         NapcatIOSender,
         NapcatMessageManager,
         NapcatOutboundMessage,
@@ -492,6 +493,9 @@ pub(crate) struct VoxelPlayerStandee {
     pub(crate) user_id: u64,
     image_source: String,
     half_size: Vec2,
+    /// While true, the standee only renders on the DM gizmo layer, so player
+    /// cameras never see it and the GM viewport keeps a preview frame around it.
+    invisible: bool,
 }
 
 #[derive(Component, Clone)]
@@ -515,6 +519,7 @@ impl VoxelPlayerStandee {
             user_id,
             image_source: String::new(),
             half_size: Vec2::splat(VOXEL_SIZE),
+            invisible: false,
         }
     }
 }
@@ -1399,6 +1404,7 @@ pub(crate) struct VoxelPossessionState {
     applied_user_id: Option<u64>,
     pub selected_hotbar_slot: usize,
     pub player_inventory_open: bool,
+    pub invisibility_active: bool,
     pub movement_used: f32,
     pub movement_limit: f32,
     movement_completed: bool,
@@ -1433,6 +1439,7 @@ impl Default for VoxelPossessionState {
             applied_user_id: None,
             selected_hotbar_slot: 0,
             player_inventory_open: false,
+            invisibility_active: false,
             movement_used: 0.0,
             movement_limit: 0.0,
             movement_completed: false,
@@ -1468,6 +1475,7 @@ impl VoxelPossessionState {
 
     fn reset_turn_overrides(&mut self) {
         self.player_inventory_open = false;
+        self.invisibility_active = false;
         self.reset_movement_requested = false;
         self.movement_limit_bypassed = false;
         self.movement_bypass_confirmation_pending = false;
@@ -2399,6 +2407,7 @@ impl Plugin for TrpgVoxelPlugin {
                         sync_possessed_player_camera,
                         sync_voxel_player_cameras,
                         sync_voxel_player_standees.in_set(VoxelPlayerStandeeSynced),
+                        sync_voxel_standee_invisibility_render_layers,
                         sync_voxel_unit_standees,
                         sync_voxel_scene_character_positions,
                         sync_voxel_gm_map_state,
@@ -2419,7 +2428,10 @@ impl Plugin for TrpgVoxelPlugin {
         )
         .add_systems(
             Update,
-            draw_possessed_player_targeting
+            (
+                draw_possessed_player_targeting,
+                draw_voxel_invisible_player_previews,
+            )
                 .after(VoxelPlayerStandeeSynced)
                 .run_if(crate::replay::replay_video_capture_inactive),
         )
@@ -2904,6 +2916,29 @@ fn activate_player_hotbar_slot(
     if releases_control {
         possession.release();
     }
+}
+
+/// A GM-authored inventory item counts as an invisibility item when its name
+/// or one of its approved skills mentions 隐身. The possessed player becomes
+/// invisible while the GM activates that item from the hotbar.
+fn voxel_item_is_invisibility(item: &InventoryItem) -> bool {
+    item.name.contains("隐身")
+        || item.skills.iter().any(|skill| {
+            skill.metadata.is_approved()
+                && (skill.name.contains("隐身") || skill.note.contains("隐身"))
+        })
+}
+
+fn voxel_invisibility_item(
+    character: &PlayerCharacter,
+    slot: usize,
+) -> Option<&InventoryItem> {
+    let slot = *character.inventory.hotbar.get(slot)?;
+    let CharacterHotbarSlot::Item(index) = slot else {
+        return None;
+    };
+    let item = character.inventory.items.get(index)?;
+    voxel_item_is_invisibility(item).then_some(item)
 }
 
 fn voxel_glass_material() -> StandardMaterial {
@@ -8141,6 +8176,32 @@ fn voxel_player_camera_panel(
                         }
                     }
                 });
+                if let Some(character) = manager
+                    .as_deref()
+                    .and_then(|manager| manager.player_characters.get(&selected.to_string()))
+                {
+                    if possession.invisibility_active
+                        || voxel_invisibility_item(character, possession.selected_hotbar_slot)
+                            .is_some()
+                    {
+                        ui.horizontal(|ui| {
+                            let label = if possession.invisibility_active {
+                                "取消隐身"
+                            } else {
+                                "使用隐身道具"
+                            };
+                            if ui.button(label).clicked() {
+                                possession.invisibility_active = !possession.invisibility_active;
+                            }
+                            if possession.invisibility_active {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(120, 230, 255),
+                                    "隐身中：仅GM视角可见预览框",
+                                );
+                            }
+                        });
+                    }
+                }
                 ui.small("生存模式：不可飞行或编辑方块；数字键1-9切换物品/主动技能。");
             }
 
@@ -8658,7 +8719,8 @@ fn sync_voxel_player_standees(
     mut images: ResMut<Assets<Image>>,
     mut assets: ResMut<VoxelPlayerStandeeAssets>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
-    existing: Query<(Entity, &VoxelPlayerStandee)>,
+    possession: Res<VoxelPossessionState>,
+    mut existing: Query<(Entity, &mut VoxelPlayerStandee)>,
     capture_cameras: Query<
         (&Transform, &VoxelPlayerCaptureCamera),
         (
@@ -8707,12 +8769,15 @@ fn sync_voxel_player_standees(
 
     for (user_id, image_source) in active {
         let camera_transform = camera_transforms[&user_id];
+        let invisible =
+            possession.active_user_id == Some(user_id) && possession.invisibility_active;
         if let Some(entity) = assets.entities.get(&user_id).copied() {
-            if let Ok((_, standee)) = existing.get(entity) {
+            if let Ok((_, mut standee)) = existing.get_mut(entity) {
                 if standee.image_source == image_source {
                     if let Ok(mut transform) = standee_transforms.get_mut(entity) {
                         *transform = voxel_player_standee_transform(&camera_transform);
                     }
+                    standee.invisible = invisible;
                     continue;
                 }
                 assets.failed_sources.remove(&standee.image_source);
@@ -8754,6 +8819,7 @@ fn sync_voxel_player_standees(
                         user_id,
                         image_source,
                         half_size: size * 0.5,
+                        invisible,
                     },
                     VoxelStandeeAccess::Player(user_id),
                 ));
@@ -8788,6 +8854,60 @@ fn sync_voxel_player_standees(
                 eprintln!("failed to load voxel player standee for {user_id}: {err}");
             },
         }
+    }
+}
+
+/// Keep the invisible player's standee on the DM-only render layer (and every
+/// mesh child with it), so player cameras and QQ scene captures never show it
+/// while the GM viewport still renders it with its preview frame.
+fn sync_voxel_standee_invisibility_render_layers(
+    mut standees: Query<(Entity, &VoxelPlayerStandee, &Children, &mut RenderLayers)>,
+    mut child_layers: Query<
+        &mut RenderLayers,
+        (Without<VoxelPlayerStandee>, Without<VoxelPlayerCaptureCamera>),
+    >,
+) {
+    for (_, standee, children, mut root_layers) in &mut standees {
+        let target = if standee.invisible {
+            RenderLayers::layer(VOXEL_DM_GIZMO_RENDER_LAYER)
+        } else {
+            RenderLayers::default()
+        };
+        if *root_layers != target {
+            *root_layers = target.clone();
+        }
+        for child in children.iter() {
+            if let Ok(mut layers) = child_layers.get_mut(child) {
+                if *layers != target {
+                    *layers = target.clone();
+                }
+            }
+        }
+    }
+}
+
+/// GM-only wireframe frame around each invisible player's standee. Gizmos
+/// render on the DM layer, so players never see this preview box.
+fn draw_voxel_invisible_player_previews(
+    mut gizmos: Gizmos,
+    possession: Res<VoxelPossessionState>,
+    standees: Query<(&VoxelPlayerStandee, &GlobalTransform), Without<VoxelFirstPersonPlayer>>,
+) {
+    for (standee, transform) in &standees {
+        if !standee.invisible || possession.active_user_id == Some(standee.user_id) {
+            continue;
+        }
+        let eye = transform.translation();
+        let center = eye - Vec3::Y * (FIRST_PERSON_EYE_OFFSET - PLAYER_STANDEE_HEIGHT * 0.5);
+        let size = Vec3::new(
+            VOXEL_SIZE * 1.7,
+            PLAYER_STANDEE_HEIGHT * 1.15,
+            VOXEL_SIZE * 1.7,
+        );
+        gizmos.cube(
+            Transform::from_translation(center).with_scale(size),
+            Color::srgba(0.4, 0.95, 1.0, 0.95),
+        );
     }
 }
 
@@ -16072,6 +16192,7 @@ mod tests {
                 user_id,
                 image_source: "avatar.png".to_owned(),
                 half_size: Vec2::splat(VOXEL_SIZE),
+                invisible: false,
             },
             GlobalTransform::from_translation(standee_eye_position),
         ));
@@ -16149,6 +16270,140 @@ mod tests {
 
         assert_eq!(size.y, VOXEL_SIZE * 2.0);
         assert_eq!(size.x, VOXEL_SIZE);
+    }
+
+    #[test]
+    fn invisibility_item_detection_uses_item_name_or_approved_skill() {
+        let character = PlayerCharacter {
+            inventory: crate::napcat::CharacterInventory {
+                items: vec![
+                    crate::napcat::InventoryItem {
+                        name: "隐身斗篷".to_owned(),
+                        ..Default::default()
+                    },
+                    crate::napcat::InventoryItem {
+                        name: "普通道具".to_owned(),
+                        skills: vec![crate::napcat::InventoryItemSkill {
+                            name: "潜行".to_owned(),
+                            note: "进入隐身状态".to_owned(),
+                            metadata: CharacterSkillMetadata::default(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    crate::napcat::InventoryItem {
+                        name: "普通未审批道具".to_owned(),
+                        skills: vec![crate::napcat::InventoryItemSkill {
+                            note: "隐身".to_owned(),
+                            metadata: CharacterSkillMetadata {
+                                pc_approved: false,
+                                st_approved: false,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                hotbar: vec![
+                    CharacterHotbarSlot::Item(0),
+                    CharacterHotbarSlot::Item(1),
+                    CharacterHotbarSlot::Item(2),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(voxel_invisibility_item(&character, 0).is_some());
+        assert!(voxel_invisibility_item(&character, 1).is_some());
+        assert!(voxel_invisibility_item(&character, 2).is_none());
+        assert!(voxel_invisibility_item(&character, 3).is_none());
+        assert!(voxel_invisibility_item(&character, 4).is_none());
+    }
+
+    #[test]
+    fn possession_invisibility_resets_when_releasing_or_switching_players() {
+        let mut possession = VoxelPossessionState::default();
+        possession.possess(42);
+        possession.invisibility_active = true;
+
+        possession.release();
+
+        assert!(!possession.invisibility_active);
+
+        possession.possess(43);
+        possession.invisibility_active = true;
+        possession.possess(44);
+
+        assert!(!possession.invisibility_active);
+    }
+
+    #[test]
+    fn invisible_standee_switches_to_the_gm_only_render_layer() {
+        let mut app = App::new();
+        app.add_systems(Update, sync_voxel_standee_invisibility_render_layers);
+        let child_a = app
+            .world_mut()
+            .spawn((Transform::default(), RenderLayers::default()))
+            .id();
+        let child_b = app
+            .world_mut()
+            .spawn((Transform::default(), RenderLayers::default()))
+            .id();
+        let standee = app
+            .world_mut()
+            .spawn((
+                VoxelPlayerStandee {
+                    user_id: 42,
+                    image_source: "avatar.png".to_owned(),
+                    half_size: Vec2::splat(VOXEL_SIZE),
+                    invisible: true,
+                },
+                Transform::default(),
+                RenderLayers::default(),
+            ))
+            .id();
+        app.world_mut()
+            .entity_mut(standee)
+            .add_children(&[child_a, child_b]);
+
+        app.update();
+
+        let gm_only = RenderLayers::layer(VOXEL_DM_GIZMO_RENDER_LAYER);
+        assert_eq!(
+            *app.world().entity(standee).get::<RenderLayers>().unwrap(),
+            gm_only
+        );
+        assert_eq!(
+            *app.world().entity(child_a).get::<RenderLayers>().unwrap(),
+            gm_only
+        );
+        assert_eq!(
+            *app.world().entity(child_b).get::<RenderLayers>().unwrap(),
+            gm_only
+        );
+
+        app.world_mut()
+            .entity_mut(standee)
+            .get_mut::<VoxelPlayerStandee>()
+            .unwrap()
+            .invisible = false;
+        app.update();
+
+        let default_layers = RenderLayers::default();
+        assert_eq!(
+            *app.world().entity(standee).get::<RenderLayers>().unwrap(),
+            default_layers
+        );
+        assert_eq!(
+            *app.world().entity(child_a).get::<RenderLayers>().unwrap(),
+            default_layers
+        );
+        assert_eq!(
+            *app.world().entity(child_b).get::<RenderLayers>().unwrap(),
+            default_layers
+        );
     }
 
     #[test]
@@ -16246,6 +16501,7 @@ mod tests {
                 user_id: 1_670_426_821,
                 image_source: "avatar.png".to_owned(),
                 half_size: Vec2::splat(VOXEL_SIZE),
+                invisible: false,
             },
             Transform::from_xyz(12.0, 3.0, -8.0),
         ));
