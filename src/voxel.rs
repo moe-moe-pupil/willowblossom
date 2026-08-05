@@ -280,6 +280,21 @@ const COMBAT_SPACESHIP_CENTER: IVec3 = IVec3::new(
     100 * ORBITAL_LAYOUT_SCALE,
 );
 const ABANDONED_STATION_CENTER: IVec3 = IVec3::new(0, 0, 200 * ORBITAL_LAYOUT_SCALE);
+/// GM-only remote island, 20x20 cells, placed far outside the main scene so
+/// the DM has a private spot away from the stations, fleet, and orbital
+/// planet. It is reachable through the teleport tool like a WoW GM island.
+const GM_ISLAND_CENTER: IVec3 = IVec3::new(12_000, 48, 12_000);
+const GM_ISLAND_EXTENT: i32 = 20;
+const GM_ISLAND_DEPTH: i32 = 8;
+// The island footprint spans `center.x/z - 10 ..= center.x/z + 9` (exactly
+// 20 cells per side) and `center.y - DEPTH ..= center.y + 1` (the +1 layer
+// holds the central landing pad).
+const GM_ISLAND_MIN_X: i32 = GM_ISLAND_CENTER.x - GM_ISLAND_EXTENT / 2;
+const GM_ISLAND_MAX_X: i32 = GM_ISLAND_CENTER.x + GM_ISLAND_EXTENT / 2 - 1;
+const GM_ISLAND_MIN_Z: i32 = GM_ISLAND_CENTER.z - GM_ISLAND_EXTENT / 2;
+const GM_ISLAND_MAX_Z: i32 = GM_ISLAND_CENTER.z + GM_ISLAND_EXTENT / 2 - 1;
+const GM_ISLAND_MIN_Y: i32 = GM_ISLAND_CENTER.y - GM_ISLAND_DEPTH;
+const GM_ISLAND_MAX_Y: i32 = GM_ISLAND_CENTER.y + 1;
 const WORKBOOK_ROOM_HEIGHT: i32 = 7;
 const STATION_DOCK_PAD_HALF_WIDTH: i32 = 22;
 const STATION_DOCK_PAD_HALF_LENGTH: i32 = 25;
@@ -1199,18 +1214,20 @@ pub(crate) enum VoxelTeleportDestination {
     CannonStation,
     AbandonedStation,
     PlanetScienceLab,
+    GmIsland,
     Spaceship(u8),
     PlayerStandee(u64),
     MapCell(IVec3),
 }
 
 impl VoxelTeleportDestination {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::ResearchStation,
         Self::SensorStation,
         Self::CannonStation,
         Self::AbandonedStation,
         Self::PlanetScienceLab,
+        Self::GmIsland,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -1220,6 +1237,7 @@ impl VoxelTeleportDestination {
             Self::CannonStation => "U.S.I Kyo空间防御炮台",
             Self::AbandonedStation => "废弃空间站",
             Self::PlanetScienceLab => "XY星基地",
+            Self::GmIsland => "GM小岛",
             Self::Spaceship(slot) => TELEPORT_SPACESHIP_NAMES
                 .get(slot as usize)
                 .copied()
@@ -1274,6 +1292,10 @@ impl VoxelTeleportDestination {
                     ) * VOXEL_SIZE
                     + floor_offset
             },
+            Self::GmIsland => {
+                // Land on top of the central pad (one cell above the grass).
+                (GM_ISLAND_CENTER + IVec3::Y).as_vec3() * VOXEL_SIZE + floor_offset
+            },
             Self::Spaceship(_) => return None,
             Self::PlayerStandee(_) => return None,
             Self::MapCell(cell) => cell.as_vec3() * VOXEL_SIZE + floor_offset,
@@ -1311,6 +1333,9 @@ pub(crate) fn voxel_spaceship_contains_position(
 
 pub(crate) fn voxel_teleport_static_area_label(position: Vec3) -> &'static str {
     let cell = (position / VOXEL_SIZE).round().as_ivec3();
+    if gm_island_contains_xz(cell) && cell.y >= GM_ISLAND_MIN_Y - 4 {
+        return "GM小岛";
+    }
     for (center, design, label) in [
         (
             RESEARCH_STATION_CENTER,
@@ -1341,6 +1366,15 @@ pub(crate) fn voxel_teleport_static_area_label(position: Vec3) -> &'static str {
     } else {
         "外部空间"
     }
+}
+
+fn gm_island_contains_xz(cell: IVec3) -> bool {
+    (GM_ISLAND_MIN_X..=GM_ISLAND_MAX_X).contains(&cell.x)
+        && (GM_ISLAND_MIN_Z..=GM_ISLAND_MAX_Z).contains(&cell.z)
+}
+
+fn is_gm_island_cell(cell: IVec3) -> bool {
+    gm_island_contains_xz(cell) && (GM_ISLAND_MIN_Y..=GM_ISLAND_MAX_Y).contains(&cell.y)
 }
 
 #[derive(Component, Clone)]
@@ -3608,9 +3642,44 @@ fn populate_default_grid(grid: &mut Mut<Grid<u8>>) {
         build_workbook_orbital_location(grid, center, design);
         add_space_station_docking_areas(grid, center, design);
     }
+    build_gm_island(grid);
     for door in static_voxel_auto_doors() {
         for cell in door.cells {
             grid.set(cell, 0);
+        }
+    }
+}
+
+fn build_gm_island(grid: &mut Mut<Grid<u8>>) {
+    for dz in 0..GM_ISLAND_EXTENT {
+        for dx in 0..GM_ISLAND_EXTENT {
+            let edge =
+                dx == 0 || dz == 0 || dx == GM_ISLAND_EXTENT - 1 || dz == GM_ISLAND_EXTENT - 1;
+            let column = GM_ISLAND_CENTER
+                + IVec3::new(
+                    dx - GM_ISLAND_EXTENT / 2,
+                    0,
+                    dz - GM_ISLAND_EXTENT / 2,
+                );
+            for depth in 0..=GM_ISLAND_DEPTH {
+                let cell = column - IVec3::Y * depth;
+                let material = if depth == 0 {
+                    if edge { 3 } else { 1 }
+                } else if depth == GM_ISLAND_DEPTH && edge {
+                    3
+                } else {
+                    2
+                };
+                grid.set(cell, material);
+            }
+        }
+    }
+    // Central landing pad: a stone disc with a glowing trim ring, where the
+    // GM arrives after teleporting.
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            let pad = GM_ISLAND_CENTER + IVec3::new(dx, 1, dz);
+            grid.set(pad, if dx == 0 && dz == 0 { 6 } else { 7 });
         }
     }
 }
@@ -12211,7 +12280,10 @@ fn refresh_voxel_minimap_snapshot(
         return;
     };
     *snapshot = voxel_minimap_snapshot_from_cells(
-        &voxel_cells(grid),
+        &voxel_cells(grid)
+            .into_iter()
+            .filter(|(cell, _)| !is_gm_island_cell(*cell))
+            .collect::<Vec<_>>(),
         VOXEL_MINIMAP_RESOLUTION,
     );
 }
@@ -15669,6 +15741,155 @@ mod tests {
                     + Vec3::Y * 0.5
             )
         );
+        assert_eq!(
+            VoxelTeleportDestination::GmIsland.player_position(),
+            Some(
+                (GM_ISLAND_CENTER + IVec3::Y).as_vec3() * VOXEL_SIZE
+                    + Vec3::Y * 0.5
+            )
+        );
+    }
+
+    #[test]
+    fn teleport_menu_lists_the_gm_island_destination() {
+        assert!(VoxelTeleportDestination::ALL
+            .contains(&VoxelTeleportDestination::GmIsland));
+        assert_eq!(
+            VoxelTeleportDestination::GmIsland.label(),
+            "GM小岛"
+        );
+    }
+
+    #[test]
+    fn gm_island_teleport_is_far_from_the_main_scene() {
+        let island = VoxelTeleportDestination::GmIsland
+            .player_position()
+            .unwrap();
+
+        for landmark in [
+            RESEARCH_STATION_CENTER,
+            SENSOR_STATION_CENTER,
+            CANNON_STATION_CENTER,
+            ABANDONED_STATION_CENTER,
+            COMBAT_SPACESHIP_CENTER,
+        ] {
+            assert!(
+                island.distance(landmark.as_vec3() * VOXEL_SIZE) > 2_000.0,
+                "GM island must stay far outside the main scene"
+            );
+        }
+        assert!(
+            island.distance(ORBITAL_PLANET_CENTER) > 2_000.0,
+            "GM island must stay far from the orbital planet"
+        );
+    }
+
+    #[test]
+    fn gm_island_builds_a_20_by_20_grass_island_with_a_landing_pad() {
+        let mut app = App::new();
+        let entity = app.world_mut().spawn(Grid::<u8>::new()).id();
+        let mut entity = app.world_mut().entity_mut(entity);
+        let mut grid = entity.get_mut::<Grid<u8>>().unwrap();
+        build_gm_island(&mut grid);
+
+        let mut top_cells = 0;
+        for x in GM_ISLAND_MIN_X..=GM_ISLAND_MAX_X {
+            for z in GM_ISLAND_MIN_Z..=GM_ISLAND_MAX_Z {
+                let top = IVec3::new(x, GM_ISLAND_CENTER.y, z);
+                let edge = x == GM_ISLAND_MIN_X
+                    || z == GM_ISLAND_MIN_Z
+                    || x == GM_ISLAND_MAX_X
+                    || z == GM_ISLAND_MAX_Z;
+                assert_eq!(
+                    grid.get(top),
+                    Some(&if edge { 3 } else { 1 }),
+                    "grass/sand rim at {top:?}"
+                );
+                assert_eq!(
+                    grid.get(top - IVec3::Y),
+                    Some(&2),
+                    "dirt under {top:?}"
+                );
+                assert_eq!(
+                    grid.get(top - IVec3::Y * GM_ISLAND_DEPTH),
+                    Some(&if edge { 3 } else { 2 }),
+                    "island base at {top:?}"
+                );
+                let pad_area = x.abs_diff(GM_ISLAND_CENTER.x) <= 1
+                    && z.abs_diff(GM_ISLAND_CENTER.z) <= 1;
+                if !pad_area {
+                    assert_eq!(
+                        grid.get(top + IVec3::Y),
+                        Some(&0),
+                        "air above {top:?}"
+                    );
+                }
+                top_cells += 1;
+            }
+        }
+        assert_eq!(top_cells, GM_ISLAND_EXTENT * GM_ISLAND_EXTENT);
+
+        assert_eq!(
+            grid.get(GM_ISLAND_CENTER + IVec3::Y),
+            Some(&6),
+            "pad center"
+        );
+        for offset in [
+            IVec3::new(1, 1, 0),
+            IVec3::new(-1, 1, 0),
+            IVec3::new(0, 1, 1),
+            IVec3::new(0, 1, -1),
+        ] {
+            assert_eq!(
+                grid.get(GM_ISLAND_CENTER + offset),
+                Some(&7),
+                "pad trim at {offset:?}"
+            );
+        }
+        assert_eq!(
+            grid.get(GM_ISLAND_CENTER + IVec3::new(2, 1, 0)),
+            Some(&0),
+            "pad must stay 3x3"
+        );
+        assert_eq!(
+            grid.get(GM_ISLAND_CENTER + IVec3::new(0, 2, 0)),
+            Some(&0),
+            "nothing above the pad"
+        );
+    }
+
+    #[test]
+    fn gm_island_cell_predicate_matches_the_built_footprint() {
+        assert!(!is_gm_island_cell(IVec3::new(
+            GM_ISLAND_MIN_X - 1,
+            GM_ISLAND_CENTER.y,
+            GM_ISLAND_CENTER.z,
+        )));
+        assert!(is_gm_island_cell(IVec3::new(
+            GM_ISLAND_MIN_X,
+            GM_ISLAND_CENTER.y,
+            GM_ISLAND_CENTER.z,
+        )));
+        assert!(is_gm_island_cell(IVec3::new(
+            GM_ISLAND_MAX_X,
+            GM_ISLAND_CENTER.y - GM_ISLAND_DEPTH,
+            GM_ISLAND_MAX_Z,
+        )));
+        assert!(!is_gm_island_cell(IVec3::new(
+            GM_ISLAND_MAX_X,
+            GM_ISLAND_CENTER.y - GM_ISLAND_DEPTH - 1,
+            GM_ISLAND_MAX_Z,
+        )));
+        assert!(is_gm_island_cell(IVec3::new(
+            GM_ISLAND_CENTER.x,
+            GM_ISLAND_CENTER.y + 1,
+            GM_ISLAND_CENTER.z,
+        )));
+        assert!(!is_gm_island_cell(IVec3::new(
+            GM_ISLAND_CENTER.x,
+            GM_ISLAND_CENTER.y + 2,
+            GM_ISLAND_CENTER.z,
+        )));
     }
 
     #[test]
@@ -15730,6 +15951,16 @@ mod tests {
         assert_eq!(
             voxel_teleport_static_area_label(ABANDONED_STATION_CENTER.as_vec3() * VOXEL_SIZE),
             "废弃空间站"
+        );
+        assert_eq!(
+            voxel_teleport_static_area_label(GM_ISLAND_CENTER.as_vec3() * VOXEL_SIZE),
+            "GM小岛"
+        );
+        assert_eq!(
+            voxel_teleport_static_area_label(
+                (GM_ISLAND_CENTER + IVec3::Y * 2).as_vec3() * VOXEL_SIZE
+            ),
+            "GM小岛"
         );
         assert_eq!(
             voxel_teleport_static_area_label(Vec3::splat(100_000.0)),
