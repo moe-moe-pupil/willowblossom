@@ -2982,21 +2982,21 @@ fn encounter_roster_ui(
                 .text_edit_singleline(&mut participant.display_name)
                 .changed();
             ui.small(&participant.target_id);
-            ui.label("速度");
-            changed |= ui
-                .add(egui::DragValue::new(&mut participant.speed).speed(0.5))
-                .changed();
             let effective_speed = participant_order_speed(
                 participant,
                 living_player_count,
                 encounter.active,
             );
-            if (effective_speed - participant.speed).abs() > f32::EPSILON {
-                ui.small(format!(
-                    "实 {}",
-                    format_number(effective_speed)
-                ));
+            let speed_escalated = (effective_speed - participant.speed).abs() > f32::EPSILON;
+            if speed_escalated {
+                ui.label(format!("速度 {}", format_number(effective_speed)))
+                    .on_hover_text("存活玩家≤3，狂风恶浪移速加成提升至35%");
+            } else {
+                ui.label("速度");
             }
+            changed |= ui
+                .add(egui::DragValue::new(&mut participant.speed).speed(0.5))
+                .changed();
             if participant.penance_healing_bonus_percent > f32::EPSILON
                 && participant.penance_kill_assist_count > 0
             {
@@ -9885,6 +9885,14 @@ mod tests {
             13.5
         );
         assert_eq!(
+            participant_order_speed(
+                gale_participant,
+                living_player_participant_count(&encounter),
+                encounter.active,
+            ),
+            12.0
+        );
+        assert_eq!(
             ordered_participant_indices(&encounter)
                 .into_iter()
                 .map(|index| encounter.participants[index].target_id.as_str())
@@ -9902,6 +9910,18 @@ mod tests {
         assert_eq!(
             living_player_participant_count(&encounter),
             3
+        );
+        assert_eq!(
+            participant_order_speed(
+                encounter
+                    .participants
+                    .iter()
+                    .find(|participant| participant.target_id == "gale")
+                    .unwrap(),
+                living_player_participant_count(&encounter),
+                encounter.active,
+            ),
+            13.5
         );
         assert_eq!(
             ordered_participant_indices(&encounter)
