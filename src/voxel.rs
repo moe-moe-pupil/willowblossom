@@ -102,7 +102,6 @@ use crate::{
     napcat::{
         CharacterHotbarSlot,
         CharacterSkillMetadata,
-        InventoryItem,
         NapcatIOSender,
         NapcatMessageManager,
         NapcatOutboundMessage,
@@ -1210,6 +1209,7 @@ pub(crate) enum VoxelCreativeItem {
     SpaceshipPossessionTool,
     TeleportTool,
     DoorLockTool,
+    InvisibilityTool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1404,7 +1404,6 @@ pub(crate) struct VoxelPossessionState {
     applied_user_id: Option<u64>,
     pub selected_hotbar_slot: usize,
     pub player_inventory_open: bool,
-    pub invisibility_active: bool,
     pub movement_used: f32,
     pub movement_limit: f32,
     movement_completed: bool,
@@ -1439,7 +1438,6 @@ impl Default for VoxelPossessionState {
             applied_user_id: None,
             selected_hotbar_slot: 0,
             player_inventory_open: false,
-            invisibility_active: false,
             movement_used: 0.0,
             movement_limit: 0.0,
             movement_completed: false,
@@ -1475,7 +1473,6 @@ impl VoxelPossessionState {
 
     fn reset_turn_overrides(&mut self) {
         self.player_inventory_open = false;
-        self.invisibility_active = false;
         self.reset_movement_requested = false;
         self.movement_limit_bypassed = false;
         self.movement_bypass_confirmation_pending = false;
@@ -1507,6 +1504,28 @@ struct VoxelAutoDoor {
 #[derive(Resource, Default)]
 struct VoxelAutoDoorLockState {
     all_locked: bool,
+}
+
+/// Players marked invisible by the GM's 隐身工具. Their standees only render
+/// on the DM gizmo layer, so player cameras never see them and the GM viewport
+/// keeps a preview frame around each one.
+#[derive(Resource, Default)]
+struct VoxelInvisibilityState {
+    invisible_user_ids: HashSet<u64>,
+}
+
+/// Toggles a player's invisibility mark. Returns the new state (`true` = now
+/// invisible).
+fn toggle_voxel_player_invisibility(
+    state: &mut VoxelInvisibilityState,
+    user_id: u64,
+) -> bool {
+    if state.invisible_user_ids.remove(&user_id) {
+        false
+    } else {
+        state.invisible_user_ids.insert(user_id);
+        true
+    }
 }
 
 #[derive(Resource, Default)]
@@ -1989,6 +2008,10 @@ impl VoxelEditorState {
                 self.light_tool = None;
                 self.selected_light = None;
             },
+            VoxelCreativeItem::InvisibilityTool => {
+                self.light_tool = None;
+                self.selected_light = None;
+            },
         }
         if item != VoxelCreativeItem::TeleportTool {
             self.teleport_menu_open = false;
@@ -2070,6 +2093,9 @@ impl VoxelEditorState {
         if self.is_door_lock_tool_equipped() {
             return "门锁工具".to_owned();
         }
+        if self.is_invisibility_tool_equipped() {
+            return "隐身工具".to_owned();
+        }
         self.light_tool
             .map_or_else(
                 || self.mode.label(),
@@ -2096,6 +2122,10 @@ impl VoxelEditorState {
 
     pub(crate) fn is_door_lock_tool_equipped(&self) -> bool {
         self.equipped_item == Some(VoxelCreativeItem::DoorLockTool)
+    }
+
+    pub(crate) fn is_invisibility_tool_equipped(&self) -> bool {
+        self.equipped_item == Some(VoxelCreativeItem::InvisibilityTool)
     }
 
     pub(crate) fn request_teleport(&mut self, destination: VoxelTeleportDestination) {
@@ -2308,6 +2338,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPossessionState>()
         .init_resource::<VoxelTargetingPreview>()
         .init_resource::<VoxelAutoDoorLockState>()
+        .init_resource::<VoxelInvisibilityState>()
         .init_resource::<VoxelLockedDoorMaterials>()
         .init_resource::<VoxelRadianceVolume>()
         .init_resource::<SceneCaptureRequests>()
@@ -2369,6 +2400,8 @@ impl Plugin for TrpgVoxelPlugin {
                     sync_selected_voxel_light,
                     edit_voxel_grid.run_if(crate::replay::replay_mouse_interaction_inactive),
                     use_voxel_door_lock_tool
+                        .run_if(crate::replay::replay_mouse_interaction_inactive),
+                    use_voxel_invisibility_tool
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
                     rebuild_dirty_voxel_spaceships,
                     despawn_unsupported_voxel_auto_doors,
@@ -2916,29 +2949,6 @@ fn activate_player_hotbar_slot(
     if releases_control {
         possession.release();
     }
-}
-
-/// A GM-authored inventory item counts as an invisibility item when its name
-/// or one of its approved skills mentions 隐身. The possessed player becomes
-/// invisible while the GM activates that item from the hotbar.
-fn voxel_item_is_invisibility(item: &InventoryItem) -> bool {
-    item.name.contains("隐身")
-        || item.skills.iter().any(|skill| {
-            skill.metadata.is_approved()
-                && (skill.name.contains("隐身") || skill.note.contains("隐身"))
-        })
-}
-
-fn voxel_invisibility_item(
-    character: &PlayerCharacter,
-    slot: usize,
-) -> Option<&InventoryItem> {
-    let slot = *character.inventory.hotbar.get(slot)?;
-    let CharacterHotbarSlot::Item(index) = slot else {
-        return None;
-    };
-    let item = character.inventory.items.get(index)?;
-    voxel_item_is_invisibility(item).then_some(item)
 }
 
 fn voxel_glass_material() -> StandardMaterial {
@@ -8176,32 +8186,6 @@ fn voxel_player_camera_panel(
                         }
                     }
                 });
-                if let Some(character) = manager
-                    .as_deref()
-                    .and_then(|manager| manager.player_characters.get(&selected.to_string()))
-                {
-                    if possession.invisibility_active
-                        || voxel_invisibility_item(character, possession.selected_hotbar_slot)
-                            .is_some()
-                    {
-                        ui.horizontal(|ui| {
-                            let label = if possession.invisibility_active {
-                                "取消隐身"
-                            } else {
-                                "使用隐身道具"
-                            };
-                            if ui.button(label).clicked() {
-                                possession.invisibility_active = !possession.invisibility_active;
-                            }
-                            if possession.invisibility_active {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(120, 230, 255),
-                                    "隐身中：仅GM视角可见预览框",
-                                );
-                            }
-                        });
-                    }
-                }
                 ui.small("生存模式：不可飞行或编辑方块；数字键1-9切换物品/主动技能。");
             }
 
@@ -8719,7 +8703,7 @@ fn sync_voxel_player_standees(
     mut images: ResMut<Assets<Image>>,
     mut assets: ResMut<VoxelPlayerStandeeAssets>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
-    possession: Res<VoxelPossessionState>,
+    invisibility_state: Res<VoxelInvisibilityState>,
     mut existing: Query<(Entity, &mut VoxelPlayerStandee)>,
     capture_cameras: Query<
         (&Transform, &VoxelPlayerCaptureCamera),
@@ -8769,8 +8753,7 @@ fn sync_voxel_player_standees(
 
     for (user_id, image_source) in active {
         let camera_transform = camera_transforms[&user_id];
-        let invisible =
-            possession.active_user_id == Some(user_id) && possession.invisibility_active;
+        let invisible = invisibility_state.invisible_user_ids.contains(&user_id);
         if let Some(entity) = assets.entities.get(&user_id).copied() {
             if let Ok((_, mut standee)) = existing.get_mut(entity) {
                 if standee.image_source == image_source {
@@ -13877,6 +13860,66 @@ fn use_voxel_door_lock_tool(
     });
 }
 
+fn use_voxel_invisibility_tool(
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
+    possession: Res<VoxelPossessionState>,
+    standees: Query<(
+        &VoxelPlayerStandee,
+        &GlobalTransform,
+        &Visibility,
+    )>,
+    mut invisibility_state: ResMut<VoxelInvisibilityState>,
+    mut editor: ResMut<VoxelEditorState>,
+    egui_input: Res<EguiWantsInput>,
+) {
+    if possession.active_user_id.is_some()
+        || !editor.is_invisibility_tool_equipped()
+        || editor.creative_inventory_open
+        || editor.teleport_menu_open
+        || !mouse.just_pressed(MouseButton::Right)
+        || voxel_world_pointer_blocked(
+            egui_input.wants_any_pointer_input(),
+            editor.right_started_over_ui,
+        )
+    {
+        return;
+    }
+    let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single()) else {
+        return;
+    };
+    let Some(ray) = viewport_ray(
+        window,
+        camera,
+        camera_transform,
+        &editor,
+    ) else {
+        return;
+    };
+    let Some((user_id, _)) = standees
+        .iter()
+        .filter_map(|(standee, transform, visibility)| {
+            if *visibility == Visibility::Hidden {
+                return None;
+            }
+            ray_intersects_player_standee(ray, transform, standee.half_size)
+                .map(|distance| (standee.user_id, distance))
+        })
+        .filter(|(_, distance)| *distance <= MAX_RAY_DISTANCE)
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+    else {
+        editor.physics_status = Some("没有瞄准玩家立绘".to_owned());
+        return;
+    };
+    let now_invisible = toggle_voxel_player_invisibility(&mut invisibility_state, user_id);
+    editor.physics_status = Some(if now_invisible {
+        format!("已标记PL {user_id} 隐身（仅GM视角可见预览框）")
+    } else {
+        format!("已取消PL {user_id} 隐身")
+    });
+}
+
 fn apply_voxel_teleport(
     mut editor: ResMut<VoxelEditorState>,
     possession: Res<VoxelPossessionState>,
@@ -16273,70 +16316,34 @@ mod tests {
     }
 
     #[test]
-    fn invisibility_item_detection_uses_item_name_or_approved_skill() {
-        let character = PlayerCharacter {
-            inventory: crate::napcat::CharacterInventory {
-                items: vec![
-                    crate::napcat::InventoryItem {
-                        name: "隐身斗篷".to_owned(),
-                        ..Default::default()
-                    },
-                    crate::napcat::InventoryItem {
-                        name: "普通道具".to_owned(),
-                        skills: vec![crate::napcat::InventoryItemSkill {
-                            name: "潜行".to_owned(),
-                            note: "进入隐身状态".to_owned(),
-                            metadata: CharacterSkillMetadata::default(),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                    crate::napcat::InventoryItem {
-                        name: "普通未审批道具".to_owned(),
-                        skills: vec![crate::napcat::InventoryItemSkill {
-                            note: "隐身".to_owned(),
-                            metadata: CharacterSkillMetadata {
-                                pc_approved: false,
-                                st_approved: false,
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                ],
-                hotbar: vec![
-                    CharacterHotbarSlot::Item(0),
-                    CharacterHotbarSlot::Item(1),
-                    CharacterHotbarSlot::Item(2),
-                ],
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+    fn invisibility_state_toggles_players_hidden_flags() {
+        let mut state = VoxelInvisibilityState::default();
+        assert!(!state.invisible_user_ids.contains(&42));
 
-        assert!(voxel_invisibility_item(&character, 0).is_some());
-        assert!(voxel_invisibility_item(&character, 1).is_some());
-        assert!(voxel_invisibility_item(&character, 2).is_none());
-        assert!(voxel_invisibility_item(&character, 3).is_none());
-        assert!(voxel_invisibility_item(&character, 4).is_none());
+        assert!(toggle_voxel_player_invisibility(&mut state, 42));
+        assert!(state.invisible_user_ids.contains(&42));
+
+        assert!(!toggle_voxel_player_invisibility(&mut state, 42));
+        assert!(!state.invisible_user_ids.contains(&42));
+
+        assert!(toggle_voxel_player_invisibility(&mut state, 42));
+        assert!(toggle_voxel_player_invisibility(&mut state, 7));
+        assert!(state.invisible_user_ids.contains(&7));
+        assert_eq!(state.invisible_user_ids.len(), 2);
+
+        assert!(!toggle_voxel_player_invisibility(&mut state, 7));
+        assert_eq!(state.invisible_user_ids.len(), 1);
     }
 
     #[test]
-    fn possession_invisibility_resets_when_releasing_or_switching_players() {
-        let mut possession = VoxelPossessionState::default();
-        possession.possess(42);
-        possession.invisibility_active = true;
+    fn invisibility_tool_equips_like_other_gm_creative_tools() {
+        let mut editor = VoxelEditorState::default();
+        assert!(!editor.is_invisibility_tool_equipped());
 
-        possession.release();
+        editor.equip_creative_item(VoxelCreativeItem::InvisibilityTool);
 
-        assert!(!possession.invisibility_active);
-
-        possession.possess(43);
-        possession.invisibility_active = true;
-        possession.possess(44);
-
-        assert!(!possession.invisibility_active);
+        assert!(editor.is_invisibility_tool_equipped());
+        assert_eq!(editor.active_tool_label(), "隐身工具");
     }
 
     #[test]

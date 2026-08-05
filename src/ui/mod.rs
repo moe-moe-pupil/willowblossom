@@ -458,6 +458,15 @@ fn paint_voxel_creative_item_icon(
             dot(0.0, 0.14, 0.1);
             line((0.0, 0.02), (0.0, -0.22));
         },
+        VoxelCreativeItem::InvisibilityTool => {
+            circle(0.0, -0.35, 0.28);
+            line((-0.38, 0.55), (-0.12, 0.92));
+            line((-0.12, 0.92), (0.12, 0.92));
+            line((0.12, 0.92), (0.38, 0.55));
+            box_outline((-0.82, -0.82), (0.82, 0.82));
+            thin_line((-0.82, -0.2), (0.82, -0.2));
+            thin_line((-0.82, 0.2), (0.82, 0.2));
+        },
         VoxelCreativeItem::Mode(VoxelEditMode::Add) => {
             box_outline((-0.75, -0.75), (0.35, 0.35));
             plus(0.48, 0.48, 0.4);
@@ -609,6 +618,10 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
         VoxelCreativeItem::DoorLockTool => (
             "门锁工具",
             egui::Color32::from_rgb(230, 176, 42),
+        ),
+        VoxelCreativeItem::InvisibilityTool => (
+            "隐身工具",
+            egui::Color32::from_rgb(120, 220, 255),
         ),
         VoxelCreativeItem::Mode(mode) => match mode {
             VoxelEditMode::Add => (
@@ -16126,6 +16139,31 @@ pub fn ui_system(
                                     .clicked()
                                     {
                                         picked_item = Some(door_lock_tool);
+                                    }
+                                    ui.small(name);
+                                });
+                                let invisibility_tool =
+                                    VoxelCreativeItem::InvisibilityTool;
+                                let (name, _) =
+                                    voxel_creative_item_visual(invisibility_tool);
+                                ui.vertical_centered(|ui| {
+                                    if voxel_creative_drag_source(
+                                        ui,
+                                        egui::Id::new("voxel_catalog_invisibility_tool"),
+                                        VoxelCreativeDragPayload::Catalog(invisibility_tool),
+                                        invisibility_tool,
+                                        voxel_editor.creative_hotbar
+                                            [voxel_editor.selected_hotbar_slot]
+                                            == Some(invisibility_tool),
+                                        48.0,
+                                        None,
+                                    )
+                                    .on_hover_text(
+                                        "GM右键玩家立绘即可标记/取消隐身；隐身玩家只对GM视角显示预览框",
+                                    )
+                                    .clicked()
+                                    {
+                                        picked_item = Some(invisibility_tool);
                                     }
                                     ui.small(name);
                                 });
