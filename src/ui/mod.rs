@@ -16199,7 +16199,7 @@ pub fn ui_system(
                                         None,
                                     )
                                     .on_hover_text(
-                                        "GM右键玩家立绘循环切换：原立绘 → 默认头像 → 其他玩家 → 原立绘",
+                                        "GM右键玩家立绘打开立绘变形选择窗口",
                                     )
                                     .clicked()
                                     {
@@ -16395,6 +16395,111 @@ pub fn ui_system(
                     });
                 if !window_open {
                     voxel_editor.teleport_menu_open = false;
+                }
+            }
+
+            if let Some(user_id) = voxel_editor.portrait_transform_target {
+                let mut window_open = true;
+                let mut close_requested = false;
+                let target_id = user_id.to_string();
+                let target_name = target_display_name(&manager, &target_id);
+                let portrait_window_max_height =
+                    (ctx.content_rect().height() - 32.0).max(200.0);
+                egui::Window::new(format!("立绘变形 · {target_name}"))
+                    .id(egui::Id::new("voxel_portrait_transform_tool_window"))
+                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                    .collapsible(false)
+                    .resizable(false)
+                    .max_height(portrait_window_max_height)
+                    .vscroll(true)
+                    .open(&mut window_open)
+                    .show(ctx, |ui| {
+                        ui.label("选择要变成的立绘外观");
+                        ui.small("只改变立绘显示，不影响角色数据。");
+                        ui.separator();
+                        let options = crate::napcat::player_portrait_transform_options(
+                            &manager.player_characters,
+                            &target_id,
+                        );
+                        let current = manager
+                            .player_characters
+                            .get(&target_id)
+                            .and_then(|character| {
+                                character.portrait_transform.as_ref().map(|transform| match transform {
+                                    crate::napcat::PortraitTransform::DefaultAvatar => {
+                                        "默认头像".to_owned()
+                                    },
+                                    crate::napcat::PortraitTransform::OtherPlayer(other_id) => {
+                                        options
+                                            .iter()
+                                            .find(|(option_id, _)| option_id == other_id)
+                                            .map(|(_, label)| format!("{label}的立绘"))
+                                            .unwrap_or_else(|| format!("玩家{other_id}的立绘"))
+                                    },
+                                })
+                            })
+                            .unwrap_or_else(|| "原立绘".to_owned());
+                        ui.small(format!("当前：{current}"));
+                        let mut chosen: Option<Option<crate::napcat::PortraitTransform>> = None;
+                        if ui
+                            .add_sized(
+                                egui::vec2(220.0, 28.0),
+                                egui::Button::new("原立绘（恢复）"),
+                            )
+                            .on_hover_text("恢复为该玩家自己的立绘")
+                            .clicked()
+                        {
+                            chosen = Some(None);
+                        }
+                        if ui
+                            .add_sized(
+                                egui::vec2(220.0, 28.0),
+                                egui::Button::new("默认头像"),
+                            )
+                            .on_hover_text("显示内置的通用默认头像")
+                            .clicked()
+                        {
+                            chosen = Some(Some(crate::napcat::PortraitTransform::DefaultAvatar));
+                        }
+                        if !options.is_empty() {
+                            ui.separator();
+                            for (option_id, label) in options {
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(220.0, 28.0),
+                                        egui::Button::new(format!("{label}的立绘")),
+                                    )
+                                    .on_hover_text(format!("QQ：{option_id}"))
+                                    .clicked()
+                                {
+                                    chosen = Some(Some(
+                                        crate::napcat::PortraitTransform::OtherPlayer(
+                                            option_id.clone(),
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("取消").clicked() {
+                            close_requested = true;
+                        }
+                        if let Some(transform) = chosen {
+                            if let Some(character) = manager
+                                .player_characters
+                                .get_mut(&target_id)
+                            {
+                                character.portrait_transform = transform;
+                            }
+                            manager.persist().ok();
+                            close_requested = true;
+                        }
+                    });
+                if close_requested {
+                    window_open = false;
+                }
+                if !window_open {
+                    voxel_editor.portrait_transform_target = None;
                 }
             }
 

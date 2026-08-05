@@ -1861,6 +1861,8 @@ pub(crate) struct VoxelEditorState {
     first_person_was_enabled: bool,
     first_person_cursor_released: bool,
     teleport_requested: Option<VoxelTeleportDestination>,
+    /// 立绘变形器当前选中的玩家；窗口关闭后恢复为 None。
+    pub portrait_transform_target: Option<u64>,
 }
 
 impl Default for VoxelEditorState {
@@ -1926,6 +1928,7 @@ impl Default for VoxelEditorState {
             // Keep the OS cursor free until the user explicitly clicks the 3D viewport.
             first_person_cursor_released: true,
             teleport_requested: None,
+            portrait_transform_target: None,
         }
     }
 }
@@ -2018,6 +2021,9 @@ impl VoxelEditorState {
         if item != VoxelCreativeItem::TeleportTool {
             self.teleport_menu_open = false;
         }
+        if item != VoxelCreativeItem::PortraitTransformTool {
+            self.portrait_transform_target = None;
+        }
     }
 
     pub(crate) fn select_hotbar_slot(&mut self, slot: usize) {
@@ -2032,6 +2038,7 @@ impl VoxelEditorState {
             self.light_tool = None;
             self.selected_light = None;
             self.teleport_menu_open = false;
+            self.portrait_transform_target = None;
         }
     }
 
@@ -2048,6 +2055,7 @@ impl VoxelEditorState {
                 self.light_tool = None;
                 self.selected_light = None;
                 self.teleport_menu_open = false;
+                self.portrait_transform_target = None;
             }
         }
     }
@@ -2065,6 +2073,7 @@ impl VoxelEditorState {
                 self.light_tool = None;
                 self.selected_light = None;
                 self.teleport_menu_open = false;
+                self.portrait_transform_target = None;
             }
         }
     }
@@ -10477,7 +10486,6 @@ fn use_portrait_transform_tool(
         &Visibility,
     )>,
     mut editor: ResMut<VoxelEditorState>,
-    manager: Option<ResMut<Persistent<NapcatMessageManager>>>,
     egui_input: Res<EguiWantsInput>,
 ) {
     if !editor.is_portrait_transform_tool_equipped()
@@ -10487,10 +10495,6 @@ fn use_portrait_transform_tool(
     {
         return;
     }
-    let Some(mut manager) = manager else {
-        editor.physics_status = Some("没有玩家数据，无法使用立绘变形器".to_owned());
-        return;
-    };
     let (Ok(window), Ok((camera, camera_transform))) = (windows.single(), cameras.single()) else {
         return;
     };
@@ -10519,42 +10523,8 @@ fn use_portrait_transform_tool(
         editor.physics_status = Some("没有瞄准玩家立绘".to_owned());
         return;
     };
-    let target_id = user_id.to_string();
-    let options = crate::napcat::player_portrait_transform_options(
-        &manager.player_characters,
-        &target_id,
-    );
-    let candidate_ids = options
-        .iter()
-        .map(|(player_id, _)| player_id.clone())
-        .collect::<Vec<_>>();
-    let Some(character) = manager.player_characters.get_mut(&target_id) else {
-        editor.physics_status = Some(format!("PL {user_id}还没有角色数据"));
-        return;
-    };
-    let next = crate::napcat::next_portrait_transform(
-        &character.portrait_transform,
-        &candidate_ids,
-    );
-    character.portrait_transform = next.clone();
-    let status = match &next {
-        None => format!("已将PL {user_id}的立绘恢复原样"),
-        Some(crate::napcat::PortraitTransform::DefaultAvatar) => {
-            format!("已将PL {user_id}的立绘变为默认头像")
-        },
-        Some(crate::napcat::PortraitTransform::OtherPlayer(other_id)) => {
-            let name = options
-                .iter()
-                .find(|(player_id, _)| player_id == other_id)
-                .map(|(_, label)| label.clone())
-                .unwrap_or_else(|| other_id.clone());
-            format!("已将PL {user_id}的立绘变为“{name}”")
-        },
-    };
-    if let Err(err) = manager.persist() {
-        eprintln!("failed to persist portrait transform tool change: {err}");
-    }
-    editor.physics_status = Some(status);
+    editor.portrait_transform_target = Some(user_id);
+    editor.physics_status = Some(format!("已打开立绘变形选择：PL {user_id}"));
 }
 
 fn use_spaceship_possession_tool(
