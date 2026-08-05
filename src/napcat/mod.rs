@@ -714,6 +714,9 @@ pub struct InventoryItem {
     pub stat_effects: Vec<BuffEffect>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<InventoryItemSkill>,
+    /// 使用道具后把使用者的立绘变成该外观。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portrait_transform: Option<PortraitTransform>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -770,6 +773,7 @@ impl Default for InventoryItem {
             soulbound: false,
             stat_effects: Vec::new(),
             skills: Vec::new(),
+            portrait_transform: None,
         }
     }
 }
@@ -1454,6 +1458,25 @@ pub(crate) fn player_portrait_transform_options(
         },
     );
     options
+}
+
+/// 全部有立绘的玩家选项（物品池等不需要排除某个玩家时使用）。
+pub(crate) fn player_portrait_options(
+    characters: &HashMap<String, PlayerCharacter>,
+) -> Vec<(String, String)> {
+    player_portrait_transform_options(characters, "")
+}
+
+/// 把道具配置的立绘变形应用到角色；返回是否发生变化。
+pub(crate) fn apply_item_portrait_transform(
+    character: &mut PlayerCharacter,
+    item: &InventoryItem,
+) -> bool {
+    if character.portrait_transform == item.portrait_transform {
+        return false;
+    }
+    character.portrait_transform = item.portrait_transform.clone();
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -10802,6 +10825,68 @@ position_cells = [4, 5, 6]
 
         let json = serde_json::to_string(&character).unwrap();
         let restored: PlayerCharacter = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.portrait_transform,
+            Some(PortraitTransform::OtherPlayer("2".to_owned()))
+        );
+    }
+
+    #[test]
+    fn apply_item_portrait_transform_applies_and_detects_no_change() {
+        let mut character = PlayerCharacter {
+            inited: true,
+            image: "own.png".to_owned(),
+            ..Default::default()
+        };
+        let item = InventoryItem {
+            name: "易容面具".to_owned(),
+            portrait_transform: Some(PortraitTransform::DefaultAvatar),
+            ..Default::default()
+        };
+
+        assert!(apply_item_portrait_transform(&mut character, &item));
+        assert_eq!(
+            character.portrait_transform,
+            Some(PortraitTransform::DefaultAvatar)
+        );
+        assert!(!apply_item_portrait_transform(&mut character, &item));
+    }
+
+    #[test]
+    fn apply_item_portrait_transform_can_revert_to_original() {
+        let mut character = PlayerCharacter {
+            inited: true,
+            image: "own.png".to_owned(),
+            portrait_transform: Some(PortraitTransform::OtherPlayer("2".to_owned())),
+            ..Default::default()
+        };
+        let item = InventoryItem::default();
+
+        assert!(apply_item_portrait_transform(&mut character, &item));
+        assert_eq!(character.portrait_transform, None);
+    }
+
+    #[test]
+    fn inventory_item_portrait_transform_deserializes_from_legacy_json() {
+        let legacy = r#"{"name":"旧物品"}"#;
+        let item: InventoryItem = serde_json::from_str(legacy).unwrap();
+        assert_eq!(item.portrait_transform, None);
+
+        let json = serde_json::to_string(&item).unwrap();
+        let round_tripped: InventoryItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.portrait_transform, None);
+    }
+
+    #[test]
+    fn inventory_item_portrait_transform_round_trips_through_json() {
+        let item = InventoryItem {
+            name: "变形魔盒".to_owned(),
+            portrait_transform: Some(PortraitTransform::OtherPlayer("2".to_owned())),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&item).unwrap();
+        let restored: InventoryItem = serde_json::from_str(&json).unwrap();
         assert_eq!(
             restored.portrait_transform,
             Some(PortraitTransform::OtherPlayer("2".to_owned()))

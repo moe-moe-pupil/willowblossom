@@ -6628,10 +6628,10 @@ fn format_character_number(value: f32) -> String {
 }
 
 fn portrait_transform_label(
-    character: &PlayerCharacter,
+    transform: &Option<crate::napcat::PortraitTransform>,
     portrait_options: &[(String, String)],
 ) -> String {
-    match character.portrait_transform.as_ref() {
+    match transform {
         None => "原立绘".to_owned(),
         Some(crate::napcat::PortraitTransform::DefaultAvatar) => "默认头像".to_owned(),
         Some(crate::napcat::PortraitTransform::OtherPlayer(other_id)) => portrait_options
@@ -6640,6 +6640,64 @@ fn portrait_transform_label(
             .map(|(_, label)| format!("{label}的立绘"))
             .unwrap_or_else(|| format!("玩家{other_id}的立绘")),
     }
+}
+
+fn portrait_transform_editor_ui(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    label: &str,
+    transform: &mut Option<crate::napcat::PortraitTransform>,
+    portrait_options: &[(String, String)],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(label);
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(portrait_transform_label(transform, portrait_options))
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(transform.is_none(), "原立绘")
+                    .on_hover_text("恢复为角色自己的立绘")
+                    .clicked()
+                {
+                    *transform = None;
+                    changed = true;
+                }
+                if ui
+                    .selectable_label(
+                        matches!(
+                            transform.as_ref(),
+                            Some(crate::napcat::PortraitTransform::DefaultAvatar)
+                        ),
+                        "默认头像",
+                    )
+                    .on_hover_text("显示内置的通用默认头像")
+                    .clicked()
+                {
+                    *transform = Some(crate::napcat::PortraitTransform::DefaultAvatar);
+                    changed = true;
+                }
+                for (option_id, label) in portrait_options {
+                    let active = matches!(
+                        transform.as_ref(),
+                        Some(crate::napcat::PortraitTransform::OtherPlayer(other_id))
+                            if other_id == option_id
+                    );
+                    if ui
+                        .selectable_label(active, format!("{label}的立绘"))
+                        .on_hover_text("把立绘变成这名玩家的样子")
+                        .clicked()
+                    {
+                        *transform =
+                            Some(crate::napcat::PortraitTransform::OtherPlayer(
+                                option_id.clone(),
+                            ));
+                        changed = true;
+                    }
+                }
+            });
+    });
+    changed
 }
 
 fn character_editor_ui(
@@ -6738,57 +6796,13 @@ fn character_editor_ui(
     changed |= ui.text_edit_singleline(&mut character.image).changed();
 
     ui.separator();
-    ui.horizontal_wrapped(|ui| {
-        ui.label("立绘变形");
-        egui::ComboBox::from_id_salt(("portrait_transform", target_id))
-            .selected_text(portrait_transform_label(character, portrait_options))
-            .show_ui(ui, |ui| {
-                if ui
-                    .selectable_label(
-                        character.portrait_transform.is_none(),
-                        "原立绘",
-                    )
-                    .on_hover_text("恢复为角色自己的立绘")
-                    .clicked()
-                {
-                    character.portrait_transform = None;
-                    changed = true;
-                }
-                if ui
-                    .selectable_label(
-                        matches!(
-                            character.portrait_transform,
-                            Some(crate::napcat::PortraitTransform::DefaultAvatar)
-                        ),
-                        "默认头像",
-                    )
-                    .on_hover_text("显示内置的通用默认头像")
-                    .clicked()
-                {
-                    character.portrait_transform =
-                        Some(crate::napcat::PortraitTransform::DefaultAvatar);
-                    changed = true;
-                }
-                for (option_id, label) in portrait_options {
-                    let active = matches!(
-                        &character.portrait_transform,
-                        Some(crate::napcat::PortraitTransform::OtherPlayer(other_id))
-                            if other_id == option_id
-                    );
-                    if ui
-                        .selectable_label(active, format!("{label}的立绘"))
-                        .on_hover_text("把立绘变成这名玩家的样子")
-                        .clicked()
-                    {
-                        character.portrait_transform =
-                            Some(crate::napcat::PortraitTransform::OtherPlayer(
-                                option_id.clone(),
-                            ));
-                        changed = true;
-                    }
-                }
-            });
-    });
+    changed |= portrait_transform_editor_ui(
+        ui,
+        ("portrait_transform", target_id),
+        "立绘变形",
+        &mut character.portrait_transform,
+        portrait_options,
+    );
 
     ui.separator();
     let status_unlocked = edit_state.unlocked_status_targets.contains(target_id);
@@ -8620,6 +8634,7 @@ fn character_inventory_editor_ui(
 
             let mut remove_index = None;
             let mut equip_index = None;
+            let mut use_portrait_index = None;
             ui.horizontal(|ui| {
                 ui.label("背包");
                 if ui.button("+").on_hover_text("添加空物品").clicked() {
@@ -8675,6 +8690,15 @@ fn character_inventory_editor_ui(
                             {
                                 equip_index = Some(index);
                             }
+                            if item.portrait_transform.is_some() {
+                                if ui
+                                    .button("变形")
+                                    .on_hover_text("使用后改变立绘并消耗1个")
+                                    .clicked()
+                                {
+                                    use_portrait_index = Some(index);
+                                }
+                            }
                             if ui.button("-").on_hover_text("移除物品").clicked() {
                                 remove_index = Some(index);
                             }
@@ -8714,6 +8738,10 @@ fn character_inventory_editor_ui(
                 remove_character_inventory_item(character, index, true);
                 changed = true;
                 equipment_changed = true;
+            }
+            if let Some(index) = use_portrait_index {
+                use_portrait_transform_item(character, index);
+                changed = true;
             }
             if let Some(index) = remove_index {
                 remove_character_inventory_item(character, index, false);
@@ -8888,6 +8916,22 @@ fn remove_character_inventory_item(character: &mut PlayerCharacter, index: usize
     }
 }
 
+fn use_portrait_transform_item(character: &mut PlayerCharacter, index: usize) {
+    if index >= character.inventory.items.len() {
+        return;
+    }
+    let item = &character.inventory.items[index];
+    let Some(transform) = item.portrait_transform.clone() else {
+        return;
+    };
+    character.portrait_transform = Some(transform);
+    if item.stack > 1 {
+        character.inventory.items[index].stack -= 1;
+    } else {
+        remove_character_inventory_item(character, index, false);
+    }
+}
+
 fn normalize_item(item: &mut InventoryItem) -> bool {
     let mut changed = false;
     if item.max_stack == 0 {
@@ -8936,6 +8980,7 @@ fn same_stackable_item(left: &InventoryItem, right: &InventoryItem) -> bool {
         && left.soulbound == right.soulbound
         && left.stat_effects == right.stat_effects
         && left.skills == right.skills
+        && left.portrait_transform == right.portrait_transform
         && left.max_stack > 1
 }
 
@@ -11815,6 +11860,7 @@ fn item_pool_settings_ui(
     let mut changed = false;
     ui.heading("物品池");
     ui.small("物品池是GM模板库；发给玩家时会复制一份，装备后属性加成立即进入最终数值。");
+    let portrait_options = crate::napcat::player_portrait_options(&manager.player_characters);
     let category_options =
         pool_category_options(manager.item_pool.iter().map(|item| item.category.clone()));
     ui.horizontal_wrapped(|ui| {
@@ -11869,7 +11915,7 @@ fn item_pool_settings_ui(
                     item.stat_effects.len()
                 ),
                 |ui| {
-                    changed |= inventory_item_definition_ui(ui, item);
+                    changed |= inventory_item_definition_ui(ui, item, &portrait_options);
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(
@@ -11905,7 +11951,11 @@ fn item_pool_settings_ui(
 
     ui.separator();
     ui.collapsing("添加物品模板", |ui| {
-        changed |= inventory_item_definition_ui(ui, &mut state.item_pool_draft);
+        changed |= inventory_item_definition_ui(
+            ui,
+            &mut state.item_pool_draft,
+            &portrait_options,
+        );
         if ui.button("加入物品池").clicked() {
             let mut item = state.item_pool_draft.clone();
             if !item.name.trim().is_empty() {
@@ -11920,7 +11970,11 @@ fn item_pool_settings_ui(
     changed
 }
 
-fn inventory_item_definition_ui(ui: &mut Ui, item: &mut InventoryItem) -> bool {
+fn inventory_item_definition_ui(
+    ui: &mut Ui,
+    item: &mut InventoryItem,
+    portrait_options: &[(String, String)],
+) -> bool {
     let mut changed = false;
     ui.horizontal_wrapped(|ui| {
         ui.label("分类");
@@ -11966,6 +12020,16 @@ fn inventory_item_definition_ui(ui: &mut Ui, item: &mut InventoryItem) -> bool {
                 .desired_width(ui.available_width().min(CHARACTER_FIELD_MAX_WIDTH)),
         )
         .changed();
+    changed |= portrait_transform_editor_ui(
+        ui,
+        ui.next_auto_id(),
+        "使用效果：立绘变形",
+        &mut item.portrait_transform,
+        portrait_options,
+    );
+    if item.portrait_transform.is_some() {
+        ui.small("使用后把使用者的立绘变成所选外观，并消耗1个。");
+    }
     ui.collapsing(
         format!(
             "装备属性加成 ({})",
