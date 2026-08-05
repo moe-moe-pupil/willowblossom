@@ -59,6 +59,10 @@ use serde::{
 };
 use tokio_tungstenite::tungstenite::protocol::Message;
 
+use crate::backup::{
+    BackupSettings,
+    BackupState,
+};
 use crate::voxel::{
     clear_campaign_possession_movement,
     clear_player_camera,
@@ -1063,6 +1067,13 @@ pub struct UiSystemLocals<'w, 's> {
         ),
         Without<VoxelPlayerStandee>,
     >,
+}
+
+#[derive(SystemParam)]
+pub struct BackupUiParam<'w> {
+    settings: ResMut<'w, Persistent<BackupSettings>>,
+    state: ResMut<'w, BackupState>,
+    cached_memory: ResMut<'w, Persistent<CachedMemory>>,
 }
 
 struct VoxelMapUiState {
@@ -12525,6 +12536,51 @@ fn napcat_import_export_ui(
     });
 }
 
+fn backup_ui(ui: &mut Ui, settings: &mut Persistent<BackupSettings>, state: &mut BackupState) {
+    ui.collapsing("自动备份", |ui| {
+        let mut changed = false;
+        changed |= ui
+            .checkbox(&mut settings.auto_backup_enabled, "启用自动备份")
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label("间隔（分钟）");
+            changed |= ui
+                .add(egui::DragValue::new(&mut settings.interval_minutes).range(1..=1440))
+                .changed();
+            ui.label("保留份数");
+            changed |= ui
+                .add(egui::DragValue::new(&mut settings.max_backups).range(1..=200))
+                .changed();
+        });
+        if changed {
+            if let Err(err) = settings.persist() {
+                state.last_result = format!("备份设置保存失败：{err}");
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("立即备份").clicked() {
+                state.manual_requested = true;
+            }
+            let next_label = if settings.auto_backup_enabled {
+                let interval = settings.interval_seconds();
+                let remaining = (interval - state.elapsed_seconds().min(interval)).max(0.0);
+                format!("下次自动备份约 {:.0} 分钟后", remaining / 60.0)
+            } else {
+                "自动备份已停用".to_owned()
+            };
+            ui.small(next_label);
+        });
+        if let Some(name) = &state.last_backup_name {
+            ui.small(format!("最近备份：{name}（{}）", state.last_result));
+        } else if !state.last_result.is_empty() {
+            ui.small(state.last_result.as_str());
+        }
+        ui.small(
+            "备份范围：场景、玩家、聊天等全部顶层数据文件与角色立绘；不含 tts、图片缓存等大目录。保存在 .data/willowblossom/backups。",
+        );
+    });
+}
+
 fn write_napcat_manager_export(manager: &NapcatMessageManager, path: &str) -> Result<(), String> {
     write_text_export(path, manager.to_export_json())
 }
@@ -13807,6 +13863,8 @@ fn trpg_group_settings_window(
     state: &mut TrpgGroupSettingsState,
     character_edit_state: &mut CharacterEditState,
     rule_engine_state: &mut RuleEngineState,
+    backup_settings: &mut Persistent<BackupSettings>,
+    backup_state: &mut BackupState,
 ) {
     if !state.open {
         return;
@@ -13857,6 +13915,8 @@ fn trpg_group_settings_window(
                 battle_store.as_deref_mut(),
                 state,
             );
+            ui.separator();
+            backup_ui(ui, backup_settings, backup_state);
             ui.separator();
 
             ui.heading("玩家角色");
@@ -14849,7 +14909,6 @@ pub fn ui_system(
     mut deepseek_manager: ResMut<Persistent<DeepseekManager>>,
     mut send_manager: ResMut<NapcatSendManager>,
     mut manager: ResMut<Persistent<NapcatMessageManager>>,
-    mut cached_memory: ResMut<Persistent<CachedMemory>>,
     mut locals: UiSystemLocals,
     mut rule_engine_state: ResMut<RuleEngineState>,
     mut battle_round_state: ResMut<BattleRoundUiState>,
@@ -14858,6 +14917,7 @@ pub fn ui_system(
     mut scene_store: Option<ResMut<Persistent<VoxelSceneStore>>>,
     mut scene_runtime: Option<ResMut<VoxelMapRuntimeState>>,
     mut player_view_request: Option<ResMut<ScenePlayerViewRequest>>,
+    mut backup_ui: BackupUiParam,
 ) {
     let has_run_once: &mut Local<bool> = &mut locals.has_run_once;
     let new_chat_group_modal_string_open: &mut Local<(String, bool)> =
@@ -15004,6 +15064,8 @@ pub fn ui_system(
         trpg_group_settings,
         character_edit_state,
         &mut rule_engine_state,
+        &mut *backup_ui.settings,
+        &mut *backup_ui.state,
     );
     legacy_send_pane_windows(
         ctx,
@@ -16310,10 +16372,10 @@ pub fn ui_system(
             })
     });
     ctx.memory(|m| {
-        cached_memory.ui_memory = m.clone();
+        backup_ui.cached_memory.ui_memory = m.clone();
     });
     if should_persist_ui_memory {
-        cached_memory.persist().ok();
+        backup_ui.cached_memory.persist().ok();
     }
 }
 

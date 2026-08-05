@@ -1,3 +1,4 @@
+mod backup;
 mod battle_round;
 mod camera;
 mod deepseek;
@@ -235,6 +236,7 @@ impl Plugin for GamePlugin {
         app.insert_resource(app_settings);
 
         app.add_plugins((
+            backup::BackupPlugin,
             battle_round::BattleRoundPlugin,
             camera::CameraPlugin,
             napcat::NapcatPlugin,
