@@ -4869,12 +4869,7 @@ impl NapcatMessageManager {
     }
 
     pub fn character_creation_config_for_target(&self, target_id: &str) -> (i32, i32) {
-        let group = self.group_for_player_target(target_id).or_else(|| {
-            (!self.player_is_member_of_any_group(target_id))
-                .then(|| self.current_group())
-                .flatten()
-        });
-        group
+        self.group_for_player_target(target_id)
             .map(|group| {
                 (
                     group.initial_status_points.max(0),
@@ -4890,11 +4885,7 @@ impl NapcatMessageManager {
     }
 
     pub fn character_stat_config_for_target(&self, target_id: &str) -> TrpgBasicConfig {
-        let Some(group) = self.group_for_player_target(target_id).or_else(|| {
-            (!self.player_is_member_of_any_group(target_id))
-                .then(|| self.current_group())
-                .flatten()
-        }) else {
+        let Some(group) = self.group_for_player_target(target_id) else {
             return TrpgBasicConfig::default();
         };
         let int_ = self
@@ -7581,6 +7572,19 @@ fn handle_character_creation_message(
         message.data.time,
     ) {
         return Some(response);
+    }
+
+    let wants_creation = is_exchange_command(&text)
+        || manager
+            .player_characters
+            .get(target_id)
+            .is_some_and(|character| character.creation_step != CharacterCreationStep::Normal);
+    if wants_creation && !manager.player_is_member_of_any_group(target_id) {
+        return Some(if manager.trpg_groups.is_empty() {
+            "当前没有TRPG组。".to_owned()
+        } else {
+            "你还没有加入当前TRPG组，请等待GM批准入团后再开始兑换。".to_owned()
+        });
     }
 
     let creation_config = manager.character_creation_config_for_target(target_id);
@@ -15472,6 +15476,11 @@ position_cells = [4, 5, 6]
     fn private_exchange_command_runs_character_creation_workflow() {
         let mut manager = empty_manager();
         let target_id = "2";
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec![target_id.to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
 
         let response = handle_character_creation_message(
             &mut manager,
@@ -15542,6 +15551,11 @@ position_cells = [4, 5, 6]
     fn private_exchange_completion_reminds_talent_draw_and_support_bonus() {
         let mut manager = empty_manager();
         let target_id = "2";
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec![target_id.to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
 
         handle_character_creation_message(
             &mut manager,
@@ -15585,6 +15599,11 @@ position_cells = [4, 5, 6]
     fn private_exchange_skill_submission_waits_for_gm_approval() {
         let mut manager = empty_manager();
         let target_id = "2";
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec![target_id.to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
 
         handle_character_creation_message(
             &mut manager,
@@ -15713,17 +15732,14 @@ position_cells = [4, 5, 6]
     }
 
     #[test]
-    fn private_exchange_command_uses_current_group_config_before_player_joins() {
+    fn private_exchange_command_denied_for_players_not_in_group() {
         let mut manager = empty_manager();
         let target_id = "2";
         manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
-            players: Vec::new(),
             initial_status_points: 10,
-            initial_exchange_points: 12,
             ..Default::default()
         });
         manager.current_trpg_group = Some("table".to_owned());
-        manager.pending_chat_targets.insert(target_id.to_owned());
 
         let response = handle_character_creation_message(
             &mut manager,
@@ -15731,28 +15747,27 @@ position_cells = [4, 5, 6]
             target_id,
         )
         .unwrap();
-        let character = manager.player_characters.get(target_id).unwrap();
 
-        assert!(response.contains("你拥有10点属性点"));
-        assert_eq!(character.status_points, 10);
-        assert_eq!(character.exchange_points, 12);
+        assert_eq!(
+            response,
+            "你还没有加入当前TRPG组，请等待GM批准入团后再开始兑换。"
+        );
+        assert!(!manager.player_characters.contains_key(target_id));
     }
 
     #[test]
-    fn character_stat_config_uses_current_group_for_unjoined_player() {
+    fn private_exchange_command_denied_without_any_group() {
         let mut manager = empty_manager();
-        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
-            players: Vec::new(),
-            basic_config: TrpgBasicConfig {
-                base_max_hp: 999.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        manager.current_trpg_group = Some("table".to_owned());
 
-        let stat_config = manager.character_stat_config_for_target("2");
-        assert_eq!(stat_config.base_max_hp, 999.0);
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            "2",
+        )
+        .unwrap();
+
+        assert_eq!(response, "当前没有TRPG组。");
+        assert!(manager.player_characters.is_empty());
     }
 
     #[test]
@@ -16598,6 +16613,11 @@ position_cells = [4, 5, 6]
     fn character_creation_back_resets_status_phase_and_refunds_points() {
         let mut manager = empty_manager();
         let target_id = "2";
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec![target_id.to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
 
         handle_character_creation_message(
             &mut manager,
@@ -16641,6 +16661,11 @@ position_cells = [4, 5, 6]
     fn character_creation_back_from_nickname_returns_to_image_phase() {
         let mut manager = empty_manager();
         let target_id = "2";
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec![target_id.to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
 
         handle_character_creation_message(
             &mut manager,
@@ -16684,6 +16709,11 @@ position_cells = [4, 5, 6]
     fn character_creation_back_from_image_returns_to_skill_phase() {
         let mut manager = empty_manager();
         let target_id = "2";
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec![target_id.to_owned()],
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
 
         handle_character_creation_message(
             &mut manager,
