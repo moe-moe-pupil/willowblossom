@@ -4807,6 +4807,12 @@ impl NapcatMessageManager {
         group_names.next().is_none().then_some(group_name)
     }
 
+    fn player_is_member_of_any_group(&self, target_id: &str) -> bool {
+        self.trpg_groups
+            .values()
+            .any(|group| group.players.iter().any(|player_id| player_id == target_id))
+    }
+
     pub fn group_for_player_target(&self, target_id: &str) -> Option<&TrpgGroup> {
         self.group_name_for_player_target(target_id)
             .and_then(|group_name| self.trpg_groups.get(group_name))
@@ -4863,7 +4869,12 @@ impl NapcatMessageManager {
     }
 
     pub fn character_creation_config_for_target(&self, target_id: &str) -> (i32, i32) {
-        self.group_for_player_target(target_id)
+        let group = self.group_for_player_target(target_id).or_else(|| {
+            (!self.player_is_member_of_any_group(target_id))
+                .then(|| self.current_group())
+                .flatten()
+        });
+        group
             .map(|group| {
                 (
                     group.initial_status_points.max(0),
@@ -4879,7 +4890,11 @@ impl NapcatMessageManager {
     }
 
     pub fn character_stat_config_for_target(&self, target_id: &str) -> TrpgBasicConfig {
-        let Some(group) = self.group_for_player_target(target_id) else {
+        let Some(group) = self.group_for_player_target(target_id).or_else(|| {
+            (!self.player_is_member_of_any_group(target_id))
+                .then(|| self.current_group())
+                .flatten()
+        }) else {
             return TrpgBasicConfig::default();
         };
         let int_ = self
@@ -15695,6 +15710,49 @@ position_cells = [4, 5, 6]
             manager.player_characters["2"].exchange_points,
             9
         );
+    }
+
+    #[test]
+    fn private_exchange_command_uses_current_group_config_before_player_joins() {
+        let mut manager = empty_manager();
+        let target_id = "2";
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: Vec::new(),
+            initial_status_points: 10,
+            initial_exchange_points: 12,
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
+        manager.pending_chat_targets.insert(target_id.to_owned());
+
+        let response = handle_character_creation_message(
+            &mut manager,
+            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            target_id,
+        )
+        .unwrap();
+        let character = manager.player_characters.get(target_id).unwrap();
+
+        assert!(response.contains("你拥有10点属性点"));
+        assert_eq!(character.status_points, 10);
+        assert_eq!(character.exchange_points, 12);
+    }
+
+    #[test]
+    fn character_stat_config_uses_current_group_for_unjoined_player() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: Vec::new(),
+            basic_config: TrpgBasicConfig {
+                base_max_hp: 999.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("table".to_owned());
+
+        let stat_config = manager.character_stat_config_for_target("2");
+        assert_eq!(stat_config.base_max_hp, 999.0);
     }
 
     #[test]
