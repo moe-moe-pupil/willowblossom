@@ -4109,7 +4109,8 @@ fn message_image_ui(
     let texture = if let Some(texture) = image_textures.get(&path) {
         texture.clone()
     } else {
-        let Some(color_image) = load_cached_color_image(&path) else {
+        let max_texture_side = ui.ctx().input(|i| i.max_texture_side);
+        let Some(color_image) = load_cached_color_image(&path, max_texture_side) else {
             ui.label("[图片]");
             ui.small("缓存图片解码失败");
             return;
@@ -4150,9 +4151,23 @@ fn cached_image_path(path: &str) -> Option<String> {
     )
 }
 
-fn load_cached_color_image(path: &str) -> Option<egui::ColorImage> {
+fn load_cached_color_image(path: &str, max_texture_side: usize) -> Option<egui::ColorImage> {
     let bytes = fs::read(path).ok()?;
-    let image = ::image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let mut image = ::image::load_from_memory(&bytes).ok()?.to_rgba8();
+
+    let max_side = max_texture_side.max(1) as u32;
+    if image.width() > max_side || image.height() > max_side {
+        let scale = max_side as f32 / image.width().max(image.height()) as f32;
+        let new_width = ((image.width() as f32) * scale).round().max(1.0) as u32;
+        let new_height = ((image.height() as f32) * scale).round().max(1.0) as u32;
+        image = ::image::imageops::resize(
+            &image,
+            new_width,
+            new_height,
+            ::image::imageops::FilterType::Lanczos3,
+        );
+    }
+
     let size = [image.width() as usize, image.height() as usize];
     Some(egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()))
 }
