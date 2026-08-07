@@ -2065,6 +2065,9 @@ pub struct TrpgGroup {
     /// 是否处于开团状态；结团会清空本世界内持续型天赋状态。
     #[serde(default)]
     pub campaign_active: bool,
+    /// 本次开团时的世界轮次，用于「疾行如风」等按回合计时的天赋。
+    #[serde(default)]
+    pub world_start_turn: u32,
 }
 
 impl Default for TrpgGroup {
@@ -2096,6 +2099,7 @@ impl Default for TrpgGroup {
             player_turns: HashMap::default(),
             initial_player_states: HashMap::default(),
             campaign_active: false,
+            world_start_turn: 0,
         }
     }
 }
@@ -8139,6 +8143,7 @@ fn moonberry_talent_effect_summary(talent: &MoonberryTalent) -> Option<&'static 
         "瞄准镜Tex-30" => Some("远程技能射程至少为等级*15米"),
         "魔网延伸" => Some("法术技能射程+5%；召唤距离需GM处理"),
         "狂风恶浪" => Some("常驻移动速度+20%；玩家目标存活数<=3时提升至35%"),
+        "疾行如风" => Some("开团后+100%移动速度，进入战斗轮或10回合后失效"),
         "越战越勇" => Some("战斗轮中每经过任意目标一回合伤害+2%，上限+20%"),
         "斗志昂扬" => Some("战斗轮第1/2/3个自身回合承伤-50%/-10%/-2%"),
         "狂妄" => Some("战斗轮中每个新伤害来源令自身伤害+10%，上限+30%"),
@@ -9349,6 +9354,24 @@ pub fn character_dominion_max_hp_bonus_cap(character: &PlayerCharacter) -> f32 {
     }
 }
 
+/// 「疾行如风」：开团后、进入战斗轮或第10个世界回合之前，提供 +100% 移动速度加成。
+pub fn character_swift_wind_speed_multiplier(
+    character: &PlayerCharacter,
+    campaign_active: bool,
+    turns_since_world_start: u32,
+    in_active_battle: bool,
+) -> f32 {
+    if character_has_approved_moonberry_talent(character, "疾行如风")
+        && campaign_active
+        && !in_active_battle
+        && turns_since_world_start < 10
+    {
+        2.0
+    } else {
+        1.0
+    }
+}
+
 /// 开团：标记当前剧情世界开始，并清理上一个世界遗留的持续型天赋状态。
 pub fn open_trpg_group_world(
     manager: &mut NapcatMessageManager,
@@ -9363,6 +9386,7 @@ pub fn open_trpg_group_world(
         return Some("该TRPG组已经处于开团状态。".to_owned());
     }
     group.campaign_active = true;
+    group.world_start_turn = group.world_turn;
     let cleared = clear_group_world_talent_state(manager, group_name);
     Some(format!(
         "已开团：本次剧情世界开始。已清空上个世界遗留的持续型天赋状态（{cleared} 个角色）。"
@@ -9380,6 +9404,7 @@ pub fn close_trpg_group_world(
         ));
     };
     group.campaign_active = false;
+    group.world_start_turn = 0;
     let cleared = clear_group_world_talent_state(manager, group_name);
     Some(format!(
         "已结团：本次剧情世界结束。已清空世界内的持续型天赋状态（{cleared} 个角色）。"
@@ -13864,6 +13889,60 @@ position_cells = [4, 5, 6]
         assert_eq!(
             moonberry_talent_effect_summary(namek_talent),
             Some("立即获得等级*2的知识额外值")
+        );
+    }
+
+    #[test]
+    fn swift_wind_speed_multiplier_requires_open_world_and_less_than_ten_turns() {
+        let mut character = PlayerCharacter {
+            skill_names: vec!["疾行如风".to_owned()],
+            skill_metadata: vec![CharacterSkillMetadata::talent("normal_talent", "天赋")],
+            ..Default::default()
+        };
+        // 开团、未进战斗、第 3 回合：+100%。
+        assert!(
+            (character_swift_wind_speed_multiplier(&character, true, 3, false) - 2.0).abs()
+                < 0.0001
+        );
+        // 第 10 回合起失效。
+        assert!(
+            (character_swift_wind_speed_multiplier(&character, true, 10, false) - 1.0).abs()
+                < 0.0001
+        );
+        // 进入战斗轮失效。
+        assert!(
+            (character_swift_wind_speed_multiplier(&character, true, 3, true) - 1.0).abs() < 0.0001
+        );
+        // 结团后失效。
+        assert!(
+            (character_swift_wind_speed_multiplier(&character, false, 3, false) - 1.0).abs()
+                < 0.0001
+        );
+        // 没有该天赋不生效。
+        let plain = PlayerCharacter::default();
+        assert!(
+            (character_swift_wind_speed_multiplier(&plain, true, 3, false) - 1.0).abs() < 0.0001
+        );
+    }
+
+    #[test]
+    fn open_and_close_world_track_world_start_turn() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("g".to_owned(), TrpgGroup {
+            world_turn: 5,
+            ..Default::default()
+        });
+        assert!(open_trpg_group_world(&mut manager, "g").is_some());
+        assert!(manager.trpg_groups["g"].campaign_active);
+        assert_eq!(
+            manager.trpg_groups["g"].world_start_turn,
+            5
+        );
+        assert!(close_trpg_group_world(&mut manager, "g").is_some());
+        assert!(!manager.trpg_groups["g"].campaign_active);
+        assert_eq!(
+            manager.trpg_groups["g"].world_start_turn,
+            0
         );
     }
 

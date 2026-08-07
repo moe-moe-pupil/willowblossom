@@ -869,6 +869,24 @@ pub fn clear_trpg_group_dominion_bonuses(store: &mut BattleRoundStore, group_nam
     cleared
 }
 
+/// 判断某个玩家角色当前是否处于本团/本活动的激活战斗轮中。
+pub fn character_in_active_encounter(
+    store: &BattleRoundStore,
+    group_name: &str,
+    campaign_id: &str,
+    target_id: &str,
+) -> bool {
+    store.encounters.values().any(|encounter| {
+        encounter.active
+            && (encounter.trpg_group.as_deref() == Some(group_name)
+                || encounter.trpg_campaign_id.as_deref() == Some(campaign_id))
+            && encounter
+                .participants
+                .iter()
+                .any(|participant| participant.target_id == target_id)
+    })
+}
+
 fn advance_participant_rest_then_fight(participant: &mut BattleParticipantSnapshot) {
     if participant.alive && participant.rest_then_fight_healing_rate > f32::EPSILON {
         participant.rest_then_fight_turns =
@@ -14144,6 +14162,48 @@ mod tests {
         );
         assert!(crate::napcat::open_trpg_group_world(&mut manager, "g").is_some());
         assert!(manager.trpg_groups["g"].campaign_active);
+    }
+
+    #[test]
+    fn character_in_active_encounter_matches_group_and_participant() {
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                trpg_group: Some("g".to_owned()),
+                trpg_campaign_id: Some("campaign-a".to_owned()),
+                active: true,
+                participants: vec![participant("hero", 0)],
+                ..Default::default()
+            });
+        assert!(character_in_active_encounter(
+            &store,
+            "g",
+            "campaign-a",
+            "hero"
+        ));
+        assert!(!character_in_active_encounter(
+            &store,
+            "g",
+            "campaign-a",
+            "other"
+        ));
+        assert!(!character_in_active_encounter(
+            &store,
+            "other",
+            "campaign-b",
+            "hero"
+        ));
+
+        // 非激活战斗轮不算进入战斗。
+        store.encounters.get_mut("battle").unwrap().active = false;
+        assert!(!character_in_active_encounter(
+            &store,
+            "g",
+            "campaign-a",
+            "hero"
+        ));
     }
 
     #[test]

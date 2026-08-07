@@ -99,6 +99,9 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use voxxelmaxx::prelude::*;
 
 use crate::{
+    battle_round::{
+        BattleRoundStore,
+    },
     napcat::{
         CharacterHotbarSlot,
         CharacterSkillMetadata,
@@ -14478,6 +14481,7 @@ fn control_first_person_player(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    battle_store: Option<Res<Persistent<BattleRoundStore>>>,
     mut movement_store: Option<ResMut<Persistent<VoxelPossessionMovementStore>>>,
     mut editor: ResMut<VoxelEditorState>,
     mut possession: ResMut<VoxelPossessionState>,
@@ -14583,7 +14587,8 @@ fn control_first_person_player(
             possession.turn_start_position = Some(transform.translation);
             possession.last_player_position = Some(transform.translation);
             possession.movement_turn = possession_world_turn(manager.as_deref(), user_id);
-            possession.movement_limit = possession_final_movement(manager.as_deref(), user_id);
+            possession.movement_limit =
+                possession_final_movement(manager.as_deref(), battle_store.as_deref(), user_id);
             if let (Some(campaign_id), Some(store)) = (
                 possession_campaign_id(manager.as_deref(), user_id),
                 movement_store.as_deref(),
@@ -14612,7 +14617,8 @@ fn control_first_person_player(
 
     if let Some(user_id) = possession.active_user_id {
         let world_turn = possession_world_turn(manager.as_deref(), user_id);
-        let movement_limit = possession_final_movement(manager.as_deref(), user_id);
+        let movement_limit =
+            possession_final_movement(manager.as_deref(), battle_store.as_deref(), user_id);
         if possession.movement_turn != world_turn {
             possession.movement_turn = world_turn;
             possession.movement_used = 0.0;
@@ -14950,15 +14956,64 @@ fn resolve_horizontal_movement_step(
 
 fn possession_final_movement(
     manager: Option<&Persistent<NapcatMessageManager>>,
+    battle_store: Option<&Persistent<BattleRoundStore>>,
     user_id: u64,
 ) -> f32 {
-    manager
-        .and_then(|manager| manager.player_characters.get(&user_id.to_string()))
-        .map(|character| possession_character_movement(&user_id.to_string(), character))
-        .unwrap_or_default()
+    let Some(manager) = manager else { return 0.0 };
+    let target_id = user_id.to_string();
+    let Some(character) = manager.player_characters.get(&target_id) else {
+        return 0.0;
+    };
+    let swift_wind_multiplier = possession_swift_wind_multiplier(
+        manager,
+        battle_store,
+        user_id,
+        character,
+    );
+    possession_character_movement(
+        &target_id,
+        character,
+        swift_wind_multiplier,
+    )
 }
 
-fn possession_character_movement(target_id: &str, character: &PlayerCharacter) -> f32 {
+fn possession_swift_wind_multiplier(
+    manager: &NapcatMessageManager,
+    battle_store: Option<&Persistent<BattleRoundStore>>,
+    user_id: u64,
+    character: &PlayerCharacter,
+) -> f32 {
+    let target_id = user_id.to_string();
+    let Some((group_name, group)) = manager
+        .trpg_groups
+        .iter()
+        .find(|(_, group)| group.players.iter().any(|player| player == &target_id))
+    else {
+        return 1.0;
+    };
+    let campaign_id = group.campaign_id.trim();
+    let in_active_battle = battle_store.is_some_and(|store| {
+        crate::battle_round::character_in_active_encounter(
+            store,
+            group_name,
+            campaign_id,
+            &target_id,
+        )
+    });
+    let turns_since_world_start = group.world_turn.saturating_sub(group.world_start_turn);
+    crate::napcat::character_swift_wind_speed_multiplier(
+        character,
+        group.campaign_active,
+        turns_since_world_start,
+        in_active_battle,
+    )
+}
+
+fn possession_character_movement(
+    target_id: &str,
+    character: &PlayerCharacter,
+    swift_wind_multiplier: f32,
+) -> f32 {
     let mut speed = character.speed.max(0.0);
     if character.buff_base_stats.is_none() {
         let mut equipment = character.inventory.equipment.iter().collect::<Vec<_>>();
@@ -14978,10 +15033,10 @@ fn possession_character_movement(target_id: &str, character: &PlayerCharacter) -
         }
     }
     // 场景移动拆分为“移速部分”和“基础额度部分”：
-    // - 移速部分完整吃移速加成与减速；
+    // - 移速部分完整吃移速加成与减速（含「疾行如风」的 +100% 加成）；
     // - 基础额度固定为 DEFAULT_POSSESSION_MOVEMENT_BONUS，不吃任何移速加成，
     //   但会按移速的百分比减速（如 -50% 减速时 10 也减半）。
-    let speed_component = speed.max(0.0);
+    let speed_component = speed.max(0.0) * swift_wind_multiplier.max(0.0);
     let reduction_multiplier =
         crate::ui::character_speed_reduction_multiplier(target_id, character);
     let base_component = DEFAULT_POSSESSION_MOVEMENT_BONUS * reduction_multiplier;
@@ -19925,7 +19980,7 @@ mod tests {
             speed: 4.5,
             ..Default::default()
         };
-        assert!((possession_character_movement("1", &character) - 14.5).abs() < 0.0001);
+        assert!((possession_character_movement("1", &character, 1.0) - 14.5).abs() < 0.0001);
 
         character.inventory.equipment.insert(
             crate::napcat::EquipmentSlot::Feet,
@@ -19938,14 +19993,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!((possession_character_movement("1", &character) - 24.5).abs() < 0.0001);
+        assert!((possession_character_movement("1", &character, 1.0) - 24.5).abs() < 0.0001);
 
         character.speed = 14.5;
         character.buff_base_stats = Some(crate::napcat::CharacterBuffBaseStats {
             speed: 4.5,
             ..crate::napcat::CharacterBuffBaseStats::from_character(&PlayerCharacter::default())
         });
-        assert!((possession_character_movement("1", &character) - 24.5).abs() < 0.0001);
+        assert!((possession_character_movement("1", &character, 1.0) - 24.5).abs() < 0.0001);
     }
 
     #[test]
@@ -19975,17 +20030,17 @@ mod tests {
             active_buffs: vec![speed_buff(100.0)],
             ..Default::default()
         };
-        assert!((possession_character_movement("1", &character) - 19.0).abs() < 0.0001);
+        assert!((possession_character_movement("1", &character, 1.0) - 19.0).abs() < 0.0001);
 
         // +100% 加成叠加 -50% 减速：移速回到 4.5，基础 10 减半为 5。
         character.active_buffs = vec![speed_buff(100.0), speed_buff(-50.0)];
         character.speed = 4.5;
-        assert!((possession_character_movement("1", &character) - 9.5).abs() < 0.0001);
+        assert!((possession_character_movement("1", &character, 1.0) - 9.5).abs() < 0.0001);
 
         // 仅 -50% 减速：移速减半，基础 10 同样减半。
         character.active_buffs = vec![speed_buff(-50.0)];
         character.speed = 2.25;
-        assert!((possession_character_movement("1", &character) - 7.25).abs() < 0.0001);
+        assert!((possession_character_movement("1", &character, 1.0) - 7.25).abs() < 0.0001);
 
         // SetPercentOfBase(50) 同样按比例缩小基础额度。
         character.active_buffs = vec![crate::rule_engine::BuffSpec {
@@ -20002,7 +20057,7 @@ mod tests {
             tick_actions: Vec::new(),
         }];
         character.speed = 2.25;
-        assert!((possession_character_movement("1", &character) - 7.25).abs() < 0.0001);
+        assert!((possession_character_movement("1", &character, 1.0) - 7.25).abs() < 0.0001);
 
         // 装备上的百分比减速（无其他buff时）也会缩小基础额度。
         let mut character = PlayerCharacter {
@@ -20020,7 +20075,119 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!((possession_character_movement("1", &character) - 7.25).abs() < 0.0001);
+        assert!((possession_character_movement("1", &character, 1.0) - 7.25).abs() < 0.0001);
+    }
+
+    #[test]
+    fn possession_movement_swift_wind_multiplies_speed_component_only() {
+        let mut character = PlayerCharacter {
+            speed: 4.5,
+            ..Default::default()
+        };
+        // +100% 移速：只放大移速部分（4.5*2=9），基础 10 不变。
+        assert!((possession_character_movement("1", &character, 2.0) - 19.0).abs() < 0.0001);
+        // 未生效：回到 4.5 + 10。
+        assert!((possession_character_movement("1", &character, 1.0) - 14.5).abs() < 0.0001);
+
+        // 叠加 -50% 减速：移速部分 4.5*2*0.5=4.5，基础 10 减半为 5。
+        character.buff_base_stats = Some(crate::napcat::CharacterBuffBaseStats {
+            speed: 4.5,
+            ..crate::napcat::CharacterBuffBaseStats::from_character(&PlayerCharacter::default())
+        });
+        character.speed = 2.25;
+        character.active_buffs = vec![crate::rule_engine::BuffSpec {
+            name: "减速".to_owned(),
+            kind: crate::rule_engine::BuffKind::Magic,
+            priority: 0,
+            turns_remaining: 0,
+            source_id: "test".to_owned(),
+            beneficial: false,
+            effects: vec![crate::rule_engine::BuffEffect {
+                field: BuffField::Speed,
+                value: BuffValue::AddPercent(-50.0),
+            }],
+            tick_actions: Vec::new(),
+        }];
+        assert!((possession_character_movement("1", &character, 2.0) - 9.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn possession_swift_wind_active_until_battle_or_ten_world_turns() {
+        let character = PlayerCharacter {
+            speed: 4.5,
+            skill_names: vec!["疾行如风".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        let mut manager = empty_napcat_manager();
+        manager
+            .player_characters
+            .insert("1".to_owned(), character.clone());
+        manager.trpg_groups.insert(
+            "g".to_owned(),
+            crate::napcat::TrpgGroup {
+                players: vec!["1".to_owned()],
+                campaign_active: true,
+                world_turn: 3,
+                world_start_turn: 0,
+                ..Default::default()
+            },
+        );
+
+        // 开团后第 3 回合：+100% 生效。
+        assert!(
+            (possession_swift_wind_multiplier(&manager, None, 1, &character) - 2.0).abs() < 0.0001
+        );
+
+        // 第 10 个世界回合起失效。
+        manager.trpg_groups.get_mut("g").unwrap().world_turn = 10;
+        assert!(
+            (possession_swift_wind_multiplier(&manager, None, 1, &character) - 1.0).abs() < 0.0001
+        );
+
+        // 结团后失效。
+        manager.trpg_groups.get_mut("g").unwrap().world_turn = 3;
+        manager.trpg_groups.get_mut("g").unwrap().campaign_active = false;
+        assert!(
+            (possession_swift_wind_multiplier(&manager, None, 1, &character) - 1.0).abs() < 0.0001
+        );
+
+        // 没有该天赋的角色不受影响。
+        let plain_character = PlayerCharacter {
+            speed: 4.5,
+            ..Default::default()
+        };
+        assert!(
+            (possession_swift_wind_multiplier(&manager, None, 1, &plain_character) - 1.0).abs()
+                < 0.0001
+        );
+    }
+
+    fn empty_napcat_manager() -> crate::napcat::NapcatMessageManager {
+        crate::napcat::NapcatMessageManager {
+            messages: HashMap::default(),
+            replay_snapshots: HashMap::default(),
+            chat_targets: HashMap::default(),
+            chat_target_kinds: HashMap::default(),
+            player_characters: HashMap::default(),
+            trpg_groups: HashMap::default(),
+            current_trpg_group: None,
+            groups: HashMap::default(),
+            read_message_counts: HashMap::default(),
+            summarized_message_counts: HashMap::default(),
+            open_chat_targets: HashSet::default(),
+            pending_chat_targets: HashSet::default(),
+            rejected_chat_targets: HashSet::default(),
+            random_pools: HashMap::default(),
+            skill_pool: Vec::new(),
+            item_pool: Vec::new(),
+            unit_pool: HashMap::default(),
+            pending_talent_choices: HashMap::default(),
+            used_talent_names: HashSet::default(),
+        }
     }
 
     #[test]
