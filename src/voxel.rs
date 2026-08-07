@@ -1530,6 +1530,8 @@ struct VoxelAutoDoorLockState {
 #[derive(Resource, Default)]
 struct VoxelInvisibilityState {
     invisible_user_ids: HashSet<u64>,
+    /// 来自战斗「镜像外衣」的隐身标记，隐身结束会自动移除。
+    battle_invisible_user_ids: HashSet<u64>,
 }
 
 /// Toggles a player's invisibility mark. Returns the new state (`true` = now
@@ -1544,6 +1546,42 @@ fn toggle_voxel_player_invisibility(
         state.invisible_user_ids.insert(user_id);
         true
     }
+}
+
+/// 收集激活战斗轮中「镜像外衣」隐身的玩家 id。
+fn battle_mirror_coat_invisible_user_ids(store: &BattleRoundStore) -> HashSet<u64> {
+    let mut user_ids = HashSet::new();
+    for encounter in store.encounters.values() {
+        if !encounter.active {
+            continue;
+        }
+        for participant in &encounter.participants {
+            if participant.mirror_coat_layers > 0 {
+                if let Ok(user_id) = participant.target_id.parse::<u64>() {
+                    user_ids.insert(user_id);
+                }
+            }
+        }
+    }
+    user_ids
+}
+
+/// 把战斗「镜像外衣」的隐身同步到场景：隐身玩家立绘只对GM可见。
+fn sync_battle_mirror_coat_invisibility(
+    battle_store: Option<Res<Persistent<BattleRoundStore>>>,
+    mut invisibility_state: ResMut<VoxelInvisibilityState>,
+) {
+    let next_battle_marks = battle_store
+        .as_deref()
+        .map(|store| battle_mirror_coat_invisible_user_ids(store))
+        .unwrap_or_default();
+    let previous_battle_marks = std::mem::take(&mut invisibility_state.battle_invisible_user_ids);
+    invisibility_state
+        .invisible_user_ids
+        .retain(|user_id| !previous_battle_marks.contains(user_id));
+    invisibility_state.battle_invisible_user_ids = next_battle_marks;
+    let battle_marks = invisibility_state.battle_invisible_user_ids.clone();
+    invisibility_state.invisible_user_ids.extend(battle_marks);
 }
 
 #[derive(Resource, Default)]
@@ -2491,6 +2529,7 @@ impl Plugin for TrpgVoxelPlugin {
                     )
                         .chain(),
                     (
+                        sync_battle_mirror_coat_invisibility,
                         sync_possessed_player_camera,
                         sync_voxel_player_cameras,
                         sync_voxel_player_standees.in_set(VoxelPlayerStandeeSynced),

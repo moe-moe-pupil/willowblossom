@@ -9373,6 +9373,11 @@ pub fn character_swift_wind_speed_multiplier(
     }
 }
 
+/// 「镜像外衣」持有者：受到致命伤害时保命并进入隐身。
+pub fn character_mirror_coat_available(character: &PlayerCharacter) -> bool {
+    character_has_approved_moonberry_talent(character, "镜像外衣")
+}
+
 /// 开团：标记当前剧情世界开始，并清理上一个世界遗留的持续型天赋状态。
 pub fn open_trpg_group_world(
     manager: &mut NapcatMessageManager,

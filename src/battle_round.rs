@@ -71,6 +71,7 @@ use crate::{
         character_low_hp_damage_multiplier,
         character_minimum_damage_floor,
         character_minimum_range_meters,
+        character_mirror_coat_available,
         character_moonberry_talent_damage_attribute_bonus,
         character_mutual_aid_healing_rate,
         character_next_level_exp,
@@ -494,6 +495,14 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub hope_avatar_rounds_remaining: u32,
     #[serde(default)]
+    pub mirror_coat_enabled: bool,
+    #[serde(default)]
+    pub mirror_coat_layers: u32,
+    #[serde(default)]
+    pub mirror_coat_cooldown_remaining: u32,
+    #[serde(default)]
+    pub mirror_coat_cleanup_pending: bool,
+    #[serde(default)]
     pub liquid_body_damage_delay_rate: f32,
     #[serde(default)]
     pub liquid_body_self_healing_rate: f32,
@@ -627,6 +636,13 @@ struct BattleRoundRuntime;
 
 fn default_next_encounter_index() -> u64 { 1 }
 
+/// 「镜像外衣」：每层隐身持续 1 个战斗轮。
+pub const MIRROR_COAT_LAYERS_PER_MP_UNIT: f32 = 5.0;
+/// 「镜像外衣」：除保命自带的一层外，最多用魔法值叠加的额外层数（15 魔法值 / 5 = 3）。
+pub const MIRROR_COAT_MAX_EXTRA_LAYERS: u32 = 3;
+/// 「镜像外衣」冷却回合数。
+pub const MIRROR_COAT_COOLDOWN_ROUNDS: u32 = 6;
+
 fn trpg_group_campaign_id(group: &TrpgGroup) -> &str {
     let campaign_id = group.campaign_id.trim();
     if campaign_id.is_empty() {
@@ -736,6 +752,9 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.undying_rage_active = false;
             participant.hope_avatar_used = false;
             participant.hope_avatar_rounds_remaining = 0;
+            participant.mirror_coat_layers = 0;
+            participant.mirror_coat_cooldown_remaining = 0;
+            participant.mirror_coat_cleanup_pending = false;
             participant.arcane_shield =
                 participant.max_mp.max(0.0) * participant.arcane_shield_rate.max(0.0);
             let previous_hp = participant.hp;
@@ -777,6 +796,9 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.one_heart_stacks = 0;
             participant.inspiration_target_id = None;
             participant.inspiration_sources.clear();
+            participant.mirror_coat_layers = 0;
+            participant.mirror_coat_cooldown_remaining = 0;
+            participant.mirror_coat_cleanup_pending = false;
             if participant_hope_avatar_active(participant) {
                 let was_alive = participant.alive;
                 participant.hp = 0.0;
@@ -849,6 +871,21 @@ fn clear_participant_dominion_bonus(participant: &mut BattleParticipantSnapshot)
     participant.max_hp = (participant.max_hp - bonus).max(0.0);
     participant.hp = participant.hp.min(participant.max_hp);
     participant.dominion_max_hp_bonus = 0.0;
+}
+
+/// 移除角色身上会造成伤害的有害buff（伤害/固定伤害类持续效果）。
+fn remove_character_damage_dealing_buffs(character: &mut PlayerCharacter) -> usize {
+    let before = character.active_buffs.len();
+    character.active_buffs.retain(|buff| {
+        buff.beneficial
+            || !buff.tick_actions.iter().any(|action| {
+                matches!(
+                    action,
+                    BuffTickAction::Damage { .. } | BuffTickAction::FixedDamage { .. }
+                )
+            })
+    });
+    before - character.active_buffs.len()
 }
 
 /// 结团时清空某个TRPG组所有战斗轮内「役于我手」的剩余生命上限加成。
@@ -1291,6 +1328,7 @@ struct BattleDamageResolution {
     damage_absorbed: f32,
     undying_rage_triggered: bool,
     hope_avatar_triggered: bool,
+    mirror_coat_triggered: bool,
     hope_avatar_immune: bool,
     defeat_outcome: Option<BattleDefeatOutcome>,
 }
@@ -1335,6 +1373,7 @@ fn apply_participant_damage_for_battle(
             damage_absorbed: incoming_amount,
             undying_rage_triggered: false,
             hope_avatar_triggered: false,
+            mirror_coat_triggered: false,
             hope_avatar_immune: true,
             defeat_outcome: None,
         };
@@ -1353,6 +1392,7 @@ fn apply_participant_damage_for_battle(
     let mut final_amount = (after_overhealing_shield - absorbed).max(0.0);
     let mut undying_rage_triggered = false;
     let mut hope_avatar_triggered = false;
+    let mut mirror_coat_triggered = false;
     let within_undying_rage_limit =
         participant.max_hp > f32::EPSILON && final_amount <= participant.max_hp + f32::EPSILON;
     if encounter_active && participant.undying_rage_active && within_undying_rage_limit {
@@ -1375,6 +1415,7 @@ fn apply_participant_damage_for_battle(
             damage_absorbed: incoming_amount,
             undying_rage_triggered,
             hope_avatar_triggered,
+            mirror_coat_triggered,
             hope_avatar_immune: false,
             defeat_outcome: None,
         };
@@ -1395,6 +1436,26 @@ fn apply_participant_damage_for_battle(
     }
     participant.hp = (previous_hp - damage_applied).max(0.0);
     participant.alive = participant.hp > 0.0;
+    if participant.mirror_coat_layers > 0 && damage_applied > f32::EPSILON {
+        // 隐身状态下再次受到伤害会立刻脱离隐身并回到战斗。
+        participant.mirror_coat_layers = 0;
+    }
+    if encounter_active
+        && !participant.alive
+        && participant.mirror_coat_enabled
+        && participant.mirror_coat_cooldown_remaining == 0
+    {
+        // 镜像外衣：致命伤害改为移除伤害性有害buff、生命值变为1并获得镜像外衣。
+        participant.hp = 1.0;
+        participant.alive = true;
+        let extra = ((participant.mp.max(0.0) / MIRROR_COAT_LAYERS_PER_MP_UNIT).floor() as u32)
+            .min(MIRROR_COAT_MAX_EXTRA_LAYERS);
+        participant.mirror_coat_layers = 1 + extra;
+        participant.mp = (participant.mp - extra as f32 * MIRROR_COAT_LAYERS_PER_MP_UNIT).max(0.0);
+        participant.mirror_coat_cooldown_remaining = MIRROR_COAT_COOLDOWN_ROUNDS;
+        participant.mirror_coat_cleanup_pending = true;
+        mirror_coat_triggered = true;
+    }
     if encounter_active
         && !participant.alive
         && participant.hope_avatar_enabled
@@ -1410,6 +1471,7 @@ fn apply_participant_damage_for_battle(
         damage_absorbed: (incoming_amount - final_amount).max(0.0),
         undying_rage_triggered,
         hope_avatar_triggered,
+        mirror_coat_triggered,
         hope_avatar_immune: false,
         defeat_outcome: participant_defeat_outcome(participant, was_alive, Some(source_id)),
     }
@@ -1438,6 +1500,16 @@ fn advance_participant_hope_avatar(
         )),
         participant_defeat_outcome(participant, was_alive, None),
     )
+}
+
+/// 每轮推进「镜像外衣」：隐身层数递减，冷却回合递减。
+fn advance_participant_mirror_coat(participant: &mut BattleParticipantSnapshot) {
+    if participant.mirror_coat_layers > 0 {
+        participant.mirror_coat_layers -= 1;
+    }
+    if participant.mirror_coat_cooldown_remaining > 0 {
+        participant.mirror_coat_cooldown_remaining -= 1;
+    }
 }
 
 fn apply_penance_kill_assists(
@@ -3369,6 +3441,7 @@ fn encounter_action_ui(
     let target_options = encounter
         .participants
         .iter()
+        .filter(|participant| participant.mirror_coat_layers == 0)
         .map(|participant| {
             (
                 participant.target_id.clone(),
@@ -3383,7 +3456,7 @@ fn encounter_action_ui(
     let living_target_ids = encounter
         .participants
         .iter()
-        .filter(|participant| participant.alive)
+        .filter(|participant| participant.alive && participant.mirror_coat_layers == 0)
         .map(|participant| participant.target_id.clone())
         .collect::<HashSet<_>>();
     let skills = character_for_participant(&actor, manager)
@@ -3964,6 +4037,7 @@ impl BattleRoundStore {
             advance_participant_overhealing_shield(participant);
             let previous_damage_taken = participant.damage_taken_this_turn;
             reset_participant_turn_totals(participant);
+            advance_participant_mirror_coat(participant);
             let (hope_log, hope_outcome) = advance_participant_hope_avatar(participant);
             if let Some(log) = hope_log {
                 delayed_logs.push(log);
@@ -4314,6 +4388,22 @@ impl BattleRoundStore {
         if let Some(outcome) = resolution.defeat_outcome {
             apply_battle_defeat_outcome(encounter, outcome);
         }
+        if actor_snapshot.mirror_coat_layers > 0 && resolution.damage_applied > f32::EPSILON {
+            let broke_stealth = encounter
+                .participants
+                .iter_mut()
+                .find(|participant| participant.target_id == actor_id)
+                .map(|actor| {
+                    actor.mirror_coat_layers = 0;
+                })
+                .is_some();
+            if broke_stealth {
+                encounter.action_log.push(format!(
+                    "{}造成伤害，脱离隐身",
+                    actor_name
+                ));
+            }
+        }
         true
     }
 
@@ -4377,6 +4467,7 @@ impl BattleRoundStore {
             .as_ref()
             .map(|character| character_damage_dealt_talent_buffs(character, actor_id))
             .unwrap_or_default();
+        let mut actor_dealt_damage = false;
         let actor_source_notes = character_combat_source_notes(actor_character.as_ref(), "施法者");
         let actor_physical_damage_lifesteal = actor_character
             .as_ref()
@@ -4647,12 +4738,14 @@ impl BattleRoundStore {
                             consumed_endless_pain_stacks =
                                 actor_snapshot.endless_pain_stacks.min(2);
                         }
-                        if resolution.damage_applied > f32::EPSILON
-                            && actor_damage_dealt_buffs
+                        if resolution.damage_applied > f32::EPSILON {
+                            actor_dealt_damage = true;
+                            if actor_damage_dealt_buffs
                                 .iter()
                                 .any(|buff| buff.name == "溃伤")
-                        {
-                            target.wound_healing_taken_turns = 1;
+                            {
+                                target.wound_healing_taken_turns = 1;
+                            }
                         }
                         if applied_physical_damage > f32::EPSILON
                             && damage_type == DamageType::Physical
@@ -5173,6 +5266,24 @@ impl BattleRoundStore {
                 actor_name,
                 format_number(mp_cost)
             ));
+        }
+        if actor_dealt_damage && actor_snapshot.mirror_coat_layers > 0 {
+            if let Some(encounter) = self.encounters.get_mut(encounter_id) {
+                let broke_stealth = encounter
+                    .participants
+                    .iter_mut()
+                    .find(|participant| participant.target_id == actor_id)
+                    .map(|actor| {
+                        actor.mirror_coat_layers = 0;
+                    })
+                    .is_some();
+                if broke_stealth {
+                    encounter.action_log.push(format!(
+                        "{}造成伤害，脱离隐身",
+                        actor_name
+                    ));
+                }
+            }
         }
         true
     }
@@ -5750,6 +5861,11 @@ fn sync_encounter_to_manager(
         );
         if (character.dominion_max_hp_bonus - dominion_bonus).abs() > f32::EPSILON {
             character.dominion_max_hp_bonus = dominion_bonus;
+            changed = true;
+        }
+        if participant.mirror_coat_cleanup_pending
+            && remove_character_damage_dealing_buffs(character) > 0
+        {
             changed = true;
         }
         let effective_max_hp = (character.max_hp + character.dominion_max_hp_bonus).max(0.0);
@@ -6657,6 +6773,10 @@ fn participant_from_character(
         hope_avatar_enabled: character_hope_avatar_available(character),
         hope_avatar_used: false,
         hope_avatar_rounds_remaining: 0,
+        mirror_coat_enabled: character_mirror_coat_available(character),
+        mirror_coat_layers: 0,
+        mirror_coat_cooldown_remaining: 0,
+        mirror_coat_cleanup_pending: false,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         calm_heart_healing_rate: character_calm_heart_healing_rate(character),
@@ -6786,6 +6906,10 @@ fn participant_from_unit_template(
         wound_healing_taken_turns: 0,
         delayed_damage_ticks: Vec::new(),
         delayed_healing_ticks: Vec::new(),
+        mirror_coat_enabled: false,
+        mirror_coat_layers: 0,
+        mirror_coat_cooldown_remaining: 0,
+        mirror_coat_cleanup_pending: false,
         damage_taken_this_turn: character.damage_taken_this_turn,
         healing_taken_this_turn: character.healing_taken_this_turn,
         skill_last_used_turns: HashMap::new(),
@@ -6883,6 +7007,10 @@ fn participant_from_target(
         wound_healing_taken_turns: 0,
         delayed_damage_ticks: Vec::new(),
         delayed_healing_ticks: Vec::new(),
+        mirror_coat_enabled: false,
+        mirror_coat_layers: 0,
+        mirror_coat_cooldown_remaining: 0,
+        mirror_coat_cleanup_pending: false,
         damage_taken_this_turn: 0.0,
         healing_taken_this_turn: 0.0,
         skill_last_used_turns: HashMap::new(),
@@ -6952,6 +7080,7 @@ fn sync_participant_from_manager(
                 character_undying_rage_available(&character),
             );
             participant.hope_avatar_enabled = character_hope_avatar_available(&character);
+            participant.mirror_coat_enabled = character_mirror_coat_available(&character);
             participant.liquid_body_damage_delay_rate =
                 character_liquid_body_damage_delay_rate(&character);
             participant.liquid_body_self_healing_rate =
@@ -7048,6 +7177,7 @@ fn sync_participant_from_manager(
             character_undying_rage_available(character),
         );
         participant.hope_avatar_enabled = character_hope_avatar_available(character);
+        participant.mirror_coat_enabled = character_mirror_coat_available(character);
         participant.liquid_body_damage_delay_rate =
             character_liquid_body_damage_delay_rate(character);
         participant.liquid_body_self_healing_rate =
@@ -7096,6 +7226,7 @@ fn sync_participant_from_manager(
         participant.overhealing_shield_cap_rate = 0.0;
         sync_participant_undying_rage(participant, false);
         participant.hope_avatar_enabled = false;
+        participant.mirror_coat_enabled = false;
         participant.liquid_body_damage_delay_rate = 0.0;
         participant.liquid_body_self_healing_rate = 0.0;
         participant.calm_heart_healing_rate = 0.0;
@@ -8535,6 +8666,10 @@ mod area_tests {
             hope_avatar_enabled: false,
             hope_avatar_used: false,
             hope_avatar_rounds_remaining: 0,
+            mirror_coat_enabled: false,
+            mirror_coat_layers: 0,
+            mirror_coat_cooldown_remaining: 0,
+            mirror_coat_cleanup_pending: false,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             calm_heart_healing_rate: 0.0,
@@ -8715,6 +8850,10 @@ mod tests {
             hope_avatar_enabled: false,
             hope_avatar_used: false,
             hope_avatar_rounds_remaining: 0,
+            mirror_coat_enabled: false,
+            mirror_coat_layers: 0,
+            mirror_coat_cooldown_remaining: 0,
+            mirror_coat_cleanup_pending: false,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             calm_heart_healing_rate: 0.0,
@@ -14204,6 +14343,165 @@ mod tests {
             "campaign-a",
             "hero"
         ));
+    }
+
+    #[test]
+    fn mirror_coat_lethal_hit_sets_hp_one_consumes_mp_and_grants_layers() {
+        let mut holder = participant("holder", 0);
+        holder.hp = 10.0;
+        holder.max_hp = 50.0;
+        holder.mp = 12.0;
+        holder.max_mp = 50.0;
+        holder.mirror_coat_enabled = true;
+
+        let resolution = apply_participant_damage_for_battle(&mut holder, 20.0, "enemy", true);
+
+        assert!(resolution.mirror_coat_triggered);
+        assert_eq!(holder.hp, 1.0);
+        assert!(holder.alive);
+        // 基础 1 层 + 12 MP 每 5 点叠 1 层（最多 3 层额外）＝ 3 层，消耗 10 MP。
+        assert_eq!(holder.mirror_coat_layers, 3);
+        assert!((holder.mp - 2.0).abs() < 0.0001);
+        assert_eq!(holder.mirror_coat_cooldown_remaining, 6);
+        assert!(holder.mirror_coat_cleanup_pending);
+        assert!(resolution.defeat_outcome.is_none());
+    }
+
+    #[test]
+    fn mirror_coat_does_not_trigger_while_on_cooldown() {
+        let mut holder = participant("holder", 0);
+        holder.hp = 10.0;
+        holder.max_hp = 50.0;
+        holder.mirror_coat_enabled = true;
+        holder.mirror_coat_cooldown_remaining = 3;
+
+        let resolution = apply_participant_damage_for_battle(&mut holder, 20.0, "enemy", true);
+
+        assert!(!resolution.mirror_coat_triggered);
+        assert!(!holder.alive);
+        assert_eq!(holder.hp, 0.0);
+        assert!(resolution.defeat_outcome.is_some());
+    }
+
+    #[test]
+    fn mirror_coat_stealth_breaks_when_taking_damage() {
+        let mut holder = participant("holder", 0);
+        holder.hp = 20.0;
+        holder.max_hp = 50.0;
+        holder.mirror_coat_layers = 3;
+
+        let resolution = apply_participant_damage_for_battle(&mut holder, 5.0, "enemy", true);
+
+        assert_eq!(holder.mirror_coat_layers, 0);
+        assert!((holder.hp - 15.0).abs() < 0.0001);
+        assert!((resolution.damage_applied - 5.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn mirror_coat_stealth_breaks_when_holder_deals_damage() {
+        let mut manager = empty_manager();
+        let mut attacker = participant("attacker", 0);
+        attacker.hp = 50.0;
+        attacker.max_hp = 50.0;
+        attacker.mirror_coat_enabled = true;
+        attacker.mirror_coat_layers = 2;
+        let mut defender = participant("defender", 0);
+        defender.hp = 50.0;
+        defender.max_hp = 50.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                participants: vec![attacker, defender],
+                ..Default::default()
+            });
+
+        assert!(store.apply_action(
+            "battle",
+            "attacker",
+            "defender",
+            "测试攻击",
+            5.0
+        ));
+        let attacker = &store.encounters["battle"].participants[0];
+        assert_eq!(attacker.mirror_coat_layers, 0);
+    }
+
+    #[test]
+    fn mirror_coat_layers_and_cooldown_advance_per_round() {
+        let mut holder = participant("holder", 0);
+        holder.mirror_coat_layers = 2;
+        holder.mirror_coat_cooldown_remaining = 6;
+
+        advance_participant_mirror_coat(&mut holder);
+        assert_eq!(holder.mirror_coat_layers, 1);
+        assert_eq!(holder.mirror_coat_cooldown_remaining, 5);
+        advance_participant_mirror_coat(&mut holder);
+        assert_eq!(holder.mirror_coat_layers, 0);
+        assert_eq!(holder.mirror_coat_cooldown_remaining, 4);
+    }
+
+    #[test]
+    fn mirror_coat_cleanup_removes_damage_dealing_harmful_buffs() {
+        let mut manager = empty_manager();
+        let character = PlayerCharacter {
+            hp: 10.0,
+            max_hp: 50.0,
+            mp: 12.0,
+            max_mp: 50.0,
+            skill_names: vec!["镜像外衣".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            active_buffs: vec![
+                BuffSpec {
+                    name: "流血".to_owned(),
+                    kind: BuffKind::Magic,
+                    priority: 0,
+                    turns_remaining: 3,
+                    source_id: "enemy".to_owned(),
+                    beneficial: false,
+                    effects: Vec::new(),
+                    tick_actions: vec![BuffTickAction::Damage {
+                        amount: 3.0,
+                        damage_type: DamageType::Physical,
+                    }],
+                },
+                BuffSpec {
+                    name: "护佑".to_owned(),
+                    kind: BuffKind::Magic,
+                    priority: 0,
+                    turns_remaining: 3,
+                    source_id: "ally".to_owned(),
+                    beneficial: true,
+                    effects: Vec::new(),
+                    tick_actions: vec![BuffTickAction::Heal { amount: 2.0 }],
+                },
+            ],
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("holder".to_owned(), character.clone());
+        let mut holder = participant_from_character("holder", &character, &manager);
+        let resolution = apply_participant_damage_for_battle(&mut holder, 20.0, "enemy", true);
+        assert!(resolution.mirror_coat_triggered);
+
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                participants: vec![holder],
+                ..Default::default()
+            });
+        assert!(sync_encounter_to_manager(
+            store.encounters.get("battle"),
+            &mut manager,
+        ));
+        let buffs = &manager.player_characters["holder"].active_buffs;
+        assert_eq!(buffs.len(), 1);
+        assert_eq!(buffs[0].name, "护佑");
     }
 
     #[test]
