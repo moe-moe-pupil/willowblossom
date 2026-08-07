@@ -14770,11 +14770,11 @@ fn possession_final_movement(
 ) -> f32 {
     manager
         .and_then(|manager| manager.player_characters.get(&user_id.to_string()))
-        .map(possession_character_movement)
+        .map(|character| possession_character_movement(&user_id.to_string(), character))
         .unwrap_or_default()
 }
 
-fn possession_character_movement(character: &PlayerCharacter) -> f32 {
+fn possession_character_movement(target_id: &str, character: &PlayerCharacter) -> f32 {
     let mut speed = character.speed.max(0.0);
     if character.buff_base_stats.is_none() {
         let mut equipment = character.inventory.equipment.iter().collect::<Vec<_>>();
@@ -14793,7 +14793,15 @@ fn possession_character_movement(character: &PlayerCharacter) -> f32 {
             }
         }
     }
-    (speed + DEFAULT_POSSESSION_MOVEMENT_BONUS).max(0.0)
+    // 场景移动拆分为“移速部分”和“基础额度部分”：
+    // - 移速部分完整吃移速加成与减速；
+    // - 基础额度固定为 DEFAULT_POSSESSION_MOVEMENT_BONUS，不吃任何移速加成，
+    //   但会按移速的百分比减速（如 -50% 减速时 10 也减半）。
+    let speed_component = speed.max(0.0);
+    let reduction_multiplier =
+        crate::ui::character_speed_reduction_multiplier(target_id, character);
+    let base_component = DEFAULT_POSSESSION_MOVEMENT_BONUS * reduction_multiplier;
+    (speed_component + base_component).max(0.0)
 }
 
 fn sync_possessed_player_camera(
@@ -19714,7 +19722,7 @@ mod tests {
             speed: 4.5,
             ..Default::default()
         };
-        assert!((possession_character_movement(&character) - 14.5).abs() < 0.0001);
+        assert!((possession_character_movement("1", &character) - 14.5).abs() < 0.0001);
 
         character.inventory.equipment.insert(
             crate::napcat::EquipmentSlot::Feet,
@@ -19727,14 +19735,89 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!((possession_character_movement(&character) - 24.5).abs() < 0.0001);
+        assert!((possession_character_movement("1", &character) - 24.5).abs() < 0.0001);
 
         character.speed = 14.5;
         character.buff_base_stats = Some(crate::napcat::CharacterBuffBaseStats {
             speed: 4.5,
             ..crate::napcat::CharacterBuffBaseStats::from_character(&PlayerCharacter::default())
         });
-        assert!((possession_character_movement(&character) - 24.5).abs() < 0.0001);
+        assert!((possession_character_movement("1", &character) - 24.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn possession_movement_base_ignores_bonus_but_receives_percent_reduction() {
+        let base_stats = crate::napcat::CharacterBuffBaseStats {
+            speed: 4.5,
+            ..crate::napcat::CharacterBuffBaseStats::from_character(&PlayerCharacter::default())
+        };
+        let speed_buff = |percent: f32| crate::rule_engine::BuffSpec {
+            name: "速度修正".to_owned(),
+            kind: crate::rule_engine::BuffKind::Magic,
+            priority: 0,
+            turns_remaining: 0,
+            source_id: "test".to_owned(),
+            beneficial: percent >= 0.0,
+            effects: vec![crate::rule_engine::BuffEffect {
+                field: BuffField::Speed,
+                value: BuffValue::AddPercent(percent),
+            }],
+            tick_actions: Vec::new(),
+        };
+
+        // 只有 +100% 移速加成：移速翻倍，基础 10 不受影响。
+        let mut character = PlayerCharacter {
+            speed: 9.0,
+            buff_base_stats: Some(base_stats.clone()),
+            active_buffs: vec![speed_buff(100.0)],
+            ..Default::default()
+        };
+        assert!((possession_character_movement("1", &character) - 19.0).abs() < 0.0001);
+
+        // +100% 加成叠加 -50% 减速：移速回到 4.5，基础 10 减半为 5。
+        character.active_buffs = vec![speed_buff(100.0), speed_buff(-50.0)];
+        character.speed = 4.5;
+        assert!((possession_character_movement("1", &character) - 9.5).abs() < 0.0001);
+
+        // 仅 -50% 减速：移速减半，基础 10 同样减半。
+        character.active_buffs = vec![speed_buff(-50.0)];
+        character.speed = 2.25;
+        assert!((possession_character_movement("1", &character) - 7.25).abs() < 0.0001);
+
+        // SetPercentOfBase(50) 同样按比例缩小基础额度。
+        character.active_buffs = vec![crate::rule_engine::BuffSpec {
+            name: "压速".to_owned(),
+            kind: crate::rule_engine::BuffKind::Magic,
+            priority: 0,
+            turns_remaining: 0,
+            source_id: "test".to_owned(),
+            beneficial: false,
+            effects: vec![crate::rule_engine::BuffEffect {
+                field: BuffField::Speed,
+                value: BuffValue::SetPercentOfBase(50.0),
+            }],
+            tick_actions: Vec::new(),
+        }];
+        character.speed = 2.25;
+        assert!((possession_character_movement("1", &character) - 7.25).abs() < 0.0001);
+
+        // 装备上的百分比减速（无其他buff时）也会缩小基础额度。
+        let mut character = PlayerCharacter {
+            speed: 4.5,
+            ..Default::default()
+        };
+        character.inventory.equipment.insert(
+            crate::napcat::EquipmentSlot::Feet,
+            crate::napcat::InventoryItem {
+                equipment_slot: crate::napcat::EquipmentSlot::Feet,
+                stat_effects: vec![crate::rule_engine::BuffEffect {
+                    field: BuffField::Speed,
+                    value: BuffValue::AddPercent(-50.0),
+                }],
+                ..Default::default()
+            },
+        );
+        assert!((possession_character_movement("1", &character) - 7.25).abs() < 0.0001);
     }
 
     #[test]
