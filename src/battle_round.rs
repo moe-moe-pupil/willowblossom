@@ -508,6 +508,8 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub sunset_death_time_reset_pending: bool,
     #[serde(default)]
+    pub goose_channeling_turns: u32,
+    #[serde(default)]
     pub liquid_body_damage_delay_rate: f32,
     #[serde(default)]
     pub liquid_body_self_healing_rate: f32,
@@ -657,6 +659,11 @@ pub const SUNSET_DAMAGE_REDUCTION_CAP: f32 = 0.20;
 /// 「日薄崦嵫」死亡后重置的世界时间（18:00 的分钟数）。
 pub const SUNSET_TIME_RESET_MINUTES: u32 = 18 * 60;
 
+/// 「精美烧鹅」引导回合数。
+pub const GOOSE_CHANNEL_TURNS: u32 = 5;
+/// 「精美烧鹅」每回合回复的最大生命/魔法比例。
+pub const GOOSE_CHANNEL_HEAL_RATE: f32 = 0.20;
+
 fn trpg_group_campaign_id(group: &TrpgGroup) -> &str {
     let campaign_id = group.campaign_id.trim();
     if campaign_id.is_empty() {
@@ -770,6 +777,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.mirror_coat_cooldown_remaining = 0;
             participant.mirror_coat_cleanup_pending = false;
             participant.sunset_death_time_reset_pending = false;
+            participant.goose_channeling_turns = 0;
             participant.arcane_shield =
                 participant.max_mp.max(0.0) * participant.arcane_shield_rate.max(0.0);
             let previous_hp = participant.hp;
@@ -815,6 +823,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.mirror_coat_cooldown_remaining = 0;
             participant.mirror_coat_cleanup_pending = false;
             participant.sunset_death_time_reset_pending = false;
+            participant.goose_channeling_turns = 0;
             if participant_hope_avatar_active(participant) {
                 let was_alive = participant.alive;
                 participant.hp = 0.0;
@@ -1456,6 +1465,10 @@ fn apply_participant_damage_for_battle(
         // 隐身状态下再次受到伤害会立刻脱离隐身并回到战斗。
         participant.mirror_coat_layers = 0;
     }
+    if participant.goose_channeling_turns > 0 && damage_applied > f32::EPSILON {
+        // 食用烧鹅的引导被伤害打断，烧鹅消失。
+        participant.goose_channeling_turns = 0;
+    }
     if encounter_active
         && !participant.alive
         && participant.mirror_coat_enabled
@@ -1526,6 +1539,47 @@ fn advance_participant_mirror_coat(participant: &mut BattleParticipantSnapshot) 
     if participant.mirror_coat_cooldown_remaining > 0 {
         participant.mirror_coat_cooldown_remaining -= 1;
     }
+}
+
+/// 每轮推进「精美烧鹅」引导：回复20%最大生命/魔法，引导结束或被打断后烧鹅消失。
+fn advance_participant_goose_channel(
+    participant: &mut BattleParticipantSnapshot,
+    round: u32,
+) -> Option<(String, CombatLogEntry)> {
+    if participant.goose_channeling_turns == 0 {
+        return None;
+    }
+    let turns_left = participant.goose_channeling_turns;
+    participant.goose_channeling_turns -= 1;
+    let hp_heal = participant.max_hp.max(0.0) * GOOSE_CHANNEL_HEAL_RATE;
+    let mp_heal = participant.max_mp.max(0.0) * GOOSE_CHANNEL_HEAL_RATE;
+    let previous_hp = participant.hp;
+    let previous_mp = participant.mp;
+    participant.hp = (participant.hp + hp_heal).min(participant.max_hp);
+    participant.mp = (participant.mp + mp_heal).min(participant.max_mp);
+    let hp_restored = (participant.hp - previous_hp).max(0.0);
+    let mp_restored = (participant.mp - previous_mp).max(0.0);
+    let log = format!(
+        "{}食用精美烧鹅，回复{}点生命、{}点魔法（引导{}回合）",
+        participant.display_name,
+        format_number(hp_restored),
+        format_number(mp_restored),
+        turns_left
+    );
+    let entry = CombatLogEntry {
+        round,
+        kind: CombatLogKind::Healing,
+        source_id: participant.target_id.clone(),
+        source_name: participant.display_name.clone(),
+        target_id: participant.target_id.clone(),
+        target_name: participant.display_name.clone(),
+        action_name: "精美烧鹅".to_owned(),
+        base_amount: hp_restored,
+        effective_amount: hp_restored,
+        modifiers: Vec::new(),
+        benefits: vec![format!("魔法回复{}", format_number(mp_restored))],
+    };
+    Some((log, entry))
 }
 
 fn apply_penance_kill_assists(
@@ -4131,6 +4185,14 @@ impl BattleRoundStore {
                 }
                 participant.mp = (participant.mp + participant.mp_regen).min(participant.max_mp);
             }
+            if participant.goose_channeling_turns > 0 {
+                if let Some((log, combat_entry)) =
+                    advance_participant_goose_channel(participant, encounter.round)
+                {
+                    delayed_logs.push(log);
+                    delayed_combat_log.push(combat_entry);
+                }
+            }
             let delayed = advance_participant_delayed_damage_ticks(
                 participant,
                 encounter.active,
@@ -5357,6 +5419,24 @@ impl BattleRoundStore {
                 actor_name,
                 format_number(mp_cost)
             ));
+        }
+        if skill.name == "食用精美烧鹅" {
+            if let Some(encounter) = self.encounters.get_mut(encounter_id) {
+                let started = encounter
+                    .participants
+                    .iter_mut()
+                    .find(|participant| participant.target_id == actor_id)
+                    .map(|actor| {
+                        actor.goose_channeling_turns = GOOSE_CHANNEL_TURNS;
+                    })
+                    .is_some();
+                if started {
+                    encounter.action_log.push(format!(
+                        "{}开始食用精美烧鹅，引导{}回合",
+                        actor_name, GOOSE_CHANNEL_TURNS
+                    ));
+                }
+            }
         }
         if actor_dealt_damage && actor_snapshot.mirror_coat_layers > 0 {
             if let Some(encounter) = self.encounters.get_mut(encounter_id) {
@@ -6876,6 +6956,7 @@ fn participant_from_character(
         mirror_coat_cleanup_pending: false,
         sunset_enabled: character_sunset_available(character),
         sunset_death_time_reset_pending: false,
+        goose_channeling_turns: 0,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         calm_heart_healing_rate: character_calm_heart_healing_rate(character),
@@ -7011,6 +7092,7 @@ fn participant_from_unit_template(
         mirror_coat_cleanup_pending: false,
         sunset_enabled: character_sunset_available(character),
         sunset_death_time_reset_pending: false,
+        goose_channeling_turns: 0,
         damage_taken_this_turn: character.damage_taken_this_turn,
         healing_taken_this_turn: character.healing_taken_this_turn,
         skill_last_used_turns: HashMap::new(),
@@ -7114,6 +7196,7 @@ fn participant_from_target(
         mirror_coat_cleanup_pending: false,
         sunset_enabled: false,
         sunset_death_time_reset_pending: false,
+        goose_channeling_turns: 0,
         damage_taken_this_turn: 0.0,
         healing_taken_this_turn: 0.0,
         skill_last_used_turns: HashMap::new(),
@@ -7492,7 +7575,7 @@ fn current_actor_index(encounter: &BattleEncounter) -> Option<usize> {
 }
 
 fn participant_can_act(participant: &BattleParticipantSnapshot) -> bool {
-    participant.alive && !participant.action_done
+    participant.alive && !participant.action_done && participant.goose_channeling_turns == 0
 }
 
 fn normalize_encounter_after_edit(encounter: &mut BattleEncounter) {
@@ -8778,6 +8861,7 @@ mod area_tests {
             mirror_coat_cleanup_pending: false,
             sunset_enabled: false,
             sunset_death_time_reset_pending: false,
+            goose_channeling_turns: 0,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             calm_heart_healing_rate: 0.0,
@@ -8964,6 +9048,7 @@ mod tests {
             mirror_coat_cleanup_pending: false,
             sunset_enabled: false,
             sunset_death_time_reset_pending: false,
+            goose_channeling_turns: 0,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             calm_heart_healing_rate: 0.0,
@@ -14897,6 +14982,84 @@ mod tests {
             manager.trpg_groups["g"].world_time_minutes,
             5 * 60
         );
+    }
+
+    #[test]
+    fn goose_skill_starts_channel_and_blocks_other_actions() {
+        let mut manager = empty_manager();
+        let mut actor = participant("actor", 0);
+        actor.hp = 100.0;
+        actor.max_hp = 100.0;
+        let mut defender = participant("defender", 0);
+        defender.hp = 100.0;
+        defender.max_hp = 100.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                participants: vec![actor, defender],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "食用精美烧鹅".to_owned(),
+            note: "开始食用烧鹅，引导5回合，每回合回复20%最大生命和魔法值".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "actor", "actor", &skill, &manager, None,));
+        let actor = &store.encounters["battle"].participants[0];
+        assert_eq!(actor.goose_channeling_turns, 5);
+        assert!(!participant_can_act(actor));
+    }
+
+    #[test]
+    fn goose_channel_heals_per_round_for_five_turns() {
+        let mut manager = empty_manager();
+        let mut holder = participant("holder", 0);
+        holder.hp = 50.0;
+        holder.max_hp = 100.0;
+        holder.mp = 20.0;
+        holder.max_mp = 100.0;
+        holder.hp_regen = 0.0;
+        holder.mp_regen = 0.0;
+        holder.goose_channeling_turns = 5;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                participants: vec![holder],
+                ..Default::default()
+            });
+
+        for _ in 0..5 {
+            assert!(store.next_round("battle"));
+        }
+        let holder = &store.encounters["battle"].participants[0];
+        assert!((holder.hp - 100.0).abs() < 0.0001);
+        assert!((holder.mp - 100.0).abs() < 0.0001);
+        assert_eq!(holder.goose_channeling_turns, 0);
+    }
+
+    #[test]
+    fn goose_channel_interrupted_by_damage() {
+        let mut holder = participant("holder", 0);
+        holder.hp = 100.0;
+        holder.max_hp = 100.0;
+        holder.goose_channeling_turns = 5;
+
+        apply_participant_damage_for_battle(&mut holder, 10.0, "enemy", true);
+
+        assert_eq!(holder.goose_channeling_turns, 0);
+        assert!((holder.hp - 90.0).abs() < 0.0001);
     }
 
     #[test]

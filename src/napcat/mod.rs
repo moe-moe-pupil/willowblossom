@@ -9384,6 +9384,33 @@ pub fn character_sunset_available(character: &PlayerCharacter) -> bool {
     character_has_approved_moonberry_talent(character, "日薄崦嵫")
 }
 
+/// 「精美烧鹅」持有者：每次开团获得3只烧鹅。
+pub fn character_delicious_goose_available(character: &PlayerCharacter) -> bool {
+    character_has_approved_moonberry_talent(character, "精美烧鹅")
+}
+
+/// 「精美烧鹅」道具：使用后引导5回合，每回合回复20%最大生命/魔法值。
+pub fn delicious_goose_item() -> InventoryItem {
+    InventoryItem {
+        name: "精美烧鹅".to_owned(),
+        description:
+            "美味烧鹅：使用后引导5回合，每回合回复20%最大生命/魔法值；引导期间无法进行其他动作，受到伤害会中断。"
+                .to_owned(),
+        stack: 3,
+        max_stack: 3,
+        soulbound: true,
+        skills: vec![InventoryItemSkill {
+            name: "食用精美烧鹅".to_owned(),
+            note: "开始食用烧鹅，引导5回合，每回合回复20%最大生命和魔法值".to_owned(),
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            metadata: CharacterSkillMetadata::default(),
+            consume_item: true,
+        }],
+        ..Default::default()
+    }
+}
+
 /// 开团：标记当前剧情世界开始，并清理上一个世界遗留的持续型天赋状态。
 pub fn open_trpg_group_world(
     manager: &mut NapcatMessageManager,
@@ -9400,8 +9427,14 @@ pub fn open_trpg_group_world(
     group.campaign_active = true;
     group.world_start_turn = group.world_turn;
     let cleared = clear_group_world_talent_state(manager, group_name);
+    let granted_geese = grant_group_delicious_geese(manager, group_name);
     Some(format!(
-        "已开团：本次剧情世界开始。已清空上个世界遗留的持续型天赋状态（{cleared} 个角色）。"
+        "已开团：本次剧情世界开始。已清空上个世界遗留的持续型天赋状态（{cleared} 个角色）{}。",
+        if granted_geese == 0 {
+            String::new()
+        } else {
+            format!("；已为 {granted_geese} 名持有者发放精美烧鹅各3只")
+        }
     ))
 }
 
@@ -9438,6 +9471,27 @@ fn clear_group_world_talent_state(manager: &mut NapcatMessageManager, group_name
         }
     }
     cleared
+}
+
+/// 为组内持有「精美烧鹅」天赋的玩家发放本世界3只烧鹅（替换旧世界的烧鹅）。
+fn grant_group_delicious_geese(manager: &mut NapcatMessageManager, group_name: &str) -> usize {
+    let Some(group) = manager.trpg_groups.get(group_name) else {
+        return 0;
+    };
+    let mut granted = 0;
+    for target_id in &group.players {
+        if let Some(character) = manager.player_characters.get_mut(target_id) {
+            if character_delicious_goose_available(character) {
+                character
+                    .inventory
+                    .items
+                    .retain(|item| item.name != "精美烧鹅");
+                character.inventory.items.push(delicious_goose_item());
+                granted += 1;
+            }
+        }
+    }
+    granted
 }
 
 pub fn character_sin_on_sin_exp_bonus_per_stack(character: &PlayerCharacter) -> f32 {
@@ -13956,6 +14010,50 @@ position_cells = [4, 5, 6]
             manager.trpg_groups["g"].world_start_turn,
             0
         );
+    }
+
+    #[test]
+    fn open_world_grants_three_delicious_geese_to_talent_holder() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("holder".to_owned(), PlayerCharacter {
+                skill_names: vec!["精美烧鹅".to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::talent("support_talent", "辅助天赋")],
+                ..Default::default()
+            });
+        manager.player_characters.insert(
+            "plain".to_owned(),
+            PlayerCharacter::default(),
+        );
+        manager.trpg_groups.insert(
+            "g".to_owned(),
+            TrpgGroup {
+                players: vec!["holder".to_owned(), "plain".to_owned()],
+                ..Default::default()
+            },
+        );
+
+        assert!(open_trpg_group_world(&mut manager, "g").is_some());
+        let holder_items = &manager.player_characters["holder"].inventory.items;
+        assert_eq!(holder_items.len(), 1);
+        assert_eq!(holder_items[0].name, "精美烧鹅");
+        assert_eq!(holder_items[0].stack, 3);
+        assert!(holder_items[0]
+            .skills
+            .iter()
+            .any(|skill| skill.name == "食用精美烧鹅" && skill.consume_item));
+        assert!(manager.player_characters["plain"]
+            .inventory
+            .items
+            .is_empty());
+
+        // 结团再开团会替换为新的3只。
+        assert!(close_trpg_group_world(&mut manager, "g").is_some());
+        assert!(open_trpg_group_world(&mut manager, "g").is_some());
+        let holder_items = &manager.player_characters["holder"].inventory.items;
+        assert_eq!(holder_items.len(), 1);
+        assert_eq!(holder_items[0].stack, 3);
     }
 
     #[test]
