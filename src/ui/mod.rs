@@ -4129,8 +4129,22 @@ fn message_image_ui(
         texture.size_vec2(),
         Vec2::new(max_width, CHAT_IMAGE_MAX_SIZE.y),
     );
-    ui.add(egui::Image::from_texture((texture.id(), size)).corner_radius(4))
+    let image_response = ui
+        .add(
+            egui::Image::from_texture((texture.id(), size))
+                .corner_radius(4)
+                .sense(egui::Sense::click()),
+        )
         .on_hover_text(data.url.trim());
+
+    if !data.url.trim().is_empty() {
+        image_response.context_menu(|ui| {
+            if ui.button("复制图片链接").clicked() {
+                ui.ctx().copy_text(data.url.trim().to_owned());
+                ui.close();
+            }
+        });
+    }
 }
 
 fn cached_image_path(path: &str) -> Option<String> {
