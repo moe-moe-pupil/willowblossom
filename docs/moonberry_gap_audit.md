@@ -8,6 +8,8 @@ Additional 2026-08-07 update: scene possession movement is now split into a spee
 
 Additional 2026-08-07 update: `镜像外衣` approved talent now executes in battle. On a lethal post-shield hit while the encounter is active and the talent's 6-round cooldown is ready, the holder instead removes harmful buffs that deal damage (`Damage`/`FixedDamage` tick actions on non-beneficial buffs, cleaned through the manager sync), sets HP to 1, consumes up to 15 MP (5 MP per extra layer) for 1 + floor(MP/5) mirror-coat layers capped at 4, and leaves combat into stealth for one round per layer. Stealth breaks when the holder takes or deals damage, layers and cooldown advance each battle round, stealthed participants are excluded from battle target options, and the existing voxel `隐身工具` invisibility state now syncs battle mirror-coat stealth so stealthed player standees only render for the GM. Focused verification passes with `cargo test --lib -j 1 mirror_coat`: 6 passed, 0 failed.
 
+Additional 2026-08-07 update: `日薄崦嵫` approved talent now executes in battle. Incoming parsed-skill damage to the holder is reduced by 1 point for every yard beyond 10 (e.g. 11 yards reduces 1 point), capped at 20% of the incoming damage, using the scene's character positions when available. When the holder is defeated, the battle's TRPG group world time resets to 18:00 of the current day (day count preserved) through a one-shot pending flag consumed by the manager-accessible battle paths. Focused verification passes with `cargo test --lib -j 1 sunset`: 5 passed, 0 failed.
+
 ## Sources Checked
 
 - Old Moonberry source cloned from `https://github.com/moe-moe-pupil/moonberry` at commit `da85a9e`.
