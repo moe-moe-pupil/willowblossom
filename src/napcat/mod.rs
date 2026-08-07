@@ -1343,6 +1343,9 @@ pub struct PlayerCharacter {
     pub buff_base_stats: Option<CharacterBuffBaseStats>,
     #[serde(default)]
     pub inventory: CharacterInventory,
+    /// 「役于我手」在本剧情世界内累计的生命上限加成，随开团/结团重置。
+    #[serde(default)]
+    pub dominion_max_hp_bonus: f32,
 }
 
 impl Default for PlayerCharacter {
@@ -1383,6 +1386,7 @@ impl Default for PlayerCharacter {
             active_buffs: Vec::new(),
             buff_base_stats: None,
             inventory: CharacterInventory::default(),
+            dominion_max_hp_bonus: 0.0,
         }
     }
 }
@@ -2044,6 +2048,9 @@ pub struct TrpgGroup {
     pub player_turns: HashMap<String, TrpgPlayerTurnState>,
     #[serde(default)]
     pub initial_player_states: HashMap<String, PlayerCharacter>,
+    /// 是否处于开团状态；结团会清空本世界内持续型天赋状态。
+    #[serde(default)]
+    pub campaign_active: bool,
 }
 
 impl Default for TrpgGroup {
@@ -2073,6 +2080,7 @@ impl Default for TrpgGroup {
             world_turn: 0,
             player_turns: HashMap::default(),
             initial_player_states: HashMap::default(),
+            campaign_active: false,
         }
     }
 }
@@ -8336,12 +8344,14 @@ fn format_private_character_status(manager: &NapcatMessageManager, target_id: &s
     }
 
     let total_status = character_total_status(character);
-    let hp_status = private_character_hp_status(character.hp, character.max_hp);
+    let effective_max_hp = character.max_hp + character.dominion_max_hp_bonus.max(0.0);
+    let displayed_hp = character.hp.min(effective_max_hp);
+    let hp_status = private_character_hp_status(displayed_hp, effective_max_hp);
     let health = if total_status.k >= 5 {
         format!(
             "生命：{} / {} 【{}】",
-            format_character_number(character.hp),
-            format_character_number(character.max_hp),
+            format_character_number(displayed_hp),
+            format_character_number(effective_max_hp),
             hp_status,
         )
     } else {
@@ -9307,6 +9317,60 @@ pub fn character_dominion_max_hp_bonus_cap(character: &PlayerCharacter) -> f32 {
     } else {
         0.0
     }
+}
+
+/// 开团：标记当前剧情世界开始，并清理上一个世界遗留的持续型天赋状态。
+pub fn open_trpg_group_world(
+    manager: &mut NapcatMessageManager,
+    group_name: &str,
+) -> Option<String> {
+    let Some(group) = manager.trpg_groups.get_mut(group_name) else {
+        return Some(format!(
+            "TRPG组「{group_name}」不存在。"
+        ));
+    };
+    if group.campaign_active {
+        return Some("该TRPG组已经处于开团状态。".to_owned());
+    }
+    group.campaign_active = true;
+    let cleared = clear_group_world_talent_state(manager, group_name);
+    Some(format!(
+        "已开团：本次剧情世界开始。已清空上个世界遗留的持续型天赋状态（{cleared} 个角色）。"
+    ))
+}
+
+/// 结团：结束当前剧情世界，并清空世界内的持续型天赋状态。
+pub fn close_trpg_group_world(
+    manager: &mut NapcatMessageManager,
+    group_name: &str,
+) -> Option<String> {
+    let Some(group) = manager.trpg_groups.get_mut(group_name) else {
+        return Some(format!(
+            "TRPG组「{group_name}」不存在。"
+        ));
+    };
+    group.campaign_active = false;
+    let cleared = clear_group_world_talent_state(manager, group_name);
+    Some(format!(
+        "已结团：本次剧情世界结束。已清空世界内的持续型天赋状态（{cleared} 个角色）。"
+    ))
+}
+
+/// 清空某个TRPG组内所有玩家角色的世界级天赋状态（当前为「役于我手」生命上限加成）。
+fn clear_group_world_talent_state(manager: &mut NapcatMessageManager, group_name: &str) -> usize {
+    let Some(group) = manager.trpg_groups.get(group_name) else {
+        return 0;
+    };
+    let mut cleared = 0;
+    for target_id in &group.players {
+        if let Some(character) = manager.player_characters.get_mut(target_id) {
+            if character.dominion_max_hp_bonus.abs() > f32::EPSILON {
+                character.dominion_max_hp_bonus = 0.0;
+                cleared += 1;
+            }
+        }
+    }
+    cleared
 }
 
 pub fn character_sin_on_sin_exp_bonus_per_stack(character: &PlayerCharacter) -> f32 {

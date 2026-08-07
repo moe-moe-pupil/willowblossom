@@ -718,7 +718,6 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         let mut logs = Vec::new();
         let mut combat_entries = Vec::new();
         for participant in &mut encounter.participants {
-            clear_participant_dominion_bonus(participant);
             participant.combat_turns_completed = 0;
             participant.combat_damage_taken_total = 0.0;
             participant.damage_contributors.clear();
@@ -765,7 +764,6 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         let mut combat_entries = Vec::new();
         let mut defeat_outcomes = Vec::new();
         for participant in &mut encounter.participants {
-            clear_participant_dominion_bonus(participant);
             participant.combat_turns_completed = 0;
             participant.keen_evasion_available = false;
             participant.undying_rage_active = false;
@@ -850,6 +848,24 @@ fn clear_participant_dominion_bonus(participant: &mut BattleParticipantSnapshot)
     participant.max_hp = (participant.max_hp - bonus).max(0.0);
     participant.hp = participant.hp.min(participant.max_hp);
     participant.dominion_max_hp_bonus = 0.0;
+}
+
+/// 结团时清空某个TRPG组所有战斗轮内「役于我手」的剩余生命上限加成。
+pub fn clear_trpg_group_dominion_bonuses(store: &mut BattleRoundStore, group_name: &str) -> usize {
+    let mut cleared = 0;
+    for encounter in store.encounters.values_mut() {
+        if encounter.trpg_group.as_deref() != Some(group_name) {
+            continue;
+        }
+        for participant in &mut encounter.participants {
+            let before = participant.dominion_max_hp_bonus.max(0.0);
+            clear_participant_dominion_bonus(participant);
+            if before > f32::EPSILON {
+                cleared += 1;
+            }
+        }
+    }
+    cleared
 }
 
 fn advance_participant_rest_then_fight(participant: &mut BattleParticipantSnapshot) {
@@ -5705,7 +5721,16 @@ fn sync_encounter_to_manager(
             character.exp = participant.exp.max(0);
             changed = true;
         }
-        let hp = participant.hp.clamp(0.0, character.max_hp.max(0.0));
+        let dominion_bonus = participant.dominion_max_hp_bonus.clamp(
+            0.0,
+            character_dominion_max_hp_bonus_cap(character).max(0.0),
+        );
+        if (character.dominion_max_hp_bonus - dominion_bonus).abs() > f32::EPSILON {
+            character.dominion_max_hp_bonus = dominion_bonus;
+            changed = true;
+        }
+        let effective_max_hp = (character.max_hp + character.dominion_max_hp_bonus).max(0.0);
+        let hp = participant.hp.clamp(0.0, effective_max_hp);
         let mp = participant.mp.clamp(0.0, character.max_mp.max(0.0));
         if (character.hp - hp).abs() > f32::EPSILON {
             if let Some(base_stats) = character.buff_base_stats.as_mut() {
@@ -6534,6 +6559,15 @@ fn participant_from_character(
 ) -> BattleParticipantSnapshot {
     let status = character.status.combined(&character.extra_status);
     let (speed, low_survivor_speed) = character_battle_speeds(character);
+    let dominion_gain_rate = character_dominion_max_hp_gain_rate(character);
+    let dominion_bonus = if dominion_gain_rate > f32::EPSILON {
+        character.dominion_max_hp_bonus.clamp(
+            0.0,
+            character_dominion_max_hp_bonus_cap(character),
+        )
+    } else {
+        0.0
+    };
     BattleParticipantSnapshot {
         target_id: target_id.to_owned(),
         display_name: character_display_name(target_id, character, manager),
@@ -6559,7 +6593,7 @@ fn participant_from_character(
         negative_layers: 0,
         pending_negative: false,
         hp: character.hp,
-        max_hp: character.max_hp,
+        max_hp: character.max_hp + dominion_bonus,
         mp: character.mp,
         max_mp: character.max_mp,
         hp_regen: character.hp_regen,
@@ -6611,9 +6645,9 @@ fn participant_from_character(
             character,
         ),
         champion_stacks: 0,
-        dominion_max_hp_gain_rate: character_dominion_max_hp_gain_rate(character),
+        dominion_max_hp_gain_rate: dominion_gain_rate,
         dominion_max_hp_bonus_cap: character_dominion_max_hp_bonus_cap(character),
-        dominion_max_hp_bonus: 0.0,
+        dominion_max_hp_bonus: dominion_bonus,
         sin_on_sin_exp_bonus_per_stack: character_sin_on_sin_exp_bonus_per_stack(character),
         sin_on_sin_recovery_rate: character_sin_on_sin_recovery_rate(character),
         sin_on_sin_stacks: 0,
@@ -7010,7 +7044,7 @@ fn sync_participant_from_manager(
         participant.dominion_max_hp_gain_rate = dominion_gain_rate;
         participant.dominion_max_hp_bonus_cap = dominion_bonus_cap;
         participant.dominion_max_hp_bonus = if dominion_gain_rate > f32::EPSILON {
-            participant
+            character
                 .dominion_max_hp_bonus
                 .clamp(0.0, dominion_bonus_cap)
         } else {
@@ -13958,7 +13992,7 @@ mod tests {
     }
 
     #[test]
-    fn dominion_bonus_is_cleared_at_combat_boundaries() {
+    fn dominion_bonus_persists_across_combat_boundaries() {
         let mut holder = participant("holder", 0);
         holder.hp = 115.0;
         holder.max_hp = 120.0;
@@ -13982,9 +14016,9 @@ mod tests {
             false
         ));
         let holder = &encounter.participants[0];
-        assert_eq!(holder.hp, 100.0);
-        assert_eq!(holder.max_hp, 100.0);
-        assert_eq!(holder.dominion_max_hp_bonus, 0.0);
+        assert_eq!(holder.hp, 115.0);
+        assert_eq!(holder.max_hp, 120.0);
+        assert_eq!(holder.dominion_max_hp_bonus, 20.0);
         assert_eq!(encounter.participants[1].hp, 0.0);
         assert!(!encounter.participants[1].alive);
         assert!(!encounter
@@ -13992,17 +14026,93 @@ mod tests {
             .iter()
             .any(|entry| entry.contains("触发役于我手")));
 
-        encounter.participants[0].hp = 105.0;
-        encounter.participants[0].max_hp = 110.0;
-        encounter.participants[0].dominion_max_hp_bonus = 10.0;
         assert!(set_encounter_active_state(
             &mut encounter,
             true
         ));
         let holder = &encounter.participants[0];
-        assert_eq!(holder.hp, 100.0);
-        assert_eq!(holder.max_hp, 100.0);
+        assert_eq!(holder.hp, 115.0);
+        assert_eq!(holder.max_hp, 120.0);
+        assert_eq!(holder.dominion_max_hp_bonus, 20.0);
+    }
+
+    #[test]
+    fn dominion_bonus_persists_on_durable_character_until_world_close() {
+        let mut manager = empty_manager();
+        let dominion_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["役于我手".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "holder".to_owned(),
+            dominion_character.clone(),
+        );
+        manager.trpg_groups.insert(
+            "g".to_owned(),
+            crate::napcat::TrpgGroup {
+                players: vec!["holder".to_owned()],
+                ..Default::default()
+            },
+        );
+
+        let mut holder = participant_from_character("holder", &dominion_character, &manager);
         assert_eq!(holder.dominion_max_hp_bonus, 0.0);
+        holder.hp = 120.0;
+        holder.max_hp = 120.0;
+        holder.dominion_max_hp_bonus = 20.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                trpg_group: Some("g".to_owned()),
+                participants: vec![holder],
+                ..Default::default()
+            });
+
+        assert!(sync_encounter_to_manager(
+            store.encounters.get("battle"),
+            &mut manager,
+        ));
+        assert!((manager.player_characters["holder"].dominion_max_hp_bonus - 20.0).abs() < 0.0001);
+        assert!((manager.player_characters["holder"].hp - 120.0).abs() < 0.0001);
+
+        // 退出战斗后重新入场，加成仍保留到本世界结束。
+        let reentered = participant_from_character(
+            "holder",
+            &manager.player_characters["holder"],
+            &manager,
+        );
+        assert!((reentered.dominion_max_hp_bonus - 20.0).abs() < 0.0001);
+        assert!((reentered.max_hp - 120.0).abs() < 0.0001);
+
+        // 结团清空持久加成并结束世界；开团开始新世界。
+        assert_eq!(
+            store.encounters["battle"].participants[0].dominion_max_hp_bonus,
+            20.0
+        );
+        assert_eq!(
+            clear_trpg_group_dominion_bonuses(&mut store, "g"),
+            1
+        );
+        assert_eq!(
+            store.encounters["battle"].participants[0].dominion_max_hp_bonus,
+            0.0
+        );
+        assert!(crate::napcat::close_trpg_group_world(&mut manager, "g").is_some());
+        assert!(!manager.trpg_groups["g"].campaign_active);
+        assert_eq!(
+            manager.player_characters["holder"].dominion_max_hp_bonus,
+            0.0
+        );
+        assert!(crate::napcat::open_trpg_group_world(&mut manager, "g").is_some());
+        assert!(manager.trpg_groups["g"].campaign_active);
     }
 
     #[test]
@@ -14058,8 +14168,9 @@ mod tests {
         assert_eq!(holder.max_hp, 120.0);
         assert_eq!(holder.dominion_max_hp_bonus, 20.0);
         let character = &manager.player_characters["holder"];
-        assert_eq!(character.hp, 100.0);
+        assert_eq!(character.hp, 120.0);
         assert_eq!(character.max_hp, 100.0);
+        assert_eq!(character.dominion_max_hp_bonus, 20.0);
         assert_eq!(
             character.active_buffs[0].turns_remaining,
             1
@@ -14136,8 +14247,9 @@ mod tests {
         assert_eq!(holder.dominion_max_hp_bonus, 20.0);
         assert!((holder.damage_taken_modifier - 0.5).abs() < 0.0001);
         let character = &manager.player_characters["holder"];
-        assert_eq!(character.hp, 100.0);
+        assert_eq!(character.hp, 115.0);
         assert_eq!(character.max_hp, 100.0);
+        assert_eq!(character.dominion_max_hp_bonus, 20.0);
         assert_eq!(character.active_buffs.len(), 1);
     }
 

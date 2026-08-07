@@ -2,6 +2,8 @@
 
 Date: 2026-06-10
 
+Additional 2026-08-07 update: `役于我手` approved-talent max-HP growth now persists on the durable player character until the story world ends instead of being cleared at each combat boundary. The bonus is stored as a persisted `PlayerCharacter.dominion_max_hp_bonus`, restored into every new battle entry, written back from encounters through the shared manager sync, and displayed in the GM player list and player-facing `.状态` (as effective max HP) without changing the base `max_hp` or its 20% attribute-based cap. TRPG group workspaces now have a `开团`/`结团` toggle backed by a persisted `TrpgGroup.campaign_active` flag: opening starts a fresh world (clearing any leftover persistent talent state), and closing ends the world, clearing all group players' dominion bonuses and any remaining battle-roster copies via `clear_trpg_group_dominion_bonuses`. Focused verification passes with `cargo test --lib -j 1 dominion -- --nocapture`: 5 passed, 0 failed; full library verification shows only the six pre-existing unrelated failures (`private_attribute_help_accepts_both_prefixes_and_lists_all_attributes`, `private_weave_aliases_require_ten_int_and_report_same_campaign_field`, `real_history_imports_arrogance_and_gm_focuses_the_player_standee`, and three voxel default-fleet/radiance tests) that already fail on the clean base commit.
+
 ## Sources Checked
 
 - Old Moonberry source cloned from `https://github.com/moe-moe-pupil/moonberry` at commit `da85a9e`.

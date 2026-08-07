@@ -746,6 +746,7 @@ const MOONBERRY_TARGET_CLASSES: &[&str] = &["无目标", "单目标", "多目标
 
 use crate::{
     battle_round::{
+        clear_trpg_group_dominion_bonuses,
         BattleRoundStore,
         BattleRoundUiState,
         BATTLE_ROUND_EXPORT_VERSION,
@@ -781,6 +782,7 @@ use crate::{
         character_physical_damage_lifesteal,
         character_spell_range_multiplier,
         character_wounded_healing_dealt_modifier,
+        close_trpg_group_world,
         content_pool_generation_prompt,
         dying_target_healing_multiplier,
         grant_character_experience,
@@ -791,6 +793,7 @@ use crate::{
         moonberry_physical_damage_followup_buff,
         moonberry_skill_type_is_spell,
         normalized_random_pool_counts,
+        open_trpg_group_world,
         record_character_damage_taken,
         record_character_healing_taken,
         reset_character_turn_totals,
@@ -944,6 +947,7 @@ pub(crate) struct TrpgGroupSettingsState {
     pending_turn_zero_reset: Option<String>,
     pending_initial_stats_restore: Option<String>,
     pending_test_session_reset: Option<String>,
+    pending_close_world: Option<String>,
     group_reset_status: HashMap<String, String>,
     legacy_send_pane_status: HashMap<String, String>,
     legacy_team_chat_status: HashMap<String, String>,
@@ -5510,15 +5514,17 @@ fn character_status_summary_ui(ui: &mut Ui, character: &PlayerCharacter) {
     } else {
         character_creation_step_label(character.creation_step)
     };
+    let effective_max_hp = character.max_hp + character.dominion_max_hp_bonus.max(0.0);
+    let displayed_hp = character.hp.min(effective_max_hp);
 
     ui.horizontal_wrapped(|ui| {
         ui.strong(display_name);
         ui.small(state_label);
         ui.small(format!(
             "HP {}/{} [{}]",
-            format_character_number(character.hp),
-            format_character_number(character.max_hp),
-            character_hp_status(character.hp, character.max_hp)
+            format_character_number(displayed_hp),
+            format_character_number(effective_max_hp),
+            character_hp_status(displayed_hp, effective_max_hp)
         ));
         ui.small(format!(
             "MP {}/{}",
@@ -14170,6 +14176,7 @@ fn trpg_group_settings_window(
     let mut turn_zero_reset: Option<String> = None;
     let mut initial_stats_restore: Option<String> = None;
     let mut test_session_reset: Option<String> = None;
+    let mut world_action: Option<(String, bool)> = None;
     let mut legacy_negative_action: Option<(String, String, LegacyNegativeAction)> = None;
     let mut legacy_surface_action: Option<(String, LegacyGroupSurfaceAction)> = None;
     let mut settings_open = state.open;
@@ -14356,6 +14363,11 @@ fn trpg_group_settings_window(
                                     trpg_group_member_count(&snapshot),
                                     snapshot.world_turn
                                 ));
+                                if snapshot.campaign_active {
+                                    ui.colored_label(egui::Color32::LIGHT_GREEN, "开团中");
+                                } else {
+                                    ui.colored_label(egui::Color32::GRAY, "未开团");
+                                }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -14367,6 +14379,41 @@ fn trpg_group_settings_window(
                             });
 
                             ui.horizontal_wrapped(|ui| {
+                                if snapshot.campaign_active {
+                                    if state.pending_close_world.as_deref()
+                                        == Some(group_name.as_str())
+                                    {
+                                        if ui
+                                            .button("确认结团")
+                                            .on_hover_text(
+                                                "结束本次剧情世界，并清空世界内持续型天赋状态（如役于我手加成）",
+                                            )
+                                            .clicked()
+                                        {
+                                            world_action = Some((group_name.clone(), false));
+                                            state.pending_close_world = None;
+                                        }
+                                        if ui.button("取消").clicked() {
+                                            state.pending_close_world = None;
+                                        }
+                                    } else if ui
+                                        .button("结团")
+                                        .on_hover_text(
+                                            "结束本次剧情世界，并清空世界内持续型天赋状态（如役于我手加成）",
+                                        )
+                                        .clicked()
+                                    {
+                                        state.pending_close_world = Some(group_name.clone());
+                                    }
+                                } else if ui
+                                    .button("开团")
+                                    .on_hover_text(
+                                        "开始本次剧情世界，并清空上个世界遗留的持续型天赋状态（如役于我手加成）",
+                                    )
+                                    .clicked()
+                                {
+                                    world_action = Some((group_name.clone(), true));
+                                }
                                 if ui.button("推进轮次").clicked() {
                                     turn_advance = Some(group_name.clone());
                                 }
@@ -15192,6 +15239,35 @@ fn trpg_group_settings_window(
             changed = true;
         }
         state.pending_player_delete = None;
+    }
+
+    if let Some((group_name, active)) = world_action {
+        if active {
+            if let Some(message) = open_trpg_group_world(manager.as_mut(), &group_name) {
+                state.group_reset_status.insert(group_name, message);
+                changed = true;
+            }
+        } else {
+            let cleared_battles = battle_store
+                .as_deref_mut()
+                .map(|battle_store| {
+                    let cleared = clear_trpg_group_dominion_bonuses(battle_store, &group_name);
+                    battle_store.persist().ok();
+                    cleared
+                })
+                .unwrap_or_default();
+            if let Some(message) = close_trpg_group_world(manager.as_mut(), &group_name) {
+                state.group_reset_status.insert(
+                    group_name,
+                    if cleared_battles == 0 {
+                        message
+                    } else {
+                        format!("{message}（已同步清理 {cleared_battles} 个战斗轮中的旧加成）")
+                    },
+                );
+                changed = true;
+            }
+        }
     }
 
     if changed {
