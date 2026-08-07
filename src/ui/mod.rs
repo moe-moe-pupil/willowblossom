@@ -9305,6 +9305,53 @@ fn character_effect_sync_needed(target_id: &str, character: &PlayerCharacter) ->
     has_effects != character.buff_base_stats.is_some()
 }
 
+/// 场景移动的基础额度（固定10）只吃移速的百分比减速，不吃移速加成。
+/// 该函数收集角色所有生效移速修正中“减速”方向的乘数：
+/// `AddPercent` 为负或 `SetPercentOfBase` 小于100 时按比例缩小基础额度。
+pub(crate) fn character_speed_reduction_multiplier(
+    target_id: &str,
+    character: &PlayerCharacter,
+) -> f32 {
+    let mut multiplier = 1.0;
+    let mut collect = |effect: &BuffEffect| {
+        if effect.field != BuffField::Speed {
+            return;
+        }
+        match effect.value {
+            BuffValue::AddPercent(percent) if percent < 0.0 => {
+                multiplier *= 1.0 + percent / 100.0;
+            }
+            BuffValue::SetPercentOfBase(percent) if percent < 100.0 => {
+                multiplier *= percent / 100.0;
+            }
+            _ => {}
+        }
+    };
+    let mut equipment = character.inventory.equipment.iter().collect::<Vec<_>>();
+    equipment.sort_by_key(|(slot, _)| equipment_slot_sort_key(**slot));
+    for (_, item) in equipment {
+        for effect in &item.stat_effects {
+            collect(effect);
+        }
+    }
+    for buff in &character.active_buffs {
+        for effect in &buff.effects {
+            collect(effect);
+        }
+    }
+    for buff in character_legacy_passive_buffs(target_id, character) {
+        for effect in &buff.effects {
+            collect(effect);
+        }
+    }
+    for buff in character_moonberry_talent_passive_buffs(target_id, character) {
+        for effect in &buff.effects {
+            collect(effect);
+        }
+    }
+    multiplier.max(0.0)
+}
+
 fn character_equipment_buffs(target_id: &str, character: &PlayerCharacter) -> Vec<BuffSpec> {
     let mut equipment = character.inventory.equipment.iter().collect::<Vec<_>>();
     equipment.sort_by_key(|(slot, _)| equipment_slot_sort_key(**slot));
