@@ -4408,6 +4408,36 @@ fn paint_unread_badge(ctx: &Context, window_rect: Rect, unread_count: usize) {
     );
 }
 
+fn paint_chat_list_unread_badge(ui: &mut Ui, unread_count: usize) {
+    let badge_text = if unread_count > 99 {
+        "99+".to_owned()
+    } else {
+        unread_count.to_string()
+    };
+    let badge_size = egui::vec2(
+        if unread_count > 99 {
+            30.0
+        } else {
+            18.0
+        },
+        18.0,
+    );
+    let (rect, _) = ui.allocate_exact_size(badge_size, Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        9.0,
+        egui::Color32::from_rgb(235, 55, 55),
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        badge_text,
+        egui::FontId::proportional(10.0),
+        egui::Color32::WHITE,
+    );
+}
+
 fn paint_dotted_line(painter: &Painter, start: Pos2, end: Pos2, stroke: Stroke) {
     let line = end - start;
     let length = line.length();
@@ -5085,6 +5115,7 @@ struct ChatListTargetView {
     total_message_count: usize,
     unread_count: usize,
     last_time: u64,
+    creation_incomplete: bool,
 }
 
 fn chat_list_player_filter_options(manager: &NapcatMessageManager) -> Vec<String> {
@@ -5137,9 +5168,9 @@ fn chat_list_target_views(
         })
         .collect::<Vec<_>>();
     targets.sort_by(|left, right| {
-        right
-            .last_time
-            .cmp(&left.last_time)
+        left.creation_incomplete
+            .cmp(&right.creation_incomplete)
+            .then_with(|| right.last_time.cmp(&left.last_time))
             .then_with(|| left.target_id.cmp(&right.target_id))
     });
     targets
@@ -5180,12 +5211,21 @@ fn chat_list_target_view(
         },
     };
 
+    let creation_incomplete = manager.chat_target_kind(target_id)
+        == ChatTargetExportKind::Private
+        && manager
+            .player_characters
+            .get(target_id)
+            .map(|character| !character.inited)
+            .unwrap_or(true);
+
     Some(ChatListTargetView {
         target_id: target_id.to_owned(),
         message_count,
         total_message_count: messages.len(),
         unread_count,
         last_time,
+        creation_incomplete,
     })
 }
 
@@ -5360,15 +5400,26 @@ fn chat_list_panel(
                             changed = true;
                         }
 
-                        if unread_count > 0 {
-                            ui.label(format!("({unread_count})"));
-                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if unread_count > 0 {
+                                    paint_chat_list_unread_badge(ui, unread_count);
+                                }
+                            },
+                        );
                     });
                     ui.horizontal(|ui| {
                         ui.small(chat_target_kind_label(
                             manager, &target_id,
                         ));
                         ui.small(&target_id);
+                        if target.creation_incomplete {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(235, 150, 60),
+                                "建卡未完成",
+                            );
+                        }
                         if player_filter_id.is_some() {
                             ui.small(format!(
                                 "可见 {}/{}",
@@ -17816,7 +17867,8 @@ mod tests {
                     view.message_count
                 ))
                 .collect::<Vec<_>>(),
-            vec![("2", 0), ("99", 0)]
+            // 私聊目标“2”还没有建卡，按未完成建卡沉到列表底部。
+            vec![("99", 0), ("2", 0)]
         );
         assert_eq!(targets_for_target(&manager, "2"), vec![
             NapcatSendTarget::Private(2)
@@ -17832,6 +17884,59 @@ mod tests {
         assert_eq!(
             sorted_pool_targets(&manager, true),
             vec!["99".to_owned()]
+        );
+    }
+
+    #[test]
+    fn chat_list_sorts_unfinished_character_creation_to_bottom() {
+        let mut manager = empty_manager();
+        for (target_id, kind, time) in [
+            ("2", ChatTargetExportKind::Private, 10),
+            ("3", ChatTargetExportKind::Private, 20),
+            ("4", ChatTargetExportKind::Private, 30),
+            ("99", ChatTargetExportKind::Group, 25),
+        ] {
+            manager
+                .chat_targets
+                .insert(target_id.to_owned(), Default::default());
+            manager
+                .chat_target_kinds
+                .insert(target_id.to_owned(), kind);
+            let mut message = if kind == ChatTargetExportKind::Group {
+                test_group_message(2, "group")
+            } else {
+                test_private_message(2)
+            };
+            message.data.time = time;
+            manager
+                .messages
+                .insert(target_id.to_owned(), vec![message]);
+        }
+
+        // 玩家2：还没有角色卡；玩家3：正在建卡；玩家4：已完成。
+        let mut in_progress = PlayerCharacter::default();
+        in_progress.creation_step = CharacterCreationStep::Str;
+        manager
+            .player_characters
+            .insert("3".to_owned(), in_progress);
+        let mut completed = PlayerCharacter::default();
+        completed.inited = true;
+        manager
+            .player_characters
+            .insert("4".to_owned(), completed);
+
+        let views = chat_list_target_views(&manager, None);
+        let ids = views
+            .iter()
+            .map(|view| view.target_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["4", "99", "3", "2"]);
+        assert_eq!(
+            views
+                .iter()
+                .map(|view| view.creation_incomplete)
+                .collect::<Vec<_>>(),
+            vec![false, false, true, true]
         );
     }
 
