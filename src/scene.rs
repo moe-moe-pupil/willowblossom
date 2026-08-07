@@ -50,20 +50,31 @@ use avian3d::prelude::{
     WriteRigidBodyForces,
 };
 use bevy::{
-    asset::RenderAssetUsages,
+    asset::{
+        Asset,
+        RenderAssetUsages,
+    },
     camera::{
         visibility::RenderLayers,
         RenderTarget,
     },
     input::mouse::MouseMotion,
+    material::AlphaMode,
     mesh::{
         Indices,
         PrimitiveTopology,
     },
+    pbr::{
+        Material,
+        MaterialPlugin,
+    },
     prelude::*,
+    reflect::TypePath,
     render::{
         render_resource::{
+            AsBindGroup,
             Extent3d,
+            ShaderType,
             TextureDimension,
             TextureFormat,
             TextureUsages,
@@ -73,6 +84,7 @@ use bevy::{
             ScreenshotCaptured,
         },
     },
+    shader::ShaderRef,
     transform::TransformSystems,
     window::PrimaryWindow,
 };
@@ -104,6 +116,7 @@ use crate::{
         NapcatMessageManager,
         NapcatOutboundMessage,
         PlayerAccess,
+        WORLD_DAY_MINUTES,
     },
 };
 
@@ -124,6 +137,13 @@ const MAT_SUN: u8 = 8;
 const MAT_SOLAR_PANEL: u8 = 9;
 const MAT_PLANET_OCEAN: u8 = 10;
 const MAT_PLANET_LAND: u8 = 11;
+const PLANET_SUN_ILLUMINANCE: f32 = 68_000.0;
+const PLANET_MOON_ILLUMINANCE: f32 = 1_800.0;
+const PLANET_DAY_AMBIENT_BRIGHTNESS: f32 = 28.0;
+const PLANET_NIGHT_AMBIENT_BRIGHTNESS: f32 = 4.0;
+const PLANET_FAKE_BODY_RADIUS: f32 = EARTH_PLANET_RADIUS as f32 - VOXEL_PLANET_MAX_ELEVATION;
+const PLANET_ATMOSPHERE_THICKNESS: f32 = 900.0;
+const PLANET_ATMOSPHERE_RADIUS: f32 = EARTH_PLANET_RADIUS as f32 + PLANET_ATMOSPHERE_THICKNESS;
 const MAX_AUTO_MAP_STATUS_SNAPSHOTS_PER_MAP: usize = 40;
 const UNIT_TEMPLATE_STANDEE_PREFIX: &str = "unit:";
 const UNIT_TEMPLATE_TOKEN_PREFIX: &str = "unit-token:";
@@ -492,6 +512,63 @@ struct PlanetGravityBody;
 
 #[derive(Component)]
 struct PlanetPhysicsProbe;
+
+#[derive(Component)]
+struct PlanetSunLight;
+
+#[derive(Component)]
+struct PlanetMoonLight;
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+struct PlanetAtmosphereMaterial {
+    #[uniform(0)]
+    settings: PlanetAtmosphereUniform,
+}
+
+#[derive(ShaderType, Clone, Copy, Debug)]
+struct PlanetAtmosphereUniform {
+    planet_center: Vec4,
+    sun_direction: Vec4,
+    radii: Vec4,
+    day_color: Vec4,
+    night_color: Vec4,
+    params: Vec4,
+}
+
+impl PlanetAtmosphereMaterial {
+    fn initial() -> Self {
+        Self {
+            settings: PlanetAtmosphereUniform {
+                planet_center: earth_planet_center().as_vec3().extend(1.0),
+                sun_direction: Vec4::new(0.0, 1.0, 0.0, 0.0),
+                radii: Vec4::new(
+                    EARTH_PLANET_RADIUS as f32,
+                    PLANET_ATMOSPHERE_RADIUS,
+                    0.0,
+                    0.0,
+                ),
+                day_color: Vec4::new(0.30, 0.44, 0.80, 1.0),
+                night_color: Vec4::new(0.03, 0.06, 0.14, 1.0),
+                params: Vec4::new(3.0, 1.8, 1.0, 1.0),
+            },
+        }
+    }
+}
+
+impl Material for PlanetAtmosphereMaterial {
+    fn fragment_shader() -> ShaderRef {
+        ShaderRef::Path("shaders/planet_atmosphere.wgsl".into())
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+}
+
+#[derive(Resource)]
+struct PlanetAtmosphereHandles {
+    material: Handle<PlanetAtmosphereMaterial>,
+}
 
 #[derive(Component)]
 struct PhysicsVoxel;
@@ -1656,6 +1733,7 @@ impl VoxelWorldConfig for TrpgVoxelWorld {
 impl Plugin for ScenePreviewPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(PhysicsPlugins::default())
+            .add_plugins(MaterialPlugin::<PlanetAtmosphereMaterial>::default())
             .insert_resource(Gravity::ZERO)
             .add_plugins(VoxelWorldPlugin::with_config(
                 TrpgVoxelWorld,
@@ -1677,6 +1755,7 @@ impl Plugin for ScenePreviewPlugin {
             .init_resource::<BattleSpaceshipControlState>()
             .init_resource::<SceneWaypointState>()
             .add_systems(Startup, setup_scene_preview)
+            .add_systems(Update, update_planet_day_night_cycle)
             .add_systems(
                 Update,
                 (
@@ -1758,6 +1837,7 @@ fn setup_scene_preview(
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut atmosphere_materials: ResMut<Assets<PlanetAtmosphereMaterial>>,
     mut gizmo_config: ResMut<GizmoConfigStore>,
     mut editor: ResMut<VoxelEditorState>,
     mut player_cameras: ResMut<PlayerSceneCameras>,
@@ -1804,14 +1884,28 @@ fn setup_scene_preview(
 
     let sun_position = scaled_space_hifi_point(SPACE_HIFI_SUN_CENTER).as_vec3();
     let planet_center = earth_planet_center().as_vec3();
+    let sun_orbit_radius = (sun_position - planet_center).length();
+    let sun_direction = (sun_position - planet_center) / sun_orbit_radius;
     commands.spawn((
         DirectionalLight {
             color: Color::srgb(1.0, 0.88, 0.68),
-            illuminance: 68_000.0,
+            illuminance: PLANET_SUN_ILLUMINANCE,
             shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_translation(sun_position).looking_at(planet_center, Vec3::Y),
+        PlanetSunLight,
+    ));
+    commands.spawn((
+        DirectionalLight {
+            color: Color::srgb(0.65, 0.72, 0.95),
+            illuminance: PLANET_MOON_ILLUMINANCE,
+            shadow_maps_enabled: false,
+            ..default()
+        },
+        Transform::from_translation(planet_center - sun_direction * sun_orbit_radius)
+            .looking_at(planet_center, Vec3::Y),
+        PlanetMoonLight,
     ));
     spawn_space_hifi_lights(&mut commands);
     spawn_space_hifi_voxel_preview(
@@ -1824,6 +1918,12 @@ fn setup_scene_preview(
         &mut commands,
         &mut meshes,
         &mut materials,
+    );
+    spawn_planet_fake_sphere(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &mut atmosphere_materials,
     );
     spawn_static_voxel_collision_previews(&mut commands);
     spawn_planet_physics_probe(
@@ -1847,6 +1947,90 @@ fn setup_scene_preview(
         GameCamera,
         FreeCamera,
     ));
+}
+
+fn update_planet_day_night_cycle(
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    mut ambient: ResMut<GlobalAmbientLight>,
+    atmosphere_handles: Res<PlanetAtmosphereHandles>,
+    mut atmosphere_assets: ResMut<Assets<PlanetAtmosphereMaterial>>,
+    mut sun_query: Query<
+        (&mut Transform, &mut DirectionalLight),
+        (With<PlanetSunLight>, Without<PlanetMoonLight>),
+    >,
+    mut moon_query: Query<
+        (&mut Transform, &mut DirectionalLight),
+        (With<PlanetMoonLight>, Without<PlanetSunLight>),
+    >,
+) {
+    let Some(manager) = manager else {
+        return;
+    };
+    let Some(group) = manager
+        .current_trpg_group
+        .as_deref()
+        .and_then(|group_name| manager.trpg_groups.get(group_name))
+    else {
+        return;
+    };
+
+    let planet_center = earth_planet_center().as_vec3();
+    // 以玩家一侧的方向为“正午天顶”，让白天照亮玩家所在的半球。
+    let near_axis = (earth_planet_near_point().as_vec3() - planet_center).normalize();
+    let reference = if near_axis.y.abs() < 0.9 {
+        Vec3::Y
+    } else {
+        Vec3::X
+    };
+    let east = reference.cross(near_axis).normalize();
+
+    // 06:00 日出、12:00 正午、18:00 日落、00:00 午夜。
+    let minutes_of_day = (group.world_time_minutes % WORLD_DAY_MINUTES) as f32;
+    let elevation = std::f32::consts::TAU
+        * (minutes_of_day - 6.0 * 60.0)
+        / WORLD_DAY_MINUTES as f32;
+    let sun_direction = (near_axis * elevation.sin() + east * elevation.cos()).normalize();
+    let sun_elevation = sun_direction.dot(near_axis);
+    let orbit_radius =
+        (scaled_space_hifi_point(SPACE_HIFI_SUN_CENTER).as_vec3() - planet_center).length();
+    let sun_position = planet_center + sun_direction * orbit_radius;
+
+    for (mut transform, mut light) in sun_query.iter_mut() {
+        transform.translation = sun_position;
+        transform.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, -sun_direction);
+        light.illuminance = PLANET_SUN_ILLUMINANCE * sun_elevation.max(0.0).powf(0.55);
+        // 低角度时偏暖，模拟日出日落。
+        let horizon_warmth = (1.0 - sun_elevation).clamp(0.0, 1.0).powi(2);
+        let color = Vec3::new(1.0, 0.88, 0.68).lerp(Vec3::new(1.0, 0.42, 0.18), horizon_warmth);
+        light.color = Color::srgb(color.x, color.y, color.z);
+    }
+
+    let moon_direction = -sun_direction;
+    let moon_position = planet_center + moon_direction * orbit_radius;
+    for (mut transform, mut light) in moon_query.iter_mut() {
+        transform.translation = moon_position;
+        transform.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, -moon_direction);
+        light.illuminance =
+            PLANET_MOON_ILLUMINANCE * moon_direction.dot(near_axis).max(0.0).powf(0.5);
+    }
+
+    let day_amount = ((sun_elevation + 0.12) / 1.12).clamp(0.0, 1.0);
+    let day_color = Vec3::new(0.46, 0.56, 0.68);
+    let night_color = Vec3::new(0.13, 0.17, 0.30);
+    let ambient_color = day_color.lerp(night_color, 1.0 - day_amount);
+    ambient.color = Color::srgb(ambient_color.x, ambient_color.y, ambient_color.z);
+    ambient.brightness = PLANET_DAY_AMBIENT_BRIGHTNESS * day_amount
+        + PLANET_NIGHT_AMBIENT_BRIGHTNESS * (1.0 - day_amount);
+
+    if let Some(mut material) = atmosphere_assets.get_mut(&atmosphere_handles.material) {
+        material.settings.planet_center = planet_center.extend(1.0);
+        material.settings.sun_direction = sun_direction.extend(1.0);
+        let day_glow = Vec3::new(0.30, 0.44, 0.80);
+        let night_glow = Vec3::new(0.03, 0.06, 0.14);
+        let glow = day_glow.lerp(night_glow, 1.0 - day_amount);
+        material.settings.day_color = glow.extend(1.0);
+        material.settings.params.w = day_amount;
+    }
 }
 
 fn spawn_space_hifi_lights(commands: &mut Commands) {
@@ -2107,6 +2291,43 @@ fn spawn_voxel_planet_preview(
             VoxelPlanetDetailPreview,
         ));
     }
+}
+
+fn spawn_planet_fake_sphere(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    atmosphere_materials: &mut Assets<PlanetAtmosphereMaterial>,
+) {
+    let planet_center = earth_planet_center().as_vec3();
+    // 深色实体球补全星球尚未体素化的下半部分，让外部剪影看起来是个球。
+    commands.spawn((
+        Mesh3d(meshes.add(
+            Sphere::new(PLANET_FAKE_BODY_RADIUS).mesh().uv(48, 24),
+        )),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.035, 0.04, 0.055),
+            perceptual_roughness: 1.0,
+            metallic: 0.0,
+            ..default()
+        })),
+        Transform::from_translation(planet_center),
+        Visibility::Visible,
+    ));
+
+    // 半透明大气壳，让星球外轮廓带一圈大气雾，并按昼夜改变辉光。
+    let material = atmosphere_materials.add(PlanetAtmosphereMaterial::initial());
+    commands.insert_resource(PlanetAtmosphereHandles {
+        material: material.clone(),
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(
+            Sphere::new(PLANET_ATMOSPHERE_RADIUS).mesh().uv(64, 32),
+        )),
+        MeshMaterial3d(material),
+        Transform::from_translation(planet_center),
+        Visibility::Visible,
+    ));
 }
 
 fn spawn_static_voxel_collision_previews(commands: &mut Commands) {

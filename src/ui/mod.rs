@@ -2385,6 +2385,7 @@ fn chat_window(
                 (
                     group_name.to_owned(),
                     group.world_turn,
+                    group.world_time_minutes,
                     turn.map(|turn| turn.turns_passed).unwrap_or_default(),
                     turn.map(|turn| turn.acted).unwrap_or_default(),
                     turn.map(|turn| turn.skipped).unwrap_or_default(),
@@ -2541,7 +2542,7 @@ fn chat_window(
                         }
                     }
                 }
-                if let Some((group_name, _, _, acted, _)) = trpg_turn_snapshot.as_ref() {
+                if let Some((group_name, _, _, _, acted, _)) = trpg_turn_snapshot.as_ref() {
                     let button_text = if *acted { "已行动" } else { "行动" };
                     if ui.button(button_text).clicked() {
                         player_acted_toggle = Some((
@@ -2562,7 +2563,7 @@ fn chat_window(
                     },
                 );
             });
-            if let Some((group_name, world_turn, turns_passed, acted, skipped)) =
+            if let Some((group_name, world_turn, world_time_minutes, turns_passed, acted, skipped)) =
                 trpg_turn_snapshot.as_ref()
             {
                 ui.horizontal_wrapped(|ui| {
@@ -2573,7 +2574,12 @@ fn chat_window(
                     } else {
                         "等待中"
                     };
+                    let (hour, minute) = (
+                        world_time_minutes / 60 % 24,
+                        world_time_minutes % 60,
+                    );
                     ui.small(format!("世界轮次 {world_turn}"));
+                    ui.small(format!("世界时间 {hour:02}:{minute:02}"));
                     ui.small(format!("玩家轮次 {turns_passed}"));
                     ui.small(status);
 
@@ -5297,8 +5303,9 @@ fn chat_list_panel(
                         ui.label(format!("({unread_count})"));
                     }
                 });
+                let (hour, minute) = group.world_time_of_day();
                 ui.small(format!(
-                    "{}名玩家，{}个群聊，第{}轮",
+                    "{}名玩家，{}个群聊，第{}轮 · 世界时间 {hour:02}:{minute:02}",
                     group.players.len(),
                     group.group_chats.len(),
                     group.world_turn

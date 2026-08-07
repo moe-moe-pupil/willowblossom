@@ -1998,6 +1998,17 @@ impl Default for TrpgLegacySendPane {
 fn default_legacy_visible() -> bool { true }
 fn default_legacy_closable() -> bool { true }
 
+/// 每个世界回合推进的世界时间（分钟）。
+pub const WORLD_TURN_MINUTES: u32 = 30;
+/// 世界起始时间（当天 0 点起的分钟数）：08:00。
+pub const WORLD_START_TIME_MINUTES: u32 = 8 * 60;
+/// 一整天包含的分钟数。
+pub const WORLD_DAY_MINUTES: u32 = 24 * 60;
+
+fn default_world_time_minutes() -> u32 {
+    WORLD_START_TIME_MINUTES
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TrpgGroup {
     #[serde(default = "default_campaign_id")]
@@ -2044,6 +2055,9 @@ pub struct TrpgGroup {
     pub group_chats: Vec<String>,
     #[serde(default)]
     pub world_turn: u32,
+    /// 世界时间：自世界起点以来经过的分钟数，每个世界回合推进 30 分钟。
+    #[serde(default = "default_world_time_minutes")]
+    pub world_time_minutes: u32,
     #[serde(default)]
     pub player_turns: HashMap<String, TrpgPlayerTurnState>,
     #[serde(default)]
@@ -2078,6 +2092,7 @@ impl Default for TrpgGroup {
             players: Vec::new(),
             group_chats: Vec::new(),
             world_turn: 0,
+            world_time_minutes: WORLD_START_TIME_MINUTES,
             player_turns: HashMap::default(),
             initial_player_states: HashMap::default(),
             campaign_active: false,
@@ -3074,6 +3089,8 @@ impl TrpgGroup {
         let mut changed = self.sync_turn_players();
         changed |= self.world_turn != 0;
         self.world_turn = 0;
+        changed |= self.world_time_minutes != WORLD_START_TIME_MINUTES;
+        self.world_time_minutes = WORLD_START_TIME_MINUTES;
         for turn in self.player_turns.values_mut() {
             changed |= turn.turns_passed != 0 || turn.acted || turn.skipped;
             turn.turns_passed = 0;
@@ -3108,6 +3125,7 @@ impl TrpgGroup {
         }
         self.sync_turn_players();
         self.world_turn = self.world_turn.saturating_add(1);
+        self.world_time_minutes = self.world_time_minutes.saturating_add(WORLD_TURN_MINUTES);
         for turn in self.player_turns.values_mut() {
             turn.turns_passed = turn.turns_passed.saturating_add(1);
             turn.acted = false;
@@ -3115,6 +3133,12 @@ impl TrpgGroup {
         }
         self.reset_all_legacy_negative_timers();
         true
+    }
+
+    /// 当前世界时间的一天内时分（小时 0-23，分钟 0-59）。
+    pub fn world_time_of_day(&self) -> (u32, u32) {
+        let minutes = self.world_time_minutes % WORLD_DAY_MINUTES;
+        (minutes / 60, minutes % 60)
     }
 
     fn mark_player_turn(&mut self, target_id: &str, acted: bool) -> bool {
@@ -16920,6 +16944,10 @@ position_cells = [4, 5, 6]
 
         assert!(group.mark_player_skipped("b"));
         assert_eq!(group.world_turn, 1);
+        assert_eq!(
+            group.world_time_minutes,
+            WORLD_START_TIME_MINUTES + WORLD_TURN_MINUTES
+        );
         assert_eq!(group.player_turns["a"].turns_passed, 1);
         assert_eq!(group.player_turns["b"].turns_passed, 1);
         assert!(!group.player_turns["a"].acted);
@@ -16981,10 +17009,32 @@ position_cells = [4, 5, 6]
     }
 
     #[test]
+    fn trpg_group_world_turn_advances_world_clock_by_thirty_minutes() {
+        let mut group = TrpgGroup {
+            players: vec!["a".to_owned()],
+            ..Default::default()
+        };
+
+        assert_eq!(group.world_time_of_day(), (8, 0));
+        assert!(group.advance_world_turn());
+        assert_eq!(group.world_time_minutes, 8 * 60 + 30);
+        assert_eq!(group.world_time_of_day(), (8, 30));
+        for _ in 0..(WORLD_DAY_MINUTES / WORLD_TURN_MINUTES - 1) {
+            assert!(group.advance_world_turn());
+        }
+        assert_eq!(
+            group.world_time_minutes,
+            8 * 60 + WORLD_DAY_MINUTES
+        );
+        assert_eq!(group.world_time_of_day(), (8, 0));
+    }
+
+    #[test]
     fn trpg_group_reset_all_turns_sets_world_and_player_clocks_to_zero() {
         let mut group = TrpgGroup {
             players: vec!["a".to_owned(), "b".to_owned()],
             world_turn: 8,
+            world_time_minutes: WORLD_START_TIME_MINUTES + 8 * WORLD_TURN_MINUTES,
             player_turns: HashMap::from([
                 ("a".to_owned(), TrpgPlayerTurnState {
                     turns_passed: 8,
@@ -17003,6 +17053,7 @@ position_cells = [4, 5, 6]
         assert!(group.reset_all_turns());
 
         assert_eq!(group.world_turn, 0);
+        assert_eq!(group.world_time_minutes, WORLD_START_TIME_MINUTES);
         assert!(group
             .player_turns
             .values()
