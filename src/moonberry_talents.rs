@@ -171,7 +171,7 @@ pub(crate) const NORMAL_TALENT_POOL: &[MoonberryTalent] = &[
     },
     MoonberryTalent {
         name: r#"日薄崦嵫"#,
-        description: r#"无论何时，你都会减免距离你过远的伤害，距离10码开始减免[距离 * 1 点伤害]，至多减免20%的伤害，当你死亡后，时间会重置为晚上6点。"#,
+        description: r#"无论何时，你都会减免距离你过远的伤害，距离10码开始减免，超出10码后每1码减免1点伤害（如11码时减免1点），至多减免20%的伤害，当你死亡后，时间会重置为晚上6点。"#,
     },
     MoonberryTalent {
         name: r#"魔网延伸"#,
