@@ -1816,7 +1816,7 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn default_base_max_hp() -> f32 { 5.0 }
+fn default_base_max_hp() -> f32 { 10.0 }
 fn default_wis_mp_reg() -> f32 { 1.0 }
 fn default_wis_max_mp() -> f32 { 2.5 }
 fn default_int_max_mp() -> f32 { 5.0 }
@@ -9011,6 +9011,9 @@ pub fn character_next_level_exp(level: i32) -> i32 {
     required.min(i32::MAX as i128) as i32
 }
 
+/// 每次升级获得的属性点数。
+pub const STATUS_POINTS_PER_LEVEL: i32 = 2;
+
 pub fn grant_character_experience(character: &mut PlayerCharacter, amount: i32) -> i32 {
     if amount <= 0 {
         return 0;
@@ -9028,6 +9031,9 @@ pub fn grant_character_experience(character: &mut PlayerCharacter, amount: i32) 
         character.level += 1;
         level_ups += 1;
     }
+    character.status_points = character
+        .status_points
+        .saturating_add(level_ups * STATUS_POINTS_PER_LEVEL);
     level_ups
 }
 
@@ -15608,7 +15614,7 @@ position_cells = [4, 5, 6]
             character.creation_step,
             CharacterCreationStep::Normal
         );
-        assert_eq!(character.max_hp, 15.0);
+        assert_eq!(character.max_hp, 20.0);
     }
 
     #[test]
@@ -15848,13 +15854,25 @@ position_cells = [4, 5, 6]
 
         update_character_from_status(&mut character);
 
-        assert_eq!(character.max_hp, 29.0);
-        assert_eq!(character.hp, 29.0);
+        assert_eq!(character.max_hp, 34.0);
+        assert_eq!(character.hp, 34.0);
         assert_eq!(character.hp_regen, 4.0);
         assert_eq!(character.max_mp, 10.0);
         assert_eq!(character.mp, 10.0);
         assert_eq!(character.mp_regen, 2.0);
         assert_eq!(character.speed, 6.0);
+    }
+
+    #[test]
+    fn default_base_health_is_15_at_level_one_and_20_at_level_two() {
+        let mut character = PlayerCharacter::default();
+        character.level = 1;
+        update_character_from_status(&mut character);
+        assert_eq!(character.max_hp, 15.0);
+
+        character.level = 2;
+        update_character_from_status(&mut character);
+        assert_eq!(character.max_hp, 20.0);
     }
 
     #[test]
@@ -15923,6 +15941,7 @@ position_cells = [4, 5, 6]
         );
         assert_eq!(character.level, 2);
         assert_eq!(character.exp, 30);
+        assert_eq!(character.status_points, 7);
 
         assert_eq!(
             grant_character_experience(&mut character, 500),
@@ -15930,6 +15949,7 @@ position_cells = [4, 5, 6]
         );
         assert_eq!(character.level, 4);
         assert_eq!(character.exp, 230);
+        assert_eq!(character.status_points, 11);
 
         assert_eq!(
             grant_character_experience(&mut character, 0),
@@ -15937,6 +15957,7 @@ position_cells = [4, 5, 6]
         );
         assert_eq!(character.level, 4);
         assert_eq!(character.exp, 230);
+        assert_eq!(character.status_points, 11);
     }
 
     #[test]

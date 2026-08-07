@@ -99,6 +99,7 @@ use crate::{
         penance_decayed_healing_dealt_modifier,
         sin_on_sin_exp_bonus_percent,
         skill_rule_args,
+        STATUS_POINTS_PER_LEVEL,
         status_damage_attribute_multiplier,
         status_healing_attribute_multiplier,
         trpg_config_with_weave,
@@ -5713,7 +5714,11 @@ fn sync_encounter_to_manager(
             continue;
         };
         if character.level != participant.level {
+            let level_delta = (participant.level - character.level).max(0);
             character.level = participant.level.max(1);
+            character.status_points = character
+                .status_points
+                .saturating_add(level_delta * STATUS_POINTS_PER_LEVEL);
             update_character_from_status_with_config(character, &stat_config);
             changed = true;
         }
@@ -9315,6 +9320,32 @@ mod tests {
             manager.player_characters["outsider"].hp,
             10.0
         );
+    }
+
+    #[test]
+    fn battle_level_up_grants_two_status_points_per_level() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("a".to_owned(), PlayerCharacter::default());
+        let mut player = participant("a", 0);
+        player.player_character = true;
+        player.level = 3;
+        player.exp = 0;
+        let encounter = BattleEncounter {
+            participants: vec![player],
+            ..Default::default()
+        };
+
+        assert!(sync_encounter_to_manager(
+            Some(&encounter),
+            &mut manager
+        ));
+
+        let character = &manager.player_characters["a"];
+        assert_eq!(character.level, 3);
+        assert_eq!(character.status_points, 9);
+        assert_eq!(character.max_hp, 25.0);
     }
 
     #[test]
