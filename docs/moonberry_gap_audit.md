@@ -10,6 +10,8 @@ Additional 2026-08-07 update: `镜像外衣` approved talent now executes in bat
 
 Additional 2026-08-07 update: `日薄崦嵫` approved talent now executes in battle. Incoming parsed-skill damage to the holder is reduced by 1 point for every yard beyond 10 (e.g. 11 yards reduces 1 point), capped at 20% of the incoming damage, using the scene's character positions when available. When the holder is defeated, the battle's TRPG group world time resets to 18:00 of the current day (day count preserved) through a one-shot pending flag consumed by the manager-accessible battle paths. Focused verification passes with `cargo test --lib -j 1 sunset`: 5 passed, 0 failed.
 
+Additional 2026-08-07 update: `精美烧鹅` approved talent now executes. Opening a world grants the holder a soulbound 精美烧鹅 inventory item with stack 3 (replacing any previous-world geese), and casting its 食用精美烧鹅 item skill in battle consumes one goose and starts a 5-round channel: each battle round restores 20% maximum HP and MP directly (unaffected by healing modifiers), the channeling participant cannot take other actions, and taking damage interrupts the channel. Sharing the geese with other players remains a GM inventory operation. Focused verification passes with `cargo test --lib -j 1 goose` and `cargo test --lib -j 1 open_world_grants_three_delicious_geese`: 3 and 1 passed respectively, 0 failed.
+
 ## Sources Checked
 
 - Old Moonberry source cloned from `https://github.com/moe-moe-pupil/moonberry` at commit `da85a9e`.
