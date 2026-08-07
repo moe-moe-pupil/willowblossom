@@ -43,7 +43,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         * (0.40 + 0.60 * facing_sun);
     let alpha = settings.params.z
         * density
-        * (settings.params.w * 0.12 + 0.88 * rim);
+        * (settings.params.w * 0.03 + 0.97 * rim);
 
     return vec4(glow, clamp(alpha, 0.0, 1.0));
 }

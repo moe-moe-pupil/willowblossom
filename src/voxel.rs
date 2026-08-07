@@ -44,6 +44,7 @@ use bevy::{
         MouseMotion,
         MouseWheel,
     },
+    light::NotShadowCaster,
     math::{
         Affine2,
         Affine3A,
@@ -177,10 +178,6 @@ const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
 const PLANET_FAKE_BODY_INSET: f32 = 0.75;
 /// 大气外壳厚度（世界单位）。
 const PLANET_ATMOSPHERE_THICKNESS: f32 = 12.0;
-/// 时间驱动光照下的白天环境光亮度（比手动默认更低，突出太阳直射对比）。
-const PLANET_DAY_AMBIENT_BRIGHTNESS: f32 = 32.0;
-/// 时间驱动光照下的夜晚环境光亮度。
-const PLANET_NIGHT_AMBIENT_BRIGHTNESS: f32 = 6.0;
 const ORBITAL_PLANET_GRAVITY_ACCELERATION: f32 = 9.81;
 const ORBITAL_PLANET_GRAVITY_MAX_ALTITUDE: f32 = 32.0;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
@@ -1598,6 +1595,19 @@ pub(crate) struct VoxelMaterials {
     planet_ocean: Handle<StandardMaterial>,
 }
 
+/// 行星专用的材质副本：昼夜系统只调制这些材质，不影响空间站等共享材质。
+#[derive(Resource)]
+struct VoxelPlanetMaterials {
+    handles: Vec<Handle<StandardMaterial>>,
+    ocean: Handle<StandardMaterial>,
+    cloud: Handle<StandardMaterial>,
+    fake_body: Handle<StandardMaterial>,
+    base_colors: Vec<Color>,
+    ocean_color: Color,
+    cloud_color: Color,
+    fake_body_color: Color,
+}
+
 #[derive(Resource)]
 struct VoxelReplayFadeMaterials {
     handles: [Handle<StandardMaterial>; VOXEL_MATERIAL_COUNT],
@@ -2462,6 +2472,7 @@ impl Plugin for TrpgVoxelPlugin {
                 load_voxel_inventory,
                 load_voxel_toolbar_settings,
                 setup_voxel_materials,
+                setup_voxel_planet_materials,
                 setup_voxel_grid,
                 populate_voxel_grid,
                 setup_voxel_auto_doors,
@@ -2517,7 +2528,7 @@ impl Plugin for TrpgVoxelPlugin {
                         sync_voxel_auto_door_lock_materials,
                         rebuild_voxel_geometry,
                         sync_voxel_radiance_volume,
-                        sync_world_time_lighting,
+                        sync_planet_day_night_materials,
                         sync_voxel_lighting,
                         apply_voxel_teleport,
                         release_controlled_docked_spaceship,
@@ -3226,6 +3237,40 @@ fn setup_voxel_materials(
     });
 }
 
+fn setup_voxel_planet_materials(
+    mut commands: Commands,
+    voxel_materials: Res<VoxelMaterials>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    // 复制一份体素材质给行星专用：昼夜调制行星亮度时不会影响空间站等共享材质。
+    let mut handles = Vec::with_capacity(voxel_materials.handles.len());
+    let mut base_colors = Vec::with_capacity(voxel_materials.handles.len());
+    for handle in &voxel_materials.handles {
+        let source = materials
+            .get(handle)
+            .cloned()
+            .unwrap_or_else(StandardMaterial::default);
+        base_colors.push(source.base_color);
+        handles.push(materials.add(source));
+    }
+    let ocean_source = materials
+        .get(&voxel_materials.planet_ocean)
+        .cloned()
+        .unwrap_or_else(StandardMaterial::default);
+    let ocean_color = ocean_source.base_color;
+    let ocean = materials.add(ocean_source);
+    commands.insert_resource(VoxelPlanetMaterials {
+        handles,
+        ocean,
+        cloud: Handle::default(),
+        fake_body: Handle::default(),
+        base_colors,
+        ocean_color,
+        cloud_color: Color::srgba(0.92, 0.96, 1.0, 0.42),
+        fake_body_color: Color::WHITE,
+    });
+}
+
 fn opaque_planet_ocean_material(texture: Handle<Image>) -> StandardMaterial {
     StandardMaterial {
         base_color_texture: Some(texture),
@@ -3524,20 +3569,25 @@ fn world_time_sun_direction(minutes_of_day: f32) -> Vec3 {
     Vec3::new(elevation.cos(), elevation.sin(), 0.0).normalize()
 }
 
-fn sync_world_time_lighting(
+fn day_night_color(base: Color, day_amount: f32) -> Color {
+    let s = base.to_srgba();
+    let brightness = 0.10 + 0.90 * day_amount;
+    let night_blend = (1.0 - day_amount) * 0.45;
+    Color::srgba(
+        (s.red * brightness + 0.30 * night_blend).min(1.0),
+        (s.green * brightness + 0.42 * night_blend).min(1.0),
+        (s.blue * brightness + 0.75 * night_blend).min(1.0),
+        s.alpha,
+    )
+}
+
+fn sync_planet_day_night_materials(
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
-    mut editor: ResMut<VoxelEditorState>,
-    mut ambient: ResMut<GlobalAmbientLight>,
+    editor: Res<VoxelEditorState>,
+    planet_materials: Res<VoxelPlanetMaterials>,
+    mut standard_materials: ResMut<Assets<StandardMaterial>>,
     atmosphere_handles: Res<PlanetAtmosphereHandles>,
     mut atmosphere_assets: ResMut<Assets<PlanetAtmosphereMaterial>>,
-    mut key_lights: Query<
-        (&mut Transform, &mut DirectionalLight),
-        (With<VoxelKeyLight>, Without<VoxelFillLight>),
-    >,
-    mut fill_lights: Query<
-        (&mut Transform, &mut DirectionalLight),
-        (With<VoxelFillLight>, Without<VoxelKeyLight>),
-    >,
 ) {
     if !editor.time_lighting_enabled {
         return;
@@ -3556,67 +3606,29 @@ fn sync_world_time_lighting(
     let minutes_of_day = (group.world_time_minutes % WORLD_DAY_MINUTES) as f32;
     let sun_direction = world_time_sun_direction(minutes_of_day);
     let sun_elevation = sun_direction.y;
-    let orbit_radius = 180.0;
-
-    let mut key_illuminance = 0.0;
-    let mut key_color = [1.0, 0.95, 0.86];
-    for (mut transform, mut light) in &mut key_lights {
-        transform.translation = sun_direction * orbit_radius;
-        transform.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, -sun_direction);
-        key_illuminance =
-            DEFAULT_KEY_LIGHT_ILLUMINANCE * sun_elevation.max(0.0).powf(0.55);
-        light.illuminance = key_illuminance;
-        // 低角度时偏暖，模拟日出日落。
-        let horizon_warmth = (1.0 - sun_elevation).clamp(0.0, 1.0).powi(2);
-        let color = Vec3::new(1.0, 0.95, 0.86)
-            .lerp(Vec3::new(1.0, 0.42, 0.18), horizon_warmth);
-        key_color = [color.x, color.y, color.z];
-        light.color = Color::srgb(key_color[0], key_color[1], key_color[2]);
-    }
-
-    let moon_direction = -sun_direction;
-    let mut fill_illuminance = 0.0;
-    for (mut transform, mut light) in &mut fill_lights {
-        transform.translation = moon_direction * orbit_radius;
-        transform.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, -moon_direction);
-        fill_illuminance =
-            DEFAULT_FILL_LIGHT_ILLUMINANCE * (-sun_elevation).max(0.0).powf(0.5);
-        light.illuminance = fill_illuminance;
-        light.color = Color::srgb(0.5, 0.65, 1.0);
-    }
-
     let day_amount = ((sun_elevation + 0.12) / 1.12).clamp(0.0, 1.0);
-    let day_color = Vec3::new(0.60, 0.68, 0.78);
-    let night_color = Vec3::new(0.16, 0.20, 0.34);
-    let ambient_color = day_color.lerp(night_color, 1.0 - day_amount);
-    let ambient_brightness = PLANET_DAY_AMBIENT_BRIGHTNESS * day_amount
-        + PLANET_NIGHT_AMBIENT_BRIGHTNESS * (1.0 - day_amount);
-    if (ambient.brightness - ambient_brightness).abs() > 0.01 {
-        ambient.brightness = ambient_brightness;
-    }
-    let current_ambient = ambient.color.to_srgba();
-    let ambient_color_changed = (current_ambient.red - ambient_color.x).abs() > 0.01
-        || (current_ambient.green - ambient_color.y).abs() > 0.01
-        || (current_ambient.blue - ambient_color.z).abs() > 0.01;
-    if ambient_color_changed {
-        ambient.color = Color::srgb(ambient_color.x, ambient_color.y, ambient_color.z);
-    }
 
-    // 同步到编辑器字段，让光照编辑器显示当前值；仅在有变化时写入，避免每帧标记脏。
-    if (editor.ambient_brightness - ambient_brightness).abs() > 0.01 {
-        editor.ambient_brightness = ambient_brightness;
+    // 只调制行星专用材质副本的亮度，空间站等共享材质不受昼夜影响。
+    for (handle, base) in planet_materials
+        .handles
+        .iter()
+        .zip(&planet_materials.base_colors)
+    {
+        if let Some(mut material) = standard_materials.get_mut(handle) {
+            material.base_color = day_night_color(*base, day_amount);
+        }
     }
-    if (editor.key_light_illuminance - key_illuminance).abs() > 0.01 {
-        editor.key_light_illuminance = key_illuminance;
-    }
-    if editor.key_light_color != key_color {
-        editor.key_light_color = key_color;
-    }
-    if (editor.fill_light_illuminance - fill_illuminance).abs() > 0.01 {
-        editor.fill_light_illuminance = fill_illuminance;
-    }
-    if editor.fill_light_color != [0.5, 0.65, 1.0] {
-        editor.fill_light_color = [0.5, 0.65, 1.0];
+    for (handle, base) in [
+        (&planet_materials.ocean, &planet_materials.ocean_color),
+        (&planet_materials.cloud, &planet_materials.cloud_color),
+        (
+            &planet_materials.fake_body,
+            &planet_materials.fake_body_color,
+        ),
+    ] {
+        if let Some(mut material) = standard_materials.get_mut(handle) {
+            material.base_color = day_night_color(base.clone(), day_amount);
+        }
     }
 
     if let Some(mut material) = atmosphere_assets.get_mut(&atmosphere_handles.material) {
@@ -7701,7 +7713,7 @@ fn setup_voxel_view(
     radiance_volume: Res<VoxelRadianceVolume>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut standard_materials: ResMut<Assets<StandardMaterial>>,
-    voxel_materials: Res<VoxelMaterials>,
+    mut planet_materials: ResMut<VoxelPlanetMaterials>,
 ) {
     for (_, config, _) in gizmo_config.iter_mut() {
         config.render_layers = RenderLayers::layer(VOXEL_DM_GIZMO_RENDER_LAYER);
@@ -7770,12 +7782,13 @@ fn setup_voxel_view(
     spawn_voxel_orbital_planet(
         &mut commands,
         &mut meshes,
-        &voxel_materials,
+        &planet_materials,
     );
     spawn_planet_clouds(
         &mut commands,
         &mut meshes,
         &mut standard_materials,
+        &mut planet_materials,
     );
     let player_collider = Collider::capsule(
         FIRST_PERSON_RADIUS,
@@ -10363,9 +10376,12 @@ fn sorted_planet_cells(planet: &VoxelOrbitalPlanet) -> Vec<(IVec3, u8)> {
     cells
 }
 
-fn planet_material_handle(materials: &VoxelMaterials, material_id: u8) -> Handle<StandardMaterial> {
+fn planet_material_handle(
+    materials: &VoxelPlanetMaterials,
+    material_id: u8,
+) -> Handle<StandardMaterial> {
     if material_id == 4 {
-        materials.planet_ocean.clone()
+        materials.ocean.clone()
     } else {
         materials.handles[material_id as usize - 1].clone()
     }
@@ -10406,7 +10422,7 @@ fn apply_voxel_planet_gravity(
 fn spawn_voxel_orbital_planet(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    materials: &VoxelMaterials,
+    materials: &VoxelPlanetMaterials,
 ) -> Entity {
     let cells = voxel_orbital_planet_cells();
     let cell_bounds = VoxelCellBounds::from_cells(cells.iter().map(|(cell, _)| *cell));
@@ -10442,6 +10458,8 @@ fn spawn_voxel_orbital_planet(
                             material_id,
                         )),
                         Transform::from_translation(center_offset),
+                        // 行星不投射阴影，避免穹顶在假地形上投出巨大阴影。
+                        NotShadowCaster,
                     ))
                     .id(),
             );
@@ -10464,6 +10482,7 @@ fn spawn_planet_clouds(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    planet_materials: &mut VoxelPlanetMaterials,
 ) -> Entity {
     let cloud_mesh = meshes.add(Sphere::new(1.0).mesh().uv(12, 8));
     let cloud_material = materials.add(StandardMaterial {
@@ -10473,6 +10492,7 @@ fn spawn_planet_clouds(
         cull_mode: None,
         ..default()
     });
+    planet_materials.cloud = cloud_material.clone();
     let layer = commands
         .spawn((
             VoxelPlanetCloudLayer,
@@ -10594,28 +10614,33 @@ fn setup_voxel_planet_shell(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut atmosphere_materials: ResMut<Assets<PlanetAtmosphereMaterial>>,
+    mut planet_materials: ResMut<VoxelPlanetMaterials>,
 ) {
     // 深色实体球补全行星尚未体素化的下半部分，让外部剪影看起来是个球。
     // 表面使用与体素穹顶相同风格的假地形贴图；纯视觉，不参与碰撞与体素编辑。
     let terrain_texture = images.add(build_fake_planet_terrain_texture(
         ORBITAL_PLANET_RADIUS - PLANET_FAKE_BODY_INSET,
     ));
+    let fake_body_material = materials.add(StandardMaterial {
+        base_color_texture: Some(terrain_texture),
+        base_color: Color::WHITE,
+        perceptual_roughness: 1.0,
+        metallic: 0.0,
+        ..default()
+    });
+    planet_materials.fake_body = fake_body_material.clone();
     commands.spawn((
         Mesh3d(meshes.add(Sphere::new(
             ORBITAL_PLANET_RADIUS - PLANET_FAKE_BODY_INSET,
         )
         .mesh()
         .uv(256, 128))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color_texture: Some(terrain_texture),
-            base_color: Color::WHITE,
-            perceptual_roughness: 1.0,
-            metallic: 0.0,
-            ..default()
-        })),
+        MeshMaterial3d(fake_body_material),
         Transform::from_translation(ORBITAL_PLANET_CENTER)
             .with_rotation(Quat::from_rotation_arc(Vec3::Z, Vec3::Y)),
         Visibility::Visible,
+        // 行星不投射阴影，避免穹顶在假地形上投出巨大阴影。
+        NotShadowCaster,
     ));
 
     // 半透明大气外壳，让星球外轮廓带一圈大气雾，并按昼夜改变辉光。
@@ -10645,7 +10670,7 @@ fn rebuild_voxel_orbital_planet(
     mut commands: Commands,
     mut planets: Query<(Entity, &mut VoxelOrbitalPlanet)>,
     mut meshes: ResMut<Assets<Mesh>>,
-    materials: Res<VoxelMaterials>,
+    materials: Res<VoxelPlanetMaterials>,
 ) {
     for (entity, mut planet) in &mut planets {
         if !planet.dirty {
@@ -10687,6 +10712,7 @@ fn rebuild_voxel_orbital_planet(
                                 material_id,
                             )),
                             Transform::from_translation(Vec3::splat(-0.5 * VOXEL_SIZE)),
+                            NotShadowCaster,
                         ))
                         .id(),
                 );
