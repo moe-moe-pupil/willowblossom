@@ -10508,27 +10508,113 @@ fn spawn_planet_clouds(
     layer
 }
 
+/// 假地形材质：与体素穹顶使用同一套大陆噪声和地表色板，覆盖整个球面。
+/// 下半球镜像采样，让整颗星球都有连续的地形外观。
+fn fake_planet_terrain_material(world_direction: Vec3, radius: f32) -> u8 {
+    let local_position = world_direction.normalize() * radius;
+    let cell = (local_position / VOXEL_SIZE).floor().as_ivec3();
+    let cell = IVec3::new(cell.x, cell.y.abs(), cell.z);
+    let continental = (cell.x as f32 * 0.095).sin()
+        + (cell.z as f32 * 0.08).cos()
+        + ((cell.x + cell.z) as f32 * 0.055).sin()
+        + (cell.y as f32 * 0.115).cos() * 0.35;
+    if cell.y >= ORBITAL_PLANET_VOXEL_RADIUS - 4 {
+        3
+    } else if continental > 0.72 {
+        1
+    } else if continental > 0.52 {
+        3
+    } else {
+        4
+    }
+}
+
+fn fake_planet_material_color(material: u8) -> [f32; 3] {
+    match material {
+        1 => [0.20, 0.55, 0.28],
+        2 => [0.33, 0.17, 0.08],
+        3 => [0.85, 0.72, 0.40],
+        4 => [0.08, 0.38, 0.72],
+        _ => [0.45, 0.48, 0.52],
+    }
+}
+
+/// 生成整球等距圆柱投影的地形贴图，供假球体使用。
+fn build_fake_planet_terrain_texture(radius: f32) -> Image {
+    const WIDTH: u32 = 2048;
+    const HEIGHT: u32 = 1024;
+    let mesh_to_world = Quat::from_rotation_arc(Vec3::Z, Vec3::Y);
+    let mut data = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
+    for v in 0..HEIGHT {
+        let phi = (v as f32 + 0.5) / HEIGHT as f32 * std::f32::consts::PI;
+        let sin_phi = phi.sin();
+        let cos_phi = phi.cos();
+        for u in 0..WIDTH {
+            let theta = (u as f32 + 0.5) / WIDTH as f32 * std::f32::consts::TAU;
+            let mesh_direction = Vec3::new(sin_phi * theta.cos(), sin_phi * theta.sin(), cos_phi);
+            let world_direction = mesh_to_world * mesh_direction;
+            let material = fake_planet_terrain_material(world_direction, radius);
+            let [r, g, b] = fake_planet_material_color(material);
+            // 逐像素细微噪点，模拟体素贴图的颗粒感。
+            let noise = (u as f32 * 12.9898 + v as f32 * 78.233).sin().fract();
+            let tint = 0.92 + noise * 0.16;
+            data.extend_from_slice(&[
+                (r * tint * 255.0).round().clamp(0.0, 255.0) as u8,
+                (g * tint * 255.0).round().clamp(0.0, 255.0) as u8,
+                (b * tint * 255.0).round().clamp(0.0, 255.0) as u8,
+                255,
+            ]);
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: WIDTH,
+            height: HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::ClampToEdge,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    image
+}
+
 fn setup_voxel_planet_shell(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     mut atmosphere_materials: ResMut<Assets<PlanetAtmosphereMaterial>>,
 ) {
     // 深色实体球补全行星尚未体素化的下半部分，让外部剪影看起来是个球。
-    // 纯视觉，不参与碰撞与体素编辑。
+    // 表面使用与体素穹顶相同风格的假地形贴图；纯视觉，不参与碰撞与体素编辑。
+    let terrain_texture = images.add(build_fake_planet_terrain_texture(
+        ORBITAL_PLANET_RADIUS - PLANET_FAKE_BODY_INSET,
+    ));
     commands.spawn((
         Mesh3d(meshes.add(Sphere::new(
             ORBITAL_PLANET_RADIUS - PLANET_FAKE_BODY_INSET,
         )
         .mesh()
-        .uv(48, 24))),
+        .uv(256, 128))),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.035, 0.04, 0.055),
+            base_color_texture: Some(terrain_texture),
+            base_color: Color::WHITE,
             perceptual_roughness: 1.0,
             metallic: 0.0,
             ..default()
         })),
-        Transform::from_translation(ORBITAL_PLANET_CENTER),
+        Transform::from_translation(ORBITAL_PLANET_CENTER)
+            .with_rotation(Quat::from_rotation_arc(Vec3::Z, Vec3::Y)),
         Visibility::Visible,
     ));
 
@@ -15927,6 +16013,61 @@ mod tests {
             .length()
                 < 1.0e-5
         );
+    }
+
+    #[test]
+    fn fake_planet_terrain_covers_both_hemispheres_with_surface_palette() {
+        let radius = ORBITAL_PLANET_RADIUS;
+        for direction in [
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::X,
+            Vec3::NEG_X,
+            Vec3::Z,
+            Vec3::NEG_Z,
+            Vec3::new(0.3, 0.8, 0.5).normalize(),
+            Vec3::new(0.3, -0.8, 0.5).normalize(),
+        ] {
+            let material = fake_planet_terrain_material(direction, radius);
+            assert!(
+                matches!(material, 1 | 2 | 3 | 4),
+                "unexpected material {material} for {direction:?}"
+            );
+        }
+        let north = fake_planet_terrain_material(
+            Vec3::new(0.5, 0.7, 0.4).normalize(),
+            radius,
+        );
+        let south = fake_planet_terrain_material(
+            Vec3::new(0.5, -0.7, 0.4).normalize(),
+            radius,
+        );
+        assert_eq!(north, south);
+    }
+
+    #[test]
+    fn fake_planet_terrain_texture_is_mostly_bright_terrain() {
+        let image = build_fake_planet_terrain_texture(ORBITAL_PLANET_RADIUS);
+        let data = image.data.as_deref().expect("image data present");
+        let mut bright = 0;
+        for pixel in data.chunks_exact(4) {
+            if pixel[0].max(pixel[1]).max(pixel[2]) > 40 {
+                bright += 1;
+            }
+        }
+        let ratio = bright as f32 / (data.len() / 4) as f32;
+        assert!(
+            ratio > 0.8,
+            "fake terrain texture is too dark: {ratio}"
+        );
+        // 海洋色应出现在一部分像素里。
+        let mut ocean = 0;
+        for pixel in data.chunks_exact(4) {
+            if pixel[2] > pixel[0] && pixel[2] > pixel[1] && pixel[2] > 80 {
+                ocean += 1;
+            }
+        }
+        assert!(ocean as f32 / (data.len() / 4) as f32 > 0.1);
     }
 
     #[test]
