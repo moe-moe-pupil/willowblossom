@@ -6,12 +6,19 @@ use bevy::{
     pbr::{
         Material,
         MaterialPlugin,
+        MaterialPipeline,
+        MaterialPipelineKey,
     },
     prelude::*,
     reflect::TypePath,
-    render::render_resource::{
-        AsBindGroup,
-        ShaderType,
+    render::{
+        mesh::MeshVertexBufferLayoutRef,
+        render_resource::{
+            AsBindGroup,
+            RenderPipelineDescriptor,
+            ShaderType,
+            SpecializedMeshPipelineError,
+        },
     },
     shader::ShaderRef,
 };
@@ -54,6 +61,17 @@ impl Material for PlanetAtmosphereMaterial {
 
     fn alpha_mode(&self) -> AlphaMode {
         AlphaMode::Blend
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        // 双面渲染：从星球表面仰望时也能看到大气辉光。
+        descriptor.primitive.cull_mode = None;
+        Ok(())
     }
 }
 

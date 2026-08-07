@@ -27,8 +27,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         0.0,
         1.0,
     );
-    // 大气密度随高度衰减：外缘稀薄、贴近地面浓密。
-    let density = pow(1.0 - height_factor, settings.params.y);
+    // 大气密度在外壳表面最高，向行星表面衰减：中心透明、边缘形成一圈辉光。
+    let density = pow(height_factor, settings.params.y);
 
     let sun_dir = normalize(settings.sun_direction.xyz);
     let facing_sun = max(dot(normal, sun_dir), 0.0);
@@ -43,7 +43,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         * (0.40 + 0.60 * facing_sun);
     let alpha = settings.params.z
         * density
-        * (settings.params.w * 0.25 + 0.75 * rim);
+        * (settings.params.w * 0.12 + 0.88 * rim);
 
     return vec4(glow, clamp(alpha, 0.0, 1.0));
 }

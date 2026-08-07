@@ -177,8 +177,10 @@ const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
 const PLANET_FAKE_BODY_INSET: f32 = 0.75;
 /// 大气外壳厚度（世界单位）。
 const PLANET_ATMOSPHERE_THICKNESS: f32 = 12.0;
-/// 夜晚环境光亮度。
-const PLANET_NIGHT_AMBIENT_BRIGHTNESS: f32 = 8.0;
+/// 时间驱动光照下的白天环境光亮度（比手动默认更低，突出太阳直射对比）。
+const PLANET_DAY_AMBIENT_BRIGHTNESS: f32 = 32.0;
+/// 时间驱动光照下的夜晚环境光亮度。
+const PLANET_NIGHT_AMBIENT_BRIGHTNESS: f32 = 6.0;
 const ORBITAL_PLANET_GRAVITY_ACCELERATION: f32 = 9.81;
 const ORBITAL_PLANET_GRAVITY_MAX_ALTITUDE: f32 = 32.0;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
@@ -3587,7 +3589,7 @@ fn sync_world_time_lighting(
     let day_color = Vec3::new(0.60, 0.68, 0.78);
     let night_color = Vec3::new(0.16, 0.20, 0.34);
     let ambient_color = day_color.lerp(night_color, 1.0 - day_amount);
-    let ambient_brightness = DEFAULT_AMBIENT_BRIGHTNESS * day_amount
+    let ambient_brightness = PLANET_DAY_AMBIENT_BRIGHTNESS * day_amount
         + PLANET_NIGHT_AMBIENT_BRIGHTNESS * (1.0 - day_amount);
     if (ambient.brightness - ambient_brightness).abs() > 0.01 {
         ambient.brightness = ambient_brightness;
@@ -10468,7 +10470,6 @@ fn spawn_planet_clouds(
         base_color: Color::srgba(0.92, 0.96, 1.0, 0.42),
         alpha_mode: AlphaMode::Blend,
         perceptual_roughness: 1.0,
-        unlit: true,
         cull_mode: None,
         ..default()
     });
