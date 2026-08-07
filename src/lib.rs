@@ -4,6 +4,7 @@ mod camera;
 mod deepseek;
 mod moonberry_talents;
 mod napcat;
+mod planet_atmosphere;
 mod replay;
 pub mod rule_engine;
 mod scene;

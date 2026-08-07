@@ -107,6 +107,13 @@ use crate::{
         NapcatOutboundMessage,
         PlayerCharacter,
         Visibility as AccessVisibility,
+        WORLD_DAY_MINUTES,
+    },
+    planet_atmosphere::{
+        PlanetAtmosphereHandles,
+        PlanetAtmosphereMaterial,
+        PlanetAtmospherePlugin,
+        spawn_atmosphere_shell,
     },
     rule_engine::{
         parse_rule,
@@ -163,6 +170,12 @@ const ORBITAL_PLANET_CENTER: Vec3 = Vec3::new(0.0, -251.125, 0.0);
 const ORBITAL_PLANET_VOXEL_RADIUS: i32 = 485;
 const ORBITAL_PLANET_CAP_RADIUS: i32 = 128;
 const ORBITAL_PLANET_SHELL_THICKNESS: f32 = 2.25;
+/// 假球体半径相对行星表面的内缩量，避免与顶部体素穹顶重合闪烁。
+const PLANET_FAKE_BODY_INSET: f32 = 0.75;
+/// 大气外壳厚度（世界单位）。
+const PLANET_ATMOSPHERE_THICKNESS: f32 = 12.0;
+/// 夜晚环境光亮度。
+const PLANET_NIGHT_AMBIENT_BRIGHTNESS: f32 = 8.0;
 const ORBITAL_PLANET_GRAVITY_ACCELERATION: f32 = 9.81;
 const ORBITAL_PLANET_GRAVITY_MAX_ALTITUDE: f32 = 32.0;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
@@ -1211,6 +1224,7 @@ pub(crate) enum VoxelCreativeItem {
     DoorLockTool,
     PortraitTransformTool,
     InvisibilityTool,
+    GmClock,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1836,6 +1850,8 @@ pub(crate) struct VoxelEditorState {
     pub fill_light_illuminance: f32,
     pub fill_light_color: [f32; 3],
     pub radiance_intensity: f32,
+    /// 光照是否跟随世界时间（GM 时钟可切换；关闭后回到手动光照编辑器）。
+    pub time_lighting_enabled: bool,
     undo: Vec<Vec<VoxelChange>>,
     redo: Vec<Vec<VoxelChange>>,
     stroke_positions: HashSet<IVec3>,
@@ -1902,6 +1918,7 @@ impl Default for VoxelEditorState {
             fill_light_illuminance: DEFAULT_FILL_LIGHT_ILLUMINANCE,
             fill_light_color: [0.5, 0.65, 1.0],
             radiance_intensity: DEFAULT_RADIANCE_INTENSITY,
+            time_lighting_enabled: true,
             undo: Vec::new(),
             redo: Vec::new(),
             stroke_positions: HashSet::new(),
@@ -2017,6 +2034,10 @@ impl VoxelEditorState {
                 self.light_tool = None;
                 self.selected_light = None;
             },
+            VoxelCreativeItem::GmClock => {
+                self.light_tool = None;
+                self.selected_light = None;
+            },
         }
         if item != VoxelCreativeItem::TeleportTool {
             self.teleport_menu_open = false;
@@ -2110,6 +2131,9 @@ impl VoxelEditorState {
         if self.is_invisibility_tool_equipped() {
             return "隐身工具".to_owned();
         }
+        if self.is_gm_clock_equipped() {
+            return "GM时钟".to_owned();
+        }
         self.light_tool
             .map_or_else(
                 || self.mode.label(),
@@ -2144,6 +2168,10 @@ impl VoxelEditorState {
 
     pub(crate) fn is_invisibility_tool_equipped(&self) -> bool {
         self.equipped_item == Some(VoxelCreativeItem::InvisibilityTool)
+    }
+
+    pub(crate) fn is_gm_clock_equipped(&self) -> bool {
+        self.equipped_item == Some(VoxelCreativeItem::GmClock)
     }
 
     pub(crate) fn request_teleport(&mut self, destination: VoxelTeleportDestination) {
@@ -2345,6 +2373,7 @@ impl Plugin for TrpgVoxelPlugin {
             VoxelPlugin::<u8>::default(),
             ConnectivityPlugin::<TrpgVoxelConnector>::default(),
             VoxelRadianceCascadePlugin,
+            PlanetAtmospherePlugin,
         ))
         // Player observation is a prepared screenshot, so one inexpensive physics substep is
         // sufficient and avoids repeating the solver when explosions create many fragments.
@@ -2397,6 +2426,7 @@ impl Plugin for TrpgVoxelPlugin {
                 setup_voxel_sample_props,
                 setup_voxel_radiance_volume,
                 setup_voxel_view,
+                setup_voxel_planet_shell,
                 load_persisted_voxel_scene,
                 setup_voxel_spaceships,
                 setup_voxel_player_cameras,
@@ -2444,6 +2474,7 @@ impl Plugin for TrpgVoxelPlugin {
                         sync_voxel_auto_door_lock_materials,
                         rebuild_voxel_geometry,
                         sync_voxel_radiance_volume,
+                        sync_world_time_lighting,
                         sync_voxel_lighting,
                         apply_voxel_teleport,
                         release_controlled_docked_spaceship,
@@ -3438,6 +3469,120 @@ fn sync_voxel_lighting(
     }
     for mut uniform in &mut cameras {
         uniform.intensity = editor.radiance_intensity.max(0.0);
+    }
+}
+
+fn world_time_sun_direction(minutes_of_day: f32) -> Vec3 {
+    // 06:00 日出（+X 方向）、12:00 正午（+Y 天顶）、18:00 日落（-X）、00:00 午夜（-Y）。
+    let elevation = std::f32::consts::TAU
+        * (minutes_of_day - 6.0 * 60.0)
+        / WORLD_DAY_MINUTES as f32;
+    Vec3::new(elevation.cos(), elevation.sin(), 0.0).normalize()
+}
+
+fn sync_world_time_lighting(
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    mut editor: ResMut<VoxelEditorState>,
+    mut ambient: ResMut<GlobalAmbientLight>,
+    atmosphere_handles: Res<PlanetAtmosphereHandles>,
+    mut atmosphere_assets: ResMut<Assets<PlanetAtmosphereMaterial>>,
+    mut key_lights: Query<
+        (&mut Transform, &mut DirectionalLight),
+        (With<VoxelKeyLight>, Without<VoxelFillLight>),
+    >,
+    mut fill_lights: Query<
+        (&mut Transform, &mut DirectionalLight),
+        (With<VoxelFillLight>, Without<VoxelKeyLight>),
+    >,
+) {
+    if !editor.time_lighting_enabled {
+        return;
+    }
+    let Some(manager) = manager else {
+        return;
+    };
+    let Some(group) = manager
+        .current_trpg_group
+        .as_deref()
+        .and_then(|group_name| manager.trpg_groups.get(group_name))
+    else {
+        return;
+    };
+
+    let minutes_of_day = (group.world_time_minutes % WORLD_DAY_MINUTES) as f32;
+    let sun_direction = world_time_sun_direction(minutes_of_day);
+    let sun_elevation = sun_direction.y;
+    let orbit_radius = 180.0;
+
+    let mut key_illuminance = 0.0;
+    let mut key_color = [1.0, 0.95, 0.86];
+    for (mut transform, mut light) in &mut key_lights {
+        transform.translation = sun_direction * orbit_radius;
+        transform.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, -sun_direction);
+        key_illuminance =
+            DEFAULT_KEY_LIGHT_ILLUMINANCE * sun_elevation.max(0.0).powf(0.55);
+        light.illuminance = key_illuminance;
+        // 低角度时偏暖，模拟日出日落。
+        let horizon_warmth = (1.0 - sun_elevation).clamp(0.0, 1.0).powi(2);
+        let color = Vec3::new(1.0, 0.95, 0.86)
+            .lerp(Vec3::new(1.0, 0.42, 0.18), horizon_warmth);
+        key_color = [color.x, color.y, color.z];
+        light.color = Color::srgb(key_color[0], key_color[1], key_color[2]);
+    }
+
+    let moon_direction = -sun_direction;
+    let mut fill_illuminance = 0.0;
+    for (mut transform, mut light) in &mut fill_lights {
+        transform.translation = moon_direction * orbit_radius;
+        transform.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, -moon_direction);
+        fill_illuminance =
+            DEFAULT_FILL_LIGHT_ILLUMINANCE * (-sun_elevation).max(0.0).powf(0.5);
+        light.illuminance = fill_illuminance;
+        light.color = Color::srgb(0.5, 0.65, 1.0);
+    }
+
+    let day_amount = ((sun_elevation + 0.12) / 1.12).clamp(0.0, 1.0);
+    let day_color = Vec3::new(0.60, 0.68, 0.78);
+    let night_color = Vec3::new(0.16, 0.20, 0.34);
+    let ambient_color = day_color.lerp(night_color, 1.0 - day_amount);
+    let ambient_brightness = DEFAULT_AMBIENT_BRIGHTNESS * day_amount
+        + PLANET_NIGHT_AMBIENT_BRIGHTNESS * (1.0 - day_amount);
+    if (ambient.brightness - ambient_brightness).abs() > 0.01 {
+        ambient.brightness = ambient_brightness;
+    }
+    let current_ambient = ambient.color.to_srgba();
+    let ambient_color_changed = (current_ambient.red - ambient_color.x).abs() > 0.01
+        || (current_ambient.green - ambient_color.y).abs() > 0.01
+        || (current_ambient.blue - ambient_color.z).abs() > 0.01;
+    if ambient_color_changed {
+        ambient.color = Color::srgb(ambient_color.x, ambient_color.y, ambient_color.z);
+    }
+
+    // 同步到编辑器字段，让光照编辑器显示当前值；仅在有变化时写入，避免每帧标记脏。
+    if (editor.ambient_brightness - ambient_brightness).abs() > 0.01 {
+        editor.ambient_brightness = ambient_brightness;
+    }
+    if (editor.key_light_illuminance - key_illuminance).abs() > 0.01 {
+        editor.key_light_illuminance = key_illuminance;
+    }
+    if editor.key_light_color != key_color {
+        editor.key_light_color = key_color;
+    }
+    if (editor.fill_light_illuminance - fill_illuminance).abs() > 0.01 {
+        editor.fill_light_illuminance = fill_illuminance;
+    }
+    if editor.fill_light_color != [0.5, 0.65, 1.0] {
+        editor.fill_light_color = [0.5, 0.65, 1.0];
+    }
+
+    if let Some(mut material) = atmosphere_assets.get_mut(&atmosphere_handles.material) {
+        material.settings.planet_center = ORBITAL_PLANET_CENTER.extend(1.0);
+        material.settings.sun_direction = sun_direction.extend(1.0);
+        let day_glow = Vec3::new(0.30, 0.44, 0.80);
+        let night_glow = Vec3::new(0.03, 0.06, 0.14);
+        let glow = day_glow.lerp(night_glow, 1.0 - day_amount);
+        material.settings.day_color = glow.extend(1.0);
+        material.settings.params.w = day_amount;
     }
 }
 
@@ -10320,6 +10465,44 @@ fn spawn_planet_clouds(
     layer
 }
 
+fn setup_voxel_planet_shell(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut atmosphere_materials: ResMut<Assets<PlanetAtmosphereMaterial>>,
+) {
+    // 深色实体球补全行星尚未体素化的下半部分，让外部剪影看起来是个球。
+    // 纯视觉，不参与碰撞与体素编辑。
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(
+            ORBITAL_PLANET_RADIUS - PLANET_FAKE_BODY_INSET,
+        )
+        .mesh()
+        .uv(48, 24))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.035, 0.04, 0.055),
+            perceptual_roughness: 1.0,
+            metallic: 0.0,
+            ..default()
+        })),
+        Transform::from_translation(ORBITAL_PLANET_CENTER),
+        Visibility::Visible,
+    ));
+
+    // 半透明大气外壳，让星球外轮廓带一圈大气雾，并按昼夜改变辉光。
+    let material = spawn_atmosphere_shell(
+        &mut commands,
+        &mut meshes,
+        &mut atmosphere_materials,
+        ORBITAL_PLANET_CENTER,
+        ORBITAL_PLANET_RADIUS,
+        ORBITAL_PLANET_RADIUS + PLANET_ATMOSPHERE_THICKNESS,
+    );
+    commands.insert_resource(PlanetAtmosphereHandles {
+        material,
+    });
+}
+
 fn animate_planet_clouds(
     time: Res<Time>,
     mut clouds: Query<&mut Transform, With<VoxelPlanetCloudLayer>>,
@@ -13068,6 +13251,7 @@ fn edit_voxel_grid(
         || editor.is_spaceship_possession_tool_equipped()
         || editor.is_teleport_tool_equipped()
         || editor.is_door_lock_tool_equipped()
+        || editor.is_gm_clock_equipped()
     {
         return;
     }
@@ -15630,6 +15814,25 @@ fn draw_voxel_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn world_time_sun_direction_matches_key_day_night_moments() {
+        let noon = world_time_sun_direction(12.0 * 60.0);
+        let midnight = world_time_sun_direction(0.0);
+        let sunrise = world_time_sun_direction(6.0 * 60.0);
+        let sunset = world_time_sun_direction(18.0 * 60.0);
+
+        assert!((noon.x).abs() < 1.0e-4 && noon.y > 0.9999);
+        assert!(midnight.y < -0.9999 && midnight.x.abs() < 1.0e-4);
+        assert!(sunrise.x > 0.9999 && sunrise.y.abs() < 1.0e-4);
+        assert!(sunset.x < -0.9999 && sunset.y.abs() < 1.0e-4);
+        assert!(
+            (world_time_sun_direction(12.0 * 60.0)
+                - world_time_sun_direction(36.0 * 60.0))
+            .length()
+                < 1.0e-5
+        );
+    }
 
     #[test]
     fn active_possession_disables_the_gm_possession_tool() {

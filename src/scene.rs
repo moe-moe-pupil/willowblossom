@@ -50,31 +50,20 @@ use avian3d::prelude::{
     WriteRigidBodyForces,
 };
 use bevy::{
-    asset::{
-        Asset,
-        RenderAssetUsages,
-    },
+    asset::RenderAssetUsages,
     camera::{
         visibility::RenderLayers,
         RenderTarget,
     },
     input::mouse::MouseMotion,
-    material::AlphaMode,
     mesh::{
         Indices,
         PrimitiveTopology,
     },
-    pbr::{
-        Material,
-        MaterialPlugin,
-    },
     prelude::*,
-    reflect::TypePath,
     render::{
         render_resource::{
-            AsBindGroup,
             Extent3d,
-            ShaderType,
             TextureDimension,
             TextureFormat,
             TextureUsages,
@@ -84,7 +73,6 @@ use bevy::{
             ScreenshotCaptured,
         },
     },
-    shader::ShaderRef,
     transform::TransformSystems,
     window::PrimaryWindow,
 };
@@ -117,6 +105,12 @@ use crate::{
         NapcatOutboundMessage,
         PlayerAccess,
         WORLD_DAY_MINUTES,
+    },
+    planet_atmosphere::{
+        PlanetAtmosphereHandles,
+        PlanetAtmosphereMaterial,
+        PlanetAtmospherePlugin,
+        spawn_atmosphere_shell,
     },
 };
 
@@ -518,57 +512,6 @@ struct PlanetSunLight;
 
 #[derive(Component)]
 struct PlanetMoonLight;
-
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-struct PlanetAtmosphereMaterial {
-    #[uniform(0)]
-    settings: PlanetAtmosphereUniform,
-}
-
-#[derive(ShaderType, Clone, Copy, Debug)]
-struct PlanetAtmosphereUniform {
-    planet_center: Vec4,
-    sun_direction: Vec4,
-    radii: Vec4,
-    day_color: Vec4,
-    night_color: Vec4,
-    params: Vec4,
-}
-
-impl PlanetAtmosphereMaterial {
-    fn initial() -> Self {
-        Self {
-            settings: PlanetAtmosphereUniform {
-                planet_center: earth_planet_center().as_vec3().extend(1.0),
-                sun_direction: Vec4::new(0.0, 1.0, 0.0, 0.0),
-                radii: Vec4::new(
-                    EARTH_PLANET_RADIUS as f32,
-                    PLANET_ATMOSPHERE_RADIUS,
-                    0.0,
-                    0.0,
-                ),
-                day_color: Vec4::new(0.30, 0.44, 0.80, 1.0),
-                night_color: Vec4::new(0.03, 0.06, 0.14, 1.0),
-                params: Vec4::new(3.0, 1.8, 1.0, 1.0),
-            },
-        }
-    }
-}
-
-impl Material for PlanetAtmosphereMaterial {
-    fn fragment_shader() -> ShaderRef {
-        ShaderRef::Path("shaders/planet_atmosphere.wgsl".into())
-    }
-
-    fn alpha_mode(&self) -> AlphaMode {
-        AlphaMode::Blend
-    }
-}
-
-#[derive(Resource)]
-struct PlanetAtmosphereHandles {
-    material: Handle<PlanetAtmosphereMaterial>,
-}
 
 #[derive(Component)]
 struct PhysicsVoxel;
@@ -1733,7 +1676,7 @@ impl VoxelWorldConfig for TrpgVoxelWorld {
 impl Plugin for ScenePreviewPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(PhysicsPlugins::default())
-            .add_plugins(MaterialPlugin::<PlanetAtmosphereMaterial>::default())
+            .add_plugins(PlanetAtmospherePlugin)
             .insert_resource(Gravity::ZERO)
             .add_plugins(VoxelWorldPlugin::with_config(
                 TrpgVoxelWorld,
@@ -2316,18 +2259,17 @@ fn spawn_planet_fake_sphere(
     ));
 
     // 半透明大气壳，让星球外轮廓带一圈大气雾，并按昼夜改变辉光。
-    let material = atmosphere_materials.add(PlanetAtmosphereMaterial::initial());
+    let material = spawn_atmosphere_shell(
+        commands,
+        meshes,
+        atmosphere_materials,
+        planet_center,
+        EARTH_PLANET_RADIUS as f32,
+        PLANET_ATMOSPHERE_RADIUS,
+    );
     commands.insert_resource(PlanetAtmosphereHandles {
-        material: material.clone(),
+        material,
     });
-    commands.spawn((
-        Mesh3d(meshes.add(
-            Sphere::new(PLANET_ATMOSPHERE_RADIUS).mesh().uv(64, 32),
-        )),
-        MeshMaterial3d(material),
-        Transform::from_translation(planet_center),
-        Visibility::Visible,
-    ));
 }
 
 fn spawn_static_voxel_collision_previews(commands: &mut Commands) {

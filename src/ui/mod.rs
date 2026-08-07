@@ -478,6 +478,15 @@ fn paint_voxel_creative_item_icon(
             thin_line((-0.82, -0.2), (0.82, -0.2));
             thin_line((-0.82, 0.2), (0.82, 0.2));
         },
+        VoxelCreativeItem::GmClock => {
+            circle(0.0, 0.0, 0.72);
+            for (x, y) in [(0.0, 0.56), (0.56, 0.0), (-0.56, 0.0), (0.0, -0.56)] {
+                dot(x, y, 0.06);
+            }
+            line((0.0, 0.0), (-0.18, 0.36));
+            line((0.0, 0.0), (0.34, 0.22));
+            dot(0.0, 0.0, 0.07);
+        },
         VoxelCreativeItem::Mode(VoxelEditMode::Add) => {
             box_outline((-0.75, -0.75), (0.35, 0.35));
             plus(0.48, 0.48, 0.4);
@@ -637,6 +646,10 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
         VoxelCreativeItem::InvisibilityTool => (
             "隐身工具",
             egui::Color32::from_rgb(120, 220, 255),
+        ),
+        VoxelCreativeItem::GmClock => (
+            "GM时钟",
+            egui::Color32::from_rgb(255, 216, 118),
         ),
         VoxelCreativeItem::Mode(mode) => match mode {
             VoxelEditMode::Add => (
@@ -846,6 +859,8 @@ use crate::{
         Visibility,
         LEGACY_NEGATIVE_TIMEOUT_MS,
         NAPCAT_MANAGER_EXPORT_VERSION,
+        WORLD_DAY_MINUTES,
+        WORLD_TURN_MINUTES,
     },
     replay::{
         clear_campaign_replay_data,
@@ -15748,6 +15763,8 @@ pub fn ui_system(
                             "右键选择/接管玩家 · 右键空处解除"
                         } else if voxel_editor.is_tool_gun_equipped() {
                             "右键发射 · R切换模式"
+                        } else if voxel_editor.is_gm_clock_equipped() {
+                            "在下方GM时钟面板修改世界时间，只改变光照"
                         } else {
                             "左键拆除 · 右键放置/使用"
                         };
@@ -15760,6 +15777,8 @@ pub fn ui_system(
                             "右键选择/接管玩家 · 右键空处解除"
                         } else if voxel_editor.is_tool_gun_equipped() {
                             "右键发射 · R切换模式"
+                        } else if voxel_editor.is_gm_clock_equipped() {
+                            "在下方GM时钟面板修改世界时间，只改变光照"
                         } else {
                             "左键拆除 · 右键放置/使用"
                         };
@@ -15809,7 +15828,80 @@ pub fn ui_system(
                                 voxel_editor.reset_lighting();
                             }
                         });
+                        ui.checkbox(
+                            &mut voxel_editor.time_lighting_enabled,
+                            "光照跟随世界时间",
+                        );
                     });
+                    if voxel_editor.is_gm_clock_equipped() {
+                        egui::CollapsingHeader::new("GM时钟")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                let Some(group_name) = manager.current_trpg_group.clone() else {
+                                    ui.label("未选择TRPG组，无法修改世界时间");
+                                    return;
+                                };
+                                let Some(group) =
+                                    manager.trpg_groups.get_mut(&group_name)
+                                else {
+                                    return;
+                                };
+                                let day_base = group.world_time_minutes
+                                    - group.world_time_minutes % WORLD_DAY_MINUTES;
+                                let mut hour = (group.world_time_minutes / 60) % 24;
+                                let mut minute = group.world_time_minutes % 60;
+                                ui.horizontal(|ui| {
+                                    ui.label("当前时间");
+                                    ui.strong(format!("{hour:02}:{minute:02}"));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("设定时间");
+                                    let hour_changed = ui
+                                        .add(
+                                            egui::DragValue::new(&mut hour)
+                                                .range(0..=23)
+                                                .speed(1),
+                                        )
+                                        .changed();
+                                    let minute_changed = ui
+                                        .add(
+                                            egui::DragValue::new(&mut minute)
+                                                .range(0..=59)
+                                                .speed(1),
+                                        )
+                                        .changed();
+                                    if hour_changed || minute_changed {
+                                        group.world_time_minutes =
+                                            day_base + hour * 60 + minute;
+                                    }
+                                    if ui.button("+30分").clicked() {
+                                        group.world_time_minutes = group
+                                            .world_time_minutes
+                                            .saturating_add(WORLD_TURN_MINUTES);
+                                    }
+                                    if ui.button("-30分").clicked() {
+                                        group.world_time_minutes = group
+                                            .world_time_minutes
+                                            .saturating_sub(WORLD_TURN_MINUTES);
+                                    }
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    for (label, preset_hour, preset_minute) in [
+                                        ("清晨 6:00", 6, 0),
+                                        ("正午 12:00", 12, 0),
+                                        ("黄昏 18:00", 18, 0),
+                                        ("午夜 0:00", 0, 0),
+                                    ] {
+                                        if ui.button(label).clicked() {
+                                            group.world_time_minutes =
+                                                day_base + preset_hour * 60
+                                                    + preset_minute;
+                                        }
+                                    }
+                                });
+                                ui.small("只修改当前时间与光照，不会回退玩家回合。");
+                            });
+                    }
                     if voxel_editor.light_tool == Some(VoxelLightTool::Edit) {
                         egui::CollapsingHeader::new("灯光编辑工具")
                             .default_open(true)
@@ -16414,6 +16506,29 @@ pub fn ui_system(
                                     .clicked()
                                     {
                                         picked_item = Some(portrait_transform_tool);
+                                    }
+                                    ui.small(name);
+                                });
+                                let gm_clock = VoxelCreativeItem::GmClock;
+                                let (name, _) = voxel_creative_item_visual(gm_clock);
+                                ui.vertical_centered(|ui| {
+                                    if voxel_creative_drag_source(
+                                        ui,
+                                        egui::Id::new("voxel_catalog_gm_clock"),
+                                        VoxelCreativeDragPayload::Catalog(gm_clock),
+                                        gm_clock,
+                                        voxel_editor.creative_hotbar
+                                            [voxel_editor.selected_hotbar_slot]
+                                            == Some(gm_clock),
+                                        48.0,
+                                        None,
+                                    )
+                                    .on_hover_text(
+                                        "GM设定世界时间：只改变时间和光照，不会回退玩家回合",
+                                    )
+                                    .clicked()
+                                    {
+                                        picked_item = Some(gm_clock);
                                     }
                                     ui.small(name);
                                 });
