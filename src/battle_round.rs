@@ -85,6 +85,7 @@ use crate::{
         character_sin_on_sin_exp_bonus_per_stack,
         character_sin_on_sin_recovery_rate,
         character_spell_range_multiplier,
+        character_sunset_available,
         character_undying_rage_available,
         character_valorous_battle_damage_multiplier,
         character_wounded_healing_dealt_modifier,
@@ -503,6 +504,10 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub mirror_coat_cleanup_pending: bool,
     #[serde(default)]
+    pub sunset_enabled: bool,
+    #[serde(default)]
+    pub sunset_death_time_reset_pending: bool,
+    #[serde(default)]
     pub liquid_body_damage_delay_rate: f32,
     #[serde(default)]
     pub liquid_body_self_healing_rate: f32,
@@ -643,6 +648,15 @@ pub const MIRROR_COAT_MAX_EXTRA_LAYERS: u32 = 3;
 /// 「镜像外衣」冷却回合数。
 pub const MIRROR_COAT_COOLDOWN_ROUNDS: u32 = 6;
 
+/// 「日薄崦嵫」距离减免的起始距离（码）。
+pub const SUNSET_DAMAGE_DISTANCE_THRESHOLD: f32 = 10.0;
+/// 「日薄崦嵫」超出起始距离后每码减免的伤害点数。
+pub const SUNSET_DAMAGE_REDUCTION_PER_YARD: f32 = 1.0;
+/// 「日薄崦嵫」单次伤害减免上限比例。
+pub const SUNSET_DAMAGE_REDUCTION_CAP: f32 = 0.20;
+/// 「日薄崦嵫」死亡后重置的世界时间（18:00 的分钟数）。
+pub const SUNSET_TIME_RESET_MINUTES: u32 = 18 * 60;
+
 fn trpg_group_campaign_id(group: &TrpgGroup) -> &str {
     let campaign_id = group.campaign_id.trim();
     if campaign_id.is_empty() {
@@ -755,6 +769,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.mirror_coat_layers = 0;
             participant.mirror_coat_cooldown_remaining = 0;
             participant.mirror_coat_cleanup_pending = false;
+            participant.sunset_death_time_reset_pending = false;
             participant.arcane_shield =
                 participant.max_mp.max(0.0) * participant.arcane_shield_rate.max(0.0);
             let previous_hp = participant.hp;
@@ -799,6 +814,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.mirror_coat_layers = 0;
             participant.mirror_coat_cooldown_remaining = 0;
             participant.mirror_coat_cleanup_pending = false;
+            participant.sunset_death_time_reset_pending = false;
             if participant_hope_avatar_active(participant) {
                 let was_alive = participant.alive;
                 participant.hp = 0.0;
@@ -1960,6 +1976,54 @@ fn apply_battle_defeat_outcome(encounter: &mut BattleEncounter, outcome: BattleD
     if outcome.defeated_player_character {
         apply_champion_player_elimination(encounter);
     }
+    if let Some(defeated) = encounter
+        .participants
+        .iter_mut()
+        .find(|participant| participant.target_id == outcome.defeated_id)
+    {
+        if defeated.sunset_enabled {
+            defeated.sunset_death_time_reset_pending = true;
+        }
+    }
+}
+
+/// 「日薄崦嵫」持有者被击败后，把本团世界时间重置为当天18:00。
+fn apply_sunset_world_time_reset(
+    encounter: &mut BattleEncounter,
+    manager: &mut NapcatMessageManager,
+) {
+    let mut pending_names = Vec::new();
+    for participant in &mut encounter.participants {
+        if participant.sunset_death_time_reset_pending {
+            participant.sunset_death_time_reset_pending = false;
+            pending_names.push(participant.display_name.clone());
+        }
+    }
+    if pending_names.is_empty() {
+        return;
+    }
+    let group_name = encounter.trpg_group.clone().or_else(|| {
+        encounter.trpg_campaign_id.as_deref().and_then(|campaign_id| {
+            manager
+                .trpg_groups
+                .iter()
+                .find(|(_, group)| group.campaign_id.trim() == campaign_id)
+                .map(|(name, _)| name.clone())
+        })
+    });
+    let Some(group_name) = group_name else {
+        return;
+    };
+    let Some(group) = manager.trpg_groups.get_mut(&group_name) else {
+        return;
+    };
+    let day_start = (group.world_time_minutes / crate::napcat::WORLD_DAY_MINUTES)
+        * crate::napcat::WORLD_DAY_MINUTES;
+    group.world_time_minutes = day_start + SUNSET_TIME_RESET_MINUTES;
+    encounter.action_log.push(format!(
+        "{}触发日薄崦嵫，世界时间重置为晚上6点",
+        pending_names.join("、")
+    ));
 }
 
 fn reset_participant_turn_totals(participant: &mut BattleParticipantSnapshot) -> bool {
@@ -4204,7 +4268,7 @@ impl BattleRoundStore {
         target_id: &str,
         action_name: &str,
         base_damage: f32,
-        manager: &NapcatMessageManager,
+        manager: &mut NapcatMessageManager,
     ) -> bool {
         let Some(encounter) = self.encounters.get(encounter_id) else {
             return false;
@@ -4290,6 +4354,9 @@ impl BattleRoundStore {
                 modifiers: resolution.modifiers,
                 benefits: source_notes,
             });
+        }
+        if let Some(encounter) = self.encounters.get_mut(encounter_id) {
+            apply_sunset_world_time_reset(encounter, manager);
         }
         self.finish_resolved_actor_action(encounter_id, actor_id)
     }
@@ -4705,13 +4772,37 @@ impl BattleRoundStore {
                         } else {
                             0.0
                         };
-                        let (final_amount, delayed_liquid_body_damage) =
+                        let (mut final_amount, delayed_liquid_body_damage) =
                             if !encounter.active || participant_hope_avatar_active(target) {
                                 (resolved_amount, 0.0)
                             } else {
                                 participant_liquid_body_split_damage(target, resolved_amount)
                             };
                         let target_display_name = target.display_name.clone();
+                        // 日薄崦嵫：距离超过10码后每1码减免1点伤害，至多减免20%。
+                        if target.sunset_enabled {
+                            let distance = scene_positions
+                                .and_then(|positions| {
+                                    let actor_position = positions.positions.get(actor_id)?;
+                                    let target_position =
+                                        positions.positions.get(&target.target_id)?;
+                                    Some(actor_position.distance(*target_position))
+                                })
+                                .unwrap_or(0.0);
+                            if distance > SUNSET_DAMAGE_DISTANCE_THRESHOLD {
+                                let reduction = (distance - SUNSET_DAMAGE_DISTANCE_THRESHOLD)
+                                    .min(final_amount.max(0.0) * SUNSET_DAMAGE_REDUCTION_CAP);
+                                if reduction > f32::EPSILON {
+                                    final_amount = (final_amount - reduction).max(0.0);
+                                    encounter.action_log.push(format!(
+                                        "{}距离{}码，日薄崦嵫减免{}点伤害",
+                                        target_display_name,
+                                        format_number(distance),
+                                        format_number(reduction)
+                                    ));
+                                }
+                            }
+                        }
                         if delayed_liquid_body_damage > f32::EPSILON {
                             schedule_participant_delayed_damage(
                                 target,
@@ -5472,6 +5563,9 @@ impl BattleRoundStore {
                 ));
             }
         }
+        if let Some(encounter) = self.encounters.get_mut(encounter_id) {
+            apply_sunset_world_time_reset(encounter, manager);
+        }
         self.finish_resolved_actor_action(encounter_id, actor_id)
     }
 
@@ -6089,6 +6183,9 @@ fn sync_battle_round_buff_advancement(
         store.encounters.get(encounter_id),
         manager,
     );
+    if let Some(encounter) = store.encounters.get_mut(encounter_id) {
+        apply_sunset_world_time_reset(encounter, manager);
+    }
     true
 }
 
@@ -6777,6 +6874,8 @@ fn participant_from_character(
         mirror_coat_layers: 0,
         mirror_coat_cooldown_remaining: 0,
         mirror_coat_cleanup_pending: false,
+        sunset_enabled: character_sunset_available(character),
+        sunset_death_time_reset_pending: false,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         calm_heart_healing_rate: character_calm_heart_healing_rate(character),
@@ -6910,6 +7009,8 @@ fn participant_from_unit_template(
         mirror_coat_layers: 0,
         mirror_coat_cooldown_remaining: 0,
         mirror_coat_cleanup_pending: false,
+        sunset_enabled: character_sunset_available(character),
+        sunset_death_time_reset_pending: false,
         damage_taken_this_turn: character.damage_taken_this_turn,
         healing_taken_this_turn: character.healing_taken_this_turn,
         skill_last_used_turns: HashMap::new(),
@@ -7011,6 +7112,8 @@ fn participant_from_target(
         mirror_coat_layers: 0,
         mirror_coat_cooldown_remaining: 0,
         mirror_coat_cleanup_pending: false,
+        sunset_enabled: false,
+        sunset_death_time_reset_pending: false,
         damage_taken_this_turn: 0.0,
         healing_taken_this_turn: 0.0,
         skill_last_used_turns: HashMap::new(),
@@ -7081,6 +7184,7 @@ fn sync_participant_from_manager(
             );
             participant.hope_avatar_enabled = character_hope_avatar_available(&character);
             participant.mirror_coat_enabled = character_mirror_coat_available(&character);
+            participant.sunset_enabled = character_sunset_available(&character);
             participant.liquid_body_damage_delay_rate =
                 character_liquid_body_damage_delay_rate(&character);
             participant.liquid_body_self_healing_rate =
@@ -7178,6 +7282,7 @@ fn sync_participant_from_manager(
         );
         participant.hope_avatar_enabled = character_hope_avatar_available(character);
         participant.mirror_coat_enabled = character_mirror_coat_available(character);
+        participant.sunset_enabled = character_sunset_available(character);
         participant.liquid_body_damage_delay_rate =
             character_liquid_body_damage_delay_rate(character);
         participant.liquid_body_self_healing_rate =
@@ -7227,6 +7332,7 @@ fn sync_participant_from_manager(
         sync_participant_undying_rage(participant, false);
         participant.hope_avatar_enabled = false;
         participant.mirror_coat_enabled = false;
+        participant.sunset_enabled = false;
         participant.liquid_body_damage_delay_rate = 0.0;
         participant.liquid_body_self_healing_rate = 0.0;
         participant.calm_heart_healing_rate = 0.0;
@@ -8670,6 +8776,8 @@ mod area_tests {
             mirror_coat_layers: 0,
             mirror_coat_cooldown_remaining: 0,
             mirror_coat_cleanup_pending: false,
+            sunset_enabled: false,
+            sunset_death_time_reset_pending: false,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             calm_heart_healing_rate: 0.0,
@@ -8854,6 +8962,8 @@ mod tests {
             mirror_coat_layers: 0,
             mirror_coat_cooldown_remaining: 0,
             mirror_coat_cleanup_pending: false,
+            sunset_enabled: false,
+            sunset_death_time_reset_pending: false,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             calm_heart_healing_rate: 0.0,
@@ -9140,7 +9250,7 @@ mod tests {
 
     #[test]
     fn new_battle_id_wraps_and_skips_existing_imported_encounters() {
-        let manager = empty_manager();
+        let mut manager = empty_manager();
         let group = TrpgGroup::default();
         let mut store = BattleRoundStore {
             next_encounter_index: u64::MAX,
@@ -14505,6 +14615,291 @@ mod tests {
     }
 
     #[test]
+    fn sunset_distance_reduction_scales_with_distance_beyond_ten_yards() {
+        let mut manager = empty_manager();
+        let attacker_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            ..Default::default()
+        };
+        let victim_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["日薄崦嵫".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "killer".to_owned(),
+            attacker_character.clone(),
+        );
+        manager.player_characters.insert(
+            "victim".to_owned(),
+            victim_character.clone(),
+        );
+        let attacker = participant_from_character("killer", &attacker_character, &manager);
+        let victim = participant_from_character("victim", &victim_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![attacker, victim],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "远程射击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        // 11 码：超出 10 码 1 码，减免 1 点（100 - 9 = 91）。
+        let positions = crate::scene::SceneCharacterPositions {
+            positions: HashMap::from([
+                ("killer".to_owned(), Vec3::ZERO),
+                (
+                    "victim".to_owned(),
+                    Vec3::new(11.0, 0.0, 0.0),
+                ),
+            ]),
+        };
+        assert!(store.record_skill_use(
+            "battle",
+            "killer",
+            "victim",
+            &skill,
+            &manager,
+            Some(&positions),
+        ));
+        assert!((store.encounters["battle"].participants[1].hp - 91.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn sunset_distance_reduction_caps_at_twenty_percent() {
+        let mut manager = empty_manager();
+        let attacker_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            ..Default::default()
+        };
+        let victim_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["日薄崦嵫".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "killer".to_owned(),
+            attacker_character.clone(),
+        );
+        manager.player_characters.insert(
+            "victim".to_owned(),
+            victim_character.clone(),
+        );
+        let attacker = participant_from_character("killer", &attacker_character, &manager);
+        let victim = participant_from_character("victim", &victim_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![attacker, victim],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "远程射击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        // 100 码：理论减免 90 点，上限为伤害的 20%（2 点）→ 实际造成 8 点。
+        let positions = crate::scene::SceneCharacterPositions {
+            positions: HashMap::from([
+                ("killer".to_owned(), Vec3::ZERO),
+                (
+                    "victim".to_owned(),
+                    Vec3::new(100.0, 0.0, 0.0),
+                ),
+            ]),
+        };
+        assert!(store.record_skill_use(
+            "battle",
+            "killer",
+            "victim",
+            &skill,
+            &manager,
+            Some(&positions),
+        ));
+        assert!((store.encounters["battle"].participants[1].hp - 92.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn sunset_does_not_reduce_within_ten_yards() {
+        let mut manager = empty_manager();
+        let attacker_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            ..Default::default()
+        };
+        let victim_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            skill_names: vec!["日薄崦嵫".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            )],
+            ..Default::default()
+        };
+        manager.player_characters.insert(
+            "killer".to_owned(),
+            attacker_character.clone(),
+        );
+        manager.player_characters.insert(
+            "victim".to_owned(),
+            victim_character.clone(),
+        );
+        let attacker = participant_from_character("killer", &attacker_character, &manager);
+        let victim = participant_from_character("victim", &victim_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                participants: vec![attacker, victim],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "近战攻击".to_owned(),
+            note: "主动使用对目标造成10点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        // 10 码内不减免，正常造成 10 点。
+        let positions = crate::scene::SceneCharacterPositions {
+            positions: HashMap::from([
+                ("killer".to_owned(), Vec3::ZERO),
+                (
+                    "victim".to_owned(),
+                    Vec3::new(10.0, 0.0, 0.0),
+                ),
+            ]),
+        };
+        assert!(store.record_skill_use(
+            "battle",
+            "killer",
+            "victim",
+            &skill,
+            &manager,
+            Some(&positions),
+        ));
+        assert!((store.encounters["battle"].participants[1].hp - 90.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn sunset_death_resets_group_world_time_to_six_pm() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert(
+            "g".to_owned(),
+            crate::napcat::TrpgGroup {
+                world_time_minutes: 3 * crate::napcat::WORLD_DAY_MINUTES + 5 * 60,
+                ..Default::default()
+            },
+        );
+        let mut holder = participant("holder", 0);
+        holder.hp = 0.0;
+        holder.alive = false;
+        holder.sunset_enabled = true;
+        let mut encounter = BattleEncounter {
+            trpg_group: Some("g".to_owned()),
+            participants: vec![holder],
+            ..Default::default()
+        };
+        let outcome = participant_defeat_outcome(
+            &mut encounter.participants[0],
+            true,
+            None,
+        )
+        .unwrap();
+        apply_battle_defeat_outcome(&mut encounter, outcome);
+        assert!(encounter.participants[0].sunset_death_time_reset_pending);
+
+        apply_sunset_world_time_reset(&mut encounter, &mut manager);
+        assert!(!encounter.participants[0].sunset_death_time_reset_pending);
+        assert_eq!(
+            manager.trpg_groups["g"].world_time_minutes,
+            3 * crate::napcat::WORLD_DAY_MINUTES + 18 * 60
+        );
+    }
+
+    #[test]
+    fn sunset_death_without_talent_does_not_reset_world_time() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert(
+            "g".to_owned(),
+            crate::napcat::TrpgGroup {
+                world_time_minutes: 5 * 60,
+                ..Default::default()
+            },
+        );
+        let mut holder = participant("holder", 0);
+        holder.hp = 0.0;
+        holder.alive = false;
+        let mut encounter = BattleEncounter {
+            trpg_group: Some("g".to_owned()),
+            participants: vec![holder],
+            ..Default::default()
+        };
+        let outcome = participant_defeat_outcome(
+            &mut encounter.participants[0],
+            true,
+            None,
+        )
+        .unwrap();
+        apply_battle_defeat_outcome(&mut encounter, outcome);
+        assert!(!encounter.participants[0].sunset_death_time_reset_pending);
+        apply_sunset_world_time_reset(&mut encounter, &mut manager);
+        assert_eq!(
+            manager.trpg_groups["g"].world_time_minutes,
+            5 * 60
+        );
+    }
+
+    #[test]
     fn dominion_overflow_hp_uses_battle_cap_during_round_buff_healing() {
         let mut manager = empty_manager();
         let dominion_character = PlayerCharacter {
@@ -17026,7 +17421,7 @@ mod tests {
 
     #[test]
     fn common_attack_applies_stats_and_records_modifier_sources() {
-        let manager = empty_manager();
+        let mut manager = empty_manager();
         let mut actor = participant("actor", 0);
         actor.str_ = 10;
         actor.hp = 100.0;
@@ -17048,7 +17443,7 @@ mod tests {
             "target",
             "普通攻击",
             10.0,
-            &manager,
+            &mut manager,
         ));
         let encounter = &store.encounters["battle"];
         assert!((encounter.participants[1].hp - 87.5).abs() < 0.0001);

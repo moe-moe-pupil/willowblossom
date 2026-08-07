@@ -9379,6 +9379,11 @@ pub fn character_mirror_coat_available(character: &PlayerCharacter) -> bool {
     character_has_approved_moonberry_talent(character, "镜像外衣")
 }
 
+/// 「日薄崦嵫」持有者：距离减免 + 死亡后世界时间重置为晚上6点。
+pub fn character_sunset_available(character: &PlayerCharacter) -> bool {
+    character_has_approved_moonberry_talent(character, "日薄崦嵫")
+}
+
 /// 开团：标记当前剧情世界开始，并清理上一个世界遗留的持续型天赋状态。
 pub fn open_trpg_group_world(
     manager: &mut NapcatMessageManager,
@@ -13901,7 +13906,7 @@ position_cells = [4, 5, 6]
 
     #[test]
     fn swift_wind_speed_multiplier_requires_open_world_and_less_than_ten_turns() {
-        let mut character = PlayerCharacter {
+        let character = PlayerCharacter {
             skill_names: vec!["疾行如风".to_owned()],
             skill_metadata: vec![CharacterSkillMetadata::talent("normal_talent", "天赋")],
             ..Default::default()
