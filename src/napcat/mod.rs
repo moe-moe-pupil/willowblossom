@@ -2062,6 +2062,9 @@ pub struct TrpgGroup {
     pub player_turns: HashMap<String, TrpgPlayerTurnState>,
     #[serde(default)]
     pub initial_player_states: HashMap<String, PlayerCharacter>,
+    /// 「蝴蝶效应」：持有者 -> 指定目标（除自身外），由GM在界面指定。
+    #[serde(default)]
+    pub butterfly_targets: HashMap<String, String>,
     /// 是否处于开团状态；结团会清空本世界内持续型天赋状态。
     #[serde(default)]
     pub campaign_active: bool,
@@ -2098,6 +2101,7 @@ impl Default for TrpgGroup {
             world_time_minutes: WORLD_START_TIME_MINUTES,
             player_turns: HashMap::default(),
             initial_player_states: HashMap::default(),
+            butterfly_targets: HashMap::default(),
             campaign_active: false,
             world_start_turn: 0,
         }
@@ -9388,6 +9392,11 @@ pub fn character_sunset_available(character: &PlayerCharacter) -> bool {
 /// 「精美烧鹅」持有者：每次开团获得3只烧鹅。
 pub fn character_delicious_goose_available(character: &PlayerCharacter) -> bool {
     character_has_approved_moonberry_talent(character, "精美烧鹅")
+}
+
+/// 「蝴蝶效应」持有者：跑团开始后由GM指定一个除自身外的目标。
+pub fn character_butterfly_available(character: &PlayerCharacter) -> bool {
+    character_has_approved_moonberry_talent(character, "蝴蝶效应")
 }
 
 /// 「精美烧鹅」道具：使用后引导5回合，每回合回复20%最大生命/魔法值。

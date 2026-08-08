@@ -14565,6 +14565,29 @@ fn trpg_group_settings_window(
                             }
 
                             ui.collapsing("团设与建卡规则", |ui| {
+                                let butterfly_holders = snapshot
+                                    .players
+                                    .iter()
+                                    .filter(|target_id| {
+                                        manager
+                                            .player_characters
+                                            .get(target_id.as_str())
+                                            .is_some_and(
+                                                crate::napcat::character_butterfly_available,
+                                            )
+                                    })
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                let butterfly_names = snapshot
+                                    .players
+                                    .iter()
+                                    .map(|target_id| {
+                                        (
+                                            target_id.clone(),
+                                            target_display_name(manager, target_id),
+                                        )
+                                    })
+                                    .collect::<HashMap<_, _>>();
                                 if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
                                     ui.horizontal(|ui| {
                                         ui.label("活动ID");
@@ -14658,6 +14681,63 @@ fn trpg_group_settings_window(
                                                 .desired_rows(3),
                                         )
                                         .changed();
+                                    if !butterfly_holders.is_empty() {
+                                        ui.label("蝴蝶效应目标（除自身外）");
+                                        for holder_id in &butterfly_holders {
+                                            let holder_name = butterfly_names
+                                                .get(holder_id)
+                                                .cloned()
+                                                .unwrap_or_else(|| holder_id.clone());
+                                            let mut selected = group
+                                                .butterfly_targets
+                                                .get(holder_id)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            egui::ComboBox::from_label(format!(
+                                                "{holder_name} 指定"
+                                            ))
+                                            .selected_text(if selected.is_empty() {
+                                                "未指定".to_owned()
+                                            } else {
+                                                butterfly_names
+                                                    .get(&selected)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| selected.clone())
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut selected,
+                                                    String::new(),
+                                                    "未指定",
+                                                );
+                                                for (other_id, other_name) in &butterfly_names {
+                                                    if other_id == holder_id {
+                                                        continue;
+                                                    }
+                                                    ui.selectable_value(
+                                                        &mut selected,
+                                                        other_id.clone(),
+                                                        other_name.clone(),
+                                                    );
+                                                }
+                                            });
+                                            let previous = group
+                                                .butterfly_targets
+                                                .get(holder_id)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            if selected != previous {
+                                                if selected.is_empty() {
+                                                    group.butterfly_targets.remove(holder_id);
+                                                } else {
+                                                    group
+                                                        .butterfly_targets
+                                                        .insert(holder_id.clone(), selected);
+                                                }
+                                                changed = true;
+                                            }
+                                        }
+                                    }
                                     ui.collapsing("属性公式", |ui| {
                                         changed |=
                                             trpg_basic_config_ui(ui, &mut group.basic_config);

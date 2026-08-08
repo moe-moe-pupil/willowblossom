@@ -44,6 +44,7 @@ use crate::{
         character_arcane_shield_amount,
         character_arcane_shield_rate,
         character_arrogance_damage_bonus_per_source,
+        character_butterfly_available,
         character_calm_heart_healing_rate,
         character_champion_damage_bonus_per_stack,
         character_champion_damage_reduction_per_stack,
@@ -509,6 +510,18 @@ pub struct BattleParticipantSnapshot {
     pub sunset_death_time_reset_pending: bool,
     #[serde(default)]
     pub goose_channeling_turns: u32,
+    #[serde(default)]
+    pub butterfly_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub butterfly_target_id: Option<String>,
+    #[serde(default)]
+    pub butterfly_effect_on_holder: bool,
+    #[serde(default)]
+    pub butterfly_initialized: bool,
+    #[serde(default)]
+    pub butterfly_locked: bool,
+    #[serde(default)]
+    pub butterfly_effect: bool,
     #[serde(default)]
     pub liquid_body_damage_delay_rate: f32,
     #[serde(default)]
@@ -1580,6 +1593,51 @@ fn advance_participant_goose_channel(
         benefits: vec![format!("魔法回复{}", format_number(mp_restored))],
     };
     Some((log, entry))
+}
+
+/// 推进「蝴蝶效应」：效果在持有者与指定目标间每回合互换；一方死亡后常驻存活方。
+fn sync_butterfly_effects(encounter: &mut BattleEncounter) {
+    for index in 0..encounter.participants.len() {
+        if !encounter.participants[index].butterfly_enabled {
+            continue;
+        }
+        let Some(target_id) = encounter.participants[index].butterfly_target_id.clone() else {
+            continue;
+        };
+        let Some(target_index) = encounter
+            .participants
+            .iter()
+            .position(|participant| participant.target_id == target_id)
+        else {
+            continue;
+        };
+        if encounter.participants[index].butterfly_locked {
+            continue;
+        }
+        let holder_alive = encounter.participants[index].alive;
+        let target_alive = encounter.participants[target_index].alive;
+        if !holder_alive || !target_alive {
+            // 一方死亡：效果常驻存活一方，停止互换。
+            let on_holder = holder_alive;
+            encounter.participants[index].butterfly_locked = true;
+            encounter.participants[index].butterfly_effect_on_holder = on_holder;
+            encounter.participants[index].butterfly_initialized = true;
+            encounter.participants[index].butterfly_effect = on_holder;
+            encounter.participants[target_index].butterfly_effect = !on_holder;
+            continue;
+        }
+        if !encounter.participants[index].butterfly_initialized {
+            // 第一轮：指定目标先持有效果。
+            encounter.participants[index].butterfly_initialized = true;
+            encounter.participants[index].butterfly_effect_on_holder = false;
+        } else {
+            let next_on_holder = !encounter.participants[index].butterfly_effect_on_holder;
+            encounter.participants[index].butterfly_effect_on_holder = next_on_holder;
+        }
+        let on_holder = encounter.participants[index].butterfly_effect_on_holder;
+        encounter.participants[index].butterfly_effect = on_holder;
+        encounter.participants[target_index].butterfly_effect = !on_holder;
+    }
 }
 
 fn apply_penance_kill_assists(
@@ -4137,6 +4195,7 @@ impl BattleRoundStore {
         }
         encounter.round = encounter.round.saturating_add(1);
         advance_encounter_inspiration(encounter);
+        sync_butterfly_effects(encounter);
         let mut delayed_logs = Vec::new();
         let mut delayed_combat_log = Vec::new();
         let mut defeat_outcomes = Vec::new();
@@ -6957,6 +7016,12 @@ fn participant_from_character(
         sunset_enabled: character_sunset_available(character),
         sunset_death_time_reset_pending: false,
         goose_channeling_turns: 0,
+        butterfly_enabled: character_butterfly_available(character),
+        butterfly_target_id: None,
+        butterfly_effect_on_holder: false,
+        butterfly_initialized: false,
+        butterfly_locked: false,
+        butterfly_effect: false,
         liquid_body_damage_delay_rate: character_liquid_body_damage_delay_rate(character),
         liquid_body_self_healing_rate: character_liquid_body_self_healing_rate(character),
         calm_heart_healing_rate: character_calm_heart_healing_rate(character),
@@ -7093,6 +7158,12 @@ fn participant_from_unit_template(
         sunset_enabled: character_sunset_available(character),
         sunset_death_time_reset_pending: false,
         goose_channeling_turns: 0,
+        butterfly_enabled: character_butterfly_available(character),
+        butterfly_target_id: None,
+        butterfly_effect_on_holder: false,
+        butterfly_initialized: false,
+        butterfly_locked: false,
+        butterfly_effect: false,
         damage_taken_this_turn: character.damage_taken_this_turn,
         healing_taken_this_turn: character.healing_taken_this_turn,
         skill_last_used_turns: HashMap::new(),
@@ -7197,6 +7268,12 @@ fn participant_from_target(
         sunset_enabled: false,
         sunset_death_time_reset_pending: false,
         goose_channeling_turns: 0,
+        butterfly_enabled: false,
+        butterfly_target_id: None,
+        butterfly_effect_on_holder: false,
+        butterfly_initialized: false,
+        butterfly_locked: false,
+        butterfly_effect: false,
         damage_taken_this_turn: 0.0,
         healing_taken_this_turn: 0.0,
         skill_last_used_turns: HashMap::new(),
@@ -7268,6 +7345,7 @@ fn sync_participant_from_manager(
             participant.hope_avatar_enabled = character_hope_avatar_available(&character);
             participant.mirror_coat_enabled = character_mirror_coat_available(&character);
             participant.sunset_enabled = character_sunset_available(&character);
+            participant.butterfly_enabled = character_butterfly_available(&character);
             participant.liquid_body_damage_delay_rate =
                 character_liquid_body_damage_delay_rate(&character);
             participant.liquid_body_self_healing_rate =
@@ -7366,6 +7444,17 @@ fn sync_participant_from_manager(
         participant.hope_avatar_enabled = character_hope_avatar_available(character);
         participant.mirror_coat_enabled = character_mirror_coat_available(character);
         participant.sunset_enabled = character_sunset_available(character);
+        participant.butterfly_enabled = character_butterfly_available(character);
+        participant.butterfly_target_id = manager
+            .trpg_groups
+            .values()
+            .find(|group| {
+                group
+                    .players
+                    .iter()
+                    .any(|player| player == &participant.target_id)
+            })
+            .and_then(|group| group.butterfly_targets.get(&participant.target_id).cloned());
         participant.liquid_body_damage_delay_rate =
             character_liquid_body_damage_delay_rate(character);
         participant.liquid_body_self_healing_rate =
@@ -7416,6 +7505,8 @@ fn sync_participant_from_manager(
         participant.hope_avatar_enabled = false;
         participant.mirror_coat_enabled = false;
         participant.sunset_enabled = false;
+        participant.butterfly_enabled = false;
+        participant.butterfly_target_id = None;
         participant.liquid_body_damage_delay_rate = 0.0;
         participant.liquid_body_self_healing_rate = 0.0;
         participant.calm_heart_healing_rate = 0.0;
@@ -8082,6 +8173,10 @@ fn participant_damage_modifiers(
         ("低生命/疲惫行者", low_hp_multiplier),
         ("混沌输出", chaos_multiplier),
         ("勇战", valorous_multiplier),
+        (
+            "蝴蝶效应",
+            if participant.butterfly_effect { 1.05 } else { 1.0 },
+        ),
     ]
     .into_iter()
     .filter(|(source, multiplier)| {
@@ -8147,6 +8242,10 @@ fn participant_damage_taken_modifiers(
         ("强者减伤", champion),
         ("伤害类型抗性", typed),
         ("战意", fighting_spirit),
+        (
+            "蝴蝶效应",
+            if participant.butterfly_effect { 0.95 } else { 1.0 },
+        ),
     ]
     .into_iter()
     .filter(|(_, multiplier)| (*multiplier - 1.0).abs() > f32::EPSILON)
@@ -8862,6 +8961,12 @@ mod area_tests {
             sunset_enabled: false,
             sunset_death_time_reset_pending: false,
             goose_channeling_turns: 0,
+            butterfly_enabled: false,
+            butterfly_target_id: None,
+            butterfly_effect_on_holder: false,
+            butterfly_initialized: false,
+            butterfly_locked: false,
+            butterfly_effect: false,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             calm_heart_healing_rate: 0.0,
@@ -9049,6 +9154,12 @@ mod tests {
             sunset_enabled: false,
             sunset_death_time_reset_pending: false,
             goose_channeling_turns: 0,
+            butterfly_enabled: false,
+            butterfly_target_id: None,
+            butterfly_effect_on_holder: false,
+            butterfly_initialized: false,
+            butterfly_locked: false,
+            butterfly_effect: false,
             liquid_body_damage_delay_rate: 0.0,
             liquid_body_self_healing_rate: 0.0,
             calm_heart_healing_rate: 0.0,
@@ -15060,6 +15171,110 @@ mod tests {
 
         assert_eq!(holder.goose_channeling_turns, 0);
         assert!((holder.hp - 90.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn butterfly_effect_alternates_between_holder_and_target_each_round() {
+        let mut holder = participant("holder", 0);
+        holder.butterfly_enabled = true;
+        holder.butterfly_target_id = Some("target".to_owned());
+        let target = participant("target", 0);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                participants: vec![holder, target],
+                ..Default::default()
+            });
+
+        // 第1轮：指定目标先持有效果。
+        assert!(store.next_round("battle"));
+        assert!(!store.encounters["battle"].participants[0].butterfly_effect);
+        assert!(store.encounters["battle"].participants[1].butterfly_effect);
+        // 第2轮：转移给持有者。
+        assert!(store.next_round("battle"));
+        assert!(store.encounters["battle"].participants[0].butterfly_effect);
+        assert!(!store.encounters["battle"].participants[1].butterfly_effect);
+        // 第3轮：回到目标。
+        assert!(store.next_round("battle"));
+        assert!(!store.encounters["battle"].participants[0].butterfly_effect);
+        assert!(store.encounters["battle"].participants[1].butterfly_effect);
+    }
+
+    #[test]
+    fn butterfly_effect_stays_on_survivor_when_target_dies() {
+        let mut holder = participant("holder", 0);
+        holder.hp = 50.0;
+        holder.max_hp = 50.0;
+        holder.butterfly_enabled = true;
+        holder.butterfly_target_id = Some("target".to_owned());
+        let mut target = participant("target", 0);
+        target.hp = 10.0;
+        target.max_hp = 10.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                participants: vec![holder, target],
+                ..Default::default()
+            });
+        assert!(store.next_round("battle"));
+        let target = &mut store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants[1];
+        target.hp = 0.0;
+        target.alive = false;
+
+        assert!(store.next_round("battle"));
+        let holder = &store.encounters["battle"].participants[0];
+        let target = &store.encounters["battle"].participants[1];
+        assert!(holder.butterfly_locked);
+        assert!(holder.butterfly_effect);
+        assert!(!target.butterfly_effect);
+        // 后续轮次不再互换。
+        assert!(store.next_round("battle"));
+        let holder = &store.encounters["battle"].participants[0];
+        assert!(holder.butterfly_effect);
+    }
+
+    #[test]
+    fn butterfly_modifiers_apply_damage_bonus_and_reduction() {
+        let mut holder = participant("holder", 0);
+        holder.butterfly_effect = true;
+        let config = TrpgBasicConfig::default();
+        let dealt = participant_damage_modifiers(
+            &holder,
+            None,
+            &config,
+            0,
+            DamageType::Physical,
+            true,
+        );
+        assert!(dealt.iter().any(|modifier| {
+            modifier.source == "蝴蝶效应" && (modifier.multiplier - 1.05).abs() < 0.0001
+        }));
+        let taken = participant_damage_taken_modifiers(
+            &holder,
+            None,
+            DamageType::Physical,
+            true,
+        );
+        assert!(taken.iter().any(|modifier| {
+            modifier.source == "蝴蝶效应" && (modifier.multiplier - 0.95).abs() < 0.0001
+        }));
+
+        holder.butterfly_effect = false;
+        let dealt = participant_damage_modifiers(
+            &holder,
+            None,
+            &config,
+            0,
+            DamageType::Physical,
+            true,
+        );
+        assert!(!dealt.iter().any(|modifier| modifier.source == "蝴蝶效应"));
     }
 
     #[test]
