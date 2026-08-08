@@ -1700,6 +1700,8 @@ fn default_allow_join_requests() -> bool { true }
 
 fn default_battle_sort_by_turn() -> bool { true }
 
+fn default_players_scene_capture_enabled() -> bool { true }
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct TrpgBasicConfig {
     #[serde(default = "default_base_max_hp")]
@@ -2066,6 +2068,9 @@ pub struct TrpgGroup {
     pub guide: String,
     #[serde(default = "default_allow_join_requests")]
     pub allow_join_requests: bool,
+    /// 是否允许所有玩家通过 .gc/.gc2（观察/观察视频）请求场景截图；GM 不受此限制。
+    #[serde(default = "default_players_scene_capture_enabled")]
+    pub players_scene_capture_enabled: bool,
     #[serde(default = "default_status_points")]
     pub initial_status_points: i32,
     #[serde(default = "default_exchange_points")]
@@ -2126,6 +2131,7 @@ impl Default for TrpgGroup {
             st_description: String::new(),
             guide: String::new(),
             allow_join_requests: default_allow_join_requests(),
+            players_scene_capture_enabled: default_players_scene_capture_enabled(),
             initial_status_points: default_status_points(),
             initial_exchange_points: default_exchange_points(),
             basic_config: TrpgBasicConfig::default(),
@@ -5011,6 +5017,13 @@ impl NapcatMessageManager {
         self.scene_capture_campaign_for_user(user_id).as_deref() == Some(campaign_id)
     }
 
+    pub fn scene_capture_command_allowed_for_user(&self, user_id: u64) -> bool {
+        self.is_gm_user(user_id)
+            || self
+                .current_group()
+                .is_some_and(|group| group.players_scene_capture_enabled)
+    }
+
     pub fn player_access_for_user(&self, player_id: u64) -> PlayerAccess {
         self.current_group()
             .map(|group| group.player_access(player_id))
@@ -7478,6 +7491,9 @@ fn scene_capture_request(
 
     let user_id = message.data.user_id;
     let campaign_id = manager.scene_capture_campaign_for_user(user_id)?;
+    if !manager.scene_capture_command_allowed_for_user(user_id) {
+        return None;
+    }
     Some(SceneCaptureRequest {
         user_id,
         campaign_id,
@@ -14883,6 +14899,58 @@ position_cells = [4, 5, 6]
             player_request.user_id,
             &player_request.campaign_id,
         ));
+    }
+
+    #[test]
+    fn scene_capture_player_toggle_blocks_players_but_not_gm() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
+            campaign_id: "campaign-a".to_owned(),
+            players: vec!["2".to_owned()],
+            gm_users: HashSet::from([9]),
+            players_scene_capture_enabled: false,
+            ..Default::default()
+        });
+        manager.current_trpg_group = Some("alpha".to_owned());
+
+        assert!(scene_capture_request(
+            &manager,
+            &test_private_message_from(2, ".gc"),
+        )
+        .is_none());
+        assert!(scene_capture_request(
+            &manager,
+            &test_private_message_from(2, ".gc2"),
+        )
+        .is_none());
+        assert_eq!(
+            scene_capture_request(
+                &manager,
+                &test_private_message_from(9, ".gc"),
+            )
+            .unwrap()
+            .user_id,
+            9
+        );
+
+        manager
+            .trpg_groups
+            .get_mut("alpha")
+            .unwrap()
+            .players_scene_capture_enabled = true;
+        let player_request = scene_capture_request(
+            &manager,
+            &test_private_message_from(2, ".gc2"),
+        )
+        .unwrap();
+        assert_eq!(player_request.kind, SceneCaptureKind::PanoramaVideo);
+    }
+
+    #[test]
+    fn scene_capture_player_toggle_defaults_to_enabled() {
+        let group: TrpgGroup = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(group.players_scene_capture_enabled);
+        assert!(TrpgGroup::default().players_scene_capture_enabled);
     }
 
     #[test]

@@ -14830,6 +14830,31 @@ fn trpg_group_settings_window(
                                             ));
                                         }
                                     });
+                                    ui.horizontal_wrapped(|ui| {
+                                        let players_capture_enabled =
+                                            group.players_scene_capture_enabled;
+                                        if ui
+                                            .button(if players_capture_enabled {
+                                                "禁止所有玩家使用观察(.gc/.gc2)"
+                                            } else {
+                                                "允许所有玩家使用观察(.gc/.gc2)"
+                                            })
+                                            .on_hover_text(
+                                                "一键允许或禁止所有玩家私聊发送 .gc/.gc2 观察请求；GM 自己不受限制",
+                                            )
+                                            .clicked()
+                                        {
+                                            group.players_scene_capture_enabled =
+                                                !players_capture_enabled;
+                                            changed = true;
+                                        }
+                                        if !players_capture_enabled {
+                                            ui.colored_label(
+                                                egui::Color32::LIGHT_RED,
+                                                "当前已禁止玩家观察",
+                                            );
+                                        }
+                                    });
 
                                     ui.label("公开说明");
                                     changed |= ui
