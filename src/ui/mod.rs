@@ -14847,7 +14847,7 @@ fn trpg_group_settings_window(
                                                 "允许所有玩家使用观察(.gc/.gc2)"
                                             })
                                             .on_hover_text(
-                                                "一键允许或禁止所有玩家私聊发送 .gc/.gc2 观察请求；GM 自己不受限制",
+                                                "一键允许或禁止所有账号（含GM）私聊发送 .gc/.gc2 观察请求；GM 仍可通过聊天窗口按钮强制发送",
                                             )
                                             .clicked()
                                         {

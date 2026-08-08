@@ -2068,7 +2068,8 @@ pub struct TrpgGroup {
     pub guide: String,
     #[serde(default = "default_allow_join_requests")]
     pub allow_join_requests: bool,
-    /// 是否允许所有玩家通过 .gc/.gc2（观察/观察视频）请求场景截图；GM 不受此限制。
+    /// 是否允许通过 .gc/.gc2（观察/观察视频）聊天命令请求场景截图；
+    /// 关闭后聊天命令对所有账号（含GM）失效，GM仍可通过界面按钮强制发送。
     #[serde(default = "default_players_scene_capture_enabled")]
     pub players_scene_capture_enabled: bool,
     #[serde(default = "default_status_points")]
@@ -5017,11 +5018,9 @@ impl NapcatMessageManager {
         self.scene_capture_campaign_for_user(user_id).as_deref() == Some(campaign_id)
     }
 
-    pub fn scene_capture_command_allowed_for_user(&self, user_id: u64) -> bool {
-        self.is_gm_user(user_id)
-            || self
-                .current_group()
-                .is_some_and(|group| group.players_scene_capture_enabled)
+    pub fn scene_capture_command_allowed(&self) -> bool {
+        self.current_group()
+            .is_some_and(|group| group.players_scene_capture_enabled)
     }
 
     pub fn player_access_for_user(&self, player_id: u64) -> PlayerAccess {
@@ -7491,7 +7490,7 @@ fn scene_capture_request(
 
     let user_id = message.data.user_id;
     let campaign_id = manager.scene_capture_campaign_for_user(user_id)?;
-    if !manager.scene_capture_command_allowed_for_user(user_id) {
+    if !manager.scene_capture_command_allowed() {
         return None;
     }
     Some(SceneCaptureRequest {
@@ -14902,7 +14901,7 @@ position_cells = [4, 5, 6]
     }
 
     #[test]
-    fn scene_capture_player_toggle_blocks_players_but_not_gm() {
+    fn scene_capture_toggle_blocks_chat_commands_for_everyone() {
         let mut manager = empty_manager();
         manager.trpg_groups.insert("alpha".to_owned(), TrpgGroup {
             campaign_id: "campaign-a".to_owned(),
@@ -14923,15 +14922,12 @@ position_cells = [4, 5, 6]
             &test_private_message_from(2, ".gc2"),
         )
         .is_none());
-        assert_eq!(
-            scene_capture_request(
-                &manager,
-                &test_private_message_from(9, ".gc"),
-            )
-            .unwrap()
-            .user_id,
-            9
-        );
+        assert!(scene_capture_request(
+            &manager,
+            &test_private_message_from(9, ".gc"),
+        )
+        .is_none());
+        assert!(manager.can_serve_scene_capture(9, "campaign-a"));
 
         manager
             .trpg_groups
@@ -14944,6 +14940,15 @@ position_cells = [4, 5, 6]
         )
         .unwrap();
         assert_eq!(player_request.kind, SceneCaptureKind::PanoramaVideo);
+        assert_eq!(
+            scene_capture_request(
+                &manager,
+                &test_private_message_from(9, ".gc"),
+            )
+            .unwrap()
+            .user_id,
+            9
+        );
     }
 
     #[test]
