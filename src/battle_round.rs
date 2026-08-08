@@ -2884,7 +2884,6 @@ fn create_encounter_ui(
                     name,
                     group_name.to_owned(),
                     group,
-                    manager,
                 );
                 store.active_encounter_id = Some(encounter_id);
                 ui_state.new_encounter_name.clear();
@@ -2892,6 +2891,7 @@ fn create_encounter_ui(
             }
         }
     });
+    ui.small("创建后名单为空，可在战斗轮内逐个添加玩家、单位和召唤物。");
 
     changed
 }
@@ -3051,7 +3051,11 @@ fn encounter_ui(
                     .checkbox(&mut encounter.sort_by_turn, "排序")
                     .on_hover_text("仅按AGI排序行动顺序。")
                     .changed();
-                if ui.button("刷新玩家").clicked() {
+                if ui
+                    .button("刷新玩家")
+                    .on_hover_text("从TRPG组重新同步所有玩家；未在名单中的玩家会被重新加入。")
+                    .clicked()
+                {
                     changed |= refresh_encounter_players(encounter, manager);
                 }
                 if ui.button("下一轮").clicked() {
@@ -3493,7 +3497,11 @@ fn encounter_roster_ui(
             if participant.action_done {
                 ui.small("已完成");
             }
-            if ui.button("移除").clicked() {
+            if ui
+                .button("移出")
+                .on_hover_text("移出战斗轮")
+                .clicked()
+            {
                 remove = true;
             }
         });
@@ -3588,6 +3596,37 @@ fn encounter_roster_ui(
         });
     }
 
+    let mut remove_unit_id: Option<String> = None;
+    let joined_units = encounter
+        .participants
+        .iter()
+        .filter(|participant| {
+            participant.unit_template_id.is_some() && !participant.is_summon
+        })
+        .map(|participant| {
+            (
+                participant.target_id.clone(),
+                participant.display_name.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !joined_units.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("已加入单位");
+            for (target_id, display_name) in &joined_units {
+                ui.group(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(display_name);
+                        ui.small(target_id);
+                        if ui.button("移出战斗轮").clicked() {
+                            remove_unit_id = Some(target_id.clone());
+                        }
+                    });
+                });
+            }
+        });
+    }
+
     let summon_candidates = available_summon_candidates(encounter, manager);
     if !summon_candidates.is_empty() {
         let selected = ui_state
@@ -3654,6 +3693,12 @@ fn encounter_roster_ui(
         });
     }
 
+    if let Some(target_id) = remove_unit_id {
+        encounter
+            .participants
+            .retain(|participant| participant.target_id != target_id);
+        changed = true;
+    }
     if changed {
         normalize_encounter_after_edit(encounter);
     }
@@ -4111,7 +4156,6 @@ impl BattleRoundStore {
         name: String,
         group_name: String,
         group: &TrpgGroup,
-        manager: &NapcatMessageManager,
     ) -> String {
         let campaign_id = trpg_group_campaign_id(group);
         if let Some(encounter_id) =
@@ -4120,21 +4164,6 @@ impl BattleRoundStore {
             return encounter_id.to_owned();
         }
         let encounter_id = self.allocate_encounter_id();
-        let mut seen_player_ids = HashSet::new();
-        let participants = group
-            .players
-            .iter()
-            .filter(|target_id| seen_player_ids.insert((*target_id).clone()))
-            .map(|target_id| {
-                let mut participant = participant_from_target(target_id, manager);
-                initialize_participant_clock(
-                    &mut participant,
-                    Some(&group_name),
-                    manager,
-                );
-                participant
-            })
-            .collect::<Vec<_>>();
 
         self.encounters
             .insert(encounter_id.clone(), BattleEncounter {
@@ -4147,7 +4176,7 @@ impl BattleRoundStore {
                 negative_enabled: group.battle_negative_enabled,
                 round: group.world_turn,
                 combat_completed_turns: 0,
-                participants,
+                participants: Vec::new(),
                 action_log: Vec::new(),
                 combat_log: Vec::new(),
                 combat_log_start: 0,
@@ -9766,7 +9795,6 @@ mod tests {
             "test".to_owned(),
             "party".to_owned(),
             &group,
-            &manager,
         );
 
         let encounter = &store.encounters[&encounter_id];
@@ -9775,6 +9803,15 @@ mod tests {
             encounter.trpg_campaign_id.as_deref(),
             Some("default")
         );
+        assert!(
+            encounter.participants.is_empty(),
+            "new battles must not auto-join all group players"
+        );
+        let encounter = store.encounters.get_mut(&encounter_id).unwrap();
+        assert!(refresh_encounter_players(
+            encounter,
+            &manager
+        ));
         assert_eq!(encounter.participants[0].turn, 6);
         assert_eq!(
             encounter.participants[0].skill_last_used_turns,
@@ -9802,20 +9839,25 @@ mod tests {
             "test".to_owned(),
             "party".to_owned(),
             &group,
-            &manager,
         );
 
-        assert_eq!(
-            store.encounters[&encounter_id].participants.len(),
-            1
-        );
+        assert!(store.encounters[&encounter_id]
+            .participants
+            .is_empty());
+        {
+            let encounter = store.encounters.get_mut(&encounter_id).unwrap();
+            assert!(refresh_encounter_players(
+                encounter,
+                &manager
+            ));
+            assert_eq!(encounter.participants.len(), 1);
+        }
         assert!(store.finish_actor_action(&encounter_id, "a"));
         assert_eq!(store.encounters[&encounter_id].round, 1);
     }
 
     #[test]
     fn new_battle_id_wraps_and_skips_existing_imported_encounters() {
-        let mut manager = empty_manager();
         let group = TrpgGroup::default();
         let mut store = BattleRoundStore {
             next_encounter_index: u64::MAX,
@@ -9839,7 +9881,6 @@ mod tests {
             "new".to_owned(),
             "party".to_owned(),
             &group,
-            &manager,
         );
 
         assert_eq!(encounter_id, "battle-2");
@@ -9857,7 +9898,6 @@ mod tests {
 
     #[test]
     fn new_battle_reuses_the_canonical_encounter_for_its_group() {
-        let manager = empty_manager();
         let group = TrpgGroup::default();
         let mut store = BattleRoundStore {
             active_encounter_id: Some("battle-old".to_owned()),
@@ -9892,7 +9932,6 @@ mod tests {
             "replacement".to_owned(),
             "party".to_owned(),
             &group,
-            &manager,
         );
 
         assert_eq!(encounter_id, "battle-current");
@@ -9909,7 +9948,6 @@ mod tests {
 
     #[test]
     fn recreated_group_does_not_reuse_an_old_campaign_battle() {
-        let manager = empty_manager();
         let group = TrpgGroup {
             campaign_id: "party-2".to_owned(),
             ..Default::default()
@@ -9932,7 +9970,6 @@ mod tests {
             "new campaign".to_owned(),
             "party".to_owned(),
             &group,
-            &manager,
         );
 
         assert_ne!(encounter_id, "battle-old");
@@ -11410,6 +11447,61 @@ mod tests {
     }
 
     #[test]
+    fn removed_unit_participants_stay_out_of_linked_battle_roster() {
+        let mut manager = empty_manager();
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            players: vec!["pc".to_owned()],
+            ..Default::default()
+        });
+        manager
+            .player_characters
+            .insert("pc".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        manager.unit_pool.insert("slime".to_owned(), UnitPoolEntry {
+            category: String::new(),
+            label: "史莱姆".to_owned(),
+            note: String::new(),
+            legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 0.0,
+            character: PlayerCharacter {
+                hp: 6.0,
+                max_hp: 6.0,
+                ..Default::default()
+            },
+        });
+        let unit = manager.unit_pool["slime"].clone();
+        let mut encounter = BattleEncounter {
+            name: "battle".to_owned(),
+            trpg_group: Some("table".to_owned()),
+            participants: vec![
+                participant_from_unit_template("unit:slime", "slime", &unit),
+                participant("pc", 0),
+            ],
+            ..Default::default()
+        };
+
+        encounter
+            .participants
+            .retain(|participant| participant.target_id != "unit:slime");
+
+        assert!(!encounter
+            .participants
+            .iter()
+            .any(|participant| participant.target_id == "unit:slime"));
+        let roster_len_before_sync = encounter.participants.len();
+        refresh_encounter_players(&mut encounter, &manager);
+        assert_eq!(encounter.participants.len(), roster_len_before_sync);
+        assert!(!encounter
+            .participants
+            .iter()
+            .any(|participant| participant.target_id == "unit:slime"));
+    }
+
+    #[test]
     fn linked_battle_player_candidates_exclude_other_groups() {
         let mut manager = empty_manager();
         manager.player_characters.insert(
@@ -11461,7 +11553,6 @@ mod tests {
 
     #[test]
     fn group_battle_defaults_apply_to_new_encounters() {
-        let manager = empty_manager();
         let group = TrpgGroup {
             players: vec!["a".to_owned()],
             battle_sort_by_turn: false,
@@ -11474,13 +11565,15 @@ mod tests {
             "战斗".to_owned(),
             "party".to_owned(),
             &group,
-            &manager,
         );
 
         let encounter = &store.encounters[&encounter_id];
         assert!(!encounter.sort_by_turn);
         assert!(encounter.negative_enabled);
-        assert_eq!(encounter.participants.len(), 1);
+        assert!(
+            encounter.participants.is_empty(),
+            "new battles must not auto-join all group players"
+        );
     }
 
     #[test]
