@@ -8164,6 +8164,7 @@ fn moonberry_talent_effect_summary(talent: &MoonberryTalent) -> Option<&'static 
         "液态躯体" => Some("战斗轮中承伤50%延后一回合，且每回合回复上回合承伤5%"),
         "敏锐" => Some("战斗轮中第一次范围/非指向伤害100%闪避"),
         "镜像外衣" => Some("受到致命伤害时移除会造成伤害的有害buff、生命值变为1并获得镜像外衣；每5点魔法值再叠1层，隐身/脱离战斗轮需GM处理"),
+        "蝴蝶效应" => Some("跑团开始指定目标，5%伤害加成与减伤在持有者与目标间每回合互换；一方死亡后效果永久留在另一方"),
         _ => moonberry_talent_effect_category(talent.description),
     }
 }
