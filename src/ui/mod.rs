@@ -14752,7 +14752,7 @@ fn trpg_group_settings_window(
                                     })
                                     .cloned()
                                     .collect::<Vec<_>>();
-                                let butterfly_names = snapshot
+                                let mut butterfly_names = snapshot
                                     .players
                                     .iter()
                                     .map(|target_id| {
@@ -14761,6 +14761,13 @@ fn trpg_group_settings_window(
                                             target_display_name(manager, target_id),
                                         )
                                     })
+                                    .collect::<Vec<_>>();
+                                butterfly_names.sort_by(|a, b| {
+                                    a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+                                });
+                                let butterfly_name_lookup = butterfly_names
+                                    .iter()
+                                    .cloned()
                                     .collect::<HashMap<_, _>>();
                                 if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
                                     ui.horizontal(|ui| {
@@ -14883,7 +14890,7 @@ fn trpg_group_settings_window(
                                     if !butterfly_holders.is_empty() {
                                         ui.label("蝴蝶效应目标（除自身外）");
                                         for holder_id in &butterfly_holders {
-                                            let holder_name = butterfly_names
+                                            let holder_name = butterfly_name_lookup
                                                 .get(holder_id)
                                                 .cloned()
                                                 .unwrap_or_else(|| holder_id.clone());
@@ -14898,7 +14905,7 @@ fn trpg_group_settings_window(
                                             .selected_text(if selected.is_empty() {
                                                 "未指定".to_owned()
                                             } else {
-                                                butterfly_names
+                                                butterfly_name_lookup
                                                     .get(&selected)
                                                     .cloned()
                                                     .unwrap_or_else(|| selected.clone())
