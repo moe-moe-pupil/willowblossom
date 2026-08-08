@@ -44,7 +44,10 @@ use bevy::{
         MouseMotion,
         MouseWheel,
     },
-    light::NotShadowCaster,
+    light::{
+        NotShadowCaster,
+        NotShadowReceiver,
+    },
     math::{
         Affine2,
         Affine3A,
@@ -6788,6 +6791,8 @@ fn spawn_voxel_spaceship(
                                             materials.handles[material_id as usize - 1].clone(),
                                         ),
                                         VoxelSpaceshipHullMesh,
+                                        // 飞船不受阴影贴图影响。
+                                        NotShadowReceiver,
                                     ))
                                     .id(),
                             );
@@ -7721,7 +7726,9 @@ fn setup_voxel_view(
     commands.spawn((
         DirectionalLight {
             illuminance: DEFAULT_KEY_LIGHT_ILLUMINANCE,
-            shadow_maps_enabled: true,
+            // 场景主光关闭阴影贴图：屏幕视锥计算的级联阴影会在靠近大型物体时
+            // 投出巨大暗区（行星、狂妄号等），关闭后只保留屏幕空间接触阴影。
+            shadow_maps_enabled: false,
             contact_shadows_enabled: true,
             ..default()
         },
@@ -10458,8 +10465,9 @@ fn spawn_voxel_orbital_planet(
                             material_id,
                         )),
                         Transform::from_translation(center_offset),
-                        // 行星不投射阴影，避免穹顶在假地形上投出巨大阴影。
+                        // 行星不投射也不接收阴影，避免靠近时出现巨大暗区。
                         NotShadowCaster,
+                        NotShadowReceiver,
                     ))
                     .id(),
             );
@@ -10639,8 +10647,9 @@ fn setup_voxel_planet_shell(
         Transform::from_translation(ORBITAL_PLANET_CENTER)
             .with_rotation(Quat::from_rotation_arc(Vec3::Z, Vec3::Y)),
         Visibility::Visible,
-        // 行星不投射阴影，避免穹顶在假地形上投出巨大阴影。
+        // 行星不投射也不接收阴影，避免靠近时出现巨大暗区。
         NotShadowCaster,
+        NotShadowReceiver,
     ));
 
     // 半透明大气外壳，让星球外轮廓带一圈大气雾，并按昼夜改变辉光。
@@ -10713,6 +10722,7 @@ fn rebuild_voxel_orbital_planet(
                             )),
                             Transform::from_translation(Vec3::splat(-0.5 * VOXEL_SIZE)),
                             NotShadowCaster,
+                            NotShadowReceiver,
                         ))
                         .id(),
                 );
@@ -12350,6 +12360,7 @@ fn rebuild_voxel_spaceship_chunk(
                         Mesh3d(meshes.add(mesh)),
                         MeshMaterial3d(materials.handles[material_id as usize - 1].clone()),
                         VoxelSpaceshipHullMesh,
+                        NotShadowReceiver,
                     ))
                     .id(),
             );
