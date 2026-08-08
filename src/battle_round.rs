@@ -86,6 +86,7 @@ use crate::{
         character_sin_on_sin_exp_bonus_per_stack,
         character_sin_on_sin_recovery_rate,
         character_spell_range_multiplier,
+        character_summon_damage_multiplier,
         character_sunset_available,
         character_undying_rage_available,
         character_valorous_battle_damage_multiplier,
@@ -113,6 +114,7 @@ use crate::{
         NapcatMessageManager,
         PlayerCharacter,
         SkillRuleArgs,
+        Summon,
         TrpgBasicConfig,
         TrpgDamageBonusKind,
         TrpgDamageTakenKind,
@@ -214,6 +216,7 @@ pub struct BattleRoundUiState {
     selected_group: String,
     selected_add_player: HashMap<String, String>,
     selected_add_unit: HashMap<String, String>,
+    selected_add_summon: HashMap<String, (String, usize)>,
     selected_action_target: HashMap<String, String>,
     selected_action_actor: HashMap<String, String>,
     selected_skill_index: HashMap<String, usize>,
@@ -244,7 +247,11 @@ impl BattleRoundStore {
             let previous_participant_len = encounter.participants.len();
             encounter
                 .participants
-                .retain(|participant| participant.target_id != target_id);
+                .retain(|participant| {
+                    participant.target_id != target_id
+                        && !(participant.is_summon
+                            && participant.summon_owner_id.as_deref() == Some(target_id))
+                });
             removed += previous_participant_len - encounter.participants.len();
 
             for participant in &mut encounter.participants {
@@ -387,6 +394,11 @@ pub struct BattleParticipantSnapshot {
     pub unit_character: Option<PlayerCharacter>,
     #[serde(default)]
     pub player_character: bool,
+    /// 召唤物参与者：等级=主人等级，生命=召唤物数据，不受低血伤害减少。
+    #[serde(default)]
+    pub is_summon: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summon_owner_id: Option<String>,
     #[serde(default = "default_participant_level")]
     pub level: i32,
     #[serde(default)]
@@ -2466,6 +2478,8 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant.display_name.hash(&mut hasher);
             participant.unit_template_id.hash(&mut hasher);
             participant.player_character.hash(&mut hasher);
+            participant.is_summon.hash(&mut hasher);
+            participant.summon_owner_id.hash(&mut hasher);
             participant.turn.hash(&mut hasher);
             participant.combat_turns_completed.hash(&mut hasher);
             participant.str_.hash(&mut hasher);
@@ -3569,6 +3583,72 @@ fn encounter_roster_ui(
                         &target_id, unit_id, unit,
                     ));
                     changed = true;
+                }
+            }
+        });
+    }
+
+    let summon_candidates = available_summon_candidates(encounter, manager);
+    if !summon_candidates.is_empty() {
+        let selected = ui_state
+            .selected_add_summon
+            .entry(encounter_id.to_owned())
+            .or_insert_with(|| (summon_candidates[0].0.clone(), summon_candidates[0].1));
+        if !summon_candidates
+            .iter()
+            .any(|(owner_id, index, _)| owner_id == &selected.0 && *index == selected.1)
+        {
+            *selected = (summon_candidates[0].0.clone(), summon_candidates[0].1);
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("添加召唤物");
+            egui::ComboBox::from_id_salt(format!(
+                "battle_add_summon_{encounter_id}"
+            ))
+            .selected_text(
+                summon_candidates
+                    .iter()
+                    .find(|(owner_id, index, _)| {
+                        owner_id == &selected.0 && *index == selected.1
+                    })
+                    .map(|(_, _, label)| label.as_str())
+                    .unwrap_or(selected.0.as_str()),
+            )
+            .show_ui(ui, |ui| {
+                for (owner_id, index, label) in &summon_candidates {
+                    ui.selectable_value(
+                        selected,
+                        (owner_id.clone(), *index),
+                        label,
+                    );
+                }
+            });
+            if ui.button("添加").clicked() {
+                if let Some((owner_id, index)) = summon_candidates
+                    .iter()
+                    .find(|(owner_id, index, _)| {
+                        owner_id == &selected.0 && *index == selected.1
+                    })
+                    .map(|(owner_id, index, _)| (owner_id.clone(), *index))
+                {
+                    if let (Some(owner), Some(summon)) = (
+                        manager.player_characters.get(&owner_id),
+                        manager
+                            .player_characters
+                            .get(&owner_id)
+                            .and_then(|owner| owner.summons.get(index)),
+                    ) {
+                        let summon = summon.clone();
+                        let owner = owner.clone();
+                        encounter.participants.push(participant_from_summon(
+                            &owner_id,
+                            index,
+                            &summon,
+                            &owner,
+                            manager,
+                        ));
+                        changed = true;
+                    }
                 }
             }
         });
@@ -6062,6 +6142,35 @@ fn sync_encounter_to_manager(
     let mut changed = false;
 
     for participant in &encounter.participants {
+        if participant.is_summon {
+            let Some(owner_id) = participant.summon_owner_id.as_deref() else {
+                continue;
+            };
+            if linked_player_ids
+                .as_ref()
+                .is_some_and(|player_ids| !player_ids.contains(owner_id))
+            {
+                continue;
+            }
+            let Some(index) = crate::napcat::parse_summon_target_id(&participant.target_id)
+                .map(|(_, index)| index)
+            else {
+                continue;
+            };
+            let stat_config = manager.character_stat_config_for_target(owner_id);
+            let Some(character) = manager.player_characters.get_mut(owner_id) else {
+                continue;
+            };
+            let _ = crate::napcat::sync_character_summons(character, &stat_config);
+            if let Some(summon) = character.summons.get_mut(index) {
+                let hp = participant.hp.clamp(0.0, summon.max_hp.max(0.0));
+                if (summon.hp - hp).abs() > f32::EPSILON {
+                    summon.hp = hp;
+                    changed = true;
+                }
+            }
+            continue;
+        }
         if participant.unit_template_id.is_some() || !participant.player_character {
             continue;
         }
@@ -6949,6 +7058,8 @@ fn participant_from_character(
         unit_template_id: None,
         unit_character: None,
         player_character: true,
+        is_summon: false,
+        summon_owner_id: None,
         level: character.level.max(1),
         exp: character.exp.max(0),
         support_talent_experience_bonus_rate: character_support_talent_experience_bonus_rate(
@@ -7069,6 +7180,8 @@ fn participant_from_unit_template(
         unit_template_id: Some(unit_id.to_owned()),
         unit_character: Some(character.clone()),
         player_character: false,
+        is_summon: false,
+        summon_owner_id: None,
         level: character.level.max(1),
         exp: 0,
         support_talent_experience_bonus_rate: 0.0,
@@ -7185,6 +7298,8 @@ fn participant_from_target(
         unit_template_id: None,
         unit_character: None,
         player_character: false,
+        is_summon: false,
+        summon_owner_id: None,
         level: 1,
         exp: 0,
         support_talent_experience_bonus_rate: 0.0,
@@ -7281,10 +7396,121 @@ fn participant_from_target(
     }
 }
 
+/// 召唤物参与者：等级=主人等级，生命=召唤物当前值，伤害修正包含主人魅力的
+/// 召唤物伤害加成（每点魅力+2%），且不受自身低血伤害减少影响。
+fn participant_from_summon(
+    owner_id: &str,
+    summon_index: usize,
+    summon: &Summon,
+    owner: &PlayerCharacter,
+    manager: &NapcatMessageManager,
+) -> BattleParticipantSnapshot {
+    let mut participant = participant_from_target(owner_id, manager);
+    let target_id = crate::napcat::summon_target_id(owner_id, summon_index);
+    let owner_name = character_display_name(owner_id, owner, manager);
+    let summon_name = summon_display_name(summon);
+    let mut unit_character = PlayerCharacter::default();
+    unit_character.name = format!("{owner_name}的{summon_name}");
+    unit_character.level = owner.level.max(1);
+    unit_character.hp = summon.hp;
+    unit_character.max_hp = summon.max_hp;
+
+    participant.target_id = target_id.clone();
+    participant.display_name = unit_character.name.clone();
+    participant.unit_template_id = None;
+    participant.unit_character = Some(unit_character);
+    participant.player_character = false;
+    participant.is_summon = true;
+    participant.summon_owner_id = Some(owner_id.to_owned());
+    participant.level = owner.level.max(1);
+    participant.exp = 0;
+    participant.support_talent_experience_bonus_rate = 0.0;
+    participant.base_damage = 0.0;
+    participant.str_ = 0;
+    participant.agi = 0;
+    participant.dex = 0;
+    participant.int_ = 0;
+    participant.wis = 0;
+    participant.alive = summon.hp > 0.0;
+    participant.hp = summon.hp;
+    participant.max_hp = summon.max_hp;
+    participant.mp = 0.0;
+    participant.max_mp = 0.0;
+    participant.hp_regen = 0.0;
+    participant.mp_regen = 0.0;
+    participant.speed = 0.0;
+    participant.low_survivor_speed = 0.0;
+    participant.damage_dealt_modifier = character_summon_damage_multiplier(owner);
+    participant.damage_taken_modifier = 1.0;
+    participant.healing_dealt_modifier = 1.0;
+    participant.healing_taken_modifier = 1.0;
+    participant.skill_last_used_turns = HashMap::new();
+    participant.skill_cooldown_ready_turns = HashMap::new();
+    participant
+}
+
+fn summon_display_name(summon: &Summon) -> &str {
+    if summon.name.trim().is_empty() {
+        "召唤物"
+    } else {
+        summon.name.trim()
+    }
+}
+
 fn sync_participant_from_manager(
     participant: &mut BattleParticipantSnapshot,
     manager: &NapcatMessageManager,
 ) {
+    if participant.is_summon {
+        let Some(owner_id) = participant.summon_owner_id.clone() else {
+            return;
+        };
+        let Some(owner) = manager.player_characters.get(&owner_id) else {
+            return;
+        };
+        let Some(index) = crate::napcat::parse_summon_target_id(&participant.target_id)
+            .map(|(_, index)| index)
+        else {
+            return;
+        };
+        let Some(summon) = owner.summons.get(index) else {
+            return;
+        };
+        reset_non_player_participant_bonus_fields(participant);
+        let owner_name = character_display_name(&owner_id, owner, manager);
+        let summon_name = summon_display_name(summon);
+        participant.display_name = format!("{owner_name}的{summon_name}");
+        participant.player_character = false;
+        participant.level = owner.level.max(1);
+        participant.exp = 0;
+        participant.base_damage = 0.0;
+        participant.max_hp = summon.max_hp;
+        participant.max_mp = 0.0;
+        participant.hp_regen = 0.0;
+        participant.mp_regen = 0.0;
+        participant.speed = 0.0;
+        participant.low_survivor_speed = 0.0;
+        participant.str_ = 0;
+        participant.agi = 0;
+        participant.dex = 0;
+        participant.int_ = 0;
+        participant.wis = 0;
+        participant.damage_dealt_modifier = character_summon_damage_multiplier(owner);
+        participant.damage_taken_modifier = 1.0;
+        participant.healing_dealt_modifier = 1.0;
+        participant.healing_taken_modifier = 1.0;
+        participant.hp = summon.hp.clamp(0.0, participant.max_hp.max(0.0));
+        participant.mp = 0.0;
+        participant.alive = participant.hp > 0.0;
+        let mut unit_character = participant.unit_character.clone().unwrap_or_default();
+        unit_character.name = participant.display_name.clone();
+        unit_character.level = owner.level.max(1);
+        unit_character.hp = participant.hp;
+        unit_character.max_hp = participant.max_hp;
+        participant.unit_character = Some(unit_character);
+        return;
+    }
+
     if let Some(unit_id) = participant.unit_template_id.as_deref() {
         if let Some(unit) = manager.unit_pool.get(unit_id) {
             let mut character = character_for_participant(participant, manager)
@@ -7490,38 +7716,42 @@ fn sync_participant_from_manager(
         participant.mp = participant.mp.min(participant.max_mp);
         participant.alive = participant.hp > 0.0 || participant_hope_avatar_active(participant);
     } else {
-        participant.player_character = false;
-        participant.support_talent_experience_bonus_rate = 0.0;
-        participant.low_survivor_speed = participant.speed.max(0.0);
-        participant.arrogance_damage_bonus_per_source = 0.0;
-        participant.endless_pain_bonus_damage_per_stack = 0.0;
-        participant.infinite_focus_damage_bonus_per_stack = 0.0;
-        participant.one_heart_healing_bonus_per_stack = 0.0;
-        participant.inspiration_enabled = false;
-        sync_participant_keen_evasion(participant, false);
-        participant.arcane_shield_rate = 0.0;
-        participant.overhealing_shield_cap_rate = 0.0;
-        sync_participant_undying_rage(participant, false);
-        participant.hope_avatar_enabled = false;
-        participant.mirror_coat_enabled = false;
-        participant.sunset_enabled = false;
-        participant.butterfly_enabled = false;
-        participant.butterfly_target_id = None;
-        participant.liquid_body_damage_delay_rate = 0.0;
-        participant.liquid_body_self_healing_rate = 0.0;
-        participant.calm_heart_healing_rate = 0.0;
-        participant.rest_then_fight_healing_rate = 0.0;
-        participant.rest_then_fight_turns = 0;
-        participant.champion_damage_bonus_per_stack = 0.0;
-        participant.champion_damage_reduction_per_stack = 0.0;
-        participant.dominion_max_hp_gain_rate = 0.0;
-        participant.dominion_max_hp_bonus_cap = 0.0;
-        participant.dominion_max_hp_bonus = 0.0;
-        participant.sin_on_sin_exp_bonus_per_stack = 0.0;
-        participant.sin_on_sin_recovery_rate = 0.0;
-        participant.penance_healing_bonus_percent = 0.0;
+        reset_non_player_participant_bonus_fields(participant);
         participant.display_name = participant_display_name(&participant.target_id, manager);
     }
+}
+
+fn reset_non_player_participant_bonus_fields(participant: &mut BattleParticipantSnapshot) {
+    participant.player_character = false;
+    participant.support_talent_experience_bonus_rate = 0.0;
+    participant.low_survivor_speed = participant.speed.max(0.0);
+    participant.arrogance_damage_bonus_per_source = 0.0;
+    participant.endless_pain_bonus_damage_per_stack = 0.0;
+    participant.infinite_focus_damage_bonus_per_stack = 0.0;
+    participant.one_heart_healing_bonus_per_stack = 0.0;
+    participant.inspiration_enabled = false;
+    sync_participant_keen_evasion(participant, false);
+    participant.arcane_shield_rate = 0.0;
+    participant.overhealing_shield_cap_rate = 0.0;
+    sync_participant_undying_rage(participant, false);
+    participant.hope_avatar_enabled = false;
+    participant.mirror_coat_enabled = false;
+    participant.sunset_enabled = false;
+    participant.butterfly_enabled = false;
+    participant.butterfly_target_id = None;
+    participant.liquid_body_damage_delay_rate = 0.0;
+    participant.liquid_body_self_healing_rate = 0.0;
+    participant.calm_heart_healing_rate = 0.0;
+    participant.rest_then_fight_healing_rate = 0.0;
+    participant.rest_then_fight_turns = 0;
+    participant.champion_damage_bonus_per_stack = 0.0;
+    participant.champion_damage_reduction_per_stack = 0.0;
+    participant.dominion_max_hp_gain_rate = 0.0;
+    participant.dominion_max_hp_bonus_cap = 0.0;
+    participant.dominion_max_hp_bonus = 0.0;
+    participant.sin_on_sin_exp_bonus_per_stack = 0.0;
+    participant.sin_on_sin_recovery_rate = 0.0;
+    participant.penance_healing_bonus_percent = 0.0;
 }
 
 fn sync_participant_from_manager_with_vitals(
@@ -7746,6 +7976,40 @@ fn available_unit_templates(manager: &NapcatMessageManager) -> Vec<(String, Stri
     candidates
 }
 
+/// 所有可加入遭遇的召唤物（主人、索引、显示名），排除已在遭遇中的。
+fn available_summon_candidates(
+    encounter: &BattleEncounter,
+    manager: &NapcatMessageManager,
+) -> Vec<(String, usize, String)> {
+    let mut candidates = Vec::new();
+    for (owner_id, character) in &manager.player_characters {
+        for (index, summon) in character.summons.iter().enumerate() {
+            let target_id = crate::napcat::summon_target_id(owner_id, index);
+            if encounter
+                .participants
+                .iter()
+                .any(|participant| participant.target_id == target_id)
+            {
+                continue;
+            }
+            let owner_name = character_display_name(owner_id, character, manager);
+            let summon_name = summon_display_name(summon);
+            candidates.push((
+                owner_id.clone(),
+                index,
+                format!("{owner_name}：{summon_name}"),
+            ));
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.2
+            .cmp(&right.2)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    candidates
+}
+
 fn next_unit_participant_id(encounter: &BattleEncounter, unit_id: &str) -> String {
     let base = format!("unit:{unit_id}");
     if !encounter
@@ -7773,7 +8037,9 @@ fn character_for_participant(
     participant: &BattleParticipantSnapshot,
     manager: &NapcatMessageManager,
 ) -> Option<PlayerCharacter> {
-    let mut character = if let Some(unit_id) = participant.unit_template_id.as_deref() {
+    let mut character = if participant.is_summon {
+        participant.unit_character.clone()?
+    } else if let Some(unit_id) = participant.unit_template_id.as_deref() {
         participant.unit_character.clone().or_else(|| {
             manager
                 .unit_pool
@@ -8140,13 +8406,18 @@ fn participant_damage_modifiers(
         participant.champion_damage_bonus_per_stack,
         participant.champion_stacks,
     );
-    let low_hp_multiplier = low_hp_damage_multiplier_with_fatigue(
-        participant.hp,
-        participant.max_hp,
-        character
-            .map(character_fatigue_walker_available)
-            .unwrap_or(false),
-    );
+    // 召唤物不会因为自身生命值低下而受到伤害减少。
+    let low_hp_multiplier = if participant.is_summon {
+        1.0
+    } else {
+        low_hp_damage_multiplier_with_fatigue(
+            participant.hp,
+            participant.max_hp,
+            character
+                .map(character_fatigue_walker_available)
+                .unwrap_or(false),
+        )
+    };
     let chaos_multiplier = character
         .map(character_chaos_output_variance)
         .map(moonberry_chaos_output_multiplier)
@@ -8900,6 +9171,8 @@ mod area_tests {
             unit_template_id: None,
             unit_character: None,
             player_character: false,
+            is_summon: false,
+            summon_owner_id: None,
             level: 1,
             exp: 0,
             support_talent_experience_bonus_rate: 0.0,
@@ -9062,6 +9335,100 @@ mod tests {
         assert_eq!(target, "b");
     }
 
+    #[test]
+    fn summon_participant_uses_owner_level_and_charisma_damage_bonus() {
+        let mut manager = empty_manager();
+        let mut owner = PlayerCharacter::default();
+        owner.inited = true;
+        owner.level = 7;
+        owner.status.cha = 10;
+        let mut summon = Summon::default();
+        summon.name = "小火灵".to_owned();
+        summon.max_hp = 20.0;
+        summon.hp = 12.0;
+        manager
+            .player_characters
+            .insert("10001".to_owned(), owner.clone());
+
+        let participant = participant_from_summon("10001", 0, &summon, &owner, &manager);
+        assert!(participant.is_summon);
+        assert_eq!(participant.summon_owner_id.as_deref(), Some("10001"));
+        assert_eq!(participant.target_id, "summon:10001:0");
+        assert_eq!(participant.level, 7);
+        assert!((participant.hp - 12.0).abs() < f32::EPSILON);
+        assert!((participant.max_hp - 20.0).abs() < f32::EPSILON);
+        // 10点魅力 → +20%召唤物伤害。
+        assert!((participant.damage_dealt_modifier - 1.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn summon_participant_ignores_low_hp_damage_penalty() {
+        let mut manager = empty_manager();
+        let mut owner = PlayerCharacter::default();
+        owner.level = 5;
+        owner.status.cha = 5;
+        let mut summon = Summon::default();
+        summon.max_hp = 20.0;
+        summon.hp = 2.0; // 仅10%生命，普通角色会吃到严重低血惩罚。
+        manager
+            .player_characters
+            .insert("10001".to_owned(), owner.clone());
+        let participant = participant_from_summon("10001", 0, &summon, &owner, &manager);
+        let config = TrpgBasicConfig::default();
+        let modifiers = participant_damage_modifiers(
+            &participant,
+            None,
+            &config,
+            0,
+            DamageType::Magical,
+            true,
+        );
+        assert!(
+            !modifiers
+                .iter()
+                .any(|modifier| modifier.source == "低生命/疲惫行者")
+        );
+        // 相同生命下普通角色会吃到0.1倍低血惩罚，召唤物不受影响。
+        let low_hp_multiplier = low_hp_damage_multiplier_with_fatigue(2.0, 20.0, false);
+        assert!((low_hp_multiplier - 0.1).abs() < 0.0001);
+        let summon_multiplier = participant_damage_multiplier(
+            &participant,
+            None,
+            &config,
+            0,
+            DamageType::Magical,
+            true,
+        );
+        assert!((summon_multiplier - 1.1).abs() < 0.0001);
+    }
+
+    #[test]
+    fn battle_sync_writes_summon_hp_back_to_owner() {
+        let mut manager = empty_manager();
+        let mut owner = PlayerCharacter::default();
+        owner.inited = true;
+        owner.level = 5;
+        let mut summon = Summon::default();
+        summon.max_hp = 20.0;
+        summon.hp = 20.0;
+        owner.summons.push(summon);
+        manager
+            .player_characters
+            .insert("10001".to_owned(), owner);
+
+        let owner = manager.player_characters["10001"].clone();
+        let summon = owner.summons[0].clone();
+        let mut participant = participant_from_summon("10001", 0, &summon, &owner, &manager);
+        participant.hp = 3.0;
+        let encounter = BattleEncounter {
+            participants: vec![participant],
+            ..Default::default()
+        };
+
+        assert!(sync_encounter_to_manager(Some(&encounter), &mut manager));
+        assert_eq!(manager.player_characters["10001"].summons[0].hp, 3.0);
+    }
+
     fn empty_manager() -> NapcatMessageManager {
         NapcatMessageManager {
             messages: HashMap::default(),
@@ -9093,6 +9460,8 @@ mod tests {
             unit_template_id: None,
             unit_character: None,
             player_character: false,
+            is_summon: false,
+            summon_owner_id: None,
             level: 1,
             exp: 0,
             support_talent_experience_bonus_rate: 0.0,

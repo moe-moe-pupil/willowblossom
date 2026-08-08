@@ -1271,6 +1271,47 @@ pub enum PortraitTransform {
 /// 内置默认头像的图片路径（相对仓库根目录）。
 pub const DEFAULT_AVATAR_IMAGE: &str = "assets/textures/default_avatar.png";
 
+/// 召唤物基础数量下限：即使魅力为0也至少能召唤1只。
+pub const SUMMON_BASE_CAP: usize = 1;
+/// 每点魅力提供的召唤物上限。
+pub const SUMMON_CAP_PER_CHARISMA: f32 = 0.05;
+/// 每点魅力提供的召唤物伤害加成。
+pub const SUMMON_DAMAGE_BONUS_PER_CHARISMA: f32 = 0.02;
+/// 每点魅力提供的NPC交流好感。
+pub const NPC_FAVORABILITY_PER_CHARISMA: f32 = 1.0;
+/// 召唤物基础生命值 = 同等级玩家基础生命的一半。
+pub const SUMMON_MAX_HP_RATIO: f32 = 0.5;
+/// 召唤物默认离主距离（米）。
+pub const SUMMON_BASE_RANGE_METERS: f32 = 15.0;
+
+/// 玩家的召唤物。等级始终等于玩家等级，基础生命值为同等级玩家的一半；
+/// 拥有自己的立牌，且不能离开主人太远。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Summon {
+    #[serde(default)]
+    pub name: String,
+    /// 召唤物立牌图片（本地路径或URL）。
+    #[serde(default)]
+    pub image: String,
+    #[serde(default = "default_summon_hp")]
+    pub hp: f32,
+    #[serde(default = "default_summon_hp")]
+    pub max_hp: f32,
+}
+
+impl Default for Summon {
+    fn default() -> Self {
+        Self {
+            name: "召唤物".to_owned(),
+            image: String::new(),
+            hp: default_summon_hp(),
+            max_hp: default_summon_hp(),
+        }
+    }
+}
+
+fn default_summon_hp() -> f32 { 5.0 }
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PlayerCharacter {
     #[serde(default)]
@@ -1343,6 +1384,9 @@ pub struct PlayerCharacter {
     pub buff_base_stats: Option<CharacterBuffBaseStats>,
     #[serde(default)]
     pub inventory: CharacterInventory,
+    /// 玩家召唤物：等级=玩家等级，基础生命=同等级玩家的一半。
+    #[serde(default)]
+    pub summons: Vec<Summon>,
     /// 「役于我手」在本剧情世界内累计的生命上限加成，随开团/结团重置。
     #[serde(default)]
     pub dominion_max_hp_bonus: f32,
@@ -1386,6 +1430,7 @@ impl Default for PlayerCharacter {
             active_buffs: Vec::new(),
             buff_base_stats: None,
             inventory: CharacterInventory::default(),
+            summons: Vec::new(),
             dominion_max_hp_bonus: 0.0,
         }
     }
@@ -8133,6 +8178,7 @@ fn moonberry_talent_effect_summary(talent: &MoonberryTalent) -> Option<&'static 
     match talent.name {
         "那美克星之慧" => Some("立即获得等级*2的知识额外值"),
         "物理专长" => Some("立即将知识基础值提升到至少2；炮塔效果需GM处理"),
+        "狂野召唤！" => Some("召唤物上限额外+1"),
         "苏萨斯之爪" => Some("物理伤害一回合后追加35%实际伤害的魔法伤害"),
         "役于我手" => Some("战斗轮中目标死亡时获得其5%最大生命值，上限为自身20%"),
         "无尽痛楚" => Some("战斗轮中每次实际承伤令下一次命中追加等级*1.5无类型伤害，上限2层"),
@@ -8145,7 +8191,8 @@ fn moonberry_talent_effect_summary(talent: &MoonberryTalent) -> Option<&'static 
         "混沌无序" => Some("每次伤害/治疗效果随机-15%~+15%"),
         "数魔转换器" => Some("远程伤害享受正向魔法伤害加成"),
         "瞄准镜Tex-30" => Some("远程技能射程至少为等级*15米"),
-        "魔网延伸" => Some("法术技能射程+5%；召唤距离需GM处理"),
+        "魔网延伸" => Some("法术技能射程+5%，召唤物离主距离+5%"),
+        "重命名吊牌" => Some("召唤物获得无限离主距离，超出原距离时暂时从世界卸载"),
         "狂风恶浪" => Some("常驻移动速度+20%；玩家目标存活数<=3时提升至35%"),
         "疾行如风" => Some("开团后+100%移动速度，进入战斗轮或10回合后失效"),
         "日薄崦嵫" => Some("超出10码后每1码减免1点伤害，至多减免20%；死亡后世界时间重置为18:00"),
@@ -9232,6 +9279,95 @@ pub fn character_spell_range_multiplier(character: &PlayerCharacter) -> f32 {
     } else {
         1.0
     }
+}
+
+/// 玩家当前召唤物上限：基础1只，每点魅力 +0.05（向下取整，1.25仍是1只）；
+/// 「狂野召唤！」天赋再额外提供1只。
+pub fn character_summon_cap(character: &PlayerCharacter) -> usize {
+    let cha = character_total_status(character).cha.max(0) as f32;
+    let base_cap = (SUMMON_BASE_CAP as f32 + cha * SUMMON_CAP_PER_CHARISMA)
+        .floor()
+        .max(SUMMON_BASE_CAP as f32) as usize;
+    if character_has_approved_moonberry_talent(character, "狂野召唤！") {
+        base_cap.saturating_add(1)
+    } else {
+        base_cap
+    }
+}
+
+/// 召唤物离主距离（米）：默认15米，「魔网延伸」+5%；
+/// 「重命名吊牌」提供无限距离（返回None）。
+pub fn character_summon_range_meters(character: &PlayerCharacter) -> Option<f32> {
+    if character_has_approved_moonberry_talent(character, "重命名吊牌") {
+        return None;
+    }
+    let multiplier = if character_has_approved_moonberry_talent(character, "魔网延伸") {
+        1.05
+    } else {
+        1.0
+    };
+    Some(SUMMON_BASE_RANGE_METERS * multiplier)
+}
+
+/// 同等级玩家不计属性点的基础生命值：base_max_hp + level * lv_max_hp。
+pub fn player_base_max_hp_for_level(level: i32, config: &TrpgBasicConfig) -> f32 {
+    (config.base_max_hp + level.max(1) as f32 * config.lv_max_hp).max(1.0)
+}
+
+/// 召唤物基础生命值：同等级玩家基础生命的一半。
+pub fn summon_max_hp_for_level(level: i32, config: &TrpgBasicConfig) -> f32 {
+    (player_base_max_hp_for_level(level, config) * SUMMON_MAX_HP_RATIO).max(1.0)
+}
+
+/// 魅力提供的召唤物伤害加成倍率：每点魅力 +2%。
+pub fn character_summon_damage_multiplier(character: &PlayerCharacter) -> f32 {
+    1.0 + character_total_status(character).cha.max(0) as f32
+        * SUMMON_DAMAGE_BONUS_PER_CHARISMA
+}
+
+/// 魅力提供的NPC交流好感：每点魅力 +1。
+pub fn character_npc_favorability_bonus(character: &PlayerCharacter) -> f32 {
+    character_total_status(character).cha.max(0) as f32 * NPC_FAVORABILITY_PER_CHARISMA
+}
+
+/// 召唤物立牌与战斗参与者的稳定目标ID：`summon:<玩家ID>:<索引>`。
+pub fn summon_target_id(owner_id: &str, index: usize) -> String {
+    format!("summon:{owner_id}:{index}")
+}
+
+/// 解析召唤物目标ID，返回（主人玩家ID，召唤物索引）。
+pub fn parse_summon_target_id(target_id: &str) -> Option<(String, usize)> {
+    let rest = target_id.strip_prefix("summon:")?;
+    let (owner_id, index) = rest.rsplit_once(':')?;
+    Some((owner_id.to_owned(), index.parse().ok()?))
+}
+
+/// 同步召唤物：等级跟随玩家、基础生命为同等级玩家一半、数量不超过魅力上限，
+/// 当前生命值保持在有效范围内。返回是否有变化。
+pub fn sync_character_summons(character: &mut PlayerCharacter, config: &TrpgBasicConfig) -> bool {
+    let mut changed = false;
+    let cap = character_summon_cap(character);
+    if character.summons.len() > cap {
+        character.summons.truncate(cap);
+        changed = true;
+    }
+    let expected_max_hp = summon_max_hp_for_level(character.level, config);
+    for summon in &mut character.summons {
+        if summon.name.trim().is_empty() {
+            summon.name = "召唤物".to_owned();
+            changed = true;
+        }
+        if (summon.max_hp - expected_max_hp).abs() > f32::EPSILON {
+            summon.max_hp = expected_max_hp;
+            changed = true;
+        }
+        let clamped_hp = summon.hp.clamp(0.0, summon.max_hp);
+        if (summon.hp - clamped_hp).abs() > f32::EPSILON {
+            summon.hp = clamped_hp;
+            changed = true;
+        }
+    }
+    changed
 }
 
 pub fn character_gale_force_battle_speeds(character: &PlayerCharacter) -> Option<(f32, f32)> {
@@ -16743,6 +16879,114 @@ position_cells = [4, 5, 6]
 
         assert!((low_hp_damage_multiplier_with_fatigue(5.0, 10.0, true) - 0.8).abs() < 0.0001);
         assert!((low_hp_damage_multiplier_with_fatigue(0.1, 10.0, true) - 0.24).abs() < 0.0001);
+    }
+
+    #[test]
+    fn summon_cap_uses_charisma_floor_and_wild_talent_bonus() {
+        let config = TrpgBasicConfig::default();
+        let mut character = PlayerCharacter::default();
+        character.inited = true;
+        character.level = 5;
+        update_character_from_status_with_config(&mut character, &config);
+        assert_eq!(character_summon_cap(&character), SUMMON_BASE_CAP);
+
+        character.status.cha = 5;
+        // 1 + 5*0.05 = 1.25，向下取整仍是1。
+        assert_eq!(character_summon_cap(&character), 1);
+        character.status.cha = 20;
+        assert_eq!(character_summon_cap(&character), 2);
+        character.status.cha = 25;
+        // 1 + 25*0.05 = 2.25，向下取整为2。
+        assert_eq!(character_summon_cap(&character), 2);
+        character.status.cha = 40;
+        assert_eq!(character_summon_cap(&character), 3);
+
+        character.skill_names.push("狂野召唤！".to_owned());
+        character
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent("normal_talent", "天赋"));
+        assert_eq!(character_summon_cap(&character), 4);
+    }
+
+    #[test]
+    fn summon_max_hp_is_half_of_same_level_player_base_hp() {
+        let config = TrpgBasicConfig::default();
+        // 默认配置：base_max_hp=10，lv_max_hp=5。
+        assert_eq!(config.base_max_hp, 10.0);
+        assert_eq!(config.lv_max_hp, 5.0);
+        assert!((summon_max_hp_for_level(1, &config) - 7.5).abs() < f32::EPSILON);
+        assert!((summon_max_hp_for_level(3, &config) - 12.5).abs() < f32::EPSILON);
+        assert!((player_base_max_hp_for_level(3, &config) - 25.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn charisma_scales_summon_damage_and_npc_favorability() {
+        let mut character = PlayerCharacter::default();
+        character.status.cha = 10;
+        assert!((character_summon_damage_multiplier(&character) - 1.2).abs() < f32::EPSILON);
+        assert!((character_npc_favorability_bonus(&character) - 10.0).abs() < f32::EPSILON);
+
+        character.extra_status.cha = 5;
+        assert!((character_summon_damage_multiplier(&character) - 1.3).abs() < f32::EPSILON);
+        assert!((character_npc_favorability_bonus(&character) - 15.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn summon_range_respects_weave_and_rename_talents() {
+        let mut character = PlayerCharacter::default();
+        assert_eq!(
+            character_summon_range_meters(&character),
+            Some(SUMMON_BASE_RANGE_METERS)
+        );
+
+        character.skill_names.push("魔网延伸".to_owned());
+        character
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent("normal_talent", "天赋"));
+        assert_eq!(
+            character_summon_range_meters(&character),
+            Some(SUMMON_BASE_RANGE_METERS * 1.05)
+        );
+
+        character.skill_names.push("重命名吊牌".to_owned());
+        character
+            .skill_metadata
+            .push(CharacterSkillMetadata::talent("normal_talent", "天赋"));
+        assert_eq!(character_summon_range_meters(&character), None);
+    }
+
+    #[test]
+    fn summon_target_id_round_trips() {
+        assert_eq!(summon_target_id("10001", 0), "summon:10001:0");
+        assert_eq!(
+            parse_summon_target_id("summon:10001:0"),
+            Some(("10001".to_owned(), 0))
+        );
+        assert_eq!(parse_summon_target_id("summon:abc:12"), Some(("abc".to_owned(), 12)));
+        assert_eq!(parse_summon_target_id("player:10001"), None);
+        assert_eq!(parse_summon_target_id("summon:10001:x"), None);
+    }
+
+    #[test]
+    fn sync_character_summons_enforces_cap_and_hp() {
+        let config = TrpgBasicConfig::default();
+        let mut character = PlayerCharacter::default();
+        character.level = 2;
+        character.status.cha = 25; // 上限2
+        character.summons = vec![Summon::default(), Summon::default(), Summon::default()];
+        character.summons[1].hp = 999.0;
+
+        assert!(sync_character_summons(&mut character, &config));
+        assert_eq!(character.summons.len(), 2);
+        let expected_max_hp = summon_max_hp_for_level(2, &config);
+        for summon in &character.summons {
+            assert!((summon.max_hp - expected_max_hp).abs() < f32::EPSILON);
+            assert!(summon.hp <= summon.max_hp);
+        }
+        assert!((character.summons[1].hp - expected_max_hp).abs() < f32::EPSILON);
+
+        // 再次同步无变化。
+        assert!(!sync_character_summons(&mut character, &config));
     }
 
     #[test]

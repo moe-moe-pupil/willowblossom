@@ -71,8 +71,12 @@ use crate::voxel::{
     clear_campaign_possession_movement,
     clear_player_camera,
     clear_player_possession_movement,
+    has_voxel_summon_standee,
     has_voxel_unit_standee,
+    place_voxel_summon_standee,
     place_voxel_unit_standee,
+    remove_voxel_summon_standee,
+    remove_voxel_summon_standees_for_owner,
     remove_voxel_unit_standee,
     voxel_spaceship_contains_position,
     voxel_spaceship_teleport_destination,
@@ -90,6 +94,7 @@ use crate::voxel::{
     VoxelPossessionMovementStore,
     VoxelPossessionState,
     VoxelSpaceship,
+    VoxelSummonStandeeStore,
     VoxelTargetingPreview,
     VoxelTeleportDestination,
     VoxelUnitStandeeStore,
@@ -794,6 +799,11 @@ use crate::{
         character_physical_damage_followup_rate,
         character_physical_damage_lifesteal,
         character_spell_range_multiplier,
+        character_summon_cap,
+        character_summon_damage_multiplier,
+        character_summon_range_meters,
+        character_total_status,
+        character_npc_favorability_bonus,
         character_wounded_healing_dealt_modifier,
         close_trpg_group_world,
         content_pool_generation_prompt,
@@ -811,6 +821,9 @@ use crate::{
         record_character_healing_taken,
         reset_character_turn_totals,
         skill_rule_args,
+        summon_max_hp_for_level,
+        summon_target_id,
+        sync_character_summons,
         update_character_from_status,
         update_character_from_status_with_config,
         upsert_character_active_buff,
@@ -846,6 +859,7 @@ use crate::{
         RandomPoolTextResult,
         SkillPoolEntry,
         SkillRuleArgs,
+        Summon,
         TextData,
         TrpgBasicConfig,
         TrpgDamageBonusKind,
@@ -1017,6 +1031,7 @@ pub(crate) struct CharacterEditState {
     skill_pool_selected_index: HashMap<String, usize>,
     item_pool_selected_index: HashMap<String, usize>,
     exp_award_drafts: HashMap<String, i32>,
+    summon_scene_status: HashMap<String, String>,
 }
 
 impl CharacterEditState {
@@ -1035,6 +1050,8 @@ impl CharacterEditState {
         self.skill_pool_selected_index.remove(target_id);
         self.item_pool_selected_index.remove(target_id);
         self.exp_award_drafts.remove(target_id);
+        self.summon_scene_status
+            .retain(|summon_id, _| !summon_id.starts_with(&format!("summon:{target_id}:")));
     }
 }
 
@@ -1098,6 +1115,7 @@ pub struct UiSystemLocals<'w, 's> {
     replay_ship_recorder: ResMut<'w, ReplayShipTrajectoryRecorder>,
     player_camera_store: ResMut<'w, Persistent<VoxelPlayerCameraStore>>,
     unit_standee_store: ResMut<'w, Persistent<VoxelUnitStandeeStore>>,
+    summon_standee_store: ResMut<'w, Persistent<VoxelSummonStandeeStore>>,
     player_standees: Query<
         'w,
         's,
@@ -5617,6 +5635,149 @@ fn character_status_summary_ui(ui: &mut Ui, character: &PlayerCharacter) {
         });
 }
 
+fn summon_panel_ui(
+    ui: &mut Ui,
+    target_id: &str,
+    character: &mut PlayerCharacter,
+    stat_config: TrpgBasicConfig,
+    edit_state: &mut CharacterEditState,
+    voxel_editor: &mut VoxelEditorState,
+    summon_standee_store: &mut Persistent<VoxelSummonStandeeStore>,
+) -> bool {
+    let mut changed = false;
+    changed |= sync_character_summons(character, &stat_config);
+    let total_status = character_total_status(character);
+    let cap = character_summon_cap(character);
+    let damage_bonus = character_summon_damage_multiplier(character) - 1.0;
+    let favorability = character_npc_favorability_bonus(character);
+    let range_text = match character_summon_range_meters(character) {
+        Some(range) => format!("{}米", format_character_number(range)),
+        None => "无限（重命名吊牌）".to_owned(),
+    };
+
+    egui::CollapsingHeader::new("召唤物")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.small(format!(
+                "等级=玩家等级（Lv {}），基础生命=同等级玩家的一半，不受自身低血伤害减少。",
+                character.level.max(1)
+            ));
+            ui.small(format!(
+                "上限 {}（魅力 {} 点：基础1 + 每点0.05，向下取整）；伤害加成 +{:.0}%（每点魅力+2%）；NPC交流好感 +{:.0}（每点魅力+1）；离主距离 {}",
+                cap,
+                total_status.cha,
+                damage_bonus * 100.0,
+                favorability,
+                range_text,
+            ));
+            ui.separator();
+
+            let mut summon_to_remove = None;
+            for (index, summon) in character.summons.iter_mut().enumerate() {
+                let summon_id = summon_target_id(target_id, index);
+                ui.horizontal_wrapped(|ui| {
+                    ui.small(format!("#{}", index + 1));
+                    changed |= ui.text_edit_singleline(&mut summon.name).changed();
+                    let max_hp = summon.max_hp;
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut summon.hp)
+                                .range(0.0..=max_hp)
+                                .speed(0.5)
+                                .prefix("HP "),
+                        )
+                        .changed();
+                    ui.small(format!("/{}", format_character_number(max_hp)));
+                    if ui.button("移除").clicked() {
+                        summon_to_remove = Some(index);
+                    }
+                });
+                changed |= ui
+                    .horizontal(|ui| {
+                        ui.small("立牌图片");
+                        ui.text_edit_singleline(&mut summon.image).changed()
+                    })
+                    .inner;
+                let image_source = summon.image.trim().to_owned();
+                let has_standee = has_voxel_summon_standee(summon_standee_store, &summon_id);
+                ui.horizontal_wrapped(|ui| {
+                    if has_standee {
+                        ui.small("召唤物立牌已在场景中（图片修改自动同步）");
+                    } else if ui
+                        .add_enabled(!image_source.is_empty(), egui::Button::new("创建立牌"))
+                        .on_hover_text("在当前GM视野焦点创建召唤物立牌")
+                        .on_disabled_hover_text("召唤物还没有立牌图片")
+                        .clicked()
+                    {
+                        let status = match place_voxel_summon_standee(
+                            &mut *summon_standee_store,
+                            &summon_id,
+                            &image_source,
+                            voxel_editor,
+                        ) {
+                            Ok(scene_changed) => match summon_standee_store.persist() {
+                                Ok(()) => {
+                                    if scene_changed {
+                                        "已在当前GM视野焦点创建召唤物立牌".to_owned()
+                                    } else {
+                                        "召唤物立牌已在场景中".to_owned()
+                                    }
+                                },
+                                Err(err) => format!("召唤物立牌保存失败：{err}"),
+                            },
+                            Err(err) => format!("召唤物立牌失败：{err}"),
+                        };
+                        edit_state
+                            .summon_scene_status
+                            .insert(summon_id.clone(), status);
+                    }
+                    if has_standee && ui.button("移出立牌").clicked() {
+                        let removed =
+                            remove_voxel_summon_standee(&mut *summon_standee_store, &summon_id);
+                        let status = if removed {
+                            match summon_standee_store.persist() {
+                                Ok(()) => "已移出召唤物立牌".to_owned(),
+                                Err(err) => format!("移出召唤物立牌保存失败：{err}"),
+                            }
+                        } else {
+                            "场景里没有这个召唤物立牌".to_owned()
+                        };
+                        edit_state
+                            .summon_scene_status
+                            .insert(summon_id.clone(), status);
+                    }
+                    if let Some(status) = edit_state.summon_scene_status.get(&summon_id) {
+                        ui.small(status);
+                    }
+                });
+                ui.separator();
+            }
+
+            if let Some(index) = summon_to_remove {
+                let summon_id = summon_target_id(target_id, index);
+                character.summons.remove(index);
+                if remove_voxel_summon_standee(&mut *summon_standee_store, &summon_id) {
+                    let _ = summon_standee_store.persist();
+                }
+                changed = true;
+            }
+
+            if character.summons.len() < cap {
+                if ui.button("添加召唤物").clicked() {
+                    let mut summon = Summon::default();
+                    summon.max_hp = summon_max_hp_for_level(character.level, &stat_config);
+                    summon.hp = summon.max_hp;
+                    character.summons.push(summon);
+                    changed = true;
+                }
+            } else {
+                ui.small("召唤物数量已达上限。");
+            }
+        });
+
+    changed
+}
+
 #[derive(Clone)]
 struct QuickCastSkill {
     index: usize,
@@ -5674,6 +5835,8 @@ fn quick_character_windows(
     rule_engine_state: &mut RuleEngineState,
     scene_positions: Option<&SceneCharacterPositions>,
     player_camera_positions: Option<&ScenePlayerCameraPositions>,
+    voxel_editor: &mut VoxelEditorState,
+    summon_standee_store: &mut Persistent<VoxelSummonStandeeStore>,
 ) {
     let mut target_ids = quick_character_targets.iter().cloned().collect::<Vec<_>>();
     target_ids.sort();
@@ -5735,6 +5898,16 @@ fn quick_character_windows(
                     changed = true;
                 }
                 character_status_summary_ui(ui, character);
+                ui.separator();
+                changed |= summon_panel_ui(
+                    ui,
+                    &target_id,
+                    character,
+                    stat_config,
+                    character_edit_state,
+                    voxel_editor,
+                    summon_standee_store,
+                );
                 ui.separator();
                 cast_action = quick_cast_ui(
                     ui,
@@ -14220,6 +14393,7 @@ fn trpg_group_settings_window(
     replay_movement_recorder: &mut ReplayMovementHistoryRecorder,
     replay_ship_recorder: &mut ReplayShipTrajectoryRecorder,
     player_camera_store: &mut Persistent<VoxelPlayerCameraStore>,
+    summon_standee_store: &mut Persistent<VoxelSummonStandeeStore>,
     player_view_request: Option<&mut ScenePlayerViewRequest>,
     napcat_sender: Option<&NapcatIOSender>,
     ime: &mut ImeManager,
@@ -15368,6 +15542,10 @@ fn trpg_group_settings_window(
                     battle_store.persist().ok();
                 }
             }
+            if remove_voxel_summon_standees_for_owner(summon_standee_store, &target_id) > 0
+            {
+                summon_standee_store.persist().ok();
+            }
             if let Ok(user_id) = target_id.parse::<u64>() {
                 if clear_player_camera(player_camera_store, user_id) {
                     player_camera_store.persist().ok();
@@ -15483,6 +15661,7 @@ pub fn ui_system(
     let replay_ship_recorder = &mut locals.replay_ship_recorder;
     let player_camera_store = &mut locals.player_camera_store;
     let unit_standee_store = &mut locals.unit_standee_store;
+    let summon_standee_store = &mut locals.summon_standee_store;
     let player_standees = &locals.player_standees;
     let teleport_spaceships = &locals.teleport_spaceships;
 
@@ -15580,6 +15759,7 @@ pub fn ui_system(
         replay_movement_recorder,
         replay_ship_recorder,
         player_camera_store,
+        summon_standee_store,
         player_view_request.as_deref_mut(),
         napcat_sender,
         &mut *ime,
@@ -15623,6 +15803,8 @@ pub fn ui_system(
         &mut rule_engine_state,
         scene_positions.as_deref(),
         player_camera_positions.as_deref(),
+        voxel_editor,
+        summon_standee_store,
     );
     pool_management_window(
         ctx,

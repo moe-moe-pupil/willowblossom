@@ -529,6 +529,14 @@ struct VoxelUnitStandee {
     access_visibility: AccessVisibility,
 }
 
+#[derive(Component)]
+struct VoxelSummonStandee {
+    summon_id: String,
+    owner_id: String,
+    image_source: String,
+    access_visibility: AccessVisibility,
+}
+
 #[cfg(test)]
 impl VoxelPlayerStandee {
     pub(crate) fn replay_test(user_id: u64) -> Self {
@@ -551,6 +559,14 @@ struct VoxelPlayerStandeeAssets {
 
 #[derive(Resource, Default)]
 struct VoxelUnitStandeeAssets {
+    entities: HashMap<String, Entity>,
+    textures: HashMap<String, Handle<Image>>,
+    back_label_texture: Option<Handle<Image>>,
+    failed_sources: HashSet<String>,
+}
+
+#[derive(Resource, Default)]
+struct VoxelSummonStandeeAssets {
     entities: HashMap<String, Entity>,
     textures: HashMap<String, Handle<Image>>,
     back_label_texture: Option<Handle<Image>>,
@@ -589,10 +605,24 @@ struct PersistedVoxelUnitStandee {
     visibility: AccessVisibility,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PersistedVoxelSummonStandee {
+    /// 召唤物稳定ID：`summon:<玩家ID>:<索引>`。
+    summon_id: String,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+}
+
 #[derive(Resource, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct VoxelUnitStandeeStore {
     #[serde(default)]
     standees: Vec<PersistedVoxelUnitStandee>,
+}
+
+#[derive(Resource, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct VoxelSummonStandeeStore {
+    #[serde(default)]
+    standees: Vec<PersistedVoxelSummonStandee>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2361,6 +2391,19 @@ impl Plugin for TrpgVoxelPlugin {
             .revert_to_default_on_deserialization_errors(true)
             .build()
             .expect("failed to initialize voxel unit standee store");
+        let summon_standee_store = Persistent::<VoxelSummonStandeeStore>::builder()
+            .name("voxel_summon_standees")
+            .format(StorageFormat::Toml)
+            .path(
+                Path::new(".data")
+                    .join("willowblossom")
+                    .join("voxel_summon_standees.toml"),
+            )
+            .default(VoxelSummonStandeeStore::default())
+            .revertible(true)
+            .revert_to_default_on_deserialization_errors(true)
+            .build()
+            .expect("failed to initialize voxel summon standee store");
         let possession_movement_store = Persistent::<VoxelPossessionMovementStore>::builder()
             .name("voxel_possession_movement")
             .format(StorageFormat::Toml)
@@ -2451,6 +2494,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPlayerCaptureState>()
         .init_resource::<VoxelPlayerStandeeAssets>()
         .init_resource::<VoxelUnitStandeeAssets>()
+        .init_resource::<VoxelSummonStandeeAssets>()
         .init_resource::<VoxelToolGunDragState>()
         .init_resource::<VoxelPhysicsChunkLoader>()
         .init_resource::<VoxelGeometryDirtyChunks>()
@@ -2464,6 +2508,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelReplayOcclusionFade>()
         .insert_resource(player_camera_store)
         .insert_resource(unit_standee_store)
+        .insert_resource(summon_standee_store)
         .insert_resource(possession_movement_store)
         .insert_resource(inventory_store)
         .insert_resource(toolbar_settings_store)
@@ -2551,6 +2596,8 @@ impl Plugin for TrpgVoxelPlugin {
                         sync_voxel_player_standees.in_set(VoxelPlayerStandeeSynced),
                         sync_voxel_standee_invisibility_render_layers,
                         sync_voxel_unit_standees,
+                        sync_voxel_summon_standees,
+                        clamp_voxel_summon_standees_to_owner_range,
                         sync_voxel_scene_character_positions,
                         sync_voxel_gm_map_state,
                         capture_voxel_player_view,
@@ -9324,10 +9371,243 @@ fn sync_voxel_unit_standees(
     }
 }
 
+fn summon_owner_access_visibility(manager: &NapcatMessageManager, owner_id: &str) -> AccessVisibility {
+    let party_id = owner_id
+        .parse::<u64>()
+        .ok()
+        .and_then(|user_id| manager.player_access_for_user(user_id).party_id);
+    match party_id {
+        Some(party_id) => AccessVisibility::Party(party_id),
+        None => AccessVisibility::Public,
+    }
+}
+
+fn active_voxel_summon_standees(
+    manager: &NapcatMessageManager,
+    store: &VoxelSummonStandeeStore,
+) -> HashMap<String, ActiveVoxelUnitStandee> {
+    store
+        .standees
+        .iter()
+        .filter_map(|persisted| {
+            let (owner_id, index) =
+                crate::napcat::parse_summon_target_id(&persisted.summon_id)?;
+            let summon = manager
+                .player_characters
+                .get(&owner_id)?
+                .summons
+                .get(index)?;
+            let image_source = summon.image.trim();
+            if image_source.is_empty() {
+                return None;
+            }
+            Some((
+                persisted.summon_id.clone(),
+                ActiveVoxelUnitStandee {
+                    target_id: persisted.summon_id.clone(),
+                    image_source: image_source.to_owned(),
+                    transform: Transform {
+                        translation: Vec3::from_array(persisted.translation),
+                        rotation: Quat::from_array(persisted.rotation).normalize(),
+                        scale: Vec3::ONE,
+                    },
+                    access_visibility: summon_owner_access_visibility(manager, &owner_id),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn sync_voxel_summon_standees(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut assets: ResMut<VoxelSummonStandeeAssets>,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    store: Res<Persistent<VoxelSummonStandeeStore>>,
+    existing: Query<(Entity, &VoxelSummonStandee), Without<VoxelPlayerStandee>>,
+    mut standee_transforms: Query<
+        &mut Transform,
+        (
+            With<VoxelSummonStandee>,
+            Without<VoxelPlayerStandee>,
+        ),
+    >,
+) {
+    let Some(manager) = manager else { return };
+    assets.entities.clear();
+    for (entity, standee) in &existing {
+        assets.entities.insert(standee.summon_id.clone(), entity);
+    }
+    let active = active_voxel_summon_standees(&manager, &store);
+
+    for (entity, standee) in &existing {
+        if active.contains_key(&standee.summon_id) {
+            continue;
+        }
+        commands.entity(entity).despawn();
+        assets.entities.remove(&standee.summon_id);
+    }
+
+    for (summon_id, active_standee) in active {
+        if let Some(entity) = assets.entities.get(&summon_id).copied() {
+            if let Ok((_, standee)) = existing.get(entity) {
+                if standee.image_source == active_standee.image_source
+                    && standee.access_visibility == active_standee.access_visibility
+                {
+                    if let Ok(mut transform) = standee_transforms.get_mut(entity) {
+                        *transform = active_standee.transform;
+                    }
+                    continue;
+                }
+                assets.failed_sources.remove(&standee.image_source);
+            }
+            commands.entity(entity).despawn();
+            assets.entities.remove(&summon_id);
+        }
+        if assets.failed_sources.contains(&active_standee.image_source) {
+            continue;
+        }
+
+        match load_voxel_player_standee_texture(
+            &active_standee.image_source,
+            &mut images,
+            &mut assets.textures,
+        ) {
+            Ok((texture, image_size)) => {
+                let size = voxel_player_standee_size(image_size);
+                let back_label_texture = assets
+                    .back_label_texture
+                    .get_or_insert_with(|| images.add(voxel_player_standee_back_label_image()))
+                    .clone();
+                let back_label_material = materials.add(StandardMaterial {
+                    base_color_texture: Some(back_label_texture),
+                    alpha_mode: AlphaMode::Opaque,
+                    cull_mode: Some(Face::Back),
+                    unlit: true,
+                    ..default()
+                });
+                let portrait_material = materials.add(voxel_player_standee_material(texture));
+                let (owner_id, _) = crate::napcat::parse_summon_target_id(&summon_id)
+                    .expect("active summon standees always have valid summon ids");
+                let mut entity_commands = commands.spawn((
+                    Mesh3d(
+                        meshes.add(Plane3d::new(PLAYER_STANDEE_PLANE_NORMAL, size * 0.5).mesh()),
+                    ),
+                    MeshMaterial3d(portrait_material.clone()),
+                    active_standee.transform,
+                    Visibility::Visible,
+                    VoxelSummonStandee {
+                        summon_id: summon_id.clone(),
+                        owner_id,
+                        image_source: active_standee.image_source.clone(),
+                        access_visibility: active_standee.access_visibility.clone(),
+                    },
+                    VoxelStandeeAccess::Unit(active_standee.access_visibility),
+                ));
+                entity_commands.with_children(|parent| {
+                    parent.spawn((
+                        Mesh3d(
+                            meshes
+                                .add(Plane3d::new(PLAYER_STANDEE_PLANE_NORMAL, size * 0.5).mesh()),
+                        ),
+                        MeshMaterial3d(portrait_material),
+                        voxel_player_standee_back_transform(),
+                    ));
+                    parent.spawn((
+                        Mesh3d(
+                            meshes.add(
+                                Plane3d::new(
+                                    PLAYER_STANDEE_PLANE_NORMAL,
+                                    Vec2::splat(VOXEL_SIZE * 0.42),
+                                )
+                                .mesh(),
+                            ),
+                        ),
+                        MeshMaterial3d(back_label_material),
+                        voxel_player_standee_back_label_transform(),
+                    ));
+                });
+                let entity = entity_commands.id();
+                assets.entities.insert(summon_id, entity);
+            },
+            Err(err) => {
+                assets.failed_sources.insert(active_standee.image_source);
+                eprintln!("failed to load voxel summon standee for {summon_id}: {err}");
+            },
+        }
+    }
+}
+
+/// 召唤物不能离开主人太远：把超出离主距离的召唤物立牌拉回到范围边缘，
+/// 并同步回持久化存储。「重命名吊牌」提供无限距离时跳过。
+fn clamp_voxel_summon_standees_to_owner_range(
+    mut store: ResMut<Persistent<VoxelSummonStandeeStore>>,
+    manager: Option<Res<Persistent<NapcatMessageManager>>>,
+    owner_standees: Query<
+        (&VoxelPlayerStandee, &Transform),
+        Without<VoxelSummonStandee>,
+    >,
+    mut summon_standees: Query<
+        (&VoxelSummonStandee, &mut Transform),
+        Without<VoxelPlayerStandee>,
+    >,
+) {
+    let Some(manager) = manager else { return };
+    let mut changed = false;
+    for (summon, mut transform) in &mut summon_standees {
+        let owner_id = &summon.owner_id;
+        let Some(character) = manager.player_characters.get(owner_id) else {
+            continue;
+        };
+        let Some(range) = crate::napcat::character_summon_range_meters(character) else {
+            continue;
+        };
+        let Some(owner_position) = owner_standees
+            .iter()
+            .find(|(standee, _)| standee.user_id.to_string() == *owner_id)
+            .map(|(_, owner_transform)| owner_transform.translation)
+        else {
+            continue;
+        };
+        let offset = transform.translation - owner_position;
+        let distance = offset.length();
+        if distance <= range || distance <= f32::EPSILON {
+            continue;
+        }
+        let clamped = clamp_standee_position_to_range(transform.translation, owner_position, range);
+        transform.translation = clamped;
+        if let Some(persisted) = store
+            .standees
+            .iter_mut()
+            .find(|persisted| persisted.summon_id == summon.summon_id)
+        {
+            persisted.translation = clamped.to_array();
+            changed = true;
+        }
+    }
+    if changed {
+        store.persist().ok();
+    }
+}
+
+/// 把立牌位置限制在以主人为中心、指定半径的球体内（保持方向）。
+fn clamp_standee_position_to_range(position: Vec3, center: Vec3, range: f32) -> Vec3 {
+    let offset = position - center;
+    let distance = offset.length();
+    if distance <= range || distance <= f32::EPSILON {
+        position
+    } else {
+        center + offset / distance * range
+    }
+}
+
 fn sync_voxel_scene_character_positions(
     mut positions: ResMut<SceneCharacterPositions>,
     player_standees: Query<(&VoxelPlayerStandee, &Transform), Without<VoxelUnitStandee>>,
     unit_standees: Query<(&VoxelUnitStandee, &Transform), Without<VoxelPlayerStandee>>,
+    summon_standees: Query<(&VoxelSummonStandee, &Transform), Without<VoxelPlayerStandee>>,
 ) {
     positions.positions.clear();
     positions.positions.extend(
@@ -9342,6 +9622,14 @@ fn sync_voxel_scene_character_positions(
         unit_standees.iter().map(|(standee, transform)| {
             (
                 standee.target_id.clone(),
+                transform.translation,
+            )
+        }),
+    );
+    positions.positions.extend(
+        summon_standees.iter().map(|(standee, transform)| {
+            (
+                standee.summon_id.clone(),
                 transform.translation,
             )
         }),
@@ -9969,6 +10257,67 @@ fn upsert_voxel_player_camera(
 
 pub(crate) fn voxel_unit_standee_target_id(unit_id: &str) -> String {
     format!("unit:{}", unit_id.trim())
+}
+
+pub(crate) fn has_voxel_summon_standee(store: &VoxelSummonStandeeStore, summon_id: &str) -> bool {
+    let summon_id = summon_id.trim();
+    !summon_id.is_empty()
+        && store
+            .standees
+            .iter()
+            .any(|standee| standee.summon_id == summon_id)
+}
+
+/// 在GM当前视野焦点为召唤物创建立牌；立牌归属跟随主人玩家的队伍可见性。
+pub(crate) fn place_voxel_summon_standee(
+    store: &mut VoxelSummonStandeeStore,
+    summon_id: &str,
+    image_source: &str,
+    editor: &VoxelEditorState,
+) -> Result<bool, String> {
+    let summon_id = summon_id.trim();
+    if summon_id.is_empty() {
+        return Err("召唤物ID为空".to_owned());
+    }
+    if image_source.trim().is_empty() {
+        return Err("召唤物还没有立绘图片".to_owned());
+    }
+    if has_voxel_summon_standee(store, summon_id) {
+        return Ok(false);
+    }
+
+    let transform = default_voxel_unit_standee_transform(editor, store.standees.len());
+    store.standees.push(PersistedVoxelSummonStandee {
+        summon_id: summon_id.to_owned(),
+        translation: transform.translation.to_array(),
+        rotation: transform.rotation.to_array(),
+    });
+    Ok(true)
+}
+
+pub(crate) fn remove_voxel_summon_standee(
+    store: &mut VoxelSummonStandeeStore,
+    summon_id: &str,
+) -> bool {
+    let summon_id = summon_id.trim();
+    let previous_len = store.standees.len();
+    store
+        .standees
+        .retain(|standee| standee.summon_id != summon_id);
+    store.standees.len() != previous_len
+}
+
+/// 删除某位玩家全部召唤物的立牌，返回删除数量。
+pub(crate) fn remove_voxel_summon_standees_for_owner(
+    store: &mut VoxelSummonStandeeStore,
+    owner_id: &str,
+) -> usize {
+    let prefix = format!("summon:{owner_id}:");
+    let previous_len = store.standees.len();
+    store
+        .standees
+        .retain(|standee| !standee.summon_id.starts_with(&prefix));
+    previous_len - store.standees.len()
 }
 
 pub(crate) fn has_voxel_unit_standee(store: &VoxelUnitStandeeStore, unit_id: &str) -> bool {
@@ -17123,6 +17472,61 @@ mod tests {
             &mut store, " slime "
         ));
         assert!(!has_voxel_unit_standee(&store, "slime"));
+    }
+
+    #[test]
+    fn summon_standee_helpers_place_update_and_remove() {
+        let editor = VoxelEditorState {
+            first_person_enabled: false,
+            camera_focus: Vec3::new(4.0, 2.0, 6.0),
+            ..default()
+        };
+        let mut store = VoxelSummonStandeeStore::default();
+
+        assert!(place_voxel_summon_standee(
+            &mut store,
+            "summon:10001:0",
+            "spirit.png",
+            &editor,
+        )
+        .unwrap());
+        assert!(!place_voxel_summon_standee(
+            &mut store,
+            "summon:10001:0",
+            "spirit-v2.png",
+            &editor,
+        )
+        .unwrap());
+        assert!(has_voxel_summon_standee(&store, "summon:10001:0"));
+        assert_eq!(store.standees.len(), 1);
+        assert_eq!(store.standees[0].summon_id, "summon:10001:0");
+        assert_eq!(
+            Vec3::from_array(store.standees[0].translation),
+            editor.camera_focus
+        );
+
+        assert!(remove_voxel_summon_standee(&mut store, "summon:10001:0"));
+        assert!(!has_voxel_summon_standee(&store, "summon:10001:0"));
+    }
+
+    #[test]
+    fn summon_standee_placement_requires_an_image() {
+        let editor = VoxelEditorState::default();
+        let mut store = VoxelSummonStandeeStore::default();
+        assert!(place_voxel_summon_standee(&mut store, "summon:1:0", " ", &editor).is_err());
+        assert!(!has_voxel_summon_standee(&store, "summon:1:0"));
+    }
+
+    #[test]
+    fn summon_standee_range_clamp_keeps_position_inside_radius() {
+        let center = Vec3::new(0.0, 1.0, 0.0);
+        let inside = clamp_standee_position_to_range(Vec3::new(3.0, 1.0, 4.0), center, 10.0);
+        assert_eq!(inside, Vec3::new(3.0, 1.0, 4.0));
+
+        let clamped = clamp_standee_position_to_range(Vec3::new(30.0, 1.0, 40.0), center, 10.0);
+        assert!((clamped.distance(center) - 10.0).abs() < 0.0001);
+        let direction = (Vec3::new(30.0, 1.0, 40.0) - center).normalize();
+        assert!(clamped.distance(center + direction * 10.0) < 0.0001);
     }
 
     #[test]
