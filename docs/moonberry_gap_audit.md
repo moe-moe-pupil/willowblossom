@@ -12,6 +12,8 @@ Additional 2026-08-07 update: `日薄崦嵫` approved talent now executes in bat
 
 Additional 2026-08-07 update: `精美烧鹅` approved talent now executes. Opening a world grants the holder a soulbound 精美烧鹅 inventory item with stack 3 (replacing any previous-world geese), and casting its 食用精美烧鹅 item skill in battle consumes one goose and starts a 5-round channel: each battle round restores 20% maximum HP and MP directly (unaffected by healing modifiers), the channeling participant cannot take other actions, and taking damage interrupts the channel. Sharing the geese with other players remains a GM inventory operation. Focused verification passes with `cargo test --lib -j 1 goose` and `cargo test --lib -j 1 open_world_grants_three_delicious_geese`: 3 and 1 passed respectively, 0 failed.
 
+Additional 2026-08-07 update: `蝴蝶效应` approved talent now executes. The GM designates one non-self target per holder in the TRPG group settings UI (persisted in `TrpgGroup.butterfly_targets`), and in battle the 5% damage-dealt bonus / 5% damage-taken reduction alternates between the holder and the designated target each round (target holds it first). If either target dies, the swap locks and the effect stays permanently on the survivor. Focused verification passes with `cargo test --lib -j 1 butterfly`: 3 passed, 0 failed.
+
 ## Sources Checked
 
 - Old Moonberry source cloned from `https://github.com/moe-moe-pupil/moonberry` at commit `da85a9e`.
