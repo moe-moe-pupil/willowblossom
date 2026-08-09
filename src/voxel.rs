@@ -1562,7 +1562,7 @@ struct VoxelAutoDoorLockState {
 #[derive(Resource, Default)]
 struct VoxelInvisibilityState {
     invisible_user_ids: HashSet<u64>,
-    /// 来自战斗「镜像外衣」的隐身标记，隐身结束会自动移除。
+    /// 来自战斗技能的隐身标记，隐身结束会自动移除。
     battle_invisible_user_ids: HashSet<u64>,
 }
 
@@ -1580,7 +1580,7 @@ fn toggle_voxel_player_invisibility(
     }
 }
 
-/// 收集激活战斗轮中「镜像外衣」隐身的玩家 id。
+/// 收集激活战斗轮中「镜像外衣」或「隐身术」隐身的玩家 id。
 fn battle_mirror_coat_invisible_user_ids(store: &BattleRoundStore) -> HashSet<u64> {
     let mut user_ids = HashSet::new();
     for encounter in store.encounters.values() {
@@ -1588,7 +1588,9 @@ fn battle_mirror_coat_invisible_user_ids(store: &BattleRoundStore) -> HashSet<u6
             continue;
         }
         for participant in &encounter.participants {
-            if participant.mirror_coat_layers > 0 {
+            if participant.mirror_coat_layers > 0
+                || participant.redeemed_invisibility_rounds_remaining > 0
+            {
                 if let Ok(user_id) = participant.target_id.parse::<u64>() {
                     user_ids.insert(user_id);
                 }
@@ -1598,7 +1600,7 @@ fn battle_mirror_coat_invisible_user_ids(store: &BattleRoundStore) -> HashSet<u6
     user_ids
 }
 
-/// 把战斗「镜像外衣」的隐身同步到场景：隐身玩家立绘只对GM可见。
+/// 把战斗技能隐身同步到场景：隐身玩家立绘只对GM可见。
 fn sync_battle_mirror_coat_invisibility(
     battle_store: Option<Res<Persistent<BattleRoundStore>>>,
     mut invisibility_state: ResMut<VoxelInvisibilityState>,

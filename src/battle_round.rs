@@ -535,6 +535,8 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub needle_case_progress_noncombat_rounds: u8,
     #[serde(default)]
+    pub redeemed_invisibility_rounds_remaining: u32,
+    #[serde(default)]
     pub undying_rage_enabled: bool,
     #[serde(default)]
     pub undying_rage_used: bool,
@@ -1665,6 +1667,13 @@ fn is_current_redeemed_blow_needles(skill: &CharacterSkill) -> bool {
     skill.name.trim() == "吹针术"
         && skill.note.contains("一次性射出当前持有的所有飞针")
         && skill.note.contains("命中的飞针数量+2的远程物理伤害")
+}
+
+fn is_current_redeemed_invisibility(skill: &CharacterSkill) -> bool {
+    skill.name.trim() == "隐身术"
+        && skill.note.contains("冷却2")
+        && skill.note.contains("持续3回合")
+        && skill.note.contains("无消耗")
 }
 
 fn apply_void_break_damage_for_battle(
@@ -3674,6 +3683,12 @@ fn encounter_roster_ui(
                     }
                 ));
             }
+            if participant.redeemed_invisibility_rounds_remaining > 0 {
+                ui.small(format!(
+                    "隐身术：剩余{}回合",
+                    participant.redeemed_invisibility_rounds_remaining
+                ));
+            }
             if encounter.active {
                 if participant.undying_rage_active {
                     ui.small("不死者之怒生效");
@@ -4687,6 +4702,9 @@ impl BattleRoundStore {
             }
             if participant.paralyzed_rounds_remaining > 0 {
                 participant.paralyzed_rounds_remaining -= 1;
+            }
+            if participant.redeemed_invisibility_rounds_remaining > 0 {
+                participant.redeemed_invisibility_rounds_remaining -= 1;
             }
             let delayed = advance_participant_delayed_damage_ticks(
                 participant,
@@ -6080,6 +6098,19 @@ impl BattleRoundStore {
                     ready,
                     case_ready,
                     if case_enabled { 2 } else { 0 }
+                ));
+            }
+        }
+        if is_current_redeemed_invisibility(skill) {
+            if let Some(actor) = encounter
+                .participants
+                .iter_mut()
+                .find(|participant| participant.target_id == actor_id)
+            {
+                actor.redeemed_invisibility_rounds_remaining = 3;
+                encounter.action_log.push(format!(
+                    "{}进入隐身，持续3回合",
+                    actor_name
                 ));
             }
         }
@@ -7547,6 +7578,9 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant
             .needle_case_progress_noncombat_rounds
             .hash(&mut hasher);
+        participant
+            .redeemed_invisibility_rounds_remaining
+            .hash(&mut hasher);
         participant.undying_rage_enabled.hash(&mut hasher);
         participant.undying_rage_used.hash(&mut hasher);
         participant.undying_rage_active.hash(&mut hasher);
@@ -7758,6 +7792,7 @@ fn participant_from_character(
         needle_case_progress_noncombat_rounds: redeemed_needles
             .map(|(state, _)| state.case_progress_noncombat_rounds)
             .unwrap_or(0),
+        redeemed_invisibility_rounds_remaining: 0,
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
@@ -7894,6 +7929,7 @@ fn participant_from_unit_template(
         needle_case_enabled: false,
         needle_case_ready: 0,
         needle_case_progress_noncombat_rounds: 0,
+        redeemed_invisibility_rounds_remaining: 0,
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
@@ -8024,6 +8060,7 @@ fn participant_from_target(
         needle_case_enabled: false,
         needle_case_ready: 0,
         needle_case_progress_noncombat_rounds: 0,
+        redeemed_invisibility_rounds_remaining: 0,
         undying_rage_enabled: false,
         undying_rage_used: false,
         undying_rage_active: false,
@@ -10084,6 +10121,7 @@ mod area_tests {
             needle_case_enabled: false,
             needle_case_ready: 0,
             needle_case_progress_noncombat_rounds: 0,
+            redeemed_invisibility_rounds_remaining: 0,
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,
@@ -10570,6 +10608,56 @@ mod tests {
     }
 
     #[test]
+    fn redeemed_invisibility_hides_actor_for_three_rounds() {
+        let manager = empty_manager();
+        let skill = CharacterSkill {
+            index: 0,
+            name: "隐身术".to_owned(),
+            note: "冷却2，持续3回合，无消耗。".to_owned(),
+            skill_type: Some("动作".to_owned()),
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 2,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("无目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let mut store = BattleRoundStore {
+            encounters: HashMap::from([(
+                "battle".to_owned(),
+                BattleEncounter {
+                    active: true,
+                    participants: vec![participant("540716134", 0)],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert!(store.record_skill_use(
+            "battle",
+            "540716134",
+            "540716134",
+            &skill,
+            &manager,
+            None,
+        ));
+        assert_eq!(
+            store.encounters["battle"].participants[0]
+                .redeemed_invisibility_rounds_remaining,
+            3
+        );
+        assert!(store.next_round("battle"));
+        assert_eq!(
+            store.encounters["battle"].participants[0]
+                .redeemed_invisibility_rounds_remaining,
+            2
+        );
+    }
+
+    #[test]
     fn summon_participant_ignores_low_hp_damage_penalty() {
         let mut manager = empty_manager();
         let mut owner = PlayerCharacter::default();
@@ -10733,6 +10821,7 @@ mod tests {
             needle_case_enabled: false,
             needle_case_ready: 0,
             needle_case_progress_noncombat_rounds: 0,
+            redeemed_invisibility_rounds_remaining: 0,
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,
