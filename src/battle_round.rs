@@ -1581,6 +1581,70 @@ fn apply_participant_damage_for_battle(
     }
 }
 
+fn is_current_redeemed_void_break(skill: &CharacterSkill) -> bool {
+    skill.name.trim() == "玄空破"
+        && skill.note.contains("从一个4米内的可视目标内部")
+        && skill.note.contains("最多优先将生命值降低为1")
+        && skill.note.contains("爆炸造成7点物理伤害")
+}
+
+fn apply_void_break_damage_for_battle(
+    participant: &mut BattleParticipantSnapshot,
+    amount: f32,
+    source_id: &str,
+    encounter_active: bool,
+) -> BattleDamageResolution {
+    let incoming_amount = amount.max(0.0);
+    let hp_first_amount = incoming_amount.min((participant.hp.max(0.0) - 1.0).max(0.0));
+    let saved_overhealing_shield = participant.overhealing_shield;
+    let saved_overhealing_turns = participant.overhealing_shield_turns_remaining;
+    let saved_revenge_soul_shield = participant.revenge_soul_shield;
+    let saved_arcane_shield = participant.arcane_shield;
+    participant.overhealing_shield = 0.0;
+    participant.overhealing_shield_turns_remaining = 0;
+    participant.revenge_soul_shield = 0.0;
+    participant.arcane_shield = 0.0;
+
+    let mut resolution = apply_participant_damage_for_battle(
+        participant,
+        hp_first_amount,
+        source_id,
+        encounter_active,
+    );
+    participant.overhealing_shield = saved_overhealing_shield;
+    participant.overhealing_shield_turns_remaining = saved_overhealing_turns;
+    participant.revenge_soul_shield = saved_revenge_soul_shield;
+    participant.arcane_shield = saved_arcane_shield;
+
+    if resolution.damage_applied + f32::EPSILON < hp_first_amount {
+        resolution.damage_absorbed = incoming_amount;
+        return resolution;
+    }
+
+    let mut remaining = (incoming_amount - resolution.damage_applied).max(0.0);
+    let overhealing_absorbed = participant.overhealing_shield.max(0.0).min(remaining);
+    participant.overhealing_shield =
+        (participant.overhealing_shield.max(0.0) - overhealing_absorbed).max(0.0);
+    remaining = (remaining - overhealing_absorbed).max(0.0);
+    if participant.overhealing_shield <= f32::EPSILON {
+        participant.overhealing_shield = 0.0;
+        participant.overhealing_shield_turns_remaining = 0;
+    }
+
+    if encounter_active {
+        let revenge_absorbed = participant.revenge_soul_shield.max(0.0).min(remaining);
+        participant.revenge_soul_shield =
+            (participant.revenge_soul_shield.max(0.0) - revenge_absorbed).max(0.0);
+        remaining = (remaining - revenge_absorbed).max(0.0);
+        let arcane_absorbed = participant.arcane_shield.max(0.0).min(remaining);
+        participant.arcane_shield =
+            (participant.arcane_shield.max(0.0) - arcane_absorbed).max(0.0);
+    }
+
+    resolution.damage_absorbed = (incoming_amount - resolution.damage_applied).max(0.0);
+    resolution
+}
+
 fn advance_participant_hope_avatar(
     participant: &mut BattleParticipantSnapshot,
 ) -> (
@@ -5104,12 +5168,21 @@ impl BattleRoundStore {
                                 damage_type,
                             );
                         }
-                        let resolution = apply_participant_damage_for_battle(
-                            target,
-                            final_amount,
-                            actor_id,
-                            encounter.active,
-                        );
+                        let resolution = if is_current_redeemed_void_break(skill) {
+                            apply_void_break_damage_for_battle(
+                                target,
+                                final_amount,
+                                actor_id,
+                                encounter.active,
+                            )
+                        } else {
+                            apply_participant_damage_for_battle(
+                                target,
+                                final_amount,
+                                actor_id,
+                                encounter.active,
+                            )
+                        };
                         let applied_physical_damage =
                             resolution.damage_applied * physical_damage_share;
                         let endless_pain_damage_committed = endless_pain_bonus > f32::EPSILON
@@ -5169,8 +5242,14 @@ impl BattleRoundStore {
                         let mut benefits = actor_source_notes.clone();
                         benefits.extend(target_source_notes);
                         if resolution.damage_absorbed > f32::EPSILON {
+                            let source = if is_current_redeemed_void_break(skill) {
+                                "玄空破保留1点生命并由护盾吸收"
+                            } else {
+                                "护盾/免疫吸收"
+                            };
                             benefits.push(format!(
-                                "护盾/免疫吸收{}点",
+                                "{}{}点",
+                                source,
                                 format_number(resolution.damage_absorbed)
                             ));
                         }
@@ -14425,6 +14504,71 @@ mod tests {
             encounter, false
         ));
         assert!((encounter.participants[0].revenge_soul_shield - 0.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn redeemed_void_break_damages_hp_to_one_before_consuming_shields() {
+        let manager = empty_manager();
+        let actor = participant("a", 0);
+        let mut target = participant("b", 0);
+        target.hp = 4.0;
+        target.max_hp = 20.0;
+        target.overhealing_shield = 1.0;
+        target.overhealing_shield_turns_remaining = 2;
+        target.revenge_soul_shield = 1.0;
+        target.arcane_shield = 2.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                active: true,
+                participants: vec![actor, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "玄空破".to_owned(),
+            note: "从一个4米内的可视目标内部造成恐怖又玄妙的爆炸，会优先伤害生命值，在有护盾的情况下，最多优先将生命值降低为1，之后会优先对护盾造成伤害。爆炸造成7点物理伤害。".to_owned(),
+            skill_type: Some("动作".to_owned()),
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 1,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "b")
+            .unwrap();
+        assert!((target.hp - 1.0).abs() < 0.0001);
+        assert!((target.overhealing_shield - 0.0).abs() < 0.0001);
+        assert!((target.revenge_soul_shield - 0.0).abs() < 0.0001);
+        assert!((target.arcane_shield - 0.0).abs() < 0.0001);
+        assert!(target.alive);
+        assert!((target.damage_taken_this_turn - 3.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn redeemed_void_break_leaves_shields_when_hp_can_take_all_damage() {
+        let mut target = participant("b", 0);
+        target.hp = 10.0;
+        target.max_hp = 20.0;
+        target.overhealing_shield = 3.0;
+        target.arcane_shield = 2.0;
+
+        let resolution = apply_void_break_damage_for_battle(&mut target, 7.0, "a", true);
+
+        assert!((resolution.damage_applied - 7.0).abs() < 0.0001);
+        assert!((target.hp - 3.0).abs() < 0.0001);
+        assert!((target.overhealing_shield - 3.0).abs() < 0.0001);
+        assert!((target.arcane_shield - 2.0).abs() < 0.0001);
     }
 
     #[test]

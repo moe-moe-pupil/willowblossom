@@ -2793,6 +2793,11 @@ fn current_redeemed_numeric_skill_actions(text: &str) -> Option<Vec<Action>> {
     } else if text.contains("常态具备5根飞针") && text.contains("每根飞针造成1点远程物理伤害")
     {
         (1.0, DamageType::Range)
+    } else if text.contains("从一个4米内的可视目标内部")
+        && text.contains("最多优先将生命值降低为1")
+        && text.contains("爆炸造成7点物理伤害")
+    {
+        (7.0, DamageType::Physical)
     } else {
         return None;
     };
@@ -2817,6 +2822,11 @@ pub fn current_redeemed_numeric_skill_range(note: &str) -> Option<i32> {
         && note.contains("命中后造成6点物理伤害")
     {
         Some(50)
+    } else if note.contains("从一个4米内的可视目标内部")
+        && note.contains("最多优先将生命值降低为1")
+        && note.contains("爆炸造成7点物理伤害")
+    {
+        Some(4)
     } else {
         None
     }
@@ -4309,6 +4319,11 @@ mod tests {
                 1.0,
                 DamageType::Range,
             ),
+            (
+                "从一个4米内的可视目标内部造成爆炸，最多优先将生命值降低为1，之后优先对护盾造成伤害。爆炸造成7点物理伤害。",
+                7.0,
+                DamageType::Physical,
+            ),
         ] {
             let ast = parse_rule(note).unwrap();
             assert_eq!(ast.actions, vec![Action::Damage {
@@ -4340,6 +4355,12 @@ mod tests {
         assert_eq!(
             current_redeemed_numeric_skill_range("链锯剑（6分）：近身攻击会造成5点物理伤害。"),
             None
+        );
+        assert_eq!(
+            current_redeemed_numeric_skill_range(
+                "从一个4米内的可视目标内部造成爆炸，最多优先将生命值降低为1，之后优先对护盾造成伤害。爆炸造成7点物理伤害。"
+            ),
+            Some(4)
         );
     }
 
