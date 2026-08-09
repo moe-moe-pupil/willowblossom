@@ -9807,6 +9807,16 @@ pub(crate) fn cached_or_local_voxel_standee_path(source: &str) -> Result<PathBuf
     ))
 }
 
+/// Resolve/cache and decode a standee image before recording its placement, so a
+/// bad or expired URL is reported in the GUI instead of becoming a silent scene entry.
+pub(crate) fn validate_voxel_standee_image_source(source: &str) -> Result<(), String> {
+    let path = cached_or_local_voxel_standee_path(source)?;
+    let bytes = fs::read(&path).map_err(|err| format!("无法读取立绘：{err}"))?;
+    image::load_from_memory(&bytes)
+        .map_err(|err| format!("无法解析立绘图片：{err}"))?;
+    Ok(())
+}
+
 fn cache_remote_voxel_standee_image(url: &str) -> Result<PathBuf, String> {
     let mut hasher = DefaultHasher::new();
     url.hash(&mut hasher);
@@ -10284,11 +10294,22 @@ pub(crate) fn place_voxel_summon_standee(
     if image_source.trim().is_empty() {
         return Err("召唤物还没有立绘图片".to_owned());
     }
-    if has_voxel_summon_standee(store, summon_id) {
-        return Ok(false);
+    let existing_index = store
+        .standees
+        .iter()
+        .position(|standee| standee.summon_id == summon_id);
+    let transform = default_voxel_unit_standee_transform(
+        editor,
+        existing_index.unwrap_or(store.standees.len()),
+    );
+    if let Some(index) = existing_index {
+        let standee = &mut store.standees[index];
+        let changed = standee.translation != transform.translation.to_array()
+            || standee.rotation != transform.rotation.to_array();
+        standee.translation = transform.translation.to_array();
+        standee.rotation = transform.rotation.to_array();
+        return Ok(changed);
     }
-
-    let transform = default_voxel_unit_standee_transform(editor, store.standees.len());
     store.standees.push(PersistedVoxelSummonStandee {
         summon_id: summon_id.to_owned(),
         translation: transform.translation.to_array(),
@@ -10344,11 +10365,22 @@ pub(crate) fn place_voxel_unit_standee(
     if image_source.trim().is_empty() {
         return Err("单位模板还没有立绘".to_owned());
     }
-    if has_voxel_unit_standee(store, unit_id) {
-        return Ok(false);
+    let existing_index = store
+        .standees
+        .iter()
+        .position(|standee| standee.unit_id == unit_id);
+    let transform = default_voxel_unit_standee_transform(
+        editor,
+        existing_index.unwrap_or(store.standees.len()),
+    );
+    if let Some(index) = existing_index {
+        let standee = &mut store.standees[index];
+        let changed = standee.translation != transform.translation.to_array()
+            || standee.rotation != transform.rotation.to_array();
+        standee.translation = transform.translation.to_array();
+        standee.rotation = transform.rotation.to_array();
+        return Ok(changed);
     }
-
-    let transform = default_voxel_unit_standee_transform(editor, store.standees.len());
     store.standees.push(PersistedVoxelUnitStandee {
         unit_id: unit_id.to_owned(),
         translation: transform.translation.to_array(),
@@ -10380,15 +10412,16 @@ fn default_voxel_unit_standee_transform(
     let flat_right = if flat_right == Vec3::ZERO { Vec3::X } else { flat_right };
     translation += flat_right * symmetric_standee_slot(standee_index) as f32 * (VOXEL_SIZE * 3.0);
 
-    let facing_target = Vec3::new(
-        camera.translation.x,
-        translation.y,
-        camera.translation.z,
-    );
-    if facing_target.distance_squared(translation) <= f32::EPSILON {
+    // The orbit focus commonly lies on or just inside the terrain surface. Move the
+    // standee slightly toward the GM camera so its portrait plane is not occluded by
+    // the surface that was clicked/focused.
+    let toward_camera = (camera.translation - translation).normalize_or_zero();
+    translation += toward_camera * (VOXEL_SIZE * 0.25);
+
+    if camera.translation.distance_squared(translation) <= f32::EPSILON {
         Transform::from_translation(translation).with_rotation(camera.rotation)
     } else {
-        Transform::from_translation(translation).looking_at(facing_target, Vec3::Y)
+        Transform::from_translation(translation).looking_at(camera.translation, *camera.up())
     }
 }
 
@@ -17432,7 +17465,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_pool_places_one_persistent_standee_at_the_gm_focus() {
+    fn unit_pool_places_one_visible_camera_facing_standee_near_the_gm_focus() {
         let editor = VoxelEditorState {
             first_person_enabled: false,
             camera_focus: Vec3::new(12.0, 3.0, -8.0),
@@ -17457,10 +17490,11 @@ mod tests {
         assert!(has_voxel_unit_standee(&store, "slime"));
         assert_eq!(store.standees.len(), 1);
         assert_eq!(store.standees[0].unit_id, "slime");
-        assert_eq!(
-            Vec3::from_array(store.standees[0].translation),
-            editor.camera_focus
-        );
+        let placed = Vec3::from_array(store.standees[0].translation);
+        assert!((placed.distance(editor.camera_focus) - VOXEL_SIZE * 0.25).abs() < 0.0001);
+        let camera = editor_camera_transform(&editor);
+        let forward = Quat::from_array(store.standees[0].rotation) * Vec3::NEG_Z;
+        assert!(forward.dot((camera.translation - placed).normalize()) > 0.999);
         assert_eq!(
             store.standees[0].visibility,
             AccessVisibility::Public
@@ -17502,9 +17536,24 @@ mod tests {
         assert!(has_voxel_summon_standee(&store, "summon:10001:0"));
         assert_eq!(store.standees.len(), 1);
         assert_eq!(store.standees[0].summon_id, "summon:10001:0");
-        assert_eq!(
+        let first_placement = Vec3::from_array(store.standees[0].translation);
+        assert!((first_placement.distance(editor.camera_focus) - VOXEL_SIZE * 0.25).abs() < 0.0001);
+
+        let moved_editor = VoxelEditorState {
+            first_person_enabled: false,
+            camera_focus: Vec3::new(-8.0, 5.0, 12.0),
+            ..default()
+        };
+        assert!(place_voxel_summon_standee(
+            &mut store,
+            "summon:10001:0",
+            "spirit.png",
+            &moved_editor,
+        )
+        .unwrap());
+        assert_ne!(
             Vec3::from_array(store.standees[0].translation),
-            editor.camera_focus
+            first_placement
         );
 
         assert!(remove_voxel_summon_standee(&mut store, "summon:10001:0"));
@@ -17517,6 +17566,15 @@ mod tests {
         let mut store = VoxelSummonStandeeStore::default();
         assert!(place_voxel_summon_standee(&mut store, "summon:1:0", " ", &editor).is_err());
         assert!(!has_voxel_summon_standee(&store, "summon:1:0"));
+    }
+
+    #[test]
+    fn standee_image_validation_accepts_images_and_rejects_non_images() {
+        assert!(validate_voxel_standee_image_source(
+            "assets/textures/default_avatar.png"
+        )
+        .is_ok());
+        assert!(validate_voxel_standee_image_source("Cargo.toml").is_err());
     }
 
     #[test]

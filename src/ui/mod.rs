@@ -78,6 +78,7 @@ use crate::voxel::{
     remove_voxel_summon_standee,
     remove_voxel_summon_standees_for_owner,
     remove_voxel_unit_standee,
+    validate_voxel_standee_image_source,
     voxel_spaceship_contains_position,
     voxel_spaceship_teleport_destination,
     voxel_spaceship_teleport_name,
@@ -5720,18 +5721,47 @@ fn summon_panel_ui(
                 ui.horizontal_wrapped(|ui| {
                     if has_standee {
                         ui.small("召唤物立牌已在场景中（图片修改自动同步）");
+                        if ui
+                            .button("重新放置")
+                            .on_hover_text("把召唤物立牌移动到当前GM视野焦点")
+                            .clicked()
+                        {
+                            let status = match validate_voxel_standee_image_source(&image_source)
+                                .and_then(|_| {
+                                    place_voxel_summon_standee(
+                                        &mut *summon_standee_store,
+                                        &summon_id,
+                                        &image_source,
+                                        voxel_editor,
+                                    )
+                                })
+                            {
+                                Ok(_) => match summon_standee_store.persist() {
+                                    Ok(()) => "已把召唤物立牌重新放到当前GM视野焦点".to_owned(),
+                                    Err(err) => format!("召唤物立牌保存失败：{err}"),
+                                },
+                                Err(err) => format!("召唤物立牌失败：{err}"),
+                            };
+                            edit_state
+                                .summon_scene_status
+                                .insert(summon_id.clone(), status);
+                        }
                     } else if ui
                         .add_enabled(!image_source.is_empty(), egui::Button::new("创建立牌"))
                         .on_hover_text("在当前GM视野焦点创建召唤物立牌")
                         .on_disabled_hover_text("召唤物还没有立牌图片")
                         .clicked()
                     {
-                        let status = match place_voxel_summon_standee(
-                            &mut *summon_standee_store,
-                            &summon_id,
-                            &image_source,
-                            voxel_editor,
-                        ) {
+                        let status = match validate_voxel_standee_image_source(&image_source)
+                            .and_then(|_| {
+                                place_voxel_summon_standee(
+                                    &mut *summon_standee_store,
+                                    &summon_id,
+                                    &image_source,
+                                    voxel_editor,
+                                )
+                            })
+                        {
                             Ok(scene_changed) => match summon_standee_store.persist() {
                                 Ok(()) => {
                                     if scene_changed {
@@ -11781,6 +11811,29 @@ fn unit_pool_settings_ui(
                     let has_standee = has_voxel_unit_standee(unit_standee_store, &unit_id);
                     if has_standee {
                         ui.small("NPC立绘已在场景中（图片修改会自动同步）");
+                        if ui
+                            .button("重新放置NPC立绘")
+                            .on_hover_text("把NPC立绘移动到当前GM视野焦点")
+                            .clicked()
+                        {
+                            let status = match validate_voxel_standee_image_source(&image_source)
+                                .and_then(|_| {
+                                    place_voxel_unit_standee(
+                                        &mut *unit_standee_store,
+                                        &unit_id,
+                                        &image_source,
+                                        voxel_editor,
+                                    )
+                                })
+                            {
+                                Ok(_) => match unit_standee_store.persist() {
+                                    Ok(()) => "已把NPC立绘重新放到当前GM视野焦点".to_owned(),
+                                    Err(err) => format!("NPC立绘保存失败：{err}"),
+                                },
+                                Err(err) => format!("NPC立绘失败：{err}"),
+                            };
+                            state.unit_pool_scene_status.insert(unit_id.clone(), status);
+                        }
                     } else if ui
                         .add_enabled(
                             !image_source.is_empty(),
@@ -11790,12 +11843,16 @@ fn unit_pool_settings_ui(
                         .on_disabled_hover_text("单位模板还没有立绘图片")
                         .clicked()
                     {
-                        let status = match place_voxel_unit_standee(
-                            &mut *unit_standee_store,
-                            &unit_id,
-                            &image_source,
-                            voxel_editor,
-                        ) {
+                        let status = match validate_voxel_standee_image_source(&image_source)
+                            .and_then(|_| {
+                                place_voxel_unit_standee(
+                                    &mut *unit_standee_store,
+                                    &unit_id,
+                                    &image_source,
+                                    voxel_editor,
+                                )
+                            })
+                        {
                             Ok(scene_changed) => match unit_standee_store.persist() {
                                 Ok(()) => {
                                     if scene_changed {
