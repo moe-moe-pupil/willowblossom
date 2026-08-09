@@ -517,6 +517,12 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub paralyzed_rounds_remaining: u32,
     #[serde(default)]
+    pub commissar_proficiency: u32,
+    #[serde(default)]
+    pub next_attack_bonus_physical: f32,
+    #[serde(default)]
+    pub natural_hp_regen_suppressed: bool,
+    #[serde(default)]
     pub undying_rage_enabled: bool,
     #[serde(default)]
     pub undying_rage_used: bool,
@@ -1614,6 +1620,26 @@ fn is_current_redeemed_void_break(skill: &CharacterSkill) -> bool {
         && skill.note.contains("从一个4米内的可视目标内部")
         && skill.note.contains("最多优先将生命值降低为1")
         && skill.note.contains("爆炸造成7点物理伤害")
+}
+
+fn is_current_redeemed_commissar_war_cry(skill: &CharacterSkill) -> bool {
+    skill.name.trim() == "政委"
+        && skill.note.contains("战吼—为了帝皇")
+        && skill.note.contains("熟练度0/5")
+        && skill.note.contains("下次攻击伤害附带【熟练度】点物理伤害")
+}
+
+fn is_current_redeemed_chainsword(skill: &CharacterSkill) -> bool {
+    skill.name.trim() == "链锯剑"
+        && skill.note.contains("近身攻击会造成5点物理伤害")
+        && skill.note.contains("撕裂")
+        && skill.note.contains("抑制目标的自然生命回复效果")
+}
+
+fn is_current_redeemed_bolter(skill: &CharacterSkill) -> bool {
+    skill.note.contains("爆失枪（1分）")
+        && skill.note.contains("只能在6米内造成1点物理伤害")
+        && skill.note.contains("每次开枪都会广播给周围玩家这把枪的描述")
 }
 
 fn apply_void_break_damage_for_battle(
@@ -3573,6 +3599,21 @@ fn encounter_roster_ui(
                     participant.paralyzed_rounds_remaining
                 ));
             }
+            if participant.commissar_proficiency > 0 {
+                ui.small(format!(
+                    "为了帝皇熟练度 {}/5",
+                    participant.commissar_proficiency.min(5)
+                ));
+            }
+            if participant.next_attack_bonus_physical > f32::EPSILON {
+                ui.small(format!(
+                    "下次物理攻击附带{}点伤害",
+                    format_number(participant.next_attack_bonus_physical)
+                ));
+            }
+            if participant.natural_hp_regen_suppressed {
+                ui.small("撕裂：自然生命回复受抑制");
+            }
             if encounter.active {
                 if participant.undying_rage_active {
                     ui.small("不死者之怒生效");
@@ -4555,8 +4596,10 @@ impl BattleRoundStore {
             }
             if participant.alive {
                 if !encounter.active {
-                    participant.hp =
-                        (participant.hp + participant.hp_regen).min(participant.max_hp);
+                    if !participant.natural_hp_regen_suppressed {
+                        participant.hp =
+                            (participant.hp + participant.hp_regen).min(participant.max_hp);
+                    }
                     advance_participant_rest_then_fight(participant);
                 }
                 participant.mp = (participant.mp + participant.mp_regen).min(participant.max_mp);
@@ -5063,6 +5106,8 @@ impl BattleRoundStore {
                 ));
             }
         }
+        let mut pending_next_attack_bonus = actor_snapshot.next_attack_bonus_physical.max(0.0);
+        let mut consumed_next_attack_bonus = false;
         for effect in effects {
             if let Some(current_actor) = encounter
                 .participants
@@ -5172,7 +5217,12 @@ impl BattleRoundStore {
                         } else {
                             1.0
                         };
-                        let incoming_amount = (amount
+                        let attached_physical_damage = if damage_type == DamageType::Physical {
+                            pending_next_attack_bonus
+                        } else {
+                            0.0
+                        };
+                        let incoming_amount = ((amount + attached_physical_damage)
                             * actor_damage_multiplier
                             * infinite_focus_multiplier
                             * personalized_pve_level_multiplier(&actor_snapshot, target)
@@ -5285,11 +5335,18 @@ impl BattleRoundStore {
                         }
                         if resolution.damage_applied > f32::EPSILON {
                             actor_dealt_damage = true;
+                            if attached_physical_damage > f32::EPSILON {
+                                consumed_next_attack_bonus = true;
+                                pending_next_attack_bonus = 0.0;
+                            }
                             if actor_damage_dealt_buffs
                                 .iter()
                                 .any(|buff| buff.name == "溃伤")
                             {
                                 target.wound_healing_taken_turns = 1;
+                            }
+                            if is_current_redeemed_chainsword(skill) {
+                                target.natural_hp_regen_suppressed = true;
                             }
                         }
                         if applied_physical_damage > f32::EPSILON
@@ -5353,6 +5410,12 @@ impl BattleRoundStore {
                             benefits.push(format!(
                                 "液态躯体延后{}点",
                                 format_number(delayed_liquid_body_damage)
+                            ));
+                        }
+                        if attached_physical_damage > f32::EPSILON {
+                            benefits.push(format!(
+                                "为了帝皇附带{}点物理伤害",
+                                format_number(attached_physical_damage)
                             ));
                         }
                         encounter.combat_log.push(CombatLogEntry {
@@ -5846,6 +5909,47 @@ impl BattleRoundStore {
                 },
             }
         }
+        if consumed_next_attack_bonus {
+            if let Some(actor) = encounter
+                .participants
+                .iter_mut()
+                .find(|participant| participant.target_id == actor_id)
+            {
+                actor.next_attack_bonus_physical = 0.0;
+            }
+        }
+        if is_current_redeemed_commissar_war_cry(skill) {
+            let proficiency = encounter
+                .participants
+                .iter_mut()
+                .find(|participant| participant.target_id == actor_id)
+                .map(|actor| {
+                    actor.commissar_proficiency =
+                        actor.commissar_proficiency.saturating_add(1).min(5);
+                    actor.commissar_proficiency
+                })
+                .unwrap_or(0);
+            if proficiency > 0 {
+                if let Some(target) = encounter
+                    .participants
+                    .iter_mut()
+                    .find(|participant| participant.target_id == target_id && participant.alive)
+                {
+                    target.next_attack_bonus_physical = proficiency as f32;
+                    encounter.action_log.push(format!(
+                        "{}高呼“为了帝皇”，熟练度提升至{}/5；{}的下次物理攻击附带{}点物理伤害",
+                        actor_name, proficiency, target.display_name, proficiency
+                    ));
+                }
+            }
+        }
+        if is_current_redeemed_bolter(skill) {
+            encounter.action_log.push(format!(
+                "广播给周围玩家：{}开火——{}",
+                actor_name,
+                skill.note.trim()
+            ));
+        }
         if mp_cost > 0.0 {
             encounter.action_log.push(format!(
                 "{}消耗{} MP",
@@ -6121,7 +6225,10 @@ impl BattleRoundStore {
             participant.hope_avatar_rounds_remaining = 0;
         } else if participant.alive {
             if !encounter.active {
-                participant.hp = (participant.hp + participant.hp_regen).min(participant.max_hp);
+                if !participant.natural_hp_regen_suppressed {
+                    participant.hp =
+                        (participant.hp + participant.hp_regen).min(participant.max_hp);
+                }
                 advance_participant_rest_then_fight(participant);
             }
             participant.mp = (participant.mp + participant.mp_regen).min(participant.max_mp);
@@ -6528,6 +6635,11 @@ fn sync_encounter_to_manager(
         }
         if character.exp != participant.exp {
             character.exp = participant.exp.max(0);
+            changed = true;
+        }
+        let commissar_proficiency = participant.commissar_proficiency.min(5);
+        if character.redeemed_commissar_proficiency != commissar_proficiency {
+            character.redeemed_commissar_proficiency = commissar_proficiency;
             changed = true;
         }
         let dominion_bonus = participant.dominion_max_hp_bonus.clamp(
@@ -7270,6 +7382,12 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
             .construct_repair_channel_rounds_remaining
             .hash(&mut hasher);
         participant.paralyzed_rounds_remaining.hash(&mut hasher);
+        participant.commissar_proficiency.hash(&mut hasher);
+        participant
+            .next_attack_bonus_physical
+            .to_bits()
+            .hash(&mut hasher);
+        participant.natural_hp_regen_suppressed.hash(&mut hasher);
         participant.undying_rage_enabled.hash(&mut hasher);
         participant.undying_rage_used.hash(&mut hasher);
         participant.undying_rage_active.hash(&mut hasher);
@@ -7470,6 +7588,9 @@ fn participant_from_character(
         construct_shield_repair_rounds_remaining: 0,
         construct_repair_channel_rounds_remaining: 0,
         paralyzed_rounds_remaining: 0,
+        commissar_proficiency: character.redeemed_commissar_proficiency.min(5),
+        next_attack_bonus_physical: 0.0,
+        natural_hp_regen_suppressed: false,
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
@@ -7598,6 +7719,9 @@ fn participant_from_unit_template(
         construct_shield_repair_rounds_remaining: 0,
         construct_repair_channel_rounds_remaining: 0,
         paralyzed_rounds_remaining: 0,
+        commissar_proficiency: 0,
+        next_attack_bonus_physical: 0.0,
+        natural_hp_regen_suppressed: false,
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
@@ -7720,6 +7844,9 @@ fn participant_from_target(
         construct_shield_repair_rounds_remaining: 0,
         construct_repair_channel_rounds_remaining: 0,
         paralyzed_rounds_remaining: 0,
+        commissar_proficiency: 0,
+        next_attack_bonus_physical: 0.0,
+        natural_hp_regen_suppressed: false,
         undying_rage_enabled: false,
         undying_rage_used: false,
         undying_rage_active: false,
@@ -8106,6 +8233,7 @@ fn sync_participant_from_manager(
         participant.player_character = true;
         participant.level = character.level.max(1);
         participant.exp = character.exp.max(0);
+        participant.commissar_proficiency = character.redeemed_commissar_proficiency.min(5);
         participant.support_talent_experience_bonus_rate =
             character_support_talent_experience_bonus_rate(character);
         let total = character.status.combined(&character.extra_status);
@@ -9743,6 +9871,9 @@ mod area_tests {
             construct_shield_repair_rounds_remaining: 0,
             construct_repair_channel_rounds_remaining: 0,
             paralyzed_rounds_remaining: 0,
+            commissar_proficiency: 0,
+            next_attack_bonus_physical: 0.0,
+            natural_hp_regen_suppressed: false,
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,
@@ -10061,6 +10192,104 @@ mod tests {
     }
 
     #[test]
+    fn redeemed_commissar_war_cry_grants_and_consumes_proficiency_damage() {
+        let manager = empty_manager();
+        let war_cry = CharacterSkill {
+            index: 0,
+            name: "政委".to_owned(),
+            note: "战吼—为了帝皇:熟练度0/5，每次使用前熟练度+1，使目标下次攻击伤害附带【熟练度】点物理伤害。".to_owned(),
+            skill_type: Some("动作".to_owned()),
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 1,
+            cooldown_left: None,
+            target_count: Some(1),
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let attack = CharacterSkill {
+            index: 0,
+            name: "测试攻击".to_owned(),
+            note: "主动使用对目标造成2点物理伤害".to_owned(),
+            skill_type: Some("近战".to_owned()),
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: Some(1),
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let mut store = BattleRoundStore {
+            encounters: HashMap::from([(
+                "battle".to_owned(),
+                BattleEncounter {
+                    active: true,
+                    participants: vec![
+                        participant("commissar", 0),
+                        participant("ally", 0),
+                        participant("enemy", 0),
+                    ],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert!(store.record_skill_use(
+            "battle", "commissar", "ally", &war_cry, &manager, None,
+        ));
+        assert_eq!(store.encounters["battle"].participants[0].commissar_proficiency, 1);
+        assert_eq!(store.encounters["battle"].participants[1].next_attack_bonus_physical, 1.0);
+        assert!(store.record_skill_use(
+            "battle", "ally", "enemy", &attack, &manager, None,
+        ));
+        assert_eq!(store.encounters["battle"].participants[1].next_attack_bonus_physical, 0.0);
+        assert_eq!(store.encounters["battle"].participants[2].hp, 7.0);
+    }
+
+    #[test]
+    fn redeemed_chainsword_tear_suppresses_only_natural_regeneration() {
+        let manager = empty_manager();
+        let chainsword = CharacterSkill {
+            index: 0,
+            name: "链锯剑".to_owned(),
+            note: "装备\n链锯剑（6分）\n由机械教加持的加强版链锯剑，锯齿采用更坚硬的合金，近身攻击会造成5点物理伤害。\n特性:撕裂 近身命中目标造成流血效果，抑制目标的自然生命回复效果。".to_owned(),
+            skill_type: Some("近战".to_owned()),
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: Some(1),
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let mut target = participant("enemy", 0);
+        target.hp_regen = 2.0;
+        let mut store = BattleRoundStore {
+            encounters: HashMap::from([(
+                "battle".to_owned(),
+                BattleEncounter {
+                    participants: vec![participant("actor", 0), target],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert!(store.record_skill_use(
+            "battle", "actor", "enemy", &chainsword, &manager, None,
+        ));
+        assert_eq!(store.encounters["battle"].participants[1].hp, 5.0);
+        assert!(store.encounters["battle"].participants[1].natural_hp_regen_suppressed);
+        assert!(store.next_round("battle"));
+        assert_eq!(store.encounters["battle"].participants[1].hp, 5.0);
+    }
+
+    #[test]
     fn summon_participant_ignores_low_hp_damage_penalty() {
         let mut manager = empty_manager();
         let mut owner = PlayerCharacter::default();
@@ -10149,9 +10378,8 @@ mod tests {
             unit_pool: HashMap::default(),
             pending_talent_choices: HashMap::default(),
             used_talent_names: HashSet::default(),
+            }
         }
-    }
-
     fn participant(id: &str, turn: u32) -> BattleParticipantSnapshot {
         BattleParticipantSnapshot {
             target_id: id.to_owned(),
@@ -10217,6 +10445,9 @@ mod tests {
             construct_shield_repair_rounds_remaining: 0,
             construct_repair_channel_rounds_remaining: 0,
             paralyzed_rounds_remaining: 0,
+            commissar_proficiency: 0,
+            next_attack_bonus_physical: 0.0,
+            natural_hp_regen_suppressed: false,
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,

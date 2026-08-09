@@ -1415,6 +1415,9 @@ pub struct PlayerCharacter {
     /// 「役于我手」在本剧情世界内累计的生命上限加成，随开团/结团重置。
     #[serde(default)]
     pub dominion_max_hp_bonus: f32,
+    /// 「政委」战吼熟练度，使用前提升，最多5级。
+    #[serde(default)]
+    pub redeemed_commissar_proficiency: u32,
 }
 
 impl Default for PlayerCharacter {
@@ -1457,6 +1460,7 @@ impl Default for PlayerCharacter {
             inventory: CharacterInventory::default(),
             summons: Vec::new(),
             dominion_max_hp_bonus: 0.0,
+            redeemed_commissar_proficiency: 0,
         }
     }
 }
