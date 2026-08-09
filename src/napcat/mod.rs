@@ -2195,6 +2195,9 @@ pub struct TrpgGroup {
     /// 本次开团时的世界轮次，用于「疾行如风」等按回合计时的天赋。
     #[serde(default)]
     pub world_start_turn: u32,
+    /// 本次点击“开团”的 Unix 秒时间戳，用于只统计当前团期的响应与回合用时。
+    #[serde(default)]
+    pub campaign_started_at: u64,
 }
 
 impl Default for TrpgGroup {
@@ -2229,6 +2232,7 @@ impl Default for TrpgGroup {
             butterfly_targets: HashMap::default(),
             campaign_active: false,
             world_start_turn: 0,
+            campaign_started_at: 0,
         }
     }
 }
@@ -10139,6 +10143,10 @@ pub fn open_trpg_group_world(
     }
     group.campaign_active = true;
     group.world_start_turn = group.world_turn;
+    group.campaign_started_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let cleared = clear_group_world_talent_state(manager, group_name);
     let granted_geese = grant_group_delicious_geese(manager, group_name);
     Some(format!(
@@ -10163,6 +10171,7 @@ pub fn close_trpg_group_world(
     };
     group.campaign_active = false;
     group.world_start_turn = 0;
+    group.campaign_started_at = 0;
     let cleared = clear_group_world_talent_state(manager, group_name);
     Some(format!(
         "已结团：本次剧情世界结束。已清空世界内的持续型天赋状态（{cleared} 个角色）。"
@@ -14742,6 +14751,10 @@ position_cells = [4, 5, 6]
 
     #[test]
     fn open_and_close_world_track_world_start_turn() {
+        let before_open = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let mut manager = empty_manager();
         manager.trpg_groups.insert("g".to_owned(), TrpgGroup {
             world_turn: 5,
@@ -14753,12 +14766,14 @@ position_cells = [4, 5, 6]
             manager.trpg_groups["g"].world_start_turn,
             5
         );
+        assert!(manager.trpg_groups["g"].campaign_started_at >= before_open);
         assert!(close_trpg_group_world(&mut manager, "g").is_some());
         assert!(!manager.trpg_groups["g"].campaign_active);
         assert_eq!(
             manager.trpg_groups["g"].world_start_turn,
             0
         );
+        assert_eq!(manager.trpg_groups["g"].campaign_started_at, 0);
     }
 
     #[test]

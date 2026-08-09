@@ -10,6 +10,7 @@ use bevy_egui::egui;
 
 use crate::napcat::{
     NapcatMessage,
+    NapcatMessageChainType,
     NapcatMessageManager,
     NapcatMessageType,
     TrpgGroup,
@@ -39,10 +40,20 @@ pub(super) fn show_chat_analytics_window(
         .get(target_id)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let response = private_response_timing(messages, now);
-    let world_turn = group_name
-        .and_then(|name| manager.trpg_groups.get(name))
-        .map(|group| world_turn_timing(manager, group, now));
+    let group = group_name.and_then(|name| manager.trpg_groups.get(name));
+    let session_started_at = group
+        .filter(|group| group.campaign_active)
+        .and_then(|group| {
+            (group.campaign_started_at > 0)
+                .then_some(group.campaign_started_at)
+                .or_else(|| inferred_current_session_start(manager, group))
+        });
+    let response = session_started_at
+        .map(|started_at| private_response_timing(messages, started_at, now))
+        .unwrap_or_default();
+    let world_turn = group
+        .zip(session_started_at)
+        .map(|(group, started_at)| world_turn_timing(manager, group, started_at, now));
     let title = format!("响应数据 · {display_name}");
 
     egui::Window::new(title)
@@ -112,7 +123,14 @@ pub(super) fn show_chat_analytics_window(
                     ui.small("此私聊不在当前TRPG组中，暂无世界回合数据");
                 },
             }
-            ui.small("统计只使用本地时间戳；连续玩家消息按一次回复计算。");
+            if let Some(started_at) = session_started_at {
+                ui.small(format!(
+                    "仅统计本次开团（起点 {}）；连续玩家消息按一次回复计算。",
+                    format_clock(started_at)
+                ));
+            } else {
+                ui.small("尚未开团，当前没有团期统计数据。");
+            }
         });
 }
 
@@ -128,11 +146,15 @@ fn timing_average_ui(ui: &mut egui::Ui, label: &str, summary: &TimingSummary) {
     }
 }
 
-fn private_response_timing(messages: &[NapcatMessage], now: u64) -> TimingSummary {
+fn private_response_timing(
+    messages: &[NapcatMessage],
+    session_started_at: u64,
+    now: u64,
+) -> TimingSummary {
     let mut ordered = messages
         .iter()
         .enumerate()
-        .filter(|(_, message)| message.data.time > 0)
+        .filter(|(_, message)| message.data.time >= session_started_at)
         .collect::<Vec<_>>();
     ordered.sort_by_key(|(index, message)| (message.data.time, *index));
 
@@ -159,7 +181,12 @@ fn private_response_timing(messages: &[NapcatMessage], now: u64) -> TimingSummar
     timing_summary(&samples, pending_since, now)
 }
 
-fn world_turn_timing(manager: &NapcatMessageManager, group: &TrpgGroup, now: u64) -> TimingSummary {
+fn world_turn_timing(
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+    session_started_at: u64,
+    now: u64,
+) -> TimingSummary {
     let target_ids = group.players.iter().chain(group.group_chats.iter());
     let mut turn_starts = BTreeMap::<u32, u64>::new();
 
@@ -174,7 +201,9 @@ fn world_turn_timing(manager: &NapcatMessageManager, group: &TrpgGroup, now: u64
             let Some(snapshot) = snapshot else {
                 continue;
             };
-            if message.data.time == 0 || message.data.campaign_id != group.campaign_id {
+            if message.data.time < session_started_at
+                || message.data.campaign_id != group.campaign_id
+            {
                 continue;
             }
             turn_starts
@@ -185,6 +214,34 @@ fn world_turn_timing(manager: &NapcatMessageManager, group: &TrpgGroup, now: u64
     }
 
     world_turn_summary(&turn_starts, group.world_turn, now)
+}
+
+fn inferred_current_session_start(
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+) -> Option<u64> {
+    group
+        .players
+        .iter()
+        .filter_map(|target_id| manager.messages.get(target_id))
+        .flatten()
+        .filter(|message| message.data.user_id == message.data.self_id)
+        .filter(|message| {
+            let normalized = message
+                .data
+                .message
+                .iter()
+                .filter_map(|chain| match &chain.variant {
+                    NapcatMessageChainType::Text { data } => Some(data.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+                .to_lowercase()
+                .replace([' ', ',', '，'], "");
+            normalized.contains("ok兄弟萌开团了")
+        })
+        .map(|message| message.data.time)
+        .max()
 }
 
 fn world_turn_summary(
@@ -250,6 +307,14 @@ fn format_duration(total_secs: u64) -> String {
     }
 }
 
+fn format_clock(timestamp: u64) -> String {
+    let seconds = timestamp % 86_400;
+    let hour = (seconds / 3_600 + 8) % 24;
+    let minute = seconds % 3_600 / 60;
+    let second = seconds % 60;
+    format!("{hour:02}:{minute:02}:{second:02}")
+}
+
 fn unix_timestamp_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -294,6 +359,8 @@ mod tests {
     #[test]
     fn response_timing_pairs_message_bursts_with_next_reply() {
         let messages = vec![
+            private_message(10, 2, 99),
+            private_message(90, 99, 99),
             private_message(100, 2, 99),
             private_message(110, 2, 99),
             private_message(140, 99, 99),
@@ -303,7 +370,7 @@ mod tests {
         ];
 
         assert_eq!(
-            private_response_timing(&messages, 330),
+            private_response_timing(&messages, 100, 330),
             TimingSummary {
                 completed_samples: 2,
                 average_secs: Some(45),
