@@ -1724,8 +1724,15 @@ struct VoxelPhysicsRequest {
     origin: Vec3,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum VoxelChangeTarget {
+    Grid,
+    Spaceship(Entity),
+}
+
 #[derive(Clone)]
 struct VoxelChange {
+    target: VoxelChangeTarget,
     position: IVec3,
     before: u8,
     after: u8,
@@ -1945,7 +1952,7 @@ pub(crate) struct VoxelEditorState {
     pub time_lighting_enabled: bool,
     undo: Vec<Vec<VoxelChange>>,
     redo: Vec<Vec<VoxelChange>>,
-    stroke_positions: HashSet<IVec3>,
+    stroke_positions: HashSet<(VoxelChangeTarget, IVec3)>,
     active_stroke: Vec<VoxelChange>,
     edit_repeat_seconds: f32,
     camera_focus: Vec3,
@@ -12506,20 +12513,25 @@ fn handle_editor_requests(
     mut persistence: ResMut<VoxelScenePersistenceState>,
     mut scene_recorder: Option<ResMut<crate::replay::ReplaySceneRecorder>>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
-    physics_bodies: Query<Entity, With<VoxelPhysicsBody>>,
+    physics_bodies: Query<(
+        Entity,
+        &VoxelPhysicsBody,
+        Option<&VoxelSpaceship>,
+    )>,
     placed_lights: Query<Entity, With<VoxelPlacedLight>>,
     mut planets: Query<&mut VoxelOrbitalPlanet>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
     mut spaceship_store: Option<ResMut<Persistent<VoxelSpaceshipStore>>>,
     mut spaceship_control: Option<ResMut<VoxelSpaceshipControlState>>,
+    mut occupancy: ResMut<VoxelSpaceshipOccupancyCache>,
 ) {
     let Ok(mut grid) = grids.single_mut() else {
         return;
     };
     if editor.reset_requested {
         physics_loader.unloaded_bodies.clear();
-        for entity in &physics_bodies {
+        for (entity, ..) in &physics_bodies {
             commands.entity(entity).despawn();
         }
         for entity in &placed_lights {
@@ -12564,7 +12576,10 @@ fn handle_editor_requests(
     if editor.undo_requested {
         if let Some(stroke) = editor.undo.pop() {
             apply_stroke(
+                &mut commands,
                 &mut grid,
+                &mut occupancy,
+                &physics_bodies,
                 &stroke,
                 false,
                 scene_recorder.as_deref_mut(),
@@ -12576,7 +12591,10 @@ fn handle_editor_requests(
     if editor.redo_requested {
         if let Some(stroke) = editor.redo.pop() {
             apply_stroke(
+                &mut commands,
                 &mut grid,
+                &mut occupancy,
+                &physics_bodies,
                 &stroke,
                 true,
                 scene_recorder.as_deref_mut(),
@@ -12848,7 +12866,7 @@ fn raycast_voxel_spaceship_cells(
         let cell = voxel_cell_at_point(point);
         if occupancy.contains_cell(cell) {
             let normal = if cell != previous {
-                (cell - previous).clamp(IVec3::splat(-1), IVec3::splat(1))
+                (previous - cell).clamp(IVec3::splat(-1), IVec3::splat(1))
             } else {
                 // The ray started inside the voxel; face the dominant axis.
                 let mut dominant = IVec3::ZERO;
@@ -13535,19 +13553,61 @@ fn occupied_cells(grid: &Grid<u8>) -> Vec<IVec3> {
 }
 
 fn apply_stroke(
+    commands: &mut Commands,
     grid: &mut Mut<Grid<u8>>,
+    occupancy: &mut VoxelSpaceshipOccupancyCache,
+    physics_bodies: &Query<(
+        Entity,
+        &VoxelPhysicsBody,
+        Option<&VoxelSpaceship>,
+    )>,
     stroke: &[VoxelChange],
     forward: bool,
     mut scene_recorder: Option<&mut crate::replay::ReplaySceneRecorder>,
 ) {
     for change in stroke {
         let material = if forward { change.after } else { change.before };
-        grid.set(change.position, material);
-        crate::replay::record_replay_grid_cell(
-            scene_recorder.as_deref_mut(),
-            change.position,
-            material,
-        );
+        match change.target {
+            VoxelChangeTarget::Grid => {
+                grid.set(change.position, material);
+                crate::replay::record_replay_grid_cell(
+                    scene_recorder.as_deref_mut(),
+                    change.position,
+                    material,
+                );
+            },
+            VoxelChangeTarget::Spaceship(entity) => {
+                let Ok((_, body, ship)) = physics_bodies.get(entity) else {
+                    continue;
+                };
+                let entry = voxel_spaceship_occupancy_mut(
+                    &mut occupancy.ships,
+                    entity,
+                    &body.cells,
+                );
+                set_voxel_spaceship_cell(entry, change.position, material);
+                entry.cells_dirty = true;
+                crate::replay::record_replay_ship_hull_cell(
+                    scene_recorder.as_deref_mut(),
+                    ship.map(|ship| ship.id.as_str()).unwrap_or_default(),
+                    change.position,
+                    material,
+                );
+                commands.entity(entity).insert(VoxelSpaceshipNeedsRebuild);
+            },
+        }
+    }
+}
+
+fn set_voxel_spaceship_cell(
+    occupancy: &mut VoxelSpaceshipOccupancy,
+    position: IVec3,
+    material: u8,
+) {
+    if material == 0 {
+        occupancy.remove_cell(position);
+    } else {
+        occupancy.set_cell(position, material);
     }
 }
 
@@ -14566,11 +14626,16 @@ fn edit_voxel_grid(
             let entry =
                 voxel_spaceship_occupancy_mut(&mut occupancy.ships, ship_entity, &body.cells);
             let mut changed = 0;
+            let mut stroke = Vec::new();
             let brush_radius = editor.brush_radius;
             for x in -brush_radius..=brush_radius {
                 for y in -brush_radius..=brush_radius {
                     for z in -brush_radius..=brush_radius {
                         let position = center + IVec3::new(x, y, z);
+                        let target = VoxelChangeTarget::Spaceship(ship_entity);
+                        if !editor.stroke_positions.insert((target, position)) {
+                            continue;
+                        }
                         let before = entry.cell_material(position).unwrap_or(0);
                         let Some(after) = edited_voxel(input_mode, before, editor.material) else {
                             continue;
@@ -14578,11 +14643,7 @@ fn edit_voxel_grid(
                         if before == after {
                             continue;
                         }
-                        if after == 0 {
-                            entry.remove_cell(position);
-                        } else {
-                            entry.set_cell(position, after);
-                        }
+                        set_voxel_spaceship_cell(entry, position, after);
                         if after == VOXEL_BLOOD_MATERIAL {
                             blood_decay.refresh(VoxelBloodLocation::Spaceship(
                                 ship_entity,
@@ -14595,23 +14656,20 @@ fn edit_voxel_grid(
                             position,
                             after,
                         );
+                        stroke.push(VoxelChange {
+                            target,
+                            position,
+                            before,
+                            after,
+                        });
                         changed += 1;
                     }
                 }
             }
+            editor.active_stroke.extend(stroke);
             changed
         };
         if changed == 0 {
-            return;
-        }
-        if occupancy
-            .ships
-            .get(&ship_entity)
-            .is_some_and(VoxelSpaceshipOccupancy::is_empty)
-        {
-            occupancy.ships.remove(&ship_entity);
-            commands.entity(ship_entity).despawn();
-            editor.physics_status = Some("飞船已被完全拆解".to_owned());
             return;
         }
         if let Some(entry) = occupancy.ships.get_mut(&ship_entity) {
@@ -14647,7 +14705,10 @@ fn edit_voxel_grid(
         for y in -brush_radius..=brush_radius {
             for z in -brush_radius..=brush_radius {
                 let position = center + IVec3::new(x, y, z);
-                if !editor.stroke_positions.insert(position) {
+                if !editor
+                    .stroke_positions
+                    .insert((VoxelChangeTarget::Grid, position))
+                {
                     continue;
                 }
                 let before = grid.get(position).copied().unwrap_or(0);
@@ -14666,6 +14727,7 @@ fn edit_voxel_grid(
                         after,
                     );
                     stroke.push(VoxelChange {
+                        target: VoxelChangeTarget::Grid,
                         position,
                         before,
                         after,
@@ -14802,9 +14864,6 @@ pub(crate) fn rebuild_dirty_voxel_spaceships(
             .flat_map(|cells| cells.iter())
             .map(|(cell, material)| (*cell, *material))
             .collect();
-        if cells.is_empty() {
-            continue;
-        }
         if let Ok(mut entity_commands) = commands.get_entity(*entity) {
             entity_commands.insert(VoxelPhysicsBody {
                 local_center: voxel_spaceship_local_center(&cells),
@@ -19722,14 +19781,60 @@ mod tests {
         let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
         let position = IVec3::new(20, 3, 20);
         let stroke = [VoxelChange {
+            target: VoxelChangeTarget::Grid,
             position,
             before: 0,
             after: 2,
         }];
-        apply_stroke(&mut grid, &stroke, true, None);
+        for change in &stroke {
+            grid.set(change.position, change.after);
+        }
         assert_eq!(grid.get(position), Some(&2));
-        apply_stroke(&mut grid, &stroke, false, None);
+        for change in &stroke {
+            grid.set(change.position, change.before);
+        }
         assert_eq!(grid.get(position), Some(&0));
+    }
+
+    #[test]
+    fn spaceship_raycast_reports_the_outward_surface_normal_for_placement() {
+        let mut occupancy = VoxelSpaceshipOccupancy::empty();
+        occupancy.set_cell(IVec3::ZERO, 1);
+        let ray = Ray3d::new(
+            Vec3::new(-2.0, 0.5, 0.5) * VOXEL_SIZE,
+            Dir3::X,
+        );
+
+        let hit = raycast_voxel_spaceship_cells(
+            &occupancy,
+            &Transform::default(),
+            ray,
+        )
+        .expect("ray must hit the ship hull");
+
+        assert_eq!(hit.occupied, IVec3::ZERO);
+        assert_eq!(hit.normal, IVec3::NEG_X);
+        assert_eq!(hit.occupied + hit.normal, IVec3::NEG_X);
+    }
+
+    #[test]
+    fn spaceship_voxel_change_round_trips_in_ship_local_occupancy() {
+        let mut occupancy = VoxelSpaceshipOccupancy::empty();
+        occupancy.set_cell(IVec3::ZERO, 1);
+        let position = IVec3::X;
+        let change = VoxelChange {
+            target: VoxelChangeTarget::Spaceship(Entity::PLACEHOLDER),
+            position,
+            before: 0,
+            after: 4,
+        };
+
+        set_voxel_spaceship_cell(&mut occupancy, change.position, change.after);
+        assert_eq!(occupancy.cell_material(position), Some(4));
+        set_voxel_spaceship_cell(&mut occupancy, change.position, change.before);
+        assert_eq!(occupancy.cell_material(position), None);
+        set_voxel_spaceship_cell(&mut occupancy, change.position, change.after);
+        assert_eq!(occupancy.cell_material(position), Some(4));
     }
 
     #[test]
