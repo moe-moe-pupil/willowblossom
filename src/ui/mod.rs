@@ -770,17 +770,18 @@ use crate::{
         BATTLE_ROUND_EXPORT_VERSION,
     },
     deepseek::{
-        DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS,
+        filter_control_characters,
         DeepseekIOSender,
         DeepseekManager,
         DeepseekPlugin,
         DeepseekRequest,
         DeepseekSummaryBlock,
+        DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS,
         DEEPSEEK_SUMMARY_EXPORT_VERSION,
-        filter_control_characters,
     },
     napcat::{
         adjust_character_status_points,
+        advance_character_redeemed_craft_cooldowns,
         advance_character_redeemed_needles_noncombat,
         campaign_weave_state,
         character_chaos_output_variance,
@@ -790,6 +791,9 @@ use crate::{
         character_dying_target_healing_modifier,
         character_effective_skill_mp_cost,
         character_fatigue_walker_available,
+        character_has_current_redeemed_happy_split,
+        character_has_current_redeemed_reinforcement,
+        character_has_current_redeemed_treasure_hunter,
         character_healing_attribute_multiplier,
         character_large_hit_damage_taken_modifier,
         character_low_hp_damage_multiplier,
@@ -797,6 +801,7 @@ use crate::{
         character_minimum_range_meters,
         character_mutual_aid_healing_rate,
         character_next_level_exp,
+        character_npc_favorability_bonus,
         character_physical_damage_followup_rate,
         character_physical_damage_lifesteal,
         character_spell_range_multiplier,
@@ -804,10 +809,12 @@ use crate::{
         character_summon_damage_multiplier,
         character_summon_range_meters,
         character_total_status,
-        character_npc_favorability_bonus,
         character_wounded_healing_dealt_modifier,
         close_trpg_group_world,
         content_pool_generation_prompt,
+        craft_redeemed_ammunition,
+        craft_redeemed_happy_split_device,
+        dismantle_redeemed_treasure_hunter_item,
         dying_target_healing_multiplier,
         grant_character_experience,
         is_scene_capture_command_text,
@@ -820,12 +827,14 @@ use crate::{
         open_trpg_group_world,
         record_character_damage_taken,
         record_character_healing_taken,
+        reinforce_redeemed_happy_split_device,
         reset_character_turn_totals,
         skill_rule_args,
         summon_max_hp_for_level,
         summon_target_id,
-        sync_character_summons,
+        sync_character_redeemed_craft_state,
         sync_character_redeemed_needles,
+        sync_character_summons,
         update_character_from_status,
         update_character_from_status_with_config,
         upsert_character_active_buff,
@@ -1036,6 +1045,8 @@ pub(crate) struct CharacterEditState {
     item_pool_selected_index: HashMap<String, usize>,
     exp_award_drafts: HashMap<String, i32>,
     summon_scene_status: HashMap<String, String>,
+    redeemed_craft_material_index: HashMap<String, usize>,
+    redeemed_craft_status: HashMap<String, String>,
 }
 
 impl CharacterEditState {
@@ -1054,6 +1065,8 @@ impl CharacterEditState {
         self.skill_pool_selected_index.remove(target_id);
         self.item_pool_selected_index.remove(target_id);
         self.exp_award_drafts.remove(target_id);
+        self.redeemed_craft_material_index.remove(target_id);
+        self.redeemed_craft_status.remove(target_id);
         self.summon_scene_status
             .retain(|summon_id, _| !summon_id.starts_with(&format!("summon:{target_id}:")));
     }
@@ -7052,6 +7065,7 @@ fn character_editor_ui(
     stat_config: TrpgBasicConfig,
 ) -> bool {
     let mut changed = sync_character_redeemed_needles(character);
+    changed |= sync_character_redeemed_craft_state(character);
     let mut derived_stats_changed = false;
     ui.horizontal(|ui| {
         changed |= ui.checkbox(&mut character.inited, "已完成").changed();
@@ -8808,6 +8822,136 @@ fn character_buff_editor_ui(
     changed
 }
 
+fn redeemed_crafting_ui(
+    ui: &mut Ui,
+    target_id: &str,
+    character: &mut PlayerCharacter,
+    edit_state: &mut CharacterEditState,
+) -> bool {
+    let has_happy_split = character_has_current_redeemed_happy_split(character);
+    let has_treasure_hunter = character_has_current_redeemed_treasure_hunter(character);
+    let has_reinforcement = character_has_current_redeemed_reinforcement(character);
+    if !(has_happy_split || has_treasure_hunter || has_reinforcement) {
+        return false;
+    }
+
+    let mut changed = false;
+    ui.collapsing("已兑换制作能力", |ui| {
+        let item_count = character.inventory.items.len();
+        let selected = edit_state
+            .redeemed_craft_material_index
+            .entry(target_id.to_owned())
+            .or_insert(0);
+        if item_count == 0 {
+            *selected = 0;
+            ui.small("背包中没有可用材料或可拆解物品。 ");
+        } else {
+            *selected = (*selected).min(item_count - 1);
+            let selected_text = item_display_name(&character.inventory.items[*selected]);
+            egui::ComboBox::from_id_salt(("redeemed_craft_material", target_id))
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    for (index, item) in character.inventory.items.iter().enumerate() {
+                        ui.selectable_value(selected, index, item_display_name(item));
+                    }
+                });
+        }
+
+        ui.small(format!(
+            "重制冷却 {} 回合；强化/弹药冷却 {} 回合",
+            character.redeemed_craft_state.rebuild_cooldown_remaining,
+            character
+                .redeemed_craft_state
+                .reinforcement_cooldown_remaining
+        ));
+
+        let material_index = *selected;
+        let has_material = item_count > 0;
+        let mut result = None;
+        ui.horizontal_wrapped(|ui| {
+            if has_happy_split
+                && ui
+                    .add_enabled(
+                        has_material,
+                        egui::Button::new("制作科技设备（3伤）"),
+                    )
+                    .clicked()
+            {
+                result = Some(
+                    craft_redeemed_happy_split_device(character, material_index, false)
+                        .map(|name| format!("已制作：{name}")),
+                );
+            }
+            if has_happy_split
+                && ui
+                    .add_enabled(
+                        has_material,
+                        egui::Button::new("制作一次性炸药（6伤）"),
+                    )
+                    .clicked()
+            {
+                result = Some(
+                    craft_redeemed_happy_split_device(character, material_index, true)
+                        .map(|name| format!("已制作：{name}")),
+                );
+            }
+            if has_reinforcement && ui.button("强化当前制作物").clicked() {
+                result = Some(
+                    reinforce_redeemed_happy_split_device(character)
+                        .map(|damage| format!("强化完成：当前伤害 {damage}")),
+                );
+            }
+            if has_reinforcement
+                && ui
+                    .add_enabled(
+                        has_material,
+                        egui::Button::new("用金属手搓弹药"),
+                    )
+                    .clicked()
+            {
+                result = Some(
+                    craft_redeemed_ammunition(character, material_index)
+                        .map(|name| format!("已制作：{name}")),
+                );
+            }
+            if has_treasure_hunter
+                && ui
+                    .add_enabled(
+                        has_material,
+                        egui::Button::new("拆解所选物品"),
+                    )
+                    .clicked()
+            {
+                result = Some(
+                    dismantle_redeemed_treasure_hunter_item(character, material_index)
+                        .map(|name| format!("已拆出：{name} ×2")),
+                );
+            }
+        });
+
+        if let Some(result) = result {
+            let succeeded = result.is_ok();
+            edit_state.redeemed_craft_status.insert(
+                target_id.to_owned(),
+                result.unwrap_or_else(|error| format!("无法执行：{error}")),
+            );
+            if succeeded {
+                changed = true;
+                let new_count = character.inventory.items.len();
+                if new_count == 0 {
+                    *selected = 0;
+                } else {
+                    *selected = (*selected).min(new_count - 1);
+                }
+            }
+        }
+        if let Some(status) = edit_state.redeemed_craft_status.get(target_id) {
+            ui.small(status);
+        }
+    });
+    changed
+}
+
 fn character_inventory_editor_ui(
     ui: &mut Ui,
     target_id: &str,
@@ -8824,6 +8968,7 @@ fn character_inventory_editor_ui(
     egui::CollapsingHeader::new("背包 / 装备")
         .default_open(default_open)
         .show(ui, |ui| {
+            changed |= redeemed_crafting_ui(ui, target_id, character, edit_state);
             if !item_pool.is_empty() {
                 let selected = edit_state
                     .item_pool_selected_index
@@ -9912,6 +10057,7 @@ fn advance_group_world_turn(
         for target_id in &players {
             if let Some(character) = manager.player_characters.get_mut(target_id) {
                 changed |= advance_character_redeemed_needles_noncombat(character);
+                changed |= advance_character_redeemed_craft_cooldowns(character);
             }
         }
         changed |= advance_buffs_for_players(manager, &players, rule_engine_state);

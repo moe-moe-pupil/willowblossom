@@ -1329,6 +1329,19 @@ pub struct RedeemedNeedleState {
     pub case_progress_noncombat_rounds: u8,
 }
 
+pub const REDEEMED_CRAFTED_DEVICE_CATEGORY: &str = "兑换制作物/快乐分裂";
+pub const REDEEMED_HANDMADE_AMMO_CATEGORY: &str = "兑换制作物/手搓弹药";
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct RedeemedCraftState {
+    #[serde(default)]
+    pub device_active: bool,
+    #[serde(default)]
+    pub rebuild_cooldown_remaining: u32,
+    #[serde(default)]
+    pub reinforcement_cooldown_remaining: u32,
+}
+
 impl Default for RedeemedNeedleState {
     fn default() -> Self {
         Self {
@@ -1442,6 +1455,8 @@ pub struct PlayerCharacter {
     pub redeemed_commissar_proficiency: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redeemed_needles: Option<RedeemedNeedleState>,
+    #[serde(default)]
+    pub redeemed_craft_state: RedeemedCraftState,
 }
 
 impl Default for PlayerCharacter {
@@ -1486,6 +1501,7 @@ impl Default for PlayerCharacter {
             dominion_max_hp_bonus: 0.0,
             redeemed_commissar_proficiency: 0,
             redeemed_needles: None,
+            redeemed_craft_state: RedeemedCraftState::default(),
         }
     }
 }
@@ -9436,33 +9452,41 @@ fn redeemed_summon(kind: SummonKind) -> Summon {
 }
 
 fn character_has_current_redeemed_flying_needles(character: &PlayerCharacter) -> bool {
-    character.skill_names.iter().enumerate().any(|(index, name)| {
-        name.trim() == "飞针"
-            && character
-                .skill_metadata
-                .get(index)
-                .is_some_and(CharacterSkillMetadata::is_approved)
-            && character.skill_notes.get(index).is_some_and(|note| {
-                note.contains("常态具备5根飞针")
-                    && note.contains("每根飞针造成1点远程物理伤害")
-                    && note.contains("非战斗轮每一回合补充一根")
-            })
-    })
+    character
+        .skill_names
+        .iter()
+        .enumerate()
+        .any(|(index, name)| {
+            name.trim() == "飞针"
+                && character
+                    .skill_metadata
+                    .get(index)
+                    .is_some_and(CharacterSkillMetadata::is_approved)
+                && character.skill_notes.get(index).is_some_and(|note| {
+                    note.contains("常态具备5根飞针")
+                        && note.contains("每根飞针造成1点远程物理伤害")
+                        && note.contains("非战斗轮每一回合补充一根")
+                })
+        })
 }
 
 pub fn character_has_current_redeemed_needle_case(character: &PlayerCharacter) -> bool {
-    character.skill_names.iter().enumerate().any(|(index, name)| {
-        name.trim() == "针匣"
-            && character
-                .skill_metadata
-                .get(index)
-                .is_some_and(CharacterSkillMetadata::is_approved)
-            && character.skill_notes.get(index).is_some_and(|note| {
-                note.contains("额外可以存储两根飞针")
-                    && note.contains("开团时为空")
-                    && note.contains("非战斗轮每两回合生产一根")
-            })
-    })
+    character
+        .skill_names
+        .iter()
+        .enumerate()
+        .any(|(index, name)| {
+            name.trim() == "针匣"
+                && character
+                    .skill_metadata
+                    .get(index)
+                    .is_some_and(CharacterSkillMetadata::is_approved)
+                && character.skill_notes.get(index).is_some_and(|note| {
+                    note.contains("额外可以存储两根飞针")
+                        && note.contains("开团时为空")
+                        && note.contains("非战斗轮每两回合生产一根")
+                })
+        })
 }
 
 pub fn sync_character_redeemed_needles(character: &mut PlayerCharacter) -> bool {
@@ -9516,6 +9540,280 @@ pub fn advance_character_redeemed_needles_noncombat(character: &mut PlayerCharac
         changed = true;
     }
     changed
+}
+
+fn character_has_current_redeemed_skill(
+    character: &PlayerCharacter,
+    name: &str,
+    required_fragments: &[&str],
+) -> bool {
+    character
+        .skill_names
+        .iter()
+        .enumerate()
+        .any(|(index, skill_name)| {
+            skill_name.trim() == name
+                && character
+                    .skill_metadata
+                    .get(index)
+                    .is_some_and(CharacterSkillMetadata::is_approved)
+                && character.skill_notes.get(index).is_some_and(|note| {
+                    required_fragments
+                        .iter()
+                        .all(|fragment| note.contains(fragment))
+                })
+        })
+}
+
+pub fn character_has_current_redeemed_happy_split(character: &PlayerCharacter) -> bool {
+    character_has_current_redeemed_skill(character, "快乐分裂", &[
+        "有材料的情况下",
+        "一般最多3点伤害",
+        "一次性炸药类时达到",
+    ])
+}
+
+pub fn character_has_current_redeemed_treasure_hunter(character: &PlayerCharacter) -> bool {
+    character_has_current_redeemed_skill(character, "寻宝猎人", &[
+        "拆解材料",
+        "更多可用材料",
+    ])
+}
+
+pub fn character_has_current_redeemed_reinforcement(character: &PlayerCharacter) -> bool {
+    character_has_current_redeemed_skill(
+        character,
+        "赞美上帝并递上弹药",
+        &["强化当前制作物", "数值伤害+2", "爆炸物则+1", "手搓弹药"],
+    )
+}
+
+fn consume_inventory_material(
+    character: &mut PlayerCharacter,
+    material_index: usize,
+) -> Result<InventoryItem, String> {
+    let Some(material) = character.inventory.items.get(material_index) else {
+        return Err("所选材料不存在".to_owned());
+    };
+    if material.stack == 0 {
+        return Err("所选材料数量为0".to_owned());
+    }
+    if material.category == REDEEMED_CRAFTED_DEVICE_CATEGORY {
+        return Err("当前制作物不能作为自己的制作材料".to_owned());
+    }
+    let material = material.clone();
+    if character.inventory.items[material_index].stack > 1 {
+        character.inventory.items[material_index].stack -= 1;
+    } else {
+        character.inventory.items.remove(material_index);
+    }
+    Ok(material)
+}
+
+pub fn sync_character_redeemed_craft_state(character: &mut PlayerCharacter) -> bool {
+    let has_device = character
+        .inventory
+        .items
+        .iter()
+        .any(|item| item.category == REDEEMED_CRAFTED_DEVICE_CATEGORY);
+    let mut changed = false;
+    if character.redeemed_craft_state.device_active && !has_device {
+        character.redeemed_craft_state.device_active = false;
+        character.redeemed_craft_state.rebuild_cooldown_remaining = 1;
+        changed = true;
+    } else if !character.redeemed_craft_state.device_active && has_device {
+        character.redeemed_craft_state.device_active = true;
+        changed = true;
+    }
+    changed
+}
+
+pub fn advance_character_redeemed_craft_cooldowns(character: &mut PlayerCharacter) -> bool {
+    let mut changed = sync_character_redeemed_craft_state(character);
+    if character.redeemed_craft_state.rebuild_cooldown_remaining > 0 {
+        character.redeemed_craft_state.rebuild_cooldown_remaining -= 1;
+        changed = true;
+    }
+    if character
+        .redeemed_craft_state
+        .reinforcement_cooldown_remaining
+        > 0
+    {
+        character
+            .redeemed_craft_state
+            .reinforcement_cooldown_remaining -= 1;
+        changed = true;
+    }
+    changed
+}
+
+pub fn craft_redeemed_happy_split_device(
+    character: &mut PlayerCharacter,
+    material_index: usize,
+    explosive: bool,
+) -> Result<String, String> {
+    if !character_has_current_redeemed_happy_split(character) {
+        return Err("角色没有已批准的快乐分裂".to_owned());
+    }
+    sync_character_redeemed_craft_state(character);
+    if character.redeemed_craft_state.device_active {
+        return Err("当前制作物尚未消失".to_owned());
+    }
+    if character.redeemed_craft_state.rebuild_cooldown_remaining > 0 {
+        return Err(format!(
+            "快乐分裂冷却还剩{}回合",
+            character.redeemed_craft_state.rebuild_cooldown_remaining
+        ));
+    }
+    let material = consume_inventory_material(character, material_index)?;
+    let damage = if explosive { 6 } else { 3 };
+    let device_name = if explosive {
+        format!("{}一次性炸药", material.name.trim())
+    } else {
+        format!("{}科技设备", material.name.trim())
+    };
+    character.inventory.items.push(InventoryItem {
+        category: REDEEMED_CRAFTED_DEVICE_CATEGORY.to_owned(),
+        name: device_name.clone(),
+        description: format!(
+            "快乐分裂使用{}制作；{}点伤害{}",
+            material.name,
+            damage,
+            if explosive { "，使用后消失" } else { "" }
+        ),
+        stack: 1,
+        max_stack: 1,
+        item_level: damage,
+        skills: vec![InventoryItemSkill {
+            name: format!("使用{device_name}"),
+            note: format!("主动使用对目标造成{damage}点物理伤害"),
+            metadata: CharacterSkillMetadata {
+                skill_type: Some("动作".to_owned()),
+                target_class: Some("单目标".to_owned()),
+                ..Default::default()
+            },
+            consume_item: explosive,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    character.redeemed_craft_state.device_active = true;
+    Ok(device_name)
+}
+
+pub fn reinforce_redeemed_happy_split_device(
+    character: &mut PlayerCharacter,
+) -> Result<u32, String> {
+    if !character_has_current_redeemed_reinforcement(character) {
+        return Err("角色没有已批准的赞美上帝并递上弹药".to_owned());
+    }
+    if character
+        .redeemed_craft_state
+        .reinforcement_cooldown_remaining
+        > 0
+    {
+        return Err(format!(
+            "强化冷却还剩{}回合",
+            character
+                .redeemed_craft_state
+                .reinforcement_cooldown_remaining
+        ));
+    }
+    let Some(device) = character
+        .inventory
+        .items
+        .iter_mut()
+        .find(|item| item.category == REDEEMED_CRAFTED_DEVICE_CATEGORY)
+    else {
+        return Err("当前没有可强化的制作物".to_owned());
+    };
+    let explosive = device.skills.iter().any(|skill| skill.consume_item);
+    let increase = if explosive { 1 } else { 2 };
+    device.item_level = device.item_level.saturating_add(increase);
+    if let Some(skill) = device.skills.first_mut() {
+        skill.note = format!(
+            "主动使用对目标造成{}点物理伤害",
+            device.item_level
+        );
+    }
+    device.description = format!(
+        "{}；已强化至{}点伤害",
+        device.description, device.item_level
+    );
+    character
+        .redeemed_craft_state
+        .reinforcement_cooldown_remaining = 2;
+    Ok(device.item_level)
+}
+
+fn inventory_item_is_metal_material(item: &InventoryItem) -> bool {
+    ["金属", "铁", "钢", "铜", "铝"]
+        .iter()
+        .any(|word| item.name.contains(word) || item.description.contains(word))
+}
+
+pub fn craft_redeemed_ammunition(
+    character: &mut PlayerCharacter,
+    material_index: usize,
+) -> Result<String, String> {
+    if !character_has_current_redeemed_reinforcement(character) {
+        return Err("角色没有已批准的赞美上帝并递上弹药".to_owned());
+    }
+    if character
+        .redeemed_craft_state
+        .reinforcement_cooldown_remaining
+        > 0
+    {
+        return Err(format!(
+            "手搓弹药冷却还剩{}回合",
+            character
+                .redeemed_craft_state
+                .reinforcement_cooldown_remaining
+        ));
+    }
+    let Some(material) = character.inventory.items.get(material_index) else {
+        return Err("所选材料不存在".to_owned());
+    };
+    if !inventory_item_is_metal_material(material) {
+        return Err("手搓弹药需要名称或描述中标明的金属材料".to_owned());
+    }
+    let material = consume_inventory_material(character, material_index)?;
+    let ammo_name = format!("{}手搓弹药", material.name.trim());
+    character.inventory.items.push(InventoryItem {
+        category: REDEEMED_HANDMADE_AMMO_CATEGORY.to_owned(),
+        name: ammo_name.clone(),
+        description: format!("使用{}手工制作的弹药", material.name),
+        stack: 1,
+        max_stack: 99,
+        ..Default::default()
+    });
+    character
+        .redeemed_craft_state
+        .reinforcement_cooldown_remaining = 2;
+    Ok(ammo_name)
+}
+
+pub fn dismantle_redeemed_treasure_hunter_item(
+    character: &mut PlayerCharacter,
+    item_index: usize,
+) -> Result<String, String> {
+    if !character_has_current_redeemed_treasure_hunter(character) {
+        return Err("角色没有已批准的寻宝猎人".to_owned());
+    }
+    let source = consume_inventory_material(character, item_index)?;
+    let material_name = format!("{}可用材料", source.name.trim());
+    character.inventory.items.push(InventoryItem {
+        category: "拆解材料".to_owned(),
+        name: material_name.clone(),
+        description: format!(
+            "寻宝猎人从{}中拆出的更多可用材料",
+            source.name
+        ),
+        stack: 2,
+        max_stack: 99,
+        ..Default::default()
+    });
+    Ok(material_name)
 }
 
 /// 召唤物离主距离（米）：默认15米，「魔网延伸」+5%；
@@ -17366,16 +17664,170 @@ position_cells = [4, 5, 6]
             ..Default::default()
         };
 
-        assert!(sync_character_redeemed_needles(&mut character));
-        assert_eq!(character.redeemed_needles.unwrap().ready, 5);
-        assert_eq!(character.redeemed_needles.unwrap().case_ready, 0);
+        assert!(sync_character_redeemed_needles(
+            &mut character
+        ));
+        assert_eq!(
+            character.redeemed_needles.unwrap().ready,
+            5
+        );
+        assert_eq!(
+            character.redeemed_needles.unwrap().case_ready,
+            0
+        );
         character.redeemed_needles.as_mut().unwrap().ready = 3;
         assert!(advance_character_redeemed_needles_noncombat(&mut character));
-        assert_eq!(character.redeemed_needles.unwrap().ready, 4);
-        assert_eq!(character.redeemed_needles.unwrap().case_ready, 0);
+        assert_eq!(
+            character.redeemed_needles.unwrap().ready,
+            4
+        );
+        assert_eq!(
+            character.redeemed_needles.unwrap().case_ready,
+            0
+        );
         assert!(advance_character_redeemed_needles_noncombat(&mut character));
-        assert_eq!(character.redeemed_needles.unwrap().ready, 5);
-        assert_eq!(character.redeemed_needles.unwrap().case_ready, 1);
+        assert_eq!(
+            character.redeemed_needles.unwrap().ready,
+            5
+        );
+        assert_eq!(
+            character.redeemed_needles.unwrap().case_ready,
+            1
+        );
+    }
+
+    fn redeemed_crafter() -> PlayerCharacter {
+        PlayerCharacter {
+            skill_names: vec![
+                "快乐分裂".to_owned(),
+                "寻宝猎人".to_owned(),
+                "赞美上帝并递上弹药".to_owned(),
+            ],
+            skill_notes: vec![
+                "有材料的情况下制作设备，一般最多3点伤害，一次性炸药类时达到6点伤害。".to_owned(),
+                "可以拆解材料，获得更多可用材料。".to_owned(),
+                "强化当前制作物，数值伤害+2，爆炸物则+1，也可用金属手搓弹药。".to_owned(),
+            ],
+            skill_metadata: vec![CharacterSkillMetadata::default(); 3],
+            ..Default::default()
+        }
+    }
+
+    fn crafting_material(name: &str) -> InventoryItem {
+        InventoryItem {
+            name: name.to_owned(),
+            stack: 1,
+            max_stack: 99,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn redeemed_happy_split_crafts_reinforces_and_rebuilds() {
+        let mut character = redeemed_crafter();
+        character.inventory.items.push(crafting_material("废铁"));
+
+        assert_eq!(
+            craft_redeemed_happy_split_device(&mut character, 0, false).unwrap(),
+            "废铁科技设备"
+        );
+        let device = &character.inventory.items[0];
+        assert_eq!(
+            device.category,
+            REDEEMED_CRAFTED_DEVICE_CATEGORY
+        );
+        assert_eq!(device.item_level, 3);
+        assert!(!device.skills[0].consume_item);
+
+        assert_eq!(
+            reinforce_redeemed_happy_split_device(&mut character),
+            Ok(5)
+        );
+        assert_eq!(
+            character.inventory.items[0].item_level,
+            5
+        );
+        assert_eq!(
+            character
+                .redeemed_craft_state
+                .reinforcement_cooldown_remaining,
+            2
+        );
+
+        character.inventory.items.clear();
+        assert!(sync_character_redeemed_craft_state(
+            &mut character
+        ));
+        assert_eq!(
+            character.redeemed_craft_state.rebuild_cooldown_remaining,
+            1
+        );
+        character.inventory.items.push(crafting_material("钢片"));
+        assert!(craft_redeemed_happy_split_device(&mut character, 0, false).is_err());
+        assert!(advance_character_redeemed_craft_cooldowns(&mut character));
+        assert_eq!(
+            character.redeemed_craft_state.rebuild_cooldown_remaining,
+            0
+        );
+    }
+
+    #[test]
+    fn redeemed_happy_split_explosive_is_consumable_and_gains_one_damage() {
+        let mut character = redeemed_crafter();
+        character.inventory.items.push(crafting_material("火药"));
+
+        craft_redeemed_happy_split_device(&mut character, 0, true).unwrap();
+        assert_eq!(
+            character.inventory.items[0].item_level,
+            6
+        );
+        assert!(character.inventory.items[0].skills[0].consume_item);
+        assert_eq!(
+            reinforce_redeemed_happy_split_device(&mut character),
+            Ok(7)
+        );
+        assert_eq!(
+            character.inventory.items[0].item_level,
+            7
+        );
+    }
+
+    #[test]
+    fn redeemed_reinforcement_requires_metal_for_ammunition() {
+        let mut character = redeemed_crafter();
+        character.inventory.items.push(crafting_material("木板"));
+        assert!(craft_redeemed_ammunition(&mut character, 0).is_err());
+
+        character.inventory.items.push(crafting_material("铜片"));
+        assert_eq!(
+            craft_redeemed_ammunition(&mut character, 1).unwrap(),
+            "铜片手搓弹药"
+        );
+        assert!(character
+            .inventory
+            .items
+            .iter()
+            .any(|item| { item.category == REDEEMED_HANDMADE_AMMO_CATEGORY && item.stack == 1 }));
+    }
+
+    #[test]
+    fn redeemed_treasure_hunter_yields_more_material_than_it_consumes() {
+        let mut character = redeemed_crafter();
+        character
+            .inventory
+            .items
+            .push(crafting_material("旧收音机"));
+
+        assert_eq!(
+            dismantle_redeemed_treasure_hunter_item(&mut character, 0).unwrap(),
+            "旧收音机可用材料"
+        );
+        assert_eq!(character.inventory.items.len(), 1);
+        assert_eq!(
+            character.inventory.items[0].category,
+            "拆解材料"
+        );
+        assert_eq!(character.inventory.items[0].stack, 2);
     }
 
     #[test]
