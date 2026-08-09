@@ -12838,7 +12838,7 @@ fn voxel_spaceship_occupancy_mut<'a>(
 
 struct VoxelSpaceshipRayHit {
     occupied: IVec3,
-    normal: IVec3,
+    add: IVec3,
     distance: f32,
 }
 
@@ -12883,14 +12883,81 @@ fn raycast_voxel_spaceship_cells(
             };
             return Some(VoxelSpaceshipRayHit {
                 occupied: cell,
-                normal,
-                distance,
+                add: if cell == previous { cell + normal } else { previous },
+                distance: transform.transform_point(point).distance(ray.origin),
             });
         }
         previous = cell;
         distance += step;
     }
     None
+}
+
+fn blood_splatter_seed(center: IVec3, sequence: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    center.hash(&mut hasher);
+    sequence.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn blood_splatter_cells(
+    center: IVec3,
+    surface_normal: IVec3,
+    brush_radius: i32,
+    seed: u64,
+) -> Vec<IVec3> {
+    let normal = if surface_normal == IVec3::ZERO {
+        IVec3::Y
+    } else {
+        surface_normal
+    };
+    let (tangent_a, tangent_b) = if normal.x != 0 {
+        (IVec3::Y, IVec3::Z)
+    } else if normal.y != 0 {
+        (IVec3::X, IVec3::Z)
+    } else {
+        (IVec3::X, IVec3::Y)
+    };
+    let mut rng = FragmentRng::new(seed);
+    let radius = (brush_radius.max(0) + 2).min(8);
+    let target_count = (5 + rng.index(5) + brush_radius.max(0) as usize * 4).min(32);
+    let directions = [tangent_a, -tangent_a, tangent_b, -tangent_b];
+    let mut cells = vec![center];
+    let mut occupied = HashSet::from([center]);
+    let mut attempts = 0;
+    while cells.len() < target_count && attempts < target_count * 16 {
+        attempts += 1;
+        let origin = cells[rng.index(cells.len())];
+        let candidate = origin + directions[rng.index(directions.len())];
+        let offset = candidate - center;
+        if offset.dot(normal) != 0
+            || offset.x.abs().max(offset.y.abs()).max(offset.z.abs()) > radius
+            || !occupied.insert(candidate)
+        {
+            continue;
+        }
+        cells.push(candidate);
+    }
+    cells
+}
+
+fn voxel_edit_cells(
+    center: IVec3,
+    surface_normal: IVec3,
+    brush_radius: i32,
+    mode: VoxelEditMode,
+    material: u8,
+    seed: u64,
+) -> Vec<IVec3> {
+    if mode == VoxelEditMode::Add && material == VOXEL_BLOOD_MATERIAL {
+        return blood_splatter_cells(center, surface_normal, brush_radius, seed);
+    }
+    let radius = brush_radius.max(0);
+    prism(
+        center - IVec3::splat(radius),
+        center + IVec3::splat(radius) + IVec3::ONE,
+    )
+    .collect()
 }
 
 /// Rebuilds one hull chunk's mesh children from its current cells. Chunk meshes
@@ -14546,29 +14613,36 @@ fn edit_voxel_grid(
                 hit.occupied
             };
             let mut changed = 0;
-            let brush_radius = editor.brush_radius;
-            for x in -brush_radius..=brush_radius {
-                for y in -brush_radius..=brush_radius {
-                    for z in -brush_radius..=brush_radius {
-                        let cell = center + IVec3::new(x, y, z);
-                        let before = planet.cells.get(&cell).copied().unwrap_or(0);
-                        let did_change = match input_mode {
-                            VoxelEditMode::Add => {
-                                set_planet_voxel(&mut planet, cell, editor.material)
-                            },
-                            VoxelEditMode::Remove => dig_planet_voxel(&mut planet, cell),
-                            VoxelEditMode::Paint => {
-                                planet.cells.contains_key(&cell)
-                                    && set_planet_voxel(&mut planet, cell, editor.material)
-                            },
-                            _ => false,
-                        };
-                        if did_change && editor.material == VOXEL_BLOOD_MATERIAL {
-                            blood_decay.refresh(VoxelBloodLocation::Planet(cell), before);
-                        }
-                        changed += usize::from(did_change);
-                    }
+            let edit_seed = if input_mode == VoxelEditMode::Add
+                && editor.material == VOXEL_BLOOD_MATERIAL
+            {
+                *explosion_sequence = explosion_sequence.wrapping_add(1);
+                blood_splatter_seed(center, *explosion_sequence)
+            } else {
+                0
+            };
+            for cell in voxel_edit_cells(
+                center,
+                hit.normal,
+                editor.brush_radius,
+                input_mode,
+                editor.material,
+                edit_seed,
+            ) {
+                let before = planet.cells.get(&cell).copied().unwrap_or(0);
+                let did_change = match input_mode {
+                    VoxelEditMode::Add => set_planet_voxel(&mut planet, cell, editor.material),
+                    VoxelEditMode::Remove => dig_planet_voxel(&mut planet, cell),
+                    VoxelEditMode::Paint => {
+                        planet.cells.contains_key(&cell)
+                            && set_planet_voxel(&mut planet, cell, editor.material)
+                    },
+                    _ => false,
+                };
+                if did_change && editor.material == VOXEL_BLOOD_MATERIAL {
+                    blood_decay.refresh(VoxelBloodLocation::Planet(cell), before);
                 }
+                changed += usize::from(did_change);
             }
             if changed > 0 {
                 editor.physics_status = Some(format!(
@@ -14617,54 +14691,65 @@ fn edit_voxel_grid(
             return;
         };
         let ship_id = ship.map(|ship| ship.id.clone()).unwrap_or_default();
+        let surface_normal = hit.add - hit.occupied;
         let center = if input_mode == VoxelEditMode::Add {
-            hit.occupied + hit.normal
+            hit.add
         } else {
             hit.occupied
         };
+        let edit_seed = if input_mode == VoxelEditMode::Add
+            && editor.material == VOXEL_BLOOD_MATERIAL
+        {
+            *explosion_sequence = explosion_sequence.wrapping_add(1);
+            blood_splatter_seed(center, *explosion_sequence)
+        } else {
+            0
+        };
+        let edit_cells = voxel_edit_cells(
+            center,
+            surface_normal,
+            editor.brush_radius,
+            input_mode,
+            editor.material,
+            edit_seed,
+        );
         let changed = {
             let entry =
                 voxel_spaceship_occupancy_mut(&mut occupancy.ships, ship_entity, &body.cells);
             let mut changed = 0;
             let mut stroke = Vec::new();
-            let brush_radius = editor.brush_radius;
-            for x in -brush_radius..=brush_radius {
-                for y in -brush_radius..=brush_radius {
-                    for z in -brush_radius..=brush_radius {
-                        let position = center + IVec3::new(x, y, z);
-                        let target = VoxelChangeTarget::Spaceship(ship_entity);
-                        if !editor.stroke_positions.insert((target, position)) {
-                            continue;
-                        }
-                        let before = entry.cell_material(position).unwrap_or(0);
-                        let Some(after) = edited_voxel(input_mode, before, editor.material) else {
-                            continue;
-                        };
-                        if before == after {
-                            continue;
-                        }
-                        set_voxel_spaceship_cell(entry, position, after);
-                        if after == VOXEL_BLOOD_MATERIAL {
-                            blood_decay.refresh(VoxelBloodLocation::Spaceship(
-                                ship_entity,
-                                position,
-                            ), before);
-                        }
-                        crate::replay::record_replay_ship_hull_cell(
-                            scene_recorder.as_deref_mut(),
-                            &ship_id,
-                            position,
-                            after,
-                        );
-                        stroke.push(VoxelChange {
-                            target,
-                            position,
-                            before,
-                            after,
-                        });
-                        changed += 1;
-                    }
+            for position in edit_cells {
+                let target = VoxelChangeTarget::Spaceship(ship_entity);
+                if !editor.stroke_positions.insert((target, position)) {
+                    continue;
                 }
+                let before = entry.cell_material(position).unwrap_or(0);
+                let Some(after) = edited_voxel(input_mode, before, editor.material) else {
+                    continue;
+                };
+                if before == after {
+                    continue;
+                }
+                set_voxel_spaceship_cell(entry, position, after);
+                if after == VOXEL_BLOOD_MATERIAL {
+                    blood_decay.refresh(
+                        VoxelBloodLocation::Spaceship(ship_entity, position),
+                        before,
+                    );
+                }
+                crate::replay::record_replay_ship_hull_cell(
+                    scene_recorder.as_deref_mut(),
+                    &ship_id,
+                    position,
+                    after,
+                );
+                stroke.push(VoxelChange {
+                    target,
+                    position,
+                    before,
+                    after,
+                });
+                changed += 1;
             }
             editor.active_stroke.extend(stroke);
             changed
@@ -14686,6 +14771,11 @@ fn edit_voxel_grid(
     let Some(hit) = grid_hit else {
         return;
     };
+    let surface_normal = hit
+        .occupied
+        .zip(hit.add)
+        .map(|(occupied, add)| add - occupied)
+        .unwrap_or(IVec3::Y);
     let center = match input_mode {
         VoxelEditMode::Add => hit.add,
         VoxelEditMode::Remove | VoxelEditMode::Paint => hit.occupied,
@@ -14700,40 +14790,49 @@ fn edit_voxel_grid(
     };
 
     let mut stroke = Vec::new();
-    let brush_radius = editor.brush_radius;
-    for x in -brush_radius..=brush_radius {
-        for y in -brush_radius..=brush_radius {
-            for z in -brush_radius..=brush_radius {
-                let position = center + IVec3::new(x, y, z);
-                if !editor
-                    .stroke_positions
-                    .insert((VoxelChangeTarget::Grid, position))
-                {
-                    continue;
-                }
-                let before = grid.get(position).copied().unwrap_or(0);
-                let Some(after) = edited_voxel(input_mode, before, editor.material) else {
-                    continue;
-                };
-                if before != after {
-                    grid.set(position, after);
-                    if after == VOXEL_BLOOD_MATERIAL {
-                        blood_decay.refresh(VoxelBloodLocation::Grid(position), before);
-                    }
-                    dirty_chunks.mark_cell_and_neighbors(position);
-                    crate::replay::record_replay_grid_cell(
-                        scene_recorder.as_deref_mut(),
-                        position,
-                        after,
-                    );
-                    stroke.push(VoxelChange {
-                        target: VoxelChangeTarget::Grid,
-                        position,
-                        before,
-                        after,
-                    });
-                }
+    let edit_seed = if input_mode == VoxelEditMode::Add
+        && editor.material == VOXEL_BLOOD_MATERIAL
+    {
+        *explosion_sequence = explosion_sequence.wrapping_add(1);
+        blood_splatter_seed(center, *explosion_sequence)
+    } else {
+        0
+    };
+    for position in voxel_edit_cells(
+        center,
+        surface_normal,
+        editor.brush_radius,
+        input_mode,
+        editor.material,
+        edit_seed,
+    ) {
+        if !editor
+            .stroke_positions
+            .insert((VoxelChangeTarget::Grid, position))
+        {
+            continue;
+        }
+        let before = grid.get(position).copied().unwrap_or(0);
+        let Some(after) = edited_voxel(input_mode, before, editor.material) else {
+            continue;
+        };
+        if before != after {
+            grid.set(position, after);
+            if after == VOXEL_BLOOD_MATERIAL {
+                blood_decay.refresh(VoxelBloodLocation::Grid(position), before);
             }
+            dirty_chunks.mark_cell_and_neighbors(position);
+            crate::replay::record_replay_grid_cell(
+                scene_recorder.as_deref_mut(),
+                position,
+                after,
+            );
+            stroke.push(VoxelChange {
+                target: VoxelChangeTarget::Grid,
+                position,
+                before,
+                after,
+            });
         }
     }
     if !stroke.is_empty() {
@@ -19797,7 +19896,7 @@ mod tests {
     }
 
     #[test]
-    fn spaceship_raycast_reports_the_outward_surface_normal_for_placement() {
+    fn spaceship_raycast_reports_the_adjacent_surface_cell_for_placement() {
         let mut occupancy = VoxelSpaceshipOccupancy::empty();
         occupancy.set_cell(IVec3::ZERO, 1);
         let ray = Ray3d::new(
@@ -19813,8 +19912,7 @@ mod tests {
         .expect("ray must hit the ship hull");
 
         assert_eq!(hit.occupied, IVec3::ZERO);
-        assert_eq!(hit.normal, IVec3::NEG_X);
-        assert_eq!(hit.occupied + hit.normal, IVec3::NEG_X);
+        assert_eq!(hit.add, IVec3::NEG_X);
     }
 
     #[test]
@@ -20036,6 +20134,48 @@ mod tests {
         decay.refresh(location, VOXEL_BLOOD_MATERIAL);
         assert!(decay.tick(VOXEL_BLOOD_DECAY_SECONDS - 1.0).is_empty());
         assert_eq!(decay.tick(1.0), vec![(location, 7)]);
+    }
+
+    #[test]
+    fn blood_splatters_are_irregular_surface_aligned_shapes() {
+        let center = IVec3::new(4, 5, 6);
+        let first = blood_splatter_cells(center, IVec3::Y, 0, 11);
+        let second = blood_splatter_cells(center, IVec3::Y, 0, 12);
+
+        assert!(first.len() >= 5);
+        assert!(first.iter().all(|cell| cell.y == center.y));
+        assert_eq!(
+            first.iter().copied().collect::<HashSet<_>>().len(),
+            first.len()
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn scaled_dynamic_ship_hits_use_world_distance_and_accept_splatters() {
+        let mut occupancy = VoxelSpaceshipOccupancy::empty();
+        occupancy.set_cell(IVec3::ZERO, 1);
+        let transform = Transform::from_scale(Vec3::splat(2.0));
+        let ray = Ray3d::new(Vec3::new(-1.0, 0.25, 0.25), Dir3::X);
+
+        let hit = raycast_voxel_spaceship_cells(&occupancy, &transform, ray).unwrap();
+        assert!((hit.distance - 1.0).abs() <= VOXEL_SIZE * 0.21);
+        let splatter = blood_splatter_cells(hit.add, hit.add - hit.occupied, 0, 42);
+        assert!(splatter.len() >= 5);
+        assert!(splatter.iter().all(|cell| cell.x == -1));
+        for cell in splatter {
+            occupancy.set_cell(cell, VOXEL_BLOOD_MATERIAL);
+        }
+        assert_eq!(occupancy.cell_material(IVec3::ZERO), Some(1));
+        assert!(
+            occupancy
+                .chunks
+                .values()
+                .flat_map(|cells| cells.values())
+                .filter(|material| **material == VOXEL_BLOOD_MATERIAL)
+                .count()
+                >= 5
+        );
     }
 
     #[test]
