@@ -980,6 +980,7 @@ pub(crate) struct ChatScrollState {
 pub(crate) struct TrpgGroupSettingsState {
     open: bool,
     position_radio_auto_sync_groups: HashSet<String>,
+    open_global_group_chat_windows: HashSet<String>,
     pool_window_open: bool,
     pool_window_tab: PoolWindowTab,
     new_group_name: String,
@@ -3275,6 +3276,94 @@ fn group_broadcast_input_ui(
     }
 }
 
+fn trpg_group_global_chat_window_id(group_name: &str) -> Id {
+    Id::new(("trpg_group_global_chat_window", group_name))
+}
+
+fn trpg_group_global_chat_input_id(group_name: &str) -> String {
+    format!("trpg-group:{group_name}:global-private")
+}
+
+fn trpg_group_global_private_targets(
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+) -> Vec<NapcatSendTarget> {
+    private_targets_for_member_ids(manager, group.players.iter())
+}
+
+fn trpg_group_global_chat_windows(
+    ctx: &Context,
+    manager: &NapcatMessageManager,
+    napcat_sender: Option<&NapcatIOSender>,
+    chat_input_msgs: &mut Local<HashMap<String, String>>,
+    ime: &mut ResMut<ImeManager>,
+    open_groups: &mut HashSet<String>,
+) {
+    open_groups.retain(|group_name| manager.trpg_groups.contains_key(group_name));
+    let mut group_names = open_groups.iter().cloned().collect::<Vec<_>>();
+    group_names.sort();
+
+    for group_name in group_names {
+        let Some(group) = manager.trpg_groups.get(&group_name) else {
+            continue;
+        };
+        let targets = trpg_group_global_private_targets(manager, group);
+        let recipient_names = targets
+            .iter()
+            .filter_map(|target| match target {
+                NapcatSendTarget::Private(user_id) => {
+                    Some(target_display_name(manager, &user_id.to_string()))
+                },
+                NapcatSendTarget::Group(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let input_id = trpg_group_global_chat_input_id(&group_name);
+        chat_input_msgs.entry(input_id.clone()).or_default();
+        let mut open = true;
+
+        egui::Window::new(format!("全员私聊 · {group_name}"))
+            .id(trpg_group_global_chat_window_id(&group_name))
+            .open(&mut open)
+            .default_size(Vec2::new(420.0, 260.0))
+            .min_size(Vec2::new(320.0, 200.0))
+            .show(ctx, |ui| {
+                ui.label(format!("将分别私聊发送给 {} 名玩家", targets.len()));
+                if recipient_names.is_empty() {
+                    ui.small("当前TRPG组里没有可发送的私聊玩家。");
+                } else {
+                    ui.small(format!("收件人：{}", recipient_names.join("、")));
+                }
+                ui.small("玩家回复仍只会显示在各自的私聊窗口，不会互相公开。");
+                ui.separator();
+
+                let text = chat_input_msgs.get_mut(&input_id).unwrap();
+                if let Some(sender) = napcat_sender.filter(|_| !targets.is_empty()) {
+                    let _ = ime.chat_input_multiline(
+                        &input_id,
+                        text,
+                        ui.available_width(),
+                        GROUP_BROADCAST_INPUT_ROWS,
+                        ui,
+                        ctx,
+                        sender,
+                        targets.clone(),
+                    );
+                } else {
+                    ui.add_enabled(
+                        false,
+                        egui::TextEdit::multiline(text)
+                            .desired_width(ui.available_width())
+                            .desired_rows(GROUP_BROADCAST_INPUT_ROWS),
+                    );
+                }
+            });
+
+        if !open {
+            open_groups.remove(&group_name);
+        }
+    }
+}
+
 const BROADCAST_SCOPE_ALL: &str = "all";
 const BROADCAST_SCOPE_PARTY_PREFIX: &str = "party:";
 const BROADCAST_SCOPE_LEGACY_PANE_PREFIX: &str = "legacy-pane:";
@@ -5380,6 +5469,15 @@ fn chat_list_panel(
                     raise_and_expand_window(
                         ctx,
                         Id::new("trpg_group_settings_window"),
+                    );
+                }
+                if ui.button("打开全员私聊").clicked() {
+                    trpg_group_settings
+                        .open_global_group_chat_windows
+                        .insert(group_name.clone());
+                    raise_and_expand_window(
+                        ctx,
+                        trpg_group_global_chat_window_id(&group_name),
                     );
                 }
             });
@@ -17588,6 +17686,14 @@ pub fn ui_system(
                 &mut ime,
             );
             waiting_turn_manager_window(ctx, &mut manager);
+            trpg_group_global_chat_windows(
+                ctx,
+                &manager,
+                napcat_sender,
+                chat_input_msgs,
+                &mut ime,
+                &mut trpg_group_settings.open_global_group_chat_windows,
+            );
 
             let mut closed_group_names = Vec::new();
             for (k, v) in &manager.groups.clone() {
@@ -19241,6 +19347,38 @@ mod tests {
             NapcatSendTarget::Private(3),
             NapcatSendTarget::Private(4),
         ]);
+    }
+
+    #[test]
+    fn trpg_group_global_chat_targets_every_private_player_only_once() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message(user_id),
+            ]);
+        }
+        manager.messages.insert("99".to_owned(), vec![
+            test_group_message(2, "group"),
+        ]);
+        let group = TrpgGroup {
+            players: vec![
+                "3".to_owned(),
+                "2".to_owned(),
+                "2".to_owned(),
+                "99".to_owned(),
+                "invalid".to_owned(),
+            ],
+            group_chats: vec!["99".to_owned()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            trpg_group_global_private_targets(&manager, &group),
+            vec![
+                NapcatSendTarget::Private(2),
+                NapcatSendTarget::Private(3),
+            ]
+        );
     }
 
     #[test]
