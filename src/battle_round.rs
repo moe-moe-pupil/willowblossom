@@ -499,6 +499,10 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub overhealing_shield_turns_remaining: u32,
     #[serde(default)]
+    pub revenge_soul_shield_rate: f32,
+    #[serde(default)]
+    pub revenge_soul_shield: f32,
+    #[serde(default)]
     pub undying_rage_enabled: bool,
     #[serde(default)]
     pub undying_rage_used: bool,
@@ -691,6 +695,10 @@ pub const GOOSE_CHANNEL_TURNS: u32 = 5;
 /// 「精美烧鹅」每回合回复的最大生命/魔法比例。
 pub const GOOSE_CHANNEL_HEAL_RATE: f32 = 0.20;
 
+/// 「复仇之魂」：造成有效治疗后，治疗者获得治疗量一半的战斗护盾，最多 5 点。
+pub const REVENGE_SOUL_SHIELD_RATE: f32 = 0.50;
+pub const REVENGE_SOUL_SHIELD_CAP: f32 = 5.0;
+
 fn trpg_group_campaign_id(group: &TrpgGroup) -> &str {
     let campaign_id = group.campaign_id.trim();
     if campaign_id.is_empty() {
@@ -705,6 +713,39 @@ fn default_true() -> bool { true }
 fn default_combat_modifier() -> f32 { 1.0 }
 
 fn default_participant_level() -> i32 { 1 }
+
+fn character_revenge_soul_shield_rate(character: &PlayerCharacter) -> f32 {
+    character
+        .skill_names
+        .iter()
+        .enumerate()
+        .any(|(index, name)| {
+            name.trim() == "复仇之魂"
+                && character
+                    .skill_metadata
+                    .get(index)
+                    .is_some_and(|metadata| metadata.is_approved())
+                && character.skill_notes.get(index).is_some_and(|note| {
+                    note.contains("治疗数值一半的护盾") && note.contains("最多5点")
+                })
+        })
+        .then_some(REVENGE_SOUL_SHIELD_RATE)
+        .unwrap_or(0.0)
+}
+
+fn grant_participant_revenge_soul_shield(
+    participant: &mut BattleParticipantSnapshot,
+    effective_healing: f32,
+) -> f32 {
+    let previous = participant.revenge_soul_shield.max(0.0);
+    if participant.revenge_soul_shield_rate <= f32::EPSILON || effective_healing <= f32::EPSILON {
+        return 0.0;
+    }
+    participant.revenge_soul_shield = (previous
+        + effective_healing.max(0.0) * participant.revenge_soul_shield_rate)
+        .min(REVENGE_SOUL_SHIELD_CAP);
+    (participant.revenge_soul_shield - previous).max(0.0)
+}
 
 fn record_participant_damage_taken(
     participant: &mut BattleParticipantSnapshot,
@@ -807,6 +848,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.goose_channeling_turns = 0;
             participant.arcane_shield =
                 participant.max_mp.max(0.0) * participant.arcane_shield_rate.max(0.0);
+            participant.revenge_soul_shield = 0.0;
             let previous_hp = participant.hp;
             if let Some(log) = apply_participant_rest_then_fight_healing(participant) {
                 logs.push(log);
@@ -838,6 +880,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.keen_evasion_available = false;
             participant.undying_rage_active = false;
             participant.arcane_shield = 0.0;
+            participant.revenge_soul_shield = 0.0;
             participant.arrogance_damage_source_ids.clear();
             participant.endless_pain_stacks = 0;
             participant.infinite_focus_target_id = None;
@@ -1438,10 +1481,15 @@ fn apply_participant_damage_for_battle(
         participant.overhealing_shield_turns_remaining = 0;
     }
     let after_overhealing_shield = (incoming_amount - overhealing_absorbed).max(0.0);
+    let available_revenge_soul_shield =
+        if encounter_active { participant.revenge_soul_shield.max(0.0) } else { 0.0 };
+    let revenge_soul_absorbed = available_revenge_soul_shield.min(after_overhealing_shield);
+    participant.revenge_soul_shield = available_revenge_soul_shield - revenge_soul_absorbed;
+    let after_revenge_soul_shield = (after_overhealing_shield - revenge_soul_absorbed).max(0.0);
     let available_shield = if encounter_active { participant.arcane_shield.max(0.0) } else { 0.0 };
-    let absorbed = available_shield.min(after_overhealing_shield);
+    let absorbed = available_shield.min(after_revenge_soul_shield);
     participant.arcane_shield = available_shield - absorbed;
-    let mut final_amount = (after_overhealing_shield - absorbed).max(0.0);
+    let mut final_amount = (after_revenge_soul_shield - absorbed).max(0.0);
     let mut undying_rage_triggered = false;
     let mut hope_avatar_triggered = false;
     let mut mirror_coat_triggered = false;
@@ -2562,6 +2610,11 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant
                 .overhealing_shield_turns_remaining
                 .hash(&mut hasher);
+            participant
+                .revenge_soul_shield_rate
+                .to_bits()
+                .hash(&mut hasher);
+            participant.revenge_soul_shield.to_bits().hash(&mut hasher);
             participant.undying_rage_enabled.hash(&mut hasher);
             participant.undying_rage_used.hash(&mut hasher);
             participant.undying_rage_active.hash(&mut hasher);
@@ -3365,6 +3418,12 @@ fn encounter_roster_ui(
                 ui.small(format!(
                     "过量治疗护盾{}",
                     format_number(participant.overhealing_shield)
+                ));
+            }
+            if encounter.active && participant.revenge_soul_shield > f32::EPSILON {
+                ui.small(format!(
+                    "复仇之魂护盾{}",
+                    format_number(participant.revenge_soul_shield)
                 ));
             }
             if encounter.active {
@@ -5311,6 +5370,7 @@ impl BattleRoundStore {
                         ));
                     }
                     let mut pending_actor_mutual_aid_healing = 0.0;
+                    let mut pending_actor_revenge_soul_healing = 0.0;
                     let mut healed_one_heart_target_id = None::<String>;
                     let mut healed_inspiration_target_id = None::<String>;
                     for resolved_target_id in target_ids {
@@ -5357,6 +5417,7 @@ impl BattleRoundStore {
                             actor_snapshot.overhealing_shield_cap_rate,
                         );
                         let effective_amount = healing_resolution.effective_amount();
+                        pending_actor_revenge_soul_healing += healing_resolution.hp_restored;
                         if resolved_target_id != actor_id && effective_amount > f32::EPSILON {
                             pending_actor_mutual_aid_healing += effective_amount
                                 * (actor_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
@@ -5452,6 +5513,26 @@ impl BattleRoundStore {
                                 actor_name,
                                 format_number((one_heart_multiplier - 1.0) * 100.0)
                             ));
+                        }
+                    }
+                    if encounter.active && pending_actor_revenge_soul_healing > f32::EPSILON {
+                        if let Some(actor) = encounter
+                            .participants
+                            .iter_mut()
+                            .find(|participant| participant.target_id == actor_id)
+                        {
+                            let shield_gained = grant_participant_revenge_soul_shield(
+                                actor,
+                                pending_actor_revenge_soul_healing,
+                            );
+                            if shield_gained > f32::EPSILON {
+                                encounter.action_log.push(format!(
+                                    "{}触发复仇之魂，获得{}点护盾（当前{}点）",
+                                    actor_name,
+                                    format_number(shield_gained),
+                                    format_number(actor.revenge_soul_shield)
+                                ));
+                            }
                         }
                     }
                     if encounter.active {
@@ -6953,6 +7034,11 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant
             .overhealing_shield_turns_remaining
             .hash(&mut hasher);
+        participant
+            .revenge_soul_shield_rate
+            .to_bits()
+            .hash(&mut hasher);
+        participant.revenge_soul_shield.to_bits().hash(&mut hasher);
         participant.undying_rage_enabled.hash(&mut hasher);
         participant.undying_rage_used.hash(&mut hasher);
         participant.undying_rage_active.hash(&mut hasher);
@@ -7145,6 +7231,8 @@ fn participant_from_character(
         overhealing_shield_cap_rate: character_overhealing_shield_cap_rate(character),
         overhealing_shield: 0.0,
         overhealing_shield_turns_remaining: 0,
+        revenge_soul_shield_rate: character_revenge_soul_shield_rate(character),
+        revenge_soul_shield: 0.0,
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
@@ -7265,6 +7353,8 @@ fn participant_from_unit_template(
         overhealing_shield_cap_rate: character_overhealing_shield_cap_rate(character),
         overhealing_shield: 0.0,
         overhealing_shield_turns_remaining: 0,
+        revenge_soul_shield_rate: character_revenge_soul_shield_rate(character),
+        revenge_soul_shield: 0.0,
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
@@ -7379,6 +7469,8 @@ fn participant_from_target(
         overhealing_shield_cap_rate: 0.0,
         overhealing_shield: 0.0,
         overhealing_shield_turns_remaining: 0,
+        revenge_soul_shield_rate: 0.0,
+        revenge_soul_shield: 0.0,
         undying_rage_enabled: false,
         undying_rage_used: false,
         undying_rage_active: false,
@@ -7595,6 +7687,7 @@ fn sync_participant_from_manager(
             participant.arcane_shield_rate = character_arcane_shield_rate(&character);
             participant.overhealing_shield_cap_rate =
                 character_overhealing_shield_cap_rate(&character);
+            participant.revenge_soul_shield_rate = character_revenge_soul_shield_rate(&character);
             sync_participant_undying_rage(
                 participant,
                 character_undying_rage_available(&character),
@@ -7694,6 +7787,7 @@ fn sync_participant_from_manager(
         );
         participant.arcane_shield_rate = character_arcane_shield_rate(character);
         participant.overhealing_shield_cap_rate = character_overhealing_shield_cap_rate(character);
+        participant.revenge_soul_shield_rate = character_revenge_soul_shield_rate(character);
         sync_participant_undying_rage(
             participant,
             character_undying_rage_available(character),
@@ -7764,6 +7858,8 @@ fn reset_non_player_participant_bonus_fields(participant: &mut BattleParticipant
     sync_participant_keen_evasion(participant, false);
     participant.arcane_shield_rate = 0.0;
     participant.overhealing_shield_cap_rate = 0.0;
+    participant.revenge_soul_shield_rate = 0.0;
+    participant.revenge_soul_shield = 0.0;
     sync_participant_undying_rage(participant, false);
     participant.hope_avatar_enabled = false;
     participant.mirror_coat_enabled = false;
@@ -9277,6 +9373,8 @@ mod area_tests {
             overhealing_shield_cap_rate: 0.0,
             overhealing_shield: 0.0,
             overhealing_shield_turns_remaining: 0,
+            revenge_soul_shield_rate: 0.0,
+            revenge_soul_shield: 0.0,
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,
@@ -9566,6 +9664,8 @@ mod tests {
             overhealing_shield_cap_rate: 0.0,
             overhealing_shield: 0.0,
             overhealing_shield_turns_remaining: 0,
+            revenge_soul_shield_rate: 0.0,
+            revenge_soul_shield: 0.0,
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,
@@ -14241,6 +14341,90 @@ mod tests {
             target.overhealing_shield_turns_remaining,
             2
         );
+    }
+
+    #[test]
+    fn redeemed_revenge_soul_grants_healer_a_capped_battle_shield() {
+        let mut manager = empty_manager();
+        let healer_character = PlayerCharacter {
+            hp: 20.0,
+            max_hp: 20.0,
+            skill_names: vec!["复仇之魂".to_owned()],
+            skill_notes: vec!["【被动】自身会获得治疗数值一半的护盾，最多5点。".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::default()],
+            ..Default::default()
+        };
+        let target_character = PlayerCharacter {
+            hp: 0.0,
+            max_hp: 20.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("a".to_owned(), healer_character.clone());
+        manager
+            .player_characters
+            .insert("b".to_owned(), target_character.clone());
+        let healer = participant_from_character("a", &healer_character, &manager);
+        assert!((healer.revenge_soul_shield_rate - 0.5).abs() < 0.0001);
+        let target = participant_from_character("b", &target_character, &manager);
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                name: "battle".to_owned(),
+                active: true,
+                participants: vec![healer, target],
+                ..Default::default()
+            });
+        let skill = CharacterSkill {
+            index: 0,
+            name: "灵魂脉冲（治疗）".to_owned(),
+            note: "主动使用对目标回复6点生命值".to_owned(),
+            skill_type: Some("法术".to_owned()),
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let healer = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        assert!(
+            (healer.revenge_soul_shield - 5.0).abs() < 0.0001,
+            "shield={}, log={:?}",
+            healer.revenge_soul_shield,
+            store.encounters["battle"].action_log,
+        );
+
+        let healer = store
+            .encounters
+            .get_mut("battle")
+            .unwrap()
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "a")
+            .unwrap();
+        let resolution = apply_participant_damage_for_battle(healer, 7.0, "enemy", true);
+        assert!((resolution.damage_applied - 2.0).abs() < 0.0001);
+        assert!((healer.revenge_soul_shield - 0.0).abs() < 0.0001);
+        assert!((healer.hp - 18.0).abs() < 0.0001);
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        encounter.participants[0].revenge_soul_shield = 4.0;
+        assert!(set_encounter_active_state(
+            encounter, false
+        ));
+        assert!((encounter.participants[0].revenge_soul_shield - 0.0).abs() < 0.0001);
     }
 
     #[test]
