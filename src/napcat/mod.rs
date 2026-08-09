@@ -1286,6 +1286,16 @@ pub const SUMMON_BASE_RANGE_METERS: f32 = 15.0;
 
 /// 玩家的召唤物。等级始终等于玩家等级，基础生命值为同等级玩家的一半；
 /// 拥有自己的立牌，且不能离开主人太远。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummonKind {
+    #[default]
+    Custom,
+    ArmedDrone,
+    Mech,
+    PortableTurret,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Summon {
     #[serde(default)]
@@ -1297,6 +1307,16 @@ pub struct Summon {
     pub hp: f32,
     #[serde(default = "default_summon_hp")]
     pub max_hp: f32,
+    #[serde(default)]
+    pub kind: SummonKind,
+    #[serde(default)]
+    pub shield: f32,
+    #[serde(default)]
+    pub max_shield: f32,
+    #[serde(default)]
+    pub shield_repair_rounds_remaining: u32,
+    #[serde(default)]
+    pub repair_channel_rounds_remaining: u32,
 }
 
 impl Default for Summon {
@@ -1306,6 +1326,11 @@ impl Default for Summon {
             image: String::new(),
             hp: default_summon_hp(),
             max_hp: default_summon_hp(),
+            kind: SummonKind::Custom,
+            shield: 0.0,
+            max_shield: 0.0,
+            shield_repair_rounds_remaining: 0,
+            repair_channel_rounds_remaining: 0,
         }
     }
 }
@@ -9303,10 +9328,81 @@ pub fn character_summon_cap(character: &PlayerCharacter) -> usize {
     let base_cap = (SUMMON_BASE_CAP as f32 + cha * SUMMON_CAP_PER_CHARISMA)
         .floor()
         .max(SUMMON_BASE_CAP as f32) as usize;
-    if character_has_approved_moonberry_talent(character, "狂野召唤！") {
+    let cap = if character_has_approved_moonberry_talent(character, "狂野召唤！") {
         base_cap.saturating_add(1)
     } else {
         base_cap
+    };
+    cap.max(character_redeemed_summon_kinds(character).len())
+}
+
+fn character_redeemed_summon_kinds(character: &PlayerCharacter) -> Vec<SummonKind> {
+    let mut kinds = Vec::new();
+    for (index, name) in character.skill_names.iter().enumerate() {
+        if !character
+            .skill_metadata
+            .get(index)
+            .is_some_and(CharacterSkillMetadata::is_approved)
+        {
+            continue;
+        }
+        let note = character
+            .skill_notes
+            .get(index)
+            .map(String::as_str)
+            .unwrap_or("");
+        let kind = if note.contains("【武装无人机】")
+            && note.contains("3体质，3灵巧，3技术")
+            && note.contains("20米范围内的目标造成5点物理伤害")
+            && note.contains("3米内敌人造成麻痹效果")
+        {
+            Some(SummonKind::ArmedDrone)
+        } else if name.trim() == "未命名机甲"
+            && note.contains("巨型金属刀")
+            && note.contains("3点全伤害护盾")
+            && note.contains("机甲本身拥有6点生命值")
+        {
+            Some(SummonKind::Mech)
+        } else if name.trim() == "物理专长"
+            && note.contains("可放置的便携小炮塔")
+            && note.contains("攻击6米内的任意目标")
+            && note.contains("角色等级*1")
+        {
+            Some(SummonKind::PortableTurret)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+    }
+    kinds
+}
+
+fn redeemed_summon(kind: SummonKind) -> Summon {
+    match kind {
+        SummonKind::ArmedDrone => Summon {
+            name: "武装无人机".to_owned(),
+            kind,
+            ..Default::default()
+        },
+        SummonKind::Mech => Summon {
+            name: "未命名机甲".to_owned(),
+            hp: 6.0,
+            max_hp: 6.0,
+            kind,
+            shield: 3.0,
+            max_shield: 3.0,
+            ..Default::default()
+        },
+        SummonKind::PortableTurret => Summon {
+            name: "便携小炮塔".to_owned(),
+            kind,
+            ..Default::default()
+        },
+        SummonKind::Custom => Summon::default(),
     }
 }
 
@@ -9361,6 +9457,12 @@ pub fn parse_summon_target_id(target_id: &str) -> Option<(String, usize)> {
 /// 当前生命值保持在有效范围内。返回是否有变化。
 pub fn sync_character_summons(character: &mut PlayerCharacter, config: &TrpgBasicConfig) -> bool {
     let mut changed = false;
+    for kind in character_redeemed_summon_kinds(character) {
+        if !character.summons.iter().any(|summon| summon.kind == kind) {
+            character.summons.push(redeemed_summon(kind));
+            changed = true;
+        }
+    }
     let cap = character_summon_cap(character);
     if character.summons.len() > cap {
         character.summons.truncate(cap);
@@ -9372,14 +9474,26 @@ pub fn sync_character_summons(character: &mut PlayerCharacter, config: &TrpgBasi
             summon.name = "召唤物".to_owned();
             changed = true;
         }
-        if (summon.max_hp - expected_max_hp).abs() > f32::EPSILON {
-            summon.max_hp = expected_max_hp;
+        let summon_max_hp = if summon.kind == SummonKind::Mech { 6.0 } else { expected_max_hp };
+        if (summon.max_hp - summon_max_hp).abs() > f32::EPSILON {
+            summon.max_hp = summon_max_hp;
             changed = true;
         }
         let clamped_hp = summon.hp.clamp(0.0, summon.max_hp);
         if (summon.hp - clamped_hp).abs() > f32::EPSILON {
             summon.hp = clamped_hp;
             changed = true;
+        }
+        if summon.kind == SummonKind::Mech {
+            if (summon.max_shield - 3.0).abs() > f32::EPSILON {
+                summon.max_shield = 3.0;
+                changed = true;
+            }
+            let shield = summon.shield.clamp(0.0, summon.max_shield);
+            if (summon.shield - shield).abs() > f32::EPSILON {
+                summon.shield = shield;
+                changed = true;
+            }
         }
     }
     changed
@@ -17060,6 +17174,69 @@ position_cells = [4, 5, 6]
 
         // 再次同步无变化。
         assert!(!sync_character_summons(&mut character, &config));
+    }
+
+    #[test]
+    fn current_redeemed_summons_materialize_with_typed_profiles() {
+        let config = TrpgBasicConfig::default();
+        let cases = [
+            (
+                "",
+                "【武装无人机】（10分）：【召唤物】3体质，3灵巧，3技术的机械造物，可以使用自带的枪械射击20米范围内的目标造成5点物理伤害，也可以释放电能冲击将3米内敌人造成麻痹效果。",
+                SummonKind::ArmedDrone,
+                "武装无人机",
+            ),
+            (
+                "未命名机甲",
+                "一个2米5左右高的机甲，配置有一把巨型金属刀，可以横扫近身范围内的目标，造成5点物理伤害。带有一个简易的力场护盾（3点全伤害护盾），破损后会在2个非战斗轮后自我修复。机甲本身拥有6点生命值，不会自然回复，但可以在引导2个回合的维修后完全恢复。",
+                SummonKind::Mech,
+                "未命名机甲",
+            ),
+            (
+                "物理专长",
+                "物理专长：你拥有一个可放置的便携小炮塔，这个炮塔可以攻击6米内的任意目标，造成你【角色等级*1】的物理伤害。",
+                SummonKind::PortableTurret,
+                "便携小炮塔",
+            ),
+        ];
+
+        for (name, note, kind, summon_name) in cases {
+            let mut character = PlayerCharacter {
+                level: 2,
+                skill_names: vec![name.to_owned()],
+                skill_notes: vec![note.to_owned()],
+                skill_metadata: vec![CharacterSkillMetadata::default()],
+                ..Default::default()
+            };
+
+            assert!(sync_character_summons(&mut character, &config));
+            assert_eq!(character.summons.len(), 1);
+            assert_eq!(character.summons[0].kind, kind);
+            assert_eq!(character.summons[0].name, summon_name);
+            assert!(!sync_character_summons(&mut character, &config));
+        }
+    }
+
+    #[test]
+    fn redeemed_mech_keeps_fixed_vitals_and_shield() {
+        let config = TrpgBasicConfig::default();
+        let mut character = PlayerCharacter {
+            level: 9,
+            skill_names: vec!["未命名机甲".to_owned()],
+            skill_notes: vec![
+                "一个机甲，配置有巨型金属刀，带有3点全伤害护盾，机甲本身拥有6点生命值".to_owned(),
+            ],
+            skill_metadata: vec![CharacterSkillMetadata::default()],
+            ..Default::default()
+        };
+
+        assert!(sync_character_summons(&mut character, &config));
+        let mech = &character.summons[0];
+        assert_eq!(mech.kind, SummonKind::Mech);
+        assert!((mech.max_hp - 6.0).abs() < f32::EPSILON);
+        assert!((mech.hp - 6.0).abs() < f32::EPSILON);
+        assert!((mech.max_shield - 3.0).abs() < f32::EPSILON);
+        assert!((mech.shield - 3.0).abs() < f32::EPSILON);
     }
 
     #[test]

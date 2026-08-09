@@ -109,12 +109,14 @@ use crate::{
         trpg_config_with_weave,
         update_character_from_status_with_config,
         wounded_healing_dealt_multiplier,
+        CharacterSkillMetadata,
         CharacterSkillSourceKind,
         CharacterStatus,
         NapcatMessageManager,
         PlayerCharacter,
         SkillRuleArgs,
         Summon,
+        SummonKind,
         TrpgBasicConfig,
         TrpgDamageBonusKind,
         TrpgDamageTakenKind,
@@ -401,6 +403,8 @@ pub struct BattleParticipantSnapshot {
     pub is_summon: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summon_owner_id: Option<String>,
+    #[serde(default)]
+    pub summon_kind: SummonKind,
     #[serde(default = "default_participant_level")]
     pub level: i32,
     #[serde(default)]
@@ -502,6 +506,16 @@ pub struct BattleParticipantSnapshot {
     pub revenge_soul_shield_rate: f32,
     #[serde(default)]
     pub revenge_soul_shield: f32,
+    #[serde(default)]
+    pub construct_shield: f32,
+    #[serde(default)]
+    pub construct_shield_max: f32,
+    #[serde(default)]
+    pub construct_shield_repair_rounds_remaining: u32,
+    #[serde(default)]
+    pub construct_repair_channel_rounds_remaining: u32,
+    #[serde(default)]
+    pub paralyzed_rounds_remaining: u32,
     #[serde(default)]
     pub undying_rage_enabled: bool,
     #[serde(default)]
@@ -1486,10 +1500,21 @@ fn apply_participant_damage_for_battle(
     let revenge_soul_absorbed = available_revenge_soul_shield.min(after_overhealing_shield);
     participant.revenge_soul_shield = available_revenge_soul_shield - revenge_soul_absorbed;
     let after_revenge_soul_shield = (after_overhealing_shield - revenge_soul_absorbed).max(0.0);
+    let available_construct_shield = participant.construct_shield.max(0.0);
+    let construct_absorbed = available_construct_shield.min(after_revenge_soul_shield);
+    participant.construct_shield = available_construct_shield - construct_absorbed;
+    if available_construct_shield > f32::EPSILON
+        && participant.construct_shield <= f32::EPSILON
+        && participant.construct_shield_max > f32::EPSILON
+    {
+        participant.construct_shield = 0.0;
+        participant.construct_shield_repair_rounds_remaining = 2;
+    }
+    let after_construct_shield = (after_revenge_soul_shield - construct_absorbed).max(0.0);
     let available_shield = if encounter_active { participant.arcane_shield.max(0.0) } else { 0.0 };
-    let absorbed = available_shield.min(after_revenge_soul_shield);
+    let absorbed = available_shield.min(after_construct_shield);
     participant.arcane_shield = available_shield - absorbed;
-    let mut final_amount = (after_revenge_soul_shield - absorbed).max(0.0);
+    let mut final_amount = (after_construct_shield - absorbed).max(0.0);
     let mut undying_rage_triggered = false;
     let mut hope_avatar_triggered = false;
     let mut mirror_coat_triggered = false;
@@ -1543,6 +1568,9 @@ fn apply_participant_damage_for_battle(
     if participant.goose_channeling_turns > 0 && damage_applied > f32::EPSILON {
         // 食用烧鹅的引导被伤害打断，烧鹅消失。
         participant.goose_channeling_turns = 0;
+    }
+    if participant.construct_repair_channel_rounds_remaining > 0 && damage_applied > f32::EPSILON {
+        participant.construct_repair_channel_rounds_remaining = 0;
     }
     if encounter_active
         && !participant.alive
@@ -1719,6 +1747,36 @@ fn advance_participant_goose_channel(
         benefits: vec![format!("魔法回复{}", format_number(mp_restored))],
     };
     Some((log, entry))
+}
+
+fn advance_redeemed_construct_state(
+    participant: &mut BattleParticipantSnapshot,
+    encounter_active: bool,
+) -> Vec<String> {
+    let mut logs = Vec::new();
+    if !encounter_active && participant.construct_shield_repair_rounds_remaining > 0 {
+        participant.construct_shield_repair_rounds_remaining -= 1;
+        if participant.construct_shield_repair_rounds_remaining == 0 {
+            participant.construct_shield = participant.construct_shield_max.max(0.0);
+            logs.push(format!(
+                "{}的全伤害护盾维修完成，恢复{}点护盾",
+                participant.display_name,
+                format_number(participant.construct_shield)
+            ));
+        }
+    }
+    if participant.construct_repair_channel_rounds_remaining > 0 {
+        participant.construct_repair_channel_rounds_remaining -= 1;
+        if participant.construct_repair_channel_rounds_remaining == 0 {
+            participant.hp = participant.max_hp.max(0.0);
+            participant.alive = participant.hp > 0.0;
+            logs.push(format!(
+                "{}完成维修，生命值完全恢复",
+                participant.display_name
+            ));
+        }
+    }
+    logs
 }
 
 /// 推进「蝴蝶效应」：效果在持有者与指定目标间每回合互换；一方死亡后常驻存活方。
@@ -3490,6 +3548,31 @@ fn encounter_roster_ui(
                     format_number(participant.revenge_soul_shield)
                 ));
             }
+            if participant.construct_shield_max > f32::EPSILON {
+                ui.small(format!(
+                    "全伤害护盾{}/{}",
+                    format_number(participant.construct_shield),
+                    format_number(participant.construct_shield_max)
+                ));
+            }
+            if participant.construct_shield_repair_rounds_remaining > 0 {
+                ui.small(format!(
+                    "护盾维修：剩余{}回合",
+                    participant.construct_shield_repair_rounds_remaining
+                ));
+            }
+            if participant.construct_repair_channel_rounds_remaining > 0 {
+                ui.small(format!(
+                    "机甲维修引导：剩余{}回合",
+                    participant.construct_repair_channel_rounds_remaining
+                ));
+            }
+            if participant.paralyzed_rounds_remaining > 0 {
+                ui.small(format!(
+                    "麻痹：剩余{}回合",
+                    participant.paralyzed_rounds_remaining
+                ));
+            }
             if encounter.active {
                 if participant.undying_rage_active {
                     ui.small("不死者之怒生效");
@@ -4485,6 +4568,13 @@ impl BattleRoundStore {
                     delayed_logs.push(log);
                     delayed_combat_log.push(combat_entry);
                 }
+            }
+            delayed_logs.extend(advance_redeemed_construct_state(
+                participant,
+                encounter.active,
+            ));
+            if participant.paralyzed_rounds_remaining > 0 {
+                participant.paralyzed_rounds_remaining -= 1;
             }
             let delayed = advance_participant_delayed_damage_ticks(
                 participant,
@@ -5707,6 +5797,19 @@ impl BattleRoundStore {
                         ));
                     }
                     for resolved_target_id in target_ids {
+                        if skill.name == "电能冲击"
+                            && actor_snapshot.summon_kind == SummonKind::ArmedDrone
+                        {
+                            if let Some(target) = encounter
+                                .participants
+                                .iter_mut()
+                                .find(|participant| participant.target_id == resolved_target_id)
+                            {
+                                target.paralyzed_rounds_remaining = target
+                                    .paralyzed_rounds_remaining
+                                    .max(buff.turns_remaining.max(1) as u32);
+                            }
+                        }
                         let target_name = encounter
                             .participants
                             .iter()
@@ -5764,6 +5867,24 @@ impl BattleRoundStore {
                     encounter.action_log.push(format!(
                         "{}开始食用精美烧鹅，引导{}回合",
                         actor_name, GOOSE_CHANNEL_TURNS
+                    ));
+                }
+            }
+        }
+        if skill.name == "维修机甲" && actor_snapshot.summon_kind == SummonKind::Mech {
+            if let Some(encounter) = self.encounters.get_mut(encounter_id) {
+                let started = encounter
+                    .participants
+                    .iter_mut()
+                    .find(|participant| participant.target_id == actor_id)
+                    .map(|actor| {
+                        actor.construct_repair_channel_rounds_remaining = 2;
+                    })
+                    .is_some();
+                if started {
+                    encounter.action_log.push(format!(
+                        "{}开始维修机甲，引导2回合；受到生命伤害会打断维修",
+                        actor_name
                     ));
                 }
             }
@@ -6357,6 +6478,27 @@ fn sync_encounter_to_manager(
                 let hp = participant.hp.clamp(0.0, summon.max_hp.max(0.0));
                 if (summon.hp - hp).abs() > f32::EPSILON {
                     summon.hp = hp;
+                    changed = true;
+                }
+                let shield = participant
+                    .construct_shield
+                    .clamp(0.0, summon.max_shield.max(0.0));
+                if (summon.shield - shield).abs() > f32::EPSILON {
+                    summon.shield = shield;
+                    changed = true;
+                }
+                if summon.shield_repair_rounds_remaining
+                    != participant.construct_shield_repair_rounds_remaining
+                {
+                    summon.shield_repair_rounds_remaining =
+                        participant.construct_shield_repair_rounds_remaining;
+                    changed = true;
+                }
+                if summon.repair_channel_rounds_remaining
+                    != participant.construct_repair_channel_rounds_remaining
+                {
+                    summon.repair_channel_rounds_remaining =
+                        participant.construct_repair_channel_rounds_remaining;
                     changed = true;
                 }
             }
@@ -7118,6 +7260,16 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
             .to_bits()
             .hash(&mut hasher);
         participant.revenge_soul_shield.to_bits().hash(&mut hasher);
+        participant.summon_kind.hash(&mut hasher);
+        participant.construct_shield.to_bits().hash(&mut hasher);
+        participant.construct_shield_max.to_bits().hash(&mut hasher);
+        participant
+            .construct_shield_repair_rounds_remaining
+            .hash(&mut hasher);
+        participant
+            .construct_repair_channel_rounds_remaining
+            .hash(&mut hasher);
+        participant.paralyzed_rounds_remaining.hash(&mut hasher);
         participant.undying_rage_enabled.hash(&mut hasher);
         participant.undying_rage_used.hash(&mut hasher);
         participant.undying_rage_active.hash(&mut hasher);
@@ -7256,6 +7408,7 @@ fn participant_from_character(
         player_character: true,
         is_summon: false,
         summon_owner_id: None,
+        summon_kind: SummonKind::Custom,
         level: character.level.max(1),
         exp: character.exp.max(0),
         support_talent_experience_bonus_rate: character_support_talent_experience_bonus_rate(
@@ -7312,6 +7465,11 @@ fn participant_from_character(
         overhealing_shield_turns_remaining: 0,
         revenge_soul_shield_rate: character_revenge_soul_shield_rate(character),
         revenge_soul_shield: 0.0,
+        construct_shield: 0.0,
+        construct_shield_max: 0.0,
+        construct_shield_repair_rounds_remaining: 0,
+        construct_repair_channel_rounds_remaining: 0,
+        paralyzed_rounds_remaining: 0,
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
@@ -7380,6 +7538,7 @@ fn participant_from_unit_template(
         player_character: false,
         is_summon: false,
         summon_owner_id: None,
+        summon_kind: SummonKind::Custom,
         level: character.level.max(1),
         exp: 0,
         support_talent_experience_bonus_rate: 0.0,
@@ -7434,6 +7593,11 @@ fn participant_from_unit_template(
         overhealing_shield_turns_remaining: 0,
         revenge_soul_shield_rate: character_revenge_soul_shield_rate(character),
         revenge_soul_shield: 0.0,
+        construct_shield: 0.0,
+        construct_shield_max: 0.0,
+        construct_shield_repair_rounds_remaining: 0,
+        construct_repair_channel_rounds_remaining: 0,
+        paralyzed_rounds_remaining: 0,
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
@@ -7500,6 +7664,7 @@ fn participant_from_target(
         player_character: false,
         is_summon: false,
         summon_owner_id: None,
+        summon_kind: SummonKind::Custom,
         level: 1,
         exp: 0,
         support_talent_experience_bonus_rate: 0.0,
@@ -7550,6 +7715,11 @@ fn participant_from_target(
         overhealing_shield_turns_remaining: 0,
         revenge_soul_shield_rate: 0.0,
         revenge_soul_shield: 0.0,
+        construct_shield: 0.0,
+        construct_shield_max: 0.0,
+        construct_shield_repair_rounds_remaining: 0,
+        construct_repair_channel_rounds_remaining: 0,
+        paralyzed_rounds_remaining: 0,
         undying_rage_enabled: false,
         undying_rage_used: false,
         undying_rage_active: false,
@@ -7616,6 +7786,12 @@ fn participant_from_summon(
     unit_character.level = owner.level.max(1);
     unit_character.hp = summon.hp;
     unit_character.max_hp = summon.max_hp;
+    configure_redeemed_summon_character(
+        &mut unit_character,
+        summon.kind,
+        owner.level,
+    );
+    let summon_status = unit_character.status.combined(&unit_character.extra_status);
 
     participant.target_id = target_id.clone();
     participant.display_name = unit_character.name.clone();
@@ -7624,15 +7800,20 @@ fn participant_from_summon(
     participant.player_character = false;
     participant.is_summon = true;
     participant.summon_owner_id = Some(owner_id.to_owned());
+    participant.summon_kind = summon.kind;
     participant.level = owner.level.max(1);
     participant.exp = 0;
     participant.support_talent_experience_bonus_rate = 0.0;
-    participant.base_damage = 0.0;
-    participant.str_ = 0;
-    participant.agi = 0;
-    participant.dex = 0;
-    participant.int_ = 0;
-    participant.wis = 0;
+    participant.base_damage = summon_status
+        .str_
+        .max(summon_status.dex)
+        .max(summon_status.int_)
+        .max(1) as f32;
+    participant.str_ = summon_status.str_;
+    participant.agi = summon_status.agi;
+    participant.dex = summon_status.dex;
+    participant.int_ = summon_status.int_;
+    participant.wis = summon_status.wis;
     participant.alive = summon.hp > 0.0;
     participant.hp = summon.hp;
     participant.max_hp = summon.max_hp;
@@ -7646,9 +7827,84 @@ fn participant_from_summon(
     participant.damage_taken_modifier = 1.0;
     participant.healing_dealt_modifier = 1.0;
     participant.healing_taken_modifier = 1.0;
+    participant.construct_shield = summon.shield;
+    participant.construct_shield_max = summon.max_shield;
+    participant.construct_shield_repair_rounds_remaining =
+        summon.shield_repair_rounds_remaining;
+    participant.construct_repair_channel_rounds_remaining =
+        summon.repair_channel_rounds_remaining;
     participant.skill_last_used_turns = HashMap::new();
     participant.skill_cooldown_ready_turns = HashMap::new();
     participant
+}
+
+fn summon_skill_metadata(
+    skill_type: &str,
+    target_class: &str,
+    range: i32,
+) -> CharacterSkillMetadata {
+    CharacterSkillMetadata {
+        skill_type: Some(skill_type.to_owned()),
+        target_class: Some(target_class.to_owned()),
+        range: Some(range),
+        ..Default::default()
+    }
+}
+
+fn configure_redeemed_summon_character(
+    character: &mut PlayerCharacter,
+    kind: SummonKind,
+    owner_level: i32,
+) {
+    character.inited = true;
+    character.level = owner_level.max(1);
+    character.status = CharacterStatus::default();
+    character.extra_status = CharacterStatus::default();
+    character.skill_names.clear();
+    character.skill_notes.clear();
+    character.skill_mp_costs.clear();
+    character.skill_cooldown_turns.clear();
+    character.skill_metadata.clear();
+    match kind {
+        SummonKind::ArmedDrone => {
+            character.status.vit = 3;
+            character.status.dex = 3;
+            character.status.k = 3;
+            character.skill_names = vec!["无人机枪械射击".to_owned(), "电能冲击".to_owned()];
+            character.skill_notes = vec![
+                "主动使用对20米内的目标造成5点物理伤害".to_owned(),
+                "主动使用对周围3米内的目标施加1回合麻痹状态".to_owned(),
+            ];
+            character.skill_mp_costs = vec![0.0, 0.0];
+            character.skill_cooldown_turns = vec![0, 0];
+            character.skill_metadata = vec![
+                summon_skill_metadata("远程", "单目标", 20),
+                summon_skill_metadata("动作", "范围", 3),
+            ];
+        },
+        SummonKind::Mech => {
+            character.skill_names = vec!["巨型金属刀横扫".to_owned(), "维修机甲".to_owned()];
+            character.skill_notes = vec![
+                "主动使用对周围2米内的目标造成5点物理伤害".to_owned(),
+                "主动使用引导2回合后完全恢复自身生命值".to_owned(),
+            ];
+            character.skill_mp_costs = vec![0.0, 0.0];
+            character.skill_cooldown_turns = vec![0, 0];
+            character.skill_metadata = vec![
+                summon_skill_metadata("动作", "范围", 2),
+                summon_skill_metadata("动作", "无目标", 0),
+            ];
+        },
+        SummonKind::PortableTurret => {
+            let damage = owner_level.max(1);
+            character.skill_names = vec!["便携小炮塔射击".to_owned()];
+            character.skill_notes = vec![format!("主动使用对6米内的目标造成{damage}点物理伤害")];
+            character.skill_mp_costs = vec![0.0];
+            character.skill_cooldown_turns = vec![0];
+            character.skill_metadata = vec![summon_skill_metadata("远程", "单目标", 6)];
+        },
+        SummonKind::Custom => {},
+    }
 }
 
 fn summon_display_name(summon: &Summon) -> &str {
@@ -7683,6 +7939,7 @@ fn sync_participant_from_manager(
         let summon_name = summon_display_name(summon);
         participant.display_name = format!("{owner_name}的{summon_name}");
         participant.player_character = false;
+        participant.summon_kind = summon.kind;
         participant.level = owner.level.max(1);
         participant.exp = 0;
         participant.base_damage = 0.0;
@@ -7701,6 +7958,12 @@ fn sync_participant_from_manager(
         participant.damage_taken_modifier = 1.0;
         participant.healing_dealt_modifier = 1.0;
         participant.healing_taken_modifier = 1.0;
+        participant.construct_shield = summon.shield;
+        participant.construct_shield_max = summon.max_shield;
+        participant.construct_shield_repair_rounds_remaining =
+            summon.shield_repair_rounds_remaining;
+        participant.construct_repair_channel_rounds_remaining =
+            summon.repair_channel_rounds_remaining;
         participant.hp = summon.hp.clamp(0.0, participant.max_hp.max(0.0));
         participant.mp = 0.0;
         participant.alive = participant.hp > 0.0;
@@ -7709,6 +7972,18 @@ fn sync_participant_from_manager(
         unit_character.level = owner.level.max(1);
         unit_character.hp = participant.hp;
         unit_character.max_hp = participant.max_hp;
+        configure_redeemed_summon_character(
+            &mut unit_character,
+            summon.kind,
+            owner.level,
+        );
+        let status = unit_character.status.combined(&unit_character.extra_status);
+        participant.base_damage = status.str_.max(status.dex).max(status.int_).max(1) as f32;
+        participant.str_ = status.str_;
+        participant.agi = status.agi;
+        participant.dex = status.dex;
+        participant.int_ = status.int_;
+        participant.wis = status.wis;
         participant.unit_character = Some(unit_character);
         return;
     }
@@ -8102,7 +8377,11 @@ fn current_actor_index(encounter: &BattleEncounter) -> Option<usize> {
 }
 
 fn participant_can_act(participant: &BattleParticipantSnapshot) -> bool {
-    participant.alive && !participant.action_done && participant.goose_channeling_turns == 0
+    participant.alive
+        && !participant.action_done
+        && participant.goose_channeling_turns == 0
+        && participant.construct_repair_channel_rounds_remaining == 0
+        && participant.paralyzed_rounds_remaining == 0
 }
 
 fn normalize_encounter_after_edit(encounter: &mut BattleEncounter) {
@@ -8111,6 +8390,10 @@ fn normalize_encounter_after_edit(encounter: &mut BattleEncounter) {
         participant.hp = participant.hp.clamp(0.0, participant.max_hp);
         participant.max_mp = participant.max_mp.max(0.0);
         participant.mp = participant.mp.clamp(0.0, participant.max_mp);
+        participant.construct_shield_max = participant.construct_shield_max.max(0.0);
+        participant.construct_shield = participant
+            .construct_shield
+            .clamp(0.0, participant.construct_shield_max);
         participant.damage_taken_this_turn = participant.damage_taken_this_turn.max(0.0);
         participant.healing_taken_this_turn = participant.healing_taken_this_turn.max(0.0);
         participant.alive = participant.hp > 0.0 || participant_hope_avatar_active(participant);
@@ -9404,6 +9687,7 @@ mod area_tests {
             player_character: false,
             is_summon: false,
             summon_owner_id: None,
+            summon_kind: SummonKind::Custom,
             level: 1,
             exp: 0,
             support_talent_experience_bonus_rate: 0.0,
@@ -9454,6 +9738,11 @@ mod area_tests {
             overhealing_shield_turns_remaining: 0,
             revenge_soul_shield_rate: 0.0,
             revenge_soul_shield: 0.0,
+            construct_shield: 0.0,
+            construct_shield_max: 0.0,
+            construct_shield_repair_rounds_remaining: 0,
+            construct_repair_channel_rounds_remaining: 0,
+            paralyzed_rounds_remaining: 0,
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,
@@ -9595,6 +9884,183 @@ mod tests {
     }
 
     #[test]
+    fn redeemed_summon_profiles_expose_their_written_battle_skills() {
+        let manager = empty_manager();
+        let owner = PlayerCharacter {
+            level: 3,
+            ..Default::default()
+        };
+        let cases = [
+            (
+                Summon {
+                    name: "武装无人机".to_owned(),
+                    kind: SummonKind::ArmedDrone,
+                    ..Default::default()
+                },
+                vec!["无人机枪械射击", "电能冲击"],
+            ),
+            (
+                Summon {
+                    name: "未命名机甲".to_owned(),
+                    hp: 6.0,
+                    max_hp: 6.0,
+                    kind: SummonKind::Mech,
+                    ..Default::default()
+                },
+                vec!["巨型金属刀横扫", "维修机甲"],
+            ),
+            (
+                Summon {
+                    name: "便携小炮塔".to_owned(),
+                    kind: SummonKind::PortableTurret,
+                    ..Default::default()
+                },
+                vec!["便携小炮塔射击"],
+            ),
+        ];
+
+        for (summon, expected_names) in cases {
+            let participant = participant_from_summon("owner", 0, &summon, &owner, &manager);
+            let character = participant.unit_character.as_ref().unwrap();
+            assert_eq!(
+                character.skill_names,
+                expected_names
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            );
+        }
+        let drone = Summon {
+            kind: SummonKind::ArmedDrone,
+            ..Default::default()
+        };
+        let participant = participant_from_summon("owner", 0, &drone, &owner, &manager);
+        assert_eq!(participant.dex, 3);
+        let skills = character_skills(participant.unit_character.as_ref().unwrap());
+        assert_eq!(skills[0].range, Some(20));
+        assert_eq!(skills[1].range, Some(3));
+
+        let turret = Summon {
+            kind: SummonKind::PortableTurret,
+            ..Default::default()
+        };
+        let participant = participant_from_summon("owner", 0, &turret, &owner, &manager);
+        let skills = character_skills(participant.unit_character.as_ref().unwrap());
+        assert!(skills[0].note.contains("造成3点物理伤害"));
+    }
+
+    #[test]
+    fn redeemed_mech_shield_absorbs_damage_and_rebuilds_after_two_rounds() {
+        let manager = empty_manager();
+        let owner = PlayerCharacter::default();
+        let summon = Summon {
+            hp: 6.0,
+            max_hp: 6.0,
+            kind: SummonKind::Mech,
+            shield: 3.0,
+            max_shield: 3.0,
+            ..Default::default()
+        };
+        let mut mech = participant_from_summon("owner", 0, &summon, &owner, &manager);
+
+        let resolution = apply_participant_damage_for_battle(&mut mech, 5.0, "enemy", true);
+        assert_eq!(resolution.damage_absorbed, 3.0);
+        assert_eq!(resolution.damage_applied, 2.0);
+        assert_eq!(mech.hp, 4.0);
+        assert_eq!(mech.construct_shield, 0.0);
+        assert_eq!(mech.construct_shield_repair_rounds_remaining, 2);
+
+        assert!(advance_redeemed_construct_state(&mut mech, true).is_empty());
+        assert_eq!(mech.construct_shield_repair_rounds_remaining, 2);
+        assert!(advance_redeemed_construct_state(&mut mech, false).is_empty());
+        assert_eq!(mech.construct_shield, 0.0);
+        let logs = advance_redeemed_construct_state(&mut mech, false);
+        assert_eq!(mech.construct_shield, 3.0);
+        assert_eq!(logs.len(), 1);
+    }
+
+    #[test]
+    fn redeemed_mech_full_repair_channels_and_is_interrupted_by_hp_damage() {
+        let mut mech = participant("mech", 0);
+        mech.summon_kind = SummonKind::Mech;
+        mech.hp = 2.0;
+        mech.max_hp = 6.0;
+        mech.construct_repair_channel_rounds_remaining = 2;
+
+        assert!(advance_redeemed_construct_state(&mut mech, true).is_empty());
+        assert!(!participant_can_act(&mech));
+        let logs = advance_redeemed_construct_state(&mut mech, true);
+        assert_eq!(mech.hp, 6.0);
+        assert_eq!(logs.len(), 1);
+
+        mech.hp = 2.0;
+        mech.construct_repair_channel_rounds_remaining = 2;
+        apply_participant_damage_for_battle(&mut mech, 1.0, "enemy", true);
+        assert_eq!(mech.construct_repair_channel_rounds_remaining, 0);
+    }
+
+    #[test]
+    fn redeemed_drone_paralysis_note_parses_as_one_round_status() {
+        let effects = static_skill_effects(
+            "主动使用对周围3米内的目标施加1回合麻痹状态",
+            &SkillRuleArgs::default(),
+            Some("动作"),
+            None,
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            SkillEffect::GrantBuff { buff, .. }
+                if buff.name.contains("麻痹") && buff.turns_remaining == 1
+        )));
+    }
+
+    #[test]
+    fn redeemed_drone_electric_shock_prevents_target_action() {
+        let manager = empty_manager();
+        let owner = PlayerCharacter::default();
+        let drone = Summon {
+            kind: SummonKind::ArmedDrone,
+            ..Default::default()
+        };
+        let drone = participant_from_summon("owner", 0, &drone, &owner, &manager);
+        let skill = character_skills(drone.unit_character.as_ref().unwrap())[1].clone();
+        let target = participant("target", 0);
+        let mut store = BattleRoundStore {
+            encounters: HashMap::from([(
+                "battle".to_owned(),
+                BattleEncounter {
+                    active: true,
+                    participants: vec![drone, target],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let positions = SceneCharacterPositions {
+            positions: HashMap::from([
+                ("summon:owner:0".to_owned(), Vec3::ZERO),
+                ("target".to_owned(), Vec3::new(2.0, 0.0, 0.0)),
+            ]),
+        };
+
+        assert!(store.record_skill_use(
+            "battle",
+            "summon:owner:0",
+            "target",
+            &skill,
+            &manager,
+            Some(&positions),
+        ));
+        let target = store.encounters["battle"]
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "target")
+            .unwrap();
+        assert_eq!(target.paralyzed_rounds_remaining, 1);
+        assert!(!participant_can_act(target));
+    }
+
+    #[test]
     fn summon_participant_ignores_low_hp_damage_penalty() {
         let mut manager = empty_manager();
         let mut owner = PlayerCharacter::default();
@@ -9695,6 +10161,7 @@ mod tests {
             player_character: false,
             is_summon: false,
             summon_owner_id: None,
+            summon_kind: SummonKind::Custom,
             level: 1,
             exp: 0,
             support_talent_experience_bonus_rate: 0.0,
@@ -9745,6 +10212,11 @@ mod tests {
             overhealing_shield_turns_remaining: 0,
             revenge_soul_shield_rate: 0.0,
             revenge_soul_shield: 0.0,
+            construct_shield: 0.0,
+            construct_shield_max: 0.0,
+            construct_shield_repair_rounds_remaining: 0,
+            construct_repair_channel_rounds_remaining: 0,
+            paralyzed_rounds_remaining: 0,
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,
