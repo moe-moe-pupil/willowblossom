@@ -1319,6 +1319,28 @@ pub struct Summon {
     pub repair_channel_rounds_remaining: u32,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct RedeemedNeedleState {
+    #[serde(default = "default_ready_flying_needles")]
+    pub ready: u8,
+    #[serde(default)]
+    pub case_ready: u8,
+    #[serde(default)]
+    pub case_progress_noncombat_rounds: u8,
+}
+
+impl Default for RedeemedNeedleState {
+    fn default() -> Self {
+        Self {
+            ready: default_ready_flying_needles(),
+            case_ready: 0,
+            case_progress_noncombat_rounds: 0,
+        }
+    }
+}
+
+fn default_ready_flying_needles() -> u8 { 5 }
+
 impl Default for Summon {
     fn default() -> Self {
         Self {
@@ -1418,6 +1440,8 @@ pub struct PlayerCharacter {
     /// 「政委」战吼熟练度，使用前提升，最多5级。
     #[serde(default)]
     pub redeemed_commissar_proficiency: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redeemed_needles: Option<RedeemedNeedleState>,
 }
 
 impl Default for PlayerCharacter {
@@ -1461,6 +1485,7 @@ impl Default for PlayerCharacter {
             summons: Vec::new(),
             dominion_max_hp_bonus: 0.0,
             redeemed_commissar_proficiency: 0,
+            redeemed_needles: None,
         }
     }
 }
@@ -9410,6 +9435,89 @@ fn redeemed_summon(kind: SummonKind) -> Summon {
     }
 }
 
+fn character_has_current_redeemed_flying_needles(character: &PlayerCharacter) -> bool {
+    character.skill_names.iter().enumerate().any(|(index, name)| {
+        name.trim() == "飞针"
+            && character
+                .skill_metadata
+                .get(index)
+                .is_some_and(CharacterSkillMetadata::is_approved)
+            && character.skill_notes.get(index).is_some_and(|note| {
+                note.contains("常态具备5根飞针")
+                    && note.contains("每根飞针造成1点远程物理伤害")
+                    && note.contains("非战斗轮每一回合补充一根")
+            })
+    })
+}
+
+pub fn character_has_current_redeemed_needle_case(character: &PlayerCharacter) -> bool {
+    character.skill_names.iter().enumerate().any(|(index, name)| {
+        name.trim() == "针匣"
+            && character
+                .skill_metadata
+                .get(index)
+                .is_some_and(CharacterSkillMetadata::is_approved)
+            && character.skill_notes.get(index).is_some_and(|note| {
+                note.contains("额外可以存储两根飞针")
+                    && note.contains("开团时为空")
+                    && note.contains("非战斗轮每两回合生产一根")
+            })
+    })
+}
+
+pub fn sync_character_redeemed_needles(character: &mut PlayerCharacter) -> bool {
+    if !character_has_current_redeemed_flying_needles(character) {
+        return false;
+    }
+    if character.redeemed_needles.is_none() {
+        character.redeemed_needles = Some(RedeemedNeedleState::default());
+        return true;
+    }
+    let has_case = character_has_current_redeemed_needle_case(character);
+    let state = character.redeemed_needles.as_mut().unwrap();
+    let previous = *state;
+    state.ready = state.ready.min(5);
+    state.case_ready = if has_case { state.case_ready.min(2) } else { 0 };
+    if !has_case || state.case_ready >= 2 {
+        state.case_progress_noncombat_rounds = 0;
+    } else {
+        state.case_progress_noncombat_rounds = state.case_progress_noncombat_rounds.min(1);
+    }
+    *state != previous
+}
+
+pub fn character_redeemed_needle_state(
+    character: &PlayerCharacter,
+) -> Option<(RedeemedNeedleState, bool)> {
+    character_has_current_redeemed_flying_needles(character).then(|| {
+        (
+            character.redeemed_needles.unwrap_or_default(),
+            character_has_current_redeemed_needle_case(character),
+        )
+    })
+}
+
+pub fn advance_character_redeemed_needles_noncombat(character: &mut PlayerCharacter) -> bool {
+    let mut changed = sync_character_redeemed_needles(character);
+    let has_case = character_has_current_redeemed_needle_case(character);
+    let Some(state) = character.redeemed_needles.as_mut() else {
+        return changed;
+    };
+    if state.ready < 5 {
+        state.ready += 1;
+        changed = true;
+    }
+    if has_case && state.case_ready < 2 {
+        state.case_progress_noncombat_rounds += 1;
+        if state.case_progress_noncombat_rounds >= 2 {
+            state.case_progress_noncombat_rounds = 0;
+            state.case_ready += 1;
+        }
+        changed = true;
+    }
+    changed
+}
+
 /// 召唤物离主距离（米）：默认15米，「魔网延伸」+5%；
 /// 「重命名吊牌」提供无限距离（返回None）。
 pub fn character_summon_range_meters(character: &PlayerCharacter) -> Option<f32> {
@@ -17241,6 +17349,33 @@ position_cells = [4, 5, 6]
         assert!((mech.hp - 6.0).abs() < f32::EPSILON);
         assert!((mech.max_shield - 3.0).abs() < f32::EPSILON);
         assert!((mech.shield - 3.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn current_redeemed_needles_materialize_and_refill_separate_stocks() {
+        let mut character = PlayerCharacter {
+            skill_names: vec!["飞针".to_owned(), "针匣".to_owned()],
+            skill_notes: vec![
+                "常态具备5根飞针，消耗后会随时间推移自动补充，每根飞针造成1点远程物理伤害，射程6米无距离衰减。非战斗轮每一回合补充一根。".to_owned(),
+                "额外可以存储两根飞针的匣子，开团时为空，非战斗轮每两回合生产一根。".to_owned(),
+            ],
+            skill_metadata: vec![
+                CharacterSkillMetadata::default(),
+                CharacterSkillMetadata::default(),
+            ],
+            ..Default::default()
+        };
+
+        assert!(sync_character_redeemed_needles(&mut character));
+        assert_eq!(character.redeemed_needles.unwrap().ready, 5);
+        assert_eq!(character.redeemed_needles.unwrap().case_ready, 0);
+        character.redeemed_needles.as_mut().unwrap().ready = 3;
+        assert!(advance_character_redeemed_needles_noncombat(&mut character));
+        assert_eq!(character.redeemed_needles.unwrap().ready, 4);
+        assert_eq!(character.redeemed_needles.unwrap().case_ready, 0);
+        assert!(advance_character_redeemed_needles_noncombat(&mut character));
+        assert_eq!(character.redeemed_needles.unwrap().ready, 5);
+        assert_eq!(character.redeemed_needles.unwrap().case_ready, 1);
     }
 
     #[test]

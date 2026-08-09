@@ -781,6 +781,7 @@ use crate::{
     },
     napcat::{
         adjust_character_status_points,
+        advance_character_redeemed_needles_noncombat,
         campaign_weave_state,
         character_chaos_output_variance,
         character_damage_attribute_multiplier,
@@ -824,6 +825,7 @@ use crate::{
         summon_max_hp_for_level,
         summon_target_id,
         sync_character_summons,
+        sync_character_redeemed_needles,
         update_character_from_status,
         update_character_from_status_with_config,
         upsert_character_active_buff,
@@ -7049,7 +7051,7 @@ fn character_editor_ui(
     item_pool: &[InventoryItem],
     stat_config: TrpgBasicConfig,
 ) -> bool {
-    let mut changed = false;
+    let mut changed = sync_character_redeemed_needles(character);
     let mut derived_stats_changed = false;
     ui.horizontal(|ui| {
         changed |= ui.checkbox(&mut character.inited, "已完成").changed();
@@ -9907,6 +9909,11 @@ fn advance_group_world_turn(
     let mut changed = captured > 0 || advanced;
     if advanced {
         changed |= reset_turn_totals_for_players(manager, &players);
+        for target_id in &players {
+            if let Some(character) = manager.player_characters.get_mut(target_id) {
+                changed |= advance_character_redeemed_needles_noncombat(character);
+            }
+        }
         changed |= advance_buffs_for_players(manager, &players, rule_engine_state);
     }
     changed

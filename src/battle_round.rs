@@ -82,6 +82,7 @@ use crate::{
         character_physical_damage_followup_rate,
         character_physical_damage_lifesteal,
         character_range_magic_converter_damage_bonus,
+        character_redeemed_needle_state,
         character_rest_then_fight_healing_rate,
         character_sin_on_sin_exp_bonus_per_stack,
         character_sin_on_sin_recovery_rate,
@@ -114,6 +115,7 @@ use crate::{
         CharacterStatus,
         NapcatMessageManager,
         PlayerCharacter,
+        RedeemedNeedleState,
         SkillRuleArgs,
         Summon,
         SummonKind,
@@ -522,6 +524,16 @@ pub struct BattleParticipantSnapshot {
     pub next_attack_bonus_physical: f32,
     #[serde(default)]
     pub natural_hp_regen_suppressed: bool,
+    #[serde(default)]
+    pub flying_needles_enabled: bool,
+    #[serde(default)]
+    pub flying_needles_ready: u8,
+    #[serde(default)]
+    pub needle_case_enabled: bool,
+    #[serde(default)]
+    pub needle_case_ready: u8,
+    #[serde(default)]
+    pub needle_case_progress_noncombat_rounds: u8,
     #[serde(default)]
     pub undying_rage_enabled: bool,
     #[serde(default)]
@@ -1642,6 +1654,19 @@ fn is_current_redeemed_bolter(skill: &CharacterSkill) -> bool {
         && skill.note.contains("每次开枪都会广播给周围玩家这把枪的描述")
 }
 
+fn is_current_redeemed_flying_needle(skill: &CharacterSkill) -> bool {
+    skill.name.trim() == "飞针"
+        && skill.note.contains("常态具备5根飞针")
+        && skill.note.contains("每根飞针造成1点远程物理伤害")
+        && skill.note.contains("射程6米无距离衰减")
+}
+
+fn is_current_redeemed_blow_needles(skill: &CharacterSkill) -> bool {
+    skill.name.trim() == "吹针术"
+        && skill.note.contains("一次性射出当前持有的所有飞针")
+        && skill.note.contains("命中的飞针数量+2的远程物理伤害")
+}
+
 fn apply_void_break_damage_for_battle(
     participant: &mut BattleParticipantSnapshot,
     amount: f32,
@@ -1803,6 +1828,26 @@ fn advance_redeemed_construct_state(
         }
     }
     logs
+}
+
+fn advance_redeemed_needles_noncombat(participant: &mut BattleParticipantSnapshot) -> bool {
+    if !participant.flying_needles_enabled {
+        return false;
+    }
+    let mut changed = false;
+    if participant.flying_needles_ready < 5 {
+        participant.flying_needles_ready += 1;
+        changed = true;
+    }
+    if participant.needle_case_enabled && participant.needle_case_ready < 2 {
+        participant.needle_case_progress_noncombat_rounds += 1;
+        if participant.needle_case_progress_noncombat_rounds >= 2 {
+            participant.needle_case_progress_noncombat_rounds = 0;
+            participant.needle_case_ready += 1;
+        }
+        changed = true;
+    }
+    changed
 }
 
 /// 推进「蝴蝶效应」：效果在持有者与指定目标间每回合互换；一方死亡后常驻存活方。
@@ -3614,6 +3659,21 @@ fn encounter_roster_ui(
             if participant.natural_hp_regen_suppressed {
                 ui.small("撕裂：自然生命回复受抑制");
             }
+            if participant.flying_needles_enabled {
+                ui.small(format!(
+                    "飞针 {}/5 · 针匣 {}/{}{}",
+                    participant.flying_needles_ready,
+                    participant.needle_case_ready,
+                    if participant.needle_case_enabled { 2 } else { 0 },
+                    if participant.needle_case_enabled
+                        && participant.needle_case_progress_noncombat_rounds > 0
+                    {
+                        "（生产1/2）"
+                    } else {
+                        ""
+                    }
+                ));
+            }
             if encounter.active {
                 if participant.undying_rage_active {
                     ui.small("不死者之怒生效");
@@ -4616,6 +4676,15 @@ impl BattleRoundStore {
                 participant,
                 encounter.active,
             ));
+            if !encounter.active && advance_redeemed_needles_noncombat(participant) {
+                delayed_logs.push(format!(
+                    "{}补充飞针：常备{}/5，针匣{}/{}",
+                    participant.display_name,
+                    participant.flying_needles_ready,
+                    participant.needle_case_ready,
+                    if participant.needle_case_enabled { 2 } else { 0 }
+                ));
+            }
             if participant.paralyzed_rounds_remaining > 0 {
                 participant.paralyzed_rounds_remaining -= 1;
             }
@@ -4996,12 +5065,39 @@ impl BattleRoundStore {
             return false;
         }
         let actor_character = character_for_participant(&actor_snapshot, manager);
-        let effects = static_skill_effects(
+        let mut effects = static_skill_effects(
             &skill.note,
             &skill.arg_values,
             skill.skill_type.as_deref(),
             skill.legacy_buff_machine_json.as_deref(),
         );
+        let available_needles = u16::from(actor_snapshot.flying_needles_ready)
+            + u16::from(actor_snapshot.needle_case_ready);
+        let uses_single_needle = is_current_redeemed_flying_needle(skill);
+        let uses_all_needles = is_current_redeemed_blow_needles(skill);
+        if (uses_single_needle || uses_all_needles) && available_needles == 0 {
+            encounter.action_log.push(format!(
+                "{}不能使用{}；当前没有飞针",
+                actor_snapshot.display_name, skill.name
+            ));
+            return false;
+        }
+        if uses_all_needles {
+            let mut found_damage = false;
+            for effect in &mut effects {
+                if let SkillEffect::Damage { amount, .. } = effect {
+                    *amount = available_needles as f32 + 2.0;
+                    found_damage = true;
+                }
+            }
+            if !found_damage {
+                effects.push(SkillEffect::Damage {
+                    amount: available_needles as f32 + 2.0,
+                    target: TargetSelector::single(ActorRef::Target),
+                    damage_type: DamageType::Range,
+                });
+            }
+        }
         let selected_target_alive = encounter
             .participants
             .iter()
@@ -5950,6 +6046,43 @@ impl BattleRoundStore {
                 skill.note.trim()
             ));
         }
+        if uses_single_needle || uses_all_needles {
+            let consumed_state = encounter
+                .participants
+                .iter_mut()
+                .find(|participant| participant.target_id == actor_id)
+                .map(|actor| {
+                    let consumed = if uses_all_needles {
+                        let consumed = u16::from(actor.flying_needles_ready)
+                            + u16::from(actor.needle_case_ready);
+                        actor.flying_needles_ready = 0;
+                        actor.needle_case_ready = 0;
+                        consumed
+                    } else if actor.flying_needles_ready > 0 {
+                        actor.flying_needles_ready -= 1;
+                        1
+                    } else {
+                        actor.needle_case_ready = actor.needle_case_ready.saturating_sub(1);
+                        1
+                    };
+                    (
+                        consumed,
+                        actor.flying_needles_ready,
+                        actor.needle_case_ready,
+                        actor.needle_case_enabled,
+                    )
+                });
+            if let Some((consumed, ready, case_ready, case_enabled)) = consumed_state {
+                encounter.action_log.push(format!(
+                    "{}消耗{}根飞针（常备{}/5，针匣{}/{})",
+                    actor_name,
+                    consumed,
+                    ready,
+                    case_ready,
+                    if case_enabled { 2 } else { 0 }
+                ));
+            }
+        }
         if mp_cost > 0.0 {
             encounter.action_log.push(format!(
                 "{}消耗{} MP",
@@ -6641,6 +6774,25 @@ fn sync_encounter_to_manager(
         if character.redeemed_commissar_proficiency != commissar_proficiency {
             character.redeemed_commissar_proficiency = commissar_proficiency;
             changed = true;
+        }
+        if participant.flying_needles_enabled && character_redeemed_needle_state(character).is_some() {
+            let needle_state = RedeemedNeedleState {
+                ready: participant.flying_needles_ready.min(5),
+                case_ready: if participant.needle_case_enabled {
+                    participant.needle_case_ready.min(2)
+                } else {
+                    0
+                },
+                case_progress_noncombat_rounds: if participant.needle_case_enabled {
+                    participant.needle_case_progress_noncombat_rounds.min(1)
+                } else {
+                    0
+                },
+            };
+            if character.redeemed_needles != Some(needle_state) {
+                character.redeemed_needles = Some(needle_state);
+                changed = true;
+            }
         }
         let dominion_bonus = participant.dominion_max_hp_bonus.clamp(
             0.0,
@@ -7388,6 +7540,13 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
             .to_bits()
             .hash(&mut hasher);
         participant.natural_hp_regen_suppressed.hash(&mut hasher);
+        participant.flying_needles_enabled.hash(&mut hasher);
+        participant.flying_needles_ready.hash(&mut hasher);
+        participant.needle_case_enabled.hash(&mut hasher);
+        participant.needle_case_ready.hash(&mut hasher);
+        participant
+            .needle_case_progress_noncombat_rounds
+            .hash(&mut hasher);
         participant.undying_rage_enabled.hash(&mut hasher);
         participant.undying_rage_used.hash(&mut hasher);
         participant.undying_rage_active.hash(&mut hasher);
@@ -7518,6 +7677,7 @@ fn participant_from_character(
     } else {
         0.0
     };
+    let redeemed_needles = character_redeemed_needle_state(character);
     BattleParticipantSnapshot {
         target_id: target_id.to_owned(),
         display_name: character_display_name(target_id, character, manager),
@@ -7591,6 +7751,13 @@ fn participant_from_character(
         commissar_proficiency: character.redeemed_commissar_proficiency.min(5),
         next_attack_bonus_physical: 0.0,
         natural_hp_regen_suppressed: false,
+        flying_needles_enabled: redeemed_needles.is_some(),
+        flying_needles_ready: redeemed_needles.map(|(state, _)| state.ready).unwrap_or(0),
+        needle_case_enabled: redeemed_needles.map(|(_, enabled)| enabled).unwrap_or(false),
+        needle_case_ready: redeemed_needles.map(|(state, _)| state.case_ready).unwrap_or(0),
+        needle_case_progress_noncombat_rounds: redeemed_needles
+            .map(|(state, _)| state.case_progress_noncombat_rounds)
+            .unwrap_or(0),
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
@@ -7722,6 +7889,11 @@ fn participant_from_unit_template(
         commissar_proficiency: 0,
         next_attack_bonus_physical: 0.0,
         natural_hp_regen_suppressed: false,
+        flying_needles_enabled: false,
+        flying_needles_ready: 0,
+        needle_case_enabled: false,
+        needle_case_ready: 0,
+        needle_case_progress_noncombat_rounds: 0,
         undying_rage_enabled: character_undying_rage_available(character),
         undying_rage_used: false,
         undying_rage_active: false,
@@ -7847,6 +8019,11 @@ fn participant_from_target(
         commissar_proficiency: 0,
         next_attack_bonus_physical: 0.0,
         natural_hp_regen_suppressed: false,
+        flying_needles_enabled: false,
+        flying_needles_ready: 0,
+        needle_case_enabled: false,
+        needle_case_ready: 0,
+        needle_case_progress_noncombat_rounds: 0,
         undying_rage_enabled: false,
         undying_rage_used: false,
         undying_rage_active: false,
@@ -8234,6 +8411,23 @@ fn sync_participant_from_manager(
         participant.level = character.level.max(1);
         participant.exp = character.exp.max(0);
         participant.commissar_proficiency = character.redeemed_commissar_proficiency.min(5);
+        if let Some((state, case_enabled)) = character_redeemed_needle_state(character) {
+            participant.flying_needles_enabled = true;
+            participant.flying_needles_ready = state.ready.min(5);
+            participant.needle_case_enabled = case_enabled;
+            participant.needle_case_ready = if case_enabled { state.case_ready.min(2) } else { 0 };
+            participant.needle_case_progress_noncombat_rounds = if case_enabled {
+                state.case_progress_noncombat_rounds.min(1)
+            } else {
+                0
+            };
+        } else {
+            participant.flying_needles_enabled = false;
+            participant.flying_needles_ready = 0;
+            participant.needle_case_enabled = false;
+            participant.needle_case_ready = 0;
+            participant.needle_case_progress_noncombat_rounds = 0;
+        }
         participant.support_talent_experience_bonus_rate =
             character_support_talent_experience_bonus_rate(character);
         let total = character.status.combined(&character.extra_status);
@@ -8522,6 +8716,17 @@ fn normalize_encounter_after_edit(encounter: &mut BattleEncounter) {
         participant.construct_shield = participant
             .construct_shield
             .clamp(0.0, participant.construct_shield_max);
+        participant.flying_needles_ready = participant.flying_needles_ready.min(5);
+        participant.needle_case_ready = if participant.needle_case_enabled {
+            participant.needle_case_ready.min(2)
+        } else {
+            0
+        };
+        participant.needle_case_progress_noncombat_rounds = if participant.needle_case_enabled {
+            participant.needle_case_progress_noncombat_rounds.min(1)
+        } else {
+            0
+        };
         participant.damage_taken_this_turn = participant.damage_taken_this_turn.max(0.0);
         participant.healing_taken_this_turn = participant.healing_taken_this_turn.max(0.0);
         participant.alive = participant.hp > 0.0 || participant_hope_avatar_active(participant);
@@ -9874,6 +10079,11 @@ mod area_tests {
             commissar_proficiency: 0,
             next_attack_bonus_physical: 0.0,
             natural_hp_regen_suppressed: false,
+            flying_needles_enabled: false,
+            flying_needles_ready: 0,
+            needle_case_enabled: false,
+            needle_case_ready: 0,
+            needle_case_progress_noncombat_rounds: 0,
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,
@@ -10290,6 +10500,76 @@ mod tests {
     }
 
     #[test]
+    fn redeemed_blow_needles_consumes_all_inventory_for_dynamic_damage() {
+        let manager = empty_manager();
+        let skill = CharacterSkill {
+            index: 0,
+            name: "吹针术".to_owned(),
+            note: "一次性射出当前持有的所有飞针，造成命中的飞针数量+2的远程物理伤害，但命中率会降低".to_owned(),
+            skill_type: Some("远程".to_owned()),
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: Some(1),
+            target_class: Some("单目标".to_owned()),
+            range: Some(6),
+            arg_values: SkillRuleArgs::default(),
+        };
+        let mut actor = participant("actor", 0);
+        actor.flying_needles_enabled = true;
+        actor.flying_needles_ready = 3;
+        actor.needle_case_enabled = true;
+        actor.needle_case_ready = 1;
+        let mut enemy = participant("enemy", 0);
+        enemy.hp = 20.0;
+        enemy.max_hp = 20.0;
+        let mut store = BattleRoundStore {
+            encounters: HashMap::from([(
+                "battle".to_owned(),
+                BattleEncounter {
+                    active: true,
+                    participants: vec![actor, enemy],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let positions = SceneCharacterPositions {
+            positions: HashMap::from([
+                ("actor".to_owned(), Vec3::ZERO),
+                ("enemy".to_owned(), Vec3::new(2.0, 0.0, 0.0)),
+            ]),
+        };
+
+        assert!(store.record_skill_use(
+            "battle", "actor", "enemy", &skill, &manager, Some(&positions),
+        ));
+        let encounter = &store.encounters["battle"];
+        assert_eq!(encounter.participants[0].flying_needles_ready, 0);
+        assert_eq!(encounter.participants[0].needle_case_ready, 0);
+        assert_eq!(encounter.participants[1].hp, 14.0);
+    }
+
+    #[test]
+    fn redeemed_needles_refill_only_on_noncombat_rounds() {
+        let mut actor = participant("actor", 0);
+        actor.flying_needles_enabled = true;
+        actor.flying_needles_ready = 2;
+        actor.needle_case_enabled = true;
+
+        assert!(!advance_redeemed_needles_noncombat(&mut participant("other", 0)));
+        assert!(advance_redeemed_needles_noncombat(&mut actor));
+        assert_eq!(actor.flying_needles_ready, 3);
+        assert_eq!(actor.needle_case_ready, 0);
+        assert_eq!(actor.needle_case_progress_noncombat_rounds, 1);
+        assert!(advance_redeemed_needles_noncombat(&mut actor));
+        assert_eq!(actor.flying_needles_ready, 4);
+        assert_eq!(actor.needle_case_ready, 1);
+        assert_eq!(actor.needle_case_progress_noncombat_rounds, 0);
+    }
+
+    #[test]
     fn summon_participant_ignores_low_hp_damage_penalty() {
         let mut manager = empty_manager();
         let mut owner = PlayerCharacter::default();
@@ -10448,6 +10728,11 @@ mod tests {
             commissar_proficiency: 0,
             next_attack_bonus_physical: 0.0,
             natural_hp_regen_suppressed: false,
+            flying_needles_enabled: false,
+            flying_needles_ready: 0,
+            needle_case_enabled: false,
+            needle_case_ready: 0,
+            needle_case_progress_noncombat_rounds: 0,
             undying_rage_enabled: false,
             undying_rage_used: false,
             undying_rage_active: false,
