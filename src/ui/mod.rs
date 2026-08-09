@@ -139,7 +139,7 @@ const VOXEL_SCENE_EXPORT_DEFAULT_PATH: &str = ".data/willowblossom/exports/voxel
 const BATTLE_ROUND_EXPORT_DEFAULT_PATH: &str =
     ".data/willowblossom/exports/battle_rounds_export.json";
 
-fn voxel_material_choices() -> [(u8, &'static str, egui::Color32); 11] {
+fn voxel_material_choices() -> [(u8, &'static str, egui::Color32); 12] {
     [
         (
             1,
@@ -195,6 +195,11 @@ fn voxel_material_choices() -> [(u8, &'static str, egui::Color32); 11] {
             VOXEL_GLASS_MATERIAL,
             "舰船玻璃",
             egui::Color32::from_rgb(122, 235, 255),
+        ),
+        (
+            crate::voxel::VOXEL_BLOOD_MATERIAL,
+            "血迹（2分钟后消散）",
+            egui::Color32::from_rgb(82, 2, 7),
         ),
     ]
 }
@@ -17802,6 +17807,23 @@ mod tests {
             ))
             .0,
             "舰船玻璃"
+        );
+    }
+
+    #[test]
+    fn creative_catalog_exposes_decaying_blood_voxels() {
+        let blood = voxel_material_choices()
+            .into_iter()
+            .find(|(material, ..)| *material == crate::voxel::VOXEL_BLOOD_MATERIAL)
+            .expect("blood must be available to the GM");
+
+        assert!(blood.1.contains("2分钟"));
+        assert_eq!(
+            voxel_creative_item_visual(VoxelCreativeItem::Material(
+                crate::voxel::VOXEL_BLOOD_MATERIAL,
+            ))
+            .0,
+            blood.1,
         );
     }
 

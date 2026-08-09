@@ -192,8 +192,10 @@ const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
 /// whole ship mesh.
 const VOXEL_SPACESHIP_CHUNK_DIMS: i32 = 8;
 pub(crate) const VOXEL_GLASS_MATERIAL: u8 = 11;
+pub(crate) const VOXEL_BLOOD_MATERIAL: u8 = 12;
 const VOXEL_GLASS_OPACITY: f32 = 0.05;
-const VOXEL_MATERIAL_COUNT: usize = VOXEL_GLASS_MATERIAL as usize;
+const VOXEL_MATERIAL_COUNT: usize = VOXEL_BLOOD_MATERIAL as usize;
+const VOXEL_BLOOD_DECAY_SECONDS: f32 = 120.0;
 const MICRO_TILE_SUBDIVISIONS: u32 = 16;
 const WORKBOOK_FEATURE_HOVER_MIN_Y_CELLS: f32 = 1.0;
 const WORKBOOK_FEATURE_HOVER_MAX_Y_CELLS: f32 = 4.0;
@@ -714,6 +716,7 @@ pub(crate) struct VoxelGeometryDirtyChunks {
 struct VoxelEditRuntime<'w, 's> {
     editor: ResMut<'w, VoxelEditorState>,
     dirty_chunks: ResMut<'w, VoxelGeometryDirtyChunks>,
+    blood_decay: ResMut<'w, VoxelBloodDecay>,
     occupancy: ResMut<'w, VoxelSpaceshipOccupancyCache>,
     chunk_parents: Query<'w, 's, &'static ChildOf, With<VoxelSpaceshipChunk>>,
     scene_recorder: Option<ResMut<'w, crate::replay::ReplaySceneRecorder>>,
@@ -2500,6 +2503,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelToolGunDragState>()
         .init_resource::<VoxelPhysicsChunkLoader>()
         .init_resource::<VoxelGeometryDirtyChunks>()
+        .init_resource::<VoxelBloodDecay>()
         .init_resource::<VoxelSpaceshipOccupancyCache>()
         .init_resource::<VoxelScenePersistenceState>()
         .init_resource::<VoxelSpaceshipControlState>()
@@ -2534,6 +2538,7 @@ impl Plugin for TrpgVoxelPlugin {
                 load_persisted_voxel_scene,
                 setup_voxel_spaceships,
                 setup_voxel_player_cameras,
+                initialize_voxel_blood_decay,
             )
                 .chain(),
         )
@@ -2553,6 +2558,7 @@ impl Plugin for TrpgVoxelPlugin {
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
                     sync_selected_voxel_light,
                     edit_voxel_grid.run_if(crate::replay::replay_mouse_interaction_inactive),
+                    decay_voxel_blood,
                     use_voxel_door_lock_tool
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
                     use_voxel_invisibility_tool
@@ -3204,8 +3210,15 @@ fn setup_voxel_materials(
                 perceptual_roughness: 0.32,
                 ..default()
             }
-        } else {
+        } else if index == VOXEL_GLASS_MATERIAL as usize - 1 {
             voxel_glass_material()
+        } else {
+            StandardMaterial {
+                base_color: Color::srgb(0.32, 0.006, 0.012),
+                perceptual_roughness: 0.82,
+                reflectance: 0.18,
+                ..default()
+            }
         };
         match index {
             0 => {
@@ -9807,6 +9820,168 @@ pub(crate) fn cached_or_local_voxel_standee_path(source: &str) -> Result<PathBuf
     ))
 }
 
+fn initialize_voxel_blood_decay(
+    grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
+    planets: Query<&VoxelOrbitalPlanet>,
+    spaceships: Query<(Entity, &VoxelPhysicsBody), With<VoxelSpaceship>>,
+    mut blood_decay: ResMut<VoxelBloodDecay>,
+) {
+    blood_decay.voxels.clear();
+    if let Ok(grid) = grids.single() {
+        for (chunk_position, chunk) in grid.iter() {
+            for local in prism(IVec3::ZERO, DIMS) {
+                if chunk[local] == VOXEL_BLOOD_MATERIAL {
+                    blood_decay.refresh(
+                        VoxelBloodLocation::Grid(*chunk_position * DIMS + local),
+                        0,
+                    );
+                }
+            }
+        }
+    }
+    if let Ok(planet) = planets.single() {
+        for (&cell, &material) in &planet.cells {
+            if material == VOXEL_BLOOD_MATERIAL {
+                blood_decay.refresh(VoxelBloodLocation::Planet(cell), 0);
+            }
+        }
+    }
+    for (entity, body) in &spaceships {
+        for &(cell, material) in &body.cells {
+            if material == VOXEL_BLOOD_MATERIAL {
+                blood_decay.refresh(VoxelBloodLocation::Spaceship(entity, cell), 0);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decay_voxel_blood(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    mut planets: Query<&mut VoxelOrbitalPlanet>,
+    spaceships: Query<(&VoxelPhysicsBody, &VoxelSpaceship)>,
+    mut blood_decay: ResMut<VoxelBloodDecay>,
+    mut dirty_chunks: ResMut<VoxelGeometryDirtyChunks>,
+    mut occupancy: ResMut<VoxelSpaceshipOccupancyCache>,
+    mut scene_recorder: Option<ResMut<crate::replay::ReplaySceneRecorder>>,
+) {
+    let expired = blood_decay.tick(time.delta_secs());
+    if expired.is_empty() {
+        return;
+    }
+    for (location, restore_material) in expired {
+        match location {
+            VoxelBloodLocation::Grid(cell) => {
+                let Ok(mut grid) = grids.single_mut() else {
+                    continue;
+                };
+                if grid.get(cell).copied() != Some(VOXEL_BLOOD_MATERIAL) {
+                    continue;
+                }
+                grid.set(cell, restore_material);
+                dirty_chunks.mark_cell_and_neighbors(cell);
+                crate::replay::record_replay_grid_cell(
+                    scene_recorder.as_deref_mut(),
+                    cell,
+                    restore_material,
+                );
+            },
+            VoxelBloodLocation::Planet(cell) => {
+                let Ok(mut planet) = planets.single_mut() else {
+                    continue;
+                };
+                if planet.cells.get(&cell).copied() == Some(VOXEL_BLOOD_MATERIAL) {
+                    if restore_material == 0 {
+                        planet.cells.remove(&cell);
+                        planet.dirty = true;
+                    } else {
+                        set_planet_voxel(&mut planet, cell, restore_material);
+                    }
+                }
+            },
+            VoxelBloodLocation::Spaceship(entity, cell) => {
+                let Ok((body, ship)) = spaceships.get(entity) else {
+                    continue;
+                };
+                let entry = voxel_spaceship_occupancy_mut(&mut occupancy.ships, entity, &body.cells);
+                if entry.cell_material(cell) != Some(VOXEL_BLOOD_MATERIAL) {
+                    continue;
+                }
+                if restore_material == 0 {
+                    entry.remove_cell(cell);
+                } else {
+                    entry.set_cell(cell, restore_material);
+                }
+                entry.cells_dirty = true;
+                crate::replay::record_replay_ship_hull_cell(
+                    scene_recorder.as_deref_mut(),
+                    &ship.id,
+                    cell,
+                    restore_material,
+                );
+                if entry.is_empty() {
+                    occupancy.ships.remove(&entity);
+                    commands.entity(entity).despawn();
+                } else {
+                    commands.entity(entity).insert(VoxelSpaceshipNeedsRebuild);
+                }
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum VoxelBloodLocation {
+    Grid(IVec3),
+    Planet(IVec3),
+    Spaceship(Entity, IVec3),
+}
+
+#[derive(Resource, Default)]
+struct VoxelBloodDecay {
+    voxels: HashMap<VoxelBloodLocation, DecayingBloodVoxel>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DecayingBloodVoxel {
+    remaining_seconds: f32,
+    restore_material: u8,
+}
+
+impl VoxelBloodDecay {
+    fn refresh(&mut self, location: VoxelBloodLocation, replaced_material: u8) {
+        let voxel = self.voxels.entry(location).or_insert(DecayingBloodVoxel {
+            remaining_seconds: VOXEL_BLOOD_DECAY_SECONDS,
+            restore_material: replaced_material,
+        });
+        voxel.remaining_seconds = VOXEL_BLOOD_DECAY_SECONDS;
+        if replaced_material != VOXEL_BLOOD_MATERIAL {
+            voxel.restore_material = replaced_material;
+        }
+    }
+
+    fn tick(&mut self, delta_seconds: f32) -> Vec<(VoxelBloodLocation, u8)> {
+        let delta_seconds = delta_seconds.max(0.0);
+        for voxel in self.voxels.values_mut() {
+            voxel.remaining_seconds -= delta_seconds;
+        }
+        let expired = self
+            .voxels
+            .iter()
+            .filter_map(|(location, voxel)| {
+                (voxel.remaining_seconds <= 0.0)
+                    .then_some((*location, voxel.restore_material))
+            })
+            .collect::<Vec<_>>();
+        for (location, _) in &expired {
+            self.voxels.remove(location);
+        }
+        expired
+    }
+}
+
 /// Resolve/cache and decode a standee image before recording its placement, so a
 /// bad or expired URL is reported in the GUI instead of becoming a silent scene entry.
 pub(crate) fn validate_voxel_standee_image_source(source: &str) -> Result<(), String> {
@@ -13478,6 +13653,7 @@ fn place_creative_light(
     let VoxelEditRuntime {
         mut editor,
         mut dirty_chunks,
+        blood_decay: _,
         occupancy: _,
         chunk_parents: _,
         mut scene_recorder,
@@ -13767,6 +13943,7 @@ fn edit_voxel_grid(
     let VoxelEditRuntime {
         mut editor,
         mut dirty_chunks,
+        mut blood_decay,
         mut occupancy,
         chunk_parents,
         mut scene_recorder,
@@ -14314,6 +14491,7 @@ fn edit_voxel_grid(
                 for y in -brush_radius..=brush_radius {
                     for z in -brush_radius..=brush_radius {
                         let cell = center + IVec3::new(x, y, z);
+                        let before = planet.cells.get(&cell).copied().unwrap_or(0);
                         let did_change = match input_mode {
                             VoxelEditMode::Add => {
                                 set_planet_voxel(&mut planet, cell, editor.material)
@@ -14325,6 +14503,9 @@ fn edit_voxel_grid(
                             },
                             _ => false,
                         };
+                        if did_change && editor.material == VOXEL_BLOOD_MATERIAL {
+                            blood_decay.refresh(VoxelBloodLocation::Planet(cell), before);
+                        }
                         changed += usize::from(did_change);
                     }
                 }
@@ -14402,6 +14583,12 @@ fn edit_voxel_grid(
                         } else {
                             entry.set_cell(position, after);
                         }
+                        if after == VOXEL_BLOOD_MATERIAL {
+                            blood_decay.refresh(VoxelBloodLocation::Spaceship(
+                                ship_entity,
+                                position,
+                            ), before);
+                        }
                         crate::replay::record_replay_ship_hull_cell(
                             scene_recorder.as_deref_mut(),
                             &ship_id,
@@ -14469,6 +14656,9 @@ fn edit_voxel_grid(
                 };
                 if before != after {
                     grid.set(position, after);
+                    if after == VOXEL_BLOOD_MATERIAL {
+                        blood_decay.refresh(VoxelBloodLocation::Grid(position), before);
+                    }
                     dirty_chunks.mark_cell_and_neighbors(position);
                     crate::replay::record_replay_grid_cell(
                         scene_recorder.as_deref_mut(),
@@ -19706,6 +19896,41 @@ mod tests {
         assert!(TrpgVoxelConnector::solid(&8));
         assert!(TrpgVoxelConnector::solid(&9));
         assert!(TrpgVoxelConnector::solid(&10));
+        assert!(!TrpgVoxelConnector::solid(&VOXEL_BLOOD_MATERIAL));
+    }
+
+    #[test]
+    fn blood_voxels_render_at_canonical_scale_without_collision() {
+        let (meshes, collider_cells) = build_voxel_meshes_from_cells(&[(
+            IVec3::new(3, 4, 5),
+            VOXEL_BLOOD_MATERIAL,
+        )]);
+
+        assert!(meshes
+            .iter()
+            .any(|(material, _)| *material == VOXEL_BLOOD_MATERIAL));
+        assert!(collider_cells.is_empty());
+        let positions = meshes
+            .iter()
+            .find(|(material, _)| *material == VOXEL_BLOOD_MATERIAL)
+            .and_then(|(_, mesh)| mesh.attribute(Mesh::ATTRIBUTE_POSITION))
+            .and_then(VertexAttributeValues::as_float3)
+            .unwrap();
+        let min = positions.iter().copied().map(Vec3::from).reduce(Vec3::min).unwrap();
+        let max = positions.iter().copied().map(Vec3::from).reduce(Vec3::max).unwrap();
+        assert_eq!(max - min, Vec3::splat(VOXEL_SIZE));
+    }
+
+    #[test]
+    fn refreshing_blood_restarts_its_two_minute_decay() {
+        let location = VoxelBloodLocation::Grid(IVec3::new(1, 2, 3));
+        let mut decay = VoxelBloodDecay::default();
+        decay.refresh(location, 7);
+        assert!(decay.tick(VOXEL_BLOOD_DECAY_SECONDS - 1.0).is_empty());
+
+        decay.refresh(location, VOXEL_BLOOD_MATERIAL);
+        assert!(decay.tick(VOXEL_BLOOD_DECAY_SECONDS - 1.0).is_empty());
+        assert_eq!(decay.tick(1.0), vec![(location, 7)]);
     }
 
     #[test]
