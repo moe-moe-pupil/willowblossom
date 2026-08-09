@@ -104,6 +104,13 @@ use crate::voxel::{
 };
 
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
+const POSITION_RADIO_PARTIES: [&str; 5] = [
+    "狂妄号",
+    "废弃空间站",
+    "女皇号",
+    "kyo空间站",
+    "女仲裁者号",
+];
 const CHAT_WINDOW_MIN_SIZE: Vec2 = Vec2::new(260.0, 260.0);
 const CHAT_WINDOW_MAX_HEIGHT: f32 = 720.0;
 const GROUP_CHAT_MAX_HEIGHT: f32 = 720.0;
@@ -14621,6 +14628,78 @@ fn queue_legacy_negative_notice(
     Ok(true)
 }
 
+fn voxel_player_area_label<'a>(
+    position: Vec3,
+    spaceships: impl IntoIterator<
+        Item = (
+            &'static str,
+            &'a VoxelPhysicsBody,
+            &'a Transform,
+        ),
+    >,
+) -> &'static str {
+    spaceships
+        .into_iter()
+        .filter_map(|(ship_name, body, transform)| {
+            voxel_spaceship_contains_position(body, transform, position)
+                .map(|volume| (volume, ship_name))
+        })
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, ship_name)| ship_name)
+        .unwrap_or_else(|| voxel_teleport_static_area_label(position))
+}
+
+fn position_radio_party(area: &str) -> Option<&'static str> {
+    match area {
+        "狂妄号" => Some("狂妄号"),
+        "废弃空间站" => Some("废弃空间站"),
+        "Niffy女皇号空间站" => Some("女皇号"),
+        "Kyo空间站" => Some("kyo空间站"),
+        "女仲裁者号空间站" => Some("女仲裁者号"),
+        _ => None,
+    }
+}
+
+fn sync_position_radio_parties(
+    group: &mut TrpgGroup,
+    player_areas: &HashMap<String, &'static str>,
+) -> bool {
+    let before_parties = group.parties.clone();
+    let before_player_parties = group.player_parties.clone();
+
+    for party_name in POSITION_RADIO_PARTIES {
+        group.ensure_party(party_name);
+    }
+
+    for target_id in group.players.clone() {
+        for party_name in POSITION_RADIO_PARTIES {
+            if let Some(party) = group.parties.get_mut(party_name) {
+                party.players.retain(|player_id| player_id != &target_id);
+            }
+        }
+        if group
+            .player_parties
+            .get(&target_id)
+            .is_some_and(|party_id| POSITION_RADIO_PARTIES.contains(&party_id.as_str()))
+        {
+            group.player_parties.remove(&target_id);
+        }
+
+        let Some(party_name) = player_areas
+            .get(&target_id)
+            .and_then(|area| position_radio_party(area))
+        else {
+            continue;
+        };
+        if let Some(party) = group.parties.get_mut(party_name) {
+            party.players.push(target_id);
+        }
+    }
+
+    group.sync_parties();
+    group.parties != before_parties || group.player_parties != before_player_parties
+}
+
 fn trpg_group_settings_window(
     ctx: &Context,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
@@ -14637,6 +14716,7 @@ fn trpg_group_settings_window(
     replay_ship_recorder: &mut ReplayShipTrajectoryRecorder,
     player_camera_store: &mut Persistent<VoxelPlayerCameraStore>,
     summon_standee_store: &mut Persistent<VoxelSummonStandeeStore>,
+    player_position_areas: &HashMap<String, &'static str>,
     player_view_request: Option<&mut ScenePlayerViewRequest>,
     napcat_sender: Option<&NapcatIOSender>,
     ime: &mut ImeManager,
@@ -15327,6 +15407,20 @@ fn trpg_group_settings_window(
                                         }
                                     }
                                 });
+                                if ui
+                                    .button("按位置自动接入电台")
+                                    .on_hover_text(
+                                        "创建五个大型舰船/空间站电台，并按玩家立牌当前位置同步接入；不包含小型舰船和行星",
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
+                                        changed |= sync_position_radio_parties(
+                                            group,
+                                            player_position_areas,
+                                        );
+                                    }
+                                }
 
                                 let mut party_names =
                                     snapshot.parties.keys().cloned().collect::<Vec<_>>();
@@ -16019,6 +16113,22 @@ pub fn ui_system(
         }
     }
 
+    let player_position_areas = player_standees
+        .iter()
+        .filter(|(_, visibility, _)| **visibility != bevy::prelude::Visibility::Hidden)
+        .map(|(standee, _, transform)| {
+            let area = voxel_player_area_label(
+                transform.translation,
+                teleport_spaceships
+                    .iter()
+                    .filter_map(|(ship, body, transform)| {
+                        Some((voxel_spaceship_teleport_name(ship)?, body, transform))
+                    }),
+            );
+            (standee.user_id.to_string(), area)
+        })
+        .collect::<HashMap<_, _>>();
+
     trpg_group_settings_window(
         ctx,
         &mut manager,
@@ -16035,6 +16145,7 @@ pub fn ui_system(
         replay_ship_recorder,
         player_camera_store,
         summon_standee_store,
+        &player_position_areas,
         player_view_request.as_deref_mut(),
         napcat_sender,
         &mut *ime,
@@ -17186,21 +17297,14 @@ pub fn ui_system(
                                     .filter(|name| !name.is_empty())
                                     .map(str::to_owned)
                                     .unwrap_or_else(|| target_display_name(&manager, &target_id));
-                                let area = ship_destinations
-                                    .iter()
-                                    .filter_map(|(ship_name, _, body, ship_transform)| {
-                                        voxel_spaceship_contains_position(
-                                            body,
-                                            ship_transform,
-                                            transform.translation,
-                                        )
-                                        .map(|volume| (volume, *ship_name))
-                                    })
-                                    .min_by(|left, right| left.0.total_cmp(&right.0))
-                                    .map(|(_, ship_name)| ship_name)
-                                    .unwrap_or_else(|| {
-                                        voxel_teleport_static_area_label(transform.translation)
-                                    });
+                                let area = voxel_player_area_label(
+                                    transform.translation,
+                                    ship_destinations.iter().map(
+                                        |(ship_name, _, body, ship_transform)| {
+                                            (*ship_name, *body, *ship_transform)
+                                        },
+                                    ),
+                                );
                                 (character_name, standee.user_id, area)
                             })
                             .collect::<Vec<_>>();
@@ -17738,6 +17842,61 @@ fn append_local_sent_message_with_images(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_radio_sync_creates_only_the_five_requested_channels() {
+        let mut group = TrpgGroup::default();
+        group.players = vec!["1".to_owned(), "2".to_owned(), "3".to_owned()];
+        group.ensure_party("手工小队");
+        group.set_player_party_membership("1", "手工小队", true);
+        let areas = HashMap::from([
+            ("1".to_owned(), "Niffy女皇号空间站"),
+            ("2".to_owned(), "狂妄号"),
+            ("3".to_owned(), "苍鹭号"),
+        ]);
+
+        assert!(sync_position_radio_parties(&mut group, &areas));
+
+        for party_name in POSITION_RADIO_PARTIES {
+            assert!(group.parties.contains_key(party_name));
+        }
+        assert!(group.player_in_party("1", "女皇号"));
+        assert!(group.player_in_party("1", "手工小队"));
+        assert!(group.player_in_party("2", "狂妄号"));
+        assert!(POSITION_RADIO_PARTIES
+            .iter()
+            .all(|party_name| !group.player_in_party("3", party_name)));
+        assert!(!group.parties.contains_key("苍鹭号"));
+        assert!(!group.parties.contains_key("XY星基地"));
+    }
+
+    #[test]
+    fn position_radio_sync_moves_players_and_disconnects_unsupported_areas() {
+        let mut group = TrpgGroup::default();
+        group.players = vec!["1".to_owned(), "2".to_owned()];
+        sync_position_radio_parties(
+            &mut group,
+            &HashMap::from([
+                ("1".to_owned(), "废弃空间站"),
+                ("2".to_owned(), "女仲裁者号空间站"),
+            ]),
+        );
+
+        let changed = sync_position_radio_parties(
+            &mut group,
+            &HashMap::from([
+                ("1".to_owned(), "外部空间"),
+                ("2".to_owned(), "Kyo空间站"),
+            ]),
+        );
+
+        assert!(changed);
+        assert!(POSITION_RADIO_PARTIES
+            .iter()
+            .all(|party_name| !group.player_in_party("1", party_name)));
+        assert!(group.player_in_party("2", "kyo空间站"));
+        assert!(!group.player_in_party("2", "女仲裁者号"));
+    }
 
     #[test]
     fn content_pool_generation_prompt_appends_custom_preference() {
