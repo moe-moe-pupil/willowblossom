@@ -1,3 +1,4 @@
+mod chat_analytics;
 mod ime;
 use std::{
     collections::{
@@ -52,6 +53,7 @@ use bevy_persistent::{
     StorageFormat,
 };
 use ime::*;
+use chat_analytics::show_chat_analytics_window;
 use rand::RngExt;
 use serde::{
     Deserialize,
@@ -1128,6 +1130,7 @@ pub struct UiSystemLocals<'w, 's> {
     chat_turn_count_drafts: Local<'s, HashMap<(String, String), u32>>,
     group_broadcast_scopes: Local<'s, HashMap<String, String>>,
     chat_player_visible_previews: Local<'s, HashMap<String, String>>,
+    chat_analytics_targets: Local<'s, HashSet<String>>,
     chat_list_player_visible_filter: Local<'s, Option<String>>,
     scene_capture_requests: Option<ResMut<'w, SceneCaptureRequests>>,
     voxel_editor: ResMut<'w, VoxelEditorState>,
@@ -2360,6 +2363,7 @@ fn chat_window(
     focused_trpg_group_name: Option<&str>,
     turn_count_drafts: &mut Local<HashMap<(String, String), u32>>,
     chat_player_visible_previews: &mut Local<HashMap<String, String>>,
+    chat_analytics_targets: &mut Local<HashSet<String>>,
     rule_engine_state: &mut RuleEngineState,
     mut player_view_request: Option<&mut ScenePlayerViewRequest>,
     mut scene_capture_requests: Option<&mut SceneCaptureRequests>,
@@ -2492,6 +2496,18 @@ fn chat_window(
                     }
                 }
                 if show_character_button {
+                    let analytics_open = chat_analytics_targets.contains(target_id);
+                    if ui
+                        .selectable_label(analytics_open, "数据")
+                        .on_hover_text("查看私聊回复和世界回合用时")
+                        .clicked()
+                    {
+                        if analytics_open {
+                            chat_analytics_targets.remove(target_id);
+                        } else {
+                            chat_analytics_targets.insert(target_id.to_owned());
+                        }
+                    }
                     if ui.button("角色").clicked() {
                         quick_character_targets.insert(target_id.to_owned());
                         raise_and_expand_window(
@@ -2703,6 +2719,21 @@ fn chat_window(
         );
     });
 
+    if chat_analytics_targets.contains(target_id) {
+        let mut analytics_open = true;
+        show_chat_analytics_window(
+            ctx,
+            manager.as_ref(),
+            target_id,
+            nickname,
+            trpg_membership_group.as_deref(),
+            &mut analytics_open,
+        );
+        if !analytics_open {
+            chat_analytics_targets.remove(target_id);
+        }
+    }
+
     if let Some((group_name, target_id, turns_passed)) = player_turn_count_set {
         if manager
             .trpg_groups
@@ -2772,6 +2803,7 @@ fn chat_window(
     }
     if current_group.is_none() && !window_open {
         manager.open_chat_targets.remove(target_id);
+        chat_analytics_targets.remove(target_id);
         manager.persist().ok();
         return;
     }
@@ -16178,6 +16210,8 @@ pub fn ui_system(
         &mut locals.group_broadcast_scopes;
     let chat_player_visible_previews: &mut Local<HashMap<String, String>> =
         &mut locals.chat_player_visible_previews;
+    let chat_analytics_targets: &mut Local<HashSet<String>> =
+        &mut locals.chat_analytics_targets;
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
     let scene_capture_requests = &mut locals.scene_capture_requests;
@@ -17866,6 +17900,7 @@ pub fn ui_system(
                     active_trpg_group.as_deref(),
                     turn_count_drafts,
                     chat_player_visible_previews,
+                    chat_analytics_targets,
                     &mut rule_engine_state,
                     player_view_request.as_deref_mut(),
                     scene_capture_requests.as_deref_mut(),
