@@ -2848,7 +2848,9 @@ fn parse_grant_buff_action(clause: &str) -> Option<Action> {
     if !grant_buff_words().iter().any(|word| clause.contains(word)) {
         return None;
     }
-    let name = parse_buff_name(clause)?;
+    let effects = parse_buff_effects(clause);
+    let name =
+        parse_buff_name(clause).or_else(|| (!effects.is_empty()).then(|| "数值调整".to_owned()))?;
     let default_target = if clause.contains("获得")
         && !clause.contains("目标")
         && !clause.contains("来源")
@@ -2867,7 +2869,7 @@ fn parse_grant_buff_action(clause: &str) -> Option<Action> {
             priority: 0,
             turns_remaining: parse_buff_turns(clause),
             beneficial: parse_buff_beneficial(clause),
-            effects: parse_buff_effects(clause),
+            effects,
             tick_actions: Vec::new(),
         },
     })
@@ -4163,6 +4165,30 @@ mod tests {
                 effects: vec![BuffEffect {
                     field: BuffField::DamageTakenModifier,
                     value: BuffValue::Set(0.5),
+                }],
+                tick_actions: Vec::new(),
+            },
+        }]);
+    }
+
+    #[test]
+    fn parses_unnamed_numeric_buff_from_current_redeemed_skill() {
+        let ast = parse_rule(
+            "主动使用后免除当前受到的移动阻碍效果，获得持续1回合的移动速度+2。三回合冷却。",
+        )
+        .unwrap();
+
+        assert_eq!(ast.actions, vec![Action::GrantBuff {
+            target: TargetSelector::single(ActorRef::SelfActor),
+            buff: RuleBuffTemplate {
+                name: "数值调整".to_owned(),
+                kind: BuffKind::None,
+                priority: 0,
+                turns_remaining: 1,
+                beneficial: true,
+                effects: vec![BuffEffect {
+                    field: BuffField::Speed,
+                    value: BuffValue::Add(2.0),
                 }],
                 tick_actions: Vec::new(),
             },
