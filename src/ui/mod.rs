@@ -2397,6 +2397,11 @@ fn chat_window(
         .min_size(window_min_size)
         .max_size(max_window_size)
         .resizable(true);
+    if current_group.is_none() {
+        if let Some([x, y]) = manager.chat_window_position(target_id) {
+            window = window.default_pos(egui::pos2(x, y));
+        }
+    }
     if let Some(accent) = chat_window_accent {
         window = window.frame(
             egui::Frame::window(&ctx.style_of(ctx.theme())).stroke(Stroke::new(3.0, accent)),
@@ -2827,6 +2832,15 @@ fn chat_window(
             .as_ref()
             .is_some_and(egui::Response::drag_stopped)
             || response.response.drag_stopped();
+
+        if window_drag_stopped
+            && manager.set_chat_window_position(
+                target_id,
+                [response.response.rect.left(), response.response.rect.top()],
+            )
+        {
+            manager.persist().ok();
+        }
 
         if let Some(drop_pos) = ctx.input(|input| input.pointer.latest_pos()) {
             if window_dragged {

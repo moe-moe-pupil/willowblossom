@@ -616,6 +616,9 @@ pub struct ChatTargetMetadata {
     /// Stable player accent stored with the chat target so restarts keep the same color.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_window_color_rgb: Option<[u8; 3]>,
+    /// Last standalone chat-window top-left position; window size is deliberately not saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_window_position: Option<[f32; 2]>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -4662,6 +4665,30 @@ impl NapcatMessageManager {
         self.chat_targets
             .get(target_id)
             .and_then(|metadata| metadata.chat_window_color_rgb)
+    }
+
+    pub fn chat_window_position(&self, target_id: &str) -> Option<[f32; 2]> {
+        self.chat_targets
+            .get(target_id)
+            .and_then(|metadata| metadata.chat_window_position)
+            .filter(|position| position.iter().all(|coordinate| coordinate.is_finite()))
+    }
+
+    pub fn set_chat_window_position(&mut self, target_id: &str, position: [f32; 2]) -> bool {
+        if !position.iter().all(|coordinate| coordinate.is_finite()) {
+            return false;
+        }
+
+        let saved_position = &mut self
+            .chat_targets
+            .entry(target_id.to_owned())
+            .or_default()
+            .chat_window_position;
+        if *saved_position == Some(position) {
+            return false;
+        }
+        *saved_position = Some(position);
+        true
     }
 
     fn ensure_player_chat_window_color(&mut self, target_id: &str) -> bool {
@@ -11075,6 +11102,38 @@ mod tests {
     }
 
     #[test]
+    fn chat_window_position_survives_toml_reload_without_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("messages.toml");
+        let mut manager = empty_manager();
+
+        assert!(manager.set_chat_window_position("2", [123.0, 456.0]));
+        assert!(!manager.set_chat_window_position("2", [123.0, 456.0]));
+
+        let persistent = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path.clone())
+            .default(manager)
+            .build()
+            .unwrap();
+        persistent.persist().unwrap();
+
+        let encoded = fs::read_to_string(&path).unwrap();
+        assert!(encoded.contains("chat_window_position = [123.0, 456.0]"));
+        assert!(!encoded.contains("chat_window_size"));
+
+        let restored = Persistent::<NapcatMessageManager>::builder()
+            .name("messages")
+            .format(StorageFormat::Toml)
+            .path(path)
+            .default(empty_manager())
+            .build()
+            .unwrap();
+        assert_eq!(restored.chat_window_position("2"), Some([123.0, 456.0]));
+    }
+
+    #[test]
     fn toml_persistence_loads_legacy_aligned_replay_snapshots() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("messages.toml");
@@ -12729,6 +12788,7 @@ position_cells = [4, 5, 6]
                 display_name: "玩家".to_owned(),
                 automatic_name: "tester".to_owned(),
                 chat_window_color_rgb: None,
+                chat_window_position: None,
             });
         manager.player_characters.insert(
             "2".to_owned(),
@@ -12826,6 +12886,7 @@ position_cells = [4, 5, 6]
                 display_name: "保留聊天名".to_owned(),
                 automatic_name: "friend".to_owned(),
                 chat_window_color_rgb: None,
+                chat_window_position: None,
             });
         manager.player_characters.insert(
             "2".to_owned(),
@@ -12889,6 +12950,7 @@ position_cells = [4, 5, 6]
                 display_name: "玩家二".to_owned(),
                 automatic_name: "friend".to_owned(),
                 chat_window_color_rgb: None,
+                chat_window_position: None,
             });
         manager.read_message_counts.insert("2".to_owned(), 3);
         manager.summarized_message_counts.insert("99".to_owned(), 5);
@@ -13012,6 +13074,7 @@ position_cells = [4, 5, 6]
                 display_name: "导入玩家".to_owned(),
                 automatic_name: "source".to_owned(),
                 chat_window_color_rgb: None,
+                chat_window_position: None,
             });
         source.read_message_counts.insert("2".to_owned(), 3);
         source.summarized_message_counts.insert("99".to_owned(), 5);
