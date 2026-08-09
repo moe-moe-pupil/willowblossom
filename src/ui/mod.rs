@@ -7382,7 +7382,8 @@ fn character_editor_ui(
         }
     });
     ui.horizontal(|ui| {
-        changed |= ui
+        let previous_hp = character.hp;
+        let hp_changed = ui
             .add(
                 egui::DragValue::new(&mut character.hp)
                     .range(0.0..=999_999.0)
@@ -7390,6 +7391,10 @@ fn character_editor_ui(
                     .prefix("HP "),
             )
             .changed();
+        if hp_changed {
+            record_manual_character_hp_edit(character, previous_hp);
+        }
+        changed |= hp_changed;
         changed |= ui
             .add(
                 egui::DragValue::new(&mut character.max_hp)
@@ -8848,6 +8853,12 @@ fn character_hp_status(hp: f32, max_hp: f32) -> &'static str {
         "é‡ä¼¤"
     } else {
         "æ¿’æ­»"
+    }
+}
+
+fn record_manual_character_hp_edit(character: &mut PlayerCharacter, previous_hp: f32) {
+    if let Some(base_stats) = character.buff_base_stats.as_mut() {
+        base_stats.hp = (base_stats.hp + character.hp - previous_hp).max(0.0);
     }
 }
 
@@ -20016,6 +20027,53 @@ mod tests {
         assert!((character.speed - 3.0).abs() < 0.0001);
         assert!((character.max_hp - 5.0).abs() < 0.0001);
         assert!(character.buff_base_stats.is_none());
+    }
+
+    #[test]
+    fn manual_hp_edit_survives_active_buff_resync() {
+        let mut character = PlayerCharacter {
+            hp: 5.0,
+            max_hp: 10.0,
+            ..Default::default()
+        };
+        character
+            .inventory
+            .equipment
+            .insert(EquipmentSlot::Feet, InventoryItem {
+                name: "¼²·çÑ¥".to_owned(),
+                equipment_slot: EquipmentSlot::Feet,
+                stat_effects: vec![BuffEffect {
+                    field: BuffField::Speed,
+                    value: BuffValue::Add(2.0),
+                }],
+                ..Default::default()
+            });
+        let mut rules = RuleEngineState::default();
+        let config = TrpgBasicConfig::default();
+        sync_character_buffs(
+            "player",
+            &mut character,
+            &config,
+            &mut rules,
+            &[],
+        );
+
+        let previous_hp = character.hp;
+        character.hp = 3.0;
+        record_manual_character_hp_edit(&mut character, previous_hp);
+        sync_character_buffs(
+            "player",
+            &mut character,
+            &config,
+            &mut rules,
+            &[],
+        );
+
+        assert_eq!(character.hp, 3.0);
+        assert_eq!(
+            character.buff_base_stats.as_ref().unwrap().hp,
+            3.0
+        );
     }
 
     #[test]
