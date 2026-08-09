@@ -2706,6 +2706,16 @@ pub fn parse_rule_with_named_args(
             actions,
         });
     }
+    if let Some(actions) = current_redeemed_numeric_skill_actions(&normalized) {
+        return Ok(RuleAst {
+            raw: input.to_owned(),
+            trigger: Trigger {
+                subject: ActorRef::SelfActor,
+                event: EventKind::SkillCast,
+            },
+            actions,
+        });
+    }
     if !normalized.starts_with("每当") {
         return Err("规则必须以“每当”开头".to_owned());
     }
@@ -2729,6 +2739,40 @@ pub fn parse_rule_with_named_args(
         trigger,
         actions,
     })
+}
+
+fn current_redeemed_numeric_skill_actions(text: &str) -> Option<Vec<Action>> {
+    let amount = if text.contains("链锯剑（6分）") && text.contains("近身攻击会造成5点物理伤害")
+    {
+        5.0
+    } else if text.contains("爆失枪（1分）") && text.contains("6米内造成1点物理伤害")
+    {
+        1.0
+    } else if text.contains("【自制狙击枪】") && text.contains("命中后造成6点物理伤害")
+    {
+        6.0
+    } else {
+        return None;
+    };
+    Some(vec![Action::Damage {
+        target: TargetSelector::single(ActorRef::Target),
+        amount: ValueExpr::Number(amount),
+        damage_type: DamageType::Physical,
+    }])
+}
+
+pub fn current_redeemed_numeric_skill_range(note: &str) -> Option<i32> {
+    let note = normalize_rule_text(note);
+    if note.contains("爆失枪（1分）") && note.contains("6米内造成1点物理伤害") {
+        Some(6)
+    } else if note.contains("【自制狙击枪】")
+        && note.contains("50米射程")
+        && note.contains("命中后造成6点物理伤害")
+    {
+        Some(50)
+    } else {
+        None
+    }
 }
 
 fn is_active_skill_rule(text: &str) -> bool {
@@ -4193,6 +4237,49 @@ mod tests {
                 tick_actions: Vec::new(),
             },
         }]);
+    }
+
+    #[test]
+    fn parses_current_redeemed_weapons_numeric_damage_only() {
+        for (note, amount) in [
+            (
+                "装备\n链锯剑（6分）\n近身攻击会造成5点物理伤害。特性:撕裂。",
+                5.0,
+            ),
+            (
+                "爆失枪（1分）：只能在6米内造成1点物理伤害，每次开枪广播描述。",
+                1.0,
+            ),
+            (
+                "【自制狙击枪】【道具】(10分)：50米射程，会被障碍物阻挡，命中后造成6点物理伤害。",
+                6.0,
+            ),
+        ] {
+            let ast = parse_rule(note).unwrap();
+            assert_eq!(ast.actions, vec![Action::Damage {
+                target: TargetSelector::single(ActorRef::Target),
+                amount: ValueExpr::Number(amount),
+                damage_type: DamageType::Physical,
+            }]);
+        }
+    }
+
+    #[test]
+    fn current_redeemed_weapon_ranges_use_only_explicit_numeric_ranges() {
+        assert_eq!(
+            current_redeemed_numeric_skill_range("爆失枪（1分）：只能在6米内造成1点物理伤害。"),
+            Some(6)
+        );
+        assert_eq!(
+            current_redeemed_numeric_skill_range(
+                "【自制狙击枪】：50米射程，命中后造成6点物理伤害。"
+            ),
+            Some(50)
+        );
+        assert_eq!(
+            current_redeemed_numeric_skill_range("链锯剑（6分）：近身攻击会造成5点物理伤害。"),
+            None
+        );
     }
 
     #[test]

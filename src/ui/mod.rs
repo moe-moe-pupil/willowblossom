@@ -888,6 +888,7 @@ use crate::{
     },
     rule_engine::{
         apply_skill_type_damage_default,
+        current_redeemed_numeric_skill_range,
         legacy_moonberry_buff_machine_passive_buffs,
         legacy_moonberry_buff_machine_skill_cast_rule_with_context,
         parse_rule_with_named_args,
@@ -6190,14 +6191,15 @@ fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
             } else {
                 name.trim().to_owned()
             };
+            let note = character
+                .skill_notes
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
             Some(QuickCastSkill {
                 index,
                 name,
-                note: character
-                    .skill_notes
-                    .get(index)
-                    .cloned()
-                    .unwrap_or_default(),
+                note: note.clone(),
                 skill_type: metadata.skill_type.clone(),
                 legacy_buff_machine_json: metadata.legacy_buff_machine_json,
                 mp_cost: character_effective_skill_mp_cost(
@@ -6217,7 +6219,9 @@ fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
                 cooldown_left: metadata.cooldown_left,
                 target_count: metadata.target_count,
                 target_class: metadata.target_class,
-                range: metadata.range,
+                range: metadata
+                    .range
+                    .or_else(|| current_redeemed_numeric_skill_range(&note)),
                 arg_values: skill_rule_args(&metadata.args),
             })
         })
@@ -9488,7 +9492,6 @@ fn character_effective_buffs(target_id: &str, character: &PlayerCharacter) -> Ve
     buffs.extend(character_legacy_passive_buffs(
         target_id, character,
     ));
-    buffs.extend(character_redeemed_numeric_passive_buffs(target_id, character));
     buffs.extend(character_moonberry_talent_passive_buffs(target_id, character));
     buffs
 }
@@ -9497,7 +9500,6 @@ fn character_effect_sync_needed(target_id: &str, character: &PlayerCharacter) ->
     let has_effects = !character.active_buffs.is_empty()
         || !character_equipment_buffs(target_id, character).is_empty()
         || !character_legacy_passive_buffs(target_id, character).is_empty()
-        || !character_redeemed_numeric_passive_buffs(target_id, character).is_empty()
         || !character_moonberry_talent_passive_buffs(target_id, character).is_empty();
     has_effects != character.buff_base_stats.is_some()
 }
@@ -9537,11 +9539,6 @@ pub(crate) fn character_speed_reduction_multiplier(
         }
     }
     for buff in character_legacy_passive_buffs(target_id, character) {
-        for effect in &buff.effects {
-            collect(effect);
-        }
-    }
-    for buff in character_redeemed_numeric_passive_buffs(target_id, character) {
         for effect in &buff.effects {
             collect(effect);
         }
@@ -9599,48 +9596,6 @@ fn character_legacy_passive_buffs(target_id: &str, character: &PlayerCharacter) 
                 &skill_rule_args(&metadata.args).numeric_values,
                 &source_id,
             )
-        })
-        .collect()
-}
-
-fn character_redeemed_numeric_passive_buffs(
-    target_id: &str,
-    character: &PlayerCharacter,
-) -> Vec<BuffSpec> {
-    character
-        .skill_metadata
-        .iter()
-        .enumerate()
-        .filter(|(_, metadata)| metadata.is_approved())
-        .filter_map(|(index, _)| {
-            let skill_name = character.skill_names.get(index)?.trim();
-            let effects = match skill_name {
-                "青叶鞋子" => {
-                    let has_gm_override = character.active_buffs.iter().any(|buff| {
-                        buff.source_id == "gm"
-                            && buff.name.contains("青叶")
-                            && buff.effects.iter().any(|effect| effect.field == BuffField::Speed)
-                    });
-                    if has_gm_override {
-                        return None;
-                    }
-                    vec![BuffEffect {
-                        field: BuffField::Speed,
-                        value: BuffValue::Add(0.5),
-                    }]
-                },
-                _ => return None,
-            };
-            Some(BuffSpec {
-                name: skill_name.to_owned(),
-                kind: BuffKind::None,
-                priority: 0,
-                turns_remaining: 0,
-                source_id: format!("{target_id}:redeemed-passive:{index}"),
-                beneficial: true,
-                effects,
-                tick_actions: Vec::new(),
-            })
         })
         .collect()
 }
@@ -19917,58 +19872,6 @@ mod tests {
         assert_eq!(character.extra_status.str_, 0);
         assert!((character.max_hp - base_max_hp).abs() < 0.0001);
         assert!((character.damage_dealt_modifier - 1.0).abs() < 0.0001);
-    }
-
-    #[test]
-    fn current_redeemed_shoes_apply_fixed_speed_without_gm_override() {
-        let config = TrpgBasicConfig::default();
-        let mut rule_engine_state = RuleEngineState::default();
-        let mut character = PlayerCharacter {
-            skill_names: vec!["青叶鞋子".to_owned()],
-            skill_notes: vec!["增加0.5点移速".to_owned()],
-            skill_metadata: vec![CharacterSkillMetadata::default()],
-            ..Default::default()
-        };
-        update_character_from_status_with_config(&mut character, &config);
-        let base_speed = character.speed;
-
-        sync_character_buffs(
-            "player",
-            &mut character,
-            &config,
-            &mut rule_engine_state,
-            &[],
-        );
-
-        assert!((character.speed - (base_speed + 0.5)).abs() < 0.0001);
-        assert_eq!(
-            rule_engine_state.active_buff_names("player"),
-            vec!["青叶鞋子".to_owned()]
-        );
-    }
-
-    #[test]
-    fn current_redeemed_shoes_defer_to_existing_gm_speed_override() {
-        let character = PlayerCharacter {
-            skill_names: vec!["青叶鞋子".to_owned()],
-            skill_metadata: vec![CharacterSkillMetadata::default()],
-            active_buffs: vec![BuffSpec {
-                name: "青叶靴子，跑快快".to_owned(),
-                kind: BuffKind::None,
-                priority: 0,
-                turns_remaining: 0,
-                source_id: "gm".to_owned(),
-                beneficial: true,
-                effects: vec![BuffEffect {
-                    field: BuffField::Speed,
-                    value: BuffValue::Add(1.0),
-                }],
-                tick_actions: Vec::new(),
-            }],
-            ..Default::default()
-        };
-
-        assert!(character_redeemed_numeric_passive_buffs("player", &character).is_empty());
     }
 
     #[test]

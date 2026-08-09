@@ -124,6 +124,7 @@ use crate::{
     },
     rule_engine::{
         apply_skill_type_damage_default,
+        current_redeemed_numeric_skill_range,
         legacy_moonberry_buff_machine_skill_cast_rule,
         parse_rule_with_named_args,
         Action,
@@ -8126,14 +8127,15 @@ fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
             } else {
                 name.trim().to_owned()
             };
+            let note = character
+                .skill_notes
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
             CharacterSkill {
                 index,
                 name: display_name,
-                note: character
-                    .skill_notes
-                    .get(index)
-                    .cloned()
-                    .unwrap_or_default(),
+                note: note.clone(),
                 skill_type: character
                     .skill_metadata
                     .get(index)
@@ -8174,7 +8176,8 @@ fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
                 range: character
                     .skill_metadata
                     .get(index)
-                    .and_then(|metadata| metadata.range),
+                    .and_then(|metadata| metadata.range)
+                    .or_else(|| current_redeemed_numeric_skill_range(&note)),
                 arg_values: character
                     .skill_metadata
                     .get(index)
