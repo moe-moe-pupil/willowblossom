@@ -889,6 +889,7 @@ use crate::{
     rule_engine::{
         apply_skill_type_damage_default,
         current_redeemed_numeric_skill_range,
+        current_redeemed_skill_modes,
         legacy_moonberry_buff_machine_passive_buffs,
         legacy_moonberry_buff_machine_skill_cast_rule_with_context,
         parse_rule_with_named_args,
@@ -6177,7 +6178,7 @@ fn quick_cast_ui(
 
 fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
     normalize_character_skill_fields(character);
-    character
+    let skills = character
         .skill_names
         .iter()
         .enumerate()
@@ -6224,6 +6225,29 @@ fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
                     .or_else(|| current_redeemed_numeric_skill_range(&note)),
                 arg_values: skill_rule_args(&metadata.args),
             })
+        })
+        .collect::<Vec<_>>();
+    skills
+        .into_iter()
+        .flat_map(|skill| {
+            let Some(modes) = current_redeemed_skill_modes(&skill.name, &skill.note) else {
+                return vec![skill];
+            };
+            modes
+                .iter()
+                .map(|mode| QuickCastSkill {
+                    name: format!("{}（{}）", skill.name, mode.label),
+                    note: mode.rule.to_owned(),
+                    skill_type: Some("法术".to_owned()),
+                    mp_cost: mode.mp_cost,
+                    cooldown_turns: 0,
+                    cooldown_left: None,
+                    target_count: None,
+                    target_class: Some(mode.target_class.to_owned()),
+                    range: Some(mode.range),
+                    ..skill.clone()
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -20353,6 +20377,33 @@ mod tests {
         assert_eq!(pending_gm_skill_count(&character), 1);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "已批准");
+    }
+
+    #[test]
+    fn quick_cast_expands_soul_pulse_into_shared_cost_modes() {
+        let mut character = PlayerCharacter {
+            skill_names: vec!["灵魂脉冲".to_owned()],
+            skill_notes: vec!["向周围释放灵魂波动，对敌方单位造成6点法术伤害或者治疗一个目标6点生命值。消耗9法力值，无冷却, 范围4米内".to_owned()],
+            skill_metadata: vec![CharacterSkillMetadata::default()],
+            ..Default::default()
+        };
+
+        let skills = quick_cast_skills(&mut character);
+
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].name, "灵魂脉冲（伤害）");
+        assert_eq!(skills[1].name, "灵魂脉冲（治疗）");
+        assert!(skills.iter().all(|skill| skill.index == 0));
+        assert!(skills.iter().all(|skill| skill.mp_cost == 9.0));
+        assert_eq!(
+            skills[0].target_class.as_deref(),
+            Some("范围")
+        );
+        assert_eq!(
+            skills[1].target_class.as_deref(),
+            Some("单目标")
+        );
+        assert!(skills.iter().all(|skill| skill.range == Some(4)));
     }
 
     #[test]

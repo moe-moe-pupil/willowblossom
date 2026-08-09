@@ -76,6 +76,44 @@ pub struct RuleAst {
     pub actions: Vec<Action>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurrentRedeemedSkillMode {
+    pub label: &'static str,
+    pub rule: &'static str,
+    pub mp_cost: f32,
+    pub target_class: &'static str,
+    pub range: i32,
+}
+
+const SOUL_PULSE_MODES: [CurrentRedeemedSkillMode; 2] = [
+    CurrentRedeemedSkillMode {
+        label: "伤害",
+        rule: "主动使用对周围4米内的目标造成6点魔法伤害",
+        mp_cost: 9.0,
+        target_class: "范围",
+        range: 4,
+    },
+    CurrentRedeemedSkillMode {
+        label: "治疗",
+        rule: "主动使用对目标回复6点生命值",
+        mp_cost: 9.0,
+        target_class: "单目标",
+        range: 4,
+    },
+];
+
+pub fn current_redeemed_skill_modes(
+    skill_name: &str,
+    note: &str,
+) -> Option<&'static [CurrentRedeemedSkillMode]> {
+    let note = normalize_rule_text(note);
+    (skill_name.trim() == "灵魂脉冲"
+        && note.contains("造成6点法术伤害")
+        && note.contains("治疗一个目标6点生命值")
+        && note.contains("消耗9法力值"))
+    .then_some(SOUL_PULSE_MODES.as_slice())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Trigger {
     pub subject: ActorRef,
@@ -4302,6 +4340,37 @@ mod tests {
         assert_eq!(
             current_redeemed_numeric_skill_range("链锯剑（6分）：近身攻击会造成5点物理伤害。"),
             None
+        );
+    }
+
+    #[test]
+    fn current_soul_pulse_exposes_damage_and_healing_modes() {
+        let modes = current_redeemed_skill_modes(
+            "灵魂脉冲",
+            "向周围释放灵魂波动，对敌方单位造成6点法术伤害或者治疗一个目标6点生命值。消耗9法力值，无冷却, 范围4米内",
+        )
+        .unwrap();
+
+        assert_eq!(modes, &SOUL_PULSE_MODES);
+        assert_eq!(
+            parse_rule(modes[0].rule).unwrap().actions,
+            vec![Action::Damage {
+                target: TargetSelector {
+                    actor: ActorRef::Target,
+                    area: Some(AreaSelector {
+                        radius_meters: Some(4.0),
+                    }),
+                },
+                amount: ValueExpr::Number(6.0),
+                damage_type: DamageType::Magical,
+            }]
+        );
+        assert_eq!(
+            parse_rule(modes[1].rule).unwrap().actions,
+            vec![Action::Heal {
+                target: TargetSelector::single(ActorRef::Target),
+                amount: ValueExpr::Number(6.0),
+            }]
         );
     }
 

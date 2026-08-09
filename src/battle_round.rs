@@ -125,6 +125,7 @@ use crate::{
     rule_engine::{
         apply_skill_type_damage_default,
         current_redeemed_numeric_skill_range,
+        current_redeemed_skill_modes,
         legacy_moonberry_buff_machine_skill_cast_rule,
         parse_rule_with_named_args,
         Action,
@@ -8117,7 +8118,7 @@ fn character_for_participant(
 }
 
 fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
-    character
+    let skills = character
         .skill_names
         .iter()
         .enumerate()
@@ -8184,6 +8185,29 @@ fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
                     .map(|metadata| skill_rule_args(&metadata.args))
                     .unwrap_or_default(),
             }
+        })
+        .collect::<Vec<_>>();
+    skills
+        .into_iter()
+        .flat_map(|skill| {
+            let Some(modes) = current_redeemed_skill_modes(&skill.name, &skill.note) else {
+                return vec![skill];
+            };
+            modes
+                .iter()
+                .map(|mode| CharacterSkill {
+                    name: format!("{}（{}）", skill.name, mode.label),
+                    note: mode.rule.to_owned(),
+                    skill_type: Some("法术".to_owned()),
+                    mp_cost: mode.mp_cost,
+                    cooldown_turns: 0,
+                    cooldown_left: None,
+                    target_count: None,
+                    target_class: Some(mode.target_class.to_owned()),
+                    range: Some(mode.range),
+                    ..skill.clone()
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -17248,6 +17272,33 @@ mod tests {
             .find(|participant| participant.target_id == "b")
             .unwrap();
         assert_eq!(target.hp, 7.0);
+    }
+
+    #[test]
+    fn battle_skills_expand_soul_pulse_into_shared_cost_modes() {
+        let character = PlayerCharacter {
+            skill_names: vec!["灵魂脉冲".to_owned()],
+            skill_notes: vec!["向周围释放灵魂波动，对敌方单位造成6点法术伤害或者治疗一个目标6点生命值。消耗9法力值，无冷却, 范围4米内".to_owned()],
+            skill_metadata: vec![crate::napcat::CharacterSkillMetadata::default()],
+            ..Default::default()
+        };
+
+        let skills = character_skills(&character);
+
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].name, "灵魂脉冲（伤害）");
+        assert_eq!(skills[1].name, "灵魂脉冲（治疗）");
+        assert!(skills.iter().all(|skill| skill.index == 0));
+        assert!(skills.iter().all(|skill| skill.mp_cost == 9.0));
+        assert_eq!(
+            skills[0].target_class.as_deref(),
+            Some("范围")
+        );
+        assert_eq!(
+            skills[1].target_class.as_deref(),
+            Some("单目标")
+        );
+        assert!(skills.iter().all(|skill| skill.range == Some(4)));
     }
 
     #[test]
