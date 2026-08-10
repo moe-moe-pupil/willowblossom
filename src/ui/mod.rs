@@ -22,6 +22,7 @@ use std::{
 use bevy::{
     ecs::system::SystemParam,
     prelude::*,
+    window::{MonitorSelection, PrimaryWindow, WindowMode},
 };
 use bevy_egui::{
     egui::{
@@ -983,6 +984,129 @@ pub(crate) struct ChatScrollState {
     near_bottom: bool,
 }
 
+const AUTO_HIDE_EDGE_SIZE: f32 = 8.0;
+const AUTO_HIDE_PANEL_GRACE: f32 = 4.0;
+
+#[derive(Clone, Copy)]
+enum AutoHideEdge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+#[derive(Default)]
+struct MainViewFullscreenState {
+    active: bool,
+    previous_window_mode: Option<WindowMode>,
+    top_rect: Option<Rect>,
+    right_rect: Option<Rect>,
+    bottom_rect: Option<Rect>,
+    left_rect: Option<Rect>,
+}
+
+#[derive(Clone, Copy)]
+struct AutoHidePanelVisibility {
+    top: bool,
+    right: bool,
+    bottom: bool,
+    left: bool,
+}
+
+impl AutoHidePanelVisibility {
+    fn all_visible() -> Self {
+        Self {
+            top: true,
+            right: true,
+            bottom: true,
+            left: true,
+        }
+    }
+}
+
+fn pointer_reveals_auto_hide_panel(
+    pointer: Option<Pos2>,
+    viewport: Rect,
+    edge: AutoHideEdge,
+    previous_rect: Option<Rect>,
+) -> bool {
+    let Some(pointer) = pointer else {
+        return false;
+    };
+    if previous_rect.is_some_and(|rect| rect.expand(AUTO_HIDE_PANEL_GRACE).contains(pointer)) {
+        return true;
+    }
+    match edge {
+        AutoHideEdge::Top => pointer.y <= viewport.top() + AUTO_HIDE_EDGE_SIZE,
+        AutoHideEdge::Right => pointer.x >= viewport.right() - AUTO_HIDE_EDGE_SIZE,
+        AutoHideEdge::Bottom => pointer.y >= viewport.bottom() - AUTO_HIDE_EDGE_SIZE,
+        AutoHideEdge::Left => pointer.x <= viewport.left() + AUTO_HIDE_EDGE_SIZE,
+    }
+}
+
+fn auto_hide_panel_visibility(
+    state: &MainViewFullscreenState,
+    pointer: Option<Pos2>,
+    viewport: Rect,
+) -> AutoHidePanelVisibility {
+    if !state.active {
+        return AutoHidePanelVisibility::all_visible();
+    }
+    AutoHidePanelVisibility {
+        top: pointer_reveals_auto_hide_panel(
+            pointer,
+            viewport,
+            AutoHideEdge::Top,
+            state.top_rect,
+        ),
+        right: pointer_reveals_auto_hide_panel(
+            pointer,
+            viewport,
+            AutoHideEdge::Right,
+            state.right_rect,
+        ),
+        bottom: pointer_reveals_auto_hide_panel(
+            pointer,
+            viewport,
+            AutoHideEdge::Bottom,
+            state.bottom_rect,
+        ),
+        left: pointer_reveals_auto_hide_panel(
+            pointer,
+            viewport,
+            AutoHideEdge::Left,
+            state.left_rect,
+        ),
+    }
+}
+
+fn toggle_main_view_fullscreen(state: &mut MainViewFullscreenState, window: Option<&mut Window>) {
+    state.active = !state.active;
+    if let Some(window) = window {
+        if state.active {
+            state.previous_window_mode = Some(window.mode);
+            window.mode = WindowMode::BorderlessFullscreen(MonitorSelection::Current);
+        } else {
+            window.mode = state.previous_window_mode.take().unwrap_or(WindowMode::Windowed);
+        }
+    } else if !state.active {
+        state.previous_window_mode = None;
+    }
+}
+
+fn auto_hide_overlay_ui(ctx: &Context, viewport: Rect, id: &'static str) -> Ui {
+    egui::Ui::new(
+        ctx.clone(),
+        Id::new(("auto_hide_overlay", id)),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::new(
+                egui::Order::Foreground,
+                Id::new(("auto_hide_overlay_layer", id)),
+            ))
+            .max_rect(viewport),
+    )
+}
+
 #[derive(Default)]
 pub(crate) struct TrpgGroupSettingsState {
     open: bool,
@@ -1123,7 +1247,7 @@ impl Default for BuffDraft {
 #[derive(SystemParam)]
 pub struct UiSystemLocals<'w, 's> {
     has_run_once: Local<'s, bool>,
-    main_view_fullscreen: Local<'s, bool>,
+    main_view_fullscreen: Local<'s, MainViewFullscreenState>,
     new_chat_group_modal_string_open: Local<'s, (String, bool)>,
     chat_input_msgs: Local<'s, HashMap<String, String>>,
     chat_scroll_states: Local<'s, HashMap<String, ChatScrollState>>,
@@ -1178,6 +1302,7 @@ pub struct UiSystemLocals<'w, 's> {
         ),
         Without<VoxelPlayerStandee>,
     >,
+    primary_window: Query<'w, 's, &'static mut Window, With<PrimaryWindow>>,
 }
 
 #[derive(SystemParam)]
@@ -16770,7 +16895,8 @@ pub fn ui_system(
     mut backup_ui: BackupUiParam,
 ) {
     let has_run_once: &mut Local<bool> = &mut locals.has_run_once;
-    let main_view_fullscreen: &mut Local<bool> = &mut locals.main_view_fullscreen;
+    let main_view_fullscreen: &mut Local<MainViewFullscreenState> =
+        &mut locals.main_view_fullscreen;
     let new_chat_group_modal_string_open: &mut Local<(String, bool)> =
         &mut locals.new_chat_group_modal_string_open;
     let chat_input_msgs: &mut Local<HashMap<String, String>> = &mut locals.chat_input_msgs;
@@ -16815,6 +16941,7 @@ pub fn ui_system(
     let summon_standee_store = &mut locals.summon_standee_store;
     let player_standees = &locals.player_standees;
     let teleport_spaceships = &locals.teleport_spaceships;
+    let primary_window = &mut locals.primary_window;
 
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -17015,7 +17142,29 @@ pub fn ui_system(
         egui::Key::F,
     );
     if ctx.input_mut(|input| input.consume_shortcut(&fullscreen_shortcut)) {
-        **main_view_fullscreen = !**main_view_fullscreen;
+        if let Ok(mut window) = primary_window.single_mut() {
+            toggle_main_view_fullscreen(main_view_fullscreen, Some(&mut window));
+        } else {
+            toggle_main_view_fullscreen(main_view_fullscreen, None);
+        }
+    }
+    let viewport_rect = ctx.viewport_rect();
+    let panel_visibility = auto_hide_panel_visibility(
+        main_view_fullscreen,
+        ctx.input(|input| input.pointer.hover_pos()),
+        viewport_rect,
+    );
+    if !panel_visibility.top {
+        main_view_fullscreen.top_rect = None;
+    }
+    if !panel_visibility.right {
+        main_view_fullscreen.right_rect = None;
+    }
+    if !panel_visibility.bottom {
+        main_view_fullscreen.bottom_rect = None;
+    }
+    if !panel_visibility.left {
+        main_view_fullscreen.left_rect = None;
     }
 
     let summary_markers_changed = sync_summarized_message_counts(&mut manager, &deepseek_manager);
@@ -17025,10 +17174,17 @@ pub fn ui_system(
         }
     }
 
-    if !**main_view_fullscreen {
-        egui::Panel::top("top_panel")
+    if panel_visibility.top {
+        let mut overlay_ui = main_view_fullscreen
+            .active
+            .then(|| auto_hide_overlay_ui(ctx, viewport_rect, "top"));
+        let panel_ui = match overlay_ui.as_mut() {
+            Some(ui) => ui,
+            None => &mut viewport_ui,
+        };
+        let top_panel = egui::Panel::top("top_panel")
             .resizable(false)
-            .show(&mut viewport_ui, |ui| {
+            .show(panel_ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     file_menu_button(
                         ui,
@@ -17043,10 +17199,20 @@ pub fn ui_system(
                     pool_menu_button(ui, &manager, trpg_group_settings);
                 });
             });
+        main_view_fullscreen.top_rect = Some(top_panel.response.rect);
+    }
 
-        egui::Panel::right("right_panel")
+    if panel_visibility.right {
+        let mut overlay_ui = main_view_fullscreen
+            .active
+            .then(|| auto_hide_overlay_ui(ctx, viewport_rect, "right"));
+        let panel_ui = match overlay_ui.as_mut() {
+            Some(ui) => ui,
+            None => &mut viewport_ui,
+        };
+        let right_panel = egui::Panel::right("right_panel")
             .resizable(true)
-            .show(&mut viewport_ui, |ui| {
+            .show(panel_ui, |ui| {
                 if napcat_sender.is_none() {
                     ui.label("NapCat websocket未连接");
                 }
@@ -17056,12 +17222,22 @@ pub fn ui_system(
 
                 summary_panel(ui, &manager, &deepseek_manager);
             });
+        main_view_fullscreen.right_rect = Some(right_panel.response.rect);
+    }
 
-        egui::Panel::left("chat_list_panel")
+    if panel_visibility.left {
+        let mut overlay_ui = main_view_fullscreen
+            .active
+            .then(|| auto_hide_overlay_ui(ctx, viewport_rect, "left"));
+        let panel_ui = match overlay_ui.as_mut() {
+            Some(ui) => ui,
+            None => &mut viewport_ui,
+        };
+        let left_panel = egui::Panel::left("chat_list_panel")
             .resizable(true)
             .default_size(220.0)
             .size_range(160.0..=340.0)
-            .show(&mut viewport_ui, |ui| {
+            .show(panel_ui, |ui| {
                 chat_list_panel(
                     ui,
                     ctx,
@@ -17072,6 +17248,7 @@ pub fn ui_system(
                     trpg_group_settings,
                 );
             });
+        main_view_fullscreen.left_rect = Some(left_panel.response.rect);
     }
 
     egui::CentralPanel::default()
@@ -17080,27 +17257,35 @@ pub fn ui_system(
             let viewport = ui.max_rect();
             let pixels_per_point = ctx.pixels_per_point();
 
-            let toolbar = egui::Frame::new()
-                .fill(egui::Color32::from_black_alpha(210))
-                .corner_radius(4)
-                .inner_margin(6)
-                .show(ui, |ui| {
+            let toolbar_bottom = if panel_visibility.top {
+                let toolbar = egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(210))
+                    .corner_radius(4)
+                    .inner_margin(6)
+                    .show(ui, |ui| {
                     let mode_before_toolbar = voxel_editor.mode;
                     ui.horizontal_wrapped(|ui| {
-                        let fullscreen_label = if **main_view_fullscreen {
-                            "退出主视图全屏"
+                        let fullscreen_label = if main_view_fullscreen.active {
+                            "退出全屏"
                         } else {
-                            "主视图全屏"
+                            "全屏"
                         };
                         if ui
                             .button(fullscreen_label)
                             .on_hover_text(format!(
-                                "自动隐藏或恢复周围面板（{}）",
+                                "切换全屏；全屏时把鼠标移到屏幕边缘可显示面板（{}）",
                                 ui.ctx().format_shortcut(&fullscreen_shortcut)
                             ))
                             .clicked()
                         {
-                            **main_view_fullscreen = !**main_view_fullscreen;
+                            if let Ok(mut window) = primary_window.single_mut() {
+                                toggle_main_view_fullscreen(
+                                    main_view_fullscreen,
+                                    Some(&mut window),
+                                );
+                            } else {
+                                toggle_main_view_fullscreen(main_view_fullscreen, None);
+                            }
                         }
                         ui.separator();
                         ui.selectable_value(
@@ -17483,6 +17668,16 @@ pub fn ui_system(
                         });
                     }
                 });
+                let toolbar_rect = toolbar.response.rect;
+                main_view_fullscreen.top_rect = Some(
+                    main_view_fullscreen
+                        .top_rect
+                        .map_or(toolbar_rect, |rect| rect.union(toolbar_rect)),
+                );
+                toolbar_rect.max.y
+            } else {
+                viewport.min.y
+            };
             voxel_editor.set_viewport_bounds(
                 bevy::prelude::Vec2::new(
                     viewport.min.x * pixels_per_point,
@@ -17492,12 +17687,12 @@ pub fn ui_system(
                     viewport.max.x * pixels_per_point,
                     viewport.max.y * pixels_per_point,
                 ),
-                toolbar.response.rect.max.y * pixels_per_point,
+                toolbar_bottom * pixels_per_point,
             );
 
             if let Some(possessed_user_id) = voxel_possession.active_user_id {
                 voxel_editor.creative_inventory_open = false;
-                if voxel_targeting_preview.show_affected_players {
+                if panel_visibility.bottom && voxel_targeting_preview.show_affected_players {
                     let affected_names = voxel_targeting_preview
                         .affected_user_ids
                         .iter()
@@ -17530,51 +17725,54 @@ pub fn ui_system(
                         });
                 }
                 let mut release_control_requested = false;
-                egui::Area::new(egui::Id::new("voxel_player_hotbar"))
-                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
-                    .order(egui::Order::Foreground)
-                    .show(ctx, |ui| {
-                        egui::Frame::new()
-                            .fill(egui::Color32::from_black_alpha(210))
-                            .corner_radius(4)
-                            .inner_margin(4)
-                            .show(ui, |ui| {
-                                if let Some(character) = manager
-                                    .player_characters
-                                    .get(&possessed_user_id.to_string())
-                                {
-                                    ui.horizontal(|ui| {
-                                        for (slot, entry) in
-                                            character.inventory.hotbar.iter().enumerate()
-                                        {
-                                            let full_label =
-                                                character_hotbar_slot_label(*entry, character);
-                                            let short_label =
-                                                character_hotbar_slot_short_label(*entry, character);
-                                            let selected =
-                                                voxel_possession.selected_hotbar_slot == slot;
-                                            let response = ui.add_sized(
-                                                [62.0, 44.0],
-                                                egui::Button::new(format!(
-                                                    "{}\n{}",
-                                                    slot + 1,
-                                                    short_label
-                                                ))
-                                                .selected(selected),
-                                            );
-                                            if response.on_hover_text(full_label).clicked() {
-                                                voxel_possession.selected_hotbar_slot = slot;
-                                                release_control_requested =
-                                                    *entry
+                if panel_visibility.bottom {
+                    let hotbar_area = egui::Area::new(egui::Id::new("voxel_player_hotbar"))
+                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| {
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_black_alpha(210))
+                                .corner_radius(4)
+                                .inner_margin(4)
+                                .show(ui, |ui| {
+                                    if let Some(character) = manager
+                                        .player_characters
+                                        .get(&possessed_user_id.to_string())
+                                    {
+                                        ui.horizontal(|ui| {
+                                            for (slot, entry) in
+                                                character.inventory.hotbar.iter().enumerate()
+                                            {
+                                                let full_label =
+                                                    character_hotbar_slot_label(*entry, character);
+                                                let short_label = character_hotbar_slot_short_label(
+                                                    *entry, character,
+                                                );
+                                                let selected =
+                                                    voxel_possession.selected_hotbar_slot == slot;
+                                                let response = ui.add_sized(
+                                                    [62.0, 44.0],
+                                                    egui::Button::new(format!(
+                                                        "{}\n{}",
+                                                        slot + 1,
+                                                        short_label
+                                                    ))
+                                                    .selected(selected),
+                                                );
+                                                if response.on_hover_text(full_label).clicked() {
+                                                    voxel_possession.selected_hotbar_slot = slot;
+                                                    release_control_requested = *entry
                                                         == CharacterHotbarSlot::ReleaseControl;
+                                                }
                                             }
-                                        }
-                                    });
-                                } else {
-                                    ui.label("该玩家还没有角色物品栏");
-                                }
-                            });
-                    });
+                                        });
+                                    } else {
+                                        ui.label("该玩家还没有角色物品栏");
+                                    }
+                                });
+                        });
+                    main_view_fullscreen.bottom_rect = Some(hotbar_area.response.rect);
+                }
                 if release_control_requested {
                     voxel_possession.release();
                 }
@@ -17638,19 +17836,20 @@ pub fn ui_system(
             let mut hotbar_drop = None;
             let mut hotbar_clicked = None;
             let mut hotbar_delete = None;
-            let hotbar_area = egui::Area::new(egui::Id::new("voxel_creative_hotbar"))
-                .anchor(
-                    egui::Align2::CENTER_BOTTOM,
-                    egui::vec2(0.0, -12.0),
-                )
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_black_alpha(210))
-                        .corner_radius(4)
-                        .inner_margin(4)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
+            let hotbar_rect = if panel_visibility.bottom {
+                let hotbar_area = egui::Area::new(egui::Id::new("voxel_creative_hotbar"))
+                    .anchor(
+                        egui::Align2::CENTER_BOTTOM,
+                        egui::vec2(0.0, -12.0),
+                    )
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_black_alpha(210))
+                            .corner_radius(4)
+                            .inner_margin(4)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
                                 for slot in 0..voxel_editor.creative_hotbar.len() {
                                     let shortcut = if slot == 9 {
                                         "0".to_owned()
@@ -17695,10 +17894,15 @@ pub fn ui_system(
                                         hotbar_drop = Some((slot, *payload));
                                     }
                                 }
+                                });
                             });
-                        });
-                });
-            let hotbar_rect = hotbar_area.response.rect;
+                    });
+                let hotbar_rect = hotbar_area.response.rect;
+                main_view_fullscreen.bottom_rect = Some(hotbar_rect);
+                hotbar_rect
+            } else {
+                Rect::NOTHING
+            };
 
             let mut inventory_rect = None;
             if voxel_editor.creative_inventory_open {
@@ -18682,6 +18886,51 @@ fn append_local_sent_message_with_images(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fullscreen_panels_reveal_only_at_their_edge_or_while_hovered() {
+        let viewport = Rect::from_min_max(Pos2::ZERO, Pos2::new(1_000.0, 700.0));
+        let mut state = MainViewFullscreenState {
+            active: true,
+            ..Default::default()
+        };
+
+        let center = auto_hide_panel_visibility(&state, Some(Pos2::new(500.0, 350.0)), viewport);
+        assert!(!center.top && !center.right && !center.bottom && !center.left);
+
+        let left_edge =
+            auto_hide_panel_visibility(&state, Some(Pos2::new(2.0, 350.0)), viewport);
+        assert!(left_edge.left);
+        assert!(!left_edge.top && !left_edge.right && !left_edge.bottom);
+
+        state.left_rect = Some(Rect::from_min_max(
+            Pos2::ZERO,
+            Pos2::new(220.0, 700.0),
+        ));
+        let hovered_panel =
+            auto_hide_panel_visibility(&state, Some(Pos2::new(180.0, 350.0)), viewport);
+        assert!(hovered_panel.left);
+    }
+
+    #[test]
+    fn fullscreen_toggle_restores_the_previous_window_mode() {
+        let mut state = MainViewFullscreenState::default();
+        let mut window = Window {
+            mode: WindowMode::Windowed,
+            ..Default::default()
+        };
+
+        toggle_main_view_fullscreen(&mut state, Some(&mut window));
+        assert!(state.active);
+        assert_eq!(
+            window.mode,
+            WindowMode::BorderlessFullscreen(MonitorSelection::Current)
+        );
+
+        toggle_main_view_fullscreen(&mut state, Some(&mut window));
+        assert!(!state.active);
+        assert_eq!(window.mode, WindowMode::Windowed);
+    }
 
     #[test]
     fn position_radio_sync_creates_only_the_five_requested_channels() {
