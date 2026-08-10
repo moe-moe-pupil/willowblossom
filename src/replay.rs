@@ -155,6 +155,7 @@ const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
 const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
 const REPLAY_PLAYING_STATUS: &str = "正在回放；停止后会恢复当前体素场景";
 const REPLAY_SPEECH_PREPARING_STATUS: &str = "正在准备当前台词语音；语音就绪后字幕与声音会同时开始";
+const REPLAY_SPEECH_MAX_WAIT_SECONDS: f32 = 5.0;
 const DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 1.5;
 const MIN_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 0.5;
 const MAX_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 4.0;
@@ -980,6 +981,9 @@ pub(crate) struct ReplayStudio {
     recorded_possession_user_id: Option<u64>,
     recorded_player_movement_index: Option<usize>,
     turn_playback_enabled: bool,
+    speech_wait_cue: Option<(u64, usize)>,
+    speech_wait_elapsed_seconds: f32,
+    speech_bypass_cues: HashSet<(u64, usize)>,
     message_counts: HashMap<String, usize>,
     pending_terrain_changes: Vec<(u64, IVec3, u8)>,
     pending_ship_hull_changes: Vec<(u64, String, IVec3, u8)>,
@@ -1096,7 +1100,10 @@ impl Default for ReplayStudio {
             player_movement_sample_accumulator: 0.0,
             recorded_possession_user_id: None,
             recorded_player_movement_index: None,
-            turn_playback_enabled: true,
+            turn_playback_enabled: false,
+            speech_wait_cue: None,
+            speech_wait_elapsed_seconds: 0.0,
+            speech_bypass_cues: HashSet::new(),
             message_counts: HashMap::new(),
             pending_terrain_changes: Vec::new(),
             pending_ship_hull_changes: Vec::new(),
@@ -1717,6 +1724,23 @@ fn interpolated_ship_pose(
     ))
 }
 
+fn replay_speech_wait_is_blocking(
+    studio: &mut ReplayStudio,
+    cue: (u64, usize),
+    delta_seconds: f32,
+) -> bool {
+    if studio.speech_wait_cue != Some(cue) {
+        studio.speech_wait_cue = Some(cue);
+        studio.speech_wait_elapsed_seconds = 0.0;
+    }
+    studio.speech_wait_elapsed_seconds += delta_seconds.max(0.0);
+    if studio.speech_wait_elapsed_seconds < REPLAY_SPEECH_MAX_WAIT_SECONDS {
+        return true;
+    }
+    studio.speech_bypass_cues.insert(cue);
+    false
+}
+
 fn advance_replay(
     time: Res<Time>,
     speech: Res<PreviewSpeechController>,
@@ -1733,8 +1757,8 @@ fn advance_replay(
     };
     let delta_ms = (time.delta_secs() * studio.playback_speed * 1_000.0).round() as u64;
     let proposed_ms = studio.playback_ms.saturating_add(delta_ms).min(duration_ms);
-    let mut waiting_for_speech = false;
-    let mut waiting_for_audio = false;
+    let mut waiting_for_speech = None;
+    let mut waiting_for_audio = None;
     if studio.speech_enabled && onnx_tts_is_available() {
         if let Some(replay) = studio.replay.as_ref() {
             let current = active_dialogue_index(&replay.dialogue, studio.playback_ms);
@@ -1750,11 +1774,11 @@ fn advance_replay(
                     let signature = replay_voice_signature(replay, studio.speech_volume);
                     let cue = (replay.created_at_unix_ms, index);
                     if !speech.onnx_cue_finished(signature, cue) {
-                        waiting_for_speech = true;
+                        waiting_for_speech = Some(cue);
                     } else if proposed != current
                         && speech.cue_audio_is_pending(cue, &audio_sinks, &audio_players)
                     {
-                        waiting_for_audio = true;
+                        waiting_for_audio = Some(cue);
                     }
                 }
             }
@@ -1766,23 +1790,25 @@ fn advance_replay(
                             signature,
                             (replay.created_at_unix_ms, index),
                         ) {
-                            waiting_for_speech = true;
+                            waiting_for_speech = Some((replay.created_at_unix_ms, index));
                         }
                     }
                 }
             }
         }
     }
-    if waiting_for_speech {
-        studio.status = REPLAY_SPEECH_PREPARING_STATUS.to_owned();
-        return;
-    }
-    if waiting_for_audio {
-        studio.status = REPLAY_PLAYING_STATUS.to_owned();
-        return;
-    }
-    if studio.status == REPLAY_SPEECH_PREPARING_STATUS {
-        studio.status = REPLAY_PLAYING_STATUS.to_owned();
+    if let Some(waiting_cue) = waiting_for_speech.or(waiting_for_audio) {
+        if replay_speech_wait_is_blocking(&mut studio, waiting_cue, time.delta_secs()) {
+            studio.status = REPLAY_SPEECH_PREPARING_STATUS.to_owned();
+            return;
+        }
+        studio.status = "当前台词语音准备超时，已跳过语音并继续回放".to_owned();
+    } else {
+        studio.speech_wait_cue = None;
+        studio.speech_wait_elapsed_seconds = 0.0;
+        if studio.status == REPLAY_SPEECH_PREPARING_STATUS {
+            studio.status = REPLAY_PLAYING_STATUS.to_owned();
+        }
     }
     if studio.turn_playback_enabled {
         if let Some(replay) = studio.replay.as_ref() {
@@ -1864,7 +1890,8 @@ fn preview_replay_speech(
                     .map(|index| (replay.created_at_unix_ms, index))
             })
         })
-        .flatten();
+        .flatten()
+        .filter(|cue| !studio.speech_bypass_cues.contains(cue));
     let cue = active;
     let results = speech
         .onnx_worker
@@ -2090,6 +2117,42 @@ impl PreviewSpeechController {
             .count();
         (ready, failed, total)
     }
+}
+
+fn replay_speech_progress_ui(
+    ui: &mut egui::Ui,
+    studio: &ReplayStudio,
+    speech: &PreviewSpeechController,
+) {
+    let Some(replay) = studio.replay.as_ref() else { return };
+    let (ready, failed, total) = speech.preparation_progress(replay, studio.speech_volume);
+    let generation_active = !speech.generation_cues.is_empty()
+        || speech
+            .pending_generation_lines
+            .iter()
+            .any(|(replay_id, _)| *replay_id == replay.created_at_unix_ms);
+    let processed = ready.saturating_add(failed);
+    let progress = if total == 0 { 1.0 } else { processed as f32 / total as f32 };
+    let text = if !studio.speech_enabled {
+        format!("语音预生成已暂停：{ready}/{total}")
+    } else if !onnx_tts_is_available() {
+        format!("语音预生成不可用：{ready}/{total}")
+    } else if failed > 0 && processed == total {
+        format!("语音预生成完成：成功 {ready}/{total}，失败 {failed}")
+    } else if failed > 0 {
+        format!("正在生成角色语音：成功 {ready}/{total}，失败 {failed}")
+    } else if ready == total {
+        format!("语音缓存已就绪：{ready}/{total}")
+    } else if generation_active || processed < total {
+        format!("正在生成角色语音：{ready}/{total}")
+    } else {
+        format!("语音缓存状态：{ready}/{total}")
+    };
+    ui.add(
+        egui::ProgressBar::new(progress)
+            .desired_width(ui.available_width())
+            .text(text),
+    );
 }
 
 fn onnx_tts_is_available() -> bool {
@@ -3297,6 +3360,7 @@ fn replay_controls(
                 format_time(duration)
             ));
         });
+        replay_speech_progress_ui(ui, studio, speech);
         ui.horizontal(|ui| {
             ui.label("速度");
             for speed in [0.5, 1.0, 2.0, 4.0] {
@@ -3737,37 +3801,7 @@ fn replay_controls(
             );
         }
     });
-    if let Some(replay) = studio.replay.as_ref() {
-        let (ready, failed, total) = speech.preparation_progress(replay, studio.speech_volume);
-        let generation_active = !speech.generation_cues.is_empty()
-            || speech
-                .pending_generation_lines
-                .iter()
-                .any(|(replay_id, _)| *replay_id == replay.created_at_unix_ms);
-        let processed = ready.saturating_add(failed);
-        let progress = if total == 0 { 1.0 } else { processed as f32 / total as f32 };
-        let text = if !studio.speech_enabled {
-            format!("语音预生成已暂停：{ready}/{total}")
-        } else if !onnx_tts_is_available() {
-            format!("语音预生成不可用：{ready}/{total}")
-        } else if failed > 0 && processed == total {
-            format!("语音预生成完成：成功 {ready}/{total}，失败 {failed}")
-        } else if failed > 0 {
-            format!("正在生成角色语音：成功 {ready}/{total}，失败 {failed}")
-        } else if ready == total {
-            format!("语音缓存已就绪：{ready}/{total}")
-        } else if generation_active || processed < total {
-            format!("正在生成角色语音：{ready}/{total}")
-        } else {
-            format!("语音缓存状态：{ready}/{total}")
-        };
-        ui.add(
-            egui::ProgressBar::new(progress)
-                .desired_width(ui.available_width())
-                .text(text),
-        );
-        ui.small("每条台词进入回放后会立即排队生成并缓存角色语音，不需要等待下一条消息或点击播放。预览与 MP4 导出共用缓存。");
-    }
+    ui.small("每条台词进入回放后会立即排队生成并缓存角色语音，不需要等待下一条消息或点击播放。预览与 MP4 导出共用缓存。");
     ui.small("整体语速默认 1.10×，调整语速或单个角色音色时不会改变时间轴。EmotiVoice 使用固定说话人 ID，声音会更机械，但同一玩家跨台词保持一致且生成更快。需要改变字幕、间隔和镜头时长时，请使用“整体台词停留”。预览与导出共用同一条时间线和语音缓存。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
         ui.small(format!(
@@ -4872,6 +4906,9 @@ fn start_playback(
         apply_scene(&mut grid, &scene);
     }
     studio.playback_ms = 0;
+    studio.speech_wait_cue = None;
+    studio.speech_wait_elapsed_seconds = 0.0;
+    studio.speech_bypass_cues.clear();
     studio.mode = ReplayMode::Playing;
     studio.status = REPLAY_PLAYING_STATUS.to_owned();
 }
@@ -5841,6 +5878,9 @@ fn stop_playback(studio: &mut ReplayStudio, grids: &mut Query<&mut Grid<u8>, Wit
         studio.mode = ReplayMode::Idle;
     }
     studio.playback_ms = 0;
+    studio.speech_wait_cue = None;
+    studio.speech_wait_elapsed_seconds = 0.0;
+    studio.speech_bypass_cues.clear();
 }
 
 fn start_video_export(
@@ -7089,7 +7129,12 @@ fn capture_scene(grid: &Grid<u8>) -> ReplayScene {
     ReplayScene { voxels }
 }
 
-fn apply_scene(grid: &mut Mut<Grid<u8>>, scene: &ReplayScene) {
+fn apply_scene(grid: &mut Mut<Grid<u8>>, scene: &ReplayScene) -> usize {
+    let mut target = scene
+        .voxels
+        .iter()
+        .map(|voxel| (IVec3::from_array(voxel.position), voxel.material))
+        .collect::<HashMap<_, _>>();
     let occupied = grid
         .iter()
         .flat_map(|(chunk_position, chunk)| {
@@ -7099,15 +7144,20 @@ fn apply_scene(grid: &mut Mut<Grid<u8>>, scene: &ReplayScene) {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let mut updates = Vec::new();
     for cell in occupied {
-        grid.set(cell, 0);
+        let current = grid.get(cell).copied().unwrap_or_default();
+        let requested = target.remove(&cell).unwrap_or_default();
+        if current != requested {
+            updates.push((cell, requested));
+        }
     }
-    for voxel in &scene.voxels {
-        grid.set(
-            IVec3::from_array(voxel.position),
-            voxel.material,
-        );
+    updates.extend(target.into_iter().filter(|(_, material)| *material != 0));
+    let changed = updates.len();
+    for (cell, material) in updates {
+        grid.set(cell, material);
     }
+    changed
 }
 
 fn camera_keyframe(time_ms: u64, transform: &Transform) -> ReplayCameraKeyframe {
@@ -10151,12 +10201,13 @@ fn replay_dialogue_is_ready_for_display(
     if dialogue_index >= replay.dialogue.len() {
         return false;
     }
+    let cue = (replay.created_at_unix_ms, dialogue_index);
+    if studio.speech_bypass_cues.contains(&cue) {
+        return true;
+    }
     speech.onnx_cue_finished(
         replay_voice_signature(replay, studio.speech_volume),
-        (
-            replay.created_at_unix_ms,
-            dialogue_index,
-        ),
+        cue,
     )
 }
 
@@ -12476,6 +12527,22 @@ mod tests {
     }
 
     #[test]
+    fn speech_wait_watchdog_keeps_replay_from_freezing() {
+        let cue = (7, 0);
+        let mut studio = ReplayStudio::default();
+        assert!(!studio.turn_playback_enabled);
+
+        assert!(replay_speech_wait_is_blocking(&mut studio, cue, 4.9));
+        assert!(!studio.speech_bypass_cues.contains(&cue));
+        assert!(!replay_speech_wait_is_blocking(&mut studio, cue, 0.1));
+        assert!(studio.speech_bypass_cues.contains(&cue));
+
+        let next_cue = (7, 1);
+        assert!(replay_speech_wait_is_blocking(&mut studio, next_cue, 0.1));
+        assert_eq!(studio.speech_wait_cue, Some(next_cue));
+    }
+
+    #[test]
     fn uncached_unqueued_speech_does_not_block_playback() {
         let replay_json = r#"{"format_version":2,"title":"test","campaign_id":"c","created_at_unix_ms":1,"duration_ms":1000,"audience":{"scope":"public"},"scene":{"voxels":[]},"camera":[],"dialogue":[]}"#;
         let mut replay: ReplayFile = serde_json::from_str(replay_json).unwrap();
@@ -13253,6 +13320,47 @@ mod tests {
 
         apply_terrain_changes_at(&mut grid, &mut dirty, &mut state, &changes, 500);
         assert_eq!(grid.get(IVec3::new(1, 0, 0)), Some(&2));
+    }
+
+    #[test]
+    fn applying_replay_scene_only_writes_changed_voxels() {
+        let mut world = World::new();
+        let entity = world.spawn(Grid::<u8>::new()).id();
+        let mut entity_mut = world.entity_mut(entity);
+        let mut grid = entity_mut.get_mut::<Grid<u8>>().unwrap();
+        grid.set(IVec3::ZERO, 1);
+        grid.set(IVec3::X, 2);
+
+        let identical = ReplayScene {
+            voxels: vec![
+                ReplayVoxel {
+                    position: IVec3::ZERO.to_array(),
+                    material: 1,
+                },
+                ReplayVoxel {
+                    position: IVec3::X.to_array(),
+                    material: 2,
+                },
+            ],
+        };
+        assert_eq!(apply_scene(&mut grid, &identical), 0);
+
+        let changed = ReplayScene {
+            voxels: vec![
+                ReplayVoxel {
+                    position: IVec3::ZERO.to_array(),
+                    material: 3,
+                },
+                ReplayVoxel {
+                    position: IVec3::Y.to_array(),
+                    material: 4,
+                },
+            ],
+        };
+        assert_eq!(apply_scene(&mut grid, &changed), 3);
+        assert_eq!(grid.get(IVec3::ZERO), Some(&3));
+        assert_eq!(grid.get(IVec3::X), Some(&0));
+        assert_eq!(grid.get(IVec3::Y), Some(&4));
     }
 
     #[test]
