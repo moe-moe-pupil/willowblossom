@@ -52,8 +52,8 @@ use bevy_persistent::{
     Persistent,
     StorageFormat,
 };
-use ime::*;
 use chat_analytics::show_chat_analytics_window;
+use ime::*;
 use rand::RngExt;
 use serde::{
     Deserialize,
@@ -61,15 +61,16 @@ use serde::{
 };
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use crate::backup::{
+use crate::{
+    backup::{
     list_backups,
     restore_backup,
     BackupSettings,
     BackupState,
     BACKUP_ROOT,
     DATA_DIR,
-};
-use crate::voxel::{
+    },
+    voxel::{
     clear_campaign_possession_movement,
     clear_player_camera,
     clear_player_possession_movement,
@@ -80,6 +81,7 @@ use crate::voxel::{
     remove_voxel_summon_standee,
     remove_voxel_summon_standees_for_owner,
     remove_voxel_unit_standee,
+        remove_voxel_unit_standees_for_template,
     validate_voxel_standee_image_source,
     voxel_spaceship_contains_position,
     voxel_spaceship_teleport_destination,
@@ -103,16 +105,12 @@ use crate::voxel::{
     VoxelUnitStandeeStore,
     MAX_VOXEL_BRUSH_RADIUS,
     VOXEL_GLASS_MATERIAL,
+    },
 };
 
 const CHAT_WINDOW_SIZE: Vec2 = Vec2::new(360.0, 520.0);
-const POSITION_RADIO_PARTIES: [&str; 5] = [
-    "狂妄号",
-    "废弃空间站",
-    "女皇号",
-    "kyo空间站",
-    "女仲裁者号",
-];
+const POSITION_RADIO_PARTIES: [&str; 5] =
+    ["狂妄号", "废弃空间站", "女皇号", "kyo空间站", "女仲裁者号"];
 const CHAT_WINDOW_MIN_SIZE: Vec2 = Vec2::new(260.0, 260.0);
 const CHAT_WINDOW_MAX_HEIGHT: f32 = 720.0;
 const GROUP_CHAT_MAX_HEIGHT: f32 = 720.0;
@@ -794,6 +792,13 @@ use crate::{
         DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS,
         DEEPSEEK_SUMMARY_EXPORT_VERSION,
     },
+    hidden_roles::{
+        advance_hidden_roles_for_world_turn,
+        hidden_role_stage_summary,
+        HiddenRoleKind,
+        HiddenRoleState,
+        MutantEvolutionPath,
+    },
     napcat::{
         adjust_character_status_points,
         advance_character_redeemed_craft_cooldowns,
@@ -1014,6 +1019,7 @@ pub(crate) struct TrpgGroupSettingsState {
     legacy_negative_status: HashMap<String, String>,
     legacy_area_marker_status: HashMap<String, String>,
     unit_pool_scene_status: HashMap<String, String>,
+    unit_instance_battle_encounter: HashMap<String, String>,
     open_legacy_send_pane_windows: HashSet<(String, String)>,
     open_legacy_team_chat_windows: HashSet<(String, String)>,
     random_pool_entry_drafts: HashMap<String, RandomPoolEntry>,
@@ -1248,9 +1254,7 @@ fn weave_direction_screen_vector(direction: &str) -> Vec2 {
 
 /// World XZ facing converted to an egui screen direction. The map renders
 /// +Z (北) upward, so a northward facing (0, 1) points up on screen.
-fn map_facing_screen_vector(facing: Vec2) -> Vec2 {
-    Vec2::new(facing.x, -facing.y)
-}
+fn map_facing_screen_vector(facing: Vec2) -> Vec2 { Vec2::new(facing.x, -facing.y) }
 
 fn draw_weave_overlay(painter: &Painter, rect: Rect, manager: &NapcatMessageManager) {
     let campaign_id = manager
@@ -1262,15 +1266,11 @@ fn draw_weave_overlay(painter: &Painter, rect: Rect, manager: &NapcatMessageMana
 
     // Faint lattice spokes along every compass direction.
     for index in 0..8 {
-        let radians = -std::f32::consts::FRAC_PI_2
-            + index as f32 * std::f32::consts::FRAC_PI_4;
+        let radians = -std::f32::consts::FRAC_PI_2 + index as f32 * std::f32::consts::FRAC_PI_4;
         let direction = egui::vec2(radians.cos(), -radians.sin());
         let radius = rect.width().min(rect.height()) * 0.48;
         painter.line_segment(
-            [
-                center,
-                center + direction * radius,
-            ],
+            [center, center + direction * radius],
             Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(120, 90, 255, 24),
@@ -1279,8 +1279,7 @@ fn draw_weave_overlay(painter: &Painter, rect: Rect, manager: &NapcatMessageMana
     }
 
     let strongest = weave_direction_screen_vector(weave.strongest_direction);
-    let arrow_length =
-        rect.width().min(rect.height()) * (0.20 + 0.16 * concentration);
+    let arrow_length = rect.width().min(rect.height()) * (0.20 + 0.16 * concentration);
     let arrow_end = center + strongest * arrow_length;
     let arrow_color = egui::Color32::from_rgb(178, 138, 255);
     painter.line_segment(
@@ -1298,8 +1297,7 @@ fn draw_weave_overlay(painter: &Painter, rect: Rect, manager: &NapcatMessageMana
         Stroke::new(3.0, arrow_color),
     );
     painter.circle_filled(center, 4.0, arrow_color);
-    let ring_radius =
-        rect.width().min(rect.height()) * (0.18 + 0.22 * concentration);
+    let ring_radius = rect.width().min(rect.height()) * (0.18 + 0.22 * concentration);
     painter.circle_stroke(
         center,
         ring_radius,
@@ -1312,7 +1310,10 @@ fn draw_weave_overlay(painter: &Painter, rect: Rect, manager: &NapcatMessageMana
     painter.text(
         center + egui::vec2(0.0, 26.0),
         egui::Align2::CENTER_CENTER,
-        format!("最强魔网节点：{}", weave.strongest_direction),
+        format!(
+            "最强魔网节点：{}",
+            weave.strongest_direction
+        ),
         egui::FontId::proportional(14.0),
         egui::Color32::WHITE,
     );
@@ -1418,8 +1419,8 @@ fn voxel_map_ui(
                     continue;
                 }
                 let density = (tile.voxel_count as f32).ln_1p().min(6.0) / 6.0;
-                let color = voxel_map_material_color(tile.material)
-                    .gamma_multiply(0.55 + density * 0.45);
+                let color =
+                    voxel_map_material_color(tile.material).gamma_multiply(0.55 + density * 0.45);
                 painter.rect_filled(
                     Rect::from_two_pos(
                         world_to_screen(fraction_min),
@@ -1479,8 +1480,7 @@ fn voxel_map_ui(
                 world_to_screen(Vec2::new(fraction.x, fraction.y))
             };
             let user_id = target_id.parse::<u64>().ok();
-            let anonymized =
-                user_id.is_some_and(|id| state.anonymized_players.contains(&id));
+            let anonymized = user_id.is_some_and(|id| state.anonymized_players.contains(&id));
             let name = if anonymized {
                 "匿名玩家".to_owned()
             } else {
@@ -1519,7 +1519,9 @@ fn voxel_map_ui(
                 bevy::prelude::Vec2::ZERO,
                 bevy::prelude::Vec2::ONE,
             );
-            Some(world_to_screen(Vec2::new(clamped.x, clamped.y)))
+            Some(world_to_screen(Vec2::new(
+                clamped.x, clamped.y,
+            )))
         } else if fraction.x < view_min.x
             || fraction.x > view_max.x
             || fraction.y < view_min.y
@@ -1527,14 +1529,18 @@ fn voxel_map_ui(
         {
             None
         } else {
-            Some(world_to_screen(Vec2::new(fraction.x, fraction.y)))
+            Some(world_to_screen(Vec2::new(
+                fraction.x, fraction.y,
+            )))
         }
     });
     if let Some(point) = gm_point {
         let gm_color = egui::Color32::from_rgb(240, 240, 240);
         let arrow_color = egui::Color32::from_rgb(90, 220, 255);
-        let facing_screen =
-            map_facing_screen_vector(Vec2::new(gm_state.facing.x, gm_state.facing.y));
+        let facing_screen = map_facing_screen_vector(Vec2::new(
+            gm_state.facing.x,
+            gm_state.facing.y,
+        ));
         let arrow_end = point + facing_screen * 20.0;
         let perpendicular = egui::vec2(-facing_screen.y, facing_screen.x);
         let head_back = arrow_end - facing_screen * 7.0;
@@ -1581,14 +1587,16 @@ fn voxel_map_ui(
             north_anchor + egui::vec2(0.0, 6.0),
             north_anchor + egui::vec2(0.0, 1.0),
         ],
-        Stroke::new(1.5, egui::Color32::from_white_alpha(140)),
+        Stroke::new(
+            1.5,
+            egui::Color32::from_white_alpha(140),
+        ),
     );
 
     if zoomable && response.hovered() {
         let scroll = ui.input(|input| input.smooth_scroll_delta.y);
         if scroll != 0.0 {
-            let new_zoom = (state.zoom
-                * VOXEL_MAP_SCROLL_ZOOM_FACTOR.powf(scroll / 120.0))
+            let new_zoom = (state.zoom * VOXEL_MAP_SCROLL_ZOOM_FACTOR.powf(scroll / 120.0))
                 .clamp(1.0, VOXEL_MAP_MAX_ZOOM);
             if (new_zoom - state.zoom).abs() > f32::EPSILON {
                 if let Some(pointer) = response.hover_pos() {
@@ -1608,8 +1616,7 @@ fn voxel_map_ui(
         if let Some(pointer) = response.interact_pointer_pos() {
             let fraction = screen_to_world(pointer);
             let (x, z) = snapshot.tile_indices(bevy::prelude::Vec2::new(
-                fraction.x,
-                fraction.y,
+                fraction.x, fraction.y,
             ));
             state.context_cell = snapshot.nearest_cell(x, z);
             state.context_player = player_points
@@ -1639,11 +1646,7 @@ fn voxel_map_ui(
                 ui.close();
             }
             if ui
-                .button(if anonymized {
-                    "取消匿名"
-                } else {
-                    "匿名玩家"
-                })
+                .button(if anonymized { "取消匿名" } else { "匿名玩家" })
                 .clicked()
             {
                 if anonymized {
@@ -1898,6 +1901,7 @@ fn pool_management_window(
     deepseek_manager: &mut DeepseekManager,
     ime: &mut ImeManager,
     unit_standee_store: &mut Persistent<VoxelUnitStandeeStore>,
+    mut battle_store: Option<&mut Persistent<BattleRoundStore>>,
     voxel_editor: &VoxelEditorState,
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
 ) {
@@ -1937,7 +1941,11 @@ fn pool_management_window(
                 ui.selectable_value(
                     &mut state.pool_window_tab,
                     PoolWindowTab::Unit,
-                    format!("单位池 ({})", manager.unit_pool.len()),
+                    format!(
+                        "单位池 (模板 {} / NPC {})",
+                        manager.unit_pool.len(),
+                        manager.unit_instances.len()
+                    ),
                 );
                 ui.selectable_value(
                     &mut state.pool_window_tab,
@@ -1999,6 +2007,7 @@ fn pool_management_window(
                             state,
                             &player_targets,
                             unit_standee_store,
+                            battle_store.as_deref_mut(),
                             voxel_editor,
                             scene_store.as_deref_mut(),
                         )
@@ -2649,8 +2658,14 @@ fn chat_window(
                     },
                 );
             });
-            if let Some((group_name, world_turn, world_time_minutes, turns_passed, acted, skipped)) =
-                trpg_turn_snapshot.as_ref()
+            if let Some((
+                group_name,
+                world_turn,
+                world_time_minutes,
+                turns_passed,
+                acted,
+                skipped,
+            )) = trpg_turn_snapshot.as_ref()
             {
                 ui.horizontal_wrapped(|ui| {
                     let status = if *acted {
@@ -2665,7 +2680,9 @@ fn chat_window(
                         world_time_minutes % 60,
                     );
                     ui.small(format!("世界轮次 {world_turn}"));
-                    ui.small(format!("世界时间 {hour:02}:{minute:02}"));
+                    ui.small(format!(
+                        "世界时间 {hour:02}:{minute:02}"
+                    ));
                     ui.small(format!("玩家轮次 {turns_passed}"));
                     ui.small(status);
 
@@ -2866,10 +2883,10 @@ fn chat_window(
             || response.response.drag_stopped();
 
         if window_drag_stopped
-            && manager.set_chat_window_position(
-                target_id,
-                [response.response.rect.left(), response.response.rect.top()],
-            )
+            && manager.set_chat_window_position(target_id, [
+                response.response.rect.left(),
+                response.response.rect.top(),
+            ])
         {
             manager.persist().ok();
         }
@@ -3323,7 +3340,10 @@ fn group_broadcast_input_ui(
 }
 
 fn trpg_group_global_chat_window_id(group_name: &str) -> Id {
-    Id::new(("trpg_group_global_chat_window", group_name))
+    Id::new((
+        "trpg_group_global_chat_window",
+        group_name,
+    ))
 }
 
 fn trpg_group_global_chat_input_id(group_name: &str) -> String {
@@ -3357,9 +3377,10 @@ fn trpg_group_global_chat_windows(
         let recipient_names = targets
             .iter()
             .filter_map(|target| match target {
-                NapcatSendTarget::Private(user_id) => {
-                    Some(target_display_name(manager, &user_id.to_string()))
-                },
+                NapcatSendTarget::Private(user_id) => Some(target_display_name(
+                    manager,
+                    &user_id.to_string(),
+                )),
                 NapcatSendTarget::Group(_) => None,
             })
             .collect::<Vec<_>>();
@@ -3368,16 +3389,24 @@ fn trpg_group_global_chat_windows(
         let mut open = true;
 
         egui::Window::new(format!("全员私聊 · {group_name}"))
-            .id(trpg_group_global_chat_window_id(&group_name))
+            .id(trpg_group_global_chat_window_id(
+                &group_name,
+            ))
             .open(&mut open)
             .default_size(Vec2::new(420.0, 260.0))
             .min_size(Vec2::new(320.0, 200.0))
             .show(ctx, |ui| {
-                ui.label(format!("将分别私聊发送给 {} 名玩家", targets.len()));
+                ui.label(format!(
+                    "将分别私聊发送给 {} 名玩家",
+                    targets.len()
+                ));
                 if recipient_names.is_empty() {
                     ui.small("当前TRPG组里没有可发送的私聊玩家。");
                 } else {
-                    ui.small(format!("收件人：{}", recipient_names.join("、")));
+                    ui.small(format!(
+                        "收件人：{}",
+                        recipient_names.join("、")
+                    ));
                 }
                 ui.small("玩家回复仍只会显示在各自的私聊窗口，不会互相公开。");
                 ui.separator();
@@ -4618,17 +4647,9 @@ fn paint_unread_badge(ctx: &Context, window_rect: Rect, unread_count: usize) {
 }
 
 fn paint_chat_list_unread_badge(ui: &mut Ui, unread_count: usize) {
-    let badge_text = if unread_count > 99 {
-        "99+".to_owned()
-    } else {
-        unread_count.to_string()
-    };
+    let badge_text = if unread_count > 99 { "99+".to_owned() } else { unread_count.to_string() };
     let badge_size = egui::vec2(
-        if unread_count > 99 {
-            30.0
-        } else {
-            18.0
-        },
+        if unread_count > 99 { 30.0 } else { 18.0 },
         18.0,
     );
     let (rect, _) = ui.allocate_exact_size(badge_size, Sense::hover());
@@ -5420,8 +5441,7 @@ fn chat_list_target_view(
         },
     };
 
-    let creation_incomplete = manager.chat_target_kind(target_id)
-        == ChatTargetExportKind::Private
+    let creation_incomplete = manager.chat_target_kind(target_id) == ChatTargetExportKind::Private
         && manager
             .player_characters
             .get(target_id)
@@ -5880,7 +5900,7 @@ fn summon_panel_ui(
                         ui.small("召唤物立牌已在场景中（图片修改自动同步）");
                         if ui
                             .button("重新放置")
-                            .on_hover_text("把召唤物立牌移动到当前GM视野焦点")
+                            .on_hover_text("把召唤物立牌移动到GM所在位置")
                             .clicked()
                         {
                             let status = match validate_voxel_standee_image_source(&image_source)
@@ -5894,7 +5914,7 @@ fn summon_panel_ui(
                                 })
                             {
                                 Ok(_) => match summon_standee_store.persist() {
-                                    Ok(()) => "已把召唤物立牌重新放到当前GM视野焦点".to_owned(),
+                                    Ok(()) => "已把召唤物立牌重新放到GM所在位置".to_owned(),
                                     Err(err) => format!("召唤物立牌保存失败：{err}"),
                                 },
                                 Err(err) => format!("召唤物立牌失败：{err}"),
@@ -5905,7 +5925,7 @@ fn summon_panel_ui(
                         }
                     } else if ui
                         .add_enabled(!image_source.is_empty(), egui::Button::new("创建立牌"))
-                        .on_hover_text("在当前GM视野焦点创建召唤物立牌")
+                        .on_hover_text("在GM所在位置创建召唤物立牌")
                         .on_disabled_hover_text("召唤物还没有立牌图片")
                         .clicked()
                     {
@@ -5922,7 +5942,7 @@ fn summon_panel_ui(
                             Ok(scene_changed) => match summon_standee_store.persist() {
                                 Ok(()) => {
                                     if scene_changed {
-                                        "已在当前GM视野焦点创建召唤物立牌".to_owned()
+                                        "已在GM所在位置创建召唤物立牌".to_owned()
                                     } else {
                                         "召唤物立牌已在场景中".to_owned()
                                     }
@@ -6058,8 +6078,10 @@ fn quick_character_windows(
         let mut open = true;
         let mut changed = false;
         let mut cast_action = None;
-        let portrait_options =
-            crate::napcat::player_portrait_transform_options(&manager.player_characters, &target_id);
+        let portrait_options = crate::napcat::player_portrait_transform_options(
+            &manager.player_characters,
+            &target_id,
+        );
         let window_max_width = ctx
             .content_rect()
             .width()
@@ -6084,6 +6106,12 @@ fn quick_character_windows(
                     ui.small("玩家");
                     ui.monospace(&target_id);
                 });
+                changed |= hidden_role_editor_ui(
+                    ui,
+                    &target_id,
+                    &mut manager.hidden_roles,
+                );
+                ui.separator();
                 let skill_pool_snapshot = manager.skill_pool.clone();
                 let item_pool_snapshot = manager.item_pool.clone();
                 let stat_config = manager.character_stat_config_for_target(&target_id);
@@ -7192,7 +7220,10 @@ fn portrait_transform_editor_ui(
     ui.horizontal_wrapped(|ui| {
         ui.label(label);
         egui::ComboBox::from_id_salt(id_salt)
-            .selected_text(portrait_transform_label(transform, portrait_options))
+            .selected_text(portrait_transform_label(
+                transform,
+                portrait_options,
+            ))
             .show_ui(ui, |ui| {
                 if ui
                     .selectable_label(transform.is_none(), "原立绘")
@@ -7228,14 +7259,196 @@ fn portrait_transform_editor_ui(
                         .clicked()
                     {
                         *transform =
-                            Some(crate::napcat::PortraitTransform::OtherPlayer(
-                                option_id.clone(),
-                            ));
+                            Some(crate::napcat::PortraitTransform::OtherPlayer(option_id.clone()));
                         changed = true;
                     }
                 }
             });
     });
+    changed
+}
+
+fn hidden_role_editor_ui(
+    ui: &mut Ui,
+    target_id: &str,
+    hidden_roles: &mut HashMap<String, HiddenRoleState>,
+) -> bool {
+    let previous_role = hidden_roles.get(target_id).map(|state| state.role);
+    let mut selected_role = previous_role;
+    ui.horizontal(|ui| {
+        ui.strong("GM隐藏身份");
+        egui::ComboBox::from_id_salt(("hidden_role_kind", target_id))
+            .selected_text(
+                selected_role
+                    .map(HiddenRoleKind::label)
+                    .unwrap_or("无隐藏身份"),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut selected_role, None, "无隐藏身份");
+                for role in HiddenRoleKind::ALL {
+                    ui.selectable_value(
+                        &mut selected_role,
+                        Some(role),
+                        role.label(),
+                    );
+                }
+            });
+    });
+    let mut changed = false;
+    if selected_role != previous_role {
+        match selected_role {
+            Some(role) => {
+                hidden_roles.insert(
+                    target_id.to_owned(),
+                    HiddenRoleState::new(role),
+                );
+            },
+            None => {
+                hidden_roles.remove(target_id);
+            },
+        }
+        changed = true;
+    }
+    let Some(state) = hidden_roles.get_mut(target_id) else {
+        return changed;
+    };
+    state.normalize();
+    ui.colored_label(
+        egui::Color32::YELLOW,
+        "仅GM可见；不会出现在玩家状态、已兑换或总结上下文中。",
+    );
+    ui.label(hidden_role_stage_summary(state));
+    ui.horizontal(|ui| {
+        ui.label(format!("阶段 {}", state.stage));
+        ui.label(format!(
+            "进化点/生物质 {}",
+            state.evolution_points
+                            ));
+        if let Some(threshold) = state.next_threshold() {
+            ui.label(format!("下一阶段阈值 {threshold}"));
+        } else {
+            ui.label("已达最终阶段");
+        }
+    });
+    ui.horizontal(|ui| {
+        changed |= ui
+            .checkbox(
+                &mut state.protective_suit_worn,
+                "穿戴防护服",
+            )
+            .changed();
+        if state.protective_suit_destroyed {
+            ui.colored_label(egui::Color32::LIGHT_RED, "防护服已毁");
+        }
+        if ui.button("脱下（耗1回合）").clicked() {
+            changed |= state.remove_protective_suit();
+        }
+    });
+
+    match state.role {
+        HiddenRoleKind::Alien => {
+            ui.horizontal(|ui| {
+                if !state.transformed && ui.button("变身").clicked() {
+                    changed |= state.transform();
+                }
+                if state.transformed && !state.is_cocooning() && ui.button("恢复伪装").clicked()
+                {
+                    changed |= state.revert_form();
+                }
+                if ui.button("+1进化点").clicked() {
+                    state.evolution_points = state.evolution_points.saturating_add(1);
+                    state.last_event = "GM给予1进化点".to_owned();
+                        changed = true;
+                    }
+                if state.can_begin_cocoon() && ui.button("开始结茧").clicked() {
+                    changed |= state.begin_cocoon();
+                }
+            });
+            if state.is_cocooning() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        format!(
+                            "结茧中：{:.0} HP / 剩余{}回合",
+                            state.cocoon_hp, state.cocoon_turns_remaining
+                        ),
+                    );
+                    if ui.button("茧受5伤").clicked() {
+                        changed |= state.damage_cocoon(5.0);
+                    }
+                    if ui.button("茧受10伤").clicked() {
+                        changed |= state.damage_cocoon(10.0);
+                    }
+                    if ui.button("打断进化").clicked() {
+                        changed |= state.interrupt_cocoon("进化被打断");
+                    }
+                });
+            }
+        },
+        HiddenRoleKind::Mutant => {
+            ui.horizontal(|ui| {
+                if state.stage >= 2 && !state.transformed && ui.button("变身").clicked() {
+                    changed |= state.transform();
+                }
+                if state.transformed && ui.button("恢复伪装").clicked() {
+                    changed |= state.revert_form();
+                }
+                egui::ComboBox::from_id_salt(("mutant_path", target_id))
+                    .selected_text(
+                        state
+                            .mutant_path
+                            .map(MutantEvolutionPath::label)
+                            .unwrap_or("选择3阶段方向"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for path in MutantEvolutionPath::ALL {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut state.mutant_path,
+                                    Some(path),
+                                    path.label(),
+                                )
+                                .changed();
+                }
+            });
+    });
+            ui.horizontal(|ui| {
+                ui.label("记录吞噬尸体：");
+                for (label, biomass) in [("小型+1", 1), ("人形+2", 2), ("大型+3", 3)] {
+                    if ui.button(label).clicked() {
+                        changed |= if state.protective_suit_worn {
+                            state.force_consume_through_suit(biomass)
+                        } else {
+                            state.consume_corpse(biomass)
+                        };
+                    }
+                }
+                changed |= state.apply_automatic_mutant_evolution();
+            });
+        },
+        HiddenRoleKind::Android => {
+            if ui
+                .checkbox(
+                    &mut state.android_gear_obtained,
+                    "已在女皇号取得公司装备",
+                )
+                .changed()
+            {
+                state.last_event = if state.android_gear_obtained {
+                    "已取得公司装备，战斗配置启用".to_owned()
+                } else {
+                    "公司装备已移除".to_owned()
+                };
+                changed = true;
+            }
+        },
+    }
+    if !state.last_event.is_empty() {
+        ui.small(format!(
+            "最近事件：{}",
+            state.last_event
+        ));
+    }
     changed
 }
 
@@ -8860,7 +9073,10 @@ fn status_source_value_ui(
         .changed();
     ui.label((*creation + *draft_gm).to_string());
     ui.end_row();
-    (creation_changed || draft_changed, creation_delta)
+    (
+        creation_changed || draft_changed,
+        creation_delta,
+    )
 }
 
 fn format_signed_status(value: i32) -> String {
@@ -9888,11 +10104,11 @@ pub(crate) fn character_speed_reduction_multiplier(
         match effect.value {
             BuffValue::AddPercent(percent) if percent < 0.0 => {
                 multiplier *= 1.0 + percent / 100.0;
-            }
+            },
             BuffValue::SetPercentOfBase(percent) if percent < 100.0 => {
                 multiplier *= percent / 100.0;
-            }
-            _ => {}
+            },
+            _ => {},
         }
     };
     let mut equipment = character.inventory.equipment.iter().collect::<Vec<_>>();
@@ -10249,8 +10465,14 @@ fn advance_group_world_turn(
     };
     let players = group.players.clone();
     let advanced = group.advance_world_turn();
+    let world_turn = group.world_turn;
     let mut changed = captured > 0 || advanced;
     if advanced {
+        changed |= advance_hidden_roles_for_world_turn(
+            &mut manager.hidden_roles,
+            &players,
+            world_turn,
+        );
         changed |= reset_turn_totals_for_players(manager, &players);
         for target_id in &players {
             if let Some(character) = manager.player_characters.get_mut(target_id) {
@@ -10289,7 +10511,13 @@ fn mark_group_player_turn(
     } else {
         group.mark_player_skipped(target_id)
     };
+    let world_turn = group.world_turn;
     if changed && group.world_turn > previous_world_turn {
+        let _ = advance_hidden_roles_for_world_turn(
+            &mut manager.hidden_roles,
+            &players,
+            world_turn,
+        );
         let _ = reset_turn_totals_for_players(manager, &players);
         advance_buffs_for_players(manager, &players, rule_engine_state);
     }
@@ -11850,6 +12078,7 @@ fn unit_pool_settings_ui(
     state: &mut TrpgGroupSettingsState,
     player_targets: &[String],
     unit_standee_store: &mut Persistent<VoxelUnitStandeeStore>,
+    mut battle_store: Option<&mut Persistent<BattleRoundStore>>,
     voxel_editor: &VoxelEditorState,
     mut scene_store: Option<&mut Persistent<VoxelSceneStore>>,
 ) -> bool {
@@ -11963,6 +12192,7 @@ fn unit_pool_settings_ui(
 
     let mut unit_to_delete = None;
     for unit_id in unit_ids {
+        let mut spawn_instance = false;
         let title = manager
             .unit_pool
             .get(&unit_id)
@@ -11975,77 +12205,16 @@ fn unit_pool_settings_ui(
                     if ui.button("删除单位").clicked() {
                         unit_to_delete = Some(unit_id.clone());
                     }
-                    let image_source = unit.character.image.trim().to_owned();
-                    let has_standee = has_voxel_unit_standee(unit_standee_store, &unit_id);
-                    if has_standee {
-                        ui.small("NPC立绘已在场景中（图片修改会自动同步）");
                         if ui
-                            .button("重新放置NPC立绘")
-                            .on_hover_text("把NPC立绘移动到当前GM视野焦点")
-                            .clicked()
-                        {
-                            let status = match validate_voxel_standee_image_source(&image_source)
-                                .and_then(|_| {
-                                    place_voxel_unit_standee(
-                                        &mut *unit_standee_store,
-                                        &unit_id,
-                                        &image_source,
-                                        voxel_editor,
-                                    )
-                                })
-                            {
-                                Ok(_) => match unit_standee_store.persist() {
-                                    Ok(()) => "已把NPC立绘重新放到当前GM视野焦点".to_owned(),
-                                    Err(err) => format!("NPC立绘保存失败：{err}"),
-                                },
-                                Err(err) => format!("NPC立绘失败：{err}"),
-                            };
-                            state.unit_pool_scene_status.insert(unit_id.clone(), status);
-                        }
-                    } else if ui
                         .add_enabled(
-                            !image_source.is_empty(),
-                            egui::Button::new("创建NPC立绘"),
+                            !unit.character.image.trim().is_empty(),
+                            egui::Button::new("创建NPC实例并放入世界"),
                         )
-                        .on_hover_text("在当前GM视野焦点创建单位立绘")
+                        .on_hover_text("从此模板复制一个独立NPC，并放到GM所在位置；可重复创建")
                         .on_disabled_hover_text("单位模板还没有立绘图片")
                         .clicked()
                     {
-                        let status = match validate_voxel_standee_image_source(&image_source)
-                            .and_then(|_| {
-                                place_voxel_unit_standee(
-                                    &mut *unit_standee_store,
-                                    &unit_id,
-                                    &image_source,
-                                    voxel_editor,
-                                )
-                            })
-                        {
-                            Ok(scene_changed) => match unit_standee_store.persist() {
-                                Ok(()) => {
-                                    if scene_changed {
-                                        "已在当前GM视野焦点创建NPC立绘".to_owned()
-                                    } else {
-                                        "NPC立绘已在场景中".to_owned()
-                                    }
-                                },
-                                Err(err) => format!("NPC立绘保存失败：{err}"),
-                            },
-                            Err(err) => format!("NPC立绘失败：{err}"),
-                        };
-                        state.unit_pool_scene_status.insert(unit_id.clone(), status);
-                    }
-                    if has_standee && ui.button("移出NPC立绘").clicked() {
-                        let removed = remove_voxel_unit_standee(&mut *unit_standee_store, &unit_id);
-                        let status = if removed {
-                            match unit_standee_store.persist() {
-                                Ok(()) => "已移出NPC立绘".to_owned(),
-                                Err(err) => format!("移出NPC立绘保存失败：{err}"),
-                            }
-                        } else {
-                            "场景里没有这个NPC立绘".to_owned()
-                        };
-                        state.unit_pool_scene_status.insert(unit_id.clone(), status);
+                        spawn_instance = true;
                     }
                     if let Some(store) = scene_store.as_deref_mut() {
                         let has_token = has_unit_template_token(store, &unit_id);
@@ -12093,11 +12262,64 @@ fn unit_pool_settings_ui(
                 changed |= unit_pool_entry_editor_ui(ui, &unit_id, unit);
             }
         });
+
+        if spawn_instance {
+            let status = match manager.create_unit_instance(&unit_id) {
+                Ok(instance_id) => {
+                    let image_source = manager
+                        .unit_instances
+                        .get(&instance_id)
+                        .map(|instance| instance.character.image.trim())
+                        .unwrap_or("")
+                        .to_owned();
+                    match validate_voxel_standee_image_source(&image_source).and_then(|_| {
+                        place_voxel_unit_standee(
+                            &mut *unit_standee_store,
+                            &unit_id,
+                            &instance_id,
+                            &image_source,
+                            voxel_editor,
+                        )
+                    }) {
+                        Ok(_) => match unit_standee_store.persist() {
+                            Ok(()) => format!("已创建并放入世界：{instance_id}"),
+                            Err(err) => format!("NPC已创建，但立绘保存失败：{err}"),
+                        },
+                        Err(err) => {
+                            manager.remove_unit_instance(&instance_id);
+                            format!("NPC创建失败：{err}")
+                        },
+                    }
+                },
+                Err(err) => format!("NPC创建失败：{err}"),
+            };
+            state.unit_pool_scene_status.insert(unit_id.clone(), status);
+            changed = true;
+        }
+
+        changed |= unit_instance_management_ui(
+            ui,
+            manager,
+            state,
+            &unit_id,
+            unit_standee_store,
+            battle_store.as_deref_mut(),
+            voxel_editor,
+        );
     }
 
     if let Some(unit_id) = unit_to_delete {
+        let instance_ids = manager
+            .unit_instances
+            .iter()
+            .filter(|(_, instance)| instance.template_id == unit_id)
+            .map(|(instance_id, _)| instance_id.clone())
+            .collect::<Vec<_>>();
+        for instance_id in &instance_ids {
+            manager.remove_unit_instance(instance_id);
+        }
         manager.unit_pool.remove(&unit_id);
-        if remove_voxel_unit_standee(&mut *unit_standee_store, &unit_id) {
+        if remove_voxel_unit_standees_for_template(&mut *unit_standee_store, &unit_id) > 0 {
             if let Err(err) = unit_standee_store.persist() {
                 state.unit_pool_scene_status.insert(
                     unit_id.clone(),
@@ -12118,6 +12340,247 @@ fn unit_pool_settings_ui(
                 }
             }
         }
+        if let Some(store) = battle_store.as_deref_mut() {
+            for instance_id in &instance_ids {
+                store.remove_player_data(instance_id);
+            }
+            store.remove_unit_template_data(&unit_id);
+            if let Err(err) = store.persist() {
+                state.unit_pool_scene_status.insert(
+                    unit_id.clone(),
+                    format!("单位已删除；战斗轮保存失败：{err}"),
+                );
+            }
+        }
+        changed = true;
+    }
+
+    changed
+}
+
+fn unit_instance_management_ui(
+    ui: &mut Ui,
+    manager: &mut NapcatMessageManager,
+    state: &mut TrpgGroupSettingsState,
+    template_id: &str,
+    unit_standee_store: &mut Persistent<VoxelUnitStandeeStore>,
+    mut battle_store: Option<&mut Persistent<BattleRoundStore>>,
+    voxel_editor: &VoxelEditorState,
+) -> bool {
+    let mut instance_ids = manager
+        .unit_instances
+        .iter()
+        .filter(|(_, instance)| instance.template_id == template_id)
+        .map(|(instance_id, _)| instance_id.clone())
+        .collect::<Vec<_>>();
+    instance_ids.sort();
+    if instance_ids.is_empty() {
+        return false;
+    }
+
+    let encounter_choices = battle_store
+        .as_deref()
+        .map(|store| {
+            let mut choices = store
+                .encounters
+                .iter()
+                .map(|(encounter_id, encounter)| {
+                    let label = if encounter.name.trim().is_empty() {
+                        encounter_id.clone()
+                    } else {
+                        format!(
+                            "{} ({encounter_id})",
+                            encounter.name.trim()
+                        )
+                    };
+                    (encounter_id.clone(), label)
+                })
+                .collect::<Vec<_>>();
+            choices.sort_by(|left, right| left.1.cmp(&right.1));
+            choices
+        })
+        .unwrap_or_default();
+
+    let mut changed = false;
+    let mut place_request = None;
+    let mut remove_world_request = None;
+    let mut delete_request = None;
+    let mut join_request = None;
+    ui.indent(
+        format!("unit_instances_{template_id}"),
+        |ui| {
+            ui.separator();
+            ui.label(format!(
+                "NPC实例（{}）",
+                instance_ids.len()
+            ));
+            for instance_id in &instance_ids {
+                let title = manager
+                    .unit_instances
+                    .get(instance_id)
+                    .map(|instance| instance.display_name.trim())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(instance_id)
+                    .to_owned();
+                ui.collapsing(title, |ui| {
+                    let in_world = has_voxel_unit_standee(unit_standee_store, instance_id);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small(format!("实例ID {instance_id}"));
+                        if ui
+                            .button(if in_world { "重新放入世界" } else { "放入世界" })
+                            .clicked()
+                        {
+                            place_request = Some(instance_id.clone());
+                        }
+                        if in_world && ui.button("移出世界").clicked() {
+                            remove_world_request = Some(instance_id.clone());
+                        }
+                        if ui.button("删除实例").clicked() {
+                            delete_request = Some(instance_id.clone());
+                        }
+                    });
+
+                    if let Some(instance) = manager.unit_instances.get_mut(instance_id) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("实例名称");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut instance.display_name)
+                                        .desired_width(180.0),
+                                )
+                                .changed()
+                            {
+                                let display_name = instance.display_name.trim().to_owned();
+                                if !display_name.is_empty() {
+                                    instance.character.name = display_name.clone();
+                                    instance.character.nickname = display_name;
+                                }
+                                changed = true;
+                            }
+                        });
+                        changed |= unit_character_template_editor_ui(
+                            ui,
+                            instance_id,
+                            &mut instance.character,
+                        );
+                    }
+
+                    if encounter_choices.is_empty() {
+                        ui.small("还没有战斗轮；请先在战斗轮面板创建一个。");
+                    } else {
+                        let selection = state
+                            .unit_instance_battle_encounter
+                            .entry(instance_id.clone())
+                            .or_insert_with(|| encounter_choices[0].0.clone());
+                        if !encounter_choices
+                            .iter()
+                            .any(|(encounter_id, _)| encounter_id == selection)
+                        {
+                            *selection = encounter_choices[0].0.clone();
+                        }
+                        let selected_label = encounter_choices
+                            .iter()
+                            .find(|(encounter_id, _)| encounter_id == selection)
+                            .map(|(_, label)| label.as_str())
+                            .unwrap_or("选择战斗轮");
+                        ui.horizontal_wrapped(|ui| {
+                            egui::ComboBox::from_id_salt(format!(
+                                "unit_instance_encounter_{instance_id}"
+                            ))
+                            .selected_text(selected_label)
+                            .show_ui(ui, |ui| {
+                                for (encounter_id, label) in &encounter_choices {
+                                    ui.selectable_value(selection, encounter_id.clone(), label);
+                                }
+                            });
+                            let already_joined = battle_store.as_deref().is_some_and(|store| {
+                                store.encounters.get(selection).is_some_and(|encounter| {
+                                    encounter
+                                        .participants
+                                        .iter()
+                                        .any(|participant| participant.target_id == *instance_id)
+                                })
+                            });
+                            if ui
+                                .add_enabled(
+                                    !already_joined,
+                                    egui::Button::new("加入战斗轮"),
+                                )
+                                .clicked()
+                            {
+                                join_request = Some((instance_id.clone(), selection.clone()));
+                            }
+                            if already_joined {
+                                ui.small("已加入");
+                            }
+                        });
+                    }
+                    if let Some(status) = state.unit_pool_scene_status.get(instance_id) {
+                        ui.small(status);
+                    }
+                });
+            }
+        },
+    );
+
+    if let Some(instance_id) = place_request {
+        let status = manager
+            .unit_instances
+            .get(&instance_id)
+            .ok_or_else(|| "NPC实例不存在".to_owned())
+            .and_then(|instance| {
+                validate_voxel_standee_image_source(&instance.character.image)?;
+                place_voxel_unit_standee(
+                    &mut *unit_standee_store,
+                    &instance.template_id,
+                    &instance_id,
+                    &instance.character.image,
+                    voxel_editor,
+                )?;
+                unit_standee_store
+                    .persist()
+                    .map_err(|err| format!("保存失败：{err}"))?;
+                Ok("已放入世界".to_owned())
+            })
+            .unwrap_or_else(|err| format!("放入世界失败：{err}"));
+        state.unit_pool_scene_status.insert(instance_id, status);
+    }
+    if let Some(instance_id) = remove_world_request {
+        let status = if remove_voxel_unit_standee(&mut *unit_standee_store, &instance_id) {
+            match unit_standee_store.persist() {
+                Ok(()) => "已移出世界".to_owned(),
+                Err(err) => format!("移出世界保存失败：{err}"),
+            }
+        } else {
+            "世界里没有这个NPC实例".to_owned()
+        };
+        state.unit_pool_scene_status.insert(instance_id, status);
+    }
+    if let Some((instance_id, encounter_id)) = join_request {
+        if let Some(store) = battle_store.as_deref_mut() {
+            let status =
+                match store.add_unit_instance_to_encounter(&encounter_id, &instance_id, manager) {
+                    Ok(true) => match store.persist() {
+                        Ok(()) => "已加入战斗轮".to_owned(),
+                        Err(err) => format!("已加入战斗轮，但保存失败：{err}"),
+                    },
+                    Ok(false) => "已经在这个战斗轮里".to_owned(),
+                    Err(err) => format!("加入战斗轮失败：{err}"),
+                };
+            state.unit_pool_scene_status.insert(instance_id, status);
+        }
+    }
+    if let Some(instance_id) = delete_request {
+        manager.remove_unit_instance(&instance_id);
+        if remove_voxel_unit_standee(&mut *unit_standee_store, &instance_id) {
+            unit_standee_store.persist().ok();
+        }
+        if let Some(store) = battle_store.as_deref_mut() {
+            store.remove_player_data(&instance_id);
+            store.persist().ok();
+        }
+        state.unit_instance_battle_encounter.remove(&instance_id);
+        state.unit_pool_scene_status.remove(&instance_id);
         changed = true;
     }
 
@@ -12331,6 +12794,24 @@ fn unit_character_template_editor_ui(
                     .range(0.0..=999_999.0)
                     .speed(0.5)
                     .prefix("/ "),
+            )
+            .changed();
+    });
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.hp_regen)
+                    .range(-9999.0..=9999.0)
+                    .speed(0.1)
+                    .prefix("HP恢复 "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut character.mp_regen)
+                    .range(-9999.0..=9999.0)
+                    .speed(0.1)
+                    .prefix("MP恢复 "),
             )
             .changed();
     });
@@ -13500,7 +13981,11 @@ fn restore_selected_backup(
     scene_runtime: Option<&mut VoxelMapRuntimeState>,
     battle_store: Option<&mut Persistent<BattleRoundStore>>,
 ) -> Result<(usize, Vec<String>), String> {
-    let files = restore_backup(Path::new(BACKUP_ROOT), name, Path::new(DATA_DIR))?;
+    let files = restore_backup(
+        Path::new(BACKUP_ROOT),
+        name,
+        Path::new(DATA_DIR),
+    )?;
     let mut reload_errors = Vec::new();
     if let Err(err) = manager.reload() {
         reload_errors.push(format!("聊天记录：{err}"));
@@ -14784,6 +15269,36 @@ fn queue_legacy_negative_notice(
     Ok(true)
 }
 
+fn global_combat_modifier_row_ui(
+    ui: &mut egui::Ui,
+    label: &str,
+    base: &mut f32,
+    per_world_turn_percent: &mut f32,
+    effective: f32,
+) -> bool {
+    let mut changed = false;
+    ui.label(label);
+    changed |= ui
+        .add(
+            egui::DragValue::new(base)
+                .range(0.0..=10.0)
+                .speed(0.05)
+                .suffix("×"),
+        )
+        .changed();
+    changed |= ui
+        .add(
+            egui::DragValue::new(per_world_turn_percent)
+                .range(0.0..=100.0)
+                .speed(0.01)
+                .suffix("%/轮"),
+        )
+        .changed();
+    ui.label(format!("当前 {:.4}×", effective));
+    ui.end_row();
+    changed
+}
+
 fn voxel_player_area_label<'a>(
     position: Vec3,
     spaceships: impl IntoIterator<
@@ -14978,11 +15493,11 @@ fn trpg_group_settings_window(
                                     &manager.player_characters,
                                     target_id,
                                 );
-                            let character = manager
+                            let pending_skill_count = manager
                                 .player_characters
-                                .entry(target_id.clone())
-                                .or_default();
-                            let pending_skill_count = pending_gm_skill_count(character);
+                                .get(target_id)
+                                .map(pending_gm_skill_count)
+                                .unwrap_or_default();
                             let character_label = if pending_skill_count == 0 {
                                 format!("{display_name} ({target_id})")
                             } else {
@@ -14991,6 +15506,16 @@ fn trpg_group_settings_window(
                                 )
                             };
                             ui.collapsing(character_label, |ui| {
+                                    changed |= hidden_role_editor_ui(
+                                        ui,
+                                        target_id,
+                                        &mut manager.hidden_roles,
+                                    );
+                                    ui.separator();
+                                    let character = manager
+                                        .player_characters
+                                        .entry(target_id.clone())
+                                        .or_default();
                                     character_status_summary_ui(ui, character);
                                     ui.horizontal(|ui| {
                                         let pending_delete =
@@ -15329,6 +15854,61 @@ fn trpg_group_settings_window(
                                                 group.legacy_negative_timers.len()
                                             ));
                                         }
+                                    });
+                                    ui.collapsing("全局战斗修正", |ui| {
+                                        ui.small(
+                                            "应用于本TRPG组战斗轮中的所有单位，包括玩家、NPC和玩家召唤物。当前值 = 基础倍率 + 世界轮次 × 每轮百分比 ÷ 100。",
+                                        );
+                                        ui.small(format!("当前世界轮次：{}", group.world_turn));
+                                        let effective = group
+                                            .global_combat_modifiers
+                                            .effective_at_world_turn(group.world_turn);
+                                        let modifiers = &mut group.global_combat_modifiers;
+                                        egui::Grid::new((
+                                            "trpg_group_global_combat_modifiers",
+                                            group_name.as_str(),
+                                        ))
+                                        .num_columns(4)
+                                        .striped(true)
+                                        .show(ui, |ui| {
+                                            ui.strong("类型");
+                                            ui.strong("基础倍率");
+                                            ui.strong("每世界轮增加");
+                                            ui.strong("当前倍率");
+                                            ui.end_row();
+                                            changed |= global_combat_modifier_row_ui(
+                                                ui,
+                                                "造成伤害",
+                                                &mut modifiers.damage_dealt,
+                                                &mut modifiers
+                                                    .damage_dealt_per_world_turn_percent,
+                                                effective.damage_dealt,
+                                            );
+                                            changed |= global_combat_modifier_row_ui(
+                                                ui,
+                                                "承受伤害",
+                                                &mut modifiers.damage_taken,
+                                                &mut modifiers
+                                                    .damage_taken_per_world_turn_percent,
+                                                effective.damage_taken,
+                                            );
+                                            changed |= global_combat_modifier_row_ui(
+                                                ui,
+                                                "造成治疗",
+                                                &mut modifiers.healing_dealt,
+                                                &mut modifiers
+                                                    .healing_dealt_per_world_turn_percent,
+                                                effective.healing_dealt,
+                                            );
+                                            changed |= global_combat_modifier_row_ui(
+                                                ui,
+                                                "承受治疗",
+                                                &mut modifiers.healing_taken,
+                                                &mut modifiers
+                                                    .healing_taken_per_world_turn_percent,
+                                                effective.healing_taken,
+                                            );
+                                        });
                                     });
                                     ui.horizontal_wrapped(|ui| {
                                         let players_capture_enabled =
@@ -16111,8 +16691,7 @@ fn trpg_group_settings_window(
                     battle_store.persist().ok();
                 }
             }
-            if remove_voxel_summon_standees_for_owner(summon_standee_store, &target_id) > 0
-            {
+            if remove_voxel_summon_standees_for_owner(summon_standee_store, &target_id) > 0 {
                 summon_standee_store.persist().ok();
             }
             if let Ok(user_id) = target_id.parse::<u64>() {
@@ -16210,8 +16789,7 @@ pub fn ui_system(
         &mut locals.group_broadcast_scopes;
     let chat_player_visible_previews: &mut Local<HashMap<String, String>> =
         &mut locals.chat_player_visible_previews;
-    let chat_analytics_targets: &mut Local<HashSet<String>> =
-        &mut locals.chat_analytics_targets;
+    let chat_analytics_targets: &mut Local<HashSet<String>> = &mut locals.chat_analytics_targets;
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
     let scene_capture_requests = &mut locals.scene_capture_requests;
@@ -16324,7 +16902,11 @@ pub fn ui_system(
                 teleport_spaceships
                     .iter()
                     .filter_map(|(ship, body, transform)| {
-                        Some((voxel_spaceship_teleport_name(ship)?, body, transform))
+                        Some((
+                            voxel_spaceship_teleport_name(ship)?,
+                            body,
+                            transform,
+                        ))
                     }),
             );
             (standee.user_id.to_string(), area)
@@ -16413,6 +16995,7 @@ pub fn ui_system(
         &mut deepseek_manager,
         &mut ime,
         unit_standee_store,
+        battle_store.as_deref_mut(),
         voxel_editor,
         scene_store.as_deref_mut(),
     );
@@ -16619,8 +17202,10 @@ pub fn ui_system(
                         } else {
                             "WASD 移动 · 空格跳跃 · 双击空格飞行"
                         };
-                        let interaction_hint = if voxel_editor.is_player_possession_tool_equipped() {
-                            "右键选择/接管玩家 · 右键空处解除"
+                        let interaction_hint = if voxel_possession.is_standee_possession_active() {
+                            "正在操纵NPC或召唤物 · 按9解除操纵"
+                        } else if voxel_editor.is_player_possession_tool_equipped() {
+                            "右键接管PL、NPC或召唤物 · 右键空处解除"
                         } else if voxel_editor.is_tool_gun_equipped() {
                             "右键发射 · R切换模式"
                         } else if voxel_editor.is_gm_clock_equipped() {
@@ -16633,8 +17218,10 @@ pub fn ui_system(
                             voxel_editor.active_tool_label()
                         ));
                     } else {
-                        let interaction_hint = if voxel_editor.is_player_possession_tool_equipped() {
-                            "右键选择/接管玩家 · 右键空处解除"
+                        let interaction_hint = if voxel_possession.is_standee_possession_active() {
+                            "正在操纵NPC或召唤物 · 按9解除操纵"
+                        } else if voxel_editor.is_player_possession_tool_equipped() {
+                            "右键接管PL、NPC或召唤物 · 右键空处解除"
                         } else if voxel_editor.is_tool_gun_equipped() {
                             "右键发射 · R切换模式"
                         } else if voxel_editor.is_gm_clock_equipped() {
@@ -17221,7 +17808,7 @@ pub fn ui_system(
                                         None,
                                     )
                                     .on_hover_text(
-                                        "GM右键玩家立绘即可选择并接管；右键空处解除接管",
+                                        "GM右键PL、NPC或召唤物立绘即可接管；右键空处解除接管",
                                     )
                                     .clicked()
                                     {
@@ -17682,7 +18269,11 @@ pub fn ui_system(
             }
 
             if let Some(slot) = hotbar_clicked {
+                if voxel_possession.is_standee_possession_active() {
+                    voxel_possession.activate_standee_hotbar_slot(slot);
+                } else {
                 voxel_editor.select_hotbar_slot(slot);
+            }
             }
             if let Some(slot) = hotbar_delete {
                 voxel_editor.delete_hotbar_slot(slot);
@@ -18076,7 +18667,9 @@ mod tests {
             ("3".to_owned(), "苍鹭号"),
         ]);
 
-        assert!(sync_position_radio_parties(&mut group, &areas));
+        assert!(sync_position_radio_parties(
+            &mut group, &areas
+        ));
 
         for party_name in POSITION_RADIO_PARTIES {
             assert!(group.parties.contains_key(party_name));
@@ -18105,10 +18698,7 @@ mod tests {
 
         let changed = sync_position_radio_parties(
             &mut group,
-            &HashMap::from([
-                ("1".to_owned(), "外部空间"),
-                ("2".to_owned(), "Kyo空间站"),
-            ]),
+            &HashMap::from([("1".to_owned(), "外部空间"), ("2".to_owned(), "Kyo空间站")]),
         );
 
         assert!(changed);
@@ -18168,9 +18758,9 @@ mod tests {
 
     #[test]
     fn content_pool_generation_prompt_truncates_custom_preference() {
-        let prompt = content_pool_generation_user_prompt(&"长".repeat(
-            DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS + 100,
-        ));
+        let prompt = content_pool_generation_user_prompt(
+            &"长".repeat(DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS + 100),
+        );
         let custom_section = prompt
             .split("可选制作偏好")
             .nth(1)
@@ -18698,6 +19288,7 @@ mod tests {
             chat_targets: HashMap::default(),
             chat_target_kinds: HashMap::default(),
             player_characters: HashMap::default(),
+            hidden_roles: HashMap::default(),
             trpg_groups: HashMap::default(),
             current_trpg_group: None,
             groups: HashMap::default(),
@@ -18710,6 +19301,8 @@ mod tests {
             skill_pool: Vec::new(),
             item_pool: Vec::new(),
             unit_pool: HashMap::default(),
+            unit_instances: HashMap::default(),
+            next_unit_instance_index: 1,
             pending_talent_choices: HashMap::default(),
             used_talent_names: HashSet::default(),
         }
@@ -18719,8 +19312,7 @@ mod tests {
     fn deleting_player_related_summaries_clears_private_and_affected_group_scopes() {
         let mut manager = empty_manager();
         let private_key = SummaryScope::Private.summary_key("campaign", "2");
-        let group_key = SummaryScope::GroupParty("red".to_owned())
-            .summary_key("campaign", "99");
+        let group_key = SummaryScope::GroupParty("red".to_owned()).summary_key("campaign", "99");
         let retained_key = SummaryScope::Private.summary_key("campaign", "3");
         for key in [&private_key, &group_key, &retained_key] {
             manager.summarized_message_counts.insert(key.clone(), 1);
@@ -18734,15 +19326,16 @@ mod tests {
             "stale".to_owned(),
         );
 
-        clear_player_related_summaries(
-            &mut manager,
-            &mut deepseek,
-            &["2".to_owned(), "99".to_owned()],
-        );
+        clear_player_related_summaries(&mut manager, &mut deepseek, &[
+            "2".to_owned(),
+            "99".to_owned(),
+        ]);
 
         assert!(!manager.summarized_message_counts.contains_key(&private_key));
         assert!(!manager.summarized_message_counts.contains_key(&group_key));
-        assert!(manager.summarized_message_counts.contains_key(&retained_key));
+        assert!(manager
+            .summarized_message_counts
+            .contains_key(&retained_key));
         assert!(!deepseek.summaries.contains_key(&private_key));
         assert!(!deepseek.summaries.contains_key(&group_key));
         assert!(deepseek.summaries.contains_key(&retained_key));
@@ -19108,18 +19701,14 @@ mod tests {
             manager
                 .chat_targets
                 .insert(target_id.to_owned(), Default::default());
-            manager
-                .chat_target_kinds
-                .insert(target_id.to_owned(), kind);
+            manager.chat_target_kinds.insert(target_id.to_owned(), kind);
             let mut message = if kind == ChatTargetExportKind::Group {
                 test_group_message(2, "group")
             } else {
                 test_private_message(2)
             };
             message.data.time = time;
-            manager
-                .messages
-                .insert(target_id.to_owned(), vec![message]);
+            manager.messages.insert(target_id.to_owned(), vec![message]);
         }
 
         // 玩家2：还没有角色卡；玩家3：正在建卡；玩家4：已完成。
@@ -19130,9 +19719,7 @@ mod tests {
             .insert("3".to_owned(), in_progress);
         let mut completed = PlayerCharacter::default();
         completed.inited = true;
-        manager
-            .player_characters
-            .insert("4".to_owned(), completed);
+        manager.player_characters.insert("4".to_owned(), completed);
 
         let views = chat_list_target_views(&manager, None);
         let ids = views
@@ -19434,10 +20021,7 @@ mod tests {
 
         assert_eq!(
             trpg_group_global_private_targets(&manager, &group),
-            vec![
-                NapcatSendTarget::Private(2),
-                NapcatSendTarget::Private(3),
-            ]
+            vec![NapcatSendTarget::Private(2), NapcatSendTarget::Private(3),]
         );
     }
 
@@ -20075,7 +20659,7 @@ mod tests {
             .inventory
             .equipment
             .insert(EquipmentSlot::Feet, InventoryItem {
-                name: "����ѥ".to_owned(),
+                name: "疾风靴".to_owned(),
                 equipment_slot: EquipmentSlot::Feet,
                 stat_effects: vec![BuffEffect {
                     field: BuffField::Speed,
@@ -23284,8 +23868,14 @@ mod voxel_map_ui_helper_tests {
     #[test]
     fn gm_facing_maps_from_world_to_top_down_screen() {
         // North (+Z) faces up on the egui map; east (+X) faces right.
-        assert_eq!(map_facing_screen_vector(Vec2::new(0.0, 1.0)), Vec2::new(0.0, -1.0));
-        assert_eq!(map_facing_screen_vector(Vec2::new(1.0, 0.0)), Vec2::new(1.0, 0.0));
+        assert_eq!(
+            map_facing_screen_vector(Vec2::new(0.0, 1.0)),
+            Vec2::new(0.0, -1.0)
+        );
+        assert_eq!(
+            map_facing_screen_vector(Vec2::new(1.0, 0.0)),
+            Vec2::new(1.0, 0.0)
+        );
         assert_eq!(
             map_facing_screen_vector(Vec2::new(0.0, -1.0)),
             Vec2::new(0.0, 1.0)

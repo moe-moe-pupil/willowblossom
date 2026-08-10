@@ -2,6 +2,7 @@ mod backup;
 mod battle_round;
 mod camera;
 mod deepseek;
+mod hidden_roles;
 mod moonberry_talents;
 mod napcat;
 mod planet_atmosphere;

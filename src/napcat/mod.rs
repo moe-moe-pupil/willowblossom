@@ -142,6 +142,7 @@ pub struct NapcatOutboundMessage {
 const NAPCAT_RESPONSE_ECHO_PREFIX: &str = "willowblossom:";
 const NAPCAT_ACTION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const NAPCAT_MESSAGES_PATH: &str = ".data/willowblossom/messages.toml";
+const NAPCAT_HIDDEN_ROLES_PATH: &str = ".data/willowblossom/hidden_roles.toml";
 const NAPCAT_INBOUND_JOURNAL_PATH: &str = ".data/willowblossom/inbound_messages.jsonl";
 const PLAYER_CHAT_WINDOW_COLOR_PALETTE: [[u8; 3]; 16] = [
     [239, 68, 68],
@@ -931,6 +932,17 @@ pub struct UnitPoolEntry {
     /// Unmodified per-hit damage used for threat/experience valuation and PvE scaling.
     #[serde(default)]
     pub base_damage: f32,
+    #[serde(default)]
+    pub character: PlayerCharacter,
+}
+
+/// A durable NPC copied from a reusable unit-pool template. Its character state is
+/// independent from the template and can be shared by the world standee and battle round.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UnitInstance {
+    pub template_id: String,
+    #[serde(default)]
+    pub display_name: String,
     #[serde(default)]
     pub character: PlayerCharacter,
 }
@@ -2125,8 +2137,58 @@ pub const WORLD_START_TIME_MINUTES: u32 = 8 * 60;
 /// 一整天包含的分钟数。
 pub const WORLD_DAY_MINUTES: u32 = 24 * 60;
 
-fn default_world_time_minutes() -> u32 {
-    WORLD_START_TIME_MINUTES
+fn default_world_time_minutes() -> u32 { WORLD_START_TIME_MINUTES }
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct TrpgGlobalCombatModifiers {
+    #[serde(default = "default_modifier")]
+    pub damage_dealt: f32,
+    #[serde(default)]
+    pub damage_dealt_per_world_turn_percent: f32,
+    #[serde(default = "default_modifier")]
+    pub damage_taken: f32,
+    #[serde(default)]
+    pub damage_taken_per_world_turn_percent: f32,
+    #[serde(default = "default_modifier")]
+    pub healing_dealt: f32,
+    #[serde(default)]
+    pub healing_dealt_per_world_turn_percent: f32,
+    #[serde(default = "default_modifier")]
+    pub healing_taken: f32,
+    #[serde(default)]
+    pub healing_taken_per_world_turn_percent: f32,
+}
+
+impl Default for TrpgGlobalCombatModifiers {
+    fn default() -> Self {
+        Self {
+            damage_dealt: 1.0,
+            damage_dealt_per_world_turn_percent: 0.0,
+            damage_taken: 1.0,
+            damage_taken_per_world_turn_percent: 0.0,
+            healing_dealt: 1.0,
+            healing_dealt_per_world_turn_percent: 0.0,
+            healing_taken: 1.0,
+            healing_taken_per_world_turn_percent: 0.0,
+        }
+    }
+}
+
+impl TrpgGlobalCombatModifiers {
+    pub fn effective_at_world_turn(self, world_turn: u32) -> Self {
+        let turn = world_turn as f32;
+        Self {
+            damage_dealt: self.damage_dealt
+                + turn * self.damage_dealt_per_world_turn_percent / 100.0,
+            damage_taken: self.damage_taken
+                + turn * self.damage_taken_per_world_turn_percent / 100.0,
+            healing_dealt: self.healing_dealt
+                + turn * self.healing_dealt_per_world_turn_percent / 100.0,
+            healing_taken: self.healing_taken
+                + turn * self.healing_taken_per_world_turn_percent / 100.0,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2151,6 +2213,9 @@ pub struct TrpgGroup {
     pub initial_exchange_points: i32,
     #[serde(default)]
     pub basic_config: TrpgBasicConfig,
+    /// Applied multiplicatively to every participant in this group's battle rounds.
+    #[serde(default, alias = "npc_combat_modifiers")]
+    pub global_combat_modifiers: TrpgGlobalCombatModifiers,
     #[serde(default, alias = "runTimes")]
     pub run_times: u32,
     #[serde(default = "default_battle_sort_by_turn", alias = "orderByTurn")]
@@ -2212,6 +2277,7 @@ impl Default for TrpgGroup {
             initial_status_points: default_status_points(),
             initial_exchange_points: default_exchange_points(),
             basic_config: TrpgBasicConfig::default(),
+            global_combat_modifiers: TrpgGlobalCombatModifiers::default(),
             run_times: 0,
             battle_sort_by_turn: default_battle_sort_by_turn(),
             battle_negative_enabled: false,
@@ -3353,6 +3419,8 @@ fn legacy_party_name(name: &str, id: &str, fallback: &str) -> String {
     }
 }
 
+fn default_next_unit_instance_index() -> u64 { 1 }
+
 #[derive(Resource, Serialize, Deserialize)]
 pub struct NapcatMessageManager {
     pub messages: HashMap<String, Vec<NapcatMessage>>,
@@ -3366,6 +3434,9 @@ pub struct NapcatMessageManager {
     pub chat_target_kinds: HashMap<String, ChatTargetExportKind>,
     #[serde(default)]
     pub player_characters: HashMap<String, PlayerCharacter>,
+    /// GM-only hidden identities and progression. Never included in player-facing status text.
+    #[serde(default)]
+    pub hidden_roles: HashMap<String, crate::hidden_roles::HiddenRoleState>,
     #[serde(default)]
     pub trpg_groups: HashMap<String, TrpgGroup>,
     #[serde(default)]
@@ -3390,6 +3461,10 @@ pub struct NapcatMessageManager {
     pub item_pool: Vec<InventoryItem>,
     #[serde(default)]
     pub unit_pool: HashMap<String, UnitPoolEntry>,
+    #[serde(default)]
+    pub unit_instances: HashMap<String, UnitInstance>,
+    #[serde(default = "default_next_unit_instance_index")]
+    pub next_unit_instance_index: u64,
     #[serde(default)]
     pub pending_talent_choices: HashMap<String, PendingTalentChoice>,
     #[serde(default)]
@@ -3665,6 +3740,49 @@ fn merge_max_usize(map: &mut HashMap<String, usize>, key: String, value: usize) 
 }
 
 impl NapcatMessageManager {
+    pub fn create_unit_instance(&mut self, template_id: &str) -> Result<String, String> {
+        let template_id = template_id.trim();
+        let Some(template) = self.unit_pool.get(template_id) else {
+            return Err("单位模板不存在".to_owned());
+        };
+        let serial = self.next_unit_instance_index.max(1);
+        let instance_id = (serial..)
+            .map(|index| format!("unit:{template_id}#{index}"))
+            .find(|candidate| !self.unit_instances.contains_key(candidate))
+            .expect("unbounded NPC instance id search should always return");
+        let used_serial = instance_id
+            .rsplit_once('#')
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .unwrap_or(serial);
+        self.next_unit_instance_index = used_serial.saturating_add(1);
+
+        let mut character = template.character.clone();
+        character.inited = true;
+        let base_name = if !template.label.trim().is_empty() {
+            template.label.trim()
+        } else if !character.nickname.trim().is_empty() {
+            character.nickname.trim()
+        } else if !character.name.trim().is_empty() {
+            character.name.trim()
+        } else {
+            template_id
+        };
+        let display_name = format!("{base_name} #{used_serial}");
+        character.name = display_name.clone();
+        character.nickname = display_name.clone();
+        self.unit_instances
+            .insert(instance_id.clone(), UnitInstance {
+                template_id: template_id.to_owned(),
+                display_name,
+                character,
+            });
+        Ok(instance_id)
+    }
+
+    pub fn remove_unit_instance(&mut self, instance_id: &str) -> bool {
+        self.unit_instances.remove(instance_id.trim()).is_some()
+    }
+
     pub fn delete_player(&mut self, target_id: &str) -> Option<PlayerDeletionSummary> {
         let target_id = target_id.trim();
         if target_id.is_empty() {
@@ -3743,6 +3861,7 @@ impl NapcatMessageManager {
         self.chat_targets.remove(target_id);
         self.chat_target_kinds.remove(target_id);
         self.player_characters.remove(target_id);
+        self.hidden_roles.remove(target_id);
         self.read_message_counts.remove(target_id);
         self.summarized_message_counts.remove(target_id);
         self.open_chat_targets.remove(target_id);
@@ -6529,6 +6648,7 @@ fn setup(mut commands: Commands) {
         chat_targets: HashMap::default(),
         chat_target_kinds: HashMap::default(),
         player_characters: HashMap::default(),
+        hidden_roles: HashMap::default(),
         trpg_groups: HashMap::default(),
         current_trpg_group: None,
         groups: HashMap::default(),
@@ -6541,16 +6661,24 @@ fn setup(mut commands: Commands) {
         skill_pool: Vec::new(),
         item_pool: Vec::new(),
         unit_pool: HashMap::default(),
+        unit_instances: HashMap::default(),
+        next_unit_instance_index: default_next_unit_instance_index(),
         pending_talent_choices: HashMap::default(),
         used_talent_names: HashSet::default(),
     };
-    let message_manager = Persistent::<NapcatMessageManager>::builder()
+    let mut message_manager = Persistent::<NapcatMessageManager>::builder()
         .name("messages")
         .format(StorageFormat::Toml)
         .path(NAPCAT_MESSAGES_PATH)
         .default(default_message_manager)
         .build()
         .expect("failed to init messages");
+    if let Err(err) = crate::hidden_roles::merge_hidden_role_seed(
+        &mut message_manager.hidden_roles,
+        Path::new(NAPCAT_HIDDEN_ROLES_PATH),
+    ) {
+        eprintln!("{err}");
+    }
     let mut inbound_receipts = Persistent::<InboundMessageReceiptStore>::builder()
         .name("inbound_receipts")
         .format(StorageFormat::Toml)
@@ -8091,10 +8219,7 @@ fn begin_talent_choice(
         PendingTalentChoice {
             label: label.to_owned(),
             pool_id,
-            options: chosen
-                .iter()
-                .map(|talent| talent.name.to_owned())
-                .collect(),
+            options: chosen.iter().map(|talent| talent.name.to_owned()).collect(),
         },
     );
     for talent in &chosen {
@@ -8109,11 +8234,18 @@ fn begin_talent_choice(
     let choice_hint = if count == 1 {
         "请回复 1 选择这项天赋；未选中的天赋也不会回到天赋池。".to_owned()
     } else {
-        format!("请回复1~{}选择一项；未选中的天赋也不会回到天赋池。", count)
+        format!(
+            "请回复1~{}选择一项；未选中的天赋也不会回到天赋池。",
+            count
+        )
     };
     let mut lines = vec![header, choice_hint];
     for (index, talent) in chosen.iter().enumerate() {
-        lines.push(format!("{}. {}", index + 1, talent_note(talent)));
+        lines.push(format!(
+            "{}. {}",
+            index + 1,
+            talent_note(talent)
+        ));
     }
     lines.join("\n")
 }
@@ -9873,8 +10005,7 @@ pub fn summon_max_hp_for_level(level: i32, config: &TrpgBasicConfig) -> f32 {
 
 /// 魅力提供的召唤物伤害加成倍率：每点魅力 +2%。
 pub fn character_summon_damage_multiplier(character: &PlayerCharacter) -> f32 {
-    1.0 + character_total_status(character).cha.max(0) as f32
-        * SUMMON_DAMAGE_BONUS_PER_CHARISMA
+    1.0 + character_total_status(character).cha.max(0) as f32 * SUMMON_DAMAGE_BONUS_PER_CHARISMA
 }
 
 /// 魅力提供的NPC交流好感：每点魅力 +1。
@@ -10989,6 +11120,7 @@ mod tests {
             chat_targets: HashMap::default(),
             chat_target_kinds: HashMap::default(),
             player_characters: HashMap::default(),
+            hidden_roles: HashMap::default(),
             trpg_groups: HashMap::default(),
             current_trpg_group: None,
             groups: HashMap::default(),
@@ -11001,9 +11133,42 @@ mod tests {
             skill_pool: Vec::new(),
             item_pool: Vec::new(),
             unit_pool: HashMap::default(),
+            unit_instances: HashMap::default(),
+            next_unit_instance_index: 1,
             pending_talent_choices: HashMap::default(),
             used_talent_names: HashSet::default(),
         }
+    }
+
+    #[test]
+    fn unit_instances_are_repeatable_independent_template_copies() {
+        let mut manager = empty_manager();
+        let mut template = UnitPoolEntry::default();
+        template.label = "史莱姆".to_owned();
+        template.character.hp = 18.0;
+        template.character.max_hp = 20.0;
+        manager.unit_pool.insert("slime".to_owned(), template);
+
+        let first_id = manager.create_unit_instance("slime").unwrap();
+        let second_id = manager.create_unit_instance("slime").unwrap();
+
+        assert_eq!(first_id, "unit:slime#1");
+        assert_eq!(second_id, "unit:slime#2");
+        assert_eq!(manager.unit_instances.len(), 2);
+        manager
+            .unit_instances
+            .get_mut(&first_id)
+            .unwrap()
+            .character
+            .hp = 3.0;
+        assert_eq!(
+            manager.unit_instances[&second_id].character.hp,
+            18.0
+        );
+        assert_eq!(
+            manager.unit_pool["slime"].character.hp,
+            18.0
+        );
     }
 
     #[test]
@@ -11139,7 +11304,10 @@ mod tests {
             .default(empty_manager())
             .build()
             .unwrap();
-        assert_eq!(restored.chat_window_position("2"), Some([123.0, 456.0]));
+        assert_eq!(
+            restored.chat_window_position("2"),
+            Some([123.0, 456.0])
+        );
     }
 
     #[test]
@@ -11696,8 +11864,9 @@ position_cells = [4, 5, 6]
         });
         let character = &characters["1"];
         let mut transformed = character.clone();
-        transformed.portrait_transform =
-            Some(PortraitTransform::OtherPlayer("2".to_owned()));
+        transformed.portrait_transform = Some(PortraitTransform::OtherPlayer(
+            "2".to_owned(),
+        ));
 
         assert_eq!(
             resolve_player_portrait_image(&characters, &transformed),
@@ -11713,20 +11882,25 @@ position_cells = [4, 5, 6]
             image: "own.png".to_owned(),
             ..Default::default()
         });
-        characters.insert("2".to_owned(), PlayerCharacter::default());
+        characters.insert(
+            "2".to_owned(),
+            PlayerCharacter::default(),
+        );
         let character = &characters["1"];
 
         let mut missing_target = character.clone();
-        missing_target.portrait_transform =
-            Some(PortraitTransform::OtherPlayer("999".to_owned()));
+        missing_target.portrait_transform = Some(PortraitTransform::OtherPlayer(
+            "999".to_owned(),
+        ));
         assert_eq!(
             resolve_player_portrait_image(&characters, &missing_target),
             "own.png"
         );
 
         let mut blank_target = character.clone();
-        blank_target.portrait_transform =
-            Some(PortraitTransform::OtherPlayer("2".to_owned()));
+        blank_target.portrait_transform = Some(PortraitTransform::OtherPlayer(
+            "2".to_owned(),
+        ));
         assert_eq!(
             resolve_player_portrait_image(&characters, &blank_target),
             "own.png"
@@ -11777,7 +11951,9 @@ position_cells = [4, 5, 6]
         let character = PlayerCharacter {
             inited: true,
             image: "own.png".to_owned(),
-            portrait_transform: Some(PortraitTransform::OtherPlayer("2".to_owned())),
+            portrait_transform: Some(PortraitTransform::OtherPlayer(
+                "2".to_owned(),
+            )),
             ..Default::default()
         };
 
@@ -11785,7 +11961,9 @@ position_cells = [4, 5, 6]
         let restored: PlayerCharacter = serde_json::from_str(&json).unwrap();
         assert_eq!(
             restored.portrait_transform,
-            Some(PortraitTransform::OtherPlayer("2".to_owned()))
+            Some(PortraitTransform::OtherPlayer(
+                "2".to_owned()
+            ))
         );
     }
 
@@ -11802,12 +11980,18 @@ position_cells = [4, 5, 6]
             ..Default::default()
         };
 
-        assert!(apply_item_portrait_transform(&mut character, &item));
+        assert!(apply_item_portrait_transform(
+            &mut character,
+            &item
+        ));
         assert_eq!(
             character.portrait_transform,
             Some(PortraitTransform::DefaultAvatar)
         );
-        assert!(!apply_item_portrait_transform(&mut character, &item));
+        assert!(!apply_item_portrait_transform(
+            &mut character,
+            &item
+        ));
     }
 
     #[test]
@@ -11815,12 +11999,17 @@ position_cells = [4, 5, 6]
         let mut character = PlayerCharacter {
             inited: true,
             image: "own.png".to_owned(),
-            portrait_transform: Some(PortraitTransform::OtherPlayer("2".to_owned())),
+            portrait_transform: Some(PortraitTransform::OtherPlayer(
+                "2".to_owned(),
+            )),
             ..Default::default()
         };
         let item = InventoryItem::default();
 
-        assert!(apply_item_portrait_transform(&mut character, &item));
+        assert!(apply_item_portrait_transform(
+            &mut character,
+            &item
+        ));
         assert_eq!(character.portrait_transform, None);
     }
 
@@ -11839,7 +12028,9 @@ position_cells = [4, 5, 6]
     fn inventory_item_portrait_transform_round_trips_through_json() {
         let item = InventoryItem {
             name: "变形魔盒".to_owned(),
-            portrait_transform: Some(PortraitTransform::OtherPlayer("2".to_owned())),
+            portrait_transform: Some(PortraitTransform::OtherPlayer(
+                "2".to_owned(),
+            )),
             ..Default::default()
         };
 
@@ -11847,7 +12038,9 @@ position_cells = [4, 5, 6]
         let restored: InventoryItem = serde_json::from_str(&json).unwrap();
         assert_eq!(
             restored.portrait_transform,
-            Some(PortraitTransform::OtherPlayer("2".to_owned()))
+            Some(PortraitTransform::OtherPlayer(
+                "2".to_owned()
+            ))
         );
     }
 
@@ -14773,7 +14966,10 @@ position_cells = [4, 5, 6]
             manager.trpg_groups["g"].world_start_turn,
             0
         );
-        assert_eq!(manager.trpg_groups["g"].campaign_started_at, 0);
+        assert_eq!(
+            manager.trpg_groups["g"].campaign_started_at,
+            0
+        );
     }
 
     #[test]
@@ -14790,13 +14986,10 @@ position_cells = [4, 5, 6]
             "plain".to_owned(),
             PlayerCharacter::default(),
         );
-        manager.trpg_groups.insert(
-            "g".to_owned(),
-            TrpgGroup {
+        manager.trpg_groups.insert("g".to_owned(), TrpgGroup {
                 players: vec!["holder".to_owned(), "plain".to_owned()],
                 ..Default::default()
-            },
-        );
+        });
 
         assert!(open_trpg_group_world(&mut manager, "g").is_some());
         let holder_items = &manager.player_characters["holder"].inventory.items;
@@ -15541,7 +15734,10 @@ position_cells = [4, 5, 6]
             &test_private_message_from(2, ".gc2"),
         )
         .unwrap();
-        assert_eq!(player_request.kind, SceneCaptureKind::PanoramaVideo);
+        assert_eq!(
+            player_request.kind,
+            SceneCaptureKind::PanoramaVideo
+        );
         assert_eq!(
             scene_capture_request(
                 &manager,
@@ -17563,7 +17759,10 @@ position_cells = [4, 5, 6]
         character.inited = true;
         character.level = 5;
         update_character_from_status_with_config(&mut character, &config);
-        assert_eq!(character_summon_cap(&character), SUMMON_BASE_CAP);
+        assert_eq!(
+            character_summon_cap(&character),
+            SUMMON_BASE_CAP
+        );
 
         character.status.cha = 5;
         // 1 + 5*0.05 = 1.25，向下取整仍是1。
@@ -17579,7 +17778,10 @@ position_cells = [4, 5, 6]
         character.skill_names.push("狂野召唤！".to_owned());
         character
             .skill_metadata
-            .push(CharacterSkillMetadata::talent("normal_talent", "天赋"));
+            .push(CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            ));
         assert_eq!(character_summon_cap(&character), 4);
     }
 
@@ -17617,7 +17819,10 @@ position_cells = [4, 5, 6]
         character.skill_names.push("魔网延伸".to_owned());
         character
             .skill_metadata
-            .push(CharacterSkillMetadata::talent("normal_talent", "天赋"));
+            .push(CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            ));
         assert_eq!(
             character_summon_range_meters(&character),
             Some(SUMMON_BASE_RANGE_METERS * 1.05)
@@ -17626,20 +17831,38 @@ position_cells = [4, 5, 6]
         character.skill_names.push("重命名吊牌".to_owned());
         character
             .skill_metadata
-            .push(CharacterSkillMetadata::talent("normal_talent", "天赋"));
-        assert_eq!(character_summon_range_meters(&character), None);
+            .push(CharacterSkillMetadata::talent(
+                "normal_talent",
+                "天赋",
+            ));
+        assert_eq!(
+            character_summon_range_meters(&character),
+            None
+        );
     }
 
     #[test]
     fn summon_target_id_round_trips() {
-        assert_eq!(summon_target_id("10001", 0), "summon:10001:0");
+        assert_eq!(
+            summon_target_id("10001", 0),
+            "summon:10001:0"
+        );
         assert_eq!(
             parse_summon_target_id("summon:10001:0"),
             Some(("10001".to_owned(), 0))
         );
-        assert_eq!(parse_summon_target_id("summon:abc:12"), Some(("abc".to_owned(), 12)));
-        assert_eq!(parse_summon_target_id("player:10001"), None);
-        assert_eq!(parse_summon_target_id("summon:10001:x"), None);
+        assert_eq!(
+            parse_summon_target_id("summon:abc:12"),
+            Some(("abc".to_owned(), 12))
+        );
+        assert_eq!(
+            parse_summon_target_id("player:10001"),
+            None
+        );
+        assert_eq!(
+            parse_summon_target_id("summon:10001:x"),
+            None
+        );
     }
 
     #[test]
@@ -17651,7 +17874,10 @@ position_cells = [4, 5, 6]
         character.summons = vec![Summon::default(), Summon::default(), Summon::default()];
         character.summons[1].hp = 999.0;
 
-        assert!(sync_character_summons(&mut character, &config));
+        assert!(sync_character_summons(
+            &mut character,
+            &config
+        ));
         assert_eq!(character.summons.len(), 2);
         let expected_max_hp = summon_max_hp_for_level(2, &config);
         for summon in &character.summons {
@@ -17661,7 +17887,10 @@ position_cells = [4, 5, 6]
         assert!((character.summons[1].hp - expected_max_hp).abs() < f32::EPSILON);
 
         // 再次同步无变化。
-        assert!(!sync_character_summons(&mut character, &config));
+        assert!(!sync_character_summons(
+            &mut character,
+            &config
+        ));
     }
 
     #[test]
@@ -17697,11 +17926,17 @@ position_cells = [4, 5, 6]
                 ..Default::default()
             };
 
-            assert!(sync_character_summons(&mut character, &config));
+            assert!(sync_character_summons(
+                &mut character,
+                &config
+            ));
             assert_eq!(character.summons.len(), 1);
             assert_eq!(character.summons[0].kind, kind);
             assert_eq!(character.summons[0].name, summon_name);
-            assert!(!sync_character_summons(&mut character, &config));
+            assert!(!sync_character_summons(
+                &mut character,
+                &config
+            ));
         }
     }
 
@@ -17718,7 +17953,10 @@ position_cells = [4, 5, 6]
             ..Default::default()
         };
 
-        assert!(sync_character_summons(&mut character, &config));
+        assert!(sync_character_summons(
+            &mut character,
+            &config
+        ));
         let mech = &character.summons[0];
         assert_eq!(mech.kind, SummonKind::Mech);
         assert!((mech.max_hp - 6.0).abs() < f32::EPSILON);
@@ -18416,7 +18654,10 @@ position_cells = [4, 5, 6]
         assert!(group.reset_all_turns());
 
         assert_eq!(group.world_turn, 0);
-        assert_eq!(group.world_time_minutes, WORLD_START_TIME_MINUTES);
+        assert_eq!(
+            group.world_time_minutes,
+            WORLD_START_TIME_MINUTES
+        );
         assert!(group
             .player_turns
             .values()

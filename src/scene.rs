@@ -107,10 +107,10 @@ use crate::{
         WORLD_DAY_MINUTES,
     },
     planet_atmosphere::{
+        spawn_atmosphere_shell,
         PlanetAtmosphereHandles,
         PlanetAtmosphereMaterial,
         PlanetAtmospherePlugin,
-        spawn_atmosphere_shell,
     },
 };
 
@@ -1899,11 +1899,17 @@ fn update_planet_day_night_cycle(
     mut atmosphere_assets: ResMut<Assets<PlanetAtmosphereMaterial>>,
     mut sun_query: Query<
         (&mut Transform, &mut DirectionalLight),
-        (With<PlanetSunLight>, Without<PlanetMoonLight>),
+        (
+            With<PlanetSunLight>,
+            Without<PlanetMoonLight>,
+        ),
     >,
     mut moon_query: Query<
         (&mut Transform, &mut DirectionalLight),
-        (With<PlanetMoonLight>, Without<PlanetSunLight>),
+        (
+            With<PlanetMoonLight>,
+            Without<PlanetSunLight>,
+        ),
     >,
 ) {
     let Some(manager) = manager else {
@@ -1920,18 +1926,13 @@ fn update_planet_day_night_cycle(
     let planet_center = earth_planet_center().as_vec3();
     // 以玩家一侧的方向为“正午天顶”，让白天照亮玩家所在的半球。
     let near_axis = (earth_planet_near_point().as_vec3() - planet_center).normalize();
-    let reference = if near_axis.y.abs() < 0.9 {
-        Vec3::Y
-    } else {
-        Vec3::X
-    };
+    let reference = if near_axis.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
     let east = reference.cross(near_axis).normalize();
 
     // 06:00 日出、12:00 正午、18:00 日落、00:00 午夜。
     let minutes_of_day = (group.world_time_minutes % WORLD_DAY_MINUTES) as f32;
-    let elevation = std::f32::consts::TAU
-        * (minutes_of_day - 6.0 * 60.0)
-        / WORLD_DAY_MINUTES as f32;
+    let elevation =
+        std::f32::consts::TAU * (minutes_of_day - 6.0 * 60.0) / WORLD_DAY_MINUTES as f32;
     let sun_direction = (near_axis * elevation.sin() + east * elevation.cos()).normalize();
     let sun_elevation = sun_direction.dot(near_axis);
     let orbit_radius =
@@ -1944,7 +1945,10 @@ fn update_planet_day_night_cycle(
         light.illuminance = PLANET_SUN_ILLUMINANCE * sun_elevation.max(0.0).powf(0.55);
         // 低角度时偏暖，模拟日出日落。
         let horizon_warmth = (1.0 - sun_elevation).clamp(0.0, 1.0).powi(2);
-        let color = Vec3::new(1.0, 0.88, 0.68).lerp(Vec3::new(1.0, 0.42, 0.18), horizon_warmth);
+        let color = Vec3::new(1.0, 0.88, 0.68).lerp(
+            Vec3::new(1.0, 0.42, 0.18),
+            horizon_warmth,
+        );
         light.color = Color::srgb(color.x, color.y, color.z);
     }
 
@@ -1961,7 +1965,11 @@ fn update_planet_day_night_cycle(
     let day_color = Vec3::new(0.46, 0.56, 0.68);
     let night_color = Vec3::new(0.13, 0.17, 0.30);
     let ambient_color = day_color.lerp(night_color, 1.0 - day_amount);
-    ambient.color = Color::srgb(ambient_color.x, ambient_color.y, ambient_color.z);
+    ambient.color = Color::srgb(
+        ambient_color.x,
+        ambient_color.y,
+        ambient_color.z,
+    );
     ambient.brightness = PLANET_DAY_AMBIENT_BRIGHTNESS * day_amount
         + PLANET_NIGHT_AMBIENT_BRIGHTNESS * (1.0 - day_amount);
 
@@ -2245,9 +2253,7 @@ fn spawn_planet_fake_sphere(
     let planet_center = earth_planet_center().as_vec3();
     // 深色实体球补全星球尚未体素化的下半部分，让外部剪影看起来是个球。
     commands.spawn((
-        Mesh3d(meshes.add(
-            Sphere::new(PLANET_FAKE_BODY_RADIUS).mesh().uv(48, 24),
-        )),
+        Mesh3d(meshes.add(Sphere::new(PLANET_FAKE_BODY_RADIUS).mesh().uv(48, 24))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgb(0.035, 0.04, 0.055),
             perceptual_roughness: 1.0,
@@ -2267,9 +2273,7 @@ fn spawn_planet_fake_sphere(
         EARTH_PLANET_RADIUS as f32,
         PLANET_ATMOSPHERE_RADIUS,
     );
-    commands.insert_resource(PlanetAtmosphereHandles {
-        material,
-    });
+    commands.insert_resource(PlanetAtmosphereHandles { material });
 }
 
 fn spawn_static_voxel_collision_previews(commands: &mut Commands) {
@@ -9096,6 +9100,7 @@ mod tests {
             chat_targets: HashMap::default(),
             chat_target_kinds: HashMap::default(),
             player_characters: HashMap::default(),
+            hidden_roles: HashMap::default(),
             trpg_groups: HashMap::default(),
             current_trpg_group: None,
             groups: HashMap::default(),
@@ -9108,6 +9113,8 @@ mod tests {
             skill_pool: Vec::new(),
             item_pool: Vec::new(),
             unit_pool: HashMap::default(),
+            unit_instances: HashMap::default(),
+            next_unit_instance_index: 1,
             pending_talent_choices: HashMap::default(),
             used_talent_names: HashSet::default(),
         }

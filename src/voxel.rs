@@ -103,9 +103,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use voxxelmaxx::prelude::*;
 
 use crate::{
-    battle_round::{
-        BattleRoundStore,
-    },
+    battle_round::BattleRoundStore,
     napcat::{
         CharacterHotbarSlot,
         CharacterSkillMetadata,
@@ -117,10 +115,10 @@ use crate::{
         WORLD_DAY_MINUTES,
     },
     planet_atmosphere::{
+        spawn_atmosphere_shell,
         PlanetAtmosphereHandles,
         PlanetAtmosphereMaterial,
         PlanetAtmospherePlugin,
-        spawn_atmosphere_shell,
     },
     rule_engine::{
         parse_rule,
@@ -526,9 +524,10 @@ enum VoxelStandeeAccess {
 #[derive(Component)]
 struct VoxelUnitStandee {
     target_id: String,
-    unit_id: String,
+    instance_id: String,
     image_source: String,
     access_visibility: AccessVisibility,
+    half_size: Vec2,
 }
 
 #[derive(Component)]
@@ -537,6 +536,7 @@ struct VoxelSummonStandee {
     owner_id: String,
     image_source: String,
     access_visibility: AccessVisibility,
+    half_size: Vec2,
 }
 
 #[cfg(test)]
@@ -600,7 +600,11 @@ pub(crate) struct VoxelPlayerCameraStore {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PersistedVoxelUnitStandee {
+    /// Unit-pool template id. Kept as `unit_id` for compatibility with old saves.
     unit_id: String,
+    /// Stable spawned NPC id. Empty in legacy singleton records.
+    #[serde(default)]
+    instance_id: String,
     translation: [f32; 3],
     rotation: [f32; 4],
     #[serde(default)]
@@ -1455,6 +1459,8 @@ struct VoxelPlanetGravityBody;
 pub(crate) struct VoxelPossessionState {
     pub active_user_id: Option<u64>,
     applied_user_id: Option<u64>,
+    active_standee: Option<VoxelPossessedStandee>,
+    applied_standee: Option<VoxelPossessedStandee>,
     pub selected_hotbar_slot: usize,
     pub player_inventory_open: bool,
     pub movement_used: f32,
@@ -1469,6 +1475,13 @@ pub(crate) struct VoxelPossessionState {
     movement_bypass_confirmation_pending: bool,
     persist_elapsed: f32,
     movement_persist_elapsed: f32,
+    standee_persist_elapsed: f32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum VoxelPossessedStandee {
+    Unit(String),
+    Summon(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1489,6 +1502,8 @@ impl Default for VoxelPossessionState {
         Self {
             active_user_id: None,
             applied_user_id: None,
+            active_standee: None,
+            applied_standee: None,
             selected_hotbar_slot: 0,
             player_inventory_open: false,
             movement_used: 0.0,
@@ -1503,6 +1518,7 @@ impl Default for VoxelPossessionState {
             movement_bypass_confirmation_pending: false,
             persist_elapsed: 0.0,
             movement_persist_elapsed: 0.0,
+            standee_persist_elapsed: 0.0,
         }
     }
 }
@@ -1510,12 +1526,31 @@ impl Default for VoxelPossessionState {
 impl VoxelPossessionState {
     pub(crate) fn possess(&mut self, user_id: u64) {
         self.active_user_id = Some(user_id);
+        self.active_standee = None;
+        self.reset_turn_overrides();
+    }
+
+    fn possess_standee(&mut self, standee: VoxelPossessedStandee) {
+        self.active_user_id = None;
+        self.active_standee = Some(standee);
         self.reset_turn_overrides();
     }
 
     pub(crate) fn release(&mut self) {
         self.active_user_id = None;
+        self.active_standee = None;
         self.reset_turn_overrides();
+    }
+
+    fn is_active(&self) -> bool { self.active_user_id.is_some() || self.active_standee.is_some() }
+
+    pub(crate) fn is_standee_possession_active(&self) -> bool { self.active_standee.is_some() }
+
+    pub(crate) fn activate_standee_hotbar_slot(&mut self, slot: usize) {
+        if self.active_standee.is_some() && slot == 8 {
+            self.selected_hotbar_slot = slot;
+            self.release();
+        }
     }
 
     pub(crate) fn movement_remaining(&self) -> f32 {
@@ -1571,10 +1606,7 @@ struct VoxelInvisibilityState {
 
 /// Toggles a player's invisibility mark. Returns the new state (`true` = now
 /// invisible).
-fn toggle_voxel_player_invisibility(
-    state: &mut VoxelInvisibilityState,
-    user_id: u64,
-) -> bool {
+fn toggle_voxel_player_invisibility(state: &mut VoxelInvisibilityState, user_id: u64) -> bool {
     if state.invisible_user_ids.remove(&user_id) {
         false
     } else {
@@ -1959,6 +1991,7 @@ pub(crate) struct VoxelEditorState {
     camera_distance: f32,
     camera_yaw: f32,
     camera_pitch: f32,
+    gm_standee_position: Vec3,
     camera_drag_started_in_viewport: bool,
     left_started_over_ui: bool,
     right_started_over_ui: bool,
@@ -2026,6 +2059,7 @@ impl Default for VoxelEditorState {
             camera_distance: DEFAULT_SCENE_CAMERA_DISTANCE,
             camera_yaw: 0.7,
             camera_pitch: -0.45,
+            gm_standee_position: FIRST_PERSON_START + Vec3::Y * FIRST_PERSON_EYE_OFFSET,
             camera_drag_started_in_viewport: false,
             left_started_over_ui: false,
             right_started_over_ui: false,
@@ -2270,6 +2304,21 @@ impl VoxelEditorState {
 
     pub(crate) fn is_gm_clock_equipped(&self) -> bool {
         self.equipped_item == Some(VoxelCreativeItem::GmClock)
+    }
+
+    fn equipped_item_handles_right_click_without_voxel_edit(&self) -> bool {
+        matches!(
+            self.equipped_item,
+            Some(
+                VoxelCreativeItem::PlayerPossessionTool
+                    | VoxelCreativeItem::SpaceshipPossessionTool
+                    | VoxelCreativeItem::PortraitTransformTool
+                    | VoxelCreativeItem::TeleportTool
+                    | VoxelCreativeItem::DoorLockTool
+                    | VoxelCreativeItem::InvisibilityTool
+                    | VoxelCreativeItem::GmClock
+            )
+        )
     }
 
     pub(crate) fn request_teleport(&mut self, destination: VoxelTeleportDestination) {
@@ -2602,6 +2651,7 @@ impl Plugin for TrpgVoxelPlugin {
                         control_first_person_player,
                         control_voxel_camera
                             .run_if(crate::replay::replay_mouse_interaction_inactive),
+                        sync_possessed_voxel_standee,
                     )
                         .chain(),
                     (
@@ -3044,6 +3094,13 @@ fn voxel_editor_shortcuts(
     mut editor: ResMut<VoxelEditorState>,
     mut possession: ResMut<VoxelPossessionState>,
 ) {
+    // Slot 9 is the universal release-control action. Handle it before egui's
+    // keyboard-focus guard so keyboard release matches clicking the hotbar slot.
+    if keyboard.just_pressed(KeyCode::Digit9) && possession.is_active() {
+        possession.selected_hotbar_slot = 8;
+        possession.release();
+        return;
+    }
     if egui_input.wants_any_keyboard_input() {
         return;
     }
@@ -3087,6 +3144,8 @@ fn voxel_editor_shortcuts(
                     .as_deref()
                     .and_then(|manager| manager.player_characters.get(&active_user_id.to_string()));
                 activate_player_hotbar_slot(&mut possession, character, slot);
+            } else if possession.is_standee_possession_active() {
+                possession.activate_standee_hotbar_slot(slot);
             } else {
                 editor.select_hotbar_slot(slot);
             }
@@ -3635,9 +3694,8 @@ fn sync_voxel_lighting(
 
 fn world_time_sun_direction(minutes_of_day: f32) -> Vec3 {
     // 06:00 日出（+X 方向）、12:00 正午（+Y 天顶）、18:00 日落（-X）、00:00 午夜（-Y）。
-    let elevation = std::f32::consts::TAU
-        * (minutes_of_day - 6.0 * 60.0)
-        / WORLD_DAY_MINUTES as f32;
+    let elevation =
+        std::f32::consts::TAU * (minutes_of_day - 6.0 * 60.0) / WORLD_DAY_MINUTES as f32;
     Vec3::new(elevation.cos(), elevation.sin(), 0.0).normalize()
 }
 
@@ -3691,8 +3749,14 @@ fn sync_planet_day_night_materials(
         }
     }
     for (handle, base) in [
-        (&planet_materials.ocean, &planet_materials.ocean_color),
-        (&planet_materials.cloud, &planet_materials.cloud_color),
+        (
+            &planet_materials.ocean,
+            &planet_materials.ocean_color,
+        ),
+        (
+            &planet_materials.cloud,
+            &planet_materials.cloud_color,
+        ),
         (
             &planet_materials.fake_body,
             &planet_materials.fake_body_color,
@@ -4014,7 +4078,11 @@ fn build_gm_island(grid: &mut Mut<Grid<u8>>) {
             for depth in 0..=GM_ISLAND_DEPTH {
                 let cell = column - IVec3::Y * depth;
                 let material = if depth == 0 {
-                    if edge { 3 } else { 1 }
+                    if edge {
+                        3
+                    } else {
+                        1
+                    }
                 } else if depth == GM_ISLAND_DEPTH && edge {
                     3
                 } else {
@@ -4029,7 +4097,10 @@ fn build_gm_island(grid: &mut Mut<Grid<u8>>) {
     for dz in -1..=1 {
         for dx in -1..=1 {
             let pad = GM_ISLAND_CENTER + IVec3::new(dx, 1, dz);
-            grid.set(pad, if dx == 0 && dz == 0 { 6 } else { 7 });
+            grid.set(
+                pad,
+                if dx == 0 && dz == 0 { 6 } else { 7 },
+            );
         }
     }
 }
@@ -5877,8 +5948,7 @@ fn combat_spaceship_corridor_auto_doors() -> Vec<VoxelAutoDoor> {
         // The cab interior and the hangar carve the workbook hull, so only the
         // corridor doorways that keep their surrounding wall survive.
         if cells.iter().any(|cell| {
-            combat_spaceship_cab_interior_contains(*cell)
-                || combat_spaceship_hangar_contains(*cell)
+            combat_spaceship_cab_interior_contains(*cell) || combat_spaceship_hangar_contains(*cell)
         }) {
             continue;
         }
@@ -6842,15 +6912,17 @@ fn spawn_voxel_spaceship(
                     .collect::<Vec<_>>();
                 let chunk = parent
                     .spawn((
-                        Name::new(format!("{} hull chunk {index:?}", spec.ship.name)),
+                        Name::new(format!(
+                            "{} hull chunk {index:?}",
+                            spec.ship.name
+                        )),
                         Transform::from_translation(origin.as_vec3() * VOXEL_SIZE),
                         VoxelSpaceshipChunk {
                             surfaces: Vec::new(),
                         },
                     ))
                     .with_children(|chunk_parent| {
-                        let (material_meshes, _) =
-                            build_voxel_meshes_from_cells(&local_cells);
+                        let (material_meshes, _) = build_voxel_meshes_from_cells(&local_cells);
                         for (material_id, mesh) in material_meshes {
                             surfaces.push(
                                 chunk_parent
@@ -6902,9 +6974,7 @@ fn spawn_voxel_spaceship(
                         parent.spawn((
                             Name::new("Arrogance corridor automatic door"),
                             Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
-                            MeshMaterial3d(
-                                materials.handles[panel.material as usize - 1].clone(),
-                            ),
+                            MeshMaterial3d(materials.handles[panel.material as usize - 1].clone()),
                             Transform::from_translation(translation),
                             Collider::cuboid(size.x, size.y, size.z),
                             panel,
@@ -7512,7 +7582,9 @@ fn dock_idle_voxel_spaceships(
         };
         linear.0 = carrier_point_velocity;
         angular.0 = carrier_angular;
-        commands.entity(entity).insert((RigidBody::Kinematic, docking));
+        commands
+            .entity(entity)
+            .insert((RigidBody::Kinematic, docking));
         let layers = docked_voxel_spaceship_collision_layers();
         commands.entity(entity).insert(layers);
         if let Ok(chunk_map) = ship_chunks.get(entity) {
@@ -8719,12 +8791,19 @@ fn voxel_auto_door_lock_panel(
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    egui::Area::new(egui::Id::new("voxel_spaceship_door_lock_panel"))
-        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 224.0))
+    egui::Area::new(egui::Id::new(
+        "voxel_spaceship_door_lock_panel",
+    ))
+    .anchor(
+        egui::Align2::CENTER_TOP,
+        egui::vec2(0.0, 224.0),
+    )
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(5, 18, 30, 232))
+            .fill(egui::Color32::from_rgba_unmultiplied(
+                5, 18, 30, 232,
+            ))
                 .stroke(egui::Stroke::new(
                     1.5,
                     egui::Color32::from_rgb(55, 205, 235),
@@ -8734,9 +8813,15 @@ fn voxel_auto_door_lock_panel(
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let (label, fill) = if lock_state.all_locked {
-                            ("解锁所有自动门", egui::Color32::from_rgb(42, 136, 96))
+                        (
+                            "解锁所有自动门",
+                            egui::Color32::from_rgb(42, 136, 96),
+                        )
                         } else {
-                            ("锁定所有自动门", egui::Color32::from_rgb(168, 116, 24))
+                        (
+                            "锁定所有自动门",
+                            egui::Color32::from_rgb(168, 116, 24),
+                        )
                         };
                         if ui
                             .add(egui::Button::new(label).fill(fill))
@@ -9161,16 +9246,31 @@ fn sync_voxel_player_standees(
 fn sync_voxel_standee_invisibility_render_layers(
     mut commands: Commands,
     missing_layers: Query<
-        (Entity, &VoxelPlayerStandee, Option<&Children>),
-        (Without<VoxelPlayerCaptureCamera>, Without<RenderLayers>),
+        (
+            Entity,
+            &VoxelPlayerStandee,
+            Option<&Children>,
+        ),
+        (
+            Without<VoxelPlayerCaptureCamera>,
+            Without<RenderLayers>,
+        ),
     >,
     mut standees: Query<
-        (Entity, &VoxelPlayerStandee, &Children, &mut RenderLayers),
+        (
+            Entity,
+            &VoxelPlayerStandee,
+            &Children,
+            &mut RenderLayers,
+        ),
         Without<VoxelPlayerCaptureCamera>,
     >,
     mut child_layers: Query<
         &mut RenderLayers,
-        (Without<VoxelPlayerStandee>, Without<VoxelPlayerCaptureCamera>),
+        (
+            Without<VoxelPlayerStandee>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
     >,
     missing_child_layers: Query<
         Entity,
@@ -9252,14 +9352,19 @@ fn active_voxel_unit_standees(
         .iter()
         .filter_map(|persisted| {
             let unit = manager.unit_pool.get(&persisted.unit_id)?;
-            let image_source = unit.character.image.trim();
+            let instance_id = persisted_voxel_unit_instance_id(persisted);
+            let instance = manager.unit_instances.get(&instance_id);
+            let image_source = instance
+                .map(|instance| instance.character.image.trim())
+                .filter(|source| !source.is_empty())
+                .unwrap_or_else(|| unit.character.image.trim());
             if image_source.is_empty() {
                 return None;
             }
             Some((
-                persisted.unit_id.clone(),
+                instance_id.clone(),
                 ActiveVoxelUnitStandee {
-                    target_id: voxel_unit_standee_target_id(&persisted.unit_id),
+                    target_id: instance_id,
                     image_source: image_source.to_owned(),
                     transform: Transform {
                         translation: Vec3::from_array(persisted.translation),
@@ -9293,20 +9398,20 @@ fn sync_voxel_unit_standees(
     let Some(manager) = manager else { return };
     assets.entities.clear();
     for (entity, standee) in &existing {
-        assets.entities.insert(standee.unit_id.clone(), entity);
+        assets.entities.insert(standee.instance_id.clone(), entity);
     }
     let active = active_voxel_unit_standees(&manager, &store);
 
     for (entity, standee) in &existing {
-        if active.contains_key(&standee.unit_id) {
+        if active.contains_key(&standee.instance_id) {
             continue;
         }
         commands.entity(entity).despawn();
-        assets.entities.remove(&standee.unit_id);
+        assets.entities.remove(&standee.instance_id);
     }
 
-    for (unit_id, active_standee) in active {
-        if let Some(entity) = assets.entities.get(&unit_id).copied() {
+    for (instance_id, active_standee) in active {
+        if let Some(entity) = assets.entities.get(&instance_id).copied() {
             if let Ok((_, standee)) = existing.get(entity) {
                 if standee.image_source == active_standee.image_source
                     && standee.access_visibility == active_standee.access_visibility
@@ -9319,7 +9424,7 @@ fn sync_voxel_unit_standees(
                 assets.failed_sources.remove(&standee.image_source);
             }
             commands.entity(entity).despawn();
-            assets.entities.remove(&unit_id);
+            assets.entities.remove(&instance_id);
         }
         if assets.failed_sources.contains(&active_standee.image_source) {
             continue;
@@ -9353,9 +9458,10 @@ fn sync_voxel_unit_standees(
                     Visibility::Visible,
                     VoxelUnitStandee {
                         target_id: active_standee.target_id,
-                        unit_id: unit_id.clone(),
+                        instance_id: instance_id.clone(),
                         image_source: active_standee.image_source.clone(),
                         access_visibility: active_standee.access_visibility.clone(),
+                        half_size: size * 0.5,
                     },
                     VoxelStandeeAccess::Unit(active_standee.access_visibility),
                 ));
@@ -9383,17 +9489,20 @@ fn sync_voxel_unit_standees(
                     ));
                 });
                 let entity = entity_commands.id();
-                assets.entities.insert(unit_id, entity);
+                assets.entities.insert(instance_id, entity);
             },
             Err(err) => {
                 assets.failed_sources.insert(active_standee.image_source);
-                eprintln!("failed to load voxel unit standee for {unit_id}: {err}");
+                eprintln!("failed to load voxel unit standee for {instance_id}: {err}");
             },
         }
     }
 }
 
-fn summon_owner_access_visibility(manager: &NapcatMessageManager, owner_id: &str) -> AccessVisibility {
+fn summon_owner_access_visibility(
+    manager: &NapcatMessageManager,
+    owner_id: &str,
+) -> AccessVisibility {
     let party_id = owner_id
         .parse::<u64>()
         .ok()
@@ -9412,8 +9521,7 @@ fn active_voxel_summon_standees(
         .standees
         .iter()
         .filter_map(|persisted| {
-            let (owner_id, index) =
-                crate::napcat::parse_summon_target_id(&persisted.summon_id)?;
+            let (owner_id, index) = crate::napcat::parse_summon_target_id(&persisted.summon_id)?;
             let summon = manager
                 .player_characters
                 .get(&owner_id)?
@@ -9525,6 +9633,7 @@ fn sync_voxel_summon_standees(
                         owner_id,
                         image_source: active_standee.image_source.clone(),
                         access_visibility: active_standee.access_visibility.clone(),
+                        half_size: size * 0.5,
                     },
                     VoxelStandeeAccess::Unit(active_standee.access_visibility),
                 ));
@@ -9567,14 +9676,8 @@ fn sync_voxel_summon_standees(
 fn clamp_voxel_summon_standees_to_owner_range(
     mut store: ResMut<Persistent<VoxelSummonStandeeStore>>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
-    owner_standees: Query<
-        (&VoxelPlayerStandee, &Transform),
-        Without<VoxelSummonStandee>,
-    >,
-    mut summon_standees: Query<
-        (&VoxelSummonStandee, &mut Transform),
-        Without<VoxelPlayerStandee>,
-    >,
+    owner_standees: Query<(&VoxelPlayerStandee, &Transform), Without<VoxelSummonStandee>>,
+    mut summon_standees: Query<(&VoxelSummonStandee, &mut Transform), Without<VoxelPlayerStandee>>,
 ) {
     let Some(manager) = manager else { return };
     let mut changed = false;
@@ -9598,7 +9701,11 @@ fn clamp_voxel_summon_standees_to_owner_range(
         if distance <= range || distance <= f32::EPSILON {
             continue;
         }
-        let clamped = clamp_standee_position_to_range(transform.translation, owner_position, range);
+        let clamped = clamp_standee_position_to_range(
+            transform.translation,
+            owner_position,
+            range,
+        );
         transform.translation = clamped;
         if let Some(persisted) = store
             .standees
@@ -9856,7 +9963,10 @@ fn initialize_voxel_blood_decay(
     for (entity, body) in &spaceships {
         for &(cell, material) in &body.cells {
             if material == VOXEL_BLOOD_MATERIAL {
-                blood_decay.refresh(VoxelBloodLocation::Spaceship(entity, cell), 0);
+                blood_decay.refresh(
+                    VoxelBloodLocation::Spaceship(entity, cell),
+                    0,
+                );
             }
         }
     }
@@ -9912,7 +10022,11 @@ fn decay_voxel_blood(
                 let Ok((body, ship)) = spaceships.get(entity) else {
                     continue;
                 };
-                let entry = voxel_spaceship_occupancy_mut(&mut occupancy.ships, entity, &body.cells);
+                let entry = voxel_spaceship_occupancy_mut(
+                    &mut occupancy.ships,
+                    entity,
+                    &body.cells,
+                );
                 if entry.cell_material(cell) != Some(VOXEL_BLOOD_MATERIAL) {
                     continue;
                 }
@@ -9978,8 +10092,7 @@ impl VoxelBloodDecay {
             .voxels
             .iter()
             .filter_map(|(location, voxel)| {
-                (voxel.remaining_seconds <= 0.0)
-                    .then_some((*location, voxel.restore_material))
+                (voxel.remaining_seconds <= 0.0).then_some((*location, voxel.restore_material))
             })
             .collect::<Vec<_>>();
         for (location, _) in &expired {
@@ -9994,8 +10107,7 @@ impl VoxelBloodDecay {
 pub(crate) fn validate_voxel_standee_image_source(source: &str) -> Result<(), String> {
     let path = cached_or_local_voxel_standee_path(source)?;
     let bytes = fs::read(&path).map_err(|err| format!("无法读取立绘：{err}"))?;
-    image::load_from_memory(&bytes)
-        .map_err(|err| format!("无法解析立绘图片：{err}"))?;
+    image::load_from_memory(&bytes).map_err(|err| format!("无法解析立绘图片：{err}"))?;
     Ok(())
 }
 
@@ -10453,6 +10565,15 @@ pub(crate) fn voxel_unit_standee_target_id(unit_id: &str) -> String {
     format!("unit:{}", unit_id.trim())
 }
 
+fn persisted_voxel_unit_instance_id(standee: &PersistedVoxelUnitStandee) -> String {
+    let instance_id = standee.instance_id.trim();
+    if instance_id.is_empty() {
+        voxel_unit_standee_target_id(&standee.unit_id)
+    } else {
+        instance_id.to_owned()
+    }
+}
+
 pub(crate) fn has_voxel_summon_standee(store: &VoxelSummonStandeeStore, summon_id: &str) -> bool {
     let summon_id = summon_id.trim();
     !summon_id.is_empty()
@@ -10462,7 +10583,7 @@ pub(crate) fn has_voxel_summon_standee(store: &VoxelSummonStandeeStore, summon_i
             .any(|standee| standee.summon_id == summon_id)
 }
 
-/// 在GM当前视野焦点为召唤物创建立牌；立牌归属跟随主人玩家的队伍可见性。
+/// 在GM所在位置为召唤物创建立牌；立牌归属跟随主人玩家的队伍可见性。
 pub(crate) fn place_voxel_summon_standee(
     store: &mut VoxelSummonStandeeStore,
     summon_id: &str,
@@ -10480,10 +10601,7 @@ pub(crate) fn place_voxel_summon_standee(
         .standees
         .iter()
         .position(|standee| standee.summon_id == summon_id);
-    let transform = default_voxel_unit_standee_transform(
-        editor,
-        existing_index.unwrap_or(store.standees.len()),
-    );
+    let transform = default_voxel_unit_standee_transform(editor);
     if let Some(index) = existing_index {
         let standee = &mut store.standees[index];
         let changed = standee.translation != transform.translation.to_array()
@@ -10525,24 +10643,29 @@ pub(crate) fn remove_voxel_summon_standees_for_owner(
     previous_len - store.standees.len()
 }
 
-pub(crate) fn has_voxel_unit_standee(store: &VoxelUnitStandeeStore, unit_id: &str) -> bool {
-    let unit_id = unit_id.trim();
-    !unit_id.is_empty()
+pub(crate) fn has_voxel_unit_standee(store: &VoxelUnitStandeeStore, instance_id: &str) -> bool {
+    let instance_id = instance_id.trim();
+    !instance_id.is_empty()
         && store
             .standees
             .iter()
-            .any(|standee| standee.unit_id == unit_id)
+            .any(|standee| persisted_voxel_unit_instance_id(standee) == instance_id)
 }
 
 pub(crate) fn place_voxel_unit_standee(
     store: &mut VoxelUnitStandeeStore,
     unit_id: &str,
+    instance_id: &str,
     image_source: &str,
     editor: &VoxelEditorState,
 ) -> Result<bool, String> {
     let unit_id = unit_id.trim();
+    let instance_id = instance_id.trim();
     if unit_id.is_empty() {
         return Err("单位ID为空".to_owned());
+    }
+    if instance_id.is_empty() {
+        return Err("NPC实例ID为空".to_owned());
     }
     if image_source.trim().is_empty() {
         return Err("单位模板还没有立绘".to_owned());
@@ -10550,11 +10673,8 @@ pub(crate) fn place_voxel_unit_standee(
     let existing_index = store
         .standees
         .iter()
-        .position(|standee| standee.unit_id == unit_id);
-    let transform = default_voxel_unit_standee_transform(
-        editor,
-        existing_index.unwrap_or(store.standees.len()),
-    );
+        .position(|standee| persisted_voxel_unit_instance_id(standee) == instance_id);
+    let transform = default_voxel_unit_standee_transform(editor);
     if let Some(index) = existing_index {
         let standee = &mut store.standees[index];
         let changed = standee.translation != transform.translation.to_array()
@@ -10565,6 +10685,7 @@ pub(crate) fn place_voxel_unit_standee(
     }
     store.standees.push(PersistedVoxelUnitStandee {
         unit_id: unit_id.to_owned(),
+        instance_id: instance_id.to_owned(),
         translation: transform.translation.to_array(),
         rotation: transform.rotation.to_array(),
         visibility: AccessVisibility::Public,
@@ -10572,52 +10693,31 @@ pub(crate) fn place_voxel_unit_standee(
     Ok(true)
 }
 
-pub(crate) fn remove_voxel_unit_standee(store: &mut VoxelUnitStandeeStore, unit_id: &str) -> bool {
-    let unit_id = unit_id.trim();
+pub(crate) fn remove_voxel_unit_standee(
+    store: &mut VoxelUnitStandeeStore,
+    instance_id: &str,
+) -> bool {
+    let instance_id = instance_id.trim();
     let previous_len = store.standees.len();
-    store.standees.retain(|standee| standee.unit_id != unit_id);
+    store
+        .standees
+        .retain(|standee| persisted_voxel_unit_instance_id(standee) != instance_id);
     store.standees.len() != previous_len
 }
 
-fn default_voxel_unit_standee_transform(
-    editor: &VoxelEditorState,
-    standee_index: usize,
-) -> Transform {
-    let camera = editor_camera_transform(editor);
-    let mut translation = if editor.first_person_enabled {
-        camera.translation + *camera.forward() * (VOXEL_SIZE * 4.0)
-    } else {
-        editor.camera_focus
-    };
-    let camera_right = *camera.right();
-    let flat_right = Vec3::new(camera_right.x, 0.0, camera_right.z).normalize_or_zero();
-    let flat_right = if flat_right == Vec3::ZERO { Vec3::X } else { flat_right };
-    translation += flat_right * symmetric_standee_slot(standee_index) as f32 * (VOXEL_SIZE * 3.0);
-
-    // The orbit focus commonly lies on or just inside the terrain surface. Move the
-    // standee slightly toward the GM camera so its portrait plane is not occluded by
-    // the surface that was clicked/focused.
-    let toward_camera = (camera.translation - translation).normalize_or_zero();
-    translation += toward_camera * (VOXEL_SIZE * 0.25);
-
-    if camera.translation.distance_squared(translation) <= f32::EPSILON {
-        Transform::from_translation(translation).with_rotation(camera.rotation)
-    } else {
-        Transform::from_translation(translation).looking_at(camera.translation, *camera.up())
-    }
+pub(crate) fn remove_voxel_unit_standees_for_template(
+    store: &mut VoxelUnitStandeeStore,
+    unit_id: &str,
+) -> usize {
+    let unit_id = unit_id.trim();
+    let previous_len = store.standees.len();
+    store.standees.retain(|standee| standee.unit_id != unit_id);
+    previous_len - store.standees.len()
 }
 
-fn symmetric_standee_slot(index: usize) -> i32 {
-    if index == 0 {
-        0
-    } else {
-        let distance = index.div_ceil(2) as i32;
-        if index % 2 == 1 {
-            distance
-        } else {
-            -distance
-        }
-    }
+fn default_voxel_unit_standee_transform(editor: &VoxelEditorState) -> Transform {
+    let camera = editor_camera_transform(editor);
+    Transform::from_translation(editor.gm_standee_position).with_rotation(camera.rotation)
 }
 
 fn voxel_player_display_name(
@@ -11145,7 +11245,11 @@ fn build_fake_planet_terrain_texture(radius: f32) -> Image {
         let cos_phi = phi.cos();
         for u in 0..WIDTH {
             let theta = (u as f32 + 0.5) / WIDTH as f32 * std::f32::consts::TAU;
-            let mesh_direction = Vec3::new(sin_phi * theta.cos(), sin_phi * theta.sin(), cos_phi);
+            let mesh_direction = Vec3::new(
+                sin_phi * theta.cos(),
+                sin_phi * theta.sin(),
+                cos_phi,
+            );
             let world_direction = mesh_to_world * mesh_direction;
             let material = fake_planet_terrain_material(world_direction, radius);
             let [r, g, b] = fake_planet_material_color(material);
@@ -11204,14 +11308,18 @@ fn setup_voxel_planet_shell(
     });
     planet_materials.fake_body = fake_body_material.clone();
     commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(
-            ORBITAL_PLANET_RADIUS - PLANET_FAKE_BODY_INSET,
-        )
+        Mesh3d(
+            meshes.add(
+                Sphere::new(ORBITAL_PLANET_RADIUS - PLANET_FAKE_BODY_INSET)
         .mesh()
-        .uv(256, 128))),
+                    .uv(256, 128),
+            ),
+        ),
         MeshMaterial3d(fake_body_material),
-        Transform::from_translation(ORBITAL_PLANET_CENTER)
-            .with_rotation(Quat::from_rotation_arc(Vec3::Z, Vec3::Y)),
+        Transform::from_translation(ORBITAL_PLANET_CENTER).with_rotation(Quat::from_rotation_arc(
+            Vec3::Z,
+            Vec3::Y,
+        )),
         Visibility::Visible,
         // 行星不投射也不接收阴影，避免靠近时出现巨大暗区。
         NotShadowCaster,
@@ -11227,9 +11335,7 @@ fn setup_voxel_planet_shell(
         ORBITAL_PLANET_RADIUS,
         ORBITAL_PLANET_RADIUS + PLANET_ATMOSPHERE_THICKNESS,
     );
-    commands.insert_resource(PlanetAtmosphereHandles {
-        material,
-    });
+    commands.insert_resource(PlanetAtmosphereHandles { material });
 }
 
 fn animate_planet_clouds(
@@ -11336,8 +11442,18 @@ fn use_player_possession_tool(
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
-    standees: Query<(
+    player_standees: Query<(
         &VoxelPlayerStandee,
+        &GlobalTransform,
+        &Visibility,
+    )>,
+    unit_standees: Query<(
+        &VoxelUnitStandee,
+        &GlobalTransform,
+        &Visibility,
+    )>,
+    summon_standees: Query<(
+        &VoxelSummonStandee,
         &GlobalTransform,
         &Visibility,
     )>,
@@ -11345,6 +11461,8 @@ fn use_player_possession_tool(
     mut possession: ResMut<VoxelPossessionState>,
     mut camera_editor: ResMut<VoxelPlayerCameraEditor>,
     camera_store: ResMut<Persistent<VoxelPlayerCameraStore>>,
+    unit_store: ResMut<Persistent<VoxelUnitStandeeStore>>,
+    summon_store: ResMut<Persistent<VoxelSummonStandeeStore>>,
     egui_input: Res<EguiWantsInput>,
 ) {
     if !possession_tool_can_target(
@@ -11367,7 +11485,7 @@ fn use_player_possession_tool(
     ) else {
         return;
     };
-    let selected = standees
+    let selected_player = player_standees
         .iter()
         .filter_map(|(standee, transform, visibility)| {
             if *visibility == Visibility::Hidden {
@@ -11378,30 +11496,101 @@ fn use_player_possession_tool(
         })
         .filter(|(_, distance)| *distance <= MAX_RAY_DISTANCE)
         .min_by(|(_, left), (_, right)| left.total_cmp(right))
-        .map(|(user_id, _)| user_id);
+        .map(|(user_id, distance)| {
+            (
+                VoxelPossessionSelection::Player(user_id),
+                distance,
+            )
+        });
+    let selected_unit = unit_standees
+        .iter()
+        .filter_map(|(standee, transform, visibility)| {
+            (*visibility != Visibility::Hidden)
+                .then(|| ray_intersects_player_standee(ray, transform, standee.half_size))
+                .flatten()
+                .map(|distance| {
+                    (
+                        VoxelPossessionSelection::Standee(VoxelPossessedStandee::Unit(
+                            standee.instance_id.clone(),
+                        )),
+                        distance,
+                    )
+                })
+        });
+    let selected_summon = summon_standees
+        .iter()
+        .filter_map(|(standee, transform, visibility)| {
+            (*visibility != Visibility::Hidden)
+                .then(|| ray_intersects_player_standee(ray, transform, standee.half_size))
+                .flatten()
+                .map(|distance| {
+                    (
+                        VoxelPossessionSelection::Standee(VoxelPossessedStandee::Summon(
+                            standee.summon_id.clone(),
+                        )),
+                        distance,
+                    )
+                })
+        });
+    let selected = selected_player
+        .into_iter()
+        .chain(selected_unit)
+        .chain(selected_summon)
+        .filter(|(_, distance)| *distance <= MAX_RAY_DISTANCE)
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(selection, _)| selection);
 
     if let Err(err) = camera_store.persist() {
         eprintln!("failed to persist player camera before possession tool action: {err}");
     }
+    if let Some(active_standee) = possession.active_standee.as_ref() {
+        let result = match active_standee {
+            VoxelPossessedStandee::Unit(_) => unit_store.persist(),
+            VoxelPossessedStandee::Summon(_) => summon_store.persist(),
+        };
+        if let Err(err) = result {
+            eprintln!("failed to persist standee before possession tool action: {err}");
+        }
+    }
     match selected {
-        Some(user_id) if possession.active_user_id == Some(user_id) => {
+        Some(VoxelPossessionSelection::Player(user_id))
+            if possession.active_user_id == Some(user_id) =>
+        {
             possession.release();
             camera_editor.selected_user_id = Some(user_id);
             editor.physics_status = Some(format!("已解除PL {user_id}的接管"));
         },
-        Some(user_id) => {
+        Some(VoxelPossessionSelection::Player(user_id)) => {
             possession.possess(user_id);
             camera_editor.selected_user_id = Some(user_id);
             editor.physics_status = Some(format!("已选择并接管PL {user_id}"));
         },
-        None if possession.active_user_id.is_some() => {
+        Some(VoxelPossessionSelection::Standee(standee)) => {
+            let label = match &standee {
+                VoxelPossessedStandee::Unit(instance_id) => format!("NPC {instance_id}"),
+                VoxelPossessedStandee::Summon(summon_id) => format!("召唤物 {summon_id}"),
+            };
+            if possession.active_standee.as_ref() == Some(&standee) {
+                possession.release();
+                editor.physics_status = Some(format!("已解除{label}的接管"));
+            } else {
+                possession.possess_standee(standee);
+                editor.physics_status = Some(format!("已接管{label}"));
+            }
+        },
+        None if possession.is_active() => {
             possession.release();
-            editor.physics_status = Some("已解除PL接管".to_owned());
+            editor.physics_status = Some("已解除角色接管".to_owned());
         },
         None => {
-            editor.physics_status = Some("没有瞄准玩家立绘".to_owned());
+            editor.physics_status = Some("没有瞄准PL、NPC或召唤物立绘".to_owned());
         },
     }
+}
+
+enum VoxelPossessionSelection {
+    Player(u64),
+    Standee(VoxelPossessedStandee),
 }
 
 fn use_portrait_transform_tool(
@@ -11452,7 +11641,9 @@ fn use_portrait_transform_tool(
         return;
     };
     editor.portrait_transform_target = Some(user_id);
-    editor.physics_status = Some(format!("已打开立绘变形选择：PL {user_id}"));
+    editor.physics_status = Some(format!(
+        "已打开立绘变形选择：PL {user_id}"
+    ));
 }
 
 fn use_spaceship_possession_tool(
@@ -11495,9 +11686,7 @@ fn use_spaceship_possession_tool(
             MAX_RAY_DISTANCE,
             true,
             &SpatialQueryFilter::default(),
-            &|entity| {
-                spaceships.contains(entity) || chunk_parents.contains(entity)
-            },
+            &|entity| spaceships.contains(entity) || chunk_parents.contains(entity),
         )
         .and_then(|hit| {
             let ship = chunk_parents
@@ -12055,10 +12244,7 @@ fn animate_voxel_materials(
         let pulse = 4.5 + (seconds * 2.4).sin() * 1.2;
         lava.emissive = voxel_emissive(pulse, pulse * 0.11, 0.015);
     }
-    for handle in [
-        &locked_door_materials.normal,
-        &locked_door_materials.fade,
-    ] {
+    for handle in [&locked_door_materials.normal, &locked_door_materials.fade] {
         if let Some(mut locked_door) = materials.get_mut(handle) {
             let pulse = 2.8 + (seconds * 2.6).sin() * 1.0;
             locked_door.emissive = voxel_emissive(pulse, pulse * 0.035, 0.018);
@@ -12090,8 +12276,12 @@ fn sync_voxel_occlusion_fade(
     for handle in fade_materials
         .handles
         .iter()
-        .chain(std::iter::once(&fade_materials.planet_ocean))
-        .chain(std::iter::once(&locked_door_materials.fade))
+        .chain(std::iter::once(
+            &fade_materials.planet_ocean,
+        ))
+        .chain(std::iter::once(
+            &locked_door_materials.fade,
+        ))
     {
         if let Some(mut material) = materials.get_mut(handle) {
             material.base_color = material.base_color.with_alpha(opacity);
@@ -12501,8 +12691,7 @@ fn replay_fade_handle(
                 .then(|| fade_materials.planet_ocean.clone())
         })
         .or_else(|| {
-            (material.0 == locked_door_materials.normal)
-                .then(|| locked_door_materials.fade.clone())
+            (material.0 == locked_door_materials.normal).then(|| locked_door_materials.fade.clone())
         })
 }
 
@@ -12693,11 +12882,7 @@ fn make_selection_physical(
 
     for (cell, _) in &selected_voxels {
         grid.set(*cell, 0);
-        crate::replay::record_replay_grid_cell(
-            scene_recorder.as_deref_mut(),
-            *cell,
-            0,
-        );
+        crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), *cell, 0);
     }
     spawn_voxel_physics_body(
         &mut commands,
@@ -12839,6 +13024,7 @@ fn voxel_spaceship_occupancy_mut<'a>(
 struct VoxelSpaceshipRayHit {
     occupied: IVec3,
     add: IVec3,
+    normal: IVec3,
     distance: f32,
 }
 
@@ -12884,6 +13070,7 @@ fn raycast_voxel_spaceship_cells(
             return Some(VoxelSpaceshipRayHit {
                 occupied: cell,
                 add: if cell == previous { cell + normal } else { previous },
+                normal,
                 distance: transform.transform_point(point).distance(ray.origin),
             });
         }
@@ -12906,11 +13093,7 @@ fn blood_splatter_cells(
     brush_radius: i32,
     seed: u64,
 ) -> Vec<IVec3> {
-    let normal = if surface_normal == IVec3::ZERO {
-        IVec3::Y
-    } else {
-        surface_normal
-    };
+    let normal = if surface_normal == IVec3::ZERO { IVec3::Y } else { surface_normal };
     let (tangent_a, tangent_b) = if normal.x != 0 {
         (IVec3::Y, IVec3::Z)
     } else if normal.y != 0 {
@@ -12950,7 +13133,12 @@ fn voxel_edit_cells(
     seed: u64,
 ) -> Vec<IVec3> {
     if mode == VoxelEditMode::Add && material == VOXEL_BLOOD_MATERIAL {
-        return blood_splatter_cells(center, surface_normal, brush_radius, seed);
+        return blood_splatter_cells(
+            center,
+            surface_normal,
+            brush_radius,
+            seed,
+        );
     }
     let radius = brush_radius.max(0);
     prism(
@@ -12980,9 +13168,7 @@ fn rebuild_voxel_spaceship_chunk(
         .collect::<Vec<_>>();
     let local_solid = local_cells
         .iter()
-        .filter_map(|(cell, material)| {
-            TrpgVoxelConnector::solid(material).then_some(*cell)
-        })
+        .filter_map(|(cell, material)| TrpgVoxelConnector::solid(material).then_some(*cell))
         .collect::<Vec<_>>();
     let (material_meshes, _) = build_voxel_meshes_from_cells(&local_cells);
     if local_solid.is_empty() {
@@ -13894,11 +14080,7 @@ fn place_creative_light(
         if grid.get(cell).copied().unwrap_or(0) != 8 {
             grid.set(cell, 8);
             dirty_chunks.mark_cell_and_neighbors(cell);
-            crate::replay::record_replay_grid_cell(
-                scene_recorder.as_deref_mut(),
-                cell,
-                8,
-            );
+            crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), cell, 8);
         }
     }
     spawn_voxel_placed_light(
@@ -14005,9 +14187,7 @@ fn drag_voxel_physics_body(
             MAX_RAY_DISTANCE,
             true,
             &SpatialQueryFilter::default(),
-            &|entity| {
-                body_entities.contains(entity) || chunk_parents.contains(entity)
-            },
+            &|entity| body_entities.contains(entity) || chunk_parents.contains(entity),
         ) else {
             return;
         };
@@ -14101,11 +14281,7 @@ fn edit_voxel_grid(
         }
     }
     if possession.active_user_id.is_some()
-        || editor.is_player_possession_tool_equipped()
-        || editor.is_spaceship_possession_tool_equipped()
-        || editor.is_teleport_tool_equipped()
-        || editor.is_door_lock_tool_equipped()
-        || editor.is_gm_clock_equipped()
+        || editor.equipped_item_handles_right_click_without_voxel_edit()
     {
         return;
     }
@@ -14159,9 +14335,7 @@ fn edit_voxel_grid(
                 MAX_RAY_DISTANCE,
                 true,
                 &SpatialQueryFilter::default(),
-                &|entity| {
-                    physics_bodies.contains(entity) || chunk_parents.contains(entity)
-                },
+                &|entity| physics_bodies.contains(entity) || chunk_parents.contains(entity),
             )
             .map(|mut hit| {
                 // Chunked hull colliders hit the chunk child; resolve to the
@@ -14263,14 +14437,7 @@ fn edit_voxel_grid(
                         )
                 })
                 .map(
-                    |(
-                        entity,
-                        body,
-                        transform,
-                        linear_velocity,
-                        angular_velocity,
-                        is_ship,
-                    )| {
+                    |(entity, body, transform, linear_velocity, angular_velocity, is_ship)| {
                         (
                             entity,
                             body.cells.clone(),
@@ -14296,22 +14463,12 @@ fn edit_voxel_grid(
             }
             for (
                 source_index,
-                (
-                    entity,
-                    cells,
-                    transform,
-                    linear_velocity,
-                    angular_velocity,
-                    is_ship,
-                ),
+                (entity, cells, transform, linear_velocity, angular_velocity, is_ship),
             ) in ship_bodies.into_iter().enumerate()
             {
-                let ship_id = is_ship
-                    .map(|ship| ship.id.clone())
-                    .unwrap_or_default();
+                let ship_id = is_ship.map(|ship| ship.id.clone()).unwrap_or_default();
                 let removed = {
-                    let entry =
-                        voxel_spaceship_occupancy_mut(&mut occupancy.ships, entity, &cells);
+                    let entry = voxel_spaceship_occupancy_mut(&mut occupancy.ships, entity, &cells);
                     let removed = voxel_spaceship_cells_in_radius(
                         entry,
                         &transform,
@@ -14444,11 +14601,7 @@ fn edit_voxel_grid(
             if static_part_count > 0 {
                 for (cell, _) in &selected {
                     grid.set(*cell, 0);
-                    crate::replay::record_replay_grid_cell(
-                        scene_recorder.as_deref_mut(),
-                        *cell,
-                        0,
-                    );
+                    crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), *cell, 0);
                 }
                 for cells in split_voxel_cells_randomly(
                     selected,
@@ -14480,11 +14633,7 @@ fn edit_voxel_grid(
             }
             for (cell, _) in &selected {
                 grid.set(*cell, 0);
-                crate::replay::record_replay_grid_cell(
-                    scene_recorder.as_deref_mut(),
-                    *cell,
-                    0,
-                );
+                crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), *cell, 0);
             }
             let entity = spawn_voxel_physics_body(
                 &mut commands,
@@ -14589,7 +14738,11 @@ fn edit_voxel_grid(
         if is_ship.is_none() {
             continue;
         }
-        let entry = voxel_spaceship_occupancy_mut(&mut occupancy.ships, entity, &body.cells);
+        let entry = voxel_spaceship_occupancy_mut(
+            &mut occupancy.ships,
+            entity,
+            &body.cells,
+        );
         let Some(hit) = raycast_voxel_spaceship_cells(entry, transform, ray) else {
             continue;
         };
@@ -14613,14 +14766,13 @@ fn edit_voxel_grid(
                 hit.occupied
             };
             let mut changed = 0;
-            let edit_seed = if input_mode == VoxelEditMode::Add
-                && editor.material == VOXEL_BLOOD_MATERIAL
-            {
-                *explosion_sequence = explosion_sequence.wrapping_add(1);
-                blood_splatter_seed(center, *explosion_sequence)
-            } else {
-                0
-            };
+            let edit_seed =
+                if input_mode == VoxelEditMode::Add && editor.material == VOXEL_BLOOD_MATERIAL {
+                    *explosion_sequence = explosion_sequence.wrapping_add(1);
+                    blood_splatter_seed(center, *explosion_sequence)
+                } else {
+                    0
+                };
             for cell in voxel_edit_cells(
                 center,
                 hit.normal,
@@ -14629,21 +14781,21 @@ fn edit_voxel_grid(
                 editor.material,
                 edit_seed,
             ) {
-                let before = planet.cells.get(&cell).copied().unwrap_or(0);
-                let did_change = match input_mode {
+                        let before = planet.cells.get(&cell).copied().unwrap_or(0);
+                        let did_change = match input_mode {
                     VoxelEditMode::Add => set_planet_voxel(&mut planet, cell, editor.material),
-                    VoxelEditMode::Remove => dig_planet_voxel(&mut planet, cell),
-                    VoxelEditMode::Paint => {
-                        planet.cells.contains_key(&cell)
-                            && set_planet_voxel(&mut planet, cell, editor.material)
-                    },
-                    _ => false,
-                };
-                if did_change && editor.material == VOXEL_BLOOD_MATERIAL {
-                    blood_decay.refresh(VoxelBloodLocation::Planet(cell), before);
-                }
-                changed += usize::from(did_change);
-            }
+                            VoxelEditMode::Remove => dig_planet_voxel(&mut planet, cell),
+                            VoxelEditMode::Paint => {
+                                planet.cells.contains_key(&cell)
+                                    && set_planet_voxel(&mut planet, cell, editor.material)
+                            },
+                            _ => false,
+                        };
+                        if did_change && editor.material == VOXEL_BLOOD_MATERIAL {
+                            blood_decay.refresh(VoxelBloodLocation::Planet(cell), before);
+                        }
+                        changed += usize::from(did_change);
+                    }
             if changed > 0 {
                 editor.physics_status = Some(format!(
                     "已编辑 {changed} 个行星 0.25 体素"
@@ -14692,18 +14844,13 @@ fn edit_voxel_grid(
         };
         let ship_id = ship.map(|ship| ship.id.clone()).unwrap_or_default();
         let surface_normal = hit.add - hit.occupied;
-        let center = if input_mode == VoxelEditMode::Add {
-            hit.add
+        let center = if input_mode == VoxelEditMode::Add { hit.add } else { hit.occupied };
+        let edit_seed =
+            if input_mode == VoxelEditMode::Add && editor.material == VOXEL_BLOOD_MATERIAL {
+                *explosion_sequence = explosion_sequence.wrapping_add(1);
+                blood_splatter_seed(center, *explosion_sequence)
         } else {
-            hit.occupied
-        };
-        let edit_seed = if input_mode == VoxelEditMode::Add
-            && editor.material == VOXEL_BLOOD_MATERIAL
-        {
-            *explosion_sequence = explosion_sequence.wrapping_add(1);
-            blood_splatter_seed(center, *explosion_sequence)
-        } else {
-            0
+                0
         };
         let edit_cells = voxel_edit_cells(
             center,
@@ -14714,43 +14861,46 @@ fn edit_voxel_grid(
             edit_seed,
         );
         let changed = {
-            let entry =
-                voxel_spaceship_occupancy_mut(&mut occupancy.ships, ship_entity, &body.cells);
+            let entry = voxel_spaceship_occupancy_mut(
+                &mut occupancy.ships,
+                ship_entity,
+                &body.cells,
+            );
             let mut changed = 0;
             let mut stroke = Vec::new();
             for position in edit_cells {
-                let target = VoxelChangeTarget::Spaceship(ship_entity);
-                if !editor.stroke_positions.insert((target, position)) {
-                    continue;
-                }
-                let before = entry.cell_material(position).unwrap_or(0);
-                let Some(after) = edited_voxel(input_mode, before, editor.material) else {
-                    continue;
-                };
-                if before == after {
-                    continue;
-                }
-                set_voxel_spaceship_cell(entry, position, after);
-                if after == VOXEL_BLOOD_MATERIAL {
+                        let target = VoxelChangeTarget::Spaceship(ship_entity);
+                        if !editor.stroke_positions.insert((target, position)) {
+                            continue;
+                        }
+                        let before = entry.cell_material(position).unwrap_or(0);
+                        let Some(after) = edited_voxel(input_mode, before, editor.material) else {
+                            continue;
+                        };
+                        if before == after {
+                            continue;
+                        }
+                        set_voxel_spaceship_cell(entry, position, after);
+                        if after == VOXEL_BLOOD_MATERIAL {
                     blood_decay.refresh(
                         VoxelBloodLocation::Spaceship(ship_entity, position),
                         before,
                     );
-                }
-                crate::replay::record_replay_ship_hull_cell(
-                    scene_recorder.as_deref_mut(),
-                    &ship_id,
-                    position,
-                    after,
-                );
-                stroke.push(VoxelChange {
-                    target,
-                    position,
-                    before,
-                    after,
-                });
-                changed += 1;
-            }
+                        }
+                        crate::replay::record_replay_ship_hull_cell(
+                            scene_recorder.as_deref_mut(),
+                            &ship_id,
+                            position,
+                            after,
+                        );
+                        stroke.push(VoxelChange {
+                            target,
+                            position,
+                            before,
+                            after,
+                        });
+                        changed += 1;
+                    }
             editor.active_stroke.extend(stroke);
             changed
         };
@@ -14790,9 +14940,7 @@ fn edit_voxel_grid(
     };
 
     let mut stroke = Vec::new();
-    let edit_seed = if input_mode == VoxelEditMode::Add
-        && editor.material == VOXEL_BLOOD_MATERIAL
-    {
+    let edit_seed = if input_mode == VoxelEditMode::Add && editor.material == VOXEL_BLOOD_MATERIAL {
         *explosion_sequence = explosion_sequence.wrapping_add(1);
         blood_splatter_seed(center, *explosion_sequence)
     } else {
@@ -14806,35 +14954,38 @@ fn edit_voxel_grid(
         editor.material,
         edit_seed,
     ) {
-        if !editor
-            .stroke_positions
-            .insert((VoxelChangeTarget::Grid, position))
-        {
-            continue;
-        }
-        let before = grid.get(position).copied().unwrap_or(0);
-        let Some(after) = edited_voxel(input_mode, before, editor.material) else {
-            continue;
-        };
-        if before != after {
-            grid.set(position, after);
-            if after == VOXEL_BLOOD_MATERIAL {
-                blood_decay.refresh(VoxelBloodLocation::Grid(position), before);
+                if !editor
+                    .stroke_positions
+                    .insert((VoxelChangeTarget::Grid, position))
+                {
+                    continue;
+                }
+                let before = grid.get(position).copied().unwrap_or(0);
+                let Some(after) = edited_voxel(input_mode, before, editor.material) else {
+                    continue;
+                };
+                if before != after {
+                    grid.set(position, after);
+                    if after == VOXEL_BLOOD_MATERIAL {
+                blood_decay.refresh(
+                    VoxelBloodLocation::Grid(position),
+                    before,
+                );
+                    }
+                    dirty_chunks.mark_cell_and_neighbors(position);
+                    crate::replay::record_replay_grid_cell(
+                        scene_recorder.as_deref_mut(),
+                        position,
+                        after,
+                    );
+                    stroke.push(VoxelChange {
+                        target: VoxelChangeTarget::Grid,
+                        position,
+                        before,
+                        after,
+                    });
+                }
             }
-            dirty_chunks.mark_cell_and_neighbors(position);
-            crate::replay::record_replay_grid_cell(
-                scene_recorder.as_deref_mut(),
-                position,
-                after,
-            );
-            stroke.push(VoxelChange {
-                target: VoxelChangeTarget::Grid,
-                position,
-                before,
-                after,
-            });
-        }
-    }
     if !stroke.is_empty() {
         editor.active_stroke.extend(stroke);
     }
@@ -14928,7 +15079,9 @@ pub(crate) fn rebuild_dirty_voxel_spaceships(
                     &old_surfaces,
                 );
             }
-            commands.entity(entity).insert(VoxelSpaceshipChunks(chunk_map));
+            commands
+                .entity(entity)
+                .insert(VoxelSpaceshipChunks(chunk_map));
         }
         if let Some(micro_tiles) = micro_tiles {
             rebuild_voxel_spaceship_micro_tiles(
@@ -15402,12 +15555,31 @@ fn control_first_person_player(
             Without<VoxelFirstPersonPlayer>,
         ),
     >,
+    controlled_standees: Query<
+        (
+            &GlobalTransform,
+            Option<&VoxelUnitStandee>,
+            Option<&VoxelSummonStandee>,
+        ),
+        (
+            Without<VoxelFirstPersonPlayer>,
+            Without<VoxelPlayerStandee>,
+        ),
+    >,
 ) {
     let Ok((entity, ground_hits, mut transform, mut velocity, mut acceleration, is_sensor)) =
         players.single_mut()
     else {
         return;
     };
+
+    if !possession.is_active()
+        && spaceship_control
+            .as_deref()
+            .is_none_or(|control| control.cockpit_eye.is_none())
+    {
+        editor.gm_standee_position = transform.translation + Vec3::Y * FIRST_PERSON_EYE_OFFSET;
+    }
 
     if let Some((cockpit_eye, cockpit_rotation)) =
         spaceship_control.as_deref().and_then(|control| {
@@ -15482,8 +15654,11 @@ fn control_first_person_player(
             possession.turn_start_position = Some(transform.translation);
             possession.last_player_position = Some(transform.translation);
             possession.movement_turn = possession_world_turn(manager.as_deref(), user_id);
-            possession.movement_limit =
-                possession_final_movement(manager.as_deref(), battle_store.as_deref(), user_id);
+            possession.movement_limit = possession_final_movement(
+                manager.as_deref(),
+                battle_store.as_deref(),
+                user_id,
+            );
             if let (Some(campaign_id), Some(store)) = (
                 possession_campaign_id(manager.as_deref(), user_id),
                 movement_store.as_deref(),
@@ -15510,10 +15685,46 @@ fn control_first_person_player(
         }
     }
 
+    if possession.active_standee != possession.applied_standee {
+        if let Some(target) = possession.active_standee.as_ref() {
+            let target_transform = controlled_standees.iter().find_map(
+                |(transform, unit, summon)| match target {
+                    VoxelPossessedStandee::Unit(instance_id) => unit
+                        .filter(|standee| standee.instance_id == *instance_id)
+                        .map(|_| transform),
+                    VoxelPossessedStandee::Summon(summon_id) => summon
+                        .filter(|standee| standee.summon_id == *summon_id)
+                        .map(|_| transform),
+                },
+            );
+            if let Some(target_transform) = target_transform {
+                transform.translation =
+                    first_person_player_position(target_transform.translation());
+                velocity.0 = Vec3::ZERO;
+                editor.first_person_enabled = true;
+                editor.first_person_was_enabled = true;
+                editor.first_person_flying = false;
+                editor.creative_inventory_open = false;
+                editor.teleport_menu_open = false;
+                possession.player_inventory_open = false;
+                possession.standee_persist_elapsed = 0.0;
+            } else {
+                possession.active_standee = None;
+                editor.physics_status = Some("被接管的NPC或召唤物已不在世界中".to_owned());
+            }
+        }
+        if possession.active_standee.is_some() {
+            possession.applied_standee = possession.active_standee.clone();
+        }
+    }
+
     if let Some(user_id) = possession.active_user_id {
         let world_turn = possession_world_turn(manager.as_deref(), user_id);
-        let movement_limit =
-            possession_final_movement(manager.as_deref(), battle_store.as_deref(), user_id);
+        let movement_limit = possession_final_movement(
+            manager.as_deref(),
+            battle_store.as_deref(),
+            user_id,
+        );
         if possession.movement_turn != world_turn {
             possession.movement_turn = world_turn;
             possession.movement_used = 0.0;
@@ -15597,6 +15808,13 @@ fn control_first_person_player(
             }
         }
     }
+    if possession.active_standee.is_some() {
+        editor.first_person_enabled = true;
+        editor.first_person_flying = false;
+        editor.creative_inventory_open = false;
+        editor.teleport_menu_open = false;
+        possession.player_inventory_open = false;
+    }
 
     acceleration.0 =
         if editor.first_person_flying { Vec3::ZERO } else { Vec3::new(0.0, -9.81, 0.0) };
@@ -15626,7 +15844,7 @@ fn control_first_person_player(
     }
 
     editor.first_person_space_tap_elapsed += time.delta_secs();
-    if possession.active_user_id.is_none()
+    if !possession.is_active()
         && keyboard.just_pressed(KeyCode::Space)
         && register_first_person_space_tap(&mut editor.first_person_space_tap_elapsed)
     {
@@ -15672,7 +15890,9 @@ fn control_first_person_player(
         .any(|hit| (-hit.normal2).angle_between(Vec3::Y).abs() <= 55.0_f32.to_radians());
     if grounded
         && keyboard.just_pressed(KeyCode::Space)
-        && (!possession.movement_completed || possession.movement_limit_bypassed)
+        && (possession.active_user_id.is_none()
+            || !possession.movement_completed
+            || possession.movement_limit_bypassed)
     {
         velocity.y = FIRST_PERSON_JUMP_SPEED;
     }
@@ -15982,6 +16202,73 @@ fn sync_possessed_player_camera(
         if let Err(err) = store.persist() {
             eprintln!("failed to persist possessed player camera: {err}");
         }
+    }
+}
+
+fn sync_possessed_voxel_standee(
+    time: Res<Time>,
+    viewport_camera: Query<
+        &Transform,
+        (
+            With<VoxelViewportCamera>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
+    mut possession: ResMut<VoxelPossessionState>,
+    mut unit_store: ResMut<Persistent<VoxelUnitStandeeStore>>,
+    mut summon_store: ResMut<Persistent<VoxelSummonStandeeStore>>,
+) {
+    let Some(target) = possession.active_standee.clone() else {
+        if possession.applied_standee.take().is_some() {
+            if let Err(err) = unit_store.persist() {
+                eprintln!("failed to persist released NPC standee position: {err}");
+            }
+            if let Err(err) = summon_store.persist() {
+                eprintln!("failed to persist released summon standee position: {err}");
+            }
+        }
+        possession.standee_persist_elapsed = 0.0;
+        return;
+    };
+    let Ok(camera_transform) = viewport_camera.single() else { return };
+    let translation = camera_transform.translation.to_array();
+    let rotation = camera_transform.rotation.to_array();
+    let changed = match &target {
+        VoxelPossessedStandee::Unit(instance_id) => unit_store
+            .standees
+            .iter_mut()
+            .find(|standee| persisted_voxel_unit_instance_id(standee) == *instance_id)
+            .is_some_and(|standee| {
+                let changed = standee.translation != translation || standee.rotation != rotation;
+                standee.translation = translation;
+                standee.rotation = rotation;
+                changed
+            }),
+        VoxelPossessedStandee::Summon(summon_id) => summon_store
+            .standees
+            .iter_mut()
+            .find(|standee| standee.summon_id == *summon_id)
+            .is_some_and(|standee| {
+                let changed = standee.translation != translation || standee.rotation != rotation;
+                standee.translation = translation;
+                standee.rotation = rotation;
+                changed
+            }),
+    };
+    if !changed {
+        return;
+    }
+    possession.standee_persist_elapsed += time.delta_secs();
+    if possession.standee_persist_elapsed < 0.5 {
+        return;
+    }
+    possession.standee_persist_elapsed = 0.0;
+    let result = match target {
+        VoxelPossessedStandee::Unit(_) => unit_store.persist(),
+        VoxelPossessedStandee::Summon(_) => summon_store.persist(),
+    };
+    if let Err(err) = result {
+        eprintln!("failed to persist possessed standee position: {err}");
     }
 }
 
@@ -16584,9 +16871,7 @@ fn draw_voxel_target(
                 MAX_RAY_DISTANCE,
                 true,
                 &SpatialQueryFilter::default(),
-                &|entity| {
-                    physics_bodies.contains(entity) || chunk_entities.contains(entity)
-                },
+                &|entity| physics_bodies.contains(entity) || chunk_entities.contains(entity),
             );
             let static_distance = hit
                 .as_ref()
@@ -16777,8 +17062,7 @@ mod tests {
         assert!(sunrise.x > 0.9999 && sunrise.y.abs() < 1.0e-4);
         assert!(sunset.x < -0.9999 && sunset.y.abs() < 1.0e-4);
         assert!(
-            (world_time_sun_direction(12.0 * 60.0)
-                - world_time_sun_direction(36.0 * 60.0))
+            (world_time_sun_direction(12.0 * 60.0) - world_time_sun_direction(36.0 * 60.0))
             .length()
                 < 1.0e-5
         );
@@ -16859,6 +17143,27 @@ mod tests {
 
         assert_eq!(possession.selected_hotbar_slot, 8);
         assert_eq!(possession.active_user_id, None);
+    }
+
+    #[test]
+    fn npc_and_summon_possession_stays_separate_from_player_identity() {
+        let mut possession = VoxelPossessionState::default();
+        let npc = VoxelPossessedStandee::Unit("unit:slime#1".to_owned());
+        possession.possess_standee(npc.clone());
+
+        assert_eq!(possession.active_user_id, None);
+        assert_eq!(possession.active_standee, Some(npc));
+        assert!(possession.is_active());
+
+        possession.possess(42);
+        assert_eq!(possession.active_user_id, Some(42));
+        assert_eq!(possession.active_standee, None);
+
+        possession.possess_standee(VoxelPossessedStandee::Summon(
+            "summon:42:0".to_owned(),
+        ));
+        possession.release();
+        assert!(!possession.is_active());
     }
 
     #[test]
@@ -17257,17 +17562,13 @@ mod tests {
         );
         assert_eq!(
             VoxelTeleportDestination::GmIsland.player_position(),
-            Some(
-                (GM_ISLAND_CENTER + IVec3::Y).as_vec3() * VOXEL_SIZE
-                    + Vec3::Y * 0.5
-            )
+            Some((GM_ISLAND_CENTER + IVec3::Y).as_vec3() * VOXEL_SIZE + Vec3::Y * 0.5)
         );
     }
 
     #[test]
     fn teleport_menu_lists_the_gm_island_destination() {
-        assert!(VoxelTeleportDestination::ALL
-            .contains(&VoxelTeleportDestination::GmIsland));
+        assert!(VoxelTeleportDestination::ALL.contains(&VoxelTeleportDestination::GmIsland));
         assert_eq!(
             VoxelTeleportDestination::GmIsland.label(),
             "GM小岛"
@@ -17329,8 +17630,8 @@ mod tests {
                     Some(&if edge { 3 } else { 2 }),
                     "island base at {top:?}"
                 );
-                let pad_area = x.abs_diff(GM_ISLAND_CENTER.x) <= 1
-                    && z.abs_diff(GM_ISLAND_CENTER.z) <= 1;
+                let pad_area =
+                    x.abs_diff(GM_ISLAND_CENTER.x) <= 1 && z.abs_diff(GM_ISLAND_CENTER.z) <= 1;
                 if !pad_area {
                     assert_eq!(
                         grid.get(top + IVec3::Y),
@@ -17341,7 +17642,10 @@ mod tests {
                 top_cells += 1;
             }
         }
-        assert_eq!(top_cells, GM_ISLAND_EXTENT * GM_ISLAND_EXTENT);
+        assert_eq!(
+            top_cells,
+            GM_ISLAND_EXTENT * GM_ISLAND_EXTENT
+        );
 
         assert_eq!(
             grid.get(GM_ISLAND_CENTER + IVec3::Y),
@@ -17723,18 +18027,28 @@ mod tests {
         let mut state = VoxelInvisibilityState::default();
         assert!(!state.invisible_user_ids.contains(&42));
 
-        assert!(toggle_voxel_player_invisibility(&mut state, 42));
+        assert!(toggle_voxel_player_invisibility(
+            &mut state, 42
+        ));
         assert!(state.invisible_user_ids.contains(&42));
 
-        assert!(!toggle_voxel_player_invisibility(&mut state, 42));
+        assert!(!toggle_voxel_player_invisibility(
+            &mut state, 42
+        ));
         assert!(!state.invisible_user_ids.contains(&42));
 
-        assert!(toggle_voxel_player_invisibility(&mut state, 42));
-        assert!(toggle_voxel_player_invisibility(&mut state, 7));
+        assert!(toggle_voxel_player_invisibility(
+            &mut state, 42
+        ));
+        assert!(toggle_voxel_player_invisibility(
+            &mut state, 7
+        ));
         assert!(state.invisible_user_ids.contains(&7));
         assert_eq!(state.invisible_user_ids.len(), 2);
 
-        assert!(!toggle_voxel_player_invisibility(&mut state, 7));
+        assert!(!toggle_voxel_player_invisibility(
+            &mut state, 7
+        ));
         assert_eq!(state.invisible_user_ids.len(), 1);
     }
 
@@ -17752,7 +18066,10 @@ mod tests {
     #[test]
     fn invisible_standee_switches_to_the_gm_only_render_layer() {
         let mut app = App::new();
-        app.add_systems(Update, sync_voxel_standee_invisibility_render_layers);
+        app.add_systems(
+            Update,
+            sync_voxel_standee_invisibility_render_layers,
+        );
         // Mirror the real spawn path: standees and their planes are spawned
         // without RenderLayers, so the sync system has to insert them first.
         let child_a = app.world_mut().spawn(Transform::default()).id();
@@ -17813,10 +18130,11 @@ mod tests {
     }
 
     #[test]
-    fn unit_pool_places_one_visible_camera_facing_standee_near_the_gm_focus() {
+    fn unit_pool_places_standees_at_the_gm_position_not_the_view_focus() {
         let editor = VoxelEditorState {
             first_person_enabled: false,
             camera_focus: Vec3::new(12.0, 3.0, -8.0),
+            gm_standee_position: Vec3::new(-4.0, 7.0, 9.0),
             ..default()
         };
         let mut store = VoxelUnitStandeeStore::default();
@@ -17824,6 +18142,7 @@ mod tests {
         assert!(place_voxel_unit_standee(
             &mut store,
             " slime ",
+            " unit:slime#1 ",
             "slime.png",
             &editor,
         )
@@ -17831,18 +18150,41 @@ mod tests {
         assert!(!place_voxel_unit_standee(
             &mut store,
             "slime",
+            "unit:slime#1",
             "slime-v2.png",
             &editor,
         )
         .unwrap());
-        assert!(has_voxel_unit_standee(&store, "slime"));
-        assert_eq!(store.standees.len(), 1);
+        assert!(place_voxel_unit_standee(
+            &mut store,
+            "slime",
+            "unit:slime#2",
+            "slime.png",
+            &editor,
+        )
+        .unwrap());
+        assert!(has_voxel_unit_standee(
+            &store,
+            "unit:slime#1"
+        ));
+        assert!(has_voxel_unit_standee(
+            &store,
+            "unit:slime#2"
+        ));
+        assert_eq!(store.standees.len(), 2);
         assert_eq!(store.standees[0].unit_id, "slime");
+        assert_eq!(
+            store.standees[0].instance_id,
+            "unit:slime#1"
+        );
         let placed = Vec3::from_array(store.standees[0].translation);
-        assert!((placed.distance(editor.camera_focus) - VOXEL_SIZE * 0.25).abs() < 0.0001);
+        assert_eq!(placed, editor.gm_standee_position);
+        assert_ne!(placed, editor.camera_focus);
         let camera = editor_camera_transform(&editor);
-        let forward = Quat::from_array(store.standees[0].rotation) * Vec3::NEG_Z;
-        assert!(forward.dot((camera.translation - placed).normalize()) > 0.999);
+        assert_eq!(
+            Quat::from_array(store.standees[0].rotation),
+            camera.rotation
+        );
         assert_eq!(
             store.standees[0].visibility,
             AccessVisibility::Public
@@ -17853,9 +18195,13 @@ mod tests {
         );
 
         assert!(remove_voxel_unit_standee(
-            &mut store, " slime "
+            &mut store,
+            " unit:slime#1 "
         ));
-        assert!(!has_voxel_unit_standee(&store, "slime"));
+        assert!(!has_voxel_unit_standee(
+            &store,
+            "unit:slime#1"
+        ));
     }
 
     #[test]
@@ -17863,6 +18209,7 @@ mod tests {
         let editor = VoxelEditorState {
             first_person_enabled: false,
             camera_focus: Vec3::new(4.0, 2.0, 6.0),
+            gm_standee_position: Vec3::new(20.0, 4.0, -3.0),
             ..default()
         };
         let mut store = VoxelSummonStandeeStore::default();
@@ -17881,15 +18228,26 @@ mod tests {
             &editor,
         )
         .unwrap());
-        assert!(has_voxel_summon_standee(&store, "summon:10001:0"));
+        assert!(has_voxel_summon_standee(
+            &store,
+            "summon:10001:0"
+        ));
         assert_eq!(store.standees.len(), 1);
-        assert_eq!(store.standees[0].summon_id, "summon:10001:0");
+        assert_eq!(
+            store.standees[0].summon_id,
+            "summon:10001:0"
+        );
         let first_placement = Vec3::from_array(store.standees[0].translation);
-        assert!((first_placement.distance(editor.camera_focus) - VOXEL_SIZE * 0.25).abs() < 0.0001);
+        assert_eq!(
+            first_placement,
+            editor.gm_standee_position
+        );
+        assert_ne!(first_placement, editor.camera_focus);
 
         let moved_editor = VoxelEditorState {
             first_person_enabled: false,
             camera_focus: Vec3::new(-8.0, 5.0, 12.0),
+            gm_standee_position: Vec3::new(-12.0, 6.0, 18.0),
             ..default()
         };
         assert!(place_voxel_summon_standee(
@@ -17904,8 +18262,14 @@ mod tests {
             first_placement
         );
 
-        assert!(remove_voxel_summon_standee(&mut store, "summon:10001:0"));
-        assert!(!has_voxel_summon_standee(&store, "summon:10001:0"));
+        assert!(remove_voxel_summon_standee(
+            &mut store,
+            "summon:10001:0"
+        ));
+        assert!(!has_voxel_summon_standee(
+            &store,
+            "summon:10001:0"
+        ));
     }
 
     #[test]
@@ -17913,15 +18277,15 @@ mod tests {
         let editor = VoxelEditorState::default();
         let mut store = VoxelSummonStandeeStore::default();
         assert!(place_voxel_summon_standee(&mut store, "summon:1:0", " ", &editor).is_err());
-        assert!(!has_voxel_summon_standee(&store, "summon:1:0"));
+        assert!(!has_voxel_summon_standee(
+            &store,
+            "summon:1:0"
+        ));
     }
 
     #[test]
     fn standee_image_validation_accepts_images_and_rejects_non_images() {
-        assert!(validate_voxel_standee_image_source(
-            "assets/textures/default_avatar.png"
-        )
-        .is_ok());
+        assert!(validate_voxel_standee_image_source("assets/textures/default_avatar.png").is_ok());
         assert!(validate_voxel_standee_image_source("Cargo.toml").is_err());
     }
 
@@ -17994,9 +18358,10 @@ mod tests {
         app.world_mut().spawn((
             VoxelUnitStandee {
                 target_id: "unit:slime".to_owned(),
-                unit_id: "slime".to_owned(),
+                instance_id: "unit:slime".to_owned(),
                 image_source: "slime.png".to_owned(),
                 access_visibility: AccessVisibility::Public,
+                half_size: Vec2::splat(VOXEL_SIZE),
             },
             Transform::from_xyz(7.0, 2.0, 4.0),
         ));
@@ -18027,16 +18392,18 @@ mod tests {
             .add_systems(Update, sync_voxel_gm_map_state);
         app.world_mut().spawn((
             VoxelViewportCamera,
-            Transform::from_translation(Vec3::new(12.0, 3.0, -8.0))
-                .with_rotation(Quat::from_rotation_y(
-                    std::f32::consts::FRAC_PI_2,
-                )),
+            Transform::from_translation(Vec3::new(12.0, 3.0, -8.0)).with_rotation(
+                Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            ),
         ));
 
         app.update();
 
         let gm = app.world().resource::<VoxelGmMapState>();
-        assert_eq!(gm.position, Some(Vec3::new(12.0, 3.0, -8.0)));
+        assert_eq!(
+            gm.position,
+            Some(Vec3::new(12.0, 3.0, -8.0))
+        );
         // yaw 90° turns the default -Z facing toward -X (west).
         assert!((gm.facing - Vec2::new(-1.0, 0.0)).length() < 1e-5);
     }
@@ -19464,11 +19831,20 @@ mod tests {
 
     #[test]
     fn auto_door_panels_share_one_lock_state_across_trigger_groups() {
-        let door = make_voxel_auto_door(IVec3::new(8, 0, -3), IVec3::X, 2, 8, 1.75);
+        let door = make_voxel_auto_door(
+            IVec3::new(8, 0, -3),
+            IVec3::X,
+            2,
+            8,
+            1.75,
+        );
         assert!(!door.locked);
         let mut panels = voxel_auto_door_panels(&door);
         assert!(panels.iter().all(|panel| !panel.locked));
-        assert_eq!(panels[0].trigger_center, panels[1].trigger_center);
+        assert_eq!(
+            panels[0].trigger_center,
+            panels[1].trigger_center
+        );
 
         // The GM tool toggles every panel of the clicked door in one press.
         let sliding = panels
@@ -19497,13 +19873,17 @@ mod tests {
     fn locked_auto_doors_swap_to_the_red_glow_material_and_back() {
         let mut app = App::new();
         let mut asset_store = Assets::<StandardMaterial>::default();
-        let handles = std::array::from_fn(|_| {
-            asset_store.add(StandardMaterial::default())
-        });
+        let handles = std::array::from_fn(|_| asset_store.add(StandardMaterial::default()));
         let planet_ocean = asset_store.add(StandardMaterial::default());
         // A station automatic door (not the Arrogance cab door) must receive
         // the same lock visuals as every other automatic door.
-        let door = make_voxel_auto_door(IVec3::new(3, 0, -2), IVec3::X, 2, 8, 1.75);
+        let door = make_voxel_auto_door(
+            IVec3::new(3, 0, -2),
+            IVec3::X,
+            2,
+            8,
+            1.75,
+        );
         let panel = voxel_auto_door_panels(&door)[0].clone();
         let original_handle = handles[panel.material as usize - 1].clone();
         app.init_resource::<VoxelAutoDoorLockState>()
@@ -19512,7 +19892,10 @@ mod tests {
                 handles,
                 planet_ocean,
             })
-            .add_systems(Update, sync_voxel_auto_door_lock_materials);
+            .add_systems(
+                Update,
+                sync_voxel_auto_door_lock_materials,
+            );
         let entity = app
             .world_mut()
             .spawn((
@@ -19578,13 +19961,9 @@ mod tests {
         let mut asset_store = Assets::<StandardMaterial>::default();
         let locked = asset_store.add(StandardMaterial::default());
         let locked_fade = asset_store.add(StandardMaterial::default());
-        let handles = std::array::from_fn(|_| {
-            asset_store.add(StandardMaterial::default())
-        });
+        let handles = std::array::from_fn(|_| asset_store.add(StandardMaterial::default()));
         let planet_ocean = asset_store.add(StandardMaterial::default());
-        let fade_handles = std::array::from_fn(|_| {
-            asset_store.add(StandardMaterial::default())
-        });
+        let fade_handles = std::array::from_fn(|_| asset_store.add(StandardMaterial::default()));
         let fade_planet_ocean = asset_store.add(StandardMaterial::default());
         let locked_door_materials = VoxelLockedDoorMaterials {
             normal: locked.clone(),
@@ -19896,46 +20275,6 @@ mod tests {
     }
 
     #[test]
-    fn spaceship_raycast_reports_the_adjacent_surface_cell_for_placement() {
-        let mut occupancy = VoxelSpaceshipOccupancy::empty();
-        occupancy.set_cell(IVec3::ZERO, 1);
-        let ray = Ray3d::new(
-            Vec3::new(-2.0, 0.5, 0.5) * VOXEL_SIZE,
-            Dir3::X,
-        );
-
-        let hit = raycast_voxel_spaceship_cells(
-            &occupancy,
-            &Transform::default(),
-            ray,
-        )
-        .expect("ray must hit the ship hull");
-
-        assert_eq!(hit.occupied, IVec3::ZERO);
-        assert_eq!(hit.add, IVec3::NEG_X);
-    }
-
-    #[test]
-    fn spaceship_voxel_change_round_trips_in_ship_local_occupancy() {
-        let mut occupancy = VoxelSpaceshipOccupancy::empty();
-        occupancy.set_cell(IVec3::ZERO, 1);
-        let position = IVec3::X;
-        let change = VoxelChange {
-            target: VoxelChangeTarget::Spaceship(Entity::PLACEHOLDER),
-            position,
-            before: 0,
-            after: 4,
-        };
-
-        set_voxel_spaceship_cell(&mut occupancy, change.position, change.after);
-        assert_eq!(occupancy.cell_material(position), Some(4));
-        set_voxel_spaceship_cell(&mut occupancy, change.position, change.before);
-        assert_eq!(occupancy.cell_material(position), None);
-        set_voxel_spaceship_cell(&mut occupancy, change.position, change.after);
-        assert_eq!(occupancy.cell_material(position), Some(4));
-    }
-
-    #[test]
     fn raycast_hits_voxel_and_adjacent_air() {
         let (app, entity) = test_grid();
         let grid = app.world().entity(entity).get::<Grid<u8>>().unwrap();
@@ -19953,6 +20292,61 @@ mod tests {
         let hit = raycast_grid(grid, ray).unwrap();
         assert!(hit.occupied.is_some());
         assert_ne!(hit.occupied, hit.add);
+    }
+
+    #[test]
+    fn spaceship_raycast_reports_the_outward_surface_normal_for_placement() {
+        let mut occupancy = VoxelSpaceshipOccupancy::empty();
+        occupancy.set_cell(IVec3::ZERO, 1);
+        let ray = Ray3d::new(
+            Vec3::new(-2.0, 0.5, 0.5) * VOXEL_SIZE,
+            Dir3::X,
+        );
+
+        let hit = raycast_voxel_spaceship_cells(&occupancy, &Transform::default(), ray)
+        .expect("ray must hit the ship hull");
+
+        assert_eq!(hit.occupied, IVec3::ZERO);
+        assert_eq!(hit.normal, IVec3::NEG_X);
+        assert_eq!(hit.occupied + hit.normal, IVec3::NEG_X);
+    }
+
+    #[test]
+    fn spaceship_voxel_change_round_trips_in_ship_local_occupancy() {
+        let mut occupancy = VoxelSpaceshipOccupancy::empty();
+        occupancy.set_cell(IVec3::ZERO, 1);
+        let position = IVec3::X;
+        let change = VoxelChange {
+            target: VoxelChangeTarget::Spaceship(Entity::PLACEHOLDER),
+            position,
+            before: 0,
+            after: 4,
+        };
+
+        set_voxel_spaceship_cell(
+            &mut occupancy,
+            change.position,
+            change.after,
+        );
+        assert_eq!(
+            occupancy.cell_material(position),
+            Some(4)
+        );
+        set_voxel_spaceship_cell(
+            &mut occupancy,
+            change.position,
+            change.before,
+        );
+        assert_eq!(occupancy.cell_material(position), None);
+        set_voxel_spaceship_cell(
+            &mut occupancy,
+            change.position,
+            change.after,
+        );
+        assert_eq!(
+            occupancy.cell_material(position),
+            Some(4)
+        );
     }
 
     #[test]
@@ -20099,7 +20493,9 @@ mod tests {
         assert!(TrpgVoxelConnector::solid(&8));
         assert!(TrpgVoxelConnector::solid(&9));
         assert!(TrpgVoxelConnector::solid(&10));
-        assert!(!TrpgVoxelConnector::solid(&VOXEL_BLOOD_MATERIAL));
+        assert!(!TrpgVoxelConnector::solid(
+            &VOXEL_BLOOD_MATERIAL
+        ));
     }
 
     #[test]
@@ -20119,8 +20515,18 @@ mod tests {
             .and_then(|(_, mesh)| mesh.attribute(Mesh::ATTRIBUTE_POSITION))
             .and_then(VertexAttributeValues::as_float3)
             .unwrap();
-        let min = positions.iter().copied().map(Vec3::from).reduce(Vec3::min).unwrap();
-        let max = positions.iter().copied().map(Vec3::from).reduce(Vec3::max).unwrap();
+        let min = positions
+            .iter()
+            .copied()
+            .map(Vec3::from)
+            .reduce(Vec3::min)
+            .unwrap();
+        let max = positions
+            .iter()
+            .copied()
+            .map(Vec3::from)
+            .reduce(Vec3::max)
+            .unwrap();
         assert_eq!(max - min, Vec3::splat(VOXEL_SIZE));
     }
 
@@ -20166,7 +20572,10 @@ mod tests {
         for cell in splatter {
             occupancy.set_cell(cell, VOXEL_BLOOD_MATERIAL);
         }
-        assert_eq!(occupancy.cell_material(IVec3::ZERO), Some(1));
+        assert_eq!(
+            occupancy.cell_material(IVec3::ZERO),
+            Some(1)
+        );
         assert!(
             occupancy
                 .chunks
@@ -20237,6 +20646,20 @@ mod tests {
             force_tool_action(VoxelEditMode::Physics),
             None
         );
+    }
+
+    #[test]
+    fn item_action_tools_do_not_fall_through_to_voxel_editing() {
+        let mut editor = VoxelEditorState::default();
+        assert!(!editor.equipped_item_handles_right_click_without_voxel_edit());
+
+        for item in [
+            VoxelCreativeItem::PortraitTransformTool,
+            VoxelCreativeItem::InvisibilityTool,
+        ] {
+            editor.equip_creative_item(item);
+            assert!(editor.equipped_item_handles_right_click_without_voxel_edit());
+        }
     }
 
     #[test]
@@ -20740,6 +21163,71 @@ mod tests {
         let possession = app.world().resource::<VoxelPossessionState>();
         assert_eq!(possession.selected_hotbar_slot, 4);
         assert!(possession.player_inventory_open);
+    }
+
+    #[test]
+    fn digit_nine_releases_npc_possession_without_changing_creative_hotbar() {
+        let mut possession = VoxelPossessionState::default();
+        possession.possess_standee(VoxelPossessedStandee::Unit(
+            "unit:slime#1".to_owned(),
+        ));
+        let mut editor = VoxelEditorState::default();
+        editor.select_hotbar_slot(0);
+
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<EguiWantsInput>()
+            .insert_resource(editor)
+            .insert_resource(possession)
+            .add_systems(Update, voxel_editor_shortcuts);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Digit9);
+
+        app.update();
+
+        let possession = app.world().resource::<VoxelPossessionState>();
+        assert!(!possession.is_active());
+        assert_eq!(possession.selected_hotbar_slot, 8);
+        assert_eq!(
+            app.world()
+                .resource::<VoxelEditorState>()
+                .selected_hotbar_slot,
+            0
+        );
+    }
+
+    #[test]
+    fn digit_nine_releases_player_possession_even_without_character_hotbar_lookup() {
+        let mut possession = VoxelPossessionState::default();
+        possession.possess(42);
+
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<EguiWantsInput>()
+            .init_resource::<VoxelEditorState>()
+            .insert_resource(possession)
+            .add_systems(Update, voxel_editor_shortcuts);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Digit9);
+
+        app.update();
+
+        assert!(!app.world().resource::<VoxelPossessionState>().is_active());
+    }
+
+    #[test]
+    fn ninth_hotbar_click_releases_summon_possession() {
+        let mut possession = VoxelPossessionState::default();
+        possession.possess_standee(VoxelPossessedStandee::Summon(
+            "summon:42:0".to_owned(),
+        ));
+
+        possession.activate_standee_hotbar_slot(8);
+
+        assert!(!possession.is_active());
+        assert_eq!(possession.selected_hotbar_slot, 8);
     }
 
     #[test]
@@ -21325,6 +21813,7 @@ mod tests {
             chat_targets: HashMap::default(),
             chat_target_kinds: HashMap::default(),
             player_characters: HashMap::default(),
+            hidden_roles: HashMap::default(),
             trpg_groups: HashMap::default(),
             current_trpg_group: None,
             groups: HashMap::default(),
@@ -21337,6 +21826,8 @@ mod tests {
             skill_pool: Vec::new(),
             item_pool: Vec::new(),
             unit_pool: HashMap::default(),
+            unit_instances: HashMap::default(),
+            next_unit_instance_index: 1,
             pending_talent_choices: HashMap::default(),
             used_talent_names: HashSet::default(),
         }
@@ -21504,7 +21995,10 @@ mod tests {
         assert_eq!(possession.movement_used, 0.0);
         assert!(!possession.movement_completed);
         assert!(!possession.movement_happened);
-        assert_eq!(possession.turn_start_position, Some(turn_start));
+        assert_eq!(
+            possession.turn_start_position,
+            Some(turn_start)
+        );
     }
 
     #[test]

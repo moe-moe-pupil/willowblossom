@@ -37,6 +37,12 @@ use crate::rule_engine::{
     BuffValue,
 };
 use crate::{
+    hidden_roles::{
+        effective_hidden_role_character,
+        hidden_role_battle_state,
+        hidden_role_opening_shield,
+        HiddenRoleBattleState,
+    },
     napcat::{
         arrogance_damage_dealt_multiplier,
         champion_damage_dealt_multiplier,
@@ -104,7 +110,6 @@ use crate::{
         penance_decayed_healing_dealt_modifier,
         sin_on_sin_exp_bonus_percent,
         skill_rule_args,
-        STATUS_POINTS_PER_LEVEL,
         status_damage_attribute_multiplier,
         status_healing_attribute_multiplier,
         trpg_config_with_weave,
@@ -122,9 +127,12 @@ use crate::{
         TrpgBasicConfig,
         TrpgDamageBonusKind,
         TrpgDamageTakenKind,
+        TrpgGlobalCombatModifiers,
         TrpgGroup,
+        UnitInstance,
         UnitPoolEntry,
         UnitRarity,
+        STATUS_POINTS_PER_LEVEL,
     },
     rule_engine::{
         apply_skill_type_damage_default,
@@ -247,13 +255,60 @@ pub struct BattleRoundStore {
 }
 
 impl BattleRoundStore {
+    pub fn add_unit_instance_to_encounter(
+        &mut self,
+        encounter_id: &str,
+        instance_id: &str,
+        manager: &NapcatMessageManager,
+    ) -> Result<bool, String> {
+        let instance_id = instance_id.trim();
+        let instance = manager
+            .unit_instances
+            .get(instance_id)
+            .ok_or_else(|| "NPC实例不存在".to_owned())?;
+        let template = manager
+            .unit_pool
+            .get(&instance.template_id)
+            .ok_or_else(|| "NPC实例对应的单位模板不存在".to_owned())?;
+        let encounter = self
+            .encounters
+            .get_mut(encounter_id)
+            .ok_or_else(|| "战斗轮不存在".to_owned())?;
+        if encounter
+            .participants
+            .iter()
+            .any(|participant| participant.target_id == instance_id)
+        {
+            return Ok(false);
+        }
+        let mut participant = participant_from_unit_instance(instance_id, instance, template);
+        participant.group_modifiers = encounter_group_combat_modifiers(encounter, manager);
+        initialize_participant_clock(
+            &mut participant,
+            encounter.trpg_group.as_deref(),
+            manager,
+        );
+        encounter.participants.push(participant);
+        Ok(true)
+    }
+
+    pub fn remove_unit_template_data(&mut self, template_id: &str) -> usize {
+        let mut removed = 0;
+        for encounter in self.encounters.values_mut() {
+            let previous_len = encounter.participants.len();
+            encounter
+                .participants
+                .retain(|participant| participant.unit_template_id.as_deref() != Some(template_id));
+            removed += previous_len - encounter.participants.len();
+        }
+        removed
+    }
+
     pub fn remove_player_data(&mut self, target_id: &str) -> usize {
         let mut removed = 0;
         for encounter in self.encounters.values_mut() {
             let previous_participant_len = encounter.participants.len();
-            encounter
-                .participants
-                .retain(|participant| {
+            encounter.participants.retain(|participant| {
                     participant.target_id != target_id
                         && !(participant.is_summon
                             && participant.summon_owner_id.as_deref() == Some(target_id))
@@ -286,6 +341,9 @@ impl BattleRoundStore {
                 participant
                     .delayed_healing_ticks
                     .retain(|tick| tick.source_id != target_id);
+                participant
+                    .corrosion_stacks
+                    .retain(|stack| stack.source_id != target_id);
             }
             encounter
                 .combat_log
@@ -464,6 +522,13 @@ pub struct BattleParticipantSnapshot {
     pub healing_dealt_modifier: f32,
     #[serde(default = "default_combat_modifier")]
     pub healing_taken_modifier: f32,
+    /// TRPG-group-wide multipliers for every participant. Kept separate
+    /// from character/equipment/buff modifiers so group setting changes do not
+    /// get baked into persisted character, NPC, or summon state.
+    #[serde(default, alias = "npc_group_modifiers")]
+    pub group_modifiers: TrpgGlobalCombatModifiers,
+    #[serde(default)]
+    pub hidden_role: HiddenRoleBattleState,
     #[serde(default)]
     pub arrogance_damage_bonus_per_source: f32,
     #[serde(default)]
@@ -619,6 +684,8 @@ pub struct BattleParticipantSnapshot {
     #[serde(default)]
     pub delayed_healing_ticks: Vec<BattleDelayedHealingTick>,
     #[serde(default)]
+    pub corrosion_stacks: Vec<BattleCorrosionStack>,
+    #[serde(default)]
     pub damage_taken_this_turn: f32,
     #[serde(default)]
     pub healing_taken_this_turn: f32,
@@ -647,6 +714,22 @@ pub struct BattleDelayedHealingTick {
     #[serde(default)]
     pub overhealing_shield_cap_rate: f32,
     pub turns_remaining: i32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum BattleCorrosionKind {
+    Poison,
+    Rust,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BattleCorrosionStack {
+    pub source_id: String,
+    pub source_name: String,
+    pub kind: BattleCorrosionKind,
+    pub damage_per_turn: f32,
+    pub turns_remaining: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -732,6 +815,11 @@ pub const GOOSE_CHANNEL_HEAL_RATE: f32 = 0.20;
 /// 「复仇之魂」：造成有效治疗后，治疗者获得治疗量一半的战斗护盾，最多 5 点。
 pub const REVENGE_SOUL_SHIELD_RATE: f32 = 0.50;
 pub const REVENGE_SOUL_SHIELD_CAP: f32 = 5.0;
+const CORROSION_WAVE_POISON_DAMAGE: f32 = 3.0;
+const CORROSION_WAVE_POISON_TURNS: u32 = 4;
+const CORROSION_WAVE_RUST_DAMAGE: f32 = 6.0;
+const CORROSION_WAVE_RUST_TURNS: u32 = 2;
+const CORROSION_WAVE_STACK_MULTIPLIER: f32 = 0.75;
 
 fn trpg_group_campaign_id(group: &TrpgGroup) -> &str {
     let campaign_id = group.campaign_id.trim();
@@ -765,6 +853,133 @@ fn character_revenge_soul_shield_rate(character: &PlayerCharacter) -> f32 {
         })
         .then_some(REVENGE_SOUL_SHIELD_RATE)
         .unwrap_or(0.0)
+}
+
+fn character_has_corrosion_wave(character: &PlayerCharacter) -> bool {
+    character
+        .skill_notes
+        .iter()
+        .enumerate()
+        .any(|(index, note)| {
+            character
+                .skill_metadata
+                .get(index)
+                .is_some_and(|metadata| metadata.is_approved())
+                && (character
+                    .skill_names
+                    .get(index)
+                    .is_some_and(|name| name.trim() == "腐蚀波")
+                    || note.contains("腐蚀波"))
+                && note.contains("每次攻击后")
+                && note.contains("所有敌人")
+                && note.contains("中毒")
+                && note.contains("锈蚀")
+        })
+}
+
+fn participant_is_player_side(
+    participant: &BattleParticipantSnapshot,
+    manager: &NapcatMessageManager,
+) -> bool {
+    participant.player_character
+        || participant
+            .summon_owner_id
+            .as_deref()
+            .is_some_and(|owner_id| manager.player_characters.contains_key(owner_id))
+}
+
+fn participant_is_mechanical(
+    participant: &BattleParticipantSnapshot,
+    manager: &NapcatMessageManager,
+) -> bool {
+    if participant.summon_kind == SummonKind::Mech {
+        return true;
+    }
+    participant
+        .unit_template_id
+        .as_deref()
+        .and_then(|unit_id| manager.unit_pool.get(unit_id))
+        .is_some_and(|unit| {
+            unit.category.contains("机械")
+                || unit.label.contains("机械")
+                || unit.note.contains("机械")
+        })
+        || participant.display_name.contains("机械")
+}
+
+fn apply_corrosion_wave_after_attack(
+    encounter: &mut BattleEncounter,
+    actor_id: &str,
+    actor_character: Option<&PlayerCharacter>,
+    manager: &NapcatMessageManager,
+) -> usize {
+    if !encounter.active || !actor_character.is_some_and(character_has_corrosion_wave) {
+        return 0;
+    }
+    let Some(actor) = encounter
+        .participants
+        .iter()
+        .find(|participant| participant.target_id == actor_id)
+    else {
+        return 0;
+    };
+    let actor_name = actor.display_name.clone();
+    let actor_player_side = participant_is_player_side(actor, manager);
+    let mut logs = Vec::new();
+    for target in &mut encounter.participants {
+        if !target.alive
+            || target.target_id == actor_id
+            || participant_is_player_side(target, manager) == actor_player_side
+        {
+            continue;
+        }
+        let kind = if participant_is_mechanical(target, manager) {
+            BattleCorrosionKind::Rust
+        } else {
+            BattleCorrosionKind::Poison
+        };
+        let active_layers = target
+            .corrosion_stacks
+            .iter()
+            .filter(|stack| stack.source_id == actor_id)
+            .count();
+        let (base_damage, turns, label) = match kind {
+            BattleCorrosionKind::Poison => (
+                CORROSION_WAVE_POISON_DAMAGE,
+                CORROSION_WAVE_POISON_TURNS,
+                "中毒",
+            ),
+            BattleCorrosionKind::Rust => (
+                CORROSION_WAVE_RUST_DAMAGE,
+                CORROSION_WAVE_RUST_TURNS,
+                "锈蚀",
+            ),
+        };
+        let damage_per_turn = if active_layers == 0 {
+            base_damage
+        } else {
+            base_damage * CORROSION_WAVE_STACK_MULTIPLIER
+        };
+        target.corrosion_stacks.push(BattleCorrosionStack {
+            source_id: actor_id.to_owned(),
+            source_name: actor_name.clone(),
+            kind,
+            damage_per_turn,
+            turns_remaining: turns,
+        });
+        logs.push(format!(
+            "{}触发腐蚀波，使{}获得第{}层{}（每回合{}点物理伤害，持续{}回合）",
+            actor_name,
+            target.display_name,
+            active_layers + 1,
+            label,
+            format_number(damage_per_turn),
+            turns
+        ));
+    }
+    let applied = logs.len();
+    encounter.action_log.extend(logs);
+    applied
 }
 
 fn grant_participant_revenge_soul_shield(
@@ -871,6 +1086,9 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.inspiration_target_id = None;
             participant.inspiration_sources.clear();
             participant.keen_evasion_available = participant.keen_evasion_enabled;
+            participant.hidden_role.free_action_available =
+                participant.hidden_role.free_action_skill.is_some();
+            participant.hidden_role.second_wind_used = false;
             participant.undying_rage_used = false;
             participant.undying_rage_active = false;
             participant.hope_avatar_used = false;
@@ -880,6 +1098,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.mirror_coat_cleanup_pending = false;
             participant.sunset_death_time_reset_pending = false;
             participant.goose_channeling_turns = 0;
+            participant.corrosion_stacks.clear();
             participant.arcane_shield =
                 participant.max_mp.max(0.0) * participant.arcane_shield_rate.max(0.0);
             participant.revenge_soul_shield = 0.0;
@@ -912,6 +1131,8 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
         for participant in &mut encounter.participants {
             participant.combat_turns_completed = 0;
             participant.keen_evasion_available = false;
+            participant.hidden_role.free_action_available = false;
+            participant.hidden_role.second_wind_used = false;
             participant.undying_rage_active = false;
             participant.arcane_shield = 0.0;
             participant.revenge_soul_shield = 0.0;
@@ -928,6 +1149,7 @@ fn set_encounter_active_state(encounter: &mut BattleEncounter, active: bool) -> 
             participant.mirror_coat_cleanup_pending = false;
             participant.sunset_death_time_reset_pending = false;
             participant.goose_channeling_turns = 0;
+            participant.corrosion_stacks.clear();
             if participant_hope_avatar_active(participant) {
                 let was_alive = participant.alive;
                 participant.hp = 0.0;
@@ -1581,6 +1803,16 @@ fn apply_participant_damage_for_battle(
     }
     participant.hp = (previous_hp - damage_applied).max(0.0);
     participant.alive = participant.hp > 0.0;
+    if encounter_active
+        && participant.alive
+        && !participant.hidden_role.second_wind_used
+        && participant.hidden_role.second_wind_heal > f32::EPSILON
+        && participant.hp <= participant.max_hp * 0.5 + f32::EPSILON
+    {
+        participant.hp =
+            (participant.hp + participant.hidden_role.second_wind_heal).min(participant.max_hp);
+        participant.hidden_role.second_wind_used = true;
+    }
     if participant.mirror_coat_layers > 0 && damage_applied > f32::EPSILON {
         // 隐身状态下再次受到伤害会立刻脱离隐身并回到战斗。
         participant.mirror_coat_layers = 0;
@@ -1653,7 +1885,9 @@ fn is_current_redeemed_chainsword(skill: &CharacterSkill) -> bool {
 fn is_current_redeemed_bolter(skill: &CharacterSkill) -> bool {
     skill.note.contains("爆失枪（1分）")
         && skill.note.contains("只能在6米内造成1点物理伤害")
-        && skill.note.contains("每次开枪都会广播给周围玩家这把枪的描述")
+        && skill
+            .note
+            .contains("每次开枪都会广播给周围玩家这把枪的描述")
 }
 
 fn is_current_redeemed_flying_needle(skill: &CharacterSkill) -> bool {
@@ -1725,8 +1959,7 @@ fn apply_void_break_damage_for_battle(
             (participant.revenge_soul_shield.max(0.0) - revenge_absorbed).max(0.0);
         remaining = (remaining - revenge_absorbed).max(0.0);
         let arcane_absorbed = participant.arcane_shield.max(0.0).min(remaining);
-        participant.arcane_shield =
-            (participant.arcane_shield.max(0.0) - arcane_absorbed).max(0.0);
+        participant.arcane_shield = (participant.arcane_shield.max(0.0) - arcane_absorbed).max(0.0);
     }
 
     resolution.damage_absorbed = (incoming_amount - resolution.damage_applied).max(0.0);
@@ -2379,7 +2612,10 @@ fn apply_sunset_world_time_reset(
         return;
     }
     let group_name = encounter.trpg_group.clone().or_else(|| {
-        encounter.trpg_campaign_id.as_deref().and_then(|campaign_id| {
+        encounter
+            .trpg_campaign_id
+            .as_deref()
+            .and_then(|campaign_id| {
             manager
                 .trpg_groups
                 .iter()
@@ -2550,6 +2786,98 @@ fn advance_participant_delayed_damage_ticks(
             ));
         }
     }
+    advance
+}
+
+fn advance_participant_corrosion(
+    participant: &mut BattleParticipantSnapshot,
+    encounter_active: bool,
+    round: u32,
+) -> BattleDelayedDamageAdvance {
+    if !encounter_active || !participant.alive || participant.corrosion_stacks.is_empty() {
+        if !encounter_active || !participant.alive {
+            participant.corrosion_stacks.clear();
+        }
+        return BattleDelayedDamageAdvance::default();
+    }
+
+    let display_name = participant.display_name.clone();
+    let mut advance = BattleDelayedDamageAdvance::default();
+    let stacks = std::mem::take(&mut participant.corrosion_stacks);
+    let mut remaining = Vec::with_capacity(stacks.len());
+    for mut stack in stacks {
+        if !participant.alive {
+            break;
+        }
+        let label = match stack.kind {
+            BattleCorrosionKind::Poison => "中毒",
+            BattleCorrosionKind::Rust => "锈蚀",
+        };
+        let damage = stack.damage_per_turn.max(0.0);
+        let resolution = apply_participant_damage_for_battle(
+            participant,
+            damage,
+            &stack.source_id,
+            encounter_active,
+        );
+        let mut benefits = vec![format!("腐蚀波{label}")];
+        if resolution.damage_absorbed > f32::EPSILON {
+            benefits.push(format!(
+                "护盾/免疫吸收{}点",
+                format_number(resolution.damage_absorbed)
+            ));
+        }
+        advance.combat_log.push(CombatLogEntry {
+            round,
+            kind: CombatLogKind::Damage,
+            source_id: stack.source_id.clone(),
+            source_name: stack.source_name.clone(),
+            target_id: participant.target_id.clone(),
+            target_name: display_name.clone(),
+            action_name: format!("腐蚀波·{label}"),
+            base_amount: damage,
+            effective_amount: resolution.damage_applied,
+            modifiers: Vec::new(),
+            benefits,
+        });
+        advance.logs.push(format!(
+            "{}的腐蚀波{}对{}造成{}点物理伤害",
+            stack.source_name,
+            label,
+            display_name,
+            format_number(resolution.damage_applied)
+        ));
+        if resolution.hope_avatar_triggered {
+            advance.logs.push(format!(
+                "{}触发希望化身，进入持续2回合的无敌天使形态",
+                display_name
+            ));
+        } else if resolution.hope_avatar_immune {
+            advance.logs.push(format!(
+                "{}处于希望化身，免疫本次伤害",
+                display_name
+            ));
+        } else if resolution.undying_rage_triggered {
+            advance.logs.push(format!(
+                "{}触发不死者之怒，免疫本次致命伤害",
+                display_name
+            ));
+        } else if resolution.damage_absorbed > f32::EPSILON {
+            advance.logs.push(format!(
+                "{}吸收{}点伤害",
+                display_name,
+                format_number(resolution.damage_absorbed)
+            ));
+        }
+        if let Some(outcome) = resolution.defeat_outcome {
+            advance.defeat_outcomes.push(outcome);
+        }
+        stack.turns_remaining = stack.turns_remaining.saturating_sub(1);
+        if stack.turns_remaining > 0 && participant.alive {
+            remaining.push(stack);
+        }
+    }
+    participant.corrosion_stacks = remaining;
     advance
 }
 
@@ -2768,6 +3096,41 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
                 .to_bits()
                 .hash(&mut hasher);
             participant
+                .group_modifiers
+                .damage_dealt
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .group_modifiers
+                .damage_taken
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .group_modifiers
+                .healing_dealt
+                .to_bits()
+                .hash(&mut hasher);
+            participant
+                .group_modifiers
+                .healing_taken
+                .to_bits()
+                .hash(&mut hasher);
+            participant.hidden_role.cocooning.hash(&mut hasher);
+            participant.hidden_role.free_action_skill.hash(&mut hasher);
+            participant
+                .hidden_role
+                .free_action_available
+                .hash(&mut hasher);
+            participant
+                .hidden_role
+                .second_wind_heal
+                .to_bits()
+                .hash(&mut hasher);
+            participant.hidden_role.second_wind_used.hash(&mut hasher);
+            participant.hidden_role.immune_diseased.hash(&mut hasher);
+            participant.hidden_role.immune_poisoning.hash(&mut hasher);
+            participant.hidden_role.immune_bleed.hash(&mut hasher);
+            participant
                 .arrogance_damage_bonus_per_source
                 .to_bits()
                 .hash(&mut hasher);
@@ -2898,6 +3261,13 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
                 tick.amount.to_bits().hash(&mut hasher);
                 tick.overhealing_shield_cap_rate.to_bits().hash(&mut hasher);
                 tick.turns_remaining.hash(&mut hasher);
+            }
+            for stack in &participant.corrosion_stacks {
+                stack.source_id.hash(&mut hasher);
+                stack.source_name.hash(&mut hasher);
+                stack.kind.hash(&mut hasher);
+                stack.damage_per_turn.to_bits().hash(&mut hasher);
+                stack.turns_remaining.hash(&mut hasher);
             }
             participant
                 .damage_taken_this_turn
@@ -3137,11 +3507,8 @@ fn create_encounter_ui(
                 } else {
                     ui_state.new_encounter_name.trim().to_owned()
                 };
-                let encounter_id = store.create_encounter_from_group(
-                    name,
-                    group_name.to_owned(),
-                    group,
-                );
+                let encounter_id =
+                    store.create_encounter_from_group(name, group_name.to_owned(), group);
                 store.active_encounter_id = Some(encounter_id);
                 ui_state.new_encounter_name.clear();
                 changed = true;
@@ -3547,7 +3914,10 @@ fn encounter_roster_ui(
             );
             let speed_escalated = (effective_speed - participant.speed).abs() > f32::EPSILON;
             if speed_escalated {
-                ui.label(format!("速度 {}", format_number(effective_speed)))
+                ui.label(format!(
+                    "速度 {}",
+                    format_number(effective_speed)
+                ))
                     .on_hover_text("存活玩家≤3，狂风恶浪移速加成提升至35%");
             } else {
                 ui.label("速度");
@@ -3609,6 +3979,26 @@ fn encounter_roster_ui(
                 && participant.keen_evasion_available
             {
                 ui.small("敏锐待机");
+            }
+            if participant.hidden_role.cocooning {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    "结茧中·无法行动",
+                );
+            }
+            if encounter.active && participant.hidden_role.free_action_available {
+                if let Some(skill) = participant.hidden_role.free_action_skill.as_deref() {
+                    ui.small(format!("免费行动待机：{skill}"));
+                }
+            }
+            if participant.hidden_role.second_wind_heal > f32::EPSILON {
+                ui.small(
+                    if participant.hidden_role.second_wind_used {
+                        "适应恢复已触发"
+                    } else {
+                        "适应恢复待机"
+                    },
+                );
             }
             if encounter.active && participant.arcane_shield > f32::EPSILON {
                 ui.small(format!(
@@ -3745,6 +4135,12 @@ fn encounter_roster_ui(
                     format_number(pending_delayed_damage)
                 ));
             }
+            if !participant.corrosion_stacks.is_empty() {
+                ui.small(format!(
+                    "腐蚀{}层",
+                    participant.corrosion_stacks.len()
+                ));
+            }
             let pending_delayed_healing = participant
                 .delayed_healing_ticks
                 .iter()
@@ -3821,11 +4217,7 @@ fn encounter_roster_ui(
             if participant.action_done {
                 ui.small("已完成");
             }
-            if ui
-                .button("移出")
-                .on_hover_text("移出战斗轮")
-                .clicked()
-            {
+            if ui.button("移出").on_hover_text("移出战斗轮").clicked() {
                 remove = true;
             }
         });
@@ -3872,6 +4264,7 @@ fn encounter_roster_ui(
                     encounter.trpg_group.as_deref(),
                     manager,
                 );
+                participant.group_modifiers = encounter_group_combat_modifiers(encounter, manager);
                 encounter.participants.push(participant);
                 changed = true;
             }
@@ -3911,9 +4304,10 @@ fn encounter_roster_ui(
                 let unit_id = selected.as_str();
                 if let Some(unit) = manager.unit_pool.get(unit_id) {
                     let target_id = next_unit_participant_id(encounter, unit_id);
-                    encounter.participants.push(participant_from_unit_template(
-                        &target_id, unit_id, unit,
-                    ));
+                    let mut participant = participant_from_unit_template(&target_id, unit_id, unit);
+                    participant.group_modifiers =
+                        encounter_group_combat_modifiers(encounter, manager);
+                    encounter.participants.push(participant);
                     changed = true;
                 }
             }
@@ -3924,9 +4318,7 @@ fn encounter_roster_ui(
     let joined_units = encounter
         .participants
         .iter()
-        .filter(|participant| {
-            participant.unit_template_id.is_some() && !participant.is_summon
-        })
+        .filter(|participant| participant.unit_template_id.is_some() && !participant.is_summon)
         .map(|participant| {
             (
                 participant.target_id.clone(),
@@ -3956,12 +4348,20 @@ fn encounter_roster_ui(
         let selected = ui_state
             .selected_add_summon
             .entry(encounter_id.to_owned())
-            .or_insert_with(|| (summon_candidates[0].0.clone(), summon_candidates[0].1));
+            .or_insert_with(|| {
+                (
+                    summon_candidates[0].0.clone(),
+                    summon_candidates[0].1,
+                )
+            });
         if !summon_candidates
             .iter()
             .any(|(owner_id, index, _)| owner_id == &selected.0 && *index == selected.1)
         {
-            *selected = (summon_candidates[0].0.clone(), summon_candidates[0].1);
+            *selected = (
+                summon_candidates[0].0.clone(),
+                summon_candidates[0].1,
+            );
         }
         ui.horizontal_wrapped(|ui| {
             ui.label("添加召唤物");
@@ -3971,9 +4371,7 @@ fn encounter_roster_ui(
             .selected_text(
                 summon_candidates
                     .iter()
-                    .find(|(owner_id, index, _)| {
-                        owner_id == &selected.0 && *index == selected.1
-                    })
+                    .find(|(owner_id, index, _)| owner_id == &selected.0 && *index == selected.1)
                     .map(|(_, _, label)| label.as_str())
                     .unwrap_or(selected.0.as_str()),
             )
@@ -3989,9 +4387,7 @@ fn encounter_roster_ui(
             if ui.button("添加").clicked() {
                 if let Some((owner_id, index)) = summon_candidates
                     .iter()
-                    .find(|(owner_id, index, _)| {
-                        owner_id == &selected.0 && *index == selected.1
-                    })
+                    .find(|(owner_id, index, _)| owner_id == &selected.0 && *index == selected.1)
                     .map(|(owner_id, index, _)| (owner_id.clone(), *index))
                 {
                     if let (Some(owner), Some(summon)) = (
@@ -4003,13 +4399,12 @@ fn encounter_roster_ui(
                     ) {
                         let summon = summon.clone();
                         let owner = owner.clone();
-                        encounter.participants.push(participant_from_summon(
-                            &owner_id,
-                            index,
-                            &summon,
-                            &owner,
-                            manager,
-                        ));
+                        let mut participant = participant_from_summon(
+                            &owner_id, index, &summon, &owner, manager,
+                        );
+                        participant.group_modifiers =
+                            encounter_group_combat_modifiers(encounter, manager);
+                        encounter.participants.push(participant);
                         changed = true;
                     }
                 }
@@ -4643,6 +5038,8 @@ impl BattleRoundStore {
                 }
             }
             participant.action_done = false;
+            participant.hidden_role.free_action_available =
+                encounter.active && participant.hidden_role.free_action_skill.is_some();
             participant.undying_rage_active = false;
             advance_participant_overhealing_shield(participant);
             let previous_damage_taken = participant.damage_taken_this_turn;
@@ -4714,6 +5111,14 @@ impl BattleRoundStore {
             delayed_logs.extend(delayed.logs);
             delayed_combat_log.extend(delayed.combat_log);
             defeat_outcomes.extend(delayed.defeat_outcomes);
+            let corrosion = advance_participant_corrosion(
+                participant,
+                encounter.active,
+                encounter.round,
+            );
+            delayed_logs.extend(corrosion.logs);
+            delayed_combat_log.extend(corrosion.combat_log);
+            defeat_outcomes.extend(corrosion.defeat_outcomes);
             let delayed_healing =
                 advance_participant_delayed_healing_ticks(participant, encounter.round);
             delayed_logs.extend(delayed_healing.logs);
@@ -4909,7 +5314,7 @@ impl BattleRoundStore {
         ) {
             return false;
         }
-        if let Some(encounter) = self.encounters.get_mut(encounter_id) {
+        let effective = if let Some(encounter) = self.encounters.get_mut(encounter_id) {
             let effective = encounter
                 .participants
                 .iter()
@@ -4929,6 +5334,19 @@ impl BattleRoundStore {
                 modifiers: resolution.modifiers,
                 benefits: source_notes,
             });
+            effective
+        } else {
+            0.0
+        };
+        if effective > f32::EPSILON {
+            if let Some(encounter) = self.encounters.get_mut(encounter_id) {
+                apply_corrosion_wave_after_attack(
+                    encounter,
+                    actor_id,
+                    actor_character.as_ref(),
+                    manager,
+                );
+            }
         }
         if let Some(encounter) = self.encounters.get_mut(encounter_id) {
             apply_sunset_world_time_reset(encounter, manager);
@@ -5075,10 +5493,23 @@ impl BattleRoundStore {
         else {
             return false;
         };
-        if !participant_can_act(&actor_snapshot) {
+        let hidden_role_free_action =
+            actor_snapshot.hidden_role.free_action_skill.as_deref() == Some(skill.name.trim());
+        let can_use_hidden_role_free_action = hidden_role_free_action
+            && actor_snapshot.alive
+            && actor_snapshot.hidden_role.free_action_available
+            && !actor_snapshot.hidden_role.cocooning;
+        if !participant_can_act(&actor_snapshot) && !can_use_hidden_role_free_action {
             encounter.action_log.push(format!(
                 "{}已经倒下或完成本轮行动，无法使用技能",
                 actor_snapshot.display_name
+            ));
+            return false;
+        }
+        if hidden_role_free_action && !actor_snapshot.hidden_role.free_action_available {
+            encounter.action_log.push(format!(
+                "{}本轮已经使用过免费技能{}",
+                actor_snapshot.display_name, skill.name
             ));
             return false;
         }
@@ -5741,7 +6172,9 @@ impl BattleRoundStore {
                             actor_dying_target_healing_modifier,
                         );
                         let target_healing_multiplier =
-                            target.healing_taken_modifier * wound_multiplier * dying_multiplier;
+                            participant_healing_taken_multiplier(target)
+                                * wound_multiplier
+                                * dying_multiplier;
                         let one_heart_multiplier = if encounter.active
                             && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
                         {
@@ -5812,6 +6245,13 @@ impl BattleRoundStore {
                             modifiers.push(RuleAmountResolution::factor(
                                 "目标受到治疗修正（角色/装备/BUFF）",
                                 target.healing_taken_modifier,
+                            ));
+                        }
+                        let group_healing_taken = participant_group_modifiers(target).healing_taken;
+                        if (group_healing_taken - 1.0).abs() > f32::EPSILON {
+                            modifiers.push(RuleAmountResolution::factor(
+                                "TRPG组全局承受治疗修正",
+                                group_healing_taken,
                             ));
                         }
                         if (wound_multiplier - 1.0).abs() > f32::EPSILON {
@@ -6157,6 +6597,57 @@ impl BattleRoundStore {
                 }
             }
         }
+        if actor_dealt_damage {
+            if let Some(encounter) = self.encounters.get_mut(encounter_id) {
+                apply_corrosion_wave_after_attack(
+                    encounter,
+                    actor_id,
+                    actor_character.as_ref(),
+                    manager,
+                );
+            }
+        }
+        if actor_dealt_damage && skill.name.trim() == "异形震慑尖啸" {
+            if let Some(encounter) = self.encounters.get_mut(encounter_id) {
+                let actor_player_side = encounter
+                    .participants
+                    .iter()
+                    .find(|participant| participant.target_id == actor_id)
+                    .map(|participant| participant_is_player_side(participant, manager))
+                    .unwrap_or(true);
+                let actor_position = scene_positions
+                    .and_then(|positions| positions.positions.get(actor_id))
+                    .copied();
+                let mut affected = Vec::new();
+                for target in &mut encounter.participants {
+                    if !target.alive
+                        || target.target_id == actor_id
+                        || participant_is_player_side(target, manager) == actor_player_side
+                    {
+                        continue;
+                    }
+                    let in_range = actor_position.is_none_or(|actor_position| {
+                        scene_positions
+                            .and_then(|positions| positions.positions.get(&target.target_id))
+                            .is_some_and(|target_position| {
+                                actor_position.distance(*target_position) <= 5.0
+                            })
+                    });
+                    if in_range {
+                        target.paralyzed_rounds_remaining =
+                            target.paralyzed_rounds_remaining.max(1);
+                        affected.push(target.display_name.clone());
+                    }
+                }
+                if !affected.is_empty() {
+                    encounter.action_log.push(format!(
+                        "{}的震慑尖啸使{}麻痹1回合",
+                        actor_name,
+                        affected.join("、")
+                    ));
+                }
+            }
+        }
         if actor_dealt_damage && actor_snapshot.mirror_coat_layers > 0 {
             if let Some(encounter) = self.encounters.get_mut(encounter_id) {
                 let broke_stealth = encounter
@@ -6365,6 +6856,28 @@ impl BattleRoundStore {
         if let Some(encounter) = self.encounters.get_mut(encounter_id) {
             apply_sunset_world_time_reset(encounter, manager);
         }
+        let used_hidden_role_free_action = self
+            .encounters
+            .get_mut(encounter_id)
+            .and_then(|encounter| {
+                encounter
+                    .participants
+                    .iter_mut()
+                    .find(|participant| participant.target_id == actor_id)
+            })
+            .is_some_and(|actor| {
+                if actor.hidden_role.free_action_available
+                    && actor.hidden_role.free_action_skill.as_deref() == Some(skill.name.trim())
+                {
+                    actor.hidden_role.free_action_available = false;
+                    true
+                } else {
+                    false
+                }
+            });
+        if used_hidden_role_free_action {
+            return true;
+        }
         self.finish_resolved_actor_action(encounter_id, actor_id)
     }
 
@@ -6433,6 +6946,14 @@ impl BattleRoundStore {
             delayed_logs.extend(delayed.logs);
             delayed_combat_log.extend(delayed.combat_log);
             defeat_outcomes.extend(delayed.defeat_outcomes);
+            let corrosion = advance_participant_corrosion(
+                participant,
+                encounter.active,
+                encounter.round,
+            );
+            delayed_logs.extend(corrosion.logs);
+            delayed_combat_log.extend(corrosion.combat_log);
+            defeat_outcomes.extend(corrosion.defeat_outcomes);
             let delayed_healing =
                 advance_participant_delayed_healing_ticks(participant, encounter.round);
             delayed_logs.extend(delayed_healing.logs);
@@ -6443,6 +6964,8 @@ impl BattleRoundStore {
             participant.combat_turns_completed =
                 participant.combat_turns_completed.saturating_add(1);
             encounter.combat_completed_turns = encounter.combat_completed_turns.saturating_add(1);
+            participant.hidden_role.free_action_available =
+                participant.hidden_role.free_action_skill.is_some();
         }
         participant.pending_negative = false;
         encounter.round = encounter
@@ -6498,11 +7021,20 @@ fn refresh_encounter_players(
     let Some(group) = manager.trpg_groups.get(&group_name) else {
         return false;
     };
+    let group_modifiers = group
+        .global_combat_modifiers
+        .effective_at_world_turn(group.world_turn);
 
     let before_signature = encounter_participants_signature(&encounter.participants);
     deduplicate_encounter_participants(encounter);
     encounter.participants.retain(|participant| {
-        participant.unit_template_id.is_some() || group.players.contains(&participant.target_id)
+        participant.unit_template_id.is_some()
+            || group.players.contains(&participant.target_id)
+            || (participant.is_summon
+                && participant
+                    .summon_owner_id
+                    .as_ref()
+                    .is_some_and(|owner_id| group.players.contains(owner_id)))
     });
     for participant in encounter
         .participants
@@ -6527,6 +7059,9 @@ fn refresh_encounter_players(
             );
             encounter.participants.push(participant);
         }
+    }
+    for participant in &mut encounter.participants {
+        participant.group_modifiers = group_modifiers;
     }
     before_signature != encounter_participants_signature(&encounter.participants)
 }
@@ -6553,7 +7088,13 @@ fn prune_unbound_group_participants(
     };
     let before_len = encounter.participants.len();
     encounter.participants.retain(|participant| {
-        participant.unit_template_id.is_some() || group.players.contains(&participant.target_id)
+        participant.unit_template_id.is_some()
+            || group.players.contains(&participant.target_id)
+            || (participant.is_summon
+                && participant
+                    .summon_owner_id
+                    .as_ref()
+                    .is_some_and(|owner_id| group.players.contains(owner_id)))
     });
     before_len != encounter.participants.len()
 }
@@ -6775,7 +7316,33 @@ fn sync_encounter_to_manager(
             }
             continue;
         }
-        if participant.unit_template_id.is_some() || !participant.player_character {
+        if participant.unit_template_id.is_some() {
+            if let Some(instance) = manager.unit_instances.get_mut(&participant.target_id) {
+                let mut character = participant
+                    .unit_character
+                    .clone()
+                    .unwrap_or_else(|| instance.character.clone());
+                character.name = participant.display_name.clone();
+                character.nickname = participant.display_name.clone();
+                character.hp = participant.hp.clamp(0.0, participant.max_hp.max(0.0));
+                character.max_hp = participant.max_hp.max(0.0);
+                character.mp = participant.mp.clamp(0.0, participant.max_mp.max(0.0));
+                character.max_mp = participant.max_mp.max(0.0);
+                character.hp_regen = participant.hp_regen;
+                character.mp_regen = participant.mp_regen;
+                character.speed = participant.speed;
+                character.damage_taken_this_turn = participant.damage_taken_this_turn;
+                character.healing_taken_this_turn = participant.healing_taken_this_turn;
+                character.skill_last_cast_turns = participant.skill_last_used_turns.clone();
+                character.skill_cooldown_ready_turns =
+                    participant.skill_cooldown_ready_turns.clone();
+                instance.display_name = participant.display_name.clone();
+                instance.character = character;
+                changed = true;
+            }
+            continue;
+        }
+        if !participant.player_character {
             continue;
         }
         if linked_player_ids
@@ -6806,7 +7373,9 @@ fn sync_encounter_to_manager(
             character.redeemed_commissar_proficiency = commissar_proficiency;
             changed = true;
         }
-        if participant.flying_needles_enabled && character_redeemed_needle_state(character).is_some() {
+        if participant.flying_needles_enabled
+            && character_redeemed_needle_state(character).is_some()
+        {
             let needle_state = RedeemedNeedleState {
                 ready: participant.flying_needles_ready.min(5),
                 case_ready: if participant.needle_case_enabled {
@@ -7353,8 +7922,11 @@ fn apply_battle_buff_ticks(
                             })
                             .unwrap_or(1.0)
                     });
-                let target_multiplier = encounter.participants[target_index].healing_taken_modifier
-                    * participant_wound_healing_multiplier(&encounter.participants[target_index])
+                let target_multiplier =
+                    participant_healing_taken_multiplier(&encounter.participants[target_index])
+                        * participant_wound_healing_multiplier(
+                            &encounter.participants[target_index],
+                        )
                     * source_character
                         .as_ref()
                         .map(|source| {
@@ -7506,6 +8078,41 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
             .healing_taken_modifier
             .to_bits()
             .hash(&mut hasher);
+        participant
+            .group_modifiers
+            .damage_dealt
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .group_modifiers
+            .damage_taken
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .group_modifiers
+            .healing_dealt
+            .to_bits()
+            .hash(&mut hasher);
+        participant
+            .group_modifiers
+            .healing_taken
+            .to_bits()
+            .hash(&mut hasher);
+        participant.hidden_role.cocooning.hash(&mut hasher);
+        participant.hidden_role.free_action_skill.hash(&mut hasher);
+        participant
+            .hidden_role
+            .free_action_available
+            .hash(&mut hasher);
+        participant
+            .hidden_role
+            .second_wind_heal
+            .to_bits()
+            .hash(&mut hasher);
+        participant.hidden_role.second_wind_used.hash(&mut hasher);
+        participant.hidden_role.immune_diseased.hash(&mut hasher);
+        participant.hidden_role.immune_poisoning.hash(&mut hasher);
+        participant.hidden_role.immune_bleed.hash(&mut hasher);
         participant
             .arrogance_damage_bonus_per_source
             .to_bits()
@@ -7663,6 +8270,13 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
             tick.overhealing_shield_cap_rate.to_bits().hash(&mut hasher);
             tick.turns_remaining.hash(&mut hasher);
         }
+        for stack in &participant.corrosion_stacks {
+            stack.source_id.hash(&mut hasher);
+            stack.source_name.hash(&mut hasher);
+            stack.kind.hash(&mut hasher);
+            stack.damage_per_turn.to_bits().hash(&mut hasher);
+            stack.turns_remaining.hash(&mut hasher);
+        }
         participant
             .damage_taken_this_turn
             .to_bits()
@@ -7700,6 +8314,14 @@ fn participant_from_character(
     character: &PlayerCharacter,
     manager: &NapcatMessageManager,
 ) -> BattleParticipantSnapshot {
+    let effective_character = effective_hidden_role_character(
+        target_id,
+        character,
+        &manager.hidden_roles,
+    );
+    let character = &effective_character;
+    let hidden_role = hidden_role_battle_state(manager.hidden_roles.get(target_id));
+    let opening_shield = hidden_role_opening_shield(manager.hidden_roles.get(target_id));
     let status = character.status.combined(&character.extra_status);
     let (speed, low_survivor_speed) = character_battle_speeds(character);
     let dominion_gain_rate = character_dominion_max_hp_gain_rate(character);
@@ -7751,6 +8373,8 @@ fn participant_from_character(
         damage_taken_modifier: character.damage_taken_modifier,
         healing_dealt_modifier: character.healing_dealt_modifier,
         healing_taken_modifier: character.healing_taken_modifier,
+        group_modifiers: TrpgGlobalCombatModifiers::default(),
+        hidden_role,
         arrogance_damage_bonus_per_source: character_arrogance_damage_bonus_per_source(character),
         arrogance_damage_source_ids: Vec::new(),
         endless_pain_bonus_damage_per_stack: character_endless_pain_bonus_damage_per_stack(
@@ -7777,8 +8401,8 @@ fn participant_from_character(
         overhealing_shield_turns_remaining: 0,
         revenge_soul_shield_rate: character_revenge_soul_shield_rate(character),
         revenge_soul_shield: 0.0,
-        construct_shield: 0.0,
-        construct_shield_max: 0.0,
+        construct_shield: opening_shield,
+        construct_shield_max: opening_shield,
         construct_shield_repair_rounds_remaining: 0,
         construct_repair_channel_rounds_remaining: 0,
         paralyzed_rounds_remaining: 0,
@@ -7787,8 +8411,12 @@ fn participant_from_character(
         natural_hp_regen_suppressed: false,
         flying_needles_enabled: redeemed_needles.is_some(),
         flying_needles_ready: redeemed_needles.map(|(state, _)| state.ready).unwrap_or(0),
-        needle_case_enabled: redeemed_needles.map(|(_, enabled)| enabled).unwrap_or(false),
-        needle_case_ready: redeemed_needles.map(|(state, _)| state.case_ready).unwrap_or(0),
+        needle_case_enabled: redeemed_needles
+            .map(|(_, enabled)| enabled)
+            .unwrap_or(false),
+        needle_case_ready: redeemed_needles
+            .map(|(state, _)| state.case_ready)
+            .unwrap_or(0),
         needle_case_progress_noncombat_rounds: redeemed_needles
             .map(|(state, _)| state.case_progress_noncombat_rounds)
             .unwrap_or(0),
@@ -7836,6 +8464,7 @@ fn participant_from_character(
         wound_healing_taken_turns: 0,
         delayed_damage_ticks: Vec::new(),
         delayed_healing_ticks: Vec::new(),
+        corrosion_stacks: Vec::new(),
         damage_taken_this_turn: character.damage_taken_this_turn,
         healing_taken_this_turn: character.healing_taken_this_turn,
         skill_last_used_turns: HashMap::new(),
@@ -7890,6 +8519,8 @@ fn participant_from_unit_template(
         damage_taken_modifier: character.damage_taken_modifier,
         healing_dealt_modifier: character.healing_dealt_modifier,
         healing_taken_modifier: character.healing_taken_modifier,
+        group_modifiers: TrpgGlobalCombatModifiers::default(),
+        hidden_role: HiddenRoleBattleState::default(),
         arrogance_damage_bonus_per_source: character_arrogance_damage_bonus_per_source(character),
         arrogance_damage_source_ids: Vec::new(),
         endless_pain_bonus_damage_per_stack: character_endless_pain_bonus_damage_per_stack(
@@ -7960,6 +8591,7 @@ fn participant_from_unit_template(
         wound_healing_taken_turns: 0,
         delayed_damage_ticks: Vec::new(),
         delayed_healing_ticks: Vec::new(),
+        corrosion_stacks: Vec::new(),
         mirror_coat_enabled: false,
         mirror_coat_layers: 0,
         mirror_coat_cooldown_remaining: 0,
@@ -7978,6 +8610,30 @@ fn participant_from_unit_template(
         skill_last_used_turns: HashMap::new(),
         skill_cooldown_ready_turns: cooldown_character.skill_cooldown_ready_turns,
     }
+}
+
+fn participant_from_unit_instance(
+    instance_id: &str,
+    instance: &UnitInstance,
+    template: &UnitPoolEntry,
+) -> BattleParticipantSnapshot {
+    let mut instance_template = template.clone();
+    instance_template.character = instance.character.clone();
+    let mut participant = participant_from_unit_template(
+        instance_id,
+        &instance.template_id,
+        &instance_template,
+    );
+    participant.display_name = if instance.display_name.trim().is_empty() {
+        unit_template_name(&instance.template_id, template)
+    } else {
+        instance.display_name.trim().to_owned()
+    };
+    if let Some(character) = participant.unit_character.as_mut() {
+        character.name = participant.display_name.clone();
+        character.nickname = participant.display_name.clone();
+    }
+    participant
 }
 
 fn participant_from_target(
@@ -8025,6 +8681,8 @@ fn participant_from_target(
         damage_taken_modifier: 1.0,
         healing_dealt_modifier: 1.0,
         healing_taken_modifier: 1.0,
+        group_modifiers: TrpgGlobalCombatModifiers::default(),
+        hidden_role: HiddenRoleBattleState::default(),
         arrogance_damage_bonus_per_source: 0.0,
         arrogance_damage_source_ids: Vec::new(),
         endless_pain_bonus_damage_per_stack: 0.0,
@@ -8089,6 +8747,7 @@ fn participant_from_target(
         wound_healing_taken_turns: 0,
         delayed_damage_ticks: Vec::new(),
         delayed_healing_ticks: Vec::new(),
+        corrosion_stacks: Vec::new(),
         mirror_coat_enabled: false,
         mirror_coat_layers: 0,
         mirror_coat_cooldown_remaining: 0,
@@ -8170,10 +8829,8 @@ fn participant_from_summon(
     participant.healing_taken_modifier = 1.0;
     participant.construct_shield = summon.shield;
     participant.construct_shield_max = summon.max_shield;
-    participant.construct_shield_repair_rounds_remaining =
-        summon.shield_repair_rounds_remaining;
-    participant.construct_repair_channel_rounds_remaining =
-        summon.repair_channel_rounds_remaining;
+    participant.construct_shield_repair_rounds_remaining = summon.shield_repair_rounds_remaining;
+    participant.construct_repair_channel_rounds_remaining = summon.repair_channel_rounds_remaining;
     participant.skill_last_used_turns = HashMap::new();
     participant.skill_cooldown_ready_turns = HashMap::new();
     participant
@@ -8267,8 +8924,8 @@ fn sync_participant_from_manager(
         let Some(owner) = manager.player_characters.get(&owner_id) else {
             return;
         };
-        let Some(index) = crate::napcat::parse_summon_target_id(&participant.target_id)
-            .map(|(_, index)| index)
+        let Some(index) =
+            crate::napcat::parse_summon_target_id(&participant.target_id).map(|(_, index)| index)
         else {
             return;
         };
@@ -8331,7 +8988,10 @@ fn sync_participant_from_manager(
 
     if let Some(unit_id) = participant.unit_template_id.as_deref() {
         if let Some(unit) = manager.unit_pool.get(unit_id) {
-            let mut character = character_for_participant(participant, manager)
+            let instance = manager.unit_instances.get(&participant.target_id);
+            let mut character = instance
+                .map(|instance| instance.character.clone())
+                .or_else(|| character_for_participant(participant, manager))
                 .unwrap_or_else(|| unit.character.clone());
             let stat_config = manager.character_stat_config_for_target(&participant.target_id);
             let mut rule_engine_state = RuleEngineState::default();
@@ -8344,8 +9004,13 @@ fn sync_participant_from_manager(
             );
             let status = character.status.combined(&character.extra_status);
             let (speed, low_survivor_speed) = character_battle_speeds(&character);
-            participant.display_name =
-                unit_participant_display_name(&participant.target_id, unit_id, unit);
+            participant.display_name = instance
+                .map(|instance| instance.display_name.trim())
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    unit_participant_display_name(&participant.target_id, unit_id, unit)
+                });
             participant.player_character = false;
             participant.level = character.level.max(1);
             participant.support_talent_experience_bonus_rate = 0.0;
@@ -8436,7 +9101,13 @@ fn sync_participant_from_manager(
         return;
     }
 
-    if let Some(character) = manager.player_characters.get(&participant.target_id) {
+    if let Some(base_character) = manager.player_characters.get(&participant.target_id) {
+        let effective_character = effective_hidden_role_character(
+            &participant.target_id,
+            base_character,
+            &manager.hidden_roles,
+        );
+        let character = &effective_character;
         let status = character.status.combined(&character.extra_status);
         let (speed, low_survivor_speed) = character_battle_speeds(character);
         participant.display_name = character_display_name(
@@ -8453,11 +9124,8 @@ fn sync_participant_from_manager(
             participant.flying_needles_ready = state.ready.min(5);
             participant.needle_case_enabled = case_enabled;
             participant.needle_case_ready = if case_enabled { state.case_ready.min(2) } else { 0 };
-            participant.needle_case_progress_noncombat_rounds = if case_enabled {
-                state.case_progress_noncombat_rounds.min(1)
-            } else {
-                0
-            };
+            participant.needle_case_progress_noncombat_rounds =
+                if case_enabled { state.case_progress_noncombat_rounds.min(1) } else { 0 };
         } else {
             participant.flying_needles_enabled = false;
             participant.flying_needles_ready = 0;
@@ -8608,7 +9276,14 @@ fn sync_participant_from_manager_with_vitals(
         manager
             .player_characters
             .get(&participant.target_id)
-            .map(|character| (character.hp, character.mp))
+            .map(|character| {
+                let effective = effective_hidden_role_character(
+                    &participant.target_id,
+                    character,
+                    &manager.hidden_roles,
+                );
+                (effective.hp, effective.mp)
+            })
     };
     if let Some((hp, mp)) = vitals {
         participant.hp = hp.clamp(0.0, participant.max_hp.max(0.0));
@@ -8627,8 +9302,11 @@ fn refresh_unit_participant_from_template(
     let Some(unit) = manager.unit_pool.get(unit_id) else {
         return;
     };
+    let instance = manager.unit_instances.get(&participant.target_id);
     let current = character_for_participant(participant, manager);
-    let mut refreshed = unit.character.clone();
+    let mut refreshed = instance
+        .map(|instance| instance.character.clone())
+        .unwrap_or_else(|| unit.character.clone());
     if let Some(current) = current {
         refreshed.active_buffs = current.active_buffs;
         refreshed.hp = current
@@ -8741,6 +9419,7 @@ fn participant_can_act(participant: &BattleParticipantSnapshot) -> bool {
         && participant.goose_channeling_turns == 0
         && participant.construct_repair_channel_rounds_remaining == 0
         && participant.paralyzed_rounds_remaining == 0
+        && !participant.hidden_role.cocooning
 }
 
 fn normalize_encounter_after_edit(encounter: &mut BattleEncounter) {
@@ -8892,6 +9571,22 @@ fn next_unit_participant_id(encounter: &BattleEncounter, unit_id: &str) -> Strin
     unreachable!("unbounded unit participant id search should always return")
 }
 
+fn encounter_group_combat_modifiers(
+    encounter: &BattleEncounter,
+    manager: &NapcatMessageManager,
+) -> TrpgGlobalCombatModifiers {
+    encounter
+        .trpg_group
+        .as_deref()
+        .and_then(|group_name| manager.trpg_groups.get(group_name))
+        .map(|group| {
+            group
+                .global_combat_modifiers
+                .effective_at_world_turn(group.world_turn)
+        })
+        .unwrap_or_default()
+}
+
 fn character_for_participant(
     participant: &BattleParticipantSnapshot,
     manager: &NapcatMessageManager,
@@ -8906,10 +9601,11 @@ fn character_for_participant(
                 .map(|unit| unit.character.clone())
         })?
     } else {
-        manager
-            .player_characters
-            .get(&participant.target_id)?
-            .clone()
+        effective_hidden_role_character(
+            &participant.target_id,
+            manager.player_characters.get(&participant.target_id)?,
+            &manager.hidden_roles,
+        )
     };
     if let Some(base_stats) = character.buff_base_stats.as_mut() {
         base_stats.hp = (base_stats.hp + participant.hp - character.hp).max(0.0);
@@ -9222,6 +9918,16 @@ fn participant_status(participant: &BattleParticipantSnapshot) -> CharacterStatu
     }
 }
 
+fn participant_group_modifiers(
+    participant: &BattleParticipantSnapshot,
+) -> TrpgGlobalCombatModifiers {
+    participant.group_modifiers
+}
+
+fn participant_healing_taken_multiplier(participant: &BattleParticipantSnapshot) -> f32 {
+    participant.healing_taken_modifier * participant_group_modifiers(participant).healing_taken
+}
+
 fn participant_damage_multiplier(
     participant: &BattleParticipantSnapshot,
     character: Option<&PlayerCharacter>,
@@ -9320,6 +10026,10 @@ fn participant_damage_modifiers(
             "造成伤害修正（角色/装备/BUFF）",
             participant.damage_dealt_modifier,
         ),
+        (
+            "TRPG组全局造成伤害修正",
+            participant_group_modifiers(participant).damage_dealt,
+        ),
         ("属性伤害加成", attribute_multiplier),
         ("振奋", inspiration_multiplier),
         ("不死者之怒", undying_rage_multiplier),
@@ -9389,14 +10099,28 @@ fn participant_damage_taken_modifiers(
     } else {
         1.0
     };
+    let hidden_role_immunity = match damage_type {
+        DamageType::Diseased if participant.hidden_role.immune_diseased => 0.0,
+        DamageType::Poisoning if participant.hidden_role.immune_poisoning => 0.0,
+        DamageType::Bleed if participant.hidden_role.immune_bleed => 0.0,
+        _ => 1.0,
+    };
     [
         (
             "承受伤害修正（角色/装备/BUFF）",
             participant.damage_taken_modifier,
         ),
+        (
+            "TRPG组全局承受伤害修正",
+            participant_group_modifiers(participant).damage_taken,
+        ),
         ("强者减伤", champion),
         ("伤害类型抗性", typed),
         ("战意", fighting_spirit),
+        (
+            "仿生体生物伤害免疫",
+            hidden_role_immunity,
+        ),
         (
             "蝴蝶效应",
             if participant.butterfly_effect { 0.95 } else { 1.0 },
@@ -9447,6 +10171,10 @@ fn participant_healing_modifiers(
         (
             "造成治疗修正（角色/装备/BUFF/忏悔）",
             dealt,
+        ),
+        (
+            "TRPG组全局造成治疗修正",
+            participant_group_modifiers(participant).healing_dealt,
         ),
         ("WIS/INT治疗属性加成", attribute),
         ("背水疗愈", wounded),
@@ -9716,6 +10444,12 @@ fn participant_snapshot_display_name(
     participant: &BattleParticipantSnapshot,
     manager: &NapcatMessageManager,
 ) -> String {
+    if let Some(instance) = manager.unit_instances.get(&participant.target_id) {
+        let name = instance.display_name.trim();
+        if !name.is_empty() {
+            return name.to_owned();
+        }
+    }
     if let Some(unit_id) = participant.unit_template_id.as_deref() {
         if let Some(unit) = manager.unit_pool.get(unit_id) {
             return unit_participant_display_name(&participant.target_id, unit_id, unit);
@@ -10086,6 +10820,8 @@ mod area_tests {
             damage_taken_modifier: 1.0,
             healing_dealt_modifier: 1.0,
             healing_taken_modifier: 1.0,
+            group_modifiers: TrpgGlobalCombatModifiers::default(),
+            hidden_role: HiddenRoleBattleState::default(),
             arrogance_damage_bonus_per_source: 0.0,
             arrogance_damage_source_ids: Vec::new(),
             endless_pain_bonus_damage_per_stack: 0.0,
@@ -10163,6 +10899,7 @@ mod area_tests {
             wound_healing_taken_turns: 0,
             delayed_damage_ticks: Vec::new(),
             delayed_healing_ticks: Vec::new(),
+            corrosion_stacks: Vec::new(),
             damage_taken_this_turn: 0.0,
             healing_taken_this_turn: 0.0,
             skill_last_used_turns: HashMap::new(),
@@ -10253,7 +10990,10 @@ mod tests {
 
         let participant = participant_from_summon("10001", 0, &summon, &owner, &manager);
         assert!(participant.is_summon);
-        assert_eq!(participant.summon_owner_id.as_deref(), Some("10001"));
+        assert_eq!(
+            participant.summon_owner_id.as_deref(),
+            Some("10001")
+        );
         assert_eq!(participant.target_id, "summon:10001:0");
         assert_eq!(participant.level, 7);
         assert!((participant.hp - 12.0).abs() < f32::EPSILON);
@@ -10347,10 +11087,16 @@ mod tests {
         assert_eq!(resolution.damage_applied, 2.0);
         assert_eq!(mech.hp, 4.0);
         assert_eq!(mech.construct_shield, 0.0);
-        assert_eq!(mech.construct_shield_repair_rounds_remaining, 2);
+        assert_eq!(
+            mech.construct_shield_repair_rounds_remaining,
+            2
+        );
 
         assert!(advance_redeemed_construct_state(&mut mech, true).is_empty());
-        assert_eq!(mech.construct_shield_repair_rounds_remaining, 2);
+        assert_eq!(
+            mech.construct_shield_repair_rounds_remaining,
+            2
+        );
         assert!(advance_redeemed_construct_state(&mut mech, false).is_empty());
         assert_eq!(mech.construct_shield, 0.0);
         let logs = advance_redeemed_construct_state(&mut mech, false);
@@ -10375,7 +11121,10 @@ mod tests {
         mech.hp = 2.0;
         mech.construct_repair_channel_rounds_remaining = 2;
         apply_participant_damage_for_battle(&mut mech, 1.0, "enemy", true);
-        assert_eq!(mech.construct_repair_channel_rounds_remaining, 0);
+        assert_eq!(
+            mech.construct_repair_channel_rounds_remaining,
+            0
+        );
     }
 
     #[test]
@@ -10405,20 +11154,20 @@ mod tests {
         let skill = character_skills(drone.unit_character.as_ref().unwrap())[1].clone();
         let target = participant("target", 0);
         let mut store = BattleRoundStore {
-            encounters: HashMap::from([(
-                "battle".to_owned(),
-                BattleEncounter {
+            encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
                     active: true,
                     participants: vec![drone, target],
                     ..Default::default()
-                },
-            )]),
+            })]),
             ..Default::default()
         };
         let positions = SceneCharacterPositions {
             positions: HashMap::from([
                 ("summon:owner:0".to_owned(), Vec3::ZERO),
-                ("target".to_owned(), Vec3::new(2.0, 0.0, 0.0)),
+                (
+                    "target".to_owned(),
+                    Vec3::new(2.0, 0.0, 0.0),
+                ),
             ]),
         };
 
@@ -10471,9 +11220,7 @@ mod tests {
             arg_values: SkillRuleArgs::default(),
         };
         let mut store = BattleRoundStore {
-            encounters: HashMap::from([(
-                "battle".to_owned(),
-                BattleEncounter {
+            encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
                     active: true,
                     participants: vec![
                         participant("commissar", 0),
@@ -10481,21 +11228,35 @@ mod tests {
                         participant("enemy", 0),
                     ],
                     ..Default::default()
-                },
-            )]),
+            })]),
             ..Default::default()
         };
 
         assert!(store.record_skill_use(
-            "battle", "commissar", "ally", &war_cry, &manager, None,
+            "battle",
+            "commissar",
+            "ally",
+            &war_cry,
+            &manager,
+            None,
         ));
-        assert_eq!(store.encounters["battle"].participants[0].commissar_proficiency, 1);
-        assert_eq!(store.encounters["battle"].participants[1].next_attack_bonus_physical, 1.0);
-        assert!(store.record_skill_use(
-            "battle", "ally", "enemy", &attack, &manager, None,
-        ));
-        assert_eq!(store.encounters["battle"].participants[1].next_attack_bonus_physical, 0.0);
-        assert_eq!(store.encounters["battle"].participants[2].hp, 7.0);
+        assert_eq!(
+            store.encounters["battle"].participants[0].commissar_proficiency,
+            1
+        );
+        assert_eq!(
+            store.encounters["battle"].participants[1].next_attack_bonus_physical,
+            1.0
+        );
+        assert!(store.record_skill_use("battle", "ally", "enemy", &attack, &manager, None,));
+        assert_eq!(
+            store.encounters["battle"].participants[1].next_attack_bonus_physical,
+            0.0
+        );
+        assert_eq!(
+            store.encounters["battle"].participants[2].hp,
+            7.0
+        );
     }
 
     #[test]
@@ -10518,23 +11279,31 @@ mod tests {
         let mut target = participant("enemy", 0);
         target.hp_regen = 2.0;
         let mut store = BattleRoundStore {
-            encounters: HashMap::from([(
-                "battle".to_owned(),
-                BattleEncounter {
+            encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
                     participants: vec![participant("actor", 0), target],
                     ..Default::default()
-                },
-            )]),
+            })]),
             ..Default::default()
         };
 
         assert!(store.record_skill_use(
-            "battle", "actor", "enemy", &chainsword, &manager, None,
+            "battle",
+            "actor",
+            "enemy",
+            &chainsword,
+            &manager,
+            None,
         ));
-        assert_eq!(store.encounters["battle"].participants[1].hp, 5.0);
+        assert_eq!(
+            store.encounters["battle"].participants[1].hp,
+            5.0
+        );
         assert!(store.encounters["battle"].participants[1].natural_hp_regen_suppressed);
         assert!(store.next_round("battle"));
-        assert_eq!(store.encounters["battle"].participants[1].hp, 5.0);
+        assert_eq!(
+            store.encounters["battle"].participants[1].hp,
+            5.0
+        );
     }
 
     #[test]
@@ -10543,7 +11312,9 @@ mod tests {
         let skill = CharacterSkill {
             index: 0,
             name: "吹针术".to_owned(),
-            note: "一次性射出当前持有的所有飞针，造成命中的飞针数量+2的远程物理伤害，但命中率会降低".to_owned(),
+            note:
+                "一次性射出当前持有的所有飞针，造成命中的飞针数量+2的远程物理伤害，但命中率会降低"
+                    .to_owned(),
             skill_type: Some("远程".to_owned()),
             legacy_buff_machine_json: None,
             mp_cost: 0.0,
@@ -10563,29 +11334,40 @@ mod tests {
         enemy.hp = 20.0;
         enemy.max_hp = 20.0;
         let mut store = BattleRoundStore {
-            encounters: HashMap::from([(
-                "battle".to_owned(),
-                BattleEncounter {
+            encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
                     active: true,
                     participants: vec![actor, enemy],
                     ..Default::default()
-                },
-            )]),
+            })]),
             ..Default::default()
         };
         let positions = SceneCharacterPositions {
             positions: HashMap::from([
                 ("actor".to_owned(), Vec3::ZERO),
-                ("enemy".to_owned(), Vec3::new(2.0, 0.0, 0.0)),
+                (
+                    "enemy".to_owned(),
+                    Vec3::new(2.0, 0.0, 0.0),
+                ),
             ]),
         };
 
         assert!(store.record_skill_use(
-            "battle", "actor", "enemy", &skill, &manager, Some(&positions),
+            "battle",
+            "actor",
+            "enemy",
+            &skill,
+            &manager,
+            Some(&positions),
         ));
         let encounter = &store.encounters["battle"];
-        assert_eq!(encounter.participants[0].flying_needles_ready, 0);
-        assert_eq!(encounter.participants[0].needle_case_ready, 0);
+        assert_eq!(
+            encounter.participants[0].flying_needles_ready,
+            0
+        );
+        assert_eq!(
+            encounter.participants[0].needle_case_ready,
+            0
+        );
         assert_eq!(encounter.participants[1].hp, 14.0);
     }
 
@@ -10596,15 +11378,27 @@ mod tests {
         actor.flying_needles_ready = 2;
         actor.needle_case_enabled = true;
 
-        assert!(!advance_redeemed_needles_noncombat(&mut participant("other", 0)));
-        assert!(advance_redeemed_needles_noncombat(&mut actor));
+        assert!(!advance_redeemed_needles_noncombat(
+            &mut participant("other", 0)
+        ));
+        assert!(advance_redeemed_needles_noncombat(
+            &mut actor
+        ));
         assert_eq!(actor.flying_needles_ready, 3);
         assert_eq!(actor.needle_case_ready, 0);
-        assert_eq!(actor.needle_case_progress_noncombat_rounds, 1);
-        assert!(advance_redeemed_needles_noncombat(&mut actor));
+        assert_eq!(
+            actor.needle_case_progress_noncombat_rounds,
+            1
+        );
+        assert!(advance_redeemed_needles_noncombat(
+            &mut actor
+        ));
         assert_eq!(actor.flying_needles_ready, 4);
         assert_eq!(actor.needle_case_ready, 1);
-        assert_eq!(actor.needle_case_progress_noncombat_rounds, 0);
+        assert_eq!(
+            actor.needle_case_progress_noncombat_rounds,
+            0
+        );
     }
 
     #[test]
@@ -10625,14 +11419,11 @@ mod tests {
             arg_values: SkillRuleArgs::default(),
         };
         let mut store = BattleRoundStore {
-            encounters: HashMap::from([(
-                "battle".to_owned(),
-                BattleEncounter {
+            encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
                     active: true,
                     participants: vec![participant("540716134", 0)],
                     ..Default::default()
-                },
-            )]),
+            })]),
             ..Default::default()
         };
 
@@ -10645,14 +11436,12 @@ mod tests {
             None,
         ));
         assert_eq!(
-            store.encounters["battle"].participants[0]
-                .redeemed_invisibility_rounds_remaining,
+            store.encounters["battle"].participants[0].redeemed_invisibility_rounds_remaining,
             3
         );
         assert!(store.next_round("battle"));
         assert_eq!(
-            store.encounters["battle"].participants[0]
-                .redeemed_invisibility_rounds_remaining,
+            store.encounters["battle"].participants[0].redeemed_invisibility_rounds_remaining,
             2
         );
     }
@@ -10679,11 +11468,9 @@ mod tests {
             DamageType::Magical,
             true,
         );
-        assert!(
-            !modifiers
+        assert!(!modifiers
                 .iter()
-                .any(|modifier| modifier.source == "低生命/疲惫行者")
-        );
+            .any(|modifier| modifier.source == "低生命/疲惫行者"));
         // 相同生命下普通角色会吃到0.1倍低血惩罚，召唤物不受影响。
         let low_hp_multiplier = low_hp_damage_multiplier_with_fatigue(2.0, 20.0, false);
         assert!((low_hp_multiplier - 0.1).abs() < 0.0001);
@@ -10708,9 +11495,7 @@ mod tests {
         summon.max_hp = 20.0;
         summon.hp = 20.0;
         owner.summons.push(summon);
-        manager
-            .player_characters
-            .insert("10001".to_owned(), owner);
+        manager.player_characters.insert("10001".to_owned(), owner);
 
         let owner = manager.player_characters["10001"].clone();
         let summon = owner.summons[0].clone();
@@ -10721,8 +11506,14 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(sync_encounter_to_manager(Some(&encounter), &mut manager));
-        assert_eq!(manager.player_characters["10001"].summons[0].hp, 3.0);
+        assert!(sync_encounter_to_manager(
+            Some(&encounter),
+            &mut manager
+        ));
+        assert_eq!(
+            manager.player_characters["10001"].summons[0].hp,
+            3.0
+        );
     }
 
     fn empty_manager() -> NapcatMessageManager {
@@ -10732,6 +11523,7 @@ mod tests {
             chat_targets: HashMap::default(),
             chat_target_kinds: HashMap::default(),
             player_characters: HashMap::default(),
+            hidden_roles: HashMap::default(),
             trpg_groups: HashMap::default(),
             current_trpg_group: None,
             groups: HashMap::default(),
@@ -10744,10 +11536,61 @@ mod tests {
             skill_pool: Vec::new(),
             item_pool: Vec::new(),
             unit_pool: HashMap::default(),
+            unit_instances: HashMap::default(),
+            next_unit_instance_index: 1,
             pending_talent_choices: HashMap::default(),
             used_talent_names: HashSet::default(),
             }
         }
+
+    #[test]
+    fn persistent_unit_instances_join_battle_independently_and_sync_back() {
+        let mut manager = empty_manager();
+        let mut template = UnitPoolEntry::default();
+        template.label = "史莱姆".to_owned();
+        template.character.hp = 12.0;
+        template.character.max_hp = 12.0;
+        manager.unit_pool.insert("slime".to_owned(), template);
+        let first_id = manager.create_unit_instance("slime").unwrap();
+        let second_id = manager.create_unit_instance("slime").unwrap();
+
+        let mut store = BattleRoundStore::default();
+        store.encounters.insert(
+            "battle-1".to_owned(),
+            BattleEncounter::default(),
+        );
+        assert!(store
+            .add_unit_instance_to_encounter("battle-1", &first_id, &manager)
+            .unwrap());
+        assert!(store
+            .add_unit_instance_to_encounter("battle-1", &second_id, &manager)
+            .unwrap());
+        assert!(!store
+            .add_unit_instance_to_encounter("battle-1", &first_id, &manager)
+            .unwrap());
+
+        let encounter = store.encounters.get_mut("battle-1").unwrap();
+        assert_eq!(encounter.participants.len(), 2);
+        encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == first_id)
+            .unwrap()
+            .hp = 4.0;
+        assert!(sync_encounter_to_manager(
+            Some(encounter),
+            &mut manager
+        ));
+        assert_eq!(
+            manager.unit_instances[&first_id].character.hp,
+            4.0
+        );
+        assert_eq!(
+            manager.unit_instances[&second_id].character.hp,
+            12.0
+        );
+    }
+
     fn participant(id: &str, turn: u32) -> BattleParticipantSnapshot {
         BattleParticipantSnapshot {
             target_id: id.to_owned(),
@@ -10786,6 +11629,8 @@ mod tests {
             damage_taken_modifier: 1.0,
             healing_dealt_modifier: 1.0,
             healing_taken_modifier: 1.0,
+            group_modifiers: TrpgGlobalCombatModifiers::default(),
+            hidden_role: HiddenRoleBattleState::default(),
             arrogance_damage_bonus_per_source: 0.0,
             arrogance_damage_source_ids: Vec::new(),
             endless_pain_bonus_damage_per_stack: 0.0,
@@ -10863,6 +11708,7 @@ mod tests {
             wound_healing_taken_turns: 0,
             delayed_damage_ticks: Vec::new(),
             delayed_healing_ticks: Vec::new(),
+            corrosion_stacks: Vec::new(),
             damage_taken_this_turn: 0.0,
             healing_taken_this_turn: 0.0,
             skill_last_used_turns: HashMap::new(),
@@ -11092,8 +11938,7 @@ mod tests {
         );
         let encounter = store.encounters.get_mut(&encounter_id).unwrap();
         assert!(refresh_encounter_players(
-            encounter,
-            &manager
+            encounter, &manager
         ));
         assert_eq!(encounter.participants[0].turn, 6);
         assert_eq!(
@@ -11124,14 +11969,11 @@ mod tests {
             &group,
         );
 
-        assert!(store.encounters[&encounter_id]
-            .participants
-            .is_empty());
+        assert!(store.encounters[&encounter_id].participants.is_empty());
         {
             let encounter = store.encounters.get_mut(&encounter_id).unwrap();
             assert!(refresh_encounter_players(
-                encounter,
-                &manager
+                encounter, &manager
             ));
             assert_eq!(encounter.participants.len(), 1);
         }
@@ -11477,9 +12319,10 @@ mod tests {
     #[test]
     fn battle_level_up_grants_two_status_points_per_level() {
         let mut manager = empty_manager();
-        manager
-            .player_characters
-            .insert("a".to_owned(), PlayerCharacter::default());
+        manager.player_characters.insert(
+            "a".to_owned(),
+            PlayerCharacter::default(),
+        );
         let mut player = participant("a", 0);
         player.player_character = true;
         player.level = 3;
@@ -12199,6 +13042,163 @@ mod tests {
     }
 
     #[test]
+    fn trpg_group_global_modifiers_cover_all_combat_amount_channels_and_units() {
+        let unit = UnitPoolEntry {
+            category: String::new(),
+            label: "测试NPC".to_owned(),
+            note: String::new(),
+            legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 1.0,
+            character: PlayerCharacter::default(),
+        };
+        let mut participant = participant_from_unit_template("npc:1", "test", &unit);
+        participant.group_modifiers = TrpgGlobalCombatModifiers {
+            damage_dealt: 1.5,
+            damage_taken: 0.75,
+            healing_dealt: 2.0,
+            healing_taken: 0.5,
+            ..Default::default()
+        };
+        let config = TrpgBasicConfig::default();
+
+        let damage_dealt = participant_damage_modifiers(
+            &participant,
+            None,
+            &config,
+            0,
+            DamageType::Physical,
+            false,
+        );
+        assert!(damage_dealt.iter().any(|modifier| {
+            modifier.source == "TRPG组全局造成伤害修正"
+                && (modifier.multiplier - 1.5).abs() < f32::EPSILON
+        }));
+        let damage_taken = participant_damage_taken_modifiers(
+            &participant,
+            None,
+            DamageType::Physical,
+            false,
+        );
+        assert!(damage_taken.iter().any(|modifier| {
+            modifier.source == "TRPG组全局承受伤害修正"
+                && (modifier.multiplier - 0.75).abs() < f32::EPSILON
+        }));
+        let healing_dealt = participant_healing_modifiers(&participant, None, &config);
+        assert!(healing_dealt.iter().any(|modifier| {
+            modifier.source == "TRPG组全局造成治疗修正"
+                && (modifier.multiplier - 2.0).abs() < f32::EPSILON
+        }));
+        assert!((participant_healing_taken_multiplier(&participant) - 0.5).abs() < f32::EPSILON);
+
+        let expected = participant.group_modifiers;
+        participant.unit_template_id = None;
+        participant.player_character = true;
+        assert_eq!(
+            participant_group_modifiers(&participant),
+            expected,
+            "players must receive the global modifier"
+        );
+        participant.player_character = false;
+        participant.is_summon = true;
+        assert_eq!(
+            participant_group_modifiers(&participant),
+            expected,
+            "player summons must receive the global modifier"
+        );
+    }
+
+    #[test]
+    fn group_global_modifier_changes_refresh_existing_players_and_npcs() {
+        let mut manager = empty_manager();
+        let unit = UnitPoolEntry {
+            category: String::new(),
+            label: "测试NPC".to_owned(),
+            note: String::new(),
+            legacy_member_id: None,
+            rarity: UnitRarity::Normal,
+            base_damage: 1.0,
+            character: PlayerCharacter::default(),
+        };
+        manager.unit_pool.insert("test".to_owned(), unit.clone());
+        let summon = Summon {
+            hp: 5.0,
+            max_hp: 5.0,
+            ..Default::default()
+        };
+        manager
+            .player_characters
+            .insert("player".to_owned(), PlayerCharacter {
+                summons: vec![summon.clone()],
+                ..Default::default()
+            });
+        manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
+            global_combat_modifiers: TrpgGlobalCombatModifiers {
+                damage_dealt: 1.0,
+                damage_dealt_per_world_turn_percent: 0.1,
+                damage_taken: 0.8,
+                damage_taken_per_world_turn_percent: 0.2,
+                healing_dealt: 1.5,
+                healing_dealt_per_world_turn_percent: 0.3,
+                healing_taken: 0.6,
+                healing_taken_per_world_turn_percent: 0.4,
+            },
+            players: vec!["player".to_owned()],
+            world_turn: 10,
+            ..Default::default()
+        });
+        let mut encounter = BattleEncounter {
+            trpg_group: Some("table".to_owned()),
+            participants: vec![
+                participant_from_unit_template("npc:1", "test", &unit),
+                participant_from_character(
+                    "player",
+                    &manager.player_characters["player"],
+                    &manager,
+                ),
+                participant_from_summon(
+                    "player",
+                    0,
+                    &summon,
+                    &manager.player_characters["player"],
+                    &manager,
+                ),
+            ],
+            ..Default::default()
+        };
+
+        assert!(refresh_encounter_players(
+            &mut encounter,
+            &manager
+        ));
+        assert_eq!(
+            encounter.participants[0].group_modifiers,
+            manager.trpg_groups["table"]
+                .global_combat_modifiers
+                .effective_at_world_turn(10)
+        );
+        assert_eq!(
+            encounter.participants[1].group_modifiers, encounter.participants[0].group_modifiers,
+            "players and NPCs must receive the same group modifier"
+        );
+        assert_eq!(
+            encounter.participants[2].group_modifiers, encounter.participants[0].group_modifiers,
+            "player summons must remain in the roster and receive the same group modifier"
+        );
+        let effective = encounter.participants[0].group_modifiers;
+        assert!((effective.damage_dealt - 1.01).abs() < 0.0001);
+        assert!((effective.damage_taken - 0.82).abs() < 0.0001);
+        assert!((effective.healing_dealt - 1.53).abs() < 0.0001);
+        assert!((effective.healing_taken - 0.64).abs() < 0.0001);
+
+        let legacy_group: TrpgGroup = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            legacy_group.global_combat_modifiers,
+            TrpgGlobalCombatModifiers::default()
+        );
+    }
+
+    #[test]
     fn battle_buffs_are_isolated_per_unit_instance_and_expire() {
         let mut manager = empty_manager();
         let caster = PlayerCharacter {
@@ -12777,7 +13777,10 @@ mod tests {
             .any(|participant| participant.target_id == "unit:slime"));
         let roster_len_before_sync = encounter.participants.len();
         refresh_encounter_players(&mut encounter, &manager);
-        assert_eq!(encounter.participants.len(), roster_len_before_sync);
+        assert_eq!(
+            encounter.participants.len(),
+            roster_len_before_sync
+        );
         assert!(!encounter
             .participants
             .iter()
@@ -17113,11 +18116,7 @@ mod tests {
                 ..Default::default()
             });
         assert!(store.next_round("battle"));
-        let target = &mut store
-            .encounters
-            .get_mut("battle")
-            .unwrap()
-            .participants[1];
+        let target = &mut store.encounters.get_mut("battle").unwrap().participants[1];
         target.hp = 0.0;
         target.alive = false;
 
@@ -19751,6 +20750,109 @@ mod tests {
             .modifiers
             .iter()
             .any(|modifier| modifier.source == "属性伤害加成"));
+    }
+
+    #[test]
+    fn corrosion_wave_stacks_poison_and_rust_on_enemy_turns_only() {
+        let mut manager = empty_manager();
+        let mut actor_character = PlayerCharacter {
+            hp: 100.0,
+            max_hp: 100.0,
+            ..Default::default()
+        };
+        actor_character.skill_names = vec![String::new()];
+        actor_character.skill_notes = vec!["腐蚀波（10分）：自己每次攻击后，给与所有敌人一层可叠加的中毒（3点物理伤害，持续4回合），如果是机械单位，则将中毒改为锈蚀（6点物理伤害，持续2回合）。对同一个目标第一层之后的层数会减少25%伤害。".to_owned()];
+        actor_character.skill_metadata = vec![CharacterSkillMetadata::default()];
+        manager.player_characters.insert(
+            "actor".to_owned(),
+            actor_character.clone(),
+        );
+
+        let actor = participant_from_character("actor", &actor_character, &manager);
+        let mut living_enemy = participant("living", 0);
+        living_enemy.hp = 100.0;
+        living_enemy.max_hp = 100.0;
+        let mut mechanical_enemy = participant("mech", 0);
+        mechanical_enemy.hp = 100.0;
+        mechanical_enemy.max_hp = 100.0;
+        mechanical_enemy.is_summon = true;
+        mechanical_enemy.summon_owner_id = Some("npc-owner".to_owned());
+        mechanical_enemy.summon_kind = SummonKind::Mech;
+        let mut player_ally = participant("ally", 0);
+        player_ally.player_character = true;
+
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                active: true,
+                participants: vec![actor, living_enemy, mechanical_enemy, player_ally],
+                ..Default::default()
+            });
+        let attack = CharacterSkill {
+            index: 1,
+            name: "打击".to_owned(),
+            note: "主动使用对目标造成1点物理伤害".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+
+        assert!(store.record_skill_use("battle", "actor", "living", &attack, &manager, None));
+        assert!(store.record_skill_use("battle", "actor", "living", &attack, &manager, None));
+        assert!(store.record_skill_use("battle", "actor", "living", &attack, &manager, None));
+
+        let encounter = store.encounters.get_mut("battle").unwrap();
+        let living = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "living")
+            .unwrap();
+        assert_eq!(living.corrosion_stacks.len(), 3);
+        assert_eq!(
+            living.corrosion_stacks[0].kind,
+            BattleCorrosionKind::Poison
+        );
+        assert!((living.corrosion_stacks[0].damage_per_turn - 3.0).abs() < 0.0001);
+        assert!((living.corrosion_stacks[1].damage_per_turn - 2.25).abs() < 0.0001);
+        assert!((living.corrosion_stacks[2].damage_per_turn - 2.25).abs() < 0.0001);
+        living.hp = 100.0;
+        for _ in 0..4 {
+            advance_participant_corrosion(living, true, 1);
+        }
+        assert!((living.hp - 70.0).abs() < 0.0001);
+        assert!(living.corrosion_stacks.is_empty());
+
+        let mechanical = encounter
+            .participants
+            .iter_mut()
+            .find(|participant| participant.target_id == "mech")
+            .unwrap();
+        assert_eq!(mechanical.corrosion_stacks.len(), 3);
+        assert_eq!(
+            mechanical.corrosion_stacks[0].kind,
+            BattleCorrosionKind::Rust
+        );
+        assert!((mechanical.corrosion_stacks[0].damage_per_turn - 6.0).abs() < 0.0001);
+        assert!((mechanical.corrosion_stacks[1].damage_per_turn - 4.5).abs() < 0.0001);
+        assert!((mechanical.corrosion_stacks[2].damage_per_turn - 4.5).abs() < 0.0001);
+        advance_participant_corrosion(mechanical, true, 1);
+        advance_participant_corrosion(mechanical, true, 2);
+        assert!((mechanical.hp - 70.0).abs() < 0.0001);
+        assert!(mechanical.corrosion_stacks.is_empty());
+
+        let ally = encounter
+            .participants
+            .iter()
+            .find(|participant| participant.target_id == "ally")
+            .unwrap();
+        assert!(ally.corrosion_stacks.is_empty());
     }
 
     #[test]
