@@ -991,7 +991,6 @@ const AUTO_HIDE_PANEL_GRACE: f32 = 4.0;
 enum AutoHideEdge {
     Top,
     Right,
-    Bottom,
     Left,
 }
 
@@ -1001,7 +1000,6 @@ struct MainViewFullscreenState {
     previous_window_mode: Option<WindowMode>,
     top_rect: Option<Rect>,
     right_rect: Option<Rect>,
-    bottom_rect: Option<Rect>,
     left_rect: Option<Rect>,
 }
 
@@ -1039,7 +1037,6 @@ fn pointer_reveals_auto_hide_panel(
     match edge {
         AutoHideEdge::Top => pointer.y <= viewport.top() + AUTO_HIDE_EDGE_SIZE,
         AutoHideEdge::Right => pointer.x >= viewport.right() - AUTO_HIDE_EDGE_SIZE,
-        AutoHideEdge::Bottom => pointer.y >= viewport.bottom() - AUTO_HIDE_EDGE_SIZE,
         AutoHideEdge::Left => pointer.x <= viewport.left() + AUTO_HIDE_EDGE_SIZE,
     }
 }
@@ -1065,12 +1062,7 @@ fn auto_hide_panel_visibility(
             AutoHideEdge::Right,
             state.right_rect,
         ),
-        bottom: pointer_reveals_auto_hide_panel(
-            pointer,
-            viewport,
-            AutoHideEdge::Bottom,
-            state.bottom_rect,
-        ),
+        bottom: true,
         left: pointer_reveals_auto_hide_panel(
             pointer,
             viewport,
@@ -17160,9 +17152,6 @@ pub fn ui_system(
     if !panel_visibility.right {
         main_view_fullscreen.right_rect = None;
     }
-    if !panel_visibility.bottom {
-        main_view_fullscreen.bottom_rect = None;
-    }
     if !panel_visibility.left {
         main_view_fullscreen.left_rect = None;
     }
@@ -17726,7 +17715,7 @@ pub fn ui_system(
                 }
                 let mut release_control_requested = false;
                 if panel_visibility.bottom {
-                    let hotbar_area = egui::Area::new(egui::Id::new("voxel_player_hotbar"))
+                    egui::Area::new(egui::Id::new("voxel_player_hotbar"))
                         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
                         .order(egui::Order::Foreground)
                         .show(ctx, |ui| {
@@ -17771,7 +17760,6 @@ pub fn ui_system(
                                     }
                                 });
                         });
-                    main_view_fullscreen.bottom_rect = Some(hotbar_area.response.rect);
                 }
                 if release_control_requested {
                     voxel_possession.release();
@@ -17898,7 +17886,6 @@ pub fn ui_system(
                             });
                     });
                 let hotbar_rect = hotbar_area.response.rect;
-                main_view_fullscreen.bottom_rect = Some(hotbar_rect);
                 hotbar_rect
             } else {
                 Rect::NOTHING
@@ -18888,7 +18875,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fullscreen_panels_reveal_only_at_their_edge_or_while_hovered() {
+    fn fullscreen_side_panels_reveal_at_edges_and_bottom_items_stay_visible() {
         let viewport = Rect::from_min_max(Pos2::ZERO, Pos2::new(1_000.0, 700.0));
         let mut state = MainViewFullscreenState {
             active: true,
@@ -18896,12 +18883,12 @@ mod tests {
         };
 
         let center = auto_hide_panel_visibility(&state, Some(Pos2::new(500.0, 350.0)), viewport);
-        assert!(!center.top && !center.right && !center.bottom && !center.left);
+        assert!(!center.top && !center.right && center.bottom && !center.left);
 
         let left_edge =
             auto_hide_panel_visibility(&state, Some(Pos2::new(2.0, 350.0)), viewport);
         assert!(left_edge.left);
-        assert!(!left_edge.top && !left_edge.right && !left_edge.bottom);
+        assert!(!left_edge.top && !left_edge.right && left_edge.bottom);
 
         state.left_rect = Some(Rect::from_min_max(
             Pos2::ZERO,
