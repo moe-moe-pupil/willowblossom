@@ -1123,6 +1123,7 @@ impl Default for BuffDraft {
 #[derive(SystemParam)]
 pub struct UiSystemLocals<'w, 's> {
     has_run_once: Local<'s, bool>,
+    main_view_fullscreen: Local<'s, bool>,
     new_chat_group_modal_string_open: Local<'s, (String, bool)>,
     chat_input_msgs: Local<'s, HashMap<String, String>>,
     chat_scroll_states: Local<'s, HashMap<String, ChatScrollState>>,
@@ -16769,6 +16770,7 @@ pub fn ui_system(
     mut backup_ui: BackupUiParam,
 ) {
     let has_run_once: &mut Local<bool> = &mut locals.has_run_once;
+    let main_view_fullscreen: &mut Local<bool> = &mut locals.main_view_fullscreen;
     let new_chat_group_modal_string_open: &mut Local<(String, bool)> =
         &mut locals.new_chat_group_modal_string_open;
     let chat_input_msgs: &mut Local<HashMap<String, String>> = &mut locals.chat_input_msgs;
@@ -17008,59 +17010,69 @@ pub fn ui_system(
             .max_rect(ctx.viewport_rect()),
     );
 
-    egui::Panel::top("top_panel")
-        .resizable(false)
-        .show(&mut viewport_ui, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                file_menu_button(
-                    ui,
-                    &mut new_chat_group_modal_string_open.1,
-                    &mut trpg_group_settings.open,
-                );
-                tools_menu_button(
-                    ui,
-                    &mut rule_engine_state,
-                    &mut battle_round_state,
-                );
-                pool_menu_button(ui, &manager, trpg_group_settings);
+    let fullscreen_shortcut = egui::KeyboardShortcut::new(
+        Modifiers::COMMAND | Modifiers::SHIFT,
+        egui::Key::F,
+    );
+    if ctx.input_mut(|input| input.consume_shortcut(&fullscreen_shortcut)) {
+        **main_view_fullscreen = !**main_view_fullscreen;
+    }
+
+    let summary_markers_changed = sync_summarized_message_counts(&mut manager, &deepseek_manager);
+    if summary_markers_changed {
+        if let Err(err) = manager.persist() {
+            eprintln!("failed to persist summarized message markers: {err}");
+        }
+    }
+
+    if !**main_view_fullscreen {
+        egui::Panel::top("top_panel")
+            .resizable(false)
+            .show(&mut viewport_ui, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| {
+                    file_menu_button(
+                        ui,
+                        &mut new_chat_group_modal_string_open.1,
+                        &mut trpg_group_settings.open,
+                    );
+                    tools_menu_button(
+                        ui,
+                        &mut rule_engine_state,
+                        &mut battle_round_state,
+                    );
+                    pool_menu_button(ui, &manager, trpg_group_settings);
+                });
             });
-        });
 
-    egui::Panel::right("right_panel")
-        .resizable(true)
-        .show(&mut viewport_ui, |ui| {
-            if napcat_sender.is_none() {
-                ui.label("NapCat websocket未连接");
-            }
-            if deepseek_sender.is_none() {
-                ui.label("DeepSeek后台未就绪");
-            }
-            let summary_markers_changed =
-                sync_summarized_message_counts(&mut manager, &deepseek_manager);
-            if summary_markers_changed {
-                if let Err(err) = manager.persist() {
-                    eprintln!("failed to persist summarized message markers: {err}");
+        egui::Panel::right("right_panel")
+            .resizable(true)
+            .show(&mut viewport_ui, |ui| {
+                if napcat_sender.is_none() {
+                    ui.label("NapCat websocket未连接");
                 }
-            }
+                if deepseek_sender.is_none() {
+                    ui.label("DeepSeek后台未就绪");
+                }
 
-            summary_panel(ui, &manager, &deepseek_manager);
-        });
+                summary_panel(ui, &manager, &deepseek_manager);
+            });
 
-    egui::Panel::left("chat_list_panel")
-        .resizable(true)
-        .default_size(220.0)
-        .size_range(160.0..=340.0)
-        .show(&mut viewport_ui, |ui| {
-            chat_list_panel(
-                ui,
-                ctx,
-                &mut manager,
-                chat_list_edit_target,
-                chat_list_edit_name,
-                chat_list_player_visible_filter,
-                trpg_group_settings,
-            );
-        });
+        egui::Panel::left("chat_list_panel")
+            .resizable(true)
+            .default_size(220.0)
+            .size_range(160.0..=340.0)
+            .show(&mut viewport_ui, |ui| {
+                chat_list_panel(
+                    ui,
+                    ctx,
+                    &mut manager,
+                    chat_list_edit_target,
+                    chat_list_edit_name,
+                    chat_list_player_visible_filter,
+                    trpg_group_settings,
+                );
+            });
+    }
 
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
@@ -17074,7 +17086,23 @@ pub fn ui_system(
                 .inner_margin(6)
                 .show(ui, |ui| {
                     let mode_before_toolbar = voxel_editor.mode;
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let fullscreen_label = if **main_view_fullscreen {
+                            "退出主视图全屏"
+                        } else {
+                            "主视图全屏"
+                        };
+                        if ui
+                            .button(fullscreen_label)
+                            .on_hover_text(format!(
+                                "自动隐藏或恢复周围面板（{}）",
+                                ui.ctx().format_shortcut(&fullscreen_shortcut)
+                            ))
+                            .clicked()
+                        {
+                            **main_view_fullscreen = !**main_view_fullscreen;
+                        }
+                        ui.separator();
                         ui.selectable_value(
                             &mut voxel_editor.mode,
                             VoxelEditMode::Add,
