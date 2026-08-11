@@ -1187,6 +1187,7 @@ pub(crate) struct CharacterEditState {
     pending_character_reset: Option<String>,
     pending_skill_delete: Option<(String, usize)>,
     quick_cast_skill_index: HashMap<String, usize>,
+    quick_cast_target_ids: HashMap<(String, usize), String>,
     pending_force_cast: Option<(String, usize)>,
     skill_pool_selected_index: HashMap<String, usize>,
     item_pool_selected_index: HashMap<String, usize>,
@@ -1207,6 +1208,10 @@ impl CharacterEditState {
         self.pending_skill_delete
             .take_if(|(pending_target, _)| pending_target == target_id);
         self.quick_cast_skill_index.remove(target_id);
+        self.quick_cast_target_ids
+            .retain(|(caster_id, _), selected_target_id| {
+                caster_id != target_id && selected_target_id != target_id
+            });
         self.pending_force_cast
             .take_if(|(pending_target, _)| pending_target == target_id);
         self.skill_pool_selected_index.remove(target_id);
@@ -6805,6 +6810,7 @@ fn quick_cast_ui(
     if *selected >= skills.len() {
         *selected = 0;
     }
+    let selected_skill_index = *selected;
     let skill = skills[*selected].clone();
     let mut effect = quick_cast_effect(
         &skill.note,
@@ -6820,22 +6826,24 @@ fn quick_cast_ui(
         skill.cooldown_left,
         cast_turn,
     );
-    let targets = effect
-        .as_mut()
-        .map(|effect| {
-            resolve_quick_cast_effect_targets(
-                caster_id,
-                character,
-                effect,
-                character_targets,
-                scene_positions,
-                player_camera_positions,
-                &skill,
-            )
+    let uses_selected_target = effect.as_ref().is_some_and(|effect| {
+        quick_cast_effect_uses_selected_target(effect, skill.target_class.as_deref())
+    });
+    let target_state_key = (
+        caster_id.to_owned(),
+        selected_skill_index,
+    );
+    let mut selected_target_id = edit_state
+        .quick_cast_target_ids
+        .get(&target_state_key)
+        .filter(|target_id| {
+            character_targets
+                .iter()
+                .any(|(candidate_id, _)| candidate_id == *target_id)
         })
-        .unwrap_or_default();
+        .cloned()
+        .unwrap_or_else(|| default_quick_cast_target_id(character_targets, caster_id));
     let can_pay = character.mp + f32::EPSILON >= skill.mp_cost;
-    let can_cast = can_pay && cooldown_remaining == 0 && effect.is_some();
     let force_pending = edit_state
         .pending_force_cast
         .as_ref()
@@ -6917,6 +6925,52 @@ fn quick_cast_ui(
                 }
             });
 
+            if uses_selected_target {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("目标");
+                    egui::ComboBox::from_id_salt(format!(
+                        "quick_cast_target_{caster_id}_{selected_skill_index}"
+                    ))
+                    .selected_text(quick_cast_target_display_name(
+                        character_targets,
+                        &selected_target_id,
+                        caster_id,
+                    ))
+                    .show_ui(ui, |ui| {
+                        for (target_id, name) in character_targets {
+                            let label = if target_id == caster_id {
+                                format!("{name}（自己）")
+                            } else {
+                                name.clone()
+                            };
+                            ui.selectable_value(
+                                &mut selected_target_id,
+                                target_id.clone(),
+                                label,
+                            );
+                        }
+                    });
+                });
+            }
+
+            let targets = effect
+                .as_mut()
+                .map(|effect| {
+                    resolve_quick_cast_effect_targets(
+                        caster_id,
+                        character,
+                        effect,
+                        character_targets,
+                        &selected_target_id,
+                        scene_positions,
+                        player_camera_positions,
+                        &skill,
+                    )
+                })
+                .unwrap_or_default();
+            let can_cast =
+                can_pay && cooldown_remaining == 0 && effect.is_some() && !targets.is_empty();
+
             if let Some(effect) = effect.as_ref() {
                 let target_label = match effect {
                     QuickCastEffect::Damage { .. } => "范围内目标",
@@ -6959,7 +7013,7 @@ fn quick_cast_ui(
             ui.horizontal_wrapped(|ui| {
                 let force_response = ui
                     .add(egui::Button::new("强制释放"))
-                    .on_hover_text("GM强制释放：忽略MP、目标和规则解析条件。");
+                    .on_hover_text("GM强制释放：忽略MP不足、目标和规则解析条件，但仍扣除现有MP。");
                 if force_response.clicked() {
                     if force_pending {
                         action = Some(QuickCastAction {
@@ -6988,8 +7042,12 @@ fn quick_cast_ui(
                     "冷却还剩{cooldown_remaining}轮"
                 ));
             }
-            if !can_cast && can_pay && cooldown_remaining == 0 {
-                ui.small("普通释放需要可解析的固定伤害或治疗规则；强制释放可忽略。");
+            if can_pay && cooldown_remaining == 0 {
+                if effect.is_none() {
+                    ui.small("普通释放需要可解析的固定伤害或治疗规则；强制释放可忽略。");
+                } else if targets.is_empty() {
+                    ui.small("普通释放需要有效目标；强制释放可忽略。");
+                }
             }
             if !can_pay {
                 ui.small(format!(
@@ -6998,7 +7056,62 @@ fn quick_cast_ui(
                 ));
             }
         });
+    if uses_selected_target && !selected_target_id.is_empty() {
+        edit_state
+            .quick_cast_target_ids
+            .insert(target_state_key, selected_target_id);
+    }
     action
+}
+
+fn quick_cast_effect_uses_selected_target(
+    effect: &QuickCastEffect,
+    target_class: Option<&str>,
+) -> bool {
+    if let QuickCastEffect::Sequence(effects) = effect {
+        return effects.iter().any(|resolved| {
+            quick_cast_effect_uses_selected_target(&resolved.effect, target_class)
+        });
+    }
+    let target = match effect {
+        QuickCastEffect::Damage { target, .. }
+        | QuickCastEffect::Heal { target, .. }
+        | QuickCastEffect::GrantBuff { target, .. } => target,
+        QuickCastEffect::Sequence(_) => unreachable!("sequence handled above"),
+    };
+    target.area.is_none()
+        && !skill_target_class_is_area(target_class)
+        && matches!(
+            target.actor,
+            ActorRef::Source | ActorRef::Target
+        )
+}
+
+fn default_quick_cast_target_id(character_targets: &[(String, String)], caster_id: &str) -> String {
+    character_targets
+        .iter()
+        .find(|(target_id, _)| target_id != caster_id)
+        .or_else(|| character_targets.first())
+        .map(|(target_id, _)| target_id.clone())
+        .unwrap_or_default()
+}
+
+fn quick_cast_target_display_name(
+    character_targets: &[(String, String)],
+    selected_target_id: &str,
+    caster_id: &str,
+) -> String {
+    character_targets
+        .iter()
+        .find(|(target_id, _)| target_id == selected_target_id)
+        .map(|(_, name)| {
+            if selected_target_id == caster_id {
+                format!("{name}（自己）")
+            } else {
+                name.clone()
+            }
+        })
+        .unwrap_or_else(|| "无可用目标".to_owned())
 }
 
 fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
@@ -7263,6 +7376,7 @@ fn resolve_quick_cast_effect_targets(
     character: &PlayerCharacter,
     effect: &mut QuickCastEffect,
     character_targets: &[(String, String)],
+    selected_target_id: &str,
     scene_positions: Option<&SceneCharacterPositions>,
     player_camera_positions: Option<&ScenePlayerCameraPositions>,
     skill: &QuickCastSkill,
@@ -7276,6 +7390,7 @@ fn resolve_quick_cast_effect_targets(
                 character,
                 &mut resolved.effect,
                 character_targets,
+                selected_target_id,
                 scene_positions,
                 player_camera_positions,
                 skill,
@@ -7300,6 +7415,7 @@ fn resolve_quick_cast_effect_targets(
             caster_id,
             effect,
             character_targets,
+            selected_target_id,
             scene_positions,
             player_camera_positions,
             fallback_radius,
@@ -7316,6 +7432,7 @@ fn quick_cast_targets(
     caster_id: &str,
     effect: &QuickCastEffect,
     character_targets: &[(String, String)],
+    selected_target_id: &str,
     scene_positions: Option<&SceneCharacterPositions>,
     player_camera_positions: Option<&ScenePlayerCameraPositions>,
     fallback_radius: Option<f32>,
@@ -7380,7 +7497,7 @@ fn quick_cast_targets(
         ActorRef::Source | ActorRef::Target => {
             let targets = character_targets
                 .iter()
-                .find(|(target_id, _)| target_id != caster_id)
+                .find(|(target_id, _)| target_id == selected_target_id)
                 .map(|(target_id, _)| vec![target_id.clone()])
                 .unwrap_or_default();
             filter_quick_cast_targets_by_range(
@@ -7404,24 +7521,23 @@ fn filter_quick_cast_targets_by_range(
     let Some(radius) = radius else {
         return targets;
     };
-    let Some(user_id) = caster_id.parse::<u64>().ok() else {
-        return Vec::new();
-    };
-    let Some(camera_position) =
+    let camera_position = caster_id.parse::<u64>().ok().and_then(|user_id| {
         player_camera_positions.and_then(|positions| positions.positions.get(&user_id))
-    else {
-        return Vec::new();
-    };
-    let Some(scene_positions) = scene_positions else {
-        return Vec::new();
-    };
+    });
     targets
         .into_iter()
         .filter(|target_id| {
-            scene_positions
-                .positions
-                .get(target_id)
-                .map(|position| camera_position.distance(*position) <= radius)
+            if target_id == caster_id {
+                return true;
+            }
+            camera_position
+                .zip(scene_positions)
+                .and_then(|(camera_position, scene_positions)| {
+                    scene_positions
+                        .positions
+                        .get(target_id)
+                        .map(|position| camera_position.distance(*position) <= radius)
+                })
                 .unwrap_or(false)
         })
         .collect()
@@ -7616,9 +7732,7 @@ fn apply_quick_cast_action_to_manager(
         };
         let source_dying_target_healing_modifier = character_dying_target_healing_modifier(caster);
         let damage_dealt_buffs = character_damage_dealt_talent_buffs(caster, &action.caster_id);
-        if !action.force {
-            caster.mp = (caster.mp - action.skill.mp_cost).max(0.0);
-        }
+        caster.mp = (caster.mp - action.skill.mp_cost).max(0.0);
         caster.skill_last_cast_turns.insert(
             action.skill.index.to_string(),
             action.cast_turn,
@@ -23045,6 +23159,82 @@ mod tests {
     }
 
     #[test]
+    fn forced_quick_cast_spends_mana_while_bypassing_insufficient_mp() {
+        let mut manager = empty_manager();
+        manager
+            .player_characters
+            .insert("caster".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                mp: 10.0,
+                max_mp: 10.0,
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("target".to_owned(), PlayerCharacter {
+                hp: 10.0,
+                max_hp: 10.0,
+                ..Default::default()
+            });
+        let skill = QuickCastSkill {
+            index: 0,
+            name: "强制施法测试".to_owned(),
+            note: String::new(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 3.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: Some(1),
+            target_class: Some("单目标".to_owned()),
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let effect = QuickCastEffect::Damage {
+            amount: 1.0,
+            target: TargetSelector {
+                actor: ActorRef::Target,
+                area: None,
+            },
+            damage_type: DamageType::Physical,
+        };
+
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill: skill.clone(),
+                targets: vec!["target".to_owned()],
+                effect: Some(effect.clone()),
+                cast_turn: 0,
+                force: true,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["caster"].mp,
+            7.0
+        );
+
+        manager.player_characters.get_mut("caster").unwrap().mp = 2.0;
+        assert!(apply_quick_cast_action_to_manager(
+            &mut manager,
+            QuickCastAction {
+                caster_id: "caster".to_owned(),
+                skill,
+                targets: vec!["target".to_owned()],
+                effect: Some(effect),
+                cast_turn: 1,
+                force: true,
+            },
+        ));
+        assert_eq!(
+            manager.player_characters["caster"].mp,
+            0.0
+        );
+    }
+
+    #[test]
     fn quick_cast_blocks_imported_cooldown_left() {
         let mut manager = empty_manager();
         manager
@@ -23178,6 +23368,7 @@ mod tests {
             &manager.player_characters["caster"],
             &mut effect,
             &character_targets,
+            "target",
             None,
             None,
             &skill,
@@ -23715,6 +23906,7 @@ mod tests {
             "1",
             &effect,
             &character_targets,
+            "near",
             Some(&scene_positions),
             Some(&camera_positions),
             skill_range_radius(Some(3)),
@@ -23756,6 +23948,7 @@ mod tests {
             "1",
             &effect,
             &character_targets,
+            "far",
             Some(&scene_positions),
             Some(&camera_positions),
             skill_range_radius(Some(3)),
@@ -23763,6 +23956,38 @@ mod tests {
         );
 
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn quick_cast_single_target_can_select_caster_without_scene_position() {
+        let effect = QuickCastEffect::Heal {
+            amount: 6.0,
+            target: TargetSelector {
+                actor: ActorRef::Target,
+                area: None,
+            },
+        };
+        let character_targets = vec![
+            ("1".to_owned(), "天幕".to_owned()),
+            ("ally".to_owned(), "队友".to_owned()),
+        ];
+
+        assert!(quick_cast_effect_uses_selected_target(
+            &effect,
+            Some("单目标")
+        ));
+        let targets = quick_cast_targets(
+            "1",
+            &effect,
+            &character_targets,
+            "1",
+            None,
+            None,
+            skill_range_radius(Some(4)),
+            Some("单目标"),
+        );
+
+        assert_eq!(targets, vec!["1".to_owned()]);
     }
 
     #[test]
@@ -23801,6 +24026,7 @@ mod tests {
             "1",
             &effect,
             &character_targets,
+            "far",
             Some(&scene_positions),
             Some(&camera_positions),
             fallback_radius,
@@ -23824,6 +24050,7 @@ mod tests {
             "1",
             &physical_effect,
             &character_targets,
+            "far",
             Some(&scene_positions),
             Some(&camera_positions),
             quick_cast_skill_range_radius(&caster, &physical_effect, Some(3), None),
@@ -23868,6 +24095,7 @@ mod tests {
             "1",
             &effect,
             &character_targets,
+            "far",
             Some(&scene_positions),
             Some(&camera_positions),
             fallback_radius,
@@ -23879,6 +24107,7 @@ mod tests {
             "1",
             &effect,
             &character_targets,
+            "far",
             Some(&scene_positions),
             Some(&camera_positions),
             quick_cast_skill_range_radius(&caster, &effect, Some(10), None),
@@ -23922,6 +24151,7 @@ mod tests {
             "1",
             &effect,
             &character_targets,
+            "near",
             Some(&scene_positions),
             Some(&camera_positions),
             skill_range_radius(Some(3)),
