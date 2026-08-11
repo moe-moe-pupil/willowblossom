@@ -8791,6 +8791,7 @@ fn participant_from_summon(
         summon.kind,
         owner.level,
     );
+    unit_character.inventory = summon.inventory.clone();
     let summon_status = unit_character.status.combined(&unit_character.extra_status);
 
     participant.target_id = target_id.clone();
@@ -8975,6 +8976,7 @@ fn sync_participant_from_manager(
             summon.kind,
             owner.level,
         );
+        unit_character.inventory = summon.inventory.clone();
         let status = unit_character.status.combined(&unit_character.extra_status);
         participant.base_damage = status.str_.max(status.dex).max(status.int_).max(1) as f32;
         participant.str_ = status.str_;

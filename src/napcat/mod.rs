@@ -1324,6 +1324,9 @@ pub struct Summon {
     pub max_hp: f32,
     #[serde(default)]
     pub kind: SummonKind,
+    /// 召唤物独立的背包、装备与1-9快捷栏。
+    #[serde(default)]
+    pub inventory: CharacterInventory,
     #[serde(default)]
     pub shield: f32,
     #[serde(default)]
@@ -1377,6 +1380,7 @@ impl Default for Summon {
             hp: default_summon_hp(),
             max_hp: default_summon_hp(),
             kind: SummonKind::Custom,
+            inventory: CharacterInventory::default(),
             shield: 0.0,
             max_shield: 0.0,
             shield_repair_rounds_remaining: 0,
@@ -18754,6 +18758,18 @@ position_cells = [4, 5, 6]
             .all(|slot| *slot == CharacterHotbarSlot::Empty));
         assert_eq!(
             inventory.hotbar[8],
+            CharacterHotbarSlot::ReleaseControl
+        );
+
+        let legacy_summon = serde_json::from_value::<Summon>(serde_json::json!({
+            "name": "旧召唤物",
+            "hp": 5.0,
+            "max_hp": 5.0
+        }))
+        .expect("legacy summon without inventory should deserialize");
+        assert_eq!(legacy_summon.inventory.hotbar.len(), 9);
+        assert_eq!(
+            legacy_summon.inventory.hotbar[8],
             CharacterHotbarSlot::ReleaseControl
         );
     }

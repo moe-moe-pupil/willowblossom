@@ -105,6 +105,7 @@ use crate::{
     VoxelPhysicsBody,
     VoxelPlayerCameraStore,
     VoxelPlayerStandee,
+    VoxelPossessedStandee,
     VoxelPossessionMovementStore,
     VoxelPossessionState,
     VoxelSpaceship,
@@ -8035,7 +8036,7 @@ fn character_editor_ui(
     );
     ui.separator();
     let (inventory_changed, equipment_changed) = character_inventory_editor_ui(
-        ui, target_id, character, edit_state, item_pool, false,
+        ui, target_id, character, edit_state, item_pool, false, true,
     );
     changed |= inventory_changed;
     if equipment_changed {
@@ -9641,6 +9642,7 @@ fn character_inventory_editor_ui(
     edit_state: &mut CharacterEditState,
     item_pool: &[InventoryItem],
     default_open: bool,
+    allow_character_actions: bool,
 ) -> (bool, bool) {
     let mut changed = false;
     let mut equipment_changed = false;
@@ -9650,7 +9652,9 @@ fn character_inventory_editor_ui(
     egui::CollapsingHeader::new("背包 / 装备")
         .default_open(default_open)
         .show(ui, |ui| {
-            changed |= redeemed_crafting_ui(ui, target_id, character, edit_state);
+            if allow_character_actions {
+                changed |= redeemed_crafting_ui(ui, target_id, character, edit_state);
+            }
             if !item_pool.is_empty() {
                 let selected = edit_state
                     .item_pool_selected_index
@@ -9735,7 +9739,7 @@ fn character_inventory_editor_ui(
             });
 
             ui.collapsing("生存快捷栏", |ui| {
-                ui.small("GM可把背包物品或已批准的主动技能放进玩家的1-9快捷栏。");
+                ui.small("GM可把背包物品或已批准的主动技能放进角色的1-9快捷栏。");
                 let active_skills = character_hotbar_skills(character);
                 let active_skill_indexes = active_skills
                     .iter()
@@ -9856,7 +9860,7 @@ fn character_inventory_editor_ui(
                             {
                                 equip_index = Some(index);
                             }
-                            if item.portrait_transform.is_some() {
+                            if allow_character_actions && item.portrait_transform.is_some() {
                                 if ui
                                     .button("变形")
                                     .on_hover_text("使用后改变立绘并消耗1个")
@@ -9905,9 +9909,11 @@ fn character_inventory_editor_ui(
                 changed = true;
                 equipment_changed = true;
             }
-            if let Some(index) = use_portrait_index {
-                use_portrait_transform_item(character, index);
-                changed = true;
+            if allow_character_actions {
+                if let Some(index) = use_portrait_index {
+                    use_portrait_transform_item(character, index);
+                    changed = true;
+                }
             }
             if let Some(index) = remove_index {
                 remove_character_inventory_item(character, index, false);
@@ -9983,6 +9989,114 @@ fn normalize_character_hotbar(character: &mut PlayerCharacter) -> bool {
         }
     }
     changed
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VoxelControlledInventoryTarget {
+    Player(u64),
+    Unit(String),
+    Summon {
+        summon_id: String,
+        owner_id: String,
+        index: usize,
+    },
+}
+
+impl VoxelControlledInventoryTarget {
+    fn from_possession(possession: &VoxelPossessionState) -> Option<Self> {
+        if let Some(user_id) = possession.active_user_id {
+            return Some(Self::Player(user_id));
+        }
+        match possession.active_standee()? {
+            VoxelPossessedStandee::Unit(instance_id) => Some(Self::Unit(instance_id.clone())),
+            VoxelPossessedStandee::Summon(summon_id) => {
+                let (owner_id, index) = crate::napcat::parse_summon_target_id(summon_id)?;
+                Some(Self::Summon {
+                    summon_id: summon_id.clone(),
+                    owner_id,
+                    index,
+                })
+            },
+        }
+    }
+
+    fn target_id(&self) -> String {
+        match self {
+            Self::Player(user_id) => user_id.to_string(),
+            Self::Unit(instance_id) => instance_id.clone(),
+            Self::Summon { summon_id, .. } => summon_id.clone(),
+        }
+    }
+}
+
+struct VoxelControlledInventorySnapshot {
+    title: String,
+    character: PlayerCharacter,
+}
+
+fn voxel_controlled_inventory_snapshot(
+    manager: &NapcatMessageManager,
+    target: &VoxelControlledInventoryTarget,
+) -> Option<VoxelControlledInventorySnapshot> {
+    match target {
+        VoxelControlledInventoryTarget::Player(user_id) => {
+            let target_id = user_id.to_string();
+            let character = manager.player_characters.get(&target_id)?.clone();
+            let display_name = if character.name.trim().is_empty() {
+                target_display_name(manager, &target_id)
+            } else {
+                character.name.trim().to_owned()
+            };
+            Some(VoxelControlledInventorySnapshot {
+                title: format!("玩家背包 · {display_name}"),
+                character,
+            })
+        },
+        VoxelControlledInventoryTarget::Unit(instance_id) => {
+            let instance = manager.unit_instances.get(instance_id)?;
+            let display_name = if !instance.display_name.trim().is_empty() {
+                instance.display_name.trim()
+            } else if !instance.character.name.trim().is_empty() {
+                instance.character.name.trim()
+            } else {
+                instance_id
+            };
+            Some(VoxelControlledInventorySnapshot {
+                title: format!("NPC背包 · {display_name}"),
+                character: instance.character.clone(),
+            })
+        },
+        VoxelControlledInventoryTarget::Summon {
+            owner_id, index, ..
+        } => {
+            let summon = manager
+                .player_characters
+                .get(owner_id)?
+                .summons
+                .get(*index)?;
+            let display_name = if summon.name.trim().is_empty() {
+                "召唤物"
+            } else {
+                summon.name.trim()
+            };
+            Some(VoxelControlledInventorySnapshot {
+                title: format!("召唤物背包 · {display_name}"),
+                character: summon_control_character(summon),
+            })
+        },
+    }
+}
+
+fn summon_control_character(summon: &Summon) -> PlayerCharacter {
+    PlayerCharacter {
+        inited: true,
+        name: summon.name.clone(),
+        image: summon.image.clone(),
+        hp: summon.hp,
+        max_hp: summon.max_hp,
+        inventory: summon.inventory.clone(),
+        ..Default::default()
+    }
 }
 
 fn character_hotbar_skills(character: &mut PlayerCharacter) -> Vec<(usize, String)> {
@@ -17560,7 +17674,7 @@ pub fn ui_system(
                             "WASD 移动 · 空格跳跃 · 双击空格飞行"
                         };
                         let interaction_hint = if voxel_possession.is_standee_possession_active() {
-                            "正在操纵NPC或召唤物 · 按9解除操纵"
+                            "正在操纵NPC或召唤物 · E背包 · 按9解除操纵"
                         } else if voxel_editor.is_player_possession_tool_equipped() {
                             "右键接管PL、NPC或召唤物 · 右键空处解除"
                         } else if voxel_editor.is_tool_gun_equipped() {
@@ -17576,7 +17690,7 @@ pub fn ui_system(
                         ));
                     } else {
                         let interaction_hint = if voxel_possession.is_standee_possession_active() {
-                            "正在操纵NPC或召唤物 · 按9解除操纵"
+                            "正在操纵NPC或召唤物 · E背包 · 按9解除操纵"
                         } else if voxel_editor.is_player_possession_tool_equipped() {
                             "右键接管PL、NPC或召唤物 · 右键空处解除"
                         } else if voxel_editor.is_tool_gun_equipped() {
@@ -17834,9 +17948,12 @@ pub fn ui_system(
                 toolbar_bottom * pixels_per_point,
             );
 
-            if let Some(possessed_user_id) = voxel_possession.active_user_id {
+            if voxel_possession.is_active() {
                 voxel_editor.creative_inventory_open = false;
-                if panel_visibility.bottom && voxel_targeting_preview.show_affected_players {
+                if voxel_possession.active_user_id.is_some()
+                    && panel_visibility.bottom
+                    && voxel_targeting_preview.show_affected_players
+                {
                     let affected_names = voxel_targeting_preview
                         .affected_user_ids
                         .iter()
@@ -17868,9 +17985,14 @@ pub fn ui_system(
                                 });
                         });
                 }
+                let controlled_target =
+                    VoxelControlledInventoryTarget::from_possession(voxel_possession);
+                let controlled_snapshot = controlled_target.as_ref().and_then(|target| {
+                    voxel_controlled_inventory_snapshot(&manager, target)
+                });
                 let mut release_control_requested = false;
                 if panel_visibility.bottom {
-                    egui::Area::new(egui::Id::new("voxel_player_hotbar"))
+                    egui::Area::new(egui::Id::new("voxel_controlled_hotbar"))
                         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
                         .order(egui::Order::Foreground)
                         .show(ctx, |ui| {
@@ -17879,10 +18001,8 @@ pub fn ui_system(
                                 .corner_radius(4)
                                 .inner_margin(4)
                                 .show(ui, |ui| {
-                                    if let Some(character) = manager
-                                        .player_characters
-                                        .get(&possessed_user_id.to_string())
-                                    {
+                                    if let Some(snapshot) = controlled_snapshot.as_ref() {
+                                        let character = &snapshot.character;
                                         ui.horizontal(|ui| {
                                             for (slot, entry) in
                                                 character.inventory.hotbar.iter().enumerate()
@@ -17911,7 +18031,7 @@ pub fn ui_system(
                                             }
                                         });
                                     } else {
-                                        ui.label("该玩家还没有角色物品栏");
+                                        ui.label("被接管角色没有可用物品栏");
                                     }
                                 });
                         });
@@ -17920,60 +18040,89 @@ pub fn ui_system(
                     voxel_possession.release();
                 }
                 if voxel_possession.player_inventory_open {
-                    let target_id = possessed_user_id.to_string();
                     let skill_pool_snapshot = manager.skill_pool.clone();
                     let item_pool_snapshot = manager.item_pool.clone();
-                    let stat_config = manager.character_stat_config_for_target(&target_id);
                     let mut window_open = true;
                     let mut inventory_changed = false;
                     let mut equipment_changed = false;
-                    if let Some(character) = manager.player_characters.get_mut(&target_id) {
-                        let title = format!(
-                            "玩家背包 · {}",
-                            if character.name.trim().is_empty() {
-                                target_id.as_str()
-                            } else {
-                                character.name.trim()
-                            }
-                        );
+                    if let (Some(target), Some(snapshot)) =
+                        (controlled_target.as_ref(), controlled_snapshot)
+                    {
+                        let target_id = target.target_id();
+                        let stat_config = manager.character_stat_config_for_target(&target_id);
+                        let VoxelControlledInventorySnapshot {
+                            title,
+                            mut character,
+                        } = snapshot;
+                        let allow_character_actions =
+                            !matches!(target, VoxelControlledInventoryTarget::Summon { .. });
                         egui::Window::new(title)
-                            .id(egui::Id::new(("voxel_player_inventory", possessed_user_id)))
+                            .id(egui::Id::new(("voxel_controlled_inventory", &target_id)))
                             .default_width(620.0)
                             .resizable(true)
                             .open(&mut window_open)
                             .show(ctx, |ui| {
                                 ui.small("E关闭 · GM可编辑装备、1-9快捷栏和背包物品");
                                 let result = ui
-                                    .push_id(("possessed_inventory", possessed_user_id), |ui| {
+                                    .push_id(("possessed_inventory", &target_id), |ui| {
                                         character_inventory_editor_ui(
                                             ui,
                                             &target_id,
-                                            character,
+                                            &mut character,
                                             character_edit_state,
                                             &item_pool_snapshot,
                                             true,
+                                            allow_character_actions,
                                         )
                                     })
                                     .inner;
                                 inventory_changed |= result.0;
                                 equipment_changed |= result.1;
                             });
-                        if equipment_changed {
+                        if equipment_changed && allow_character_actions {
                             sync_character_buffs(
                                 &target_id,
-                                character,
+                                &mut character,
                                 &stat_config,
                                 &mut rule_engine_state,
                                 &skill_pool_snapshot,
                             );
                         }
+                        if inventory_changed {
+                            let updated = match target {
+                                VoxelControlledInventoryTarget::Player(user_id) => manager
+                                    .player_characters
+                                    .get_mut(&user_id.to_string())
+                                    .is_some_and(|stored| {
+                                        *stored = character;
+                                        true
+                                    }),
+                                VoxelControlledInventoryTarget::Unit(instance_id) => manager
+                                    .unit_instances
+                                    .get_mut(instance_id)
+                                    .is_some_and(|instance| {
+                                        instance.character = character;
+                                        true
+                                    }),
+                                VoxelControlledInventoryTarget::Summon {
+                                    owner_id, index, ..
+                                } => manager
+                                    .player_characters
+                                    .get_mut(owner_id)
+                                    .and_then(|owner| owner.summons.get_mut(*index))
+                                    .is_some_and(|summon| {
+                                        summon.inventory = character.inventory;
+                                        true
+                                    }),
+                            };
+                            if updated {
+                                manager.persist().ok();
+                            }
+                        }
                     } else {
                         window_open = false;
                     }
                     voxel_possession.player_inventory_open = window_open;
-                    if inventory_changed {
-                        manager.persist().ok();
-                    }
                 }
             } else {
             let mut hotbar_drop = None;
@@ -18643,11 +18792,7 @@ pub fn ui_system(
             }
 
             if let Some(slot) = hotbar_clicked {
-                if voxel_possession.is_standee_possession_active() {
-                    voxel_possession.activate_standee_hotbar_slot(slot);
-                } else {
                 voxel_editor.select_hotbar_slot(slot);
-            }
             }
             if let Some(slot) = hotbar_delete {
                 voxel_editor.delete_hotbar_slot(slot);

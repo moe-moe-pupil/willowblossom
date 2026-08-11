@@ -106,6 +106,7 @@ use crate::{
     battle_round::BattleRoundStore,
     napcat::{
         CharacterHotbarSlot,
+        CharacterInventory,
         CharacterSkillMetadata,
         NapcatIOSender,
         NapcatMessageManager,
@@ -629,6 +630,13 @@ pub(crate) struct VoxelUnitStandeeStore {
 pub(crate) struct VoxelSummonStandeeStore {
     #[serde(default)]
     standees: Vec<PersistedVoxelSummonStandee>,
+}
+
+#[derive(Resource, Default)]
+struct VoxelSummonOwnerMotion {
+    positions: HashMap<String, Vec3>,
+    persist_pending: bool,
+    persist_elapsed: f32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1479,7 +1487,7 @@ pub(crate) struct VoxelPossessionState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum VoxelPossessedStandee {
+pub(crate) enum VoxelPossessedStandee {
     Unit(String),
     Summon(String),
 }
@@ -1542,13 +1550,26 @@ impl VoxelPossessionState {
         self.reset_turn_overrides();
     }
 
-    fn is_active(&self) -> bool { self.active_user_id.is_some() || self.active_standee.is_some() }
+    pub(crate) fn is_active(&self) -> bool {
+        self.active_user_id.is_some() || self.active_standee.is_some()
+    }
 
     pub(crate) fn is_standee_possession_active(&self) -> bool { self.active_standee.is_some() }
 
-    pub(crate) fn activate_standee_hotbar_slot(&mut self, slot: usize) {
-        if self.active_standee.is_some() && slot == 8 {
-            self.selected_hotbar_slot = slot;
+    pub(crate) fn active_standee(&self) -> Option<&VoxelPossessedStandee> {
+        self.active_standee.as_ref()
+    }
+
+    pub(crate) fn activate_controlled_hotbar_slot(
+        &mut self,
+        slot: usize,
+        entry: Option<CharacterHotbarSlot>,
+    ) {
+        if !self.is_active() || slot >= 9 {
+            return;
+        }
+        self.selected_hotbar_slot = slot;
+        if entry == Some(CharacterHotbarSlot::ReleaseControl) {
             self.release();
         }
     }
@@ -2556,6 +2577,7 @@ impl Plugin for TrpgVoxelPlugin {
         .init_resource::<VoxelPlayerStandeeAssets>()
         .init_resource::<VoxelUnitStandeeAssets>()
         .init_resource::<VoxelSummonStandeeAssets>()
+        .init_resource::<VoxelSummonOwnerMotion>()
         .init_resource::<VoxelToolGunDragState>()
         .init_resource::<VoxelPhysicsChunkLoader>()
         .init_resource::<VoxelGeometryDirtyChunks>()
@@ -2662,7 +2684,7 @@ impl Plugin for TrpgVoxelPlugin {
                         sync_voxel_standee_invisibility_render_layers,
                         sync_voxel_unit_standees,
                         sync_voxel_summon_standees,
-                        clamp_voxel_summon_standees_to_owner_range,
+                        follow_and_clamp_voxel_summon_standees,
                         sync_voxel_scene_character_positions,
                         sync_voxel_gm_map_state,
                         capture_voxel_player_view,
@@ -3109,7 +3131,7 @@ fn voxel_editor_shortcuts(
         .is_some_and(|control| control.driving_ship_id.is_some());
     if keyboard.just_pressed(KeyCode::KeyE) && !driving_spaceship {
         editor.teleport_menu_open = false;
-        if possession.active_user_id.is_some() {
+        if possession.is_active() {
             possession.player_inventory_open = !possession.player_inventory_open;
             editor.creative_inventory_open = false;
         } else {
@@ -3117,7 +3139,7 @@ fn voxel_editor_shortcuts(
         }
     }
     if keyboard.just_pressed(KeyCode::KeyR)
-        && possession.active_user_id.is_none()
+        && !possession.is_active()
         && !editor.creative_inventory_open
         && editor.is_tool_gun_equipped()
     {
@@ -3144,14 +3166,19 @@ fn voxel_editor_shortcuts(
                     .as_deref()
                     .and_then(|manager| manager.player_characters.get(&active_user_id.to_string()));
                 activate_player_hotbar_slot(&mut possession, character, slot);
-            } else if possession.is_standee_possession_active() {
-                possession.activate_standee_hotbar_slot(slot);
+            } else if let Some(target) = possession.active_standee().cloned() {
+                let entry = manager
+                    .as_deref()
+                    .and_then(|manager| controlled_standee_inventory(manager, &target))
+                    .and_then(|inventory| inventory.hotbar.get(slot))
+                    .copied();
+                possession.activate_controlled_hotbar_slot(slot, entry);
             } else {
                 editor.select_hotbar_slot(slot);
             }
         }
     }
-    if possession.active_user_id.is_some() {
+    if possession.is_active() {
         return;
     }
     if !keyboard.just_pressed(KeyCode::KeyZ) {
@@ -3174,14 +3201,29 @@ fn activate_player_hotbar_slot(
     character: Option<&PlayerCharacter>,
     slot: usize,
 ) {
-    if slot >= 9 {
-        return;
-    }
-    possession.selected_hotbar_slot = slot;
-    let releases_control = character.and_then(|character| character.inventory.hotbar.get(slot))
-        == Some(&CharacterHotbarSlot::ReleaseControl);
-    if releases_control {
-        possession.release();
+    let entry = character
+        .and_then(|character| character.inventory.hotbar.get(slot))
+        .copied();
+    possession.activate_controlled_hotbar_slot(slot, entry);
+}
+
+fn controlled_standee_inventory<'a>(
+    manager: &'a NapcatMessageManager,
+    target: &VoxelPossessedStandee,
+) -> Option<&'a CharacterInventory> {
+    match target {
+        VoxelPossessedStandee::Unit(instance_id) => manager
+            .unit_instances
+            .get(instance_id)
+            .map(|instance| &instance.character.inventory),
+        VoxelPossessedStandee::Summon(summon_id) => {
+            let (owner_id, index) = crate::napcat::parse_summon_target_id(summon_id)?;
+            manager
+                .player_characters
+                .get(&owner_id)
+                .and_then(|owner| owner.summons.get(index))
+                .map(|summon| &summon.inventory)
+        },
     }
 }
 
@@ -9673,54 +9715,88 @@ fn sync_voxel_summon_standees(
     }
 }
 
-/// 召唤物不能离开主人太远：把超出离主距离的召唤物立牌拉回到范围边缘，
-/// 并同步回持久化存储。「重命名吊牌」提供无限距离时跳过。
-fn clamp_voxel_summon_standees_to_owner_range(
+/// 主人移动时保持召唤物的相对位置，再把超出离主距离的召唤物拉回范围边缘。
+/// 「重命名吊牌」只解除距离限制，不会解除跟随移动。
+fn follow_and_clamp_voxel_summon_standees(
+    time: Res<Time>,
     mut store: ResMut<Persistent<VoxelSummonStandeeStore>>,
+    mut owner_motion: ResMut<VoxelSummonOwnerMotion>,
     manager: Option<Res<Persistent<NapcatMessageManager>>>,
     owner_standees: Query<(&VoxelPlayerStandee, &Transform), Without<VoxelSummonStandee>>,
     mut summon_standees: Query<(&VoxelSummonStandee, &mut Transform), Without<VoxelPlayerStandee>>,
 ) {
-    let Some(manager) = manager else { return };
+    let Some(manager) = manager else {
+        owner_motion.positions.clear();
+        return;
+    };
+    let owner_positions = owner_standees
+        .iter()
+        .map(|(standee, transform)| {
+            (
+                standee.user_id.to_string(),
+                transform.translation,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let previous_owner_positions = std::mem::take(&mut owner_motion.positions);
     let mut changed = false;
     for (summon, mut transform) in &mut summon_standees {
         let owner_id = &summon.owner_id;
         let Some(character) = manager.player_characters.get(owner_id) else {
             continue;
         };
-        let Some(range) = crate::napcat::character_summon_range_meters(character) else {
+        let Some(owner_position) = owner_positions.get(owner_id).copied() else {
             continue;
         };
-        let Some(owner_position) = owner_standees
-            .iter()
-            .find(|(standee, _)| standee.user_id.to_string() == *owner_id)
-            .map(|(_, owner_transform)| owner_transform.translation)
-        else {
-            continue;
-        };
-        let offset = transform.translation - owner_position;
-        let distance = offset.length();
-        if distance <= range || distance <= f32::EPSILON {
+        let next_position = followed_summon_position(
+            transform.translation,
+            previous_owner_positions.get(owner_id).copied(),
+            owner_position,
+            crate::napcat::character_summon_range_meters(character),
+        );
+        if next_position == transform.translation {
             continue;
         }
-        let clamped = clamp_standee_position_to_range(
-            transform.translation,
-            owner_position,
-            range,
-        );
-        transform.translation = clamped;
+        transform.translation = next_position;
         if let Some(persisted) = store
             .standees
             .iter_mut()
             .find(|persisted| persisted.summon_id == summon.summon_id)
         {
-            persisted.translation = clamped.to_array();
+            persisted.translation = next_position.to_array();
             changed = true;
         }
     }
+    owner_motion.positions = owner_positions;
     if changed {
-        store.persist().ok();
+        owner_motion.persist_pending = true;
     }
+    if !owner_motion.persist_pending {
+        return;
+    }
+    owner_motion.persist_elapsed += time.delta_secs();
+    if owner_motion.persist_elapsed < 0.5 {
+        return;
+    }
+    owner_motion.persist_elapsed = 0.0;
+    match store.persist() {
+        Ok(()) => owner_motion.persist_pending = false,
+        Err(err) => eprintln!("failed to persist owner-followed summon positions: {err}"),
+    }
+}
+
+fn followed_summon_position(
+    position: Vec3,
+    previous_owner_position: Option<Vec3>,
+    owner_position: Vec3,
+    range: Option<f32>,
+) -> Vec3 {
+    let followed = previous_owner_position
+        .map(|previous| position + owner_position - previous)
+        .unwrap_or(position);
+    range.map_or(followed, |range| {
+        clamp_standee_position_to_range(followed, owner_position, range.max(0.0))
+    })
 }
 
 /// 把立牌位置限制在以主人为中心、指定半径的球体内（保持方向）。
@@ -15815,7 +15891,6 @@ fn control_first_person_player(
         editor.first_person_flying = false;
         editor.creative_inventory_open = false;
         editor.teleport_menu_open = false;
-        possession.player_inventory_open = false;
     }
 
     acceleration.0 =
@@ -16438,7 +16513,7 @@ fn control_voxel_camera(
             steps + event.y.signum() as i32
         });
         if !inventory_open && !editor.first_person_cursor_released && wheel_steps != 0 {
-            if possession.active_user_id.is_some() {
+            if possession.is_active() {
                 possession.selected_hotbar_slot = cycled_hotbar_slot(
                     possession.selected_hotbar_slot,
                     wheel_steps,
@@ -18301,6 +18376,34 @@ mod tests {
         assert!((clamped.distance(center) - 10.0).abs() < 0.0001);
         let direction = (Vec3::new(30.0, 1.0, 40.0) - center).normalize();
         assert!(clamped.distance(center + direction * 10.0) < 0.0001);
+    }
+
+    #[test]
+    fn summon_standee_preserves_its_offset_when_owner_moves() {
+        let previous_owner = Vec3::new(2.0, 3.0, 4.0);
+        let owner = Vec3::new(12.0, 5.0, -1.0);
+        let summon = previous_owner + Vec3::new(3.0, 0.0, -2.0);
+
+        let followed = followed_summon_position(
+            summon,
+            Some(previous_owner),
+            owner,
+            None,
+        );
+
+        assert_eq!(followed, owner + Vec3::new(3.0, 0.0, -2.0));
+    }
+
+    #[test]
+    fn owner_follow_still_clamps_summon_to_its_range() {
+        let followed = followed_summon_position(
+            Vec3::new(10.0, 0.0, 0.0),
+            Some(Vec3::ZERO),
+            Vec3::new(20.0, 0.0, 0.0),
+            Some(4.0),
+        );
+
+        assert!((followed.distance(Vec3::new(20.0, 0.0, 0.0)) - 4.0).abs() < 0.0001);
     }
 
     #[test]
@@ -21105,6 +21208,33 @@ mod tests {
     }
 
     #[test]
+    fn e_opens_npc_inventory_instead_of_creative_inventory() {
+        let mut possession = VoxelPossessionState::default();
+        possession.possess_standee(VoxelPossessedStandee::Unit(
+            "unit:slime#1".to_owned(),
+        ));
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<EguiWantsInput>()
+            .init_resource::<VoxelEditorState>()
+            .insert_resource(possession)
+            .add_systems(Update, voxel_editor_shortcuts);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyE);
+
+        app.update();
+
+        let editor = app.world().resource::<VoxelEditorState>();
+        assert!(!editor.creative_inventory_open);
+        assert!(
+            app.world()
+                .resource::<VoxelPossessionState>()
+                .player_inventory_open
+        );
+    }
+
+    #[test]
     fn zero_selects_tenth_creative_material() {
         let mut app = App::new();
         app.init_resource::<ButtonInput<KeyCode>>()
@@ -21226,7 +21356,10 @@ mod tests {
             "summon:42:0".to_owned(),
         ));
 
-        possession.activate_standee_hotbar_slot(8);
+        possession.activate_controlled_hotbar_slot(
+            8,
+            Some(CharacterHotbarSlot::ReleaseControl),
+        );
 
         assert!(!possession.is_active());
         assert_eq!(possession.selected_hotbar_slot, 8);
