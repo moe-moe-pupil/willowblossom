@@ -8362,8 +8362,9 @@ fn character_editor_ui(
             }
         }
     });
-    ui.horizontal(|ui| {
-        let previous_hp = character.hp;
+    let stats_before_edit = CharacterBuffBaseStats::from_character(character);
+    let mut stats_changed = false;
+    ui.horizontal_wrapped(|ui| {
         let hp_changed = ui
             .add(
                 egui::DragValue::new(&mut character.hp)
@@ -8372,11 +8373,9 @@ fn character_editor_ui(
                     .prefix("HP "),
             )
             .changed();
-        if hp_changed {
-            record_manual_character_hp_edit(character, previous_hp);
-        }
         changed |= hp_changed;
-        changed |= ui
+        stats_changed |= hp_changed;
+        let max_hp_changed = ui
             .add(
                 egui::DragValue::new(&mut character.max_hp)
                     .range(0.0..=999_999.0)
@@ -8384,7 +8383,9 @@ fn character_editor_ui(
                     .prefix("/ "),
             )
             .changed();
-        changed |= ui
+        changed |= max_hp_changed;
+        stats_changed |= max_hp_changed;
+        let hp_regen_changed = ui
             .add(
                 egui::DragValue::new(&mut character.hp_regen)
                     .range(-9999.0..=9999.0)
@@ -8392,9 +8393,11 @@ fn character_editor_ui(
                     .prefix("回复 "),
             )
             .changed();
+        changed |= hp_regen_changed;
+        stats_changed |= hp_regen_changed;
     });
-    ui.horizontal(|ui| {
-        changed |= ui
+    ui.horizontal_wrapped(|ui| {
+        let mp_changed = ui
             .add(
                 egui::DragValue::new(&mut character.mp)
                     .range(0.0..=999_999.0)
@@ -8402,7 +8405,9 @@ fn character_editor_ui(
                     .prefix("MP "),
             )
             .changed();
-        changed |= ui
+        changed |= mp_changed;
+        stats_changed |= mp_changed;
+        let max_mp_changed = ui
             .add(
                 egui::DragValue::new(&mut character.max_mp)
                     .range(0.0..=999_999.0)
@@ -8410,7 +8415,9 @@ fn character_editor_ui(
                     .prefix("/ "),
             )
             .changed();
-        changed |= ui
+        changed |= max_mp_changed;
+        stats_changed |= max_mp_changed;
+        let mp_regen_changed = ui
             .add(
                 egui::DragValue::new(&mut character.mp_regen)
                     .range(-9999.0..=9999.0)
@@ -8418,9 +8425,11 @@ fn character_editor_ui(
                     .prefix("回复 "),
             )
             .changed();
+        changed |= mp_regen_changed;
+        stats_changed |= mp_regen_changed;
     });
-    ui.horizontal(|ui| {
-        changed |= ui
+    ui.horizontal_wrapped(|ui| {
+        let speed_changed = ui
             .add(
                 egui::DragValue::new(&mut character.speed)
                     .range(0.0..=9999.0)
@@ -8428,7 +8437,9 @@ fn character_editor_ui(
                     .prefix("速度 "),
             )
             .changed();
-        changed |= ui
+        changed |= speed_changed;
+        stats_changed |= speed_changed;
+        let damage_dealt_changed = ui
             .add(
                 egui::DragValue::new(&mut character.damage_dealt_modifier)
                     .range(0.0..=99.0)
@@ -8436,7 +8447,9 @@ fn character_editor_ui(
                     .prefix("伤害 "),
             )
             .changed();
-        changed |= ui
+        changed |= damage_dealt_changed;
+        stats_changed |= damage_dealt_changed;
+        let damage_taken_changed = ui
             .add(
                 egui::DragValue::new(&mut character.damage_taken_modifier)
                     .range(0.0..=99.0)
@@ -8444,9 +8457,11 @@ fn character_editor_ui(
                     .prefix("承伤 "),
             )
             .changed();
+        changed |= damage_taken_changed;
+        stats_changed |= damage_taken_changed;
     });
-    ui.horizontal(|ui| {
-        changed |= ui
+    ui.horizontal_wrapped(|ui| {
+        let healing_dealt_changed = ui
             .add(
                 egui::DragValue::new(&mut character.healing_dealt_modifier)
                     .range(0.0..=99.0)
@@ -8454,7 +8469,9 @@ fn character_editor_ui(
                     .prefix("治疗 "),
             )
             .changed();
-        changed |= ui
+        changed |= healing_dealt_changed;
+        stats_changed |= healing_dealt_changed;
+        let healing_taken_changed = ui
             .add(
                 egui::DragValue::new(&mut character.healing_taken_modifier)
                     .range(0.0..=99.0)
@@ -8462,7 +8479,13 @@ fn character_editor_ui(
                     .prefix("受疗 "),
             )
             .changed();
+        changed |= healing_taken_changed;
+        stats_changed |= healing_taken_changed;
     });
+    if stats_changed {
+        let stat_scales = character_buff_stat_scales(target_id, character);
+        record_manual_character_stat_edits(character, &stats_before_edit, &stat_scales);
+    }
     ui.horizontal_wrapped(|ui| {
         changed |= ui
             .add(
@@ -9840,9 +9863,176 @@ fn character_hp_status(hp: f32, max_hp: f32) -> &'static str {
     }
 }
 
-fn record_manual_character_hp_edit(character: &mut PlayerCharacter, previous_hp: f32) {
+#[derive(Clone, Copy)]
+struct CharacterBuffStatScales {
+    hp: f32,
+    max_hp: f32,
+    hp_regen: f32,
+    mp: f32,
+    max_mp: f32,
+    mp_regen: f32,
+    speed: f32,
+    damage_dealt_modifier: f32,
+    damage_taken_modifier: f32,
+    healing_dealt_modifier: f32,
+    healing_taken_modifier: f32,
+}
+
+impl Default for CharacterBuffStatScales {
+    fn default() -> Self {
+        Self {
+            hp: 1.0,
+            max_hp: 1.0,
+            hp_regen: 1.0,
+            mp: 1.0,
+            max_mp: 1.0,
+            mp_regen: 1.0,
+            speed: 1.0,
+            damage_dealt_modifier: 1.0,
+            damage_taken_modifier: 1.0,
+            healing_dealt_modifier: 1.0,
+            healing_taken_modifier: 1.0,
+        }
+    }
+}
+
+impl CharacterBuffStatScales {
+    fn field_mut(&mut self, field: BuffField) -> Option<&mut f32> {
+        match field {
+            BuffField::Hp => Some(&mut self.hp),
+            BuffField::Mp => Some(&mut self.mp),
+            BuffField::MaxHp => Some(&mut self.max_hp),
+            BuffField::MaxMp => Some(&mut self.max_mp),
+            BuffField::HpRegen => Some(&mut self.hp_regen),
+            BuffField::MpRegen => Some(&mut self.mp_regen),
+            BuffField::Speed => Some(&mut self.speed),
+            BuffField::DamageDealtModifier => Some(&mut self.damage_dealt_modifier),
+            BuffField::DamageTakenModifier => Some(&mut self.damage_taken_modifier),
+            BuffField::HealingDealtModifier => Some(&mut self.healing_dealt_modifier),
+            BuffField::HealingTakenModifier => Some(&mut self.healing_taken_modifier),
+            BuffField::Status(_) => None,
+        }
+    }
+}
+
+fn character_buff_stat_scales(
+    target_id: &str,
+    character: &PlayerCharacter,
+) -> CharacterBuffStatScales {
+    let mut scales = CharacterBuffStatScales::default();
+    let mut buffs = character_effective_buffs(target_id, character);
+    buffs.sort_by_key(|buff| buff.priority);
+    for buff in buffs {
+        for effect in buff.effects {
+            let Some(scale) = scales.field_mut(effect.field) else {
+                continue;
+            };
+            match effect.value {
+                BuffValue::Add(_) => {},
+                BuffValue::AddPercent(percent) => *scale *= 1.0 + percent / 100.0,
+                BuffValue::Set(_) => *scale = 0.0,
+                BuffValue::SetPercentOfBase(percent) => *scale *= percent / 100.0,
+            }
+        }
+    }
+    scales
+}
+
+fn adjusted_character_base_stat(
+    base: f32,
+    current: f32,
+    previous: f32,
+    scale: f32,
+) -> f32 {
+    let effective_delta = current - previous;
+    if scale.abs() > f32::EPSILON {
+        base + effective_delta / scale
+    } else {
+        base + effective_delta
+    }
+}
+
+fn record_manual_character_stat_edits(
+    character: &mut PlayerCharacter,
+    previous: &CharacterBuffBaseStats,
+    scales: &CharacterBuffStatScales,
+) {
     if let Some(base_stats) = character.buff_base_stats.as_mut() {
-        base_stats.hp = (base_stats.hp + character.hp - previous_hp).max(0.0);
+        base_stats.hp = adjusted_character_base_stat(
+            base_stats.hp,
+            character.hp,
+            previous.hp,
+            scales.hp,
+        )
+        .max(0.0);
+        base_stats.max_hp = adjusted_character_base_stat(
+            base_stats.max_hp,
+            character.max_hp,
+            previous.max_hp,
+            scales.max_hp,
+        )
+        .max(0.0);
+        base_stats.hp_regen = adjusted_character_base_stat(
+            base_stats.hp_regen,
+            character.hp_regen,
+            previous.hp_regen,
+            scales.hp_regen,
+        );
+        base_stats.mp = adjusted_character_base_stat(
+            base_stats.mp,
+            character.mp,
+            previous.mp,
+            scales.mp,
+        )
+        .max(0.0);
+        base_stats.max_mp = adjusted_character_base_stat(
+            base_stats.max_mp,
+            character.max_mp,
+            previous.max_mp,
+            scales.max_mp,
+        )
+        .max(0.0);
+        base_stats.mp_regen = adjusted_character_base_stat(
+            base_stats.mp_regen,
+            character.mp_regen,
+            previous.mp_regen,
+            scales.mp_regen,
+        );
+        base_stats.speed = adjusted_character_base_stat(
+            base_stats.speed,
+            character.speed,
+            previous.speed,
+            scales.speed,
+        )
+        .max(0.0);
+        base_stats.damage_dealt_modifier = adjusted_character_base_stat(
+            base_stats.damage_dealt_modifier,
+            character.damage_dealt_modifier,
+            previous.damage_dealt_modifier,
+            scales.damage_dealt_modifier,
+        )
+        .max(0.0);
+        base_stats.damage_taken_modifier = adjusted_character_base_stat(
+            base_stats.damage_taken_modifier,
+            character.damage_taken_modifier,
+            previous.damage_taken_modifier,
+            scales.damage_taken_modifier,
+        )
+        .max(0.0);
+        base_stats.healing_dealt_modifier = adjusted_character_base_stat(
+            base_stats.healing_dealt_modifier,
+            character.healing_dealt_modifier,
+            previous.healing_dealt_modifier,
+            scales.healing_dealt_modifier,
+        )
+        .max(0.0);
+        base_stats.healing_taken_modifier = adjusted_character_base_stat(
+            base_stats.healing_taken_modifier,
+            character.healing_taken_modifier,
+            previous.healing_taken_modifier,
+            scales.healing_taken_modifier,
+        )
+        .max(0.0);
     }
 }
 
@@ -21972,10 +22162,18 @@ mod tests {
     }
 
     #[test]
-    fn manual_hp_edit_survives_active_buff_resync() {
+    fn manual_character_stat_edits_survive_active_buff_resync() {
         let mut character = PlayerCharacter {
             hp: 5.0,
             max_hp: 10.0,
+            hp_regen: 1.0,
+            mp: 4.0,
+            max_mp: 8.0,
+            mp_regen: 2.0,
+            damage_dealt_modifier: 1.1,
+            damage_taken_modifier: 0.9,
+            healing_dealt_modifier: 1.2,
+            healing_taken_modifier: 0.8,
             ..Default::default()
         };
         character
@@ -21984,10 +22182,20 @@ mod tests {
             .insert(EquipmentSlot::Feet, InventoryItem {
                 name: "疾风靴".to_owned(),
                 equipment_slot: EquipmentSlot::Feet,
-                stat_effects: vec![BuffEffect {
-                    field: BuffField::Speed,
-                    value: BuffValue::Add(2.0),
-                }],
+                stat_effects: vec![
+                    BuffEffect {
+                        field: BuffField::Speed,
+                        value: BuffValue::AddPercent(25.0),
+                    },
+                    BuffEffect {
+                        field: BuffField::MaxHp,
+                        value: BuffValue::AddPercent(50.0),
+                    },
+                    BuffEffect {
+                        field: BuffField::HealingDealtModifier,
+                        value: BuffValue::AddPercent(20.0),
+                    },
+                ],
                 ..Default::default()
             });
         let mut rules = RuleEngineState::default();
@@ -22000,9 +22208,20 @@ mod tests {
             &[],
         );
 
-        let previous_hp = character.hp;
+        let previous = CharacterBuffBaseStats::from_character(&character);
         character.hp = 3.0;
-        record_manual_character_hp_edit(&mut character, previous_hp);
+        character.max_hp = 12.0;
+        character.hp_regen = 1.5;
+        character.mp = 5.0;
+        character.max_mp = 9.0;
+        character.mp_regen = 2.5;
+        character.speed = 8.0;
+        character.damage_dealt_modifier = 1.3;
+        character.damage_taken_modifier = 0.7;
+        character.healing_dealt_modifier = 1.4;
+        character.healing_taken_modifier = 0.6;
+        let stat_scales = character_buff_stat_scales("player", &character);
+        record_manual_character_stat_edits(&mut character, &previous, &stat_scales);
         sync_character_buffs(
             "player",
             &mut character,
@@ -22011,11 +22230,35 @@ mod tests {
             &[],
         );
 
-        assert_eq!(character.hp, 3.0);
-        assert_eq!(
-            character.buff_base_stats.as_ref().unwrap().hp,
-            3.0
-        );
+        let assert_close = |actual: f32, expected: f32| {
+            assert!(
+                (actual - expected).abs() < 0.0001,
+                "expected {expected}, got {actual}"
+            );
+        };
+        assert_close(character.hp, 3.0);
+        assert_close(character.max_hp, 12.0);
+        assert_close(character.hp_regen, 1.5);
+        assert_close(character.mp, 5.0);
+        assert_close(character.max_mp, 9.0);
+        assert_close(character.mp_regen, 2.5);
+        assert_close(character.speed, 8.0);
+        assert_close(character.damage_dealt_modifier, 1.3);
+        assert_close(character.damage_taken_modifier, 0.7);
+        assert_close(character.healing_dealt_modifier, 1.4);
+        assert_close(character.healing_taken_modifier, 0.6);
+        let base_stats = character.buff_base_stats.as_ref().unwrap();
+        assert_close(base_stats.hp, 3.0);
+        assert_close(base_stats.max_hp, 8.0);
+        assert_close(base_stats.hp_regen, 1.5);
+        assert_close(base_stats.mp, 5.0);
+        assert_close(base_stats.max_mp, 9.0);
+        assert_close(base_stats.mp_regen, 2.5);
+        assert_close(base_stats.speed, 6.4);
+        assert_close(base_stats.damage_dealt_modifier, 1.3);
+        assert_close(base_stats.damage_taken_modifier, 0.7);
+        assert_close(base_stats.healing_dealt_modifier, 7.0 / 6.0);
+        assert_close(base_stats.healing_taken_modifier, 0.6);
     }
 
     #[test]
