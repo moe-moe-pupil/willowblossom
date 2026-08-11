@@ -15,12 +15,15 @@ use serde::{
 use crate::napcat::{
     CharacterSkillMetadata,
     PlayerCharacter,
+    ProtectiveSuitState,
 };
 
 pub const ALIEN_STAGE_TWO_POINTS: u32 = 6;
 pub const ALIEN_STAGE_THREE_POINTS: u32 = 14;
 pub const MUTANT_STAGE_TWO_BIOMASS: u32 = 3;
 pub const MUTANT_STAGE_THREE_BIOMASS: u32 = 9;
+pub const PROTECTIVE_SUIT_OPENING_SHIELD: f32 = 6.0;
+pub const MUTANT_PROTECTIVE_SUIT_OPENING_SHIELD: f32 = 3.0;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -74,8 +77,10 @@ pub struct HiddenRoleState {
     #[serde(default)]
     pub transformed: bool,
     #[serde(default)]
+    /// Legacy location retained for migrating existing campaigns.
     pub protective_suit_worn: bool,
     #[serde(default)]
+    /// Legacy location retained for migrating existing campaigns.
     pub protective_suit_destroyed: bool,
     #[serde(default)]
     pub cocoon_turns_remaining: u8,
@@ -153,17 +158,16 @@ impl HiddenRoleState {
                 .is_some_and(|threshold| self.evolution_points >= threshold)
     }
 
-    pub fn begin_cocoon(&mut self) -> bool {
+    pub fn begin_cocoon(&mut self, protective_suit: &mut ProtectiveSuitState) -> bool {
         if !self.can_begin_cocoon() {
             return false;
         }
         let (turns, hp) = if self.stage == 1 { (2, 24.0) } else { (3, 40.0) };
         self.cocoon_turns_remaining = turns;
         self.cocoon_hp = hp;
-        let destroyed_suit_now = self.protective_suit_worn;
+        let destroyed_suit_now = protective_suit.worn;
         if destroyed_suit_now {
-            self.protective_suit_worn = false;
-            self.protective_suit_destroyed = true;
+            protective_suit.destroy();
         }
         self.transformed = true;
         self.last_event = format!(
@@ -200,16 +204,18 @@ impl HiddenRoleState {
         true
     }
 
-    pub fn remove_protective_suit(&mut self) -> bool {
-        if !self.protective_suit_worn {
+    pub fn remove_protective_suit(
+        &mut self,
+        protective_suit: &mut ProtectiveSuitState,
+    ) -> bool {
+        if !protective_suit.remove() {
             return false;
         }
-        self.protective_suit_worn = false;
         self.last_event = "已脱下防护服（消耗1回合）".to_owned();
         true
     }
 
-    pub fn transform(&mut self) -> bool {
+    pub fn transform(&mut self, protective_suit: &mut ProtectiveSuitState) -> bool {
         let allowed = match self.role {
             HiddenRoleKind::Alien => true,
             HiddenRoleKind::Mutant => self.stage >= 2,
@@ -218,9 +224,8 @@ impl HiddenRoleState {
         if !allowed || self.transformed || self.is_cocooning() {
             return false;
         }
-        if self.protective_suit_worn {
-            self.protective_suit_worn = false;
-            self.protective_suit_destroyed = true;
+        if protective_suit.worn {
+            protective_suit.destroy();
             self.last_event = "强行变身，防护服被摧毁".to_owned();
         } else {
             self.last_event = "完成变身".to_owned();
@@ -238,8 +243,12 @@ impl HiddenRoleState {
         true
     }
 
-    pub fn consume_corpse(&mut self, biomass: u32) -> bool {
-        if self.role != HiddenRoleKind::Mutant || biomass == 0 || self.protective_suit_worn {
+    pub fn consume_corpse(
+        &mut self,
+        biomass: u32,
+        protective_suit: &ProtectiveSuitState,
+    ) -> bool {
+        if self.role != HiddenRoleKind::Mutant || biomass == 0 || protective_suit.worn {
             return false;
         }
         self.corpses_consumed = self.corpses_consumed.saturating_add(1);
@@ -249,12 +258,15 @@ impl HiddenRoleState {
         true
     }
 
-    pub fn force_consume_through_suit(&mut self, biomass: u32) -> bool {
-        if self.role != HiddenRoleKind::Mutant || biomass == 0 || !self.protective_suit_worn {
+    pub fn force_consume_through_suit(
+        &mut self,
+        biomass: u32,
+        protective_suit: &mut ProtectiveSuitState,
+    ) -> bool {
+        if self.role != HiddenRoleKind::Mutant || biomass == 0 || !protective_suit.worn {
             return false;
         }
-        self.protective_suit_worn = false;
-        self.protective_suit_destroyed = true;
+        protective_suit.destroy();
         self.corpses_consumed = self.corpses_consumed.saturating_add(1);
         self.evolution_points = self.evolution_points.saturating_add(biomass);
         self.last_event = format!("强行进食摧毁防护服，获得{biomass}生物质");
@@ -319,6 +331,38 @@ impl HiddenRoleState {
         }
         false
     }
+}
+
+pub fn migrate_legacy_protective_suit(
+    character: &mut PlayerCharacter,
+    hidden_role: &mut HiddenRoleState,
+) -> bool {
+    if !hidden_role.protective_suit_worn && !hidden_role.protective_suit_destroyed {
+        return false;
+    }
+
+    if hidden_role.protective_suit_destroyed {
+        character.protective_suit.destroy();
+    } else if !character.protective_suit.destroyed {
+        character.protective_suit.worn |= hidden_role.protective_suit_worn;
+    }
+    hidden_role.protective_suit_worn = false;
+    hidden_role.protective_suit_destroyed = false;
+    true
+}
+
+pub fn migrate_legacy_protective_suits(
+    player_characters: &mut HashMap<String, PlayerCharacter>,
+    hidden_roles: &mut HashMap<String, HiddenRoleState>,
+) -> bool {
+    let mut changed = false;
+    for (target_id, hidden_role) in hidden_roles {
+        let Some(character) = player_characters.get_mut(target_id) else {
+            continue;
+        };
+        changed |= migrate_legacy_protective_suit(character, hidden_role);
+    }
+    changed
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
@@ -742,20 +786,28 @@ pub fn hidden_role_battle_state(state: Option<&HiddenRoleState>) -> HiddenRoleBa
     }
 }
 
-pub fn hidden_role_opening_shield(state: Option<&HiddenRoleState>) -> f32 {
-    let Some(state) = state else {
-        return 0.0;
-    };
-    let suit_shield = if state.protective_suit_worn && !state.protective_suit_destroyed {
-        match state.role {
-            HiddenRoleKind::Alien => 6.0,
-            HiddenRoleKind::Mutant => 3.0,
-            HiddenRoleKind::Android => 0.0,
+pub fn hidden_role_opening_shield(
+    state: Option<&HiddenRoleState>,
+    protective_suit: &ProtectiveSuitState,
+) -> f32 {
+    let legacy_suit_intact = state.is_some_and(|state| {
+        state.protective_suit_worn && !state.protective_suit_destroyed
+    });
+    let suit_intact = protective_suit.is_intact()
+        || (!protective_suit.destroyed && legacy_suit_intact);
+    let suit_shield = if suit_intact {
+        match state.map(|state| state.role) {
+            None | Some(HiddenRoleKind::Alien) => PROTECTIVE_SUIT_OPENING_SHIELD,
+            Some(HiddenRoleKind::Mutant) => MUTANT_PROTECTIVE_SUIT_OPENING_SHIELD,
+            Some(HiddenRoleKind::Android) => 0.0,
         }
     } else {
         0.0
     };
-    combat_profile(state).opening_shield.max(suit_shield)
+    state
+        .map(|state| combat_profile(state).opening_shield)
+        .unwrap_or_default()
+        .max(suit_shield)
 }
 
 pub fn hidden_role_stage_summary(state: &HiddenRoleState) -> String {
@@ -840,9 +892,10 @@ mod tests {
     #[test]
     fn alien_requires_points_and_surviving_cocoon_turns() {
         let mut state = HiddenRoleState::new(HiddenRoleKind::Alien);
+        let mut protective_suit = ProtectiveSuitState::default();
         assert!(state.advance_world_turn(6));
         assert_eq!(state.evolution_points, 6);
-        assert!(state.begin_cocoon());
+        assert!(state.begin_cocoon(&mut protective_suit));
         assert_eq!(state.cocoon_hp, 24.0);
         assert!(state.advance_world_turn(7));
         assert_eq!(state.stage, 1);
@@ -853,10 +906,13 @@ mod tests {
     #[test]
     fn destroying_an_alien_cocoon_interrupts_evolution() {
         let mut state = HiddenRoleState::new(HiddenRoleKind::Alien);
+        let mut protective_suit = ProtectiveSuitState {
+            worn: true,
+            destroyed: false,
+        };
         state.evolution_points = ALIEN_STAGE_TWO_POINTS;
-        state.protective_suit_worn = true;
-        assert!(state.begin_cocoon());
-        assert!(state.protective_suit_destroyed);
+        assert!(state.begin_cocoon(&mut protective_suit));
+        assert!(protective_suit.destroyed);
         assert!(state.damage_cocoon(24.0));
         assert_eq!(state.cocoon_turns_remaining, 0);
         assert_eq!(
@@ -869,14 +925,44 @@ mod tests {
     #[test]
     fn mutant_evolves_automatically_and_waits_for_second_path() {
         let mut state = HiddenRoleState::new(HiddenRoleKind::Mutant);
-        assert!(state.consume_corpse(3));
+        let protective_suit = ProtectiveSuitState::default();
+        assert!(state.consume_corpse(3, &protective_suit));
         assert_eq!(state.stage, 2);
         assert!(!state.transformed);
-        assert!(state.consume_corpse(6));
+        assert!(state.consume_corpse(6, &protective_suit));
         assert_eq!(state.stage, 2);
         state.mutant_path = Some(MutantEvolutionPath::Bulwark);
         assert!(state.apply_automatic_mutant_evolution());
         assert_eq!(state.stage, 3);
+    }
+
+    #[test]
+    fn normal_player_protective_suit_grants_opening_shield() {
+        let protective_suit = ProtectiveSuitState {
+            worn: true,
+            destroyed: false,
+        };
+
+        assert_eq!(
+            hidden_role_opening_shield(None, &protective_suit),
+            PROTECTIVE_SUIT_OPENING_SHIELD
+        );
+    }
+
+    #[test]
+    fn legacy_hidden_role_suit_moves_to_player_character() {
+        let mut character = PlayerCharacter::default();
+        let mut hidden_role = HiddenRoleState::new(HiddenRoleKind::Alien);
+        hidden_role.protective_suit_worn = true;
+
+        assert!(migrate_legacy_protective_suit(
+            &mut character,
+            &mut hidden_role,
+        ));
+        assert!(character.protective_suit.worn);
+        assert!(!character.protective_suit.destroyed);
+        assert!(!hidden_role.protective_suit_worn);
+        assert!(!hidden_role.protective_suit_destroyed);
     }
 
     #[test]

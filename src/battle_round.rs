@@ -8321,7 +8321,10 @@ fn participant_from_character(
     );
     let character = &effective_character;
     let hidden_role = hidden_role_battle_state(manager.hidden_roles.get(target_id));
-    let opening_shield = hidden_role_opening_shield(manager.hidden_roles.get(target_id));
+    let opening_shield = hidden_role_opening_shield(
+        manager.hidden_roles.get(target_id),
+        &character.protective_suit,
+    );
     let status = character.status.combined(&character.extra_status);
     let (speed, low_survivor_speed) = character_battle_speeds(character);
     let dominion_gain_rate = character_dominion_max_hp_gain_rate(character);

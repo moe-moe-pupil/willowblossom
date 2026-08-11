@@ -1391,6 +1391,33 @@ impl Default for Summon {
 
 fn default_summon_hp() -> f32 { 5.0 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProtectiveSuitState {
+    #[serde(default)]
+    pub worn: bool,
+    #[serde(default)]
+    pub destroyed: bool,
+}
+
+impl ProtectiveSuitState {
+    pub fn is_intact(self) -> bool { self.worn && !self.destroyed }
+
+    pub fn remove(&mut self) -> bool {
+        if !self.worn {
+            return false;
+        }
+        self.worn = false;
+        true
+    }
+
+    pub fn destroy(&mut self) -> bool {
+        let changed = self.worn || !self.destroyed;
+        self.worn = false;
+        self.destroyed = true;
+        changed
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PlayerCharacter {
     #[serde(default)]
@@ -1463,6 +1490,9 @@ pub struct PlayerCharacter {
     pub buff_base_stats: Option<CharacterBuffBaseStats>,
     #[serde(default)]
     pub inventory: CharacterInventory,
+    /// Ordinary protective equipment shared by normal and hidden-role players.
+    #[serde(default)]
+    pub protective_suit: ProtectiveSuitState,
     /// 玩家召唤物：等级=玩家等级，基础生命=同等级玩家的一半。
     #[serde(default)]
     pub summons: Vec<Summon>,
@@ -1516,6 +1546,7 @@ impl Default for PlayerCharacter {
             active_buffs: Vec::new(),
             buff_base_stats: None,
             inventory: CharacterInventory::default(),
+            protective_suit: ProtectiveSuitState::default(),
             summons: Vec::new(),
             dominion_max_hp_bonus: 0.0,
             redeemed_commissar_proficiency: 0,
@@ -3900,7 +3931,12 @@ impl NapcatMessageManager {
                 export.version, NAPCAT_MANAGER_EXPORT_VERSION
             ));
         }
-        Ok(export.manager)
+        let mut manager = export.manager;
+        crate::hidden_roles::migrate_legacy_protective_suits(
+            &mut manager.player_characters,
+            &mut manager.hidden_roles,
+        );
+        Ok(manager)
     }
 
     pub fn to_player_characters_export_json(&self) -> Result<String, String> {
@@ -3939,6 +3975,10 @@ impl NapcatMessageManager {
 
         let imported_count = imported.len();
         self.player_characters.extend(imported);
+        crate::hidden_roles::migrate_legacy_protective_suits(
+            &mut self.player_characters,
+            &mut self.hidden_roles,
+        );
         Ok(imported_count)
     }
 
@@ -6682,6 +6722,18 @@ fn setup(mut commands: Commands) {
         Path::new(NAPCAT_HIDDEN_ROLES_PATH),
     ) {
         eprintln!("{err}");
+    }
+    let migrated_protective_suits = {
+        let manager: &mut NapcatMessageManager = &mut message_manager;
+        crate::hidden_roles::migrate_legacy_protective_suits(
+            &mut manager.player_characters,
+            &mut manager.hidden_roles,
+        )
+    };
+    if migrated_protective_suits {
+        if let Err(err) = message_manager.persist() {
+            eprintln!("failed to migrate protective-suit state: {err}");
+        }
     }
     let mut inbound_receipts = Persistent::<InboundMessageReceiptStore>::builder()
         .name("inbound_receipts")

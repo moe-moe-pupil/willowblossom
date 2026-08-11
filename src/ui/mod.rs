@@ -6374,7 +6374,7 @@ fn quick_character_windows(
                 changed |= hidden_role_editor_ui(
                     ui,
                     &target_id,
-                    &mut manager.hidden_roles,
+                    manager,
                 );
                 ui.separator();
                 let skill_pool_snapshot = manager.skill_pool.clone();
@@ -7536,9 +7536,21 @@ fn portrait_transform_editor_ui(
 fn hidden_role_editor_ui(
     ui: &mut Ui,
     target_id: &str,
-    hidden_roles: &mut HashMap<String, HiddenRoleState>,
+    manager: &mut NapcatMessageManager,
 ) -> bool {
-    let previous_role = hidden_roles.get(target_id).map(|state| state.role);
+    let mut changed = {
+        let (player_characters, hidden_roles) = (
+            &mut manager.player_characters,
+            &mut manager.hidden_roles,
+        );
+        let character = player_characters.entry(target_id.to_owned()).or_default();
+        hidden_roles
+            .get_mut(target_id)
+            .is_some_and(|hidden_role| {
+                crate::hidden_roles::migrate_legacy_protective_suit(character, hidden_role)
+            })
+    };
+    let previous_role = manager.hidden_roles.get(target_id).map(|state| state.role);
     let mut selected_role = previous_role;
     ui.horizontal(|ui| {
         ui.strong("GM隐藏身份");
@@ -7559,25 +7571,55 @@ fn hidden_role_editor_ui(
                 }
             });
     });
-    let mut changed = false;
     if selected_role != previous_role {
         match selected_role {
             Some(role) => {
-                hidden_roles.insert(
+                manager.hidden_roles.insert(
                     target_id.to_owned(),
                     HiddenRoleState::new(role),
                 );
             },
             None => {
-                hidden_roles.remove(target_id);
+                manager.hidden_roles.remove(target_id);
             },
         }
         changed = true;
     }
-    let Some(state) = hidden_roles.get_mut(target_id) else {
+
+    let (player_characters, hidden_roles) = (
+        &mut manager.player_characters,
+        &mut manager.hidden_roles,
+    );
+    let protective_suit = &mut player_characters
+        .entry(target_id.to_owned())
+        .or_default()
+        .protective_suit;
+    let mut hidden_role = hidden_roles.get_mut(target_id);
+    if let Some(state) = hidden_role.as_deref_mut() {
+        state.normalize();
+    }
+    let mut remove_suit = false;
+    ui.horizontal(|ui| {
+        changed |= ui
+            .checkbox(&mut protective_suit.worn, "穿戴防护服")
+            .on_hover_text("普通玩家和异形获得6点开场护盾；变种人获得3点")
+            .changed();
+        if protective_suit.destroyed {
+            ui.colored_label(egui::Color32::LIGHT_RED, "防护服已毁");
+        }
+        remove_suit = ui.button("脱下（耗1回合）").clicked();
+    });
+    if remove_suit {
+        changed |= if let Some(state) = hidden_role.as_deref_mut() {
+            state.remove_protective_suit(protective_suit)
+        } else {
+            protective_suit.remove()
+        };
+    }
+
+    let Some(state) = hidden_role else {
         return changed;
     };
-    state.normalize();
     ui.colored_label(
         egui::Color32::YELLOW,
         "仅GM可见；不会出现在玩家状态、已兑换或总结上下文中。",
@@ -7595,26 +7637,11 @@ fn hidden_role_editor_ui(
             ui.label("已达最终阶段");
         }
     });
-    ui.horizontal(|ui| {
-        changed |= ui
-            .checkbox(
-                &mut state.protective_suit_worn,
-                "穿戴防护服",
-            )
-            .changed();
-        if state.protective_suit_destroyed {
-            ui.colored_label(egui::Color32::LIGHT_RED, "防护服已毁");
-        }
-        if ui.button("脱下（耗1回合）").clicked() {
-            changed |= state.remove_protective_suit();
-        }
-    });
-
     match state.role {
         HiddenRoleKind::Alien => {
             ui.horizontal(|ui| {
                 if !state.transformed && ui.button("变身").clicked() {
-                    changed |= state.transform();
+                    changed |= state.transform(protective_suit);
                 }
                 if state.transformed && !state.is_cocooning() && ui.button("恢复伪装").clicked()
                 {
@@ -7626,7 +7653,7 @@ fn hidden_role_editor_ui(
                         changed = true;
                     }
                 if state.can_begin_cocoon() && ui.button("开始结茧").clicked() {
-                    changed |= state.begin_cocoon();
+                    changed |= state.begin_cocoon(protective_suit);
                 }
             });
             if state.is_cocooning() {
@@ -7653,7 +7680,7 @@ fn hidden_role_editor_ui(
         HiddenRoleKind::Mutant => {
             ui.horizontal(|ui| {
                 if state.stage >= 2 && !state.transformed && ui.button("变身").clicked() {
-                    changed |= state.transform();
+                    changed |= state.transform(protective_suit);
                 }
                 if state.transformed && ui.button("恢复伪装").clicked() {
                     changed |= state.revert_form();
@@ -7681,10 +7708,10 @@ fn hidden_role_editor_ui(
                 ui.label("记录吞噬尸体：");
                 for (label, biomass) in [("小型+1", 1), ("人形+2", 2), ("大型+3", 3)] {
                     if ui.button(label).clicked() {
-                        changed |= if state.protective_suit_worn {
-                            state.force_consume_through_suit(biomass)
+                        changed |= if protective_suit.worn {
+                            state.force_consume_through_suit(biomass, protective_suit)
                         } else {
-                            state.consume_corpse(biomass)
+                            state.consume_corpse(biomass, protective_suit)
                         };
                     }
                 }
@@ -15895,7 +15922,7 @@ fn trpg_group_settings_window(
                                     changed |= hidden_role_editor_ui(
                                         ui,
                                         target_id,
-                                        &mut manager.hidden_roles,
+                                        manager,
                                     );
                                     ui.separator();
                                     let character = manager
@@ -20532,12 +20559,33 @@ mod tests {
         }
     }
 
-    fn shape_contains_widget_id_clash(shape: &egui::Shape) -> bool {
+    fn shape_contains_text(shape: &egui::Shape, needle: &str) -> bool {
         match shape {
-            egui::Shape::Text(text) => text.galley.text().contains("use of widget ID"),
-            egui::Shape::Vec(shapes) => shapes.iter().any(shape_contains_widget_id_clash),
+            egui::Shape::Text(text) => text.galley.text().contains(needle),
+            egui::Shape::Vec(shapes) => {
+                shapes.iter().any(|shape| shape_contains_text(shape, needle))
+            },
             _ => false,
         }
+    }
+
+    fn shape_contains_widget_id_clash(shape: &egui::Shape) -> bool {
+        shape_contains_text(shape, "use of widget ID")
+    }
+
+    #[test]
+    fn normal_player_editor_shows_protective_suit_control() {
+        let context = egui::Context::default();
+        let mut manager = empty_manager();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            hidden_role_editor_ui(ui, "normal-player", &mut manager);
+        });
+
+        assert!(manager.hidden_roles.is_empty());
+        assert!(output
+            .shapes
+            .iter()
+            .any(|shape| shape_contains_text(&shape.shape, "穿戴防护服")));
     }
 
     #[test]
