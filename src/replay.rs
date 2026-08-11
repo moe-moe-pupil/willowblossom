@@ -182,7 +182,13 @@ const MOVEMENT_HISTORY_PERSIST_SECONDS: f32 = 0.5;
 const MAX_PERSISTED_SHIP_TRAJECTORY_SESSIONS: usize = 128;
 const SHIP_TRAJECTORY_HISTORY_PERSIST_SECONDS: f32 = 0.5;
 
-pub struct ReplayPlugin;
+pub struct ReplayPlugin {
+    runtime_enabled: bool,
+}
+
+impl ReplayPlugin {
+    pub fn new(runtime_enabled: bool) -> Self { Self { runtime_enabled } }
+}
 
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ReplayCameraApplied;
@@ -237,8 +243,13 @@ impl Plugin for ReplayPlugin {
             .init_resource::<ReplayShipTrajectoryRecorder>()
             .insert_resource(voice_favorites)
             .insert_resource(player_movement_history)
-            .insert_resource(ship_trajectory_history)
-            .add_systems(
+            .insert_resource(ship_trajectory_history);
+
+        if !self.runtime_enabled {
+            return;
+        }
+
+        app.add_systems(
                 Update,
                 (
                     snapshot_new_replay_messages,

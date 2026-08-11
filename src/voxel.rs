@@ -351,7 +351,13 @@ pub(crate) const DEFAULT_VOXEL_OCCLUSION_CAST_END_HEIGHT_CELLS: f32 = 2.0;
 pub(crate) const MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS: f32 = 1.0;
 pub(crate) const MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS: f32 = 16.0;
 
-pub struct TrpgVoxelPlugin;
+pub struct TrpgVoxelPlugin {
+    runtime_enabled: bool,
+}
+
+impl TrpgVoxelPlugin {
+    pub fn new(runtime_enabled: bool) -> Self { Self { runtime_enabled } }
+}
 
 pub struct TrpgVoxelConnector;
 
@@ -2550,6 +2556,47 @@ impl Plugin for TrpgVoxelPlugin {
             .revert_to_default_on_deserialization_errors(true)
             .build()
             .expect("failed to initialize voxel spaceship store");
+        app.init_resource::<VoxelEditorState>()
+            .init_resource::<VoxelPossessionState>()
+            .init_resource::<VoxelTargetingPreview>()
+            .init_resource::<VoxelAutoDoorLockState>()
+            .init_resource::<VoxelInvisibilityState>()
+            .init_resource::<VoxelLockedDoorMaterials>()
+            .init_resource::<VoxelRadianceVolume>()
+            .init_resource::<SceneCaptureRequests>()
+            .init_resource::<SceneCharacterPositions>()
+            .init_resource::<VoxelPlayerCameraRuntimes>()
+            .init_resource::<VoxelPlayerCameraEditor>()
+            .init_resource::<VoxelPlayerCaptureState>()
+            .init_resource::<VoxelPlayerStandeeAssets>()
+            .init_resource::<VoxelUnitStandeeAssets>()
+            .init_resource::<VoxelSummonStandeeAssets>()
+            .init_resource::<VoxelSummonOwnerMotion>()
+            .init_resource::<VoxelToolGunDragState>()
+            .init_resource::<VoxelPhysicsChunkLoader>()
+            .init_resource::<VoxelGeometryDirtyChunks>()
+            .init_resource::<VoxelBloodDecay>()
+            .init_resource::<VoxelSpaceshipOccupancyCache>()
+            .init_resource::<VoxelScenePersistenceState>()
+            .init_resource::<VoxelSpaceshipControlState>()
+            .init_resource::<VoxelSpaceshipPassengerMotion>()
+            .init_resource::<VoxelSpaceshipPersistenceState>()
+            .init_resource::<VoxelMinimapSnapshot>()
+            .init_resource::<VoxelGmMapState>()
+            .init_resource::<VoxelReplayOcclusionFade>()
+            .insert_resource(player_camera_store)
+            .insert_resource(unit_standee_store)
+            .insert_resource(summon_standee_store)
+            .insert_resource(possession_movement_store)
+            .insert_resource(inventory_store)
+            .insert_resource(toolbar_settings_store)
+            .insert_resource(scene_store)
+            .insert_resource(spaceship_store);
+
+        if !self.runtime_enabled {
+            return;
+        }
+
         app.add_plugins((
             PhysicsPlugins::default(),
             VoxelPlugin::<u8>::default(),
@@ -2563,42 +2610,6 @@ impl Plugin for TrpgVoxelPlugin {
         .insert_resource(Gravity::ZERO)
         .insert_resource(static_workbook_micro_decorations())
         .insert_resource(static_workbook_feature_annotations())
-        .init_resource::<VoxelEditorState>()
-        .init_resource::<VoxelPossessionState>()
-        .init_resource::<VoxelTargetingPreview>()
-        .init_resource::<VoxelAutoDoorLockState>()
-        .init_resource::<VoxelInvisibilityState>()
-        .init_resource::<VoxelLockedDoorMaterials>()
-        .init_resource::<VoxelRadianceVolume>()
-        .init_resource::<SceneCaptureRequests>()
-        .init_resource::<SceneCharacterPositions>()
-        .init_resource::<VoxelPlayerCameraRuntimes>()
-        .init_resource::<VoxelPlayerCameraEditor>()
-        .init_resource::<VoxelPlayerCaptureState>()
-        .init_resource::<VoxelPlayerStandeeAssets>()
-        .init_resource::<VoxelUnitStandeeAssets>()
-        .init_resource::<VoxelSummonStandeeAssets>()
-        .init_resource::<VoxelSummonOwnerMotion>()
-        .init_resource::<VoxelToolGunDragState>()
-        .init_resource::<VoxelPhysicsChunkLoader>()
-        .init_resource::<VoxelGeometryDirtyChunks>()
-        .init_resource::<VoxelBloodDecay>()
-        .init_resource::<VoxelSpaceshipOccupancyCache>()
-        .init_resource::<VoxelScenePersistenceState>()
-        .init_resource::<VoxelSpaceshipControlState>()
-        .init_resource::<VoxelSpaceshipPassengerMotion>()
-        .init_resource::<VoxelSpaceshipPersistenceState>()
-        .init_resource::<VoxelMinimapSnapshot>()
-        .init_resource::<VoxelGmMapState>()
-        .init_resource::<VoxelReplayOcclusionFade>()
-        .insert_resource(player_camera_store)
-        .insert_resource(unit_standee_store)
-        .insert_resource(summon_standee_store)
-        .insert_resource(possession_movement_store)
-        .insert_resource(inventory_store)
-        .insert_resource(toolbar_settings_store)
-        .insert_resource(scene_store)
-        .insert_resource(spaceship_store)
         .add_systems(
             Startup,
             (

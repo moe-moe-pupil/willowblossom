@@ -1,3 +1,4 @@
+mod app_features;
 mod backup;
 mod battle_round;
 mod camera;
@@ -15,6 +16,10 @@ mod voxel_radiance;
 
 use std::path::Path;
 
+use app_features::{
+    load_app_feature_settings,
+    AppFeatureRuntime,
+};
 use bevy::{
     asset::AssetPlugin,
     log::LogPlugin,
@@ -185,6 +190,8 @@ impl Plugin for GamePlugin {
             }
         }
         let (window_width, window_height) = app_settings.window_size();
+        let feature_settings = load_app_feature_settings();
+        let game_scene_enabled = feature_settings.game_scene_enabled;
 
         #[allow(unused_mut)]
         let mut window_plugin = WindowPlugin {
@@ -236,18 +243,26 @@ impl Plugin for GamePlugin {
                 .set(image_plugin),
         );
         app.insert_resource(app_settings);
+        app.insert_resource(feature_settings);
+        app.insert_resource(AppFeatureRuntime {
+            game_scene_loaded: game_scene_enabled,
+        });
 
         app.add_plugins((
             backup::BackupPlugin,
             battle_round::BattleRoundPlugin,
-            camera::CameraPlugin,
+        ));
+        if game_scene_enabled {
+            app.add_plugins(camera::CameraPlugin);
+        }
+        app.add_plugins((
             napcat::NapcatPlugin,
-            replay::ReplayPlugin,
+            replay::ReplayPlugin::new(game_scene_enabled),
             rule_engine::RuleEnginePlugin,
             ui::UIPlugin,
-            voxel::TrpgVoxelPlugin,
-        ))
-        .add_systems(Update, persist_primary_window_size);
+            voxel::TrpgVoxelPlugin::new(game_scene_enabled),
+        ));
+        app.add_systems(Update, persist_primary_window_size);
     }
 }
 

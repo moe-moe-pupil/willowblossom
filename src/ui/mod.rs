@@ -1,5 +1,6 @@
 mod chat_analytics;
 mod ime;
+mod legacy_chat;
 use std::{
     collections::{
         hash_map::DefaultHasher,
@@ -48,6 +49,7 @@ use bevy_egui::{
     EguiGlobalSettings,
     EguiPlugin,
     EguiPrimaryContextPass,
+    PrimaryEguiContext,
 };
 use bevy_persistent::{
     Persistent,
@@ -63,6 +65,10 @@ use chat_analytics::{
     GmAutoChatModeState,
 };
 use ime::*;
+use legacy_chat::{
+    show_chat_workspace,
+    ChatWorkspaceState,
+};
 use rand::RngExt;
 use serde::{
     Deserialize,
@@ -71,6 +77,10 @@ use serde::{
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::{
+    app_features::{
+        AppFeatureRuntime,
+        AppFeatureSettings,
+    },
     backup::{
     list_backups,
     restore_backup,
@@ -1251,6 +1261,8 @@ impl Default for BuffDraft {
 
 #[derive(SystemParam)]
 pub struct UiSystemLocals<'w, 's> {
+    feature_settings: ResMut<'w, Persistent<AppFeatureSettings>>,
+    runtime_features: Res<'w, AppFeatureRuntime>,
     has_run_once: Local<'s, bool>,
     main_view_fullscreen: Local<'s, MainViewFullscreenState>,
     new_chat_group_modal_string_open: Local<'s, (String, bool)>,
@@ -1269,6 +1281,7 @@ pub struct UiSystemLocals<'w, 's> {
     chat_analytics_targets: Local<'s, HashSet<String>>,
     gm_auto_chat_mode: Local<'s, GmAutoChatModeState>,
     chat_list_player_visible_filter: Local<'s, Option<String>>,
+    chat_workspace: Local<'s, ChatWorkspaceState>,
     scene_capture_requests: Option<ResMut<'w, SceneCaptureRequests>>,
     voxel_editor: ResMut<'w, VoxelEditorState>,
     voxel_possession: ResMut<'w, VoxelPossessionState>,
@@ -1950,6 +1963,57 @@ fn file_menu_button(
     });
 }
 
+fn feature_menu_button(
+    ui: &mut Ui,
+    settings: &mut Persistent<AppFeatureSettings>,
+    runtime: &AppFeatureRuntime,
+) {
+    ui.menu_button("界面", |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        let mut changed = false;
+
+        changed |= ui
+            .checkbox(
+                &mut settings.game_scene_enabled,
+                "启用游戏场景",
+            )
+            .on_hover_text("控制体素场景、物理、场景相机和回放运行时；重启后完全生效")
+            .changed();
+        if settings.game_scene_enabled != runtime.game_scene_loaded {
+            let status = if settings.game_scene_enabled {
+                "游戏场景将在重启后加载"
+            } else {
+                "游戏场景将在重启后完全卸载"
+            };
+            ui.colored_label(
+                egui::Color32::from_rgb(210, 135, 35),
+                status,
+            );
+        } else if runtime.game_scene_loaded {
+            ui.small("游戏场景运行中");
+        } else {
+            ui.small("游戏场景未加载");
+        }
+
+        ui.separator();
+        changed |= ui
+            .checkbox(
+                &mut settings.legacy_chat_layout_enabled,
+                "使用Moonberry旧版聊天布局",
+            )
+            .on_hover_text("使用旧版固定聊天列表和单聊天主区域；默认关闭，可立即切换")
+            .changed();
+        ui.small("旧版布局只改变显示方式，仍使用NapCat和当前可见性规则。");
+
+        if changed {
+            if let Err(err) = settings.persist() {
+                eprintln!("failed to persist app feature settings: {err}");
+            }
+            ui.ctx().request_repaint();
+        }
+    });
+}
+
 fn tools_menu_button(
     ui: &mut Ui,
     rule_engine_state: &mut RuleEngineState,
@@ -2364,6 +2428,10 @@ impl Widget for CircleImageButton {
 
 impl Plugin for UIPlugin {
     fn build(&self, app: &mut App) {
+        let game_scene_loaded = app
+            .world()
+            .get_resource::<AppFeatureRuntime>()
+            .is_some_and(|runtime| runtime.game_scene_loaded);
         app.add_plugins(EguiPlugin::default())
             .insert_resource(EguiGlobalSettings {
                 auto_create_primary_context: false,
@@ -2387,6 +2455,9 @@ impl Plugin for UIPlugin {
                     .run_if(crate::replay::replay_video_capture_inactive)
                     .after(load_ui_memory),
             );
+        if !game_scene_loaded {
+            app.add_systems(Startup, setup_chat_workspace_camera);
+        }
     }
 }
 
@@ -2407,6 +2478,10 @@ pub fn setup_system(mut command: Commands) {
     command.insert_resource(GIFImages {
         images: HashMap::default(),
     });
+}
+
+fn setup_chat_workspace_camera(mut commands: Commands) {
+    commands.spawn((Camera2d, PrimaryEguiContext));
 }
 
 pub fn configure_ui_fonts(mut egui_context: EguiContexts, mut fonts_configured: Local<bool>) {
@@ -2479,6 +2554,31 @@ pub fn load_ui_memory(
     let mut memory = cached_memory.ui_memory.clone();
     memory.reset_areas();
     ctx.memory_mut(|m| *m = memory);
+}
+
+fn persist_ui_memory_after_interaction(
+    ctx: &Context,
+    cached_memory: &mut Persistent<CachedMemory>,
+) {
+    let should_persist = ctx.input(|input| {
+        input.pointer.any_released()
+            || input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Copy
+                        | egui::Event::Cut
+                        | egui::Event::Paste(_)
+                        | egui::Event::Text(_)
+                        | egui::Event::Key { .. }
+                )
+            })
+    });
+    ctx.memory(|memory| {
+        cached_memory.ui_memory = memory.clone();
+    });
+    if should_persist {
+        cached_memory.persist().ok();
+    }
 }
 
 fn chat_window(
@@ -17815,6 +17915,9 @@ pub fn ui_system(
     mut player_view_request: Option<ResMut<ScenePlayerViewRequest>>,
     mut backup_ui: BackupUiParam,
 ) {
+    let feature_settings: &mut ResMut<Persistent<AppFeatureSettings>> =
+        &mut locals.feature_settings;
+    let runtime_features: &Res<AppFeatureRuntime> = &locals.runtime_features;
     let has_run_once: &mut Local<bool> = &mut locals.has_run_once;
     let main_view_fullscreen: &mut Local<MainViewFullscreenState> =
         &mut locals.main_view_fullscreen;
@@ -17842,6 +17945,7 @@ pub fn ui_system(
     let gm_auto_chat_mode: &mut Local<GmAutoChatModeState> = &mut locals.gm_auto_chat_mode;
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
+    let chat_workspace: &mut Local<ChatWorkspaceState> = &mut locals.chat_workspace;
     let scene_capture_requests = &mut locals.scene_capture_requests;
     let map_toggle_requested = locals.keyboard.just_pressed(KeyCode::KeyM);
     let voxel_minimap: &VoxelMinimapSnapshot = &locals.voxel_minimap;
@@ -18051,6 +18155,105 @@ pub fn ui_system(
         scene_store.as_deref_mut(),
     );
 
+    let legacy_chat_layout = feature_settings.legacy_chat_layout_enabled;
+    let use_chat_workspace = legacy_chat_layout
+        || !feature_settings.game_scene_enabled
+        || !runtime_features.game_scene_loaded;
+    if use_chat_workspace {
+        if sync_summarized_message_counts(&mut manager, &deepseek_manager) {
+            if let Err(err) = manager.persist() {
+                eprintln!("failed to persist summarized message markers: {err}");
+            }
+        }
+
+        let mut workspace_ui = egui::Ui::new(
+            ctx.clone(),
+            "chat_workspace_viewport".into(),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(ctx.viewport_rect()),
+        );
+        egui::Panel::top("chat_workspace_top_panel")
+            .resizable(false)
+            .show(&mut workspace_ui, |ui| {
+                if legacy_chat_layout {
+                    *ui.visuals_mut() = egui::Visuals::light();
+                }
+                egui::MenuBar::new().ui(ui, |ui| {
+                    file_menu_button(
+                        ui,
+                        &mut new_chat_group_modal_string_open.1,
+                        &mut trpg_group_settings.open,
+                    );
+                    tools_menu_button(
+                        ui,
+                        &mut rule_engine_state,
+                        &mut battle_round_state,
+                    );
+                    pool_menu_button(ui, &manager, trpg_group_settings);
+                    feature_menu_button(ui, feature_settings, runtime_features);
+                    ui.separator();
+                    if runtime_features.game_scene_loaded && !feature_settings.game_scene_enabled {
+                        ui.small("场景已隐藏；重启后完全卸载");
+                    } else if !runtime_features.game_scene_loaded {
+                        ui.small("无游戏场景模式");
+                    } else {
+                        ui.small("Moonberry旧版聊天布局");
+                    }
+                });
+            });
+
+        pending_chat_requests_window(
+            ctx,
+            &mut manager,
+            napcat_sender,
+            &mut ime,
+        );
+        trpg_group_global_chat_windows(
+            ctx,
+            &manager,
+            napcat_sender,
+            chat_input_msgs,
+            &mut ime,
+            &mut trpg_group_settings.open_global_group_chat_windows,
+        );
+
+        let active_target = show_chat_workspace(
+            ctx,
+            &mut workspace_ui,
+            &mut manager,
+            &deepseek_manager,
+            napcat_sender,
+            &mut ime,
+            chat_input_msgs,
+            chat_scroll_states,
+            image_textures,
+            chat_workspace,
+            legacy_chat_layout,
+        );
+        if let Some(target_id) = active_target {
+            let messages = manager
+                .messages
+                .get(&target_id)
+                .cloned()
+                .unwrap_or_default();
+            if queue_summaries_if_needed(
+                &manager,
+                &target_id,
+                &messages,
+                &manager.summarized_message_counts,
+                deepseek_sender,
+                &mut deepseek_manager,
+            ) {
+                if let Err(err) = deepseek_manager.persist() {
+                    eprintln!("failed to persist DeepSeek summary request: {err}");
+                }
+            }
+        }
+        persist_ui_memory_after_interaction(ctx, &mut backup_ui.cached_memory);
+        return;
+    }
+
     let mut viewport_ui = egui::Ui::new(
         ctx.clone(),
         "viewport".into(),
@@ -18116,6 +18319,7 @@ pub fn ui_system(
                         &mut battle_round_state,
                     );
                     pool_menu_button(ui, &manager, trpg_group_settings);
+                    feature_menu_button(ui, feature_settings, runtime_features);
                 });
             });
         main_view_fullscreen.top_rect = Some(top_panel.response.rect);
@@ -19748,25 +19952,7 @@ pub fn ui_system(
         voxel_gm_map,
     );
 
-    let should_persist_ui_memory = ctx.input(|input| {
-        input.pointer.any_released()
-            || input.events.iter().any(|event| {
-                matches!(
-                    event,
-                    egui::Event::Copy
-                        | egui::Event::Cut
-                        | egui::Event::Paste(_)
-                        | egui::Event::Text(_)
-                        | egui::Event::Key { .. }
-                )
-            })
-    });
-    ctx.memory(|m| {
-        backup_ui.cached_memory.ui_memory = m.clone();
-    });
-    if should_persist_ui_memory {
-        backup_ui.cached_memory.persist().ok();
-    }
+    persist_ui_memory_after_interaction(ctx, &mut backup_ui.cached_memory);
 }
 
 fn targets_for_target(manager: &NapcatMessageManager, target_id: &str) -> Vec<NapcatSendTarget> {
