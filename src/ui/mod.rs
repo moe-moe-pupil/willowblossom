@@ -9329,7 +9329,11 @@ fn character_buff_editor_ui(
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 changed |= ui.text_edit_singleline(&mut buff.name).changed();
-                changed |= buff_kind_combo(ui, &mut buff.kind);
+                changed |= buff_kind_combo(
+                    ui,
+                    ("active_buff_kind", target_id, index),
+                    &mut buff.kind,
+                );
                 let turns_response = ui.add(
                     egui::DragValue::new(&mut buff.turns_remaining)
                         .range(0..=999)
@@ -9370,7 +9374,7 @@ fn character_buff_editor_ui(
         ui.horizontal_wrapped(|ui| {
             ui.label("名称");
             ui.text_edit_singleline(&mut draft.name);
-            buff_kind_combo(ui, &mut draft.kind);
+            buff_kind_combo(ui, ("buff_draft_kind", target_id), &mut draft.kind);
             ui.add(
                 egui::DragValue::new(&mut draft.turns_remaining)
                     .range(0..=999)
@@ -9836,9 +9840,13 @@ fn character_inventory_editor_ui(
     (changed, equipment_changed)
 }
 
-fn buff_kind_combo(ui: &mut Ui, kind: &mut BuffKind) -> bool {
+fn buff_kind_combo(
+    ui: &mut Ui,
+    id_salt: impl egui::AsIdSalt,
+    kind: &mut BuffKind,
+) -> bool {
     let mut changed = false;
-    egui::ComboBox::from_label("类型")
+    egui::ComboBox::new(id_salt, "类型")
         .selected_text(buff_kind_label(*kind))
         .show_ui(ui, |ui| {
             for candidate in buff_kind_options() {
@@ -20277,6 +20285,35 @@ mod tests {
             }],
             tick_actions: Vec::new(),
         }
+    }
+
+    fn shape_contains_widget_id_clash(shape: &egui::Shape) -> bool {
+        match shape {
+            egui::Shape::Text(text) => text.galley.text().contains("use of widget ID"),
+            egui::Shape::Vec(shapes) => shapes.iter().any(shape_contains_widget_id_clash),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn active_buff_kind_combos_have_distinct_widget_ids() {
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            let mut kinds = [BuffKind::Magic, BuffKind::Physical];
+            for (index, kind) in kinds.iter_mut().enumerate() {
+                ui.group(|ui| {
+                    buff_kind_combo(ui, ("active_buff_kind", "test-target", index), kind);
+                });
+            }
+        });
+
+        assert!(
+            !output
+                .shapes
+                .iter()
+                .any(|shape| shape_contains_widget_id_clash(&shape.shape)),
+            "repeated buff type controls must not produce egui widget ID clashes"
+        );
     }
 
     #[test]
