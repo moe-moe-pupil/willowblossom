@@ -1004,6 +1004,9 @@ pub(crate) struct ChatScrollState {
 
 const AUTO_HIDE_EDGE_SIZE: f32 = 8.0;
 const AUTO_HIDE_PANEL_GRACE: f32 = 4.0;
+const AUTO_HIDE_TOP_FALLBACK_SIZE: f32 = 48.0;
+const AUTO_HIDE_RIGHT_FALLBACK_SIZE: f32 = 200.0;
+const AUTO_HIDE_LEFT_FALLBACK_SIZE: f32 = 220.0;
 
 #[derive(Clone, Copy)]
 enum AutoHideEdge {
@@ -1104,16 +1107,82 @@ fn toggle_main_view_fullscreen(state: &mut MainViewFullscreenState, window: Opti
     }
 }
 
-fn auto_hide_overlay_ui(ctx: &Context, viewport: Rect, id: &'static str) -> Ui {
+fn auto_hide_panel_interaction_rect(
+    ctx: &Context,
+    viewport: Rect,
+    edge: AutoHideEdge,
+    panel_id: &'static str,
+    previous_rect: Option<Rect>,
+    fallback_outer_size: f32,
+) -> Rect {
+    let panel_rect = previous_rect.unwrap_or_else(|| {
+        let persisted_outer_size = egui::PanelState::load(ctx, Id::new(panel_id))
+            .map(|state| match edge {
+                AutoHideEdge::Top => state.size().y,
+                AutoHideEdge::Right | AutoHideEdge::Left => state.size().x,
+            })
+            .filter(|size| size.is_finite() && *size > 0.0)
+            .unwrap_or(fallback_outer_size);
+
+        match edge {
+            AutoHideEdge::Top => Rect::from_min_max(
+                viewport.min,
+                Pos2::new(
+                    viewport.right(),
+                    viewport.top() + persisted_outer_size.min(viewport.height()),
+                ),
+            ),
+            AutoHideEdge::Right => Rect::from_min_max(
+                Pos2::new(
+                    viewport.right() - persisted_outer_size.min(viewport.width()),
+                    viewport.top(),
+                ),
+                viewport.max,
+            ),
+            AutoHideEdge::Left => Rect::from_min_max(
+                viewport.min,
+                Pos2::new(
+                    viewport.left() + persisted_outer_size.min(viewport.width()),
+                    viewport.bottom(),
+                ),
+            ),
+        }
+    });
+
+    panel_rect.expand(AUTO_HIDE_PANEL_GRACE).intersect(viewport)
+}
+
+fn auto_hide_overlay_ui(
+    ctx: &Context,
+    viewport: Rect,
+    id: &'static str,
+    interaction_rect: Rect,
+) -> Ui {
+    let overlay_layer_id = Id::new(("auto_hide_overlay_layer", id));
+    let layer_id = egui::LayerId::new(
+        egui::Order::Foreground,
+        overlay_layer_id,
+    );
+
+    // A raw `Ui` on a custom layer is paintable, but egui does not consider that
+    // layer pointer-interactive until an `Area` registers its on-screen bounds.
+    // ScrollArea uses that layer check before accepting wheel or scrollbar input.
+    egui::Area::new(overlay_layer_id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(interaction_rect.min)
+        .default_size(interaction_rect.size())
+        .movable(false)
+        .constrain_to(viewport)
+        .fade_in(false)
+        .show(ctx, |ui| {
+            ui.set_width(interaction_rect.width());
+            ui.set_height(interaction_rect.height());
+        });
+
     egui::Ui::new(
         ctx.clone(),
         Id::new(("auto_hide_overlay", id)),
-        egui::UiBuilder::new()
-            .layer_id(egui::LayerId::new(
-                egui::Order::Foreground,
-                Id::new(("auto_hide_overlay_layer", id)),
-            ))
-            .max_rect(viewport),
+        egui::UiBuilder::new().layer_id(layer_id).max_rect(viewport),
     )
 }
 
@@ -18297,9 +18366,22 @@ pub fn ui_system(
     }
 
     if panel_visibility.top {
-        let mut overlay_ui = main_view_fullscreen
-            .active
-            .then(|| auto_hide_overlay_ui(ctx, viewport_rect, "top"));
+        let interaction_rect = auto_hide_panel_interaction_rect(
+            ctx,
+            viewport_rect,
+            AutoHideEdge::Top,
+            "top_panel",
+            main_view_fullscreen.top_rect,
+            AUTO_HIDE_TOP_FALLBACK_SIZE,
+        );
+        let mut overlay_ui = main_view_fullscreen.active.then(|| {
+            auto_hide_overlay_ui(
+                ctx,
+                viewport_rect,
+                "top",
+                interaction_rect,
+            )
+        });
         let panel_ui = match overlay_ui.as_mut() {
             Some(ui) => ui,
             None => &mut viewport_ui,
@@ -18326,9 +18408,22 @@ pub fn ui_system(
     }
 
     if panel_visibility.right {
-        let mut overlay_ui = main_view_fullscreen
-            .active
-            .then(|| auto_hide_overlay_ui(ctx, viewport_rect, "right"));
+        let interaction_rect = auto_hide_panel_interaction_rect(
+            ctx,
+            viewport_rect,
+            AutoHideEdge::Right,
+            "right_panel",
+            main_view_fullscreen.right_rect,
+            AUTO_HIDE_RIGHT_FALLBACK_SIZE,
+        );
+        let mut overlay_ui = main_view_fullscreen.active.then(|| {
+            auto_hide_overlay_ui(
+                ctx,
+                viewport_rect,
+                "right",
+                interaction_rect,
+            )
+        });
         let panel_ui = match overlay_ui.as_mut() {
             Some(ui) => ui,
             None => &mut viewport_ui,
@@ -18349,9 +18444,22 @@ pub fn ui_system(
     }
 
     if panel_visibility.left {
-        let mut overlay_ui = main_view_fullscreen
-            .active
-            .then(|| auto_hide_overlay_ui(ctx, viewport_rect, "left"));
+        let interaction_rect = auto_hide_panel_interaction_rect(
+            ctx,
+            viewport_rect,
+            AutoHideEdge::Left,
+            "chat_list_panel",
+            main_view_fullscreen.left_rect,
+            AUTO_HIDE_LEFT_FALLBACK_SIZE,
+        );
+        let mut overlay_ui = main_view_fullscreen.active.then(|| {
+            auto_hide_overlay_ui(
+                ctx,
+                viewport_rect,
+                "left",
+                interaction_rect,
+            )
+        });
         let panel_ui = match overlay_ui.as_mut() {
             Some(ui) => ui,
             None => &mut viewport_ui,
@@ -20103,6 +20211,42 @@ mod tests {
         let hovered_panel =
             auto_hide_panel_visibility(&state, Some(Pos2::new(180.0, 350.0)), viewport);
         assert!(hovered_panel.left);
+    }
+
+    #[test]
+    fn auto_hide_overlay_registers_scroll_hit_region() {
+        let ctx = Context::default();
+        let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let panel_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(220.0, 480.0));
+
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(viewport),
+            events: vec![egui::Event::PointerMoved(Pos2::new(100.0, 100.0))],
+            ..Default::default()
+        });
+        let overlay_ui = auto_hide_overlay_ui(
+            &ctx,
+            viewport,
+            "scroll_test",
+            panel_rect,
+        );
+        let overlay_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            Id::new(("auto_hide_overlay_layer", "scroll_test")),
+        );
+
+        assert_eq!(
+            ctx.layer_id_at(Pos2::new(100.0, 100.0)),
+            Some(overlay_layer)
+        );
+        assert!(overlay_ui.rect_contains_pointer(panel_rect));
+        assert!(
+            !overlay_ui.rect_contains_pointer(Rect::from_min_size(
+                Pos2::new(300.0, 0.0),
+                egui::vec2(100.0, 480.0),
+            ))
+        );
+        let _ = ctx.end_pass();
     }
 
     #[test]
