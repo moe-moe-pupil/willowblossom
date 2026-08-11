@@ -8307,7 +8307,9 @@ fn voxel_workbook_feature_overlay(
     // Paint distant annotations first so a nearby room label remains readable.
     labels.sort_by(|left, right| right.depth.total_cmp(&left.depth));
     let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Middle,
+        // Scene annotations belong above the 3D viewport, but below floating
+        // egui windows such as chat.
+        egui::Order::Background,
         egui::Id::new("voxel_workbook_map_labels"),
     ));
     for label in labels {
