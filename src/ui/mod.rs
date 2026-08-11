@@ -53,7 +53,15 @@ use bevy_persistent::{
     Persistent,
     StorageFormat,
 };
-use chat_analytics::show_chat_analytics_window;
+use chat_analytics::{
+    format_duration,
+    keep_gm_auto_chat_window_topmost,
+    ranked_private_chat_timings,
+    show_chat_analytics_window,
+    show_gm_auto_chat_toast,
+    update_gm_auto_chat_mode,
+    GmAutoChatModeState,
+};
 use ime::*;
 use rand::RngExt;
 use serde::{
@@ -1254,6 +1262,7 @@ pub struct UiSystemLocals<'w, 's> {
     group_broadcast_scopes: Local<'s, HashMap<String, String>>,
     chat_player_visible_previews: Local<'s, HashMap<String, String>>,
     chat_analytics_targets: Local<'s, HashSet<String>>,
+    gm_auto_chat_mode: Local<'s, GmAutoChatModeState>,
     chat_list_player_visible_filter: Local<'s, Option<String>>,
     scene_capture_requests: Option<ResMut<'w, SceneCaptureRequests>>,
     voxel_editor: ResMut<'w, VoxelEditorState>,
@@ -3196,6 +3205,35 @@ fn focus_standalone_chat_window(ctx: &Context, target_id: &str) {
         ctx,
         standalone_chat_window_id(Id::new(target_id), target_id),
     );
+}
+
+fn focus_gm_auto_chat_target_window(
+    ctx: &Context,
+    manager: &mut NapcatMessageManager,
+    target_id: &str,
+) -> bool {
+    let mut changed = manager.pending_chat_targets.remove(target_id);
+    if manager.open_chat_targets.contains(target_id) {
+        focus_standalone_chat_window(ctx, target_id);
+        return changed;
+    }
+
+    let docked = manager.groups.values().any(|group| {
+        group
+            .members
+            .iter()
+            .any(|member_id| member_id == target_id)
+    });
+    if docked {
+        // Auto mode renders the active docked target as a temporary standalone
+        // window without changing its persisted discussion-group membership.
+        focus_standalone_chat_window(ctx, target_id);
+        return changed;
+    }
+
+    changed |= manager.open_chat_targets.insert(target_id.to_owned());
+    focus_standalone_chat_window(ctx, target_id);
+    changed
 }
 
 fn mark_target_read(
@@ -5415,6 +5453,7 @@ fn approval_onboarding_text(manager: &NapcatMessageManager, target_id: &str) -> 
 fn waiting_turn_manager_window(
     ctx: &Context,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
+    auto_mode: &mut GmAutoChatModeState,
 ) {
     let Some(group_name) = manager.current_trpg_group.clone() else {
         return;
@@ -5423,20 +5462,21 @@ fn waiting_turn_manager_window(
         return;
     };
 
-    let waiting_players = group
-        .players
-        .iter()
-        .filter(|target_id| {
+    let waiting_players = ranked_private_chat_timings(manager, group)
+        .into_iter()
+        .filter(|timing| {
             group
                 .player_turns
-                .get(*target_id)
+                .get(&timing.target_id)
                 .map(|turn| !turn.acted && !turn.skipped)
                 .unwrap_or(true)
         })
-        .map(|target_id| {
+        .map(|timing| {
             (
-                target_id.clone(),
-                target_display_name(manager, target_id),
+                timing.target_id.clone(),
+                target_display_name(manager, &timing.target_id),
+                timing.average_secs,
+                timing.completed_samples,
             )
         })
         .collect::<Vec<_>>();
@@ -5445,8 +5485,8 @@ fn waiting_turn_manager_window(
     egui::Window::new("轮次管理")
         .id(Id::new("waiting_turn_manager_window"))
         .default_pos(Pos2::new(240.0, 48.0))
-        .default_size(Vec2::new(240.0, 220.0))
-        .min_size(Vec2::new(180.0, 120.0))
+        .default_size(Vec2::new(300.0, 260.0))
+        .min_size(Vec2::new(240.0, 150.0))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(group_name.as_str());
@@ -5455,6 +5495,30 @@ fn waiting_turn_manager_window(
                     waiting_players.len()
                 ));
             });
+            let mut auto_enabled = auto_mode.enabled();
+            if ui
+                .checkbox(&mut auto_enabled, "GM自动巡查")
+                .on_hover_text(
+                    "按本次开团的平均私聊回复时间从长到短巡查等待中的玩家；数据不足者排在最后",
+                )
+                .changed()
+            {
+                auto_mode.set_enabled(auto_enabled);
+            }
+            if auto_mode.enabled() {
+                if let Some(target_id) = auto_mode.active_target() {
+                    let display_name = target_display_name(manager, target_id);
+                    let progress = auto_mode
+                        .progress()
+                        .map(|(current, total)| format!("{current}/{total}"))
+                        .unwrap_or_default();
+                    ui.small(format!(
+                        "自动巡查：{display_name} {progress}"
+                    ));
+                } else {
+                    ui.small("自动巡查正在寻找待行动的数字QQ玩家。");
+                }
+            }
             ui.separator();
 
             if waiting_players.is_empty() {
@@ -5465,10 +5529,26 @@ fn waiting_turn_manager_window(
             egui::ScrollArea::vertical()
                 .id_salt("waiting_turn_manager_players")
                 .show(ui, |ui| {
-                    for (target_id, display_name) in &waiting_players {
-                        if ui.button(display_name).on_hover_text(target_id).clicked() {
-                            target_to_focus = Some(target_id.clone());
-                        }
+                    for (target_id, display_name, average_secs, completed_samples) in
+                        &waiting_players
+                    {
+                        ui.horizontal(|ui| {
+                            if ui.button(display_name).on_hover_text(target_id).clicked() {
+                                target_to_focus = Some(target_id.clone());
+                            }
+                            match average_secs {
+                                Some(average_secs) => {
+                                    ui.small(format!(
+                                        "平均 {}（{}次）",
+                                        format_duration(*average_secs),
+                                        completed_samples
+                                    ));
+                                },
+                                None => {
+                                    ui.small("平均：数据不足");
+                                },
+                            }
+                        });
                     }
                 });
         });
@@ -16984,6 +17064,7 @@ pub fn ui_system(
     let chat_player_visible_previews: &mut Local<HashMap<String, String>> =
         &mut locals.chat_player_visible_previews;
     let chat_analytics_targets: &mut Local<HashSet<String>> = &mut locals.chat_analytics_targets;
+    let gm_auto_chat_mode: &mut Local<GmAutoChatModeState> = &mut locals.gm_auto_chat_mode;
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
     let scene_capture_requests = &mut locals.scene_capture_requests;
@@ -18628,7 +18709,15 @@ pub fn ui_system(
                 napcat_sender,
                 &mut ime,
             );
-            waiting_turn_manager_window(ctx, &mut manager);
+            waiting_turn_manager_window(ctx, &mut manager, gm_auto_chat_mode);
+            if update_gm_auto_chat_mode(
+                ctx,
+                manager.as_mut(),
+                gm_auto_chat_mode,
+                voxel_editor,
+            ) {
+                manager.persist().ok();
+            }
             trpg_group_global_chat_windows(
                 ctx,
                 &manager,
@@ -18724,7 +18813,10 @@ pub fn ui_system(
                     **has_run_once = true
                 }
 
-                let current_group = if manager.open_chat_targets.contains(&target_id) {
+                let auto_floating = gm_auto_chat_mode.active_target() == Some(target_id.as_str());
+                let current_group = if manager.open_chat_targets.contains(&target_id)
+                    || auto_floating
+                {
                     None
                 } else {
                     manager.groups.iter().find_map(|(group_name, group)| {
@@ -18790,6 +18882,14 @@ pub fn ui_system(
                     scene_capture_requests.as_deref_mut(),
                 );
             }
+            if keep_gm_auto_chat_window_topmost(
+                ctx,
+                manager.as_mut(),
+                gm_auto_chat_mode,
+            ) {
+                manager.persist().ok();
+            }
+            show_gm_auto_chat_toast(ctx, gm_auto_chat_mode);
         });
 
     dm_voxel_map_windows(

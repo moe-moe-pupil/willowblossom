@@ -1,6 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        HashSet,
+    },
     time::{
+        Duration,
         SystemTime,
         UNIX_EPOCH,
     },
@@ -8,13 +12,22 @@ use std::{
 
 use bevy_egui::egui;
 
-use crate::napcat::{
-    NapcatMessage,
-    NapcatMessageChainType,
-    NapcatMessageManager,
-    NapcatMessageType,
-    TrpgGroup,
+use crate::{
+    napcat::{
+        NapcatMessage,
+        NapcatMessageChainType,
+        NapcatMessageManager,
+        NapcatMessageType,
+        TrpgGroup,
+    },
+    voxel::{
+        VoxelEditorState,
+        VoxelTeleportDestination,
+    },
 };
+
+const GM_AUTO_CHAT_STAY_WARNING_SECS: f64 = 60.0;
+const GM_AUTO_CHAT_TOAST_VISIBLE_SECS: f64 = 8.0;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct TimingSummary {
@@ -24,6 +37,136 @@ struct TimingSummary {
     longest_secs: Option<u64>,
     current_elapsed_secs: Option<u64>,
     estimated_remaining_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PrivateChatTiming {
+    pub(super) target_id: String,
+    pub(super) completed_samples: usize,
+    pub(super) average_secs: Option<u64>,
+}
+
+#[derive(Debug)]
+struct GmAutoChatSession {
+    group_name: String,
+    world_turn: u32,
+    queue: Vec<String>,
+    active_index: usize,
+    active_since_secs: f64,
+    stay_warning_shown: bool,
+}
+
+#[derive(Debug)]
+struct GmAutoChatToast {
+    message: String,
+    shown_at_secs: f64,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct GmAutoChatModeState {
+    enabled: bool,
+    session: Option<GmAutoChatSession>,
+    toast: Option<GmAutoChatToast>,
+}
+
+impl GmAutoChatModeState {
+    pub(super) fn enabled(&self) -> bool { self.enabled }
+
+    pub(super) fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled == enabled {
+            return;
+        }
+        self.enabled = enabled;
+        self.session = None;
+        if !enabled {
+            self.toast = None;
+        }
+    }
+
+    pub(super) fn active_target(&self) -> Option<&str> {
+        let session = self.session.as_ref()?;
+        session.queue.get(session.active_index).map(String::as_str)
+    }
+
+    pub(super) fn progress(&self) -> Option<(usize, usize)> {
+        let session = self.session.as_ref()?;
+        (session.active_index < session.queue.len()).then_some((
+            session.active_index + 1,
+            session.queue.len(),
+        ))
+    }
+
+    fn sync_session(
+        &mut self,
+        group_name: &str,
+        world_turn: u32,
+        ranked_waiting_targets: &[String],
+        waiting_targets: &HashSet<String>,
+        now_secs: f64,
+    ) -> Option<String> {
+        if !self.enabled {
+            self.session = None;
+            return None;
+        }
+
+        let starts_new_session = self.session.as_ref().is_none_or(|session| {
+            session.group_name != group_name || session.world_turn != world_turn
+        });
+        if starts_new_session {
+            self.session = (!ranked_waiting_targets.is_empty()).then(|| GmAutoChatSession {
+                group_name: group_name.to_owned(),
+                world_turn,
+                queue: ranked_waiting_targets.to_vec(),
+                active_index: 0,
+                active_since_secs: now_secs,
+                stay_warning_shown: false,
+            });
+            return self.active_target().map(str::to_owned);
+        }
+
+        let Some(session) = self.session.as_mut() else {
+            return None;
+        };
+        let previous_index = session.active_index;
+        while session
+            .queue
+            .get(session.active_index)
+            .is_some_and(|target_id| !waiting_targets.contains(target_id))
+        {
+            session.active_index += 1;
+        }
+        if session.active_index == previous_index {
+            return None;
+        }
+
+        session.active_since_secs = now_secs;
+        session.stay_warning_shown = false;
+        session.queue.get(session.active_index).cloned()
+    }
+
+    fn take_stay_warning(&mut self, now_secs: f64) -> Option<String> {
+        let session = self.session.as_mut()?;
+        if now_secs < session.active_since_secs {
+            session.active_since_secs = now_secs;
+            return None;
+        }
+        if session.stay_warning_shown
+            || now_secs - session.active_since_secs < GM_AUTO_CHAT_STAY_WARNING_SECS
+        {
+            return None;
+        }
+
+        let target_id = session.queue.get(session.active_index)?.clone();
+        session.stay_warning_shown = true;
+        Some(target_id)
+    }
+
+    fn show_toast(&mut self, message: String, now_secs: f64) {
+        self.toast = Some(GmAutoChatToast {
+            message,
+            shown_at_secs: now_secs,
+        });
+    }
 }
 
 pub(super) fn show_chat_analytics_window(
@@ -41,13 +184,7 @@ pub(super) fn show_chat_analytics_window(
         .map(Vec::as_slice)
         .unwrap_or_default();
     let group = group_name.and_then(|name| manager.trpg_groups.get(name));
-    let session_started_at = group
-        .filter(|group| group.campaign_active)
-        .and_then(|group| {
-            (group.campaign_started_at > 0)
-                .then_some(group.campaign_started_at)
-                .or_else(|| inferred_current_session_start(manager, group))
-        });
+    let session_started_at = group.and_then(|group| current_session_started_at(manager, group));
     let response = session_started_at
         .map(|started_at| private_response_timing(messages, started_at, now))
         .unwrap_or_default();
@@ -132,6 +269,192 @@ pub(super) fn show_chat_analytics_window(
                 ui.small("尚未开团，当前没有团期统计数据。");
             }
         });
+}
+
+pub(super) fn ranked_private_chat_timings(
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+) -> Vec<PrivateChatTiming> {
+    let now = unix_timestamp_secs();
+    let session_started_at = current_session_started_at(manager, group);
+    let mut seen = HashSet::new();
+    let mut timings = group
+        .players
+        .iter()
+        .filter(|target_id| seen.insert((*target_id).clone()))
+        .map(|target_id| {
+            let summary = session_started_at
+                .map(|started_at| {
+                    private_response_timing(
+                        manager
+                            .messages
+                            .get(target_id)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        started_at,
+                        now,
+                    )
+                })
+                .unwrap_or_default();
+            PrivateChatTiming {
+                target_id: target_id.clone(),
+                completed_samples: summary.completed_samples,
+                average_secs: summary.average_secs,
+            }
+        })
+        .collect::<Vec<_>>();
+    sort_private_chat_timings(&mut timings);
+    timings
+}
+
+fn sort_private_chat_timings(timings: &mut [PrivateChatTiming]) {
+    timings.sort_by(|left, right| {
+        right
+            .average_secs
+            .cmp(&left.average_secs)
+            .then_with(|| left.target_id.cmp(&right.target_id))
+    });
+}
+
+fn current_session_started_at(manager: &NapcatMessageManager, group: &TrpgGroup) -> Option<u64> {
+    if !group.campaign_active {
+        return None;
+    }
+    (group.campaign_started_at > 0)
+        .then_some(group.campaign_started_at)
+        .or_else(|| inferred_current_session_start(manager, group))
+}
+
+pub(super) fn update_gm_auto_chat_mode(
+    ctx: &egui::Context,
+    manager: &mut NapcatMessageManager,
+    state: &mut GmAutoChatModeState,
+    voxel_editor: &mut VoxelEditorState,
+) -> bool {
+    let now_secs = ctx.input(|input| input.time);
+    if !state.enabled() {
+        state.session = None;
+        return false;
+    }
+
+    let Some((group_name, world_turn, ranked_waiting, waiting_targets)) = manager
+        .current_trpg_group
+        .as_deref()
+        .and_then(|group_name| {
+            let group = manager.trpg_groups.get(group_name)?;
+            let waiting_targets = group
+                .players
+                .iter()
+                .filter(|target_id| {
+                    group
+                        .player_turns
+                        .get(*target_id)
+                        .map(|turn| !turn.acted && !turn.skipped)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect::<HashSet<_>>();
+            let ranked_waiting = ranked_private_chat_timings(manager, group)
+                .into_iter()
+                .map(|timing| timing.target_id)
+                .filter(|target_id| {
+                    target_id.parse::<u64>().is_ok() && waiting_targets.contains(target_id)
+                })
+                .collect::<Vec<_>>();
+            Some((
+                group_name.to_owned(),
+                group.world_turn,
+                ranked_waiting,
+                waiting_targets,
+            ))
+        })
+    else {
+        state.session = None;
+        return false;
+    };
+
+    let selected_target = state.sync_session(
+        &group_name,
+        world_turn,
+        &ranked_waiting,
+        &waiting_targets,
+        now_secs,
+    );
+    let mut manager_changed = false;
+    if let Some(target_id) = selected_target {
+        manager_changed |= super::focus_gm_auto_chat_target_window(ctx, manager, &target_id);
+        if let Ok(user_id) = target_id.parse::<u64>() {
+            voxel_editor.request_teleport(VoxelTeleportDestination::PlayerStandee(
+                user_id,
+            ));
+        }
+    }
+
+    if let Some(target_id) = state.take_stay_warning(now_secs) {
+        let display_name = super::target_display_name(manager, &target_id);
+        state.show_toast(
+            format!(
+                "你已在 {display_name} 的聊天窗口停留 1 分钟，请处理消息或点击“行动”继续巡查。"
+            ),
+            now_secs,
+        );
+    }
+    ctx.request_repaint_after(Duration::from_secs(1));
+    manager_changed
+}
+
+pub(super) fn keep_gm_auto_chat_window_topmost(
+    ctx: &egui::Context,
+    manager: &mut NapcatMessageManager,
+    state: &GmAutoChatModeState,
+) -> bool {
+    let Some(target_id) = state.active_target() else {
+        return false;
+    };
+    super::focus_gm_auto_chat_target_window(ctx, manager, target_id)
+}
+
+pub(super) fn show_gm_auto_chat_toast(ctx: &egui::Context, state: &mut GmAutoChatModeState) {
+    let now_secs = ctx.input(|input| input.time);
+    let Some(toast) = state.toast.as_ref() else {
+        return;
+    };
+    if now_secs < toast.shown_at_secs
+        || now_secs - toast.shown_at_secs >= GM_AUTO_CHAT_TOAST_VISIBLE_SECS
+    {
+        state.toast = None;
+        return;
+    }
+    let message = toast.message.clone();
+
+    egui::Area::new(egui::Id::new("gm_auto_chat_stay_toast"))
+        .anchor(
+            egui::Align2::RIGHT_TOP,
+            egui::vec2(-16.0, 64.0),
+        )
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(
+                    48, 35, 12, 245,
+                ))
+                .stroke(egui::Stroke::new(
+                    1.5,
+                    egui::Color32::from_rgb(245, 180, 60),
+                ))
+                .corner_radius(7)
+                .inner_margin(egui::Margin::symmetric(12, 9))
+                .show(ui, |ui| {
+                    ui.set_max_width(360.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 211, 115),
+                        "自动巡查提醒",
+                    );
+                    ui.label(message);
+                });
+        });
+    ctx.request_repaint_after(Duration::from_millis(250));
 }
 
 fn timing_average_ui(ui: &mut egui::Ui, label: &str, summary: &TimingSummary) {
@@ -291,7 +614,7 @@ fn timing_summary(samples: &[u64], current_started_at: Option<u64>, now: u64) ->
     }
 }
 
-fn format_duration(total_secs: u64) -> String {
+pub(super) fn format_duration(total_secs: u64) -> String {
     let days = total_secs / 86_400;
     let hours = total_secs % 86_400 / 3_600;
     let minutes = total_secs % 3_600 / 60;
@@ -379,6 +702,108 @@ mod tests {
                 current_elapsed_secs: Some(30),
                 estimated_remaining_secs: Some(15),
             }
+        );
+    }
+
+    #[test]
+    fn private_chat_timings_rank_longest_average_first_and_missing_data_last() {
+        let mut timings = vec![
+            PrivateChatTiming {
+                target_id: "30".to_owned(),
+                completed_samples: 0,
+                average_secs: None,
+            },
+            PrivateChatTiming {
+                target_id: "20".to_owned(),
+                completed_samples: 2,
+                average_secs: Some(30),
+            },
+            PrivateChatTiming {
+                target_id: "10".to_owned(),
+                completed_samples: 4,
+                average_secs: Some(90),
+            },
+            PrivateChatTiming {
+                target_id: "40".to_owned(),
+                completed_samples: 1,
+                average_secs: Some(30),
+            },
+        ];
+
+        sort_private_chat_timings(&mut timings);
+
+        assert_eq!(
+            timings
+                .iter()
+                .map(|timing| timing.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["10", "20", "40", "30"]
+        );
+    }
+
+    #[test]
+    fn auto_chat_advances_in_captured_rank_order_when_current_player_finishes() {
+        let mut state = GmAutoChatModeState::default();
+        state.set_enabled(true);
+        let ranked = vec!["slow".to_owned(), "middle".to_owned(), "fast".to_owned()];
+        let mut waiting = ranked.iter().cloned().collect::<HashSet<_>>();
+
+        assert_eq!(
+            state.sync_session("table", 7, &ranked, &waiting, 10.0),
+            Some("slow".to_owned())
+        );
+        waiting.remove("slow");
+        assert_eq!(
+            state.sync_session("table", 7, &[], &waiting, 20.0),
+            Some("middle".to_owned())
+        );
+        waiting.remove("middle");
+        assert_eq!(
+            state.sync_session("table", 7, &[], &waiting, 30.0),
+            Some("fast".to_owned())
+        );
+        assert_eq!(state.progress(), Some((3, 3)));
+    }
+
+    #[test]
+    fn auto_chat_starts_a_fresh_ranking_when_the_world_turn_advances() {
+        let mut state = GmAutoChatModeState::default();
+        state.set_enabled(true);
+        let ranked = vec!["slow".to_owned(), "fast".to_owned()];
+        let waiting = ranked.iter().cloned().collect::<HashSet<_>>();
+
+        assert_eq!(
+            state.sync_session("table", 3, &ranked, &waiting, 10.0),
+            Some("slow".to_owned())
+        );
+        assert_eq!(
+            state.sync_session("table", 4, &ranked, &waiting, 20.0),
+            Some("slow".to_owned())
+        );
+        assert_eq!(state.progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn auto_chat_warns_once_after_one_minute_on_each_selected_player() {
+        let mut state = GmAutoChatModeState::default();
+        state.set_enabled(true);
+        let ranked = vec!["slow".to_owned(), "fast".to_owned()];
+        let mut waiting = ranked.iter().cloned().collect::<HashSet<_>>();
+        state.sync_session("table", 1, &ranked, &waiting, 10.0);
+
+        assert_eq!(state.take_stay_warning(69.9), None);
+        assert_eq!(
+            state.take_stay_warning(70.0),
+            Some("slow".to_owned())
+        );
+        assert_eq!(state.take_stay_warning(90.0), None);
+
+        waiting.remove("slow");
+        state.sync_session("table", 1, &[], &waiting, 100.0);
+        assert_eq!(state.take_stay_warning(159.9), None);
+        assert_eq!(
+            state.take_stay_warning(160.0),
+            Some("fast".to_owned())
         );
     }
 
