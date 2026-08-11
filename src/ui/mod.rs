@@ -4420,20 +4420,12 @@ fn message_bubble_layout(
     alignment: egui::Align,
     add_contents: impl FnOnce(&mut Ui),
 ) {
-    ui.with_layout(
+    ui.allocate_ui_with_layout(
+        egui::vec2(row_width, 0.0),
         egui::Layout::top_down(alignment),
         |ui| {
-            ui.set_width(row_width);
-            ui.vertical(|ui| {
-                ui.set_width(bubble_width);
-                ui.set_max_width(bubble_width);
-                ui.with_layout(
-                    egui::Layout::top_down(alignment),
-                    |ui| {
-                        add_contents(ui);
-                    },
-                );
-            });
+            ui.set_width(bubble_width);
+            add_contents(ui);
         },
     );
 }
@@ -19353,6 +19345,42 @@ mod tests {
 
         assert!(widths[1..].windows(2).all(|pair| pair[0] == pair[1]));
         assert!(widths.last().copied().unwrap() < 500.0);
+    }
+
+    #[test]
+    fn right_aligned_message_bubble_reaches_the_row_edge() {
+        let ctx = Context::default();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let mut measured_edges = None;
+
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        });
+        egui::Window::new("right aligned message")
+            .fixed_size(egui::vec2(360.0, 240.0))
+            .show(&ctx, |ui| {
+                let row_width = ui.available_width();
+                let row_right = ui.available_rect_before_wrap().right();
+                message_bubble_layout(
+                    ui,
+                    row_width,
+                    row_width * 0.72,
+                    egui::Align::RIGHT,
+                    |ui| {
+                        let message =
+                            ui.add(egui::Label::new("GM message").wrap().selectable(false));
+                        measured_edges = Some((row_right, message.rect.right()));
+                    },
+                );
+            });
+        let _ = ctx.end_pass();
+
+        let (row_right, message_right) = measured_edges.expect("message should be rendered");
+        assert!(
+            (message_right - row_right).abs() < 0.1,
+            "right-aligned message ended at {message_right}, expected row edge {row_right}"
+        );
     }
 
     #[test]
