@@ -2827,9 +2827,10 @@ fn chat_window(
                 });
             }
         }
-        let preview_messages = chat_player_visible_previews
+        let preview_player_id = chat_player_visible_previews
             .get(target_id)
-            .and_then(|player_id| player_id.parse::<u64>().ok())
+            .and_then(|player_id| player_id.parse::<u64>().ok());
+        let preview_messages = preview_player_id
             .map(|player_id| manager.visible_messages_for_player(target_id, messages, player_id));
         if let Some(preview_messages) = preview_messages.as_ref() {
             ui.small(format!(
@@ -2839,10 +2840,16 @@ fn chat_window(
             ));
         }
         let body_messages = preview_messages.as_ref().unwrap_or(messages);
+        let body_unread_count = preview_player_id
+            .map(|player_id| {
+                target_unread_count_for_player(manager, target_id, messages, player_id)
+            })
+            .unwrap_or(unread_count);
         chat_body_ui(
             ui,
             ctx,
             body_messages,
+            body_unread_count,
             napcat_sender,
             target_id,
             chat_input_msgs,
@@ -3292,6 +3299,7 @@ fn chat_body_ui(
     ui: &mut Ui,
     ctx: &Context,
     messages: &Vec<NapcatMessage>,
+    unread_count: usize,
     napcat_sender: Option<&NapcatIOSender>,
     target_id: &str,
     chat_input_msgs: &mut HashMap<String, String>,
@@ -3359,10 +3367,15 @@ fn chat_body_ui(
                     ui.with_layout(
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
-                            for message in messages {
+                            let new_message_start =
+                                newest_unread_incoming_start(messages, unread_count);
+                            for (message_index, message) in messages.iter().enumerate() {
+                                let is_new = message_index >= new_message_start
+                                    && message.data.user_id != message.data.self_id;
                                 message_row_ui(
                                     ui,
                                     message,
+                                    is_new,
                                     message_width,
                                     image_textures,
                                 );
@@ -4378,6 +4391,7 @@ fn group_drop_area_ui(ui: &mut Ui, group_name: &str, members: &[String]) {
 fn message_row_ui(
     ui: &mut Ui,
     message: &NapcatMessage,
+    is_new: bool,
     row_width: f32,
     image_textures: &mut HashMap<String, TextureHandle>,
 ) {
@@ -4394,7 +4408,7 @@ fn message_row_ui(
         max_message_width,
         alignment,
         |ui| {
-            message_text_ui(ui, message, image_textures);
+            message_text_ui(ui, message, is_new, image_textures);
         },
     );
 }
@@ -4427,14 +4441,20 @@ fn message_bubble_layout(
 fn message_text_ui(
     ui: &mut Ui,
     message: &NapcatMessage,
+    is_new: bool,
     image_textures: &mut HashMap<String, TextureHandle>,
 ) {
+    let text_color = chat_message_text_color(message, is_new, ui.visuals().dark_mode);
     ui.label(&message.data.sender.nickname);
     for chain in &message.data.message {
         match &chain.variant {
             NapcatMessageChainType::Text { data: text_data } => {
+                let mut text = egui::RichText::new(text_data.text.trim());
+                if let Some(color) = text_color {
+                    text = text.color(color);
+                }
                 ui.add(
-                    egui::Label::new(text_data.text.trim())
+                    egui::Label::new(text)
                         .wrap()
                         .selectable(false),
                 );
@@ -4447,6 +4467,60 @@ fn message_text_ui(
             NapcatMessageChainType::Unsupported => {},
         }
     }
+}
+
+fn newest_unread_incoming_start(messages: &[NapcatMessage], unread_count: usize) -> usize {
+    let mut remaining = unread_count;
+    if remaining == 0 {
+        return messages.len();
+    }
+
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.data.user_id == message.data.self_id {
+            continue;
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            return index;
+        }
+    }
+
+    0
+}
+
+fn message_starts_with_hash(message: &NapcatMessage) -> bool {
+    message
+        .data
+        .message
+        .iter()
+        .filter_map(|chain| match &chain.variant {
+            NapcatMessageChainType::Text { data } => Some(data.text.as_str()),
+            _ => None,
+        })
+        .find_map(|text| text.chars().find(|character| !character.is_whitespace()))
+        == Some('#')
+}
+
+fn chat_message_text_color(
+    message: &NapcatMessage,
+    is_new: bool,
+    dark_mode: bool,
+) -> Option<egui::Color32> {
+    if message_starts_with_hash(message) {
+        return Some(if dark_mode {
+            egui::Color32::from_rgb(88, 214, 126)
+        } else {
+            egui::Color32::from_rgb(0, 122, 61)
+        });
+    }
+
+    is_new.then(|| {
+        if dark_mode {
+            egui::Color32::from_rgb(255, 184, 77)
+        } else {
+            egui::Color32::from_rgb(166, 82, 0)
+        }
+    })
 }
 
 fn message_image_ui(
@@ -19200,6 +19274,7 @@ mod tests {
                         ui,
                         &ctx,
                         &messages,
+                        0,
                         Some(&napcat_sender),
                         target_id,
                         &mut input_msgs,
@@ -19635,6 +19710,51 @@ mod tests {
                 access_scope_resolved: false,
             },
         }
+    }
+
+    #[test]
+    fn newest_unread_messages_skip_local_replies() {
+        let messages = vec![
+            test_private_message(2),
+            test_private_message(3),
+            test_private_message(1),
+            test_private_message(4),
+        ];
+
+        assert_eq!(newest_unread_incoming_start(&messages, 0), 4);
+        assert_eq!(newest_unread_incoming_start(&messages, 1), 3);
+        assert_eq!(newest_unread_incoming_start(&messages, 2), 1);
+        assert_eq!(newest_unread_incoming_start(&messages, 99), 0);
+    }
+
+    #[test]
+    fn hash_prefixed_messages_are_green_before_new_message_accent() {
+        let ordinary = test_private_message(2);
+        let mut hash_prefixed = test_private_message(2);
+        let NapcatMessageChainType::Text { data } =
+            &mut hash_prefixed.data.message[0].variant
+        else {
+            unreachable!();
+        };
+        data.text = "  #秘密行动".to_owned();
+
+        assert_eq!(chat_message_text_color(&ordinary, false, true), None);
+        assert_eq!(
+            chat_message_text_color(&ordinary, true, true),
+            Some(egui::Color32::from_rgb(255, 184, 77))
+        );
+        assert_eq!(
+            chat_message_text_color(&ordinary, true, false),
+            Some(egui::Color32::from_rgb(166, 82, 0))
+        );
+        assert_eq!(
+            chat_message_text_color(&hash_prefixed, true, true),
+            Some(egui::Color32::from_rgb(88, 214, 126))
+        );
+        assert_eq!(
+            chat_message_text_color(&hash_prefixed, true, false),
+            Some(egui::Color32::from_rgb(0, 122, 61))
+        );
     }
 
     fn test_group_message(user_id: u64, text: &str) -> NapcatMessage {
