@@ -125,7 +125,6 @@ const CHAT_WINDOW_MIN_SIZE: Vec2 = Vec2::new(260.0, 260.0);
 const CHAT_WINDOW_MAX_HEIGHT: f32 = 720.0;
 const GROUP_CHAT_MAX_HEIGHT: f32 = 720.0;
 const GROUP_CHAT_MIN_HEIGHT: f32 = 140.0;
-const GROUP_CHAT_SEPARATOR_HEIGHT: f32 = 10.0;
 const GROUP_MEMBER_CHAT_SIZE: Vec2 = Vec2::new(320.0, 420.0);
 const GROUP_BROADCAST_INPUT_HEIGHT: f32 = 96.0;
 const GROUP_BROADCAST_INPUT_ROWS: usize = 3;
@@ -4395,7 +4394,247 @@ fn legacy_send_pane_windows(
     }
 }
 
-fn group_drop_area_ui(ui: &mut Ui, group_name: &str, members: &[String]) {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CombinedGroupMessagePart {
+    Text(String),
+    ForwardedReplay {
+        sender_id: u64,
+        sender_name: String,
+        text: String,
+        source_time: u64,
+    },
+    Image {
+        sub_type: usize,
+        file: String,
+        url: String,
+        file_id: String,
+        file_size: String,
+        local_path: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CombinedGroupMessageFingerprint {
+    time: u64,
+    self_id: u64,
+    user_id: u64,
+    sender_id: u64,
+    parts: Vec<CombinedGroupMessagePart>,
+}
+
+impl CombinedGroupMessageFingerprint {
+    fn from_message(message: &NapcatMessage) -> Self {
+        let parts = message
+            .data
+            .message
+            .iter()
+            .filter_map(|chain| match &chain.variant {
+                NapcatMessageChainType::Text { data } => Some(CombinedGroupMessagePart::Text(
+                    data.text.trim().to_owned(),
+                )),
+                NapcatMessageChainType::ForwardedReplay { data } => Some(
+                    CombinedGroupMessagePart::ForwardedReplay {
+                        sender_id: data.sender_id,
+                        sender_name: data.sender_name.clone(),
+                        text: data.text.trim().to_owned(),
+                        source_time: data.source_time,
+                    },
+                ),
+                NapcatMessageChainType::Image { data } => Some(CombinedGroupMessagePart::Image {
+                    sub_type: data.sub_type,
+                    file: data.file.clone(),
+                    url: data.url.clone(),
+                    file_id: data.file_id.clone(),
+                    file_size: data.file_size.clone(),
+                    local_path: data.local_path.clone(),
+                }),
+                NapcatMessageChainType::Source(_) | NapcatMessageChainType::Unsupported => None,
+            })
+            .collect();
+
+        Self {
+            time: message.data.time,
+            self_id: message.data.self_id,
+            user_id: message.data.user_id,
+            sender_id: message.data.sender.user_id,
+            parts,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CombinedGroupMessage<'a> {
+    message: &'a NapcatMessage,
+    target_ids: Vec<&'a str>,
+    is_new: bool,
+}
+
+#[derive(Default)]
+struct CombinedGroupFallbackState {
+    occurrence_counts: HashMap<usize, usize>,
+    output_indices: Vec<usize>,
+}
+
+fn combined_group_messages<'a>(
+    manager: &'a NapcatMessageManager,
+    members: &'a [String],
+) -> Vec<CombinedGroupMessage<'a>> {
+    let mut candidates = members
+        .iter()
+        .enumerate()
+        .flat_map(|(member_index, target_id)| {
+            manager
+                .messages
+                .get(target_id)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(move |(message_index, message)| {
+                    (
+                        member_index,
+                        message_index,
+                        target_id.as_str(),
+                        message,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.3
+            .data
+            .time
+            .cmp(&right.3.data.time)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+
+    let mut combined = Vec::<CombinedGroupMessage<'a>>::new();
+    let mut message_id_outputs = HashMap::<(u64, i64), usize>::new();
+    let mut fallback_states =
+        HashMap::<CombinedGroupMessageFingerprint, CombinedGroupFallbackState>::new();
+
+    for (member_index, message_index, target_id, message) in candidates {
+        let is_new = message.data.user_id != message.data.self_id
+            && message_index
+                >= manager
+                    .read_message_counts
+                    .get(target_id)
+                    .copied()
+                    .unwrap_or_default();
+        let message_identity = message
+            .data
+            .message_id
+            .filter(|message_id| *message_id > 0)
+            .map(|message_id| (message.data.self_id, message_id));
+        let fingerprint = CombinedGroupMessageFingerprint::from_message(message);
+        let fallback_state = fallback_states.entry(fingerprint).or_default();
+        let occurrence_index = fallback_state
+            .occurrence_counts
+            .entry(member_index)
+            .or_default();
+        let existing_message_id_output =
+            message_identity.and_then(|identity| message_id_outputs.get(&identity).copied());
+        let output_index = if let Some(output_index) = existing_message_id_output {
+            if fallback_state.output_indices.len() == *occurrence_index {
+                fallback_state.output_indices.push(output_index);
+            }
+            output_index
+        } else if let Some(output_index) = fallback_state
+            .output_indices
+            .get(*occurrence_index)
+            .copied()
+        {
+            output_index
+        } else {
+            let output_index = combined.len();
+            combined.push(CombinedGroupMessage {
+                message,
+                target_ids: Vec::new(),
+                is_new: false,
+            });
+            fallback_state.output_indices.push(output_index);
+            output_index
+        };
+        *occurrence_index += 1;
+
+        let output = &mut combined[output_index];
+        if !output.target_ids.contains(&target_id) {
+            output.target_ids.push(target_id);
+        }
+        output.is_new |= is_new;
+
+        if let Some(identity) = message_identity {
+            message_id_outputs.insert(identity, output_index);
+        }
+    }
+
+    combined
+}
+
+fn combined_group_message_row_ui(
+    ui: &mut Ui,
+    combined: &CombinedGroupMessage<'_>,
+    manager: &NapcatMessageManager,
+    row_width: f32,
+    image_textures: &mut HashMap<String, TextureHandle>,
+) {
+    let message = combined.message;
+    let is_self = message.data.self_id == message.data.user_id;
+    let max_message_width = if row_width < 120.0 {
+        row_width
+    } else {
+        (row_width * 0.72).clamp(120.0, row_width)
+    };
+    let alignment = if is_self { egui::Align::RIGHT } else { egui::Align::LEFT };
+    let show_source = is_self
+        || combined.target_ids.len() > 1
+        || combined
+            .target_ids
+            .iter()
+            .any(|target_id| manager.chat_target_kind(target_id) == ChatTargetExportKind::Group);
+    let source_label = show_source.then(|| {
+        let mut target_names = combined
+            .target_ids
+            .iter()
+            .map(|target_id| target_display_name(manager, target_id))
+            .collect::<Vec<_>>();
+        target_names.dedup();
+        format!(
+            "{}：{}",
+            if is_self { "发送至" } else { "来自" },
+            target_names.join("、")
+        )
+    });
+
+    message_bubble_layout(
+        ui,
+        row_width,
+        max_message_width,
+        alignment,
+        |ui| {
+            if let Some(source_label) = source_label {
+                ui.small(source_label);
+            }
+            message_text_ui(
+                ui,
+                message,
+                combined.is_new,
+                image_textures,
+            );
+        },
+    );
+}
+
+fn group_chat_timeline_ui(
+    ui: &mut Ui,
+    group_name: &str,
+    members: &[String],
+    combined_messages: &[CombinedGroupMessage<'_>],
+    manager: &NapcatMessageManager,
+    chat_scroll_states: &mut HashMap<String, ChatScrollState>,
+    image_textures: &mut HashMap<String, TextureHandle>,
+    remove_from_group: &mut Option<String>,
+) {
     let body_height =
         (ui.available_height() - GROUP_BROADCAST_INPUT_HEIGHT - ui.spacing().item_spacing.y)
             .max(GROUP_CHAT_MIN_HEIGHT);
@@ -4403,6 +4642,89 @@ fn group_drop_area_ui(ui: &mut Ui, group_name: &str, members: &[String]) {
         egui::vec2(ui.available_width(), body_height),
         Sense::hover(),
     );
+    let mut body_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt((group_name, "combined_timeline"))
+            .max_rect(rect.shrink(8.0))
+            .layout(egui::Layout::top_down(
+                egui::Align::LEFT,
+            )),
+    );
+    if members.is_empty() {
+        body_ui.centered_and_justified(|ui| {
+            ui.label(format!(
+                "拖入聊天到讨论组 {group_name}，消息会自动合并显示"
+            ));
+        });
+    } else {
+        body_ui.horizontal_wrapped(|ui| {
+            ui.small("成员");
+            for target_id in members {
+                if ui
+                    .small_button(format!(
+                        "{}  ×",
+                        target_display_name(manager, target_id)
+                    ))
+                    .on_hover_text("移出讨论组并重新打开独立聊天")
+                    .clicked()
+                    && remove_from_group.is_none()
+                {
+                    *remove_from_group = Some(target_id.clone());
+                }
+            }
+        });
+        body_ui.separator();
+
+        if combined_messages.is_empty() {
+            body_ui.centered_and_justified(|ui| {
+                ui.label("成员还没有消息；收到或发送后会自动显示在这里。");
+            });
+        } else {
+            let message_height = body_ui.available_height().max(0.0);
+            let scroll_key = format!("group:{group_name}:combined");
+            let scroll_state =
+                chat_scroll_states
+                    .entry(scroll_key)
+                    .or_insert_with(|| ChatScrollState {
+                        message_count: combined_messages.len(),
+                        near_bottom: true,
+                    });
+            let should_stick_to_bottom =
+                combined_messages.len() > scroll_state.message_count && scroll_state.near_bottom;
+            let mut scroll_area = egui::ScrollArea::vertical()
+                .id_salt((group_name, "combined_messages"))
+                .max_height(message_height)
+                .min_scrolled_height(message_height)
+                .auto_shrink([false, false]);
+            if should_stick_to_bottom {
+                scroll_area = scroll_area.stick_to_bottom(true);
+            }
+
+            let output = scroll_area.show(&mut body_ui, |ui| {
+                ui.with_layout(
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        for combined in combined_messages {
+                            let row_width = ui.available_width();
+                            combined_group_message_row_ui(
+                                ui,
+                                combined,
+                                manager,
+                                row_width,
+                                image_textures,
+                            );
+                            ui.add_space(ui.spacing().item_spacing.y);
+                        }
+                    },
+                );
+            });
+            let max_scroll_y = (output.content_size.y - output.inner_rect.height()).max(0.0);
+            let distance_to_bottom = (max_scroll_y - output.state.offset.y).max(0.0);
+            scroll_state.message_count = combined_messages.len();
+            scroll_state.near_bottom =
+                should_stick_to_bottom || distance_to_bottom <= CHAT_AUTO_SCROLL_THRESHOLD;
+        }
+    }
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
@@ -4415,15 +4737,6 @@ fn group_drop_area_ui(ui: &mut Ui, group_name: &str, members: &[String]) {
             ),
             egui::epaint::StrokeKind::Inside,
         );
-        if members.is_empty() {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                format!("拖入聊天到讨论组 {group_name}"),
-                egui::TextStyle::Body.resolve(ui.style()),
-                ui.visuals().weak_text_color(),
-            );
-        }
     }
 }
 
@@ -4766,14 +5079,31 @@ fn chat_group_unread_count(manager: &NapcatMessageManager, group: &ChatGroup) ->
         .map(|member_id| target_unread_count(manager, member_id))
         .sum()
 }
+fn mark_chat_group_read(manager: &mut NapcatMessageManager, group: &ChatGroup) -> bool {
+    let mut changed = false;
+    for target_id in &group.members {
+        let message_count = manager
+            .messages
+            .get(target_id)
+            .map(Vec::len)
+            .unwrap_or_default();
+        let read_count = manager
+            .read_message_counts
+            .entry(target_id.clone())
+            .or_default();
+        if *read_count < message_count {
+            *read_count = message_count;
+            changed = true;
+        }
+    }
+    changed
+}
 
 fn group_chat_inner_size(member_count: usize, max_rect: Rect) -> Vec2 {
     let desired_height = if member_count == 0 {
         GROUP_CHAT_MIN_HEIGHT + GROUP_BROADCAST_INPUT_HEIGHT
     } else {
-        member_count as f32 * GROUP_MEMBER_CHAT_SIZE.y
-            + member_count.saturating_sub(1) as f32 * GROUP_CHAT_SEPARATOR_HEIGHT
-            + GROUP_BROADCAST_INPUT_HEIGHT
+        CHAT_WINDOW_SIZE.y + GROUP_BROADCAST_INPUT_HEIGHT
     };
 
     egui::vec2(
@@ -18902,9 +19232,11 @@ pub fn ui_system(
             let mut closed_group_names = Vec::new();
             for (k, v) in &manager.groups.clone() {
                 let group_title = chat_group_title(&k, v, &manager);
+                let combined_messages = combined_group_messages(&manager, &v.members);
                 let unread_count = chat_group_unread_count(&manager, v);
                 let group_size = group_chat_inner_size(v.members.len(), ui.max_rect());
                 let group_max_size = group_chat_max_size(ui.max_rect());
+                let mut remove_from_group = None;
                 let mut group_open = true;
                 let response = egui::Window::new(group_title)
                     .open(&mut group_open)
@@ -18916,7 +19248,16 @@ pub fn ui_system(
                     .max_size(group_max_size)
                     .resizable(true)
                     .show(ctx, |ui| {
-                        group_drop_area_ui(ui, &k, &v.members);
+                        group_chat_timeline_ui(
+                            ui,
+                            &k,
+                            &v.members,
+                            &combined_messages,
+                            &manager,
+                            chat_scroll_states,
+                            image_textures,
+                            &mut remove_from_group,
+                        );
                         group_broadcast_input_ui(
                             ui,
                             ctx,
@@ -18929,11 +19270,13 @@ pub fn ui_system(
                             &mut ime,
                         );
                     });
+                drop(combined_messages);
 
                 if !group_open {
                     closed_group_names.push(k.clone());
                     continue;
                 }
+                let mut group_changed = false;
 
                 if let Some(response) = response {
                     paint_unread_badge(
@@ -18943,6 +19286,30 @@ pub fn ui_system(
                     );
                     if response.inner.is_some() {
                         group_rects.insert(k.clone(), response.response.rect);
+                    }
+                    if window_received_focus(ctx, &response.response) {
+                        group_changed |= mark_chat_group_read(&mut manager, v);
+                    }
+                }
+                if let Some(target_id) = remove_from_group {
+                    let removed = manager
+                        .groups
+                        .get_mut(k)
+                        .map(|group| {
+                            let member_count = group.members.len();
+                            group.members.retain(|member_id| member_id != &target_id);
+                            member_count != group.members.len()
+                        })
+                        .unwrap_or_default();
+                    if removed {
+                        manager.open_chat_targets.insert(target_id.clone());
+                        group_member_window_offsets.remove(&(k.clone(), target_id));
+                        group_changed = true;
+                    }
+                }
+                if group_changed {
+                    if let Err(err) = manager.persist() {
+                        eprintln!("failed to persist combined chat group state: {err}");
                     }
                 }
             }
@@ -19022,6 +19389,9 @@ pub fn ui_system(
                     if let Err(err) = deepseek_manager.persist() {
                         eprintln!("failed to persist DeepSeek summary request: {err}");
                     }
+                }
+                if current_group.is_some() {
+                    continue;
                 }
 
                 let active_trpg_group = manager.current_trpg_group.clone();
@@ -20018,6 +20388,103 @@ mod tests {
                 access_scope_resolved: false,
             },
         }
+    }
+    #[test]
+    fn combined_group_timeline_sorts_messages_and_collapses_broadcast_copies() {
+        let mut manager = empty_manager();
+        let mut player_two = test_private_message(2);
+        player_two.data.time = 20;
+        let mut player_three = test_private_message(3);
+        player_three.data.time = 10;
+        let mut broadcast_to_two = test_private_message(1);
+        broadcast_to_two.data.time = 30;
+        broadcast_to_two.data.target_id = Some(2);
+        let mut broadcast_to_three = broadcast_to_two.clone();
+        broadcast_to_three.data.target_id = Some(3);
+        manager.messages.insert("2".to_owned(), vec![
+            broadcast_to_two,
+            player_two,
+        ]);
+        manager.messages.insert("3".to_owned(), vec![
+            broadcast_to_three,
+            player_three,
+        ]);
+        let members = vec!["2".to_owned(), "3".to_owned()];
+
+        let combined = combined_group_messages(&manager, &members);
+
+        assert_eq!(
+            combined
+                .iter()
+                .map(|message| message.message.data.time)
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+        assert_eq!(combined[0].message.data.user_id, 3);
+        assert_eq!(combined[1].message.data.user_id, 2);
+        assert_eq!(combined[2].target_ids, vec!["2", "3"]);
+    }
+
+    #[test]
+    fn combined_group_timeline_preserves_repeated_messages_from_one_chat() {
+        let mut manager = empty_manager();
+        let mut repeated = test_private_message(2);
+        repeated.data.time = 40;
+        manager.messages.insert("2".to_owned(), vec![
+            repeated.clone(),
+            repeated.clone(),
+        ]);
+        manager.messages.insert("3".to_owned(), vec![repeated]);
+        let members = vec!["2".to_owned(), "3".to_owned()];
+
+        let combined = combined_group_messages(&manager, &members);
+
+        assert_eq!(combined.len(), 2);
+        assert_eq!(combined[0].target_ids, vec!["2", "3"]);
+        assert_eq!(combined[1].target_ids, vec!["2"]);
+    }
+
+    #[test]
+    fn combined_group_timeline_filters_duplicate_napcat_message_ids() {
+        let mut manager = empty_manager();
+        let mut duplicated = test_private_message(2);
+        duplicated.data.message_id = Some(77);
+        manager.messages.insert("2".to_owned(), vec![
+            duplicated.clone(),
+            duplicated,
+        ]);
+        let members = vec!["2".to_owned()];
+
+        let combined = combined_group_messages(&manager, &members);
+
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].target_ids, vec!["2"]);
+    }
+
+    #[test]
+    fn focusing_combined_group_marks_every_member_history_read() {
+        let mut manager = empty_manager();
+        manager.messages.insert("2".to_owned(), vec![
+            test_private_message(2),
+            test_private_message(2),
+        ]);
+        manager.messages.insert("3".to_owned(), vec![
+            test_private_message(3),
+        ]);
+        let group = ChatGroup {
+            members: vec!["2".to_owned(), "3".to_owned()],
+        };
+
+        assert!(mark_chat_group_read(
+            &mut manager,
+            &group
+        ));
+        assert_eq!(manager.read_message_counts["2"], 2);
+        assert_eq!(manager.read_message_counts["3"], 1);
+        assert!(!mark_chat_group_read(
+            &mut manager,
+            &group
+        ));
     }
 
     #[test]
