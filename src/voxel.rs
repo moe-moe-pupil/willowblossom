@@ -212,6 +212,7 @@ const DEFAULT_FILL_LIGHT_ILLUMINANCE: f32 = 1_600.0;
 const DEFAULT_RADIANCE_INTENSITY: f32 = 0.55;
 const FIRST_PERSON_RADIUS: f32 = VOXEL_SIZE * 0.5;
 const FIRST_PERSON_BODY_LENGTH: f32 = VOXEL_SIZE;
+const FIRST_PERSON_DOMINANCE: i8 = -127;
 const FIRST_PERSON_EYE_OFFSET: f32 = VOXEL_SIZE;
 const FIRST_PERSON_SPEED: f32 = 2.8;
 const FIRST_PERSON_JUMP_SPEED: f32 = 3.4;
@@ -7894,6 +7895,35 @@ fn sync_voxel_auto_door_lock_materials(
     }
 }
 
+fn first_person_player_bundle() -> impl Bundle {
+    let player_collider = Collider::capsule(
+        FIRST_PERSON_RADIUS,
+        FIRST_PERSON_BODY_LENGTH,
+    );
+    let mut ground_shape = player_collider.clone();
+    ground_shape.set_scale(Vec3::splat(0.99), 10);
+    (
+        VoxelFirstPersonPlayer,
+        RigidBody::Dynamic,
+        // Input continuously controls this body's velocity. Lowest dominance lets
+        // normal physics bodies carry/push the controller without receiving its impulses.
+        Dominance(FIRST_PERSON_DOMINANCE),
+        player_collider,
+        ShapeCaster::new(
+            ground_shape,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Dir3::NEG_Y,
+        )
+        .with_max_distance(0.015),
+        LockedAxes::ROTATION_LOCKED,
+        Friction::ZERO.with_combine_rule(CoefficientCombine::Min),
+        Restitution::ZERO.with_combine_rule(CoefficientCombine::Min),
+        ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
+        Transform::from_translation(FIRST_PERSON_START),
+    )
+}
+
 fn setup_voxel_view(
     mut commands: Commands,
     mut gizmo_config: ResMut<GizmoConfigStore>,
@@ -7980,29 +8010,7 @@ fn setup_voxel_view(
         &mut standard_materials,
         &mut planet_materials,
     );
-    let player_collider = Collider::capsule(
-        FIRST_PERSON_RADIUS,
-        FIRST_PERSON_BODY_LENGTH,
-    );
-    let mut ground_shape = player_collider.clone();
-    ground_shape.set_scale(Vec3::splat(0.99), 10);
-    commands.spawn((
-        VoxelFirstPersonPlayer,
-        RigidBody::Dynamic,
-        player_collider,
-        ShapeCaster::new(
-            ground_shape,
-            Vec3::ZERO,
-            Quat::IDENTITY,
-            Dir3::NEG_Y,
-        )
-        .with_max_distance(0.015),
-        LockedAxes::ROTATION_LOCKED,
-        Friction::ZERO.with_combine_rule(CoefficientCombine::Min),
-        Restitution::ZERO.with_combine_rule(CoefficientCombine::Min),
-        ConstantLinearAcceleration::new(0.0, -9.81, 0.0),
-        Transform::from_translation(FIRST_PERSON_START),
-    ));
+    commands.spawn(first_person_player_bundle());
 }
 
 fn setup_voxel_player_cameras(
@@ -19608,6 +19616,22 @@ mod tests {
         assert!((total_height - VOXEL_SIZE * 2.0).abs() < f32::EPSILON);
         assert!((FIRST_PERSON_RADIUS * 2.0 - VOXEL_SIZE).abs() < f32::EPSILON);
         assert!((FIRST_PERSON_EYE_OFFSET - VOXEL_SIZE).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn first_person_character_yields_to_dynamic_physics_bodies() {
+        let mut world = World::new();
+        let player = world.spawn(first_person_player_bundle()).id();
+        let player_dominance = *world
+            .entity(player)
+            .get::<Dominance>()
+            .expect("the first-person controller must have explicit physics dominance");
+
+        assert_eq!(
+            player_dominance,
+            Dominance(FIRST_PERSON_DOMINANCE)
+        );
+        assert!(player_dominance < Dominance::default());
     }
 
     #[test]
