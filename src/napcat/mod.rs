@@ -444,6 +444,11 @@ pub struct CampaignMessage {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayMessageSnapshot {
+    /// Stable identity assigned when the source message is first snapshotted.
+    /// Older persisted snapshots deserialize as zero and receive a project-local
+    /// identity when a replay is generated.
+    #[serde(default)]
+    pub line_id: u64,
     pub turn_index: u32,
     pub position_cells: [i32; 3],
 }
@@ -11232,6 +11237,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("messages.toml");
         let snapshot = ReplayMessageSnapshot {
+            line_id: 42,
             turn_index: 7,
             position_cells: [11, 12, 13],
         };
@@ -11393,6 +11399,7 @@ position_cells = [4, 5, 6]
         assert_eq!(
             restored.replay_snapshots["2383680235"],
             vec![Some(ReplayMessageSnapshot {
+                line_id: 0,
                 turn_index: 3,
                 position_cells: [4, 5, 6],
             })]
@@ -11502,10 +11509,12 @@ position_cells = [4, 5, 6]
         ]);
         manager.replay_snapshots.insert("99".to_owned(), vec![
             Some(ReplayMessageSnapshot {
+                line_id: 1,
                 turn_index: 1,
                 position_cells: [1, 2, 3],
             }),
             Some(ReplayMessageSnapshot {
+                line_id: 2,
                 turn_index: 2,
                 position_cells: [4, 5, 6],
             }),
@@ -15043,8 +15052,8 @@ position_cells = [4, 5, 6]
             PlayerCharacter::default(),
         );
         manager.trpg_groups.insert("g".to_owned(), TrpgGroup {
-                players: vec!["holder".to_owned(), "plain".to_owned()],
-                ..Default::default()
+            players: vec!["holder".to_owned(), "plain".to_owned()],
+            ..Default::default()
         });
 
         assert!(open_trpg_group_world(&mut manager, "g").is_some());

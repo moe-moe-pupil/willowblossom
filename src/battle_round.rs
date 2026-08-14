@@ -309,10 +309,10 @@ impl BattleRoundStore {
         for encounter in self.encounters.values_mut() {
             let previous_participant_len = encounter.participants.len();
             encounter.participants.retain(|participant| {
-                    participant.target_id != target_id
-                        && !(participant.is_summon
-                            && participant.summon_owner_id.as_deref() == Some(target_id))
-                });
+                participant.target_id != target_id
+                    && !(participant.is_summon
+                        && participant.summon_owner_id.as_deref() == Some(target_id))
+            });
             removed += previous_participant_len - encounter.participants.len();
 
             for participant in &mut encounter.participants {
@@ -2616,12 +2616,12 @@ fn apply_sunset_world_time_reset(
             .trpg_campaign_id
             .as_deref()
             .and_then(|campaign_id| {
-            manager
-                .trpg_groups
-                .iter()
-                .find(|(_, group)| group.campaign_id.trim() == campaign_id)
-                .map(|(name, _)| name.clone())
-        })
+                manager
+                    .trpg_groups
+                    .iter()
+                    .find(|(_, group)| group.campaign_id.trim() == campaign_id)
+                    .map(|(name, _)| name.clone())
+            })
     });
     let Some(group_name) = group_name else {
         return;
@@ -3918,7 +3918,7 @@ fn encounter_roster_ui(
                     "速度 {}",
                     format_number(effective_speed)
                 ))
-                    .on_hover_text("存活玩家≤3，狂风恶浪移速加成提升至35%");
+                .on_hover_text("存活玩家≤3，狂风恶浪移速加成提升至35%");
             } else {
                 ui.label("速度");
             }
@@ -7927,16 +7927,16 @@ fn apply_battle_buff_ticks(
                         * participant_wound_healing_multiplier(
                             &encounter.participants[target_index],
                         )
-                    * source_character
-                        .as_ref()
-                        .map(|source| {
-                            dying_target_healing_multiplier(
-                                encounter.participants[target_index].hp,
-                                encounter.participants[target_index].max_hp,
-                                character_dying_target_healing_modifier(source),
-                            )
-                        })
-                        .unwrap_or(1.0);
+                        * source_character
+                            .as_ref()
+                            .map(|source| {
+                                dying_target_healing_multiplier(
+                                    encounter.participants[target_index].hp,
+                                    encounter.participants[target_index].max_hp,
+                                    character_dying_target_healing_modifier(source),
+                                )
+                            })
+                            .unwrap_or(1.0);
                 let final_amount =
                     (amount.max(0.0) * source_multiplier * target_multiplier).max(0.0);
                 let source_overhealing_shield_cap_rate = source_character
@@ -11160,9 +11160,9 @@ mod tests {
         let target = participant("target", 0);
         let mut store = BattleRoundStore {
             encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
-                    active: true,
-                    participants: vec![drone, target],
-                    ..Default::default()
+                active: true,
+                participants: vec![drone, target],
+                ..Default::default()
             })]),
             ..Default::default()
         };
@@ -11226,13 +11226,13 @@ mod tests {
         };
         let mut store = BattleRoundStore {
             encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
-                    active: true,
-                    participants: vec![
-                        participant("commissar", 0),
-                        participant("ally", 0),
-                        participant("enemy", 0),
-                    ],
-                    ..Default::default()
+                active: true,
+                participants: vec![
+                    participant("commissar", 0),
+                    participant("ally", 0),
+                    participant("enemy", 0),
+                ],
+                ..Default::default()
             })]),
             ..Default::default()
         };
@@ -11285,8 +11285,8 @@ mod tests {
         target.hp_regen = 2.0;
         let mut store = BattleRoundStore {
             encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
-                    participants: vec![participant("actor", 0), target],
-                    ..Default::default()
+                participants: vec![participant("actor", 0), target],
+                ..Default::default()
             })]),
             ..Default::default()
         };
@@ -11340,9 +11340,9 @@ mod tests {
         enemy.max_hp = 20.0;
         let mut store = BattleRoundStore {
             encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
-                    active: true,
-                    participants: vec![actor, enemy],
-                    ..Default::default()
+                active: true,
+                participants: vec![actor, enemy],
+                ..Default::default()
             })]),
             ..Default::default()
         };
@@ -11425,9 +11425,9 @@ mod tests {
         };
         let mut store = BattleRoundStore {
             encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
-                    active: true,
-                    participants: vec![participant("540716134", 0)],
-                    ..Default::default()
+                active: true,
+                participants: vec![participant("540716134", 0)],
+                ..Default::default()
             })]),
             ..Default::default()
         };
@@ -11474,7 +11474,7 @@ mod tests {
             true,
         );
         assert!(!modifiers
-                .iter()
+            .iter()
             .any(|modifier| modifier.source == "低生命/疲惫行者"));
         // 相同生命下普通角色会吃到0.1倍低血惩罚，召唤物不受影响。
         let low_hp_multiplier = low_hp_damage_multiplier_with_fatigue(2.0, 20.0, false);
@@ -11545,8 +11545,8 @@ mod tests {
             next_unit_instance_index: 1,
             pending_talent_choices: HashMap::default(),
             used_talent_names: HashSet::default(),
-            }
         }
+    }
 
     #[test]
     fn persistent_unit_instances_join_battle_independently_and_sync_back() {

@@ -204,10 +204,7 @@ impl HiddenRoleState {
         true
     }
 
-    pub fn remove_protective_suit(
-        &mut self,
-        protective_suit: &mut ProtectiveSuitState,
-    ) -> bool {
+    pub fn remove_protective_suit(&mut self, protective_suit: &mut ProtectiveSuitState) -> bool {
         if !protective_suit.remove() {
             return false;
         }
@@ -243,11 +240,7 @@ impl HiddenRoleState {
         true
     }
 
-    pub fn consume_corpse(
-        &mut self,
-        biomass: u32,
-        protective_suit: &ProtectiveSuitState,
-    ) -> bool {
+    pub fn consume_corpse(&mut self, biomass: u32, protective_suit: &ProtectiveSuitState) -> bool {
         if self.role != HiddenRoleKind::Mutant || biomass == 0 || protective_suit.worn {
             return false;
         }
@@ -790,11 +783,10 @@ pub fn hidden_role_opening_shield(
     state: Option<&HiddenRoleState>,
     protective_suit: &ProtectiveSuitState,
 ) -> f32 {
-    let legacy_suit_intact = state.is_some_and(|state| {
-        state.protective_suit_worn && !state.protective_suit_destroyed
-    });
-    let suit_intact = protective_suit.is_intact()
-        || (!protective_suit.destroyed && legacy_suit_intact);
+    let legacy_suit_intact =
+        state.is_some_and(|state| state.protective_suit_worn && !state.protective_suit_destroyed);
+    let suit_intact =
+        protective_suit.is_intact() || (!protective_suit.destroyed && legacy_suit_intact);
     let suit_shield = if suit_intact {
         match state.map(|state| state.role) {
             None | Some(HiddenRoleKind::Alien) => PROTECTIVE_SUIT_OPENING_SHIELD,

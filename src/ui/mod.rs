@@ -23,7 +23,11 @@ use std::{
 use bevy::{
     ecs::system::SystemParam,
     prelude::*,
-    window::{MonitorSelection, PrimaryWindow, WindowMode},
+    window::{
+        MonitorSelection,
+        PrimaryWindow,
+        WindowMode,
+    },
 };
 use bevy_egui::{
     egui::{
@@ -82,49 +86,49 @@ use crate::{
         AppFeatureSettings,
     },
     backup::{
-    list_backups,
-    restore_backup,
-    BackupSettings,
-    BackupState,
-    BACKUP_ROOT,
-    DATA_DIR,
+        list_backups,
+        restore_backup,
+        BackupSettings,
+        BackupState,
+        BACKUP_ROOT,
+        DATA_DIR,
     },
     voxel::{
-    clear_campaign_possession_movement,
-    clear_player_camera,
-    clear_player_possession_movement,
-    has_voxel_summon_standee,
-    has_voxel_unit_standee,
-    place_voxel_summon_standee,
-    place_voxel_unit_standee,
-    remove_voxel_summon_standee,
-    remove_voxel_summon_standees_for_owner,
-    remove_voxel_unit_standee,
+        clear_campaign_possession_movement,
+        clear_player_camera,
+        clear_player_possession_movement,
+        has_voxel_summon_standee,
+        has_voxel_unit_standee,
+        place_voxel_summon_standee,
+        place_voxel_unit_standee,
+        remove_voxel_summon_standee,
+        remove_voxel_summon_standees_for_owner,
+        remove_voxel_unit_standee,
         remove_voxel_unit_standees_for_template,
-    validate_voxel_standee_image_source,
-    voxel_spaceship_contains_position,
-    voxel_spaceship_teleport_destination,
-    voxel_spaceship_teleport_name,
-    voxel_teleport_static_area_label,
-    VoxelCreativeItem,
-    VoxelEditMode,
-    VoxelEditorState,
-    VoxelGmMapState,
-    VoxelLightTool,
-    VoxelMinimapSnapshot,
-    VoxelPhysicsBody,
-    VoxelPlayerCameraStore,
-    VoxelPlayerStandee,
-    VoxelPossessedStandee,
-    VoxelPossessionMovementStore,
-    VoxelPossessionState,
-    VoxelSpaceship,
-    VoxelSummonStandeeStore,
-    VoxelTargetingPreview,
-    VoxelTeleportDestination,
-    VoxelUnitStandeeStore,
-    MAX_VOXEL_BRUSH_RADIUS,
-    VOXEL_GLASS_MATERIAL,
+        validate_voxel_standee_image_source,
+        voxel_spaceship_contains_position,
+        voxel_spaceship_teleport_destination,
+        voxel_spaceship_teleport_name,
+        voxel_teleport_static_area_label,
+        VoxelCreativeItem,
+        VoxelEditMode,
+        VoxelEditorState,
+        VoxelGmMapState,
+        VoxelLightTool,
+        VoxelMinimapSnapshot,
+        VoxelPhysicsBody,
+        VoxelPlayerCameraStore,
+        VoxelPlayerStandee,
+        VoxelPossessedStandee,
+        VoxelPossessionMovementStore,
+        VoxelPossessionState,
+        VoxelSpaceship,
+        VoxelSummonStandeeStore,
+        VoxelTargetingPreview,
+        VoxelTeleportDestination,
+        VoxelUnitStandeeStore,
+        MAX_VOXEL_BRUSH_RADIUS,
+        VOXEL_GLASS_MATERIAL,
     },
 };
 
@@ -1100,7 +1104,10 @@ fn toggle_main_view_fullscreen(state: &mut MainViewFullscreenState, window: Opti
             state.previous_window_mode = Some(window.mode);
             window.mode = WindowMode::BorderlessFullscreen(MonitorSelection::Current);
         } else {
-            window.mode = state.previous_window_mode.take().unwrap_or(WindowMode::Windowed);
+            window.mode = state
+                .previous_window_mode
+                .take()
+                .unwrap_or(WindowMode::Windowed);
         }
     } else if !state.active {
         state.previous_window_mode = None;
@@ -3392,12 +3399,10 @@ fn focus_gm_auto_chat_target_window(
         return changed;
     }
 
-    let docked = manager.groups.values().any(|group| {
-        group
-            .members
-            .iter()
-            .any(|member_id| member_id == target_id)
-    });
+    let docked = manager
+        .groups
+        .values()
+        .any(|group| group.members.iter().any(|member_id| member_id == target_id));
     if docked {
         // Auto mode renders the active docked target as a temporary standalone
         // window without changing its persisted discussion-group membership.
@@ -4816,6 +4821,7 @@ fn group_chat_timeline_ui(
         egui::vec2(ui.available_width(), body_height),
         Sense::hover(),
     );
+
     let mut body_ui = ui.new_child(
         egui::UiBuilder::new()
             .id_salt((group_name, "combined_timeline"))
@@ -4971,11 +4977,7 @@ fn message_text_ui(
                 if let Some(color) = text_color {
                     text = text.color(color);
                 }
-                ui.add(
-                    egui::Label::new(text)
-                        .wrap()
-                        .selectable(false),
-                );
+                ui.add(egui::Label::new(text).wrap().selectable(false));
             },
             NapcatMessageChainType::Image { data } => {
                 message_image_ui(ui, data, image_textures);
@@ -5253,6 +5255,7 @@ fn chat_group_unread_count(manager: &NapcatMessageManager, group: &ChatGroup) ->
         .map(|member_id| target_unread_count(manager, member_id))
         .sum()
 }
+
 fn mark_chat_group_read(manager: &mut NapcatMessageManager, group: &ChatGroup) -> bool {
     let mut changed = false;
     for target_id in &group.members {
@@ -6875,11 +6878,7 @@ fn quick_character_windows(
                     ui.small("玩家");
                     ui.monospace(&target_id);
                 });
-                changed |= hidden_role_editor_ui(
-                    ui,
-                    &target_id,
-                    manager,
-                );
+                changed |= hidden_role_editor_ui(ui, &target_id, manager);
                 ui.separator();
                 let skill_pool_snapshot = manager.skill_pool.clone();
                 let item_pool_snapshot = manager.item_pool.clone();
@@ -8146,22 +8145,16 @@ fn portrait_transform_editor_ui(
     changed
 }
 
-fn hidden_role_editor_ui(
-    ui: &mut Ui,
-    target_id: &str,
-    manager: &mut NapcatMessageManager,
-) -> bool {
+fn hidden_role_editor_ui(ui: &mut Ui, target_id: &str, manager: &mut NapcatMessageManager) -> bool {
     let mut changed = {
         let (player_characters, hidden_roles) = (
             &mut manager.player_characters,
             &mut manager.hidden_roles,
         );
         let character = player_characters.entry(target_id.to_owned()).or_default();
-        hidden_roles
-            .get_mut(target_id)
-            .is_some_and(|hidden_role| {
-                crate::hidden_roles::migrate_legacy_protective_suit(character, hidden_role)
-            })
+        hidden_roles.get_mut(target_id).is_some_and(|hidden_role| {
+            crate::hidden_roles::migrate_legacy_protective_suit(character, hidden_role)
+        })
     };
     let previous_role = manager.hidden_roles.get(target_id).map(|state| state.role);
     let mut selected_role = previous_role;
@@ -8212,7 +8205,7 @@ fn hidden_role_editor_ui(
         state.normalize();
     }
     let mut remove_suit = false;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         changed |= ui
             .checkbox(&mut protective_suit.worn, "穿戴防护服")
             .on_hover_text("普通玩家和异形获得6点开场护盾；变种人获得3点")
@@ -8243,7 +8236,7 @@ fn hidden_role_editor_ui(
         ui.label(format!(
             "进化点/生物质 {}",
             state.evolution_points
-                            ));
+        ));
         if let Some(threshold) = state.next_threshold() {
             ui.label(format!("下一阶段阈值 {threshold}"));
         } else {
@@ -8263,8 +8256,8 @@ fn hidden_role_editor_ui(
                 if ui.button("+1进化点").clicked() {
                     state.evolution_points = state.evolution_points.saturating_add(1);
                     state.last_event = "GM给予1进化点".to_owned();
-                        changed = true;
-                    }
+                    changed = true;
+                }
                 if state.can_begin_cocoon() && ui.button("开始结茧").clicked() {
                     changed |= state.begin_cocoon(protective_suit);
                 }
@@ -8314,9 +8307,9 @@ fn hidden_role_editor_ui(
                                     path.label(),
                                 )
                                 .changed();
-                }
+                        }
+                    });
             });
-    });
             ui.horizontal(|ui| {
                 ui.label("记录吞噬尸体：");
                 for (label, biomass) in [("小型+1", 1), ("人形+2", 2), ("大型+3", 3)] {
@@ -8653,7 +8646,11 @@ fn character_editor_ui(
     });
     if stats_changed {
         let stat_scales = character_buff_stat_scales(target_id, character);
-        record_manual_character_stat_edits(character, &stats_before_edit, &stat_scales);
+        record_manual_character_stat_edits(
+            character,
+            &stats_before_edit,
+            &stat_scales,
+        );
     }
     ui.horizontal_wrapped(|ui| {
         changed |= ui
@@ -10107,12 +10104,7 @@ fn character_buff_stat_scales(
     scales
 }
 
-fn adjusted_character_base_stat(
-    base: f32,
-    current: f32,
-    previous: f32,
-    scale: f32,
-) -> f32 {
+fn adjusted_character_base_stat(base: f32, current: f32, previous: f32, scale: f32) -> f32 {
     let effective_delta = current - previous;
     if scale.abs() > f32::EPSILON {
         base + effective_delta / scale
@@ -10285,7 +10277,11 @@ fn character_buff_editor_ui(
         ui.horizontal_wrapped(|ui| {
             ui.label("名称");
             ui.text_edit_singleline(&mut draft.name);
-            buff_kind_combo(ui, ("buff_draft_kind", target_id), &mut draft.kind);
+            buff_kind_combo(
+                ui,
+                ("buff_draft_kind", target_id),
+                &mut draft.kind,
+            );
             ui.add(
                 egui::DragValue::new(&mut draft.turns_remaining)
                     .range(0..=999)
@@ -10756,11 +10752,7 @@ fn character_inventory_editor_ui(
     (changed, equipment_changed)
 }
 
-fn buff_kind_combo(
-    ui: &mut Ui,
-    id_salt: impl egui::AsIdSalt,
-    kind: &mut BuffKind,
-) -> bool {
+fn buff_kind_combo(ui: &mut Ui, id_salt: impl egui::AsIdSalt, kind: &mut BuffKind) -> bool {
     let mut changed = false;
     egui::ComboBox::new(id_salt, "类型")
         .selected_text(buff_kind_label(*kind))
@@ -10904,11 +10896,8 @@ fn voxel_controlled_inventory_snapshot(
                 .get(owner_id)?
                 .summons
                 .get(*index)?;
-            let display_name = if summon.name.trim().is_empty() {
-                "召唤物"
-            } else {
-                summon.name.trim()
-            };
+            let display_name =
+                if summon.name.trim().is_empty() { "召唤物" } else { summon.name.trim() };
             Some(VoxelControlledInventorySnapshot {
                 title: format!("召唤物背包 · {display_name}"),
                 character: summon_control_character(summon),
@@ -11612,6 +11601,15 @@ fn clear_campaign_chat_messages(manager: &mut NapcatMessageManager, campaign_id:
             keep
         });
         removed += indexes.len();
+        if let Some(snapshots) = manager.replay_snapshots.get_mut(&target_id) {
+            let mut index = 0;
+            snapshots.retain(|_| {
+                let keep = !indexes.contains(&index);
+                index += 1;
+                keep
+            });
+            snapshots.truncate(messages.len());
+        }
         manager
             .read_message_counts
             .insert(target_id, messages.len());
@@ -13421,7 +13419,7 @@ fn unit_pool_settings_ui(
                     if ui.button("删除单位").clicked() {
                         unit_to_delete = Some(unit_id.clone());
                     }
-                        if ui
+                    if ui
                         .add_enabled(
                             !unit.character.image.trim().is_empty(),
                             egui::Button::new("创建NPC实例并放入世界"),
@@ -17801,9 +17799,6 @@ fn trpg_group_settings_window(
             );
             replay_movement_history.persist().ok();
             replay_ship_trajectory_history.persist().ok();
-            for target_id in &target_ids {
-                manager.replay_snapshots.remove(target_id);
-            }
             deepseek_manager.persist().ok();
             chat_input_msgs.retain(|target_id, _| !target_ids.contains(target_id));
             changed = true;
@@ -19848,12 +19843,12 @@ pub fn ui_system(
             let mut closed_group_names = Vec::new();
             for (k, v) in &manager.groups.clone() {
                 let group_title = chat_group_title(&k, v, &manager);
-                let combined_messages = combined_group_messages(&manager, &v.members);
                 let unread_count = chat_group_unread_count(&manager, v);
+                let combined_messages = combined_group_messages(&manager, &v.members);
                 let group_size = group_chat_inner_size(v.members.len(), ui.max_rect());
                 let group_max_size = group_chat_max_size(ui.max_rect());
-                let mut remove_from_group = None;
                 let mut group_open = true;
+                let mut remove_from_group = None;
                 let response = egui::Window::new(group_title)
                     .open(&mut group_open)
                     .constrain_to(ui.max_rect())
@@ -19892,8 +19887,8 @@ pub fn ui_system(
                     closed_group_names.push(k.clone());
                     continue;
                 }
-                let mut group_changed = false;
 
+                let mut group_changed = false;
                 if let Some(response) = response {
                     paint_unread_badge(
                         ctx,
@@ -20196,11 +20191,18 @@ mod tests {
             ..Default::default()
         };
 
-        let center = auto_hide_panel_visibility(&state, Some(Pos2::new(500.0, 350.0)), viewport);
+        let center = auto_hide_panel_visibility(
+            &state,
+            Some(Pos2::new(500.0, 350.0)),
+            viewport,
+        );
         assert!(!center.top && !center.right && center.bottom && !center.left);
 
-        let left_edge =
-            auto_hide_panel_visibility(&state, Some(Pos2::new(2.0, 350.0)), viewport);
+        let left_edge = auto_hide_panel_visibility(
+            &state,
+            Some(Pos2::new(2.0, 350.0)),
+            viewport,
+        );
         assert!(left_edge.left);
         assert!(!left_edge.top && !left_edge.right && left_edge.bottom);
 
@@ -20208,8 +20210,11 @@ mod tests {
             Pos2::ZERO,
             Pos2::new(220.0, 700.0),
         ));
-        let hovered_panel =
-            auto_hide_panel_visibility(&state, Some(Pos2::new(180.0, 350.0)), viewport);
+        let hovered_panel = auto_hide_panel_visibility(
+            &state,
+            Some(Pos2::new(180.0, 350.0)),
+            viewport,
+        );
         assert!(hovered_panel.left);
     }
 
@@ -21023,6 +21028,7 @@ mod tests {
             },
         }
     }
+
     #[test]
     fn combined_group_timeline_sorts_messages_and_collapses_broadcast_copies() {
         let mut manager = empty_manager();
@@ -21130,24 +21136,38 @@ mod tests {
             test_private_message(4),
         ];
 
-        assert_eq!(newest_unread_incoming_start(&messages, 0), 4);
-        assert_eq!(newest_unread_incoming_start(&messages, 1), 3);
-        assert_eq!(newest_unread_incoming_start(&messages, 2), 1);
-        assert_eq!(newest_unread_incoming_start(&messages, 99), 0);
+        assert_eq!(
+            newest_unread_incoming_start(&messages, 0),
+            4
+        );
+        assert_eq!(
+            newest_unread_incoming_start(&messages, 1),
+            3
+        );
+        assert_eq!(
+            newest_unread_incoming_start(&messages, 2),
+            1
+        );
+        assert_eq!(
+            newest_unread_incoming_start(&messages, 99),
+            0
+        );
     }
 
     #[test]
     fn hash_prefixed_messages_are_green_before_new_message_accent() {
         let ordinary = test_private_message(2);
         let mut hash_prefixed = test_private_message(2);
-        let NapcatMessageChainType::Text { data } =
-            &mut hash_prefixed.data.message[0].variant
+        let NapcatMessageChainType::Text { data } = &mut hash_prefixed.data.message[0].variant
         else {
             unreachable!();
         };
         data.text = "  #秘密行动".to_owned();
 
-        assert_eq!(chat_message_text_color(&ordinary, false, true), None);
+        assert_eq!(
+            chat_message_text_color(&ordinary, false, true),
+            None
+        );
         assert_eq!(
             chat_message_text_color(&ordinary, true, true),
             Some(egui::Color32::from_rgb(255, 184, 77))
@@ -21225,6 +21245,18 @@ mod tests {
         manager.messages.insert("2".to_owned(), vec![
             campaign_message,
             other_message,
+        ]);
+        manager.replay_snapshots.insert("2".to_owned(), vec![
+            Some(crate::napcat::ReplayMessageSnapshot {
+                line_id: 11,
+                turn_index: 1,
+                position_cells: [1, 2, 3],
+            }),
+            Some(crate::napcat::ReplayMessageSnapshot {
+                line_id: 22,
+                turn_index: 2,
+                position_cells: [4, 5, 6],
+            }),
         ]);
         manager.read_message_counts.insert("2".to_owned(), 2);
 
@@ -21311,6 +21343,13 @@ mod tests {
             "campaign-b"
         );
         assert_eq!(manager.read_message_counts["2"], 1);
+        assert_eq!(manager.replay_snapshots["2"].len(), 1);
+        assert_eq!(
+            manager.replay_snapshots["2"][0]
+                .expect("remaining campaign snapshot")
+                .line_id,
+            22
+        );
         assert!(!manager
             .summarized_message_counts
             .contains_key(&campaign_summary_key));
@@ -21663,9 +21702,9 @@ mod tests {
     fn shape_contains_text(shape: &egui::Shape, needle: &str) -> bool {
         match shape {
             egui::Shape::Text(text) => text.galley.text().contains(needle),
-            egui::Shape::Vec(shapes) => {
-                shapes.iter().any(|shape| shape_contains_text(shape, needle))
-            },
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| shape_contains_text(shape, needle)),
             _ => false,
         }
     }
@@ -21696,7 +21735,11 @@ mod tests {
             let mut kinds = [BuffKind::Magic, BuffKind::Physical];
             for (index, kind) in kinds.iter_mut().enumerate() {
                 ui.group(|ui| {
-                    buff_kind_combo(ui, ("active_buff_kind", "test-target", index), kind);
+                    buff_kind_combo(
+                        ui,
+                        ("active_buff_kind", "test-target", index),
+                        kind,
+                    );
                 });
             }
         });
@@ -22587,7 +22630,10 @@ mod tests {
         assert_close(base_stats.speed, 6.4);
         assert_close(base_stats.damage_dealt_modifier, 1.3);
         assert_close(base_stats.damage_taken_modifier, 0.7);
-        assert_close(base_stats.healing_dealt_modifier, 7.0 / 6.0);
+        assert_close(
+            base_stats.healing_dealt_modifier,
+            7.0 / 6.0,
+        );
         assert_close(base_stats.healing_taken_modifier, 0.6);
     }
 

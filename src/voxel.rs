@@ -1141,6 +1141,17 @@ struct VoxelScenePersistenceState {
     force_save: bool,
 }
 
+/// Restorable non-grid scene state used while replay playback is active. Live
+/// replay explosions may split loose bodies or create debris; those temporary
+/// entities must never become part of the campaign once playback stops.
+#[derive(Resource, Default)]
+struct VoxelReplaySceneSandbox {
+    active: bool,
+    physics_bodies: Vec<PersistedVoxelPhysicsBody>,
+    placed_lights: Vec<PersistedVoxelPlacedLight>,
+    planet: Option<PersistedVoxelPlanet>,
+}
+
 #[derive(Component)]
 struct VoxelOrbitalPlanet {
     cells: HashMap<IVec3, u8>,
@@ -2578,6 +2589,7 @@ impl Plugin for TrpgVoxelPlugin {
             .init_resource::<VoxelBloodDecay>()
             .init_resource::<VoxelSpaceshipOccupancyCache>()
             .init_resource::<VoxelScenePersistenceState>()
+            .init_resource::<VoxelReplaySceneSandbox>()
             .init_resource::<VoxelSpaceshipControlState>()
             .init_resource::<VoxelSpaceshipPassengerMotion>()
             .init_resource::<VoxelSpaceshipPersistenceState>()
@@ -2632,6 +2644,7 @@ impl Plugin for TrpgVoxelPlugin {
             )
                 .chain(),
         )
+        .add_systems(Update, sandbox_replay_voxel_scene.before(voxel_editor_shortcuts))
         .add_systems(
             Update,
             (
@@ -3000,10 +3013,146 @@ fn load_persisted_voxel_scene(
     }
 }
 
+fn sandbox_replay_voxel_scene(
+    mut commands: Commands,
+    studio: Res<crate::replay::ReplayStudio>,
+    mut sandbox: ResMut<VoxelReplaySceneSandbox>,
+    mut physics_loader: ResMut<VoxelPhysicsChunkLoader>,
+    physics_bodies: Query<
+        (
+            Entity,
+            &VoxelPhysicsBody,
+            &Transform,
+            &LinearVelocity,
+            &AngularVelocity,
+        ),
+        Without<VoxelSpaceship>,
+    >,
+    placed_lights: Query<(
+        Entity,
+        &VoxelPlacedLight,
+        &Transform,
+        Option<&LinearVelocity>,
+        Option<&AngularVelocity>,
+    )>,
+    mut planets: Query<&mut VoxelOrbitalPlanet>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
+) {
+    let active = crate::replay::replay_scene_dynamics_active(&studio);
+    if active && !sandbox.active {
+        sandbox.physics_bodies = physics_bodies
+            .iter()
+            .map(|(_, body, transform, linear_velocity, angular_velocity)| {
+                persisted_voxel_physics_body(
+                    body,
+                    transform,
+                    linear_velocity,
+                    angular_velocity,
+                )
+            })
+            .chain(physics_loader.unloaded_bodies.iter().map(|snapshot| {
+                persisted_voxel_physics_body(
+                    &snapshot.body,
+                    &snapshot.transform,
+                    &snapshot.linear_velocity,
+                    &snapshot.angular_velocity,
+                )
+            }))
+            .collect();
+        sandbox.placed_lights = placed_lights
+            .iter()
+            .map(|(_, light, transform, linear_velocity, angular_velocity)| {
+                persisted_voxel_light(
+                    light,
+                    transform,
+                    linear_velocity,
+                    angular_velocity,
+                )
+            })
+            .collect();
+        sandbox.planet = planets.single().ok().map(|planet| PersistedVoxelPlanet {
+            cells: planet
+                .cells
+                .iter()
+                .map(|(cell, material)| persisted_voxel_cell(*cell, *material))
+                .collect(),
+            removed: planet.removed.iter().map(|cell| cell.to_array()).collect(),
+        });
+        sandbox.active = true;
+        return;
+    }
+    if active || !sandbox.active {
+        return;
+    }
+
+    for (entity, ..) in &physics_bodies {
+        commands.entity(entity).despawn();
+    }
+    physics_loader.unloaded_bodies.clear();
+    for body in &sandbox.physics_bodies {
+        let (cells, transform, linear_velocity, angular_velocity) =
+            runtime_voxel_physics_body(body);
+        if !cells.is_empty() {
+            spawn_voxel_physics_body_at(
+                &mut commands,
+                &mut meshes,
+                &materials,
+                cells,
+                transform,
+                linear_velocity,
+                angular_velocity,
+            );
+        }
+    }
+
+    for (entity, ..) in &placed_lights {
+        commands.entity(entity).despawn();
+    }
+    for light in &sandbox.placed_lights {
+        let entity = spawn_voxel_placed_light(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            runtime_voxel_light(light),
+        );
+        if light.kind == VoxelLightTool::Physics {
+            commands.entity(entity).insert((
+                Transform {
+                    translation: Vec3::from_array(light.translation),
+                    rotation: Quat::from_array(light.rotation).normalize(),
+                    scale: Vec3::from_array(light.scale),
+                },
+                LinearVelocity(Vec3::from_array(light.linear_velocity)),
+                AngularVelocity(Vec3::from_array(light.angular_velocity)),
+            ));
+        }
+    }
+
+    if let (Some(saved_planet), Ok(mut planet)) = (sandbox.planet.as_ref(), planets.single_mut()) {
+        planet.cells = saved_planet
+            .cells
+            .iter()
+            .filter(|cell| cell.material != 0)
+            .map(|cell| (IVec3::from_array(cell.position), cell.material))
+            .collect();
+        planet.removed = saved_planet
+            .removed
+            .iter()
+            .copied()
+            .map(IVec3::from_array)
+            .collect();
+        planet.refresh_cell_bounds();
+        planet.dirty = true;
+    }
+    *sandbox = VoxelReplaySceneSandbox::default();
+}
+
 fn persist_voxel_scene(
     time: Res<Time>,
     mut app_exit: MessageReader<AppExit>,
     mut persistence: ResMut<VoxelScenePersistenceState>,
+    studio: Res<crate::replay::ReplayStudio>,
     grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
     planets: Query<&VoxelOrbitalPlanet>,
     physics_loader: Res<VoxelPhysicsChunkLoader>,
@@ -3024,6 +3173,11 @@ fn persist_voxel_scene(
     )>,
     mut store: ResMut<Persistent<VoxelSceneStore>>,
 ) {
+    // Replay playback, including live replay editing, operates on a temporary
+    // project scene. Never autosave those preview mutations over the campaign.
+    if crate::replay::replay_scene_dynamics_active(&studio) {
+        return;
+    }
     persistence.elapsed_seconds += time.delta_secs();
     let exiting = app_exit.read().next().is_some();
     if !exiting
@@ -8861,46 +9015,46 @@ fn voxel_auto_door_lock_panel(
         egui::Align2::CENTER_TOP,
         egui::vec2(0.0, 224.0),
     )
-        .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
-            egui::Frame::new()
+    .order(egui::Order::Foreground)
+    .show(ctx, |ui| {
+        egui::Frame::new()
             .fill(egui::Color32::from_rgba_unmultiplied(
                 5, 18, 30, 232,
             ))
-                .stroke(egui::Stroke::new(
-                    1.5,
-                    egui::Color32::from_rgb(55, 205, 235),
-                ))
-                .corner_radius(8)
-                .inner_margin(egui::Margin::symmetric(12, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let (label, fill) = if lock_state.all_locked {
+            .stroke(egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgb(55, 205, 235),
+            ))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (label, fill) = if lock_state.all_locked {
                         (
                             "解锁所有自动门",
                             egui::Color32::from_rgb(42, 136, 96),
                         )
-                        } else {
+                    } else {
                         (
                             "锁定所有自动门",
                             egui::Color32::from_rgb(168, 116, 24),
                         )
-                        };
-                        if ui
-                            .add(egui::Button::new(label).fill(fill))
-                            .on_hover_text("锁定后所有自动门保持关闭，玩家靠近也不会自动打开")
-                            .clicked()
-                        {
-                            lock_state.all_locked = !lock_state.all_locked;
-                        }
-                        ui.small(if lock_state.all_locked {
-                            "自动门已全部锁定"
-                        } else {
-                            "自动门已全部解锁"
-                        });
+                    };
+                    if ui
+                        .add(egui::Button::new(label).fill(fill))
+                        .on_hover_text("锁定后所有自动门保持关闭，玩家靠近也不会自动打开")
+                        .clicked()
+                    {
+                        lock_state.all_locked = !lock_state.all_locked;
+                    }
+                    ui.small(if lock_state.all_locked {
+                        "自动门已全部锁定"
+                    } else {
+                        "自动门已全部解锁"
                     });
                 });
-        });
+            });
+    });
 }
 
 fn voxel_spaceship_panel(
@@ -11408,7 +11562,7 @@ fn setup_voxel_planet_shell(
         Mesh3d(
             meshes.add(
                 Sphere::new(ORBITAL_PLANET_RADIUS - PLANET_FAKE_BODY_INSET)
-        .mesh()
+                    .mesh()
                     .uv(256, 128),
             ),
         ),
@@ -14878,21 +15032,21 @@ fn edit_voxel_grid(
                 editor.material,
                 edit_seed,
             ) {
-                        let before = planet.cells.get(&cell).copied().unwrap_or(0);
-                        let did_change = match input_mode {
+                let before = planet.cells.get(&cell).copied().unwrap_or(0);
+                let did_change = match input_mode {
                     VoxelEditMode::Add => set_planet_voxel(&mut planet, cell, editor.material),
-                            VoxelEditMode::Remove => dig_planet_voxel(&mut planet, cell),
-                            VoxelEditMode::Paint => {
-                                planet.cells.contains_key(&cell)
-                                    && set_planet_voxel(&mut planet, cell, editor.material)
-                            },
-                            _ => false,
-                        };
-                        if did_change && editor.material == VOXEL_BLOOD_MATERIAL {
-                            blood_decay.refresh(VoxelBloodLocation::Planet(cell), before);
-                        }
-                        changed += usize::from(did_change);
-                    }
+                    VoxelEditMode::Remove => dig_planet_voxel(&mut planet, cell),
+                    VoxelEditMode::Paint => {
+                        planet.cells.contains_key(&cell)
+                            && set_planet_voxel(&mut planet, cell, editor.material)
+                    },
+                    _ => false,
+                };
+                if did_change && editor.material == VOXEL_BLOOD_MATERIAL {
+                    blood_decay.refresh(VoxelBloodLocation::Planet(cell), before);
+                }
+                changed += usize::from(did_change);
+            }
             if changed > 0 {
                 editor.physics_status = Some(format!(
                     "已编辑 {changed} 个行星 0.25 体素"
@@ -14946,9 +15100,9 @@ fn edit_voxel_grid(
             if input_mode == VoxelEditMode::Add && editor.material == VOXEL_BLOOD_MATERIAL {
                 *explosion_sequence = explosion_sequence.wrapping_add(1);
                 blood_splatter_seed(center, *explosion_sequence)
-        } else {
+            } else {
                 0
-        };
+            };
         let edit_cells = voxel_edit_cells(
             center,
             surface_normal,
@@ -14966,38 +15120,38 @@ fn edit_voxel_grid(
             let mut changed = 0;
             let mut stroke = Vec::new();
             for position in edit_cells {
-                        let target = VoxelChangeTarget::Spaceship(ship_entity);
-                        if !editor.stroke_positions.insert((target, position)) {
-                            continue;
-                        }
-                        let before = entry.cell_material(position).unwrap_or(0);
-                        let Some(after) = edited_voxel(input_mode, before, editor.material) else {
-                            continue;
-                        };
-                        if before == after {
-                            continue;
-                        }
-                        set_voxel_spaceship_cell(entry, position, after);
-                        if after == VOXEL_BLOOD_MATERIAL {
+                let target = VoxelChangeTarget::Spaceship(ship_entity);
+                if !editor.stroke_positions.insert((target, position)) {
+                    continue;
+                }
+                let before = entry.cell_material(position).unwrap_or(0);
+                let Some(after) = edited_voxel(input_mode, before, editor.material) else {
+                    continue;
+                };
+                if before == after {
+                    continue;
+                }
+                set_voxel_spaceship_cell(entry, position, after);
+                if after == VOXEL_BLOOD_MATERIAL {
                     blood_decay.refresh(
                         VoxelBloodLocation::Spaceship(ship_entity, position),
                         before,
                     );
-                        }
-                        crate::replay::record_replay_ship_hull_cell(
-                            scene_recorder.as_deref_mut(),
-                            &ship_id,
-                            position,
-                            after,
-                        );
-                        stroke.push(VoxelChange {
-                            target,
-                            position,
-                            before,
-                            after,
-                        });
-                        changed += 1;
-                    }
+                }
+                crate::replay::record_replay_ship_hull_cell(
+                    scene_recorder.as_deref_mut(),
+                    &ship_id,
+                    position,
+                    after,
+                );
+                stroke.push(VoxelChange {
+                    target,
+                    position,
+                    before,
+                    after,
+                });
+                changed += 1;
+            }
             editor.active_stroke.extend(stroke);
             changed
         };
@@ -15051,38 +15205,38 @@ fn edit_voxel_grid(
         editor.material,
         edit_seed,
     ) {
-                if !editor
-                    .stroke_positions
-                    .insert((VoxelChangeTarget::Grid, position))
-                {
-                    continue;
-                }
-                let before = grid.get(position).copied().unwrap_or(0);
-                let Some(after) = edited_voxel(input_mode, before, editor.material) else {
-                    continue;
-                };
-                if before != after {
-                    grid.set(position, after);
-                    if after == VOXEL_BLOOD_MATERIAL {
+        if !editor
+            .stroke_positions
+            .insert((VoxelChangeTarget::Grid, position))
+        {
+            continue;
+        }
+        let before = grid.get(position).copied().unwrap_or(0);
+        let Some(after) = edited_voxel(input_mode, before, editor.material) else {
+            continue;
+        };
+        if before != after {
+            grid.set(position, after);
+            if after == VOXEL_BLOOD_MATERIAL {
                 blood_decay.refresh(
                     VoxelBloodLocation::Grid(position),
                     before,
                 );
-                    }
-                    dirty_chunks.mark_cell_and_neighbors(position);
-                    crate::replay::record_replay_grid_cell(
-                        scene_recorder.as_deref_mut(),
-                        position,
-                        after,
-                    );
-                    stroke.push(VoxelChange {
-                        target: VoxelChangeTarget::Grid,
-                        position,
-                        before,
-                        after,
-                    });
-                }
             }
+            dirty_chunks.mark_cell_and_neighbors(position);
+            crate::replay::record_replay_grid_cell(
+                scene_recorder.as_deref_mut(),
+                position,
+                after,
+            );
+            stroke.push(VoxelChange {
+                target: VoxelChangeTarget::Grid,
+                position,
+                before,
+                after,
+            });
+        }
+    }
     if !stroke.is_empty() {
         editor.active_stroke.extend(stroke);
     }
@@ -17159,7 +17313,7 @@ mod tests {
         assert!(sunset.x < -0.9999 && sunset.y.abs() < 1.0e-4);
         assert!(
             (world_time_sun_direction(12.0 * 60.0) - world_time_sun_direction(36.0 * 60.0))
-            .length()
+                .length()
                 < 1.0e-5
         );
     }
@@ -18410,7 +18564,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(followed, owner + Vec3::new(3.0, 0.0, -2.0));
+        assert_eq!(
+            followed,
+            owner + Vec3::new(3.0, 0.0, -2.0)
+        );
     }
 
     #[test]
@@ -20444,7 +20601,7 @@ mod tests {
         );
 
         let hit = raycast_voxel_spaceship_cells(&occupancy, &Transform::default(), ray)
-        .expect("ray must hit the ship hull");
+            .expect("ray must hit the ship hull");
 
         assert_eq!(hit.occupied, IVec3::ZERO);
         assert_eq!(hit.normal, IVec3::NEG_X);
