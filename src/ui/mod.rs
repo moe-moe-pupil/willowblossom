@@ -7196,7 +7196,7 @@ fn quick_cast_ui(
                     });
                 }
             } else {
-                ui.small("技能描述需要是可解析的固定伤害或治疗规则。");
+                ui.small("规则引擎无法安全自动结算此技能；请由GM裁定后记录使用。");
             }
 
             let response = ui.add_enabled(can_cast, egui::Button::new("释放"));
@@ -7213,9 +7213,14 @@ fn quick_cast_ui(
             }
 
             ui.horizontal_wrapped(|ui| {
+                let force_label = if effect.is_none() {
+                    "GM裁定并记录"
+                } else {
+                    "强制释放"
+                };
                 let force_response = ui
-                    .add(egui::Button::new("强制释放"))
-                    .on_hover_text("GM强制释放：忽略MP不足、目标和规则解析条件，但仍扣除现有MP。");
+                    .add(egui::Button::new(force_label))
+                    .on_hover_text("GM确认：忽略MP不足、目标和规则解析条件，但仍扣除现有MP并记录冷却。");
                 if force_response.clicked() {
                     if force_pending {
                         action = Some(QuickCastAction {
@@ -7246,7 +7251,7 @@ fn quick_cast_ui(
             }
             if can_pay && cooldown_remaining == 0 {
                 if effect.is_none() {
-                    ui.small("普通释放需要可解析的固定伤害或治疗规则；强制释放可忽略。");
+                    ui.small("此技能保留原意交由GM处理；确认后只记录消耗与冷却，不自动改写角色状态。");
                 } else if targets.is_empty() {
                     ui.small("普通释放需要有效目标；强制释放可忽略。");
                 }
@@ -7378,11 +7383,11 @@ fn quick_cast_skills(character: &mut PlayerCharacter) -> Vec<QuickCastSkill> {
                 .map(|mode| QuickCastSkill {
                     name: format!("{}（{}）", skill.name, mode.label),
                     note: mode.rule.to_owned(),
-                    skill_type: Some("法术".to_owned()),
+                    skill_type: Some(mode.skill_type.to_owned()),
                     mp_cost: mode.mp_cost,
-                    cooldown_turns: 0,
+                    cooldown_turns: mode.cooldown_turns,
                     cooldown_left: None,
-                    target_count: None,
+                    target_count: mode.target_count,
                     target_class: Some(mode.target_class.to_owned()),
                     range: Some(mode.range),
                     ..skill.clone()
@@ -24057,6 +24062,36 @@ mod tests {
             Some("单目标")
         );
         assert!(skills.iter().all(|skill| skill.range == Some(4)));
+    }
+
+    #[test]
+    fn quick_cast_expands_current_blade_storm_into_rule_engine_modes() {
+        let mut character = PlayerCharacter {
+            skill_names: vec![String::new()],
+            skill_notes: vec!["【无敌斩】（10分）：一次快速斩击对周围最多5个单位各造成2点物理伤害，如果目标数量减少，最多一个单位造成8点伤害。连锁斩击范围3米，冷却1轮。".to_owned()],
+            skill_metadata: vec![CharacterSkillMetadata::default()],
+            ..Default::default()
+        };
+
+        let skills = quick_cast_skills(&mut character);
+
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].name, "技能1（连斩）");
+        assert_eq!(skills[1].name, "技能1（集中斩）");
+        assert_eq!(skills[0].target_count, Some(5));
+        assert_eq!(skills[1].target_count, Some(1));
+        assert!(skills.iter().all(|skill| skill.cooldown_turns == 1));
+        assert!(skills.iter().all(|skill| skill.range == Some(3)));
+        assert!(skills.iter().all(|skill| {
+            quick_cast_effect(
+                &skill.note,
+                &skill.arg_values,
+                skill.skill_type.as_deref(),
+                None,
+                &[],
+            )
+            .is_some()
+        }));
     }
 
     #[test]

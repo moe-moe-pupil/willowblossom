@@ -81,8 +81,11 @@ pub struct CurrentRedeemedSkillMode {
     pub label: &'static str,
     pub rule: &'static str,
     pub mp_cost: f32,
+    pub cooldown_turns: u32,
     pub target_class: &'static str,
+    pub target_count: Option<u32>,
     pub range: i32,
+    pub skill_type: &'static str,
 }
 
 const SOUL_PULSE_MODES: [CurrentRedeemedSkillMode; 2] = [
@@ -90,15 +93,44 @@ const SOUL_PULSE_MODES: [CurrentRedeemedSkillMode; 2] = [
         label: "伤害",
         rule: "主动使用对周围4米内的目标造成6点魔法伤害",
         mp_cost: 9.0,
+        cooldown_turns: 0,
         target_class: "范围",
+        target_count: None,
         range: 4,
+        skill_type: "法术",
     },
     CurrentRedeemedSkillMode {
         label: "治疗",
         rule: "主动使用对目标回复6点生命值",
         mp_cost: 9.0,
+        cooldown_turns: 0,
         target_class: "单目标",
+        target_count: Some(1),
         range: 4,
+        skill_type: "法术",
+    },
+];
+
+const BLADE_STORM_MODES: [CurrentRedeemedSkillMode; 2] = [
+    CurrentRedeemedSkillMode {
+        label: "连斩",
+        rule: "主动使用对周围3米内的目标造成2点物理伤害",
+        mp_cost: 0.0,
+        cooldown_turns: 1,
+        target_class: "多目标",
+        target_count: Some(5),
+        range: 3,
+        skill_type: "动作",
+    },
+    CurrentRedeemedSkillMode {
+        label: "集中斩",
+        rule: "主动使用对目标造成8点物理伤害",
+        mp_cost: 0.0,
+        cooldown_turns: 1,
+        target_class: "单目标",
+        target_count: Some(1),
+        range: 3,
+        skill_type: "动作",
     },
 ];
 
@@ -107,11 +139,21 @@ pub fn current_redeemed_skill_modes(
     note: &str,
 ) -> Option<&'static [CurrentRedeemedSkillMode]> {
     let note = normalize_rule_text(note);
-    (skill_name.trim() == "灵魂脉冲"
+    if skill_name.trim() == "灵魂脉冲"
         && note.contains("造成6点法术伤害")
         && note.contains("治疗一个目标6点生命值")
-        && note.contains("消耗9法力值"))
-    .then_some(SOUL_PULSE_MODES.as_slice())
+        && note.contains("消耗9法力值")
+    {
+        return Some(SOUL_PULSE_MODES.as_slice());
+    }
+    if note.contains("【无敌斩】（10分）")
+        && note.contains("周围最多5个单位各造成2点物理伤害")
+        && note.contains("最多一个单位造成8点伤害")
+        && note.contains("连锁斩击范围3米")
+    {
+        return Some(BLADE_STORM_MODES.as_slice());
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4391,6 +4433,42 @@ mod tests {
             vec![Action::Heal {
                 target: TargetSelector::single(ActorRef::Target),
                 amount: ValueExpr::Number(6.0),
+            }]
+        );
+    }
+
+    #[test]
+    fn current_blade_storm_exposes_multi_target_and_single_target_modes() {
+        let modes = current_redeemed_skill_modes(
+            "技能1",
+            "【无敌斩】（10分）：一次快速斩击对周围最多5个单位各造成2点物理伤害，如果目标数量减少，最多一个单位造成8点伤害。连锁斩击范围3米，冷却1轮。",
+        )
+        .unwrap();
+
+        assert_eq!(modes, &BLADE_STORM_MODES);
+        assert_eq!(modes[0].target_count, Some(5));
+        assert_eq!(modes[1].target_count, Some(1));
+        assert!(modes.iter().all(|mode| mode.cooldown_turns == 1));
+        assert!(modes.iter().all(|mode| mode.range == 3));
+        assert_eq!(
+            parse_rule(modes[0].rule).unwrap().actions,
+            vec![Action::Damage {
+                target: TargetSelector {
+                    actor: ActorRef::Target,
+                    area: Some(AreaSelector {
+                        radius_meters: Some(3.0),
+                    }),
+                },
+                amount: ValueExpr::Number(2.0),
+                damage_type: DamageType::Physical,
+            }]
+        );
+        assert_eq!(
+            parse_rule(modes[1].rule).unwrap().actions,
+            vec![Action::Damage {
+                target: TargetSelector::single(ActorRef::Target),
+                amount: ValueExpr::Number(8.0),
+                damage_type: DamageType::Physical,
             }]
         );
     }

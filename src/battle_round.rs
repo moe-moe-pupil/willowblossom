@@ -2011,11 +2011,34 @@ fn is_current_redeemed_blow_needles(skill: &CharacterSkill) -> bool {
         && skill.note.contains("命中的飞针数量+2的远程物理伤害")
 }
 
-fn is_current_redeemed_invisibility(skill: &CharacterSkill) -> bool {
-    skill.name.trim() == "隐身术"
-        && skill.note.contains("冷却2")
-        && skill.note.contains("持续3回合")
-        && skill.note.contains("无消耗")
+fn current_redeemed_invisibility_rounds(skill: &CharacterSkill) -> Option<u32> {
+    if skill.name.trim() != "隐身术"
+        || !skill.note.contains("冷却2")
+        || !skill.note.contains("无消耗")
+    {
+        return None;
+    }
+    let duration = skill
+        .note
+        .split_once("持续")?
+        .1
+        .chars()
+        .skip_while(|character| !character.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse::<u32>()
+        .ok()?;
+    (duration > 0).then_some(duration)
+}
+
+fn skill_has_dedicated_battle_resolution(skill: &CharacterSkill) -> bool {
+    is_current_redeemed_commissar_war_cry(skill)
+        || is_current_redeemed_blow_needles(skill)
+        || current_redeemed_invisibility_rounds(skill).is_some()
+        || matches!(
+            skill.name.as_str(),
+            "食用精美烧鹅" | "维修机甲"
+        )
 }
 
 fn apply_void_break_damage_for_battle(
@@ -4918,8 +4941,15 @@ fn encounter_action_ui(
                 skill.target_class.as_deref(),
                 Some(target_alive),
             );
+            let requires_gm_resolution =
+                effects.is_empty() && !skill_has_dedicated_battle_resolution(skill);
             let can_use = cooldown_remaining == 0 && can_pay && hope_avatar_allows && target_allows;
-            let response = ui.add_enabled(can_use, egui::Button::new("使用技能"));
+            let use_label = if requires_gm_resolution {
+                "GM裁定并记录"
+            } else {
+                "使用技能"
+            };
+            let response = ui.add_enabled(can_use, egui::Button::new(use_label));
             if response.clicked() {
                 changed |= store.record_skill_use_with_buffs_and_finish(
                     encounter_id,
@@ -4943,6 +4973,8 @@ fn encounter_action_ui(
                 ui.small(format!(
                     "冷却还剩{cooldown_remaining}轮"
                 ));
+            } else if requires_gm_resolution {
+                ui.small("规则引擎无法安全自动结算此技能；确认后记录使用、消耗和冷却，具体效果由GM处理。");
             }
         });
     } else {
@@ -7101,16 +7133,16 @@ impl BattleRoundStore {
                 ));
             }
         }
-        if is_current_redeemed_invisibility(skill) {
+        if let Some(duration) = current_redeemed_invisibility_rounds(skill) {
             if let Some(actor) = encounter
                 .participants
                 .iter_mut()
                 .find(|participant| participant.target_id == actor_id)
             {
-                actor.redeemed_invisibility_rounds_remaining = 3;
+                actor.redeemed_invisibility_rounds_remaining = duration;
                 encounter.action_log.push(format!(
-                    "{}进入隐身，持续3回合",
-                    actor_name
+                    "{}进入隐身，持续{}回合",
+                    actor_name, duration
                 ));
             }
         }
@@ -10424,11 +10456,11 @@ fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
                 .map(|mode| CharacterSkill {
                     name: format!("{}（{}）", skill.name, mode.label),
                     note: mode.rule.to_owned(),
-                    skill_type: Some("法术".to_owned()),
+                    skill_type: Some(mode.skill_type.to_owned()),
                     mp_cost: mode.mp_cost,
-                    cooldown_turns: 0,
+                    cooldown_turns: mode.cooldown_turns,
                     cooldown_left: None,
-                    target_count: None,
+                    target_count: mode.target_count,
                     target_class: Some(mode.target_class.to_owned()),
                     range: Some(mode.range),
                     ..skill.clone()
