@@ -1870,9 +1870,11 @@ fn is_current_redeemed_void_break(skill: &CharacterSkill) -> bool {
 
 fn is_current_redeemed_commissar_war_cry(skill: &CharacterSkill) -> bool {
     skill.name.trim() == "政委"
-        && skill.note.contains("战吼—为了帝皇")
-        && skill.note.contains("熟练度0/5")
-        && skill.note.contains("下次攻击伤害附带【熟练度】点物理伤害")
+        && skill.note.contains("为了帝皇")
+        && skill.note.contains("熟练度")
+        && skill.note.contains("每次使用前熟练度+1")
+        && skill.note.contains("下次攻击伤害附带")
+        && skill.note.contains("物理伤害")
 }
 
 fn is_current_redeemed_chainsword(skill: &CharacterSkill) -> bool {
@@ -5552,6 +5554,13 @@ impl BattleRoundStore {
             .iter()
             .find(|participant| participant.target_id == target_id)
             .map(|participant| participant.alive);
+        if is_current_redeemed_commissar_war_cry(skill) && selected_target_alive != Some(true) {
+            encounter.action_log.push(format!(
+                "{}不能对所选目标使用{}；目标不存在或已经倒下",
+                actor_snapshot.display_name, skill.name
+            ));
+            return false;
+        }
         if !skill_effects_allow_selected_target(
             &effects,
             skill.target_class.as_deref(),
@@ -6473,6 +6482,11 @@ impl BattleRoundStore {
             }
         }
         if is_current_redeemed_commissar_war_cry(skill) {
+            let target_index = encounter
+                .participants
+                .iter()
+                .position(|participant| participant.target_id == target_id)
+                .expect("commissar war cry target was validated before applying effects");
             let proficiency = encounter
                 .participants
                 .iter_mut()
@@ -6484,17 +6498,12 @@ impl BattleRoundStore {
                 })
                 .unwrap_or(0);
             if proficiency > 0 {
-                if let Some(target) = encounter
-                    .participants
-                    .iter_mut()
-                    .find(|participant| participant.target_id == target_id && participant.alive)
-                {
-                    target.next_attack_bonus_physical = proficiency as f32;
-                    encounter.action_log.push(format!(
-                        "{}高呼“为了帝皇”，熟练度提升至{}/5；{}的下次物理攻击附带{}点物理伤害",
-                        actor_name, proficiency, target.display_name, proficiency
-                    ));
-                }
+                let target = &mut encounter.participants[target_index];
+                target.next_attack_bonus_physical = proficiency as f32;
+                encounter.action_log.push(format!(
+                    "{}高呼“为了帝皇”，熟练度提升至{}/5；{}的下次物理攻击附带{}点物理伤害",
+                    actor_name, proficiency, target.display_name, proficiency
+                ));
             }
         }
         if is_current_redeemed_bolter(skill) {
@@ -11199,14 +11208,14 @@ mod tests {
         let war_cry = CharacterSkill {
             index: 0,
             name: "政委".to_owned(),
-            note: "战吼—为了帝皇:熟练度0/5，每次使用前熟练度+1，使目标下次攻击伤害附带【熟练度】点物理伤害。".to_owned(),
-            skill_type: Some("动作".to_owned()),
+            note: "职业:政委（3分）\n政委是帝国卫队中最具标志性的角色。\n职业技能:\n战吼—为了帝皇:熟练度0/5，每次使用前熟练度+1，使目标下次攻击伤害附带【熟练度】点物理伤害。".to_owned(),
+            skill_type: None,
             legacy_buff_machine_json: None,
             mp_cost: 0.0,
             cooldown_turns: 1,
             cooldown_left: None,
-            target_count: Some(1),
-            target_class: Some("单目标".to_owned()),
+            target_count: None,
+            target_class: None,
             range: None,
             arg_values: SkillRuleArgs::default(),
         };
@@ -11237,6 +11246,24 @@ mod tests {
             ..Default::default()
         };
 
+        assert!(!store.record_skill_use(
+            "battle",
+            "commissar",
+            "missing",
+            &war_cry,
+            &manager,
+            None,
+        ));
+        assert_eq!(
+            store.encounters["battle"].participants[0].commissar_proficiency,
+            0
+        );
+        assert!(
+            store.encounters["battle"].participants[0]
+                .skill_last_used_turns
+                .is_empty()
+        );
+
         assert!(store.record_skill_use(
             "battle",
             "commissar",
@@ -11261,6 +11288,71 @@ mod tests {
         assert_eq!(
             store.encounters["battle"].participants[2].hp,
             7.0
+        );
+    }
+
+    #[test]
+    fn redeemed_commissar_proficiency_caps_and_syncs_to_character() {
+        let mut manager = empty_manager();
+        manager.player_characters.insert(
+            "commissar".to_owned(),
+            PlayerCharacter {
+                name: "膳鹰".to_owned(),
+                ..Default::default()
+            },
+        );
+        let war_cry = CharacterSkill {
+            index: 0,
+            name: "政委".to_owned(),
+            note: "战吼-为了帝皇：熟练度3/5，每次使用前熟练度+1，使目标下次攻击伤害附带熟练度点物理伤害。".to_owned(),
+            skill_type: None,
+            legacy_buff_machine_json: None,
+            mp_cost: 0.0,
+            cooldown_turns: 0,
+            cooldown_left: None,
+            target_count: None,
+            target_class: None,
+            range: None,
+            arg_values: SkillRuleArgs::default(),
+        };
+        let mut commissar = participant("commissar", 0);
+        commissar.player_character = true;
+        let mut store = BattleRoundStore {
+            encounters: HashMap::from([("battle".to_owned(), BattleEncounter {
+                active: true,
+                participants: vec![commissar, participant("ally", 0)],
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+
+        for _ in 0..6 {
+            assert!(store.record_skill_use(
+                "battle",
+                "commissar",
+                "ally",
+                &war_cry,
+                &manager,
+                None,
+            ));
+        }
+
+        let encounter = &store.encounters["battle"];
+        assert_eq!(
+            encounter.participants[0].commissar_proficiency,
+            5
+        );
+        assert_eq!(
+            encounter.participants[1].next_attack_bonus_physical,
+            5.0
+        );
+        assert!(sync_encounter_to_manager(
+            Some(encounter),
+            &mut manager
+        ));
+        assert_eq!(
+            manager.player_characters["commissar"].redeemed_commissar_proficiency,
+            5
         );
     }
 
