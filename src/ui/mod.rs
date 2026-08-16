@@ -2526,6 +2526,10 @@ impl Plugin for UIPlugin {
             )
             .add_systems(
                 EguiPrimaryContextPass,
+                attach_egui_mcp.after(configure_ui_fonts),
+            )
+            .add_systems(
+                EguiPrimaryContextPass,
                 ui_system
                     .run_if(resource_exists::<Persistent<CachedMemory>>)
                     .run_if(crate::replay::replay_video_capture_inactive)
@@ -2536,6 +2540,26 @@ impl Plugin for UIPlugin {
         }
     }
 }
+
+#[cfg(all(feature = "egui_mcp", not(target_arch = "wasm32")))]
+fn attach_egui_mcp(mut egui_context: EguiContexts, mut attempted: Local<bool>) {
+    if *attempted {
+        return;
+    }
+    let Ok(ctx) = egui_context.ctx_mut() else {
+        return;
+    };
+
+    *attempted = true;
+    match egui_inspection::attach_from_env(ctx, Some(crate::GAME_TITLE.to_owned())) {
+        Ok(true) => info!("egui MCP inspection enabled on EGUI_INSPECTION"),
+        Ok(false) => {},
+        Err(error) => error!("failed to enable egui MCP inspection: {error}"),
+    }
+}
+
+#[cfg(any(not(feature = "egui_mcp"), target_arch = "wasm32"))]
+fn attach_egui_mcp() {}
 
 pub fn setup_system(mut command: Commands) {
     let config_dir = Path::new(".data").join("willowblossom");
@@ -6834,6 +6858,13 @@ fn quick_character_windows(
     voxel_editor: &mut VoxelEditorState,
     summon_standee_store: &mut Persistent<VoxelSummonStandeeStore>,
 ) {
+    #[cfg(feature = "egui_mcp")]
+    if let Ok(target_id) = std::env::var("WILLOWBLOSSOM_EGUI_MCP_CHARACTER") {
+        if manager.player_characters.contains_key(&target_id) {
+            quick_character_targets.insert(target_id);
+        }
+    }
+
     let mut target_ids = quick_character_targets.iter().cloned().collect::<Vec<_>>();
     target_ids.sort();
 
@@ -20935,6 +20966,261 @@ mod tests {
             character_skill_ui_id("player", 0),
             character_skill_ui_id("other-player", 0)
         );
+    }
+
+    #[test]
+    fn character_editor_fields_survive_toml_round_trip() {
+        let skill_metadata = CharacterSkillMetadata {
+            pc_approved: true,
+            st_approved: false,
+            skill_type: Some("法术".to_owned()),
+            target_class: Some("范围".to_owned()),
+            target_count: Some(3),
+            range: Some(8),
+            exchange_point: Some(5),
+            cooldown_left: Some(2),
+            legacy_caster: Some("测试施法者".to_owned()),
+            ..Default::default()
+        };
+        let item_skill = InventoryItemSkill {
+            name: "物品技能".to_owned(),
+            note: "主动使用对目标造成2点魔法伤害".to_owned(),
+            mp_cost: 1.5,
+            cooldown_turns: 4,
+            metadata: skill_metadata.clone(),
+            consume_item: true,
+        };
+        let item = InventoryItem {
+            category: "消耗品".to_owned(),
+            name: "测试法杖".to_owned(),
+            description: "覆盖角色窗口的全部物品字段".to_owned(),
+            icon: "icon://staff".to_owned(),
+            quality: InventoryQuality::Epic,
+            equipment_slot: EquipmentSlot::MainHand,
+            stack: 2,
+            max_stack: 9,
+            item_level: 17,
+            soulbound: true,
+            stat_effects: vec![BuffEffect {
+                field: BuffField::Speed,
+                value: BuffValue::Add(1.25),
+            }],
+            skills: vec![item_skill],
+            portrait_transform: None,
+        };
+        let character = PlayerCharacter {
+            inited: true,
+            name: "完整角色".to_owned(),
+            nickname: "测试昵称".to_owned(),
+            image: "https://example.invalid/portrait.png".to_owned(),
+            creation_step: CharacterCreationStep::Skill,
+            status_points: 11,
+            exchange_points: 12,
+            hp: 13.5,
+            max_hp: 14.5,
+            hp_regen: 1.5,
+            mp: 15.5,
+            max_mp: 16.5,
+            mp_regen: 2.5,
+            level: 7,
+            exp: 23,
+            speed: 8.5,
+            damage_dealt_modifier: 1.1,
+            damage_taken_modifier: 1.2,
+            healing_dealt_modifier: 1.3,
+            healing_taken_modifier: 1.4,
+            damage_taken_this_turn: 3.5,
+            healing_taken_this_turn: 4.5,
+            status: CharacterStatus {
+                str_: 1,
+                agi: 2,
+                dex: 3,
+                vit: 4,
+                int_: 5,
+                wis: 6,
+                k: 7,
+                cha: 8,
+            },
+            extra_status: CharacterStatus {
+                str_: 8,
+                agi: 7,
+                dex: 6,
+                vit: 5,
+                int_: 4,
+                wis: 3,
+                k: 2,
+                cha: 1,
+            },
+            skill_names: vec!["角色技能".to_owned()],
+            skill_notes: vec!["主动使用治疗自己3点生命值".to_owned()],
+            skill_mp_costs: vec![2.5],
+            skill_cooldown_turns: vec![6],
+            skill_metadata: vec![skill_metadata],
+            inventory: CharacterInventory {
+                bag_slots: 24,
+                gold: 456,
+                items: vec![item.clone()],
+                hotbar: vec![
+                    CharacterHotbarSlot::Item(0),
+                    CharacterHotbarSlot::Skill(0),
+                    CharacterHotbarSlot::ReleaseControl,
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let encoded = toml::to_string(&character).expect("serialize complete character");
+        let decoded: PlayerCharacter =
+            toml::from_str(&encoded).expect("deserialize complete character");
+
+        assert_eq!(
+            [
+                decoded.hp,
+                decoded.max_hp,
+                decoded.hp_regen,
+                decoded.mp,
+                decoded.max_mp,
+                decoded.mp_regen,
+                decoded.speed,
+                decoded.damage_dealt_modifier,
+                decoded.damage_taken_modifier,
+                decoded.healing_dealt_modifier,
+                decoded.healing_taken_modifier,
+                decoded.damage_taken_this_turn,
+                decoded.healing_taken_this_turn,
+            ],
+            [13.5, 14.5, 1.5, 15.5, 16.5, 2.5, 8.5, 1.1, 1.2, 1.3, 1.4, 3.5, 4.5]
+        );
+        assert_eq!(
+            [
+                decoded.status.str_,
+                decoded.status.agi,
+                decoded.status.dex,
+                decoded.status.vit,
+                decoded.status.int_,
+                decoded.status.wis,
+                decoded.status.k,
+                decoded.status.cha,
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            [
+                decoded.extra_status.str_,
+                decoded.extra_status.agi,
+                decoded.extra_status.dex,
+                decoded.extra_status.vit,
+                decoded.extra_status.int_,
+                decoded.extra_status.wis,
+                decoded.extra_status.k,
+                decoded.extra_status.cha,
+            ],
+            [8, 7, 6, 5, 4, 3, 2, 1]
+        );
+        assert!(decoded.inited);
+        assert_eq!(decoded.name, "完整角色");
+        assert_eq!(decoded.nickname, "测试昵称");
+        assert_eq!(
+            decoded.image,
+            "https://example.invalid/portrait.png"
+        );
+        assert_eq!(
+            decoded.creation_step,
+            CharacterCreationStep::Skill
+        );
+        assert_eq!(
+            (
+                decoded.status_points,
+                decoded.exchange_points
+            ),
+            (11, 12)
+        );
+        assert_eq!((decoded.level, decoded.exp), (7, 23));
+        assert_eq!(decoded.skill_names, ["角色技能"]);
+        assert_eq!(decoded.skill_notes, [
+            "主动使用治疗自己3点生命值"
+        ]);
+        assert_eq!(decoded.skill_mp_costs, [2.5]);
+        assert_eq!(decoded.skill_cooldown_turns, [6]);
+        assert_eq!(decoded.skill_metadata.len(), 1);
+        assert_eq!(
+            decoded.skill_metadata[0].target_count,
+            Some(3)
+        );
+        assert_eq!(decoded.skill_metadata[0].range, Some(8));
+        assert_eq!(decoded.inventory.bag_slots, 24);
+        assert_eq!(decoded.inventory.gold, 456);
+        assert_eq!(decoded.inventory.items, [item]);
+        assert_eq!(decoded.inventory.hotbar, [
+            CharacterHotbarSlot::Item(0),
+            CharacterHotbarSlot::Skill(0),
+            CharacterHotbarSlot::ReleaseControl,
+        ]);
+    }
+
+    #[test]
+    fn character_editor_normalizes_misaligned_skills_items_and_hotbar() {
+        let mut character = PlayerCharacter {
+            skill_names: vec!["技能一".to_owned(), "技能二".to_owned()],
+            skill_notes: vec!["说明一".to_owned()],
+            skill_mp_costs: vec![-3.0],
+            skill_last_cast_turns: HashMap::from([
+                ("0".to_owned(), 2),
+                ("2".to_owned(), 9),
+                ("invalid".to_owned(), 4),
+            ]),
+            inventory: CharacterInventory {
+                bag_slots: 0,
+                items: vec![InventoryItem {
+                    name: "损坏堆叠".to_owned(),
+                    stack: 0,
+                    max_stack: 0,
+                    ..Default::default()
+                }],
+                hotbar: vec![
+                    CharacterHotbarSlot::Item(0),
+                    CharacterHotbarSlot::Item(1),
+                    CharacterHotbarSlot::Skill(0),
+                    CharacterHotbarSlot::Skill(2),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(normalize_character_skill_fields(
+            &mut character
+        ));
+        assert!(normalize_inventory(
+            &mut character.inventory
+        ));
+        assert!(normalize_character_hotbar(
+            &mut character
+        ));
+
+        assert_eq!(character.skill_names.len(), 2);
+        assert_eq!(character.skill_notes, ["说明一", ""]);
+        assert_eq!(character.skill_mp_costs, [0.0, 0.0]);
+        assert_eq!(character.skill_cooldown_turns, [0, 0]);
+        assert_eq!(character.skill_metadata.len(), 2);
+        assert_eq!(
+            character.skill_last_cast_turns,
+            HashMap::from([("0".to_owned(), 2)])
+        );
+        assert_eq!(character.inventory.bag_slots, 1);
+        assert_eq!(character.inventory.items[0].stack, 1);
+        assert_eq!(
+            character.inventory.items[0].max_stack,
+            1
+        );
+        assert_eq!(character.inventory.hotbar.len(), 9);
+        assert_eq!(character.inventory.hotbar[..4], [
+            CharacterHotbarSlot::Item(0),
+            CharacterHotbarSlot::Empty,
+            CharacterHotbarSlot::Skill(0),
+            CharacterHotbarSlot::Empty,
+        ]);
     }
 
     fn empty_manager() -> NapcatMessageManager {

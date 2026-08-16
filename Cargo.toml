@@ -26,6 +26,7 @@ pixel_perfect = []
 resizable = []
 save_schedule = []
 mock_touch = []
+egui_mcp = ["dep:egui_inspection"]
 
 [dependencies]
 # The bevy engine <3
@@ -66,6 +67,7 @@ async-compat = "0.2.5"
 futures-lite = "2.6.1"
 bevy_egui = { version = "=0.41.0", features = ["serde"] }
 egui = { version = "=0.35.0", features = ["persistence"] }
+egui_inspection = { version = "=0.35.0", features = ["plugin"], optional = true }
 serde_json = "1.0.150"
 toml = "0.9"
 base64 = "0.22.1"
