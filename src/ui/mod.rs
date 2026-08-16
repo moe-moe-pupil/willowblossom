@@ -909,6 +909,7 @@ use crate::{
         NapcatSendManager,
         NapcatSender,
         PlayerCharacter,
+        ProtectiveSuitKind,
         RandomPool,
         RandomPoolCheckedResult,
         RandomPoolEntry,
@@ -8250,6 +8251,28 @@ fn hidden_role_editor_ui(ui: &mut Ui, target_id: &str, manager: &mut NapcatMessa
         changed = true;
     }
 
+    let heavy_helpers = manager
+        .player_characters
+        .iter()
+        .filter(|(helper_id, character)| {
+            helper_id.as_str() != target_id
+                && !(character.protective_suit.is_intact()
+                    && character.protective_suit.kind == ProtectiveSuitKind::Heavy)
+        })
+        .map(|(helper_id, character)| {
+            let name = if character.nickname.trim().is_empty() {
+                if character.name.trim().is_empty() {
+                    helper_id.clone()
+                } else {
+                    character.name.clone()
+                }
+            } else {
+                character.nickname.clone()
+            };
+            (helper_id.clone(), name)
+        })
+        .collect::<Vec<_>>();
+
     let (player_characters, hidden_roles) = (
         &mut manager.player_characters,
         &mut manager.hidden_roles,
@@ -8262,23 +8285,82 @@ fn hidden_role_editor_ui(ui: &mut Ui, target_id: &str, manager: &mut NapcatMessa
     if let Some(state) = hidden_role.as_deref_mut() {
         state.normalize();
     }
-    let mut remove_suit = false;
+    let current_suit = protective_suit.worn.then_some(protective_suit.kind);
+    let mut selected_suit = current_suit;
+    let mut selected_heavy_helper = protective_suit.heavy_helper_id.clone().or_else(|| {
+        heavy_helpers
+            .first()
+            .map(|(helper_id, _)| helper_id.clone())
+    });
     ui.horizontal_wrapped(|ui| {
-        changed |= ui
-            .checkbox(&mut protective_suit.worn, "穿戴防护服")
-            .on_hover_text("普通玩家和异形获得6点开场护盾；变种人获得3点")
-            .changed();
+        ui.label("穿戴防护服");
+        egui::ComboBox::from_id_salt(("protective_suit_kind", target_id))
+            .selected_text(
+                selected_suit
+                    .map(ProtectiveSuitKind::label)
+                    .unwrap_or("未穿戴"),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut selected_suit, None, "未穿戴");
+                for kind in ProtectiveSuitKind::ALL {
+                    ui.selectable_value(&mut selected_suit, Some(kind), kind.label());
+                }
+            });
         if protective_suit.destroyed {
             ui.colored_label(egui::Color32::LIGHT_RED, "防护服已毁");
         }
-        remove_suit = ui.button("脱下（耗1回合）").clicked();
     });
-    if remove_suit {
-        changed |= if let Some(state) = hidden_role.as_deref_mut() {
-            state.remove_protective_suit(protective_suit)
-        } else {
-            protective_suit.remove()
+    if selected_suit == Some(ProtectiveSuitKind::Heavy) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("协助船员");
+            egui::ComboBox::from_id_salt(("heavy_suit_helper", target_id))
+                .selected_text(
+                    heavy_helpers
+                        .iter()
+                        .find(|(helper_id, _)| Some(helper_id) == selected_heavy_helper.as_ref())
+                        .map(|(_, name)| name.as_str())
+                        .unwrap_or("无可用船员"),
+                )
+                .show_ui(ui, |ui| {
+                    for (helper_id, name) in &heavy_helpers {
+                        ui.selectable_value(
+                            &mut selected_heavy_helper,
+                            Some(helper_id.clone()),
+                            name,
+                        );
+                    }
+                });
+        });
+        if heavy_helpers.is_empty() {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "重装防护服必须由一名未穿重装防护服的其他船员协助。",
+            );
+        }
+    }
+    if let Some(kind) = selected_suit {
+        ui.small(kind.description());
+    }
+    if selected_suit != current_suit
+        || (selected_suit == Some(ProtectiveSuitKind::Heavy)
+            && selected_heavy_helper != protective_suit.heavy_helper_id)
+    {
+        let suit_changed = match selected_suit {
+            None => {
+                if let Some(state) = hidden_role.as_deref_mut() {
+                    state.remove_protective_suit(protective_suit)
+                } else {
+                    protective_suit.remove()
+                }
+            },
+            Some(kind) => protective_suit.equip(kind, selected_heavy_helper.clone()),
         };
+        if suit_changed {
+            if let (Some(state), Some(kind)) = (hidden_role.as_deref_mut(), selected_suit) {
+                state.last_event = format!("已穿上{}（消耗1回合）", kind.label());
+            }
+            changed = true;
+        }
     }
 
     let Some(state) = hidden_role else {

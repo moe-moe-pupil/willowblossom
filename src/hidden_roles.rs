@@ -22,7 +22,7 @@ pub const ALIEN_STAGE_TWO_POINTS: u32 = 6;
 pub const ALIEN_STAGE_THREE_POINTS: u32 = 14;
 pub const MUTANT_STAGE_TWO_BIOMASS: u32 = 3;
 pub const MUTANT_STAGE_THREE_BIOMASS: u32 = 9;
-pub const PROTECTIVE_SUIT_OPENING_SHIELD: f32 = 6.0;
+pub const PROTECTIVE_SUIT_OPENING_SHIELD: f32 = 3.0;
 pub const MUTANT_PROTECTIVE_SUIT_OPENING_SHIELD: f32 = 3.0;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -788,11 +788,7 @@ pub fn hidden_role_opening_shield(
     let suit_intact =
         protective_suit.is_intact() || (!protective_suit.destroyed && legacy_suit_intact);
     let suit_shield = if suit_intact {
-        match state.map(|state| state.role) {
-            None | Some(HiddenRoleKind::Alien) => PROTECTIVE_SUIT_OPENING_SHIELD,
-            Some(HiddenRoleKind::Mutant) => MUTANT_PROTECTIVE_SUIT_OPENING_SHIELD,
-            Some(HiddenRoleKind::Android) => 0.0,
-        }
+        protective_suit.kind.all_damage_shield()
     } else {
         0.0
     };
@@ -800,6 +796,20 @@ pub fn hidden_role_opening_shield(
         .map(|state| combat_profile(state).opening_shield)
         .unwrap_or_default()
         .max(suit_shield)
+}
+
+pub fn hidden_role_intrinsic_opening_shield(state: Option<&HiddenRoleState>) -> f32 {
+    state
+        .map(|state| combat_profile(state).opening_shield)
+        .unwrap_or_default()
+}
+
+pub fn protective_suit_opening_magic_shield(protective_suit: &ProtectiveSuitState) -> f32 {
+    if protective_suit.is_intact() {
+        protective_suit.kind.magical_damage_shield()
+    } else {
+        0.0
+    }
 }
 
 pub fn hidden_role_stage_summary(state: &HiddenRoleState) -> String {
@@ -901,6 +911,7 @@ mod tests {
         let mut protective_suit = ProtectiveSuitState {
             worn: true,
             destroyed: false,
+            ..Default::default()
         };
         state.evolution_points = ALIEN_STAGE_TWO_POINTS;
         assert!(state.begin_cocoon(&mut protective_suit));
@@ -933,12 +944,32 @@ mod tests {
         let protective_suit = ProtectiveSuitState {
             worn: true,
             destroyed: false,
+            ..Default::default()
         };
 
         assert_eq!(
             hidden_role_opening_shield(None, &protective_suit),
             PROTECTIVE_SUIT_OPENING_SHIELD
         );
+    }
+
+    #[test]
+    fn protective_suit_variants_use_requested_shields() {
+        let mut suit = ProtectiveSuitState::default();
+        assert!(suit.equip(crate::napcat::ProtectiveSuitKind::Normal, None));
+        assert_eq!(hidden_role_opening_shield(None, &suit), 3.0);
+        assert_eq!(protective_suit_opening_magic_shield(&suit), 0.0);
+
+        assert!(suit.equip(crate::napcat::ProtectiveSuitKind::DarkMatter, None));
+        assert_eq!(hidden_role_opening_shield(None, &suit), 0.0);
+        assert_eq!(protective_suit_opening_magic_shield(&suit), 5.0);
+
+        assert!(!suit.equip(crate::napcat::ProtectiveSuitKind::Heavy, None));
+        assert!(suit.equip(
+            crate::napcat::ProtectiveSuitKind::Heavy,
+            Some("helper".to_owned()),
+        ));
+        assert_eq!(hidden_role_opening_shield(None, &suit), 6.0);
     }
 
     #[test]

@@ -1400,22 +1400,138 @@ impl Default for Summon {
 
 fn default_summon_hp() -> f32 { 5.0 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectiveSuitKind {
+    #[default]
+    Normal,
+    DarkMatter,
+    Medical,
+    Electronic,
+    Radiation,
+    Photon,
+    Cryogenic,
+    Scientist,
+    Heavy,
+    Maintenance,
+}
+
+impl ProtectiveSuitKind {
+    pub const ALL: [Self; 10] = [
+        Self::Normal,
+        Self::DarkMatter,
+        Self::Medical,
+        Self::Electronic,
+        Self::Radiation,
+        Self::Photon,
+        Self::Cryogenic,
+        Self::Scientist,
+        Self::Heavy,
+        Self::Maintenance,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "普通防护服",
+            Self::DarkMatter => "暗物质防护服",
+            Self::Medical => "医疗防护服",
+            Self::Electronic => "电子防护服",
+            Self::Radiation => "辐射防护服",
+            Self::Photon => "光子防护服",
+            Self::Cryogenic => "急冻防护服",
+            Self::Scientist => "科学家服装",
+            Self::Heavy => "重装防护服",
+            Self::Maintenance => "维修防护服",
+        }
+    }
+
+    pub fn all_damage_shield(self) -> f32 {
+        match self {
+            Self::DarkMatter => 0.0,
+            Self::Heavy => 6.0,
+            _ => 3.0,
+        }
+    }
+
+    pub fn magical_damage_shield(self) -> f32 {
+        if self == Self::DarkMatter { 5.0 } else { 0.0 }
+    }
+
+    pub fn has_consumable_active(self) -> bool {
+        matches!(
+            self,
+            Self::Medical | Self::Photon | Self::Cryogenic | Self::Scientist
+        )
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Normal => "3点全伤害护盾。护盾被打破后被动失效。",
+            Self::DarkMatter => "失去普通防护，改为5点魔法伤害护盾。",
+            Self::Medical => "3点全伤害护盾；一次性治疗自己或近身目标3点生命。",
+            Self::Electronic => "3点全伤害护盾；护盾有效时移动速度+1.5。",
+            Self::Radiation => "3点全伤害护盾；每回合对自己及3米内生物造成1点穿盾伤害，护盾破裂后仍生效。",
+            Self::Photon => "3点全伤害护盾；一次性致盲周围敌人1回合。",
+            Self::Cryogenic => "3点全伤害护盾；一次性使自己及10米内目标的移速减半1回合。",
+            Self::Scientist => "3点全伤害护盾；一次性酸液对落点2米内造成3点物理伤害，或腐蚀锁门。",
+            Self::Heavy => "6点全伤害护盾；必须由未穿重装防护服的船员协助穿戴。",
+            Self::Maintenance => "3点全伤害护盾；锯近身造成2点物理伤害，也可在1回合内拆除锁门。",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct ProtectiveSuitState {
     #[serde(default)]
     pub worn: bool,
     #[serde(default)]
     pub destroyed: bool,
+    #[serde(default)]
+    pub kind: ProtectiveSuitKind,
+    #[serde(default)]
+    pub active_used: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy_helper_id: Option<String>,
 }
 
 impl ProtectiveSuitState {
-    pub fn is_intact(self) -> bool { self.worn && !self.destroyed }
+    pub fn is_intact(&self) -> bool { self.worn && !self.destroyed }
 
     pub fn remove(&mut self) -> bool {
         if !self.worn {
             return false;
         }
         self.worn = false;
+        true
+    }
+
+    pub fn equip(&mut self, kind: ProtectiveSuitKind, heavy_helper_id: Option<String>) -> bool {
+        if kind == ProtectiveSuitKind::Heavy
+            && heavy_helper_id.as_deref().is_none_or(str::is_empty)
+        {
+            return false;
+        }
+        let changed = !self.worn
+            || self.destroyed
+            || self.kind != kind
+            || self.heavy_helper_id != heavy_helper_id;
+        self.worn = true;
+        self.destroyed = false;
+        self.kind = kind;
+        self.active_used = false;
+        self.heavy_helper_id = if kind == ProtectiveSuitKind::Heavy {
+            heavy_helper_id
+        } else {
+            None
+        };
+        changed
+    }
+
+    pub fn consume_active(&mut self) -> bool {
+        if !self.is_intact() || !self.kind.has_consumable_active() || self.active_used {
+            return false;
+        }
+        self.active_used = true;
         true
     }
 

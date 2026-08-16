@@ -40,7 +40,8 @@ use crate::{
     hidden_roles::{
         effective_hidden_role_character,
         hidden_role_battle_state,
-        hidden_role_opening_shield,
+        hidden_role_intrinsic_opening_shield,
+        protective_suit_opening_magic_shield,
         HiddenRoleBattleState,
     },
     napcat::{
@@ -120,6 +121,7 @@ use crate::{
         CharacterStatus,
         NapcatMessageManager,
         PlayerCharacter,
+        ProtectiveSuitKind,
         RedeemedNeedleState,
         SkillRuleArgs,
         Summon,
@@ -252,6 +254,8 @@ pub struct BattleRoundStore {
     pub active_encounter_id: Option<String>,
     #[serde(default = "default_next_encounter_index")]
     next_encounter_index: u64,
+    #[serde(skip)]
+    scene_positions: HashMap<String, Vec3>,
 }
 
 impl BattleRoundStore {
@@ -529,6 +533,24 @@ pub struct BattleParticipantSnapshot {
     pub group_modifiers: TrpgGlobalCombatModifiers,
     #[serde(default)]
     pub hidden_role: HiddenRoleBattleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protective_suit_kind: Option<ProtectiveSuitKind>,
+    #[serde(default)]
+    pub protective_suit_shield: f32,
+    #[serde(default)]
+    pub protective_suit_shield_max: f32,
+    #[serde(default)]
+    pub protective_suit_magic_only: bool,
+    #[serde(default)]
+    pub protective_suit_passive_active: bool,
+    #[serde(default)]
+    pub protective_suit_active_available: bool,
+    #[serde(default)]
+    pub protective_suit_speed_bonus: f32,
+    #[serde(default)]
+    pub protective_suit_slow_rounds_remaining: u32,
+    #[serde(default)]
+    pub protective_suit_blind_rounds_remaining: u32,
     #[serde(default)]
     pub arrogance_damage_bonus_per_source: f32,
     #[serde(default)]
@@ -1877,6 +1899,90 @@ fn is_current_redeemed_commissar_war_cry(skill: &CharacterSkill) -> bool {
         && skill.note.contains("物理伤害")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProtectiveSuitAction {
+    MedicalInjection,
+    PhotonFlash,
+    CryogenicRelease,
+    AcidVial,
+    AcidDoor,
+    MaintenanceSaw,
+    MaintenanceDoor,
+}
+
+fn apply_participant_typed_damage_for_battle(
+    participant: &mut BattleParticipantSnapshot,
+    amount: f32,
+    source_id: &str,
+    encounter_active: bool,
+    damage_type: DamageType,
+) -> BattleDamageResolution {
+    let incoming_amount = amount.max(0.0);
+    let suit_can_absorb = participant.protective_suit_passive_active
+        && participant.protective_suit_shield > f32::EPSILON
+        && (!participant.protective_suit_magic_only || damage_type == DamageType::Magical);
+    let suit_absorbed = if suit_can_absorb {
+        participant.protective_suit_shield.min(incoming_amount)
+    } else {
+        0.0
+    };
+    participant.protective_suit_shield =
+        (participant.protective_suit_shield - suit_absorbed).max(0.0);
+    if suit_can_absorb && participant.protective_suit_shield <= f32::EPSILON {
+        participant.protective_suit_shield = 0.0;
+        if participant.protective_suit_kind != Some(ProtectiveSuitKind::Radiation) {
+            participant.protective_suit_passive_active = false;
+        }
+        if participant.protective_suit_speed_bonus > f32::EPSILON {
+            participant.speed =
+                (participant.speed - participant.protective_suit_speed_bonus).max(0.0);
+            participant.low_survivor_speed =
+                (participant.low_survivor_speed - participant.protective_suit_speed_bonus)
+                    .max(0.0);
+            participant.protective_suit_speed_bonus = 0.0;
+        }
+    }
+    let mut resolution = apply_participant_damage_for_battle(
+        participant,
+        (incoming_amount - suit_absorbed).max(0.0),
+        source_id,
+        encounter_active,
+    );
+    resolution.damage_absorbed += suit_absorbed;
+    resolution
+}
+
+fn apply_participant_shield_piercing_damage_for_battle(
+    participant: &mut BattleParticipantSnapshot,
+    amount: f32,
+    source_id: &str,
+    encounter_active: bool,
+) -> BattleDamageResolution {
+    let saved_suit_shield = participant.protective_suit_shield;
+    let saved_overhealing_shield = participant.overhealing_shield;
+    let saved_overhealing_turns = participant.overhealing_shield_turns_remaining;
+    let saved_revenge_soul_shield = participant.revenge_soul_shield;
+    let saved_construct_shield = participant.construct_shield;
+    let saved_construct_repair = participant.construct_shield_repair_rounds_remaining;
+    let saved_arcane_shield = participant.arcane_shield;
+    participant.protective_suit_shield = 0.0;
+    participant.overhealing_shield = 0.0;
+    participant.overhealing_shield_turns_remaining = 0;
+    participant.revenge_soul_shield = 0.0;
+    participant.construct_shield = 0.0;
+    participant.arcane_shield = 0.0;
+    let resolution =
+        apply_participant_damage_for_battle(participant, amount, source_id, encounter_active);
+    participant.protective_suit_shield = saved_suit_shield;
+    participant.overhealing_shield = saved_overhealing_shield;
+    participant.overhealing_shield_turns_remaining = saved_overhealing_turns;
+    participant.revenge_soul_shield = saved_revenge_soul_shield;
+    participant.construct_shield = saved_construct_shield;
+    participant.construct_shield_repair_rounds_remaining = saved_construct_repair;
+    participant.arcane_shield = saved_arcane_shield;
+    resolution
+}
+
 fn is_current_redeemed_chainsword(skill: &CharacterSkill) -> bool {
     skill.name.trim() == "链锯剑"
         && skill.note.contains("近身攻击会造成5点物理伤害")
@@ -2698,6 +2804,91 @@ struct BattleDelayedDamageAdvance {
     defeat_outcomes: Vec<BattleDefeatOutcome>,
 }
 
+fn advance_radiation_protective_suits(
+    encounter: &mut BattleEncounter,
+    scene_positions: &HashMap<String, Vec3>,
+) -> BattleDelayedDamageAdvance {
+    if !encounter.active {
+        return BattleDelayedDamageAdvance::default();
+    }
+    let emitters = encounter
+        .participants
+        .iter()
+        .filter(|participant| {
+            participant.alive
+                && participant.protective_suit_kind == Some(ProtectiveSuitKind::Radiation)
+        })
+        .map(|participant| {
+            (
+                participant.target_id.clone(),
+                participant.display_name.clone(),
+                scene_positions.get(&participant.target_id).copied(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut events = Vec::new();
+    for (source_id, source_name, source_position) in emitters {
+        for (target_index, target) in encounter.participants.iter().enumerate() {
+            if !target.alive {
+                continue;
+            }
+            let in_range = target.target_id == source_id
+                || source_position.is_some_and(|source_position| {
+                    scene_positions
+                        .get(&target.target_id)
+                        .is_some_and(|target_position| {
+                            source_position.distance(*target_position) <= 3.0
+                        })
+                });
+            if in_range {
+                events.push((
+                    source_id.clone(),
+                    source_name.clone(),
+                    target_index,
+                ));
+            }
+        }
+    }
+
+    let mut advance = BattleDelayedDamageAdvance::default();
+    for (source_id, source_name, target_index) in events {
+        if !encounter.participants[target_index].alive {
+            continue;
+        }
+        let target_id = encounter.participants[target_index].target_id.clone();
+        let target_name = encounter.participants[target_index].display_name.clone();
+        let resolution = apply_participant_shield_piercing_damage_for_battle(
+            &mut encounter.participants[target_index],
+            1.0,
+            &source_id,
+            true,
+        );
+        advance.combat_log.push(CombatLogEntry {
+            round: encounter.round,
+            kind: CombatLogKind::Damage,
+            source_id: source_id.clone(),
+            source_name: source_name.clone(),
+            target_id,
+            target_name: target_name.clone(),
+            action_name: "辐射防护服".to_owned(),
+            base_amount: 1.0,
+            effective_amount: resolution.damage_applied,
+            modifiers: Vec::new(),
+            benefits: vec!["穿透护盾".to_owned()],
+        });
+        advance.logs.push(format!(
+            "{}的辐射防护服使{}失去{}点生命值（穿透护盾）",
+            source_name,
+            target_name,
+            format_number(resolution.damage_applied)
+        ));
+        if let Some(outcome) = resolution.defeat_outcome {
+            advance.defeat_outcomes.push(outcome);
+        }
+    }
+    advance
+}
+
 fn advance_participant_delayed_damage_ticks(
     participant: &mut BattleParticipantSnapshot,
     encounter_active: bool,
@@ -2728,11 +2919,12 @@ fn advance_participant_delayed_damage_ticks(
         if final_amount <= f32::EPSILON {
             continue;
         }
-        let resolution = apply_participant_damage_for_battle(
+        let resolution = apply_participant_typed_damage_for_battle(
             participant,
             final_amount,
             &tick.source_id,
             encounter_active,
+            tick.damage_type,
         );
         let mut benefits = Vec::new();
         if resolution.damage_absorbed > f32::EPSILON {
@@ -2816,11 +3008,12 @@ fn advance_participant_corrosion(
             BattleCorrosionKind::Rust => "锈蚀",
         };
         let damage = stack.damage_per_turn.max(0.0);
-        let resolution = apply_participant_damage_for_battle(
+        let resolution = apply_participant_typed_damage_for_battle(
             participant,
             damage,
             &stack.source_id,
             encounter_active,
+            DamageType::Physical,
         );
         let mut benefits = vec![format!("腐蚀波{label}")];
         if resolution.damage_absorbed > f32::EPSILON {
@@ -3132,6 +3325,20 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
             participant.hidden_role.immune_diseased.hash(&mut hasher);
             participant.hidden_role.immune_poisoning.hash(&mut hasher);
             participant.hidden_role.immune_bleed.hash(&mut hasher);
+            participant.protective_suit_kind.hash(&mut hasher);
+            participant.protective_suit_shield.to_bits().hash(&mut hasher);
+            participant
+                .protective_suit_passive_active
+                .hash(&mut hasher);
+            participant
+                .protective_suit_active_available
+                .hash(&mut hasher);
+            participant
+                .protective_suit_slow_rounds_remaining
+                .hash(&mut hasher);
+            participant
+                .protective_suit_blind_rounds_remaining
+                .hash(&mut hasher);
             participant
                 .arrogance_damage_bonus_per_source
                 .to_bits()
@@ -3308,6 +3515,10 @@ fn battle_round_panel(
     let Some(manager) = manager.as_deref_mut() else {
         return;
     };
+    store.scene_positions = scene_positions
+        .as_deref()
+        .map(|positions| positions.positions.clone())
+        .unwrap_or_default();
 
     let mut panel_open = ui_state.panel_open;
     let mut changed = false;
@@ -4045,6 +4256,33 @@ fn encounter_roster_ui(
                     participant.paralyzed_rounds_remaining
                 ));
             }
+            if let Some(kind) = participant.protective_suit_kind {
+                ui.small(format!(
+                    "{}护盾{}/{}{}",
+                    kind.label(),
+                    format_number(participant.protective_suit_shield),
+                    format_number(participant.protective_suit_shield_max),
+                    if participant.protective_suit_magic_only {
+                        "（仅魔法）"
+                    } else {
+                        ""
+                    }
+                ));
+                if !participant.protective_suit_passive_active
+                    && kind != ProtectiveSuitKind::Radiation
+                {
+                    ui.small("防护服被动已失效");
+                }
+                if participant.protective_suit_active_available {
+                    ui.small("防护服主动效果可用");
+                }
+            }
+            if participant.protective_suit_blind_rounds_remaining > 0 {
+                ui.small("致盲：本轮无法行动");
+            }
+            if participant.protective_suit_slow_rounds_remaining > 0 {
+                ui.small("急冻：本轮移速减半");
+            }
             if participant.commissar_proficiency > 0 {
                 ui.small(format!(
                     "为了帝皇熟练度 {}/5",
@@ -4567,6 +4805,57 @@ fn encounter_action_ui(
         }
     });
 
+    if let Some(kind) = actor.protective_suit_kind {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("防护服");
+            let available = actor.protective_suit_active_available;
+            let mut use_action = |label: &str, action: ProtectiveSuitAction| {
+                if ui
+                    .add_enabled(available, egui::Button::new(label))
+                    .clicked()
+                {
+                    changed |= store.use_protective_suit_action_and_finish(
+                        encounter_id,
+                        &actor.target_id,
+                        target,
+                        action,
+                        manager,
+                        scene_positions,
+                    );
+                }
+            };
+            match kind {
+                ProtectiveSuitKind::Medical => {
+                    use_action("使用治疗针（3点）", ProtectiveSuitAction::MedicalInjection);
+                },
+                ProtectiveSuitKind::Photon => {
+                    use_action("释放强光", ProtectiveSuitAction::PhotonFlash);
+                },
+                ProtectiveSuitKind::Cryogenic => {
+                    use_action("释放急冻气体", ProtectiveSuitAction::CryogenicRelease);
+                },
+                ProtectiveSuitKind::Scientist => {
+                    use_action("投掷酸液", ProtectiveSuitAction::AcidVial);
+                    use_action("腐蚀锁门", ProtectiveSuitAction::AcidDoor);
+                },
+                ProtectiveSuitKind::Maintenance => {
+                    use_action("维修锯攻击", ProtectiveSuitAction::MaintenanceSaw);
+                    use_action("拆除锁门", ProtectiveSuitAction::MaintenanceDoor);
+                },
+                ProtectiveSuitKind::Normal
+                | ProtectiveSuitKind::DarkMatter
+                | ProtectiveSuitKind::Electronic
+                | ProtectiveSuitKind::Radiation
+                | ProtectiveSuitKind::Heavy => {
+                    ui.small("无主动效果");
+                },
+            }
+            if kind.has_consumable_active() && !available {
+                ui.small("一次性装置已使用");
+            }
+        });
+    }
+
     if !skills.is_empty() {
         let selected_skill = ui_state
             .selected_skill_index
@@ -5017,6 +5306,7 @@ impl BattleRoundStore {
         if !self.encounter_is_canonical(encounter_id) {
             return false;
         }
+        let scene_positions = self.scene_positions.clone();
         let Some(encounter) = self.encounters.get_mut(encounter_id) else {
             return false;
         };
@@ -5102,6 +5392,12 @@ impl BattleRoundStore {
             if participant.paralyzed_rounds_remaining > 0 {
                 participant.paralyzed_rounds_remaining -= 1;
             }
+            if participant.protective_suit_blind_rounds_remaining > 0 {
+                participant.protective_suit_blind_rounds_remaining -= 1;
+            }
+            if participant.protective_suit_slow_rounds_remaining > 0 {
+                participant.protective_suit_slow_rounds_remaining -= 1;
+            }
             if participant.redeemed_invisibility_rounds_remaining > 0 {
                 participant.redeemed_invisibility_rounds_remaining -= 1;
             }
@@ -5126,6 +5422,10 @@ impl BattleRoundStore {
             delayed_logs.extend(delayed_healing.logs);
             delayed_combat_log.extend(delayed_healing.combat_log);
         }
+        let radiation = advance_radiation_protective_suits(encounter, &scene_positions);
+        delayed_logs.extend(radiation.logs);
+        delayed_combat_log.extend(radiation.combat_log);
+        defeat_outcomes.extend(radiation.defeat_outcomes);
         encounter.combat_completed_turns = encounter
             .combat_completed_turns
             .saturating_add(skipped_combat_turns);
@@ -5356,6 +5656,255 @@ impl BattleRoundStore {
         self.finish_resolved_actor_action(encounter_id, actor_id)
     }
 
+    fn use_protective_suit_action_and_finish(
+        &mut self,
+        encounter_id: &str,
+        actor_id: &str,
+        target_id: &str,
+        action: ProtectiveSuitAction,
+        manager: &mut NapcatMessageManager,
+        scene_positions: Option<&SceneCharacterPositions>,
+    ) -> bool {
+        if !self.encounter_is_canonical(encounter_id) {
+            return false;
+        }
+        let Some(encounter) = self.encounters.get_mut(encounter_id) else {
+            return false;
+        };
+        let Some(actor_index) = encounter
+            .participants
+            .iter()
+            .position(|participant| participant.target_id == actor_id)
+        else {
+            return false;
+        };
+        if !participant_can_act(&encounter.participants[actor_index]) {
+            return false;
+        }
+        let actor = encounter.participants[actor_index].clone();
+        let expected_kind = match action {
+            ProtectiveSuitAction::MedicalInjection => ProtectiveSuitKind::Medical,
+            ProtectiveSuitAction::PhotonFlash => ProtectiveSuitKind::Photon,
+            ProtectiveSuitAction::CryogenicRelease => ProtectiveSuitKind::Cryogenic,
+            ProtectiveSuitAction::AcidVial | ProtectiveSuitAction::AcidDoor => {
+                ProtectiveSuitKind::Scientist
+            },
+            ProtectiveSuitAction::MaintenanceSaw | ProtectiveSuitAction::MaintenanceDoor => {
+                ProtectiveSuitKind::Maintenance
+            },
+        };
+        if actor.protective_suit_kind != Some(expected_kind)
+            || !actor.protective_suit_active_available
+        {
+            return false;
+        }
+        let consumes_active = expected_kind.has_consumable_active();
+        let target_in_range = |from_id: &str, to_id: &str, radius: f32| {
+            if from_id == to_id {
+                return true;
+            }
+            scene_positions
+                .and_then(|positions| {
+                    Some((
+                        positions.positions.get(from_id)?,
+                        positions.positions.get(to_id)?,
+                    ))
+                })
+                .is_none_or(|(from, to)| from.distance(*to) <= radius)
+        };
+
+        let mut defeat_outcomes = Vec::new();
+        match action {
+            ProtectiveSuitAction::MedicalInjection => {
+                let Some(target_index) = encounter
+                    .participants
+                    .iter()
+                    .position(|participant| participant.target_id == target_id)
+                else {
+                    return false;
+                };
+                if !encounter.participants[target_index].alive
+                    || !target_in_range(actor_id, target_id, 1.0)
+                {
+                    return false;
+                }
+                let target_name = encounter.participants[target_index].display_name.clone();
+                let resolution = apply_participant_healing_for_battle(
+                    &mut encounter.participants[target_index],
+                    3.0,
+                    0.0,
+                );
+                encounter.action_log.push(format!(
+                    "{}使用医疗防护服，为{}治疗{}点生命值",
+                    actor.display_name,
+                    target_name,
+                    format_number(resolution.hp_restored)
+                ));
+                encounter.combat_log.push(CombatLogEntry {
+                    round: encounter.round,
+                    kind: CombatLogKind::Healing,
+                    source_id: actor_id.to_owned(),
+                    source_name: actor.display_name.clone(),
+                    target_id: target_id.to_owned(),
+                    target_name,
+                    action_name: "医疗防护服".to_owned(),
+                    base_amount: 3.0,
+                    effective_amount: resolution.hp_restored,
+                    modifiers: Vec::new(),
+                    benefits: Vec::new(),
+                });
+            },
+            ProtectiveSuitAction::PhotonFlash => {
+                let actor_player_side = participant_is_player_side(&actor, manager);
+                let mut affected = Vec::new();
+                for target in &mut encounter.participants {
+                    if target.alive
+                        && target.target_id != actor_id
+                        && participant_is_player_side(target, manager) != actor_player_side
+                    {
+                        target.protective_suit_blind_rounds_remaining =
+                            target.protective_suit_blind_rounds_remaining.max(1);
+                        affected.push(target.display_name.clone());
+                    }
+                }
+                encounter.action_log.push(format!(
+                    "{}释放光子防护服强光，致盲{}1回合",
+                    actor.display_name,
+                    if affected.is_empty() {
+                        "无目标".to_owned()
+                    } else {
+                        affected.join("、")
+                    }
+                ));
+            },
+            ProtectiveSuitAction::CryogenicRelease => {
+                let mut affected = Vec::new();
+                for target in &mut encounter.participants {
+                    if target.alive && target_in_range(actor_id, &target.target_id, 10.0) {
+                        target.protective_suit_slow_rounds_remaining =
+                            target.protective_suit_slow_rounds_remaining.max(1);
+                        affected.push(target.display_name.clone());
+                    }
+                }
+                encounter.action_log.push(format!(
+                    "{}释放急冻气体，使{}移速减半1回合",
+                    actor.display_name,
+                    affected.join("、")
+                ));
+            },
+            ProtectiveSuitAction::AcidVial => {
+                let Some(center_index) = encounter
+                    .participants
+                    .iter()
+                    .position(|participant| participant.target_id == target_id)
+                else {
+                    return false;
+                };
+                let center_name = encounter.participants[center_index].display_name.clone();
+                let center_position = scene_positions
+                    .and_then(|positions| positions.positions.get(target_id))
+                    .copied();
+                let target_indices = encounter
+                    .participants
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, target)| target.alive)
+                    .filter(|(_, target)| {
+                        center_position.map_or(target.target_id == target_id, |center| {
+                            scene_positions
+                                .and_then(|positions| positions.positions.get(&target.target_id))
+                                .is_some_and(|position| center.distance(*position) <= 2.0)
+                        })
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                let mut affected = Vec::new();
+                for target_index in target_indices {
+                    let target = &mut encounter.participants[target_index];
+                    let target_name = target.display_name.clone();
+                    let resolution = apply_participant_typed_damage_for_battle(
+                        target,
+                        3.0,
+                        actor_id,
+                        encounter.active,
+                        DamageType::Physical,
+                    );
+                    affected.push(format!(
+                        "{}{}点",
+                        target_name,
+                        format_number(resolution.damage_applied)
+                    ));
+                    if let Some(outcome) = resolution.defeat_outcome {
+                        defeat_outcomes.push(outcome);
+                    }
+                }
+                encounter.action_log.push(format!(
+                    "{}向{}投掷酸液：{}",
+                    actor.display_name,
+                    center_name,
+                    affected.join("、")
+                ));
+            },
+            ProtectiveSuitAction::AcidDoor => {
+                encounter.action_log.push(format!(
+                    "{}使用科学家服装的酸液腐蚀锁门（消耗1回合）",
+                    actor.display_name
+                ));
+            },
+            ProtectiveSuitAction::MaintenanceSaw => {
+                let Some(target_index) = encounter
+                    .participants
+                    .iter()
+                    .position(|participant| participant.target_id == target_id)
+                else {
+                    return false;
+                };
+                if !encounter.participants[target_index].alive
+                    || !target_in_range(actor_id, target_id, 1.0)
+                {
+                    return false;
+                }
+                let target_name = encounter.participants[target_index].display_name.clone();
+                let resolution = apply_participant_typed_damage_for_battle(
+                    &mut encounter.participants[target_index],
+                    2.0,
+                    actor_id,
+                    encounter.active,
+                    DamageType::Physical,
+                );
+                encounter.action_log.push(format!(
+                    "{}用维修锯撕裂{}，造成{}点物理伤害",
+                    actor.display_name,
+                    target_name,
+                    format_number(resolution.damage_applied)
+                ));
+                if let Some(outcome) = resolution.defeat_outcome {
+                    defeat_outcomes.push(outcome);
+                }
+            },
+            ProtectiveSuitAction::MaintenanceDoor => {
+                encounter.action_log.push(format!(
+                    "{}使用维修锯拆除锁门（消耗1回合）",
+                    actor.display_name
+                ));
+            },
+        }
+        if consumes_active {
+            encounter.participants[actor_index].protective_suit_active_available = false;
+        }
+        for outcome in defeat_outcomes {
+            apply_battle_defeat_outcome(encounter, outcome);
+        }
+        if consumes_active {
+            if let Some(character) = manager.player_characters.get_mut(actor_id) {
+                if character.protective_suit.kind == expected_kind {
+                    let _ = character.protective_suit.consume_active();
+                }
+            }
+        }
+        self.finish_resolved_actor_action(encounter_id, actor_id)
+    }
+
     fn apply_action(
         &mut self,
         encounter_id: &str,
@@ -5411,11 +5960,12 @@ impl BattleRoundStore {
         }
         let final_damage =
             damage.max(0.0) * personalized_pve_level_multiplier(&actor_snapshot, target);
-        let resolution = apply_participant_damage_for_battle(
+        let resolution = apply_participant_typed_damage_for_battle(
             target,
             final_damage,
             actor_id,
             encounter.active,
+            DamageType::Physical,
         );
         let target_display_name = target.display_name.clone();
         encounter.action_log.push(format!(
@@ -5870,11 +6420,12 @@ impl BattleRoundStore {
                                 encounter.active,
                             )
                         } else {
-                            apply_participant_damage_for_battle(
+                            apply_participant_typed_damage_for_battle(
                                 target,
                                 final_amount,
                                 actor_id,
                                 encounter.active,
+                                damage_type,
                             )
                         };
                         let applied_physical_damage =
@@ -7789,11 +8340,12 @@ fn apply_battle_buff_ticks(
                         target_large_hit_modifier,
                     ))
                 .max(0.0);
-                let resolution = apply_participant_damage_for_battle(
+                let resolution = apply_participant_typed_damage_for_battle(
                     &mut encounter.participants[target_index],
                     final_amount,
                     &tick.source_id,
                     encounter.active,
+                    damage_type,
                 );
                 let mut benefits = Vec::new();
                 if resolution.damage_absorbed > f32::EPSILON {
@@ -7847,13 +8399,17 @@ fn apply_battle_buff_ticks(
                     apply_battle_defeat_outcome(encounter, outcome);
                 }
             },
-            BuffTickAction::FixedDamage { amount, .. } => {
+            BuffTickAction::FixedDamage {
+                amount,
+                damage_type,
+            } => {
                 let final_amount = amount.max(0.0);
-                let resolution = apply_participant_damage_for_battle(
+                let resolution = apply_participant_typed_damage_for_battle(
                     &mut encounter.participants[target_index],
                     final_amount,
                     &tick.source_id,
                     encounter.active,
+                    damage_type,
                 );
                 let mut benefits = Vec::new();
                 if resolution.damage_absorbed > f32::EPSILON {
@@ -8122,6 +8678,20 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
         participant.hidden_role.immune_diseased.hash(&mut hasher);
         participant.hidden_role.immune_poisoning.hash(&mut hasher);
         participant.hidden_role.immune_bleed.hash(&mut hasher);
+        participant.protective_suit_kind.hash(&mut hasher);
+        participant.protective_suit_shield.to_bits().hash(&mut hasher);
+        participant
+            .protective_suit_passive_active
+            .hash(&mut hasher);
+        participant
+            .protective_suit_active_available
+            .hash(&mut hasher);
+        participant
+            .protective_suit_slow_rounds_remaining
+            .hash(&mut hasher);
+        participant
+            .protective_suit_blind_rounds_remaining
+            .hash(&mut hasher);
         participant
             .arrogance_damage_bonus_per_source
             .to_bits()
@@ -8330,12 +8900,29 @@ fn participant_from_character(
     );
     let character = &effective_character;
     let hidden_role = hidden_role_battle_state(manager.hidden_roles.get(target_id));
-    let opening_shield = hidden_role_opening_shield(
+    let opening_shield = hidden_role_intrinsic_opening_shield(
         manager.hidden_roles.get(target_id),
-        &character.protective_suit,
     );
+    let protective_suit_kind = character
+        .protective_suit
+        .is_intact()
+        .then_some(character.protective_suit.kind);
+    let protective_suit_all_shield = protective_suit_kind
+        .map(ProtectiveSuitKind::all_damage_shield)
+        .unwrap_or_default();
+    let protective_suit_magic_shield =
+        protective_suit_opening_magic_shield(&character.protective_suit);
+    let protective_suit_shield = protective_suit_all_shield.max(protective_suit_magic_shield);
     let status = character.status.combined(&character.extra_status);
-    let (speed, low_survivor_speed) = character_battle_speeds(character);
+    let (mut speed, mut low_survivor_speed) = character_battle_speeds(character);
+    let protective_suit_speed_bonus = if protective_suit_kind == Some(ProtectiveSuitKind::Electronic)
+    {
+        1.5
+    } else {
+        0.0
+    };
+    speed += protective_suit_speed_bonus;
+    low_survivor_speed += protective_suit_speed_bonus;
     let dominion_gain_rate = character_dominion_max_hp_gain_rate(character);
     let dominion_bonus = if dominion_gain_rate > f32::EPSILON {
         character.dominion_max_hp_bonus.clamp(
@@ -8387,6 +8974,18 @@ fn participant_from_character(
         healing_taken_modifier: character.healing_taken_modifier,
         group_modifiers: TrpgGlobalCombatModifiers::default(),
         hidden_role,
+        protective_suit_kind,
+        protective_suit_shield,
+        protective_suit_shield_max: protective_suit_shield,
+        protective_suit_magic_only: protective_suit_magic_shield > f32::EPSILON,
+        protective_suit_passive_active: protective_suit_kind.is_some(),
+        protective_suit_active_available: protective_suit_kind.is_some_and(|kind| {
+            kind == ProtectiveSuitKind::Maintenance
+                || (kind.has_consumable_active() && !character.protective_suit.active_used)
+        }),
+        protective_suit_speed_bonus,
+        protective_suit_slow_rounds_remaining: 0,
+        protective_suit_blind_rounds_remaining: 0,
         arrogance_damage_bonus_per_source: character_arrogance_damage_bonus_per_source(character),
         arrogance_damage_source_ids: Vec::new(),
         endless_pain_bonus_damage_per_stack: character_endless_pain_bonus_damage_per_stack(
@@ -8533,6 +9132,15 @@ fn participant_from_unit_template(
         healing_taken_modifier: character.healing_taken_modifier,
         group_modifiers: TrpgGlobalCombatModifiers::default(),
         hidden_role: HiddenRoleBattleState::default(),
+        protective_suit_kind: None,
+        protective_suit_shield: 0.0,
+        protective_suit_shield_max: 0.0,
+        protective_suit_magic_only: false,
+        protective_suit_passive_active: false,
+        protective_suit_active_available: false,
+        protective_suit_speed_bonus: 0.0,
+        protective_suit_slow_rounds_remaining: 0,
+        protective_suit_blind_rounds_remaining: 0,
         arrogance_damage_bonus_per_source: character_arrogance_damage_bonus_per_source(character),
         arrogance_damage_source_ids: Vec::new(),
         endless_pain_bonus_damage_per_stack: character_endless_pain_bonus_damage_per_stack(
@@ -8695,6 +9303,15 @@ fn participant_from_target(
         healing_taken_modifier: 1.0,
         group_modifiers: TrpgGlobalCombatModifiers::default(),
         hidden_role: HiddenRoleBattleState::default(),
+        protective_suit_kind: None,
+        protective_suit_shield: 0.0,
+        protective_suit_shield_max: 0.0,
+        protective_suit_magic_only: false,
+        protective_suit_passive_active: false,
+        protective_suit_active_available: false,
+        protective_suit_speed_bonus: 0.0,
+        protective_suit_slow_rounds_remaining: 0,
+        protective_suit_blind_rounds_remaining: 0,
         arrogance_damage_bonus_per_source: 0.0,
         arrogance_damage_source_ids: Vec::new(),
         endless_pain_bonus_damage_per_stack: 0.0,
@@ -8812,6 +9429,15 @@ fn participant_from_summon(
     participant.unit_character = Some(unit_character);
     participant.player_character = false;
     participant.is_summon = true;
+    participant.protective_suit_kind = None;
+    participant.protective_suit_shield = 0.0;
+    participant.protective_suit_shield_max = 0.0;
+    participant.protective_suit_magic_only = false;
+    participant.protective_suit_passive_active = false;
+    participant.protective_suit_active_available = false;
+    participant.protective_suit_speed_bonus = 0.0;
+    participant.protective_suit_slow_rounds_remaining = 0;
+    participant.protective_suit_blind_rounds_remaining = 0;
     participant.summon_owner_id = Some(owner_id.to_owned());
     participant.summon_kind = summon.kind;
     participant.level = owner.level.max(1);
@@ -9124,6 +9750,8 @@ fn sync_participant_from_manager(
         let character = &effective_character;
         let status = character.status.combined(&character.extra_status);
         let (speed, low_survivor_speed) = character_battle_speeds(character);
+        let protective_suit_speed_bonus =
+            sync_participant_protective_suit(participant, character);
         participant.display_name = character_display_name(
             &participant.target_id,
             character,
@@ -9156,8 +9784,8 @@ fn sync_participant_from_manager(
         participant.max_mp = character.max_mp;
         participant.hp_regen = character.hp_regen;
         participant.mp_regen = character.mp_regen;
-        participant.speed = speed;
-        participant.low_survivor_speed = low_survivor_speed;
+        participant.speed = speed + protective_suit_speed_bonus;
+        participant.low_survivor_speed = low_survivor_speed + protective_suit_speed_bonus;
         participant.str_ = status.str_;
         participant.agi = status.agi;
         participant.dex = status.dex;
@@ -9243,6 +9871,15 @@ fn sync_participant_from_manager(
 
 fn reset_non_player_participant_bonus_fields(participant: &mut BattleParticipantSnapshot) {
     participant.player_character = false;
+    participant.protective_suit_kind = None;
+    participant.protective_suit_shield = 0.0;
+    participant.protective_suit_shield_max = 0.0;
+    participant.protective_suit_magic_only = false;
+    participant.protective_suit_passive_active = false;
+    participant.protective_suit_active_available = false;
+    participant.protective_suit_speed_bonus = 0.0;
+    participant.protective_suit_slow_rounds_remaining = 0;
+    participant.protective_suit_blind_rounds_remaining = 0;
     participant.support_talent_experience_bonus_rate = 0.0;
     participant.low_survivor_speed = participant.speed.max(0.0);
     participant.arrogance_damage_bonus_per_source = 0.0;
@@ -9370,7 +10007,13 @@ fn participant_order_speed(
     } else {
         1.0
     };
-    base_speed * inspiration_multiplier
+    let protective_suit_slow_multiplier =
+        if participant.protective_suit_slow_rounds_remaining > 0 {
+            0.5
+        } else {
+            1.0
+        };
+    base_speed * inspiration_multiplier * protective_suit_slow_multiplier
 }
 
 /// WoW-style PvE normalization: a mob is evaluated at each interacting player's
@@ -9433,7 +10076,47 @@ fn participant_can_act(participant: &BattleParticipantSnapshot) -> bool {
         && participant.goose_channeling_turns == 0
         && participant.construct_repair_channel_rounds_remaining == 0
         && participant.paralyzed_rounds_remaining == 0
+        && participant.protective_suit_blind_rounds_remaining == 0
         && !participant.hidden_role.cocooning
+}
+
+fn sync_participant_protective_suit(
+    participant: &mut BattleParticipantSnapshot,
+    character: &PlayerCharacter,
+) -> f32 {
+    let new_kind = character
+        .protective_suit
+        .is_intact()
+        .then_some(character.protective_suit.kind);
+    if participant.protective_suit_kind != new_kind {
+        participant.protective_suit_kind = new_kind;
+        let all_shield = new_kind
+            .map(ProtectiveSuitKind::all_damage_shield)
+            .unwrap_or_default();
+        let magic_shield = protective_suit_opening_magic_shield(&character.protective_suit);
+        let shield = all_shield.max(magic_shield);
+        participant.protective_suit_shield = shield;
+        participant.protective_suit_shield_max = shield;
+        participant.protective_suit_magic_only = magic_shield > f32::EPSILON;
+        participant.protective_suit_passive_active = new_kind.is_some();
+        participant.protective_suit_active_available = new_kind.is_some_and(|kind| {
+            kind == ProtectiveSuitKind::Maintenance
+                || (kind.has_consumable_active() && !character.protective_suit.active_used)
+        });
+        participant.protective_suit_slow_rounds_remaining = 0;
+        participant.protective_suit_blind_rounds_remaining = 0;
+    } else if character.protective_suit.active_used {
+        participant.protective_suit_active_available = false;
+    }
+    let speed_bonus = if new_kind == Some(ProtectiveSuitKind::Electronic)
+        && participant.protective_suit_passive_active
+    {
+        1.5
+    } else {
+        0.0
+    };
+    participant.protective_suit_speed_bonus = speed_bonus;
+    speed_bonus
 }
 
 fn normalize_encounter_after_edit(encounter: &mut BattleEncounter) {
@@ -9446,6 +10129,11 @@ fn normalize_encounter_after_edit(encounter: &mut BattleEncounter) {
         participant.construct_shield = participant
             .construct_shield
             .clamp(0.0, participant.construct_shield_max);
+        participant.protective_suit_shield_max =
+            participant.protective_suit_shield_max.max(0.0);
+        participant.protective_suit_shield = participant
+            .protective_suit_shield
+            .clamp(0.0, participant.protective_suit_shield_max);
         participant.flying_needles_ready = participant.flying_needles_ready.min(5);
         participant.needle_case_ready = if participant.needle_case_enabled {
             participant.needle_case_ready.min(2)
@@ -10836,6 +11524,15 @@ mod area_tests {
             healing_taken_modifier: 1.0,
             group_modifiers: TrpgGlobalCombatModifiers::default(),
             hidden_role: HiddenRoleBattleState::default(),
+            protective_suit_kind: None,
+            protective_suit_shield: 0.0,
+            protective_suit_shield_max: 0.0,
+            protective_suit_magic_only: false,
+            protective_suit_passive_active: false,
+            protective_suit_active_available: false,
+            protective_suit_speed_bonus: 0.0,
+            protective_suit_slow_rounds_remaining: 0,
+            protective_suit_blind_rounds_remaining: 0,
             arrogance_damage_bonus_per_source: 0.0,
             arrogance_damage_source_ids: Vec::new(),
             endless_pain_bonus_damage_per_stack: 0.0,
@@ -10919,6 +11616,118 @@ mod area_tests {
             skill_last_used_turns: HashMap::new(),
             skill_cooldown_ready_turns: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn normal_suit_shield_breaks_before_hp_and_disables_passive() {
+        let mut participant = battle_participant("wearer");
+        participant.protective_suit_kind = Some(ProtectiveSuitKind::Normal);
+        participant.protective_suit_shield = 3.0;
+        participant.protective_suit_shield_max = 3.0;
+        participant.protective_suit_passive_active = true;
+        participant.protective_suit_active_available = true;
+
+        let resolution = apply_participant_typed_damage_for_battle(
+            &mut participant,
+            5.0,
+            "enemy",
+            true,
+            DamageType::Physical,
+        );
+
+        assert_eq!(participant.protective_suit_shield, 0.0);
+        assert_eq!(participant.hp, 8.0);
+        assert!(!participant.protective_suit_passive_active);
+        assert!(participant.protective_suit_active_available);
+        assert_eq!(resolution.damage_absorbed, 3.0);
+    }
+
+    #[test]
+    fn dark_matter_suit_only_absorbs_magical_damage() {
+        let mut participant = battle_participant("wearer");
+        participant.protective_suit_kind = Some(ProtectiveSuitKind::DarkMatter);
+        participant.protective_suit_shield = 5.0;
+        participant.protective_suit_shield_max = 5.0;
+        participant.protective_suit_magic_only = true;
+        participant.protective_suit_passive_active = true;
+
+        apply_participant_typed_damage_for_battle(
+            &mut participant,
+            2.0,
+            "enemy",
+            true,
+            DamageType::Physical,
+        );
+        assert_eq!(participant.hp, 8.0);
+        assert_eq!(participant.protective_suit_shield, 5.0);
+
+        apply_participant_typed_damage_for_battle(
+            &mut participant,
+            3.0,
+            "enemy",
+            true,
+            DamageType::Magical,
+        );
+        assert_eq!(participant.hp, 8.0);
+        assert_eq!(participant.protective_suit_shield, 2.0);
+    }
+
+    #[test]
+    fn electronic_suit_loses_speed_bonus_when_its_shield_breaks() {
+        let mut participant = battle_participant("wearer");
+        participant.speed = 6.5;
+        participant.low_survivor_speed = 6.5;
+        participant.protective_suit_kind = Some(ProtectiveSuitKind::Electronic);
+        participant.protective_suit_shield = 3.0;
+        participant.protective_suit_shield_max = 3.0;
+        participant.protective_suit_passive_active = true;
+        participant.protective_suit_speed_bonus = 1.5;
+
+        apply_participant_typed_damage_for_battle(
+            &mut participant,
+            3.0,
+            "enemy",
+            true,
+            DamageType::Physical,
+        );
+
+        assert!(!participant.protective_suit_passive_active);
+        assert_eq!(participant.speed, 5.0);
+        assert_eq!(participant.low_survivor_speed, 5.0);
+        assert_eq!(participant.protective_suit_speed_bonus, 0.0);
+    }
+
+    #[test]
+    fn radiation_suit_ticks_nearby_hp_without_consuming_shields() {
+        let mut emitter = battle_participant("emitter");
+        emitter.protective_suit_kind = Some(ProtectiveSuitKind::Radiation);
+        emitter.protective_suit_shield = 3.0;
+        emitter.protective_suit_shield_max = 3.0;
+        emitter.protective_suit_passive_active = false;
+        let mut near = battle_participant("near");
+        near.protective_suit_shield = 3.0;
+        near.protective_suit_shield_max = 3.0;
+        near.protective_suit_passive_active = true;
+        let far = battle_participant("far");
+        let mut encounter = BattleEncounter {
+            active: true,
+            participants: vec![emitter, near, far],
+            ..default()
+        };
+        let positions = HashMap::from([
+            ("emitter".to_owned(), Vec3::ZERO),
+            ("near".to_owned(), Vec3::new(3.0, 0.0, 0.0)),
+            ("far".to_owned(), Vec3::new(3.1, 0.0, 0.0)),
+        ]);
+
+        let advance = advance_radiation_protective_suits(&mut encounter, &positions);
+
+        assert_eq!(encounter.participants[0].hp, 9.0);
+        assert_eq!(encounter.participants[1].hp, 9.0);
+        assert_eq!(encounter.participants[2].hp, 10.0);
+        assert_eq!(encounter.participants[0].protective_suit_shield, 3.0);
+        assert_eq!(encounter.participants[1].protective_suit_shield, 3.0);
+        assert_eq!(advance.combat_log.len(), 2);
     }
 }
 
@@ -11728,6 +12537,15 @@ mod tests {
             healing_taken_modifier: 1.0,
             group_modifiers: TrpgGlobalCombatModifiers::default(),
             hidden_role: HiddenRoleBattleState::default(),
+            protective_suit_kind: None,
+            protective_suit_shield: 0.0,
+            protective_suit_shield_max: 0.0,
+            protective_suit_magic_only: false,
+            protective_suit_passive_active: false,
+            protective_suit_active_available: false,
+            protective_suit_speed_bonus: 0.0,
+            protective_suit_slow_rounds_remaining: 0,
+            protective_suit_blind_rounds_remaining: 0,
             arrogance_damage_bonus_per_source: 0.0,
             arrogance_damage_source_ids: Vec::new(),
             endless_pain_bonus_damage_per_stack: 0.0,
@@ -11839,6 +12657,7 @@ mod tests {
             ),
             active_encounter_id: Some("battle-4".to_owned()),
             next_encounter_index: 9,
+            scene_positions: HashMap::new(),
         };
         let json = store.to_export_json().unwrap();
         let restored = BattleRoundStore::from_export_json(&json).unwrap();
@@ -11932,6 +12751,7 @@ mod tests {
             })]),
             active_encounter_id: Some("missing".to_owned()),
             next_encounter_index: 2,
+            scene_positions: HashMap::new(),
         };
 
         let restored =
