@@ -70,7 +70,9 @@ use chat_analytics::{
 };
 use ime::*;
 use legacy_chat::{
+    legacy_rust_top_panel_frame,
     show_chat_workspace,
+    use_legacy_rust_visuals,
     ChatWorkspaceState,
 };
 use rand::RngExt;
@@ -18301,35 +18303,37 @@ pub fn ui_system(
                 .layer_id(egui::LayerId::background())
                 .max_rect(ctx.viewport_rect()),
         );
-        egui::Panel::top("chat_workspace_top_panel")
-            .resizable(false)
-            .show(&mut workspace_ui, |ui| {
-                if legacy_chat_layout {
-                    *ui.visuals_mut() = egui::Visuals::light();
+        let mut top_panel = egui::Panel::top("chat_workspace_top_panel").resizable(false);
+        if legacy_chat_layout {
+            top_panel = top_panel.frame(legacy_rust_top_panel_frame());
+        }
+        top_panel.show(&mut workspace_ui, |ui| {
+            if legacy_chat_layout {
+                use_legacy_rust_visuals(ui);
+            }
+            egui::MenuBar::new().ui(ui, |ui| {
+                file_menu_button(
+                    ui,
+                    &mut new_chat_group_modal_string_open.1,
+                    &mut trpg_group_settings.open,
+                );
+                tools_menu_button(
+                    ui,
+                    &mut rule_engine_state,
+                    &mut battle_round_state,
+                );
+                pool_menu_button(ui, &manager, trpg_group_settings);
+                feature_menu_button(ui, feature_settings, runtime_features);
+                ui.separator();
+                if runtime_features.game_scene_loaded && !feature_settings.game_scene_enabled {
+                    ui.small("场景已隐藏；重启后完全卸载");
+                } else if !runtime_features.game_scene_loaded {
+                    ui.small("无游戏场景模式");
+                } else {
+                    ui.small("Moonberry旧版聊天布局");
                 }
-                egui::MenuBar::new().ui(ui, |ui| {
-                    file_menu_button(
-                        ui,
-                        &mut new_chat_group_modal_string_open.1,
-                        &mut trpg_group_settings.open,
-                    );
-                    tools_menu_button(
-                        ui,
-                        &mut rule_engine_state,
-                        &mut battle_round_state,
-                    );
-                    pool_menu_button(ui, &manager, trpg_group_settings);
-                    feature_menu_button(ui, feature_settings, runtime_features);
-                    ui.separator();
-                    if runtime_features.game_scene_loaded && !feature_settings.game_scene_enabled {
-                        ui.small("场景已隐藏；重启后完全卸载");
-                    } else if !runtime_features.game_scene_loaded {
-                        ui.small("无游戏场景模式");
-                    } else {
-                        ui.small("Moonberry旧版聊天布局");
-                    }
-                });
             });
+        });
 
         pending_chat_requests_window(
             ctx,

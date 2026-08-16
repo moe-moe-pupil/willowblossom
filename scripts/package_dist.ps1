@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [string]$Version,
-    [string]$UpdateLogPath
+    [string]$UpdateLogPath,
+    [string]$BuildTargetDir,
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,17 +41,25 @@ if (-not (Test-Path -LiteralPath $UpdateLogPath -PathType Leaf)) {
     throw "Chinese update log does not exist: $UpdateLogPath"
 }
 
-Push-Location $repoRoot
-try {
-    & cargo build
-    if ($LASTEXITCODE -ne 0) {
-        throw "cargo build failed with exit code $LASTEXITCODE."
-    }
-} finally {
-    Pop-Location
+if ([string]::IsNullOrWhiteSpace($BuildTargetDir)) {
+    $BuildTargetDir = Join-Path $repoRoot "target"
+} elseif (-not [System.IO.Path]::IsPathRooted($BuildTargetDir)) {
+    $BuildTargetDir = Join-Path $repoRoot $BuildTargetDir
 }
 
-$builtExe = Join-Path $repoRoot "target\debug\willowblossom.exe"
+if (-not $SkipBuild) {
+    Push-Location $repoRoot
+    try {
+        & cargo build --target-dir $BuildTargetDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo build failed with exit code $LASTEXITCODE."
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+$builtExe = Join-Path $BuildTargetDir "debug\willowblossom.exe"
 if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) {
     throw "Built executable was not found: $builtExe"
 }

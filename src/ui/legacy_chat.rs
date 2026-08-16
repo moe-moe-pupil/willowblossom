@@ -3,6 +3,16 @@ use super::*;
 const LEGACY_SIDEBAR_WIDTH: f32 = 238.0;
 const LEGACY_CHAT_CARD_HEIGHT: f32 = 68.0;
 const LEGACY_SIDEBAR_CONTROLS_HEIGHT: f32 = 116.0;
+const RUST_CANVAS: egui::Color32 = egui::Color32::from_rgb(22, 16, 13);
+const RUST_PANEL: egui::Color32 = egui::Color32::from_rgb(31, 22, 18);
+const RUST_SURFACE: egui::Color32 = egui::Color32::from_rgb(48, 31, 24);
+const RUST_SURFACE_HOVER: egui::Color32 = egui::Color32::from_rgb(67, 39, 28);
+const RUST_SURFACE_ACTIVE: egui::Color32 = egui::Color32::from_rgb(92, 45, 29);
+const RUST_ORANGE: egui::Color32 = egui::Color32::from_rgb(205, 91, 45);
+const RUST_ORANGE_BRIGHT: egui::Color32 = egui::Color32::from_rgb(235, 137, 76);
+const RUST_TEXT: egui::Color32 = egui::Color32::from_rgb(238, 220, 201);
+const RUST_TEXT_MUTED: egui::Color32 = egui::Color32::from_rgb(177, 148, 126);
+const RUST_BORDER: egui::Color32 = egui::Color32::from_rgb(101, 58, 39);
 
 #[derive(Default)]
 pub(super) struct ChatWorkspaceState {
@@ -39,7 +49,8 @@ pub(super) fn show_chat_workspace(
     let mut selected_from_sidebar = None;
     let sidebar_frame = if legacy_layout {
         egui::Frame::new()
-            .fill(egui::Color32::WHITE)
+            .fill(RUST_PANEL)
+            .stroke(egui::Stroke::new(1.0, RUST_BORDER))
             .inner_margin(egui::Margin::same(10))
     } else {
         egui::Frame::side_top_panel(&ctx.style_of(ctx.theme())).inner_margin(egui::Margin::same(10))
@@ -51,7 +62,7 @@ pub(super) fn show_chat_workspace(
         .frame(sidebar_frame)
         .show(root_ui, |ui| {
             if legacy_layout {
-                use_legacy_light_visuals(ui);
+                use_legacy_rust_visuals(ui);
                 ui.heading("Moonberry 聊天");
             } else {
                 ui.heading("聊天工作区");
@@ -142,7 +153,7 @@ pub(super) fn show_chat_workspace(
     let active_target = state.selected_target.clone();
     let central_frame = if legacy_layout {
         egui::Frame::new()
-            .fill(egui::Color32::from_rgb(245, 246, 248))
+            .fill(RUST_CANVAS)
             .inner_margin(egui::Margin::same(12))
     } else {
         egui::Frame::central_panel(&ctx.style_of(ctx.theme())).inner_margin(egui::Margin::same(12))
@@ -151,7 +162,7 @@ pub(super) fn show_chat_workspace(
         .frame(central_frame)
         .show(root_ui, |ui| {
             if legacy_layout {
-                use_legacy_light_visuals(ui);
+                use_legacy_rust_visuals(ui);
             }
             let Some(target_id) = active_target.as_deref() else {
                 ui.centered_and_justified(|ui| {
@@ -300,7 +311,7 @@ fn chat_target_card(
         let visuals = ui.visuals();
         let fill = if selected {
             if legacy_layout {
-                egui::Color32::from_rgb(235, 235, 235)
+                RUST_SURFACE_ACTIVE
             } else {
                 visuals.selection.bg_fill
             }
@@ -327,13 +338,9 @@ fn chat_target_card(
         );
 
         let text_left = rect.left() + 51.0;
-        let primary_color =
-            if legacy_layout { egui::Color32::from_gray(35) } else { visuals.text_color() };
-        let secondary_color = if legacy_layout {
-            egui::Color32::from_gray(105)
-        } else {
-            visuals.weak_text_color()
-        };
+        let primary_color = if legacy_layout { RUST_TEXT } else { visuals.text_color() };
+        let secondary_color =
+            if legacy_layout { RUST_TEXT_MUTED } else { visuals.weak_text_color() };
         ui.painter().text(
             egui::pos2(text_left, rect.top() + 10.0),
             egui::Align2::LEFT_TOP,
@@ -416,7 +423,57 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn use_legacy_light_visuals(ui: &mut Ui) { *ui.visuals_mut() = egui::Visuals::light(); }
+pub(super) fn use_legacy_rust_visuals(ui: &mut Ui) { *ui.visuals_mut() = legacy_rust_visuals(); }
+
+pub(super) fn legacy_rust_top_panel_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(RUST_PANEL)
+        .stroke(egui::Stroke::new(1.0, RUST_BORDER))
+        .inner_margin(egui::Margin::symmetric(8, 5))
+}
+
+fn legacy_rust_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.override_text_color = Some(RUST_TEXT);
+    visuals.weak_text_color = Some(RUST_TEXT_MUTED);
+    visuals.panel_fill = RUST_PANEL;
+    visuals.window_fill = RUST_PANEL;
+    visuals.extreme_bg_color = RUST_CANVAS;
+    visuals.text_edit_bg_color = Some(RUST_CANVAS);
+    visuals.code_bg_color = RUST_SURFACE;
+    visuals.faint_bg_color = egui::Color32::from_rgb(37, 25, 20);
+    visuals.hyperlink_color = RUST_ORANGE_BRIGHT;
+    visuals.warn_fg_color = RUST_ORANGE_BRIGHT;
+    visuals.selection.bg_fill = RUST_SURFACE_ACTIVE;
+    visuals.selection.stroke = egui::Stroke::new(1.0, RUST_ORANGE_BRIGHT);
+    visuals.window_stroke = egui::Stroke::new(1.0, RUST_BORDER);
+
+    visuals.widgets.noninteractive.weak_bg_fill = RUST_PANEL;
+    visuals.widgets.noninteractive.bg_fill = RUST_PANEL;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, RUST_BORDER);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, RUST_TEXT_MUTED);
+
+    visuals.widgets.inactive.weak_bg_fill = RUST_SURFACE;
+    visuals.widgets.inactive.bg_fill = RUST_SURFACE;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, RUST_BORDER);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, RUST_TEXT);
+
+    visuals.widgets.hovered.weak_bg_fill = RUST_SURFACE_HOVER;
+    visuals.widgets.hovered.bg_fill = RUST_SURFACE_HOVER;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, RUST_ORANGE);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, RUST_TEXT);
+
+    visuals.widgets.active.weak_bg_fill = RUST_SURFACE_ACTIVE;
+    visuals.widgets.active.bg_fill = RUST_SURFACE_ACTIVE;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, RUST_ORANGE_BRIGHT);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, RUST_TEXT);
+
+    visuals.widgets.open.weak_bg_fill = RUST_SURFACE_HOVER;
+    visuals.widgets.open.bg_fill = RUST_SURFACE;
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, RUST_ORANGE);
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, RUST_TEXT);
+    visuals
+}
 
 #[cfg(test)]
 mod tests {
@@ -451,6 +508,23 @@ mod tests {
         assert_eq!(
             state.selected_target.as_deref(),
             Some("42")
+        );
+    }
+
+    #[test]
+    fn legacy_theme_uses_dark_rust_palette() {
+        let visuals = legacy_rust_visuals();
+
+        assert!(visuals.dark_mode);
+        assert_eq!(visuals.panel_fill, RUST_PANEL);
+        assert_eq!(visuals.extreme_bg_color, RUST_CANVAS);
+        assert_eq!(
+            visuals.selection.stroke.color,
+            RUST_ORANGE_BRIGHT
+        );
+        assert_ne!(
+            visuals.widgets.hovered.bg_fill,
+            visuals.widgets.inactive.bg_fill
         );
     }
 }
