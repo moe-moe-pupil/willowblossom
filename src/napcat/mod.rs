@@ -1694,6 +1694,44 @@ fn portrait_transformed_display_name(
     }
 }
 
+fn scoped_portrait_sender_name(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    fallback: &str,
+    member_ids: &[String],
+) -> String {
+    let sender_name = portrait_transformed_display_name(manager, target_id, fallback);
+    let matching_members = member_ids
+        .iter()
+        .filter(|member_id| {
+            let member_fallback = manager
+                .messages
+                .get(member_id.as_str())
+                .and_then(|messages| {
+                    messages.iter().rev().find_map(|message| {
+                        (message.data.sender.user_id.to_string() == member_id.as_str())
+                            .then(|| message.data.sender.nickname.trim())
+                            .filter(|nickname| !nickname.is_empty())
+                            .map(str::to_owned)
+                    })
+                })
+                .unwrap_or_else(|| private_target_display_name(manager, member_id));
+            portrait_transformed_display_name(manager, member_id, &member_fallback) == sender_name
+        })
+        .collect::<Vec<_>>();
+    if matching_members.len() <= 1 {
+        return sender_name;
+    }
+
+    let suffix = matching_members
+        .iter()
+        .position(|member_id| member_id.as_str() == target_id)
+        .map(|index| index + 1);
+    suffix
+        .map(|suffix| format!("{sender_name}{suffix}"))
+        .unwrap_or(sender_name)
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CharacterBuffBaseStats {
     #[serde(default = "default_character_hp")]
@@ -10941,11 +10979,6 @@ fn auto_forward_request(
     }
 
     let text = quoted_auto_forward_text(message)?;
-    let sender_name = portrait_transformed_display_name(
-        manager,
-        target_id,
-        &message.data.sender.nickname,
-    );
     let sender_access = auto_forward_sender_access(manager, target_id);
     if sender_access.is_none()
         && manager
@@ -10955,10 +10988,17 @@ fn auto_forward_request(
     {
         return None;
     }
-    let recipients = manager
+    let chat_group = manager
         .groups
         .values()
-        .find(|group| group.members.iter().any(|member_id| member_id == target_id))?
+        .find(|group| group.members.iter().any(|member_id| member_id == target_id))?;
+    let sender_name = scoped_portrait_sender_name(
+        manager,
+        target_id,
+        &message.data.sender.nickname,
+        &chat_group.members,
+    );
+    let recipients = chat_group
         .members
         .iter()
         .filter(|member_id| member_id.as_str() != target_id)
@@ -11053,10 +11093,11 @@ fn party_channel_auto_forward_request(
         return None;
     }
 
-    let sender_name = portrait_transformed_display_name(
+    let sender_name = scoped_portrait_sender_name(
         manager,
         target_id,
         &message.data.sender.nickname,
+        &party.players,
     );
     let forwarded_text = if party.anonymous {
         let party_name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
@@ -16240,13 +16281,13 @@ position_cells = [4, 5, 6]
     #[test]
     fn portrait_transform_changes_discussion_and_named_channel_sender_only() {
         let mut manager = empty_manager();
-        for user_id in [2, 3] {
+        for user_id in [2, 3, 4] {
             manager.messages.insert(user_id.to_string(), vec![
                 test_private_message_from(user_id, "hello"),
             ]);
         }
         manager.groups.insert("讨论组".to_owned(), ChatGroup {
-            members: vec!["2".to_owned(), "3".to_owned()],
+            members: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
         });
         manager
             .player_characters
@@ -16262,6 +16303,10 @@ position_cells = [4, 5, 6]
                 nickname: "伪装身份".to_owned(),
                 ..Default::default()
             });
+        manager.messages.get_mut("3").unwrap()[0]
+            .data
+            .sender
+            .nickname = "伪装身份".to_owned();
 
         let discussion = auto_forward_request(
             &manager,
@@ -16269,21 +16314,54 @@ position_cells = [4, 5, 6]
             "2",
         )
         .expect("discussion-group forwarding should be available");
-        assert_eq!(discussion.text, "伪装身份: 你好");
+        assert_eq!(discussion.text, "伪装身份1: 你好");
+        let mut second_discussion_message = test_private_message_from(3, "\"你好\"");
+        second_discussion_message.data.sender.nickname = "伪装身份".to_owned();
+        let second_discussion = auto_forward_request(
+            &manager,
+            &second_discussion_message,
+            "3",
+        )
+        .expect("second duplicate discussion-group sender should be available");
+        assert_eq!(
+            second_discussion.text,
+            "伪装身份2: 你好"
+        );
+
+        manager
+            .groups
+            .get_mut("讨论组")
+            .unwrap()
+            .members
+            .retain(|member_id| member_id != "3");
+        let discussion_after_leave = auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "\"再次你好\""),
+            "2",
+        )
+        .expect("remaining discussion-group recipients should be available");
+        assert_eq!(
+            discussion_after_leave.text,
+            "伪装身份: 再次你好"
+        );
 
         let mut group = TrpgGroup {
-            players: vec!["2".to_owned(), "3".to_owned()],
+            players: vec!["2".to_owned(), "3".to_owned(), "4".to_owned()],
             ..Default::default()
         };
         group.ensure_party("red");
         group.parties.get_mut("red").unwrap().name = "红队".to_owned();
         group.set_player_party("2", Some("red"));
         group.set_player_party("3", Some("red"));
+        group.set_player_party("4", Some("red"));
         manager.trpg_groups.insert("table".to_owned(), group);
         manager.current_trpg_group = Some("table".to_owned());
         let sender = manager.player_characters.get_mut("2").unwrap();
         sender.portrait_transform = Some(PortraitTransform::DefaultAvatar);
         sender.portrait_transform_name = "临时旅人".to_owned();
+        let duplicate = manager.player_characters.get_mut("3").unwrap();
+        duplicate.portrait_transform = Some(PortraitTransform::DefaultAvatar);
+        duplicate.portrait_transform_name = "临时旅人".to_owned();
 
         let Some(PartyChannelAutoForward::Forward(channel)) = party_channel_auto_forward_request(
             &manager,
@@ -16294,7 +16372,39 @@ position_cells = [4, 5, 6]
         };
         assert_eq!(
             channel.text,
-            "【红队频道】临时旅人: 频道消息"
+            "【红队频道】临时旅人1: 频道消息"
+        );
+        let Some(PartyChannelAutoForward::Forward(second_channel)) =
+            party_channel_auto_forward_request(
+                &manager,
+                &test_private_message_from(3, "[频道消息]"),
+                "3",
+            )
+        else {
+            panic!("second duplicate channel sender should be available");
+        };
+        assert_eq!(
+            second_channel.text,
+            "【红队频道】临时旅人2: 频道消息"
+        );
+
+        assert!(manager
+            .trpg_groups
+            .get_mut("table")
+            .unwrap()
+            .set_player_party_membership("3", "red", false));
+        let Some(PartyChannelAutoForward::Forward(channel_after_leave)) =
+            party_channel_auto_forward_request(
+                &manager,
+                &test_private_message_from(2, "[再次发送]"),
+                "2",
+            )
+        else {
+            panic!("remaining channel recipients should be available");
+        };
+        assert_eq!(
+            channel_after_leave.text,
+            "【红队频道】临时旅人: 再次发送"
         );
 
         manager
