@@ -726,6 +726,9 @@ pub struct InventoryItem {
     /// 使用道具后把使用者的立绘变成该外观。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portrait_transform: Option<PortraitTransform>,
+    /// 使用默认头像变形时，在频道和讨论组中显示的临时名称。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub portrait_transform_name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -783,6 +786,7 @@ impl Default for InventoryItem {
             stat_effects: Vec::new(),
             skills: Vec::new(),
             portrait_transform: None,
+            portrait_transform_name: String::new(),
         }
     }
 }
@@ -1435,6 +1439,9 @@ pub struct PlayerCharacter {
     pub image: String,
     #[serde(default)]
     pub portrait_transform: Option<PortraitTransform>,
+    /// 使用默认头像变形时，在频道和讨论组中显示的临时名称。
+    #[serde(default)]
+    pub portrait_transform_name: String,
     #[serde(default)]
     pub creation_step: CharacterCreationStep,
     #[serde(default = "default_status_points")]
@@ -1521,6 +1528,7 @@ impl Default for PlayerCharacter {
             nickname: String::new(),
             image: String::new(),
             portrait_transform: None,
+            portrait_transform_name: String::new(),
             creation_step: CharacterCreationStep::Normal,
             status_points: default_status_points(),
             exchange_points: default_exchange_points(),
@@ -1646,11 +1654,44 @@ pub(crate) fn apply_item_portrait_transform(
     character: &mut PlayerCharacter,
     item: &InventoryItem,
 ) -> bool {
-    if character.portrait_transform == item.portrait_transform {
+    let transform_name = match item.portrait_transform {
+        Some(PortraitTransform::DefaultAvatar) => item.portrait_transform_name.trim().to_owned(),
+        _ => String::new(),
+    };
+    if character.portrait_transform == item.portrait_transform
+        && character.portrait_transform_name == transform_name
+    {
         return false;
     }
     character.portrait_transform = item.portrait_transform.clone();
+    character.portrait_transform_name = transform_name;
     true
+}
+
+fn portrait_transformed_display_name(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    fallback: &str,
+) -> String {
+    let Some(character) = manager.player_characters.get(target_id) else {
+        return fallback.to_owned();
+    };
+    match character.portrait_transform.as_ref() {
+        Some(PortraitTransform::DefaultAvatar) => {
+            let temporary_name = character.portrait_transform_name.trim();
+            if temporary_name.is_empty() {
+                fallback.to_owned()
+            } else {
+                temporary_name.to_owned()
+            }
+        },
+        Some(PortraitTransform::OtherPlayer(other_id)) => manager
+            .player_characters
+            .get(other_id)
+            .map(|other| character_display_name(other, fallback))
+            .unwrap_or_else(|| fallback.to_owned()),
+        None => fallback.to_owned(),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -10900,6 +10941,11 @@ fn auto_forward_request(
     }
 
     let text = quoted_auto_forward_text(message)?;
+    let sender_name = portrait_transformed_display_name(
+        manager,
+        target_id,
+        &message.data.sender.nickname,
+    );
     let sender_access = auto_forward_sender_access(manager, target_id);
     if sender_access.is_none()
         && manager
@@ -10935,13 +10981,10 @@ fn auto_forward_request(
 
     Some(AutoForwardRequest {
         recipients,
-        text: format!(
-            "{}: {}",
-            message.data.sender.nickname, text
-        ),
+        text: format!("{}: {}", sender_name, text),
         forwarded: Some(ForwardedAttribution {
             sender_id: message.data.user_id,
-            sender_name: message.data.sender.nickname.clone(),
+            sender_name,
             text,
             source_time: message.data.time,
         }),
@@ -11010,6 +11053,11 @@ fn party_channel_auto_forward_request(
         return None;
     }
 
+    let sender_name = portrait_transformed_display_name(
+        manager,
+        target_id,
+        &message.data.sender.nickname,
+    );
     let forwarded_text = if party.anonymous {
         let party_name = if party.name.trim().is_empty() { party_id } else { party.name.trim() };
         format!(
@@ -11025,7 +11073,7 @@ fn party_channel_auto_forward_request(
         };
         format!(
             "【{}】{}: {}",
-            channel_name, message.data.sender.nickname, channel_message.text
+            channel_name, sender_name, channel_message.text
         )
     };
     Some(PartyChannelAutoForward::Forward(
@@ -11034,7 +11082,7 @@ fn party_channel_auto_forward_request(
             text: forwarded_text,
             forwarded: (!party.anonymous).then(|| ForwardedAttribution {
                 sender_id: message.data.user_id,
-                sender_name: message.data.sender.nickname.clone(),
+                sender_name,
                 text: channel_message.text,
                 source_time: message.data.time,
             }),
@@ -12042,6 +12090,7 @@ position_cells = [4, 5, 6]
         let item = InventoryItem {
             name: "易容面具".to_owned(),
             portrait_transform: Some(PortraitTransform::DefaultAvatar),
+            portrait_transform_name: "无名旅人".to_owned(),
             ..Default::default()
         };
 
@@ -12052,6 +12101,10 @@ position_cells = [4, 5, 6]
         assert_eq!(
             character.portrait_transform,
             Some(PortraitTransform::DefaultAvatar)
+        );
+        assert_eq!(
+            character.portrait_transform_name,
+            "无名旅人"
         );
         assert!(!apply_item_portrait_transform(
             &mut character,
@@ -16182,6 +16235,85 @@ position_cells = [4, 5, 6]
             "2",
         )
         .is_none());
+    }
+
+    #[test]
+    fn portrait_transform_changes_discussion_and_named_channel_sender_only() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message_from(user_id, "hello"),
+            ]);
+        }
+        manager.groups.insert("讨论组".to_owned(), ChatGroup {
+            members: vec!["2".to_owned(), "3".to_owned()],
+        });
+        manager
+            .player_characters
+            .insert("2".to_owned(), PlayerCharacter {
+                portrait_transform: Some(PortraitTransform::OtherPlayer(
+                    "3".to_owned(),
+                )),
+                ..Default::default()
+            });
+        manager
+            .player_characters
+            .insert("3".to_owned(), PlayerCharacter {
+                nickname: "伪装身份".to_owned(),
+                ..Default::default()
+            });
+
+        let discussion = auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "\"你好\""),
+            "2",
+        )
+        .expect("discussion-group forwarding should be available");
+        assert_eq!(discussion.text, "伪装身份: 你好");
+
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.parties.get_mut("red").unwrap().name = "红队".to_owned();
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("red"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+        let sender = manager.player_characters.get_mut("2").unwrap();
+        sender.portrait_transform = Some(PortraitTransform::DefaultAvatar);
+        sender.portrait_transform_name = "临时旅人".to_owned();
+
+        let Some(PartyChannelAutoForward::Forward(channel)) = party_channel_auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "[频道消息]"),
+            "2",
+        ) else {
+            panic!("named-channel forwarding should be available");
+        };
+        assert_eq!(
+            channel.text,
+            "【红队频道】临时旅人: 频道消息"
+        );
+
+        manager
+            .trpg_groups
+            .get_mut("table")
+            .unwrap()
+            .parties
+            .get_mut("red")
+            .unwrap()
+            .anonymous = true;
+        let Some(PartyChannelAutoForward::Forward(anonymous)) = party_channel_auto_forward_request(
+            &manager,
+            &test_private_message_from(2, "[匿名消息]"),
+            "2",
+        ) else {
+            panic!("anonymous-channel forwarding should be available");
+        };
+        assert_eq!(anonymous.text, "红队(匿名): 匿名消息");
+        assert!(anonymous.forwarded.is_none());
     }
 
     #[test]

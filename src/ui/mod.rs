@@ -8122,6 +8122,7 @@ fn portrait_transform_editor_ui(
     id_salt: impl std::hash::Hash + std::fmt::Debug,
     label: &str,
     transform: &mut Option<crate::napcat::PortraitTransform>,
+    transform_name: &mut String,
     portrait_options: &[(String, String)],
 ) -> bool {
     let mut changed = false;
@@ -8173,6 +8174,30 @@ fn portrait_transform_editor_ui(
                 }
             });
     });
+    if matches!(
+        transform.as_ref(),
+        Some(crate::napcat::PortraitTransform::DefaultAvatar)
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("临时名称");
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(transform_name)
+                        .hint_text("请GM填写频道/讨论组显示名")
+                        .desired_width(220.0),
+                )
+                .changed();
+        });
+        if transform_name.trim().is_empty() {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "使用默认头像前，请GM添加临时名称。",
+            );
+        }
+    } else if !transform_name.is_empty() {
+        transform_name.clear();
+        changed = true;
+    }
     changed
 }
 
@@ -8483,6 +8508,7 @@ fn character_editor_ui(
         ("portrait_transform", target_id),
         "立绘变形",
         &mut character.portrait_transform,
+        &mut character.portrait_transform_name,
         portrait_options,
     );
 
@@ -11059,6 +11085,12 @@ fn use_portrait_transform_item(character: &mut PlayerCharacter, index: usize) {
         return;
     };
     character.portrait_transform = Some(transform);
+    character.portrait_transform_name = match character.portrait_transform.as_ref() {
+        Some(crate::napcat::PortraitTransform::DefaultAvatar) => {
+            item.portrait_transform_name.trim().to_owned()
+        },
+        _ => String::new(),
+    };
     if item.stack > 1 {
         character.inventory.items[index].stack -= 1;
     } else {
@@ -14513,6 +14545,7 @@ fn inventory_item_definition_ui(
         ui.next_auto_id(),
         "使用效果：立绘变形",
         &mut item.portrait_transform,
+        &mut item.portrait_transform_name,
         portrait_options,
     );
     if item.portrait_transform.is_some() {
@@ -21007,6 +21040,7 @@ mod tests {
             }],
             skills: vec![item_skill],
             portrait_transform: None,
+            portrait_transform_name: String::new(),
         };
         let character = PlayerCharacter {
             inited: true,
