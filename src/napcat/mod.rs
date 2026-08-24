@@ -1,3 +1,4 @@
+mod dice;
 mod receipts;
 
 use std::{
@@ -41,6 +42,7 @@ use crossbeam_channel::{
     Receiver as CBReceiver,
     Sender as CBSender,
 };
+use dice::roll_dice_command;
 use futures_util::{
     SinkExt,
     StreamExt,
@@ -8296,6 +8298,9 @@ fn handle_private_player_command(
     text: &str,
     message_time: u64,
 ) -> Option<String> {
+    if let Some(response) = roll_dice_command(text) {
+        return Some(response);
+    }
     if let Some(response) = handle_pending_talent_choice(manager, target_id, text) {
         return Some(response);
     }
@@ -8362,6 +8367,9 @@ fn format_private_help() -> String {
         "玩家命令帮助",
         "命令前缀可混用半角【.】或全角【。】，例如 .help / 。help。",
         "【.兑换】开始创建角色",
+        "【.r】或【.rd】投掷D100；【.r2d3】投掷2D3",
+        "【.roll 2d6+3】或【.d 2d6+3】计算骰子表达式（支持 + - * / 和括号）",
+        "骰点后可用 # 添加说明，例如【.r 1d20+5 # 侦查】",
         "【.状态】查看角色当前状态",
         "【.属性说明】查看八项属性的完整说明",
         "【.魔网】或【.weave】感知魔网",
