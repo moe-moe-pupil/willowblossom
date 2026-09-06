@@ -15,6 +15,7 @@ enum DiceExpression {
     Dice {
         count: u32,
         faces: u32,
+        modifier: DiceModifier,
     },
     Negate(Box<DiceExpression>),
     Binary {
@@ -22,6 +23,15 @@ enum DiceExpression {
         operator: BinaryOperator,
         right: Box<DiceExpression>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiceModifier {
+    None,
+    DropLowest(u32),
+    DropHighest(u32),
+    KeepHighest(u32),
+    KeepLowest(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,9 +53,13 @@ struct ParsedDiceCommand {
 struct DiceTermResult {
     notation: String,
     values: Vec<u32>,
+    dropped: Vec<usize>,
 }
 
 pub(super) fn roll_dice_command(text: &str) -> Option<String> {
+    if let Some(response) = roll_dnd5_ability_score_command(text) {
+        return Some(response);
+    }
     let parsed = match parse_dice_command(text)? {
         Ok(parsed) => parsed,
         Err(error) => return Some(format!("骰点表达式无效：{error}")),
@@ -66,7 +80,7 @@ pub(super) fn roll_dice_command(text: &str) -> Option<String> {
         lines.push(
             dice_terms
                 .iter()
-                .map(|term| format!("{}={:?}", term.notation, term.values))
+                .map(format_dice_term)
                 .collect::<Vec<_>>()
                 .join("；"),
         );
@@ -79,6 +93,96 @@ pub(super) fn roll_dice_command(text: &str) -> Option<String> {
         lines.push(format!("说明：{description}"));
     }
     Some(lines.join("\n"))
+}
+
+fn format_dice_term(term: &DiceTermResult) -> String {
+    let values = term
+        .values
+        .iter()
+        .enumerate()
+        .map(|(position, value)| {
+            if term.dropped.contains(&position) {
+                format!("{value}↓")
+            } else {
+                value.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}=[{}]", term.notation, values)
+}
+
+fn roll_dnd5_ability_score_command(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let body = trimmed
+        .strip_prefix('.')
+        .or_else(|| trimmed.strip_prefix('。'))?
+        .trim_start();
+    let rest = dnd5_command_rest(body)?;
+    if !rest.is_empty()
+        && !rest.starts_with('#')
+        && !rest.as_bytes()[0].is_ascii_whitespace()
+    {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let description = rest.strip_prefix('#').unwrap_or(rest).trim().to_owned();
+    let description = (!description.is_empty()).then_some(description);
+    let mut rng = rand::rng();
+    Some(roll_dnd5_ability_scores(
+        description.as_deref(),
+        &mut || rng.random_range(1..=6),
+    ))
+}
+
+fn dnd5_command_rest(body: &str) -> Option<&str> {
+    if body.len() >= 5
+        && body
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("dnd5e"))
+    {
+        return Some(&body[5..]);
+    }
+    if body.len() >= 4
+        && body
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("dnd5"))
+    {
+        return Some(&body[4..]);
+    }
+    None
+}
+
+fn roll_dnd5_ability_scores(
+    description: Option<&str>,
+    roll: &mut impl FnMut() -> u32,
+) -> String {
+    let mut lines = vec!["掷骰【D&D5E属性生成 4d6dl1×6】".to_owned()];
+    let mut total = 0u32;
+    for index in 1..=6 {
+        let values = (0..4).map(|_| roll()).collect::<Vec<_>>();
+        let dropped = dropped_indices(&values, DiceModifier::DropLowest(1));
+        let kept = values
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| !dropped.contains(position))
+            .map(|(_, value)| *value)
+            .sum::<u32>();
+        total += kept;
+        lines.push(format!(
+            "第{index}组 {} → {kept}",
+            format_dice_term(&DiceTermResult {
+                notation: "4d6dl1".to_owned(),
+                values,
+                dropped,
+            })
+        ));
+    }
+    lines.push(format!("合计：{total}"));
+    if let Some(description) = description {
+        lines.push(format!("说明：{description}"));
+    }
+    lines.join("\n")
 }
 
 fn parse_dice_command(text: &str) -> Option<Result<ParsedDiceCommand, String>> {
@@ -299,12 +403,53 @@ impl<'a> DiceParser<'a> {
                 "骰子面数必须在1到{MAX_DIE_FACES}之间"
             ));
         }
+        let modifier = self.parse_dice_modifier(count)?;
         self.total_dice = self
             .total_dice
             .checked_add(count)
             .filter(|total| *total <= MAX_TOTAL_DICE)
             .ok_or_else(|| format!("一次最多投掷{MAX_TOTAL_DICE}颗骰子"))?;
-        Ok(DiceExpression::Dice { count, faces })
+        Ok(DiceExpression::Dice {
+            count,
+            faces,
+            modifier,
+        })
+    }
+
+    fn parse_dice_modifier(&mut self, count: u32) -> Result<DiceModifier, String> {
+        let bytes = self.input.as_bytes();
+        let kind = match bytes.get(self.position..self.position + 2) {
+            Some(suffix)
+                if suffix[0].is_ascii_alphabetic() && suffix[1].is_ascii_alphabetic() =>
+            {
+                (
+                    suffix[0].to_ascii_lowercase(),
+                    suffix[1].to_ascii_lowercase(),
+                )
+            },
+            _ => return Ok(DiceModifier::None),
+        };
+        let (label, constructor) = match kind {
+            (b'd', b'l') => ("dl", DiceModifier::DropLowest as fn(u32) -> DiceModifier),
+            (b'd', b'h') => ("dh", DiceModifier::DropHighest as fn(u32) -> DiceModifier),
+            (b'k', b'h') => ("kh", DiceModifier::KeepHighest as fn(u32) -> DiceModifier),
+            (b'k', b'l') => ("kl", DiceModifier::KeepLowest as fn(u32) -> DiceModifier),
+            _ => return Ok(DiceModifier::None),
+        };
+        self.position += 2;
+        if !self.peek_byte().is_some_and(|byte| byte.is_ascii_digit()) {
+            return Err(format!("骰子修饰符{label}后缺少数量，例如4d6{label}1"));
+        }
+        let amount = self.parse_unsigned_integer()?;
+        let amount = u32::try_from(amount)
+            .map_err(|_| format!("骰子修饰符{label}数量过大"))?;
+        if amount == 0 || amount >= count {
+            return Err(format!(
+                "骰子修饰符{label}的数量必须在1到{}之间",
+                count - 1
+            ));
+        }
+        Ok(constructor(amount))
     }
 
     fn parse_unsigned_integer(&mut self) -> Result<u64, String> {
@@ -340,12 +485,23 @@ fn evaluate_expression(
 ) -> Result<f64, String> {
     let result = match expression {
         DiceExpression::Number(number) => *number,
-        DiceExpression::Dice { count, faces } => {
+        DiceExpression::Dice {
+            count,
+            faces,
+            modifier,
+        } => {
             let values = (0..*count).map(|_| roll(*faces)).collect::<Vec<_>>();
-            let total = values.iter().map(|value| *value as f64).sum();
+            let dropped = dropped_indices(&values, *modifier);
+            let total = values
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| !dropped.contains(position))
+                .map(|(_, value)| *value as f64)
+                .sum();
             dice_terms.push(DiceTermResult {
-                notation: format!("{count}d{faces}"),
+                notation: format_dice_notation(*count, *faces, *modifier),
                 values,
+                dropped,
             });
             total
         },
@@ -374,6 +530,35 @@ fn evaluate_expression(
     Ok(result)
 }
 
+fn format_dice_notation(count: u32, faces: u32, modifier: DiceModifier) -> String {
+    match modifier {
+        DiceModifier::None => format!("{count}d{faces}"),
+        DiceModifier::DropLowest(amount) => format!("{count}d{faces}dl{amount}"),
+        DiceModifier::DropHighest(amount) => format!("{count}d{faces}dh{amount}"),
+        DiceModifier::KeepHighest(amount) => format!("{count}d{faces}kh{amount}"),
+        DiceModifier::KeepLowest(amount) => format!("{count}d{faces}kl{amount}"),
+    }
+}
+
+fn dropped_indices(values: &[u32], modifier: DiceModifier) -> Vec<usize> {
+    let (amount, from_highest) = match modifier {
+        DiceModifier::None => return Vec::new(),
+        DiceModifier::DropLowest(amount) => (amount as usize, false),
+        DiceModifier::DropHighest(amount) => (amount as usize, true),
+        DiceModifier::KeepHighest(amount) => (values.len() - amount as usize, false),
+        DiceModifier::KeepLowest(amount) => (values.len() - amount as usize, true),
+    };
+    let mut order = (0..values.len()).collect::<Vec<_>>();
+    if from_highest {
+        order.sort_by_key(|&position| std::cmp::Reverse(values[position]));
+    } else {
+        order.sort_by_key(|&position| values[position]);
+    }
+    let mut dropped = order.into_iter().take(amount).collect::<Vec<_>>();
+    dropped.sort_unstable();
+    dropped
+}
+
 fn format_result(result: f64) -> String {
     if result.fract().abs() < f64::EPSILON {
         format!("{result:.0}")
@@ -398,14 +583,19 @@ mod tests {
             default.expression,
             DiceExpression::Dice {
                 count: 1,
-                faces: 100
+                faces: 100,
+                modifier: DiceModifier::None,
             }
         );
 
         let explicit = parse_dice_command("。r2D3").unwrap().unwrap();
         assert_eq!(
             explicit.expression,
-            DiceExpression::Dice { count: 2, faces: 3 }
+            DiceExpression::Dice {
+                count: 2,
+                faces: 3,
+                modifier: DiceModifier::None,
+            }
         );
     }
 
@@ -461,5 +651,131 @@ mod tests {
         assert!(parse_dice_command(".random").is_none());
         assert!(parse_dice_command(".detect magic").is_none());
         assert!(parse_dice_command(".weave").is_none());
+    }
+
+    #[test]
+    fn drop_and_keep_modifiers_trim_dice_results() {
+        let parsed = parse_dice_command(".r 4d6dl1").unwrap().unwrap();
+        assert_eq!(
+            parsed.expression,
+            DiceExpression::Dice {
+                count: 4,
+                faces: 6,
+                modifier: DiceModifier::DropLowest(1),
+            }
+        );
+        let mut rolls = [2u32, 6, 1, 4].into_iter();
+        let mut terms = Vec::new();
+        let result = evaluate_expression(
+            &parsed.expression,
+            &mut terms,
+            &mut |_| rolls.next().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result, 12.0);
+        assert_eq!(terms[0].notation, "4d6dl1");
+        assert_eq!(terms[0].values, vec![2, 6, 1, 4]);
+        assert_eq!(terms[0].dropped, vec![2]);
+        assert_eq!(
+            format_dice_term(&terms[0]),
+            "4d6dl1=[2, 6, 1↓, 4]"
+        );
+    }
+
+    #[test]
+    fn keep_and_drop_aliases_share_modifier_semantics() {
+        for (command, modifier) in [
+            (".roll 4d6kh3", DiceModifier::KeepHighest(3)),
+            (".roll 4d6kl3", DiceModifier::KeepLowest(3)),
+            (".roll 4d6dh1", DiceModifier::DropHighest(1)),
+        ] {
+            let parsed = parse_dice_command(command).unwrap().unwrap();
+            assert_eq!(
+                parsed.expression,
+                DiceExpression::Dice {
+                    count: 4,
+                    faces: 6,
+                    modifier,
+                },
+                "{command}"
+            );
+        }
+
+        let parsed = parse_dice_command(".r 4d6kl3").unwrap().unwrap();
+        let mut rolls = [2u32, 6, 1, 4].into_iter();
+        let mut terms = Vec::new();
+        let result = evaluate_expression(
+            &parsed.expression,
+            &mut terms,
+            &mut |_| rolls.next().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result, 7.0);
+        assert_eq!(terms[0].notation, "4d6kl3");
+        assert_eq!(terms[0].dropped, vec![1]);
+    }
+
+    #[test]
+    fn invalid_modifier_amounts_are_rejected() {
+        for command in [
+            ".r 2d6dl2",
+            ".r 2d6dl0",
+            ".r 2d6dl",
+            ".r 2d6kh3",
+            ".r 2d6klX",
+        ] {
+            let response = roll_dice_command(command).unwrap();
+            assert!(
+                response.starts_with("骰点表达式无效："),
+                "{command}: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_words_do_not_swallow_descriptions_into_modifiers() {
+        let parsed = parse_dice_command(".r 2d6 drop 最低").unwrap().unwrap();
+        assert_eq!(parsed.formula, "2d6");
+        assert_eq!(parsed.description.as_deref(), Some("drop 最低"));
+
+        let parsed = parse_dice_command(".r 4d6kh3 # 力量").unwrap().unwrap();
+        assert_eq!(parsed.formula, "4d6kh3");
+        assert_eq!(parsed.description.as_deref(), Some("力量"));
+    }
+
+    #[test]
+    fn dnd5_command_generates_six_ability_scores() {
+        let response = roll_dnd5_ability_scores(Some("力量"), &mut || 4);
+        let lines = response.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "掷骰【D&D5E属性生成 4d6dl1×6】");
+        for (index, line) in lines[1..7].iter().enumerate() {
+            assert_eq!(
+                line,
+                &format!("第{}组 4d6dl1=[4↓, 4, 4, 4] → 12", index + 1)
+            );
+        }
+        assert_eq!(lines[7], "合计：72");
+        assert_eq!(lines[8], "说明：力量");
+
+        let mut state = 1u64;
+        let random_enough = roll_dnd5_ability_scores(None, &mut || {
+            state = state * 48271 % 2147483647;
+            (state % 6 + 1) as u32
+        });
+        let total = random_enough
+            .lines()
+            .find_map(|line| line.strip_prefix("合计："))
+            .and_then(|total| total.parse::<u32>().ok())
+            .unwrap();
+        assert!((18..=108).contains(&total), "{random_enough}");
+    }
+
+    #[test]
+    fn dnd5_aliases_and_unrelated_commands_are_separated() {
+        assert!(roll_dice_command(".dnd5").unwrap().contains("D&D5E属性生成"));
+        assert!(roll_dice_command("。dnd5e").unwrap().contains("D&D5E属性生成"));
+        assert!(roll_dice_command(".DND5 力量").unwrap().contains("说明：力量"));
+        assert!(roll_dice_command(".dnd5力量").is_none());
+        assert!(roll_dice_command(".dnd").is_none());
     }
 }

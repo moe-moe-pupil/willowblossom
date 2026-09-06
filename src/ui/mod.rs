@@ -530,6 +530,12 @@ fn paint_voxel_creative_item_icon(
             line((0.0, 0.0), (0.34, 0.22));
             dot(0.0, 0.0, 0.07);
         },
+        VoxelCreativeItem::GmSign => {
+            box_outline((-0.82, -0.72), (0.82, 0.48));
+            thin_line((-0.58, -0.4), (0.58, -0.4));
+            thin_line((-0.58, -0.05), (0.58, -0.05));
+            line((0.0, 0.48), (0.0, 0.92));
+        },
         VoxelCreativeItem::Mode(VoxelEditMode::Add) => {
             box_outline((-0.75, -0.75), (0.35, 0.35));
             plus(0.48, 0.48, 0.4);
@@ -693,6 +699,10 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
         VoxelCreativeItem::GmClock => (
             "GM时钟",
             egui::Color32::from_rgb(255, 216, 118),
+        ),
+        VoxelCreativeItem::GmSign => (
+            "GM告示牌",
+            egui::Color32::from_rgb(194, 142, 78),
         ),
         VoxelCreativeItem::Mode(mode) => match mode {
             VoxelEditMode::Add => (
@@ -7213,14 +7223,11 @@ fn quick_cast_ui(
             }
 
             ui.horizontal_wrapped(|ui| {
-                let force_label = if effect.is_none() {
-                    "GM裁定并记录"
-                } else {
-                    "强制释放"
-                };
-                let force_response = ui
-                    .add(egui::Button::new(force_label))
-                    .on_hover_text("GM确认：忽略MP不足、目标和规则解析条件，但仍扣除现有MP并记录冷却。");
+                let force_label =
+                    if effect.is_none() { "GM裁定并记录" } else { "强制释放" };
+                let force_response = ui.add(egui::Button::new(force_label)).on_hover_text(
+                    "GM确认：忽略MP不足、目标和规则解析条件，但仍扣除现有MP并记录冷却。",
+                );
                 if force_response.clicked() {
                     if force_pending {
                         action = Some(QuickCastAction {
@@ -7251,7 +7258,9 @@ fn quick_cast_ui(
             }
             if can_pay && cooldown_remaining == 0 {
                 if effect.is_none() {
-                    ui.small("此技能保留原意交由GM处理；确认后只记录消耗与冷却，不自动改写角色状态。");
+                    ui.small(
+                        "此技能保留原意交由GM处理；确认后只记录消耗与冷却，不自动改写角色状态。",
+                    );
                 } else if targets.is_empty() {
                     ui.small("普通释放需要有效目标；强制释放可忽略。");
                 }
@@ -8308,7 +8317,11 @@ fn hidden_role_editor_ui(ui: &mut Ui, target_id: &str, manager: &mut NapcatMessa
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut selected_suit, None, "未穿戴");
                 for kind in ProtectiveSuitKind::ALL {
-                    ui.selectable_value(&mut selected_suit, Some(kind), kind.label());
+                    ui.selectable_value(
+                        &mut selected_suit,
+                        Some(kind),
+                        kind.label(),
+                    );
                 }
             });
         if protective_suit.destroyed {
@@ -8361,7 +8374,10 @@ fn hidden_role_editor_ui(ui: &mut Ui, target_id: &str, manager: &mut NapcatMessa
             Some(kind) => protective_suit.equip(kind, selected_heavy_helper.clone()),
         };
         if suit_changed {
-            if let (Some(state), Some(kind)) = (hidden_role.as_deref_mut(), selected_suit) {
+            if let (Some(state), Some(kind)) = (
+                hidden_role.as_deref_mut(),
+                selected_suit,
+            ) {
                 state.last_event = format!("已穿上{}（消耗1回合）", kind.label());
             }
             changed = true;
@@ -18804,6 +18820,8 @@ pub fn ui_system(
                             "右键发射 · R切换模式"
                         } else if voxel_editor.is_gm_clock_equipped() {
                             "在下方GM时钟面板修改世界时间，只改变光照"
+                        } else if voxel_editor.is_gm_sign_equipped() {
+                            "右键放置/读取/编辑GM告示牌 · 左键移除 · 仅GM可见"
                         } else {
                             "左键拆除 · 右键放置/使用"
                         };
@@ -18820,6 +18838,8 @@ pub fn ui_system(
                             "右键发射 · R切换模式"
                         } else if voxel_editor.is_gm_clock_equipped() {
                             "在下方GM时钟面板修改世界时间，只改变光照"
+                        } else if voxel_editor.is_gm_sign_equipped() {
+                            "右键放置/读取/编辑GM告示牌 · 左键移除 · 仅GM可见"
                         } else {
                             "左键拆除 · 右键放置/使用"
                         };
@@ -19622,6 +19642,29 @@ pub fn ui_system(
                                     .clicked()
                                     {
                                         picked_item = Some(gm_clock);
+                                    }
+                                    ui.small(name);
+                                });
+                                let gm_sign = VoxelCreativeItem::GmSign;
+                                let (name, _) = voxel_creative_item_visual(gm_sign);
+                                ui.vertical_centered(|ui| {
+                                    if voxel_creative_drag_source(
+                                        ui,
+                                        egui::Id::new("voxel_catalog_gm_sign"),
+                                        VoxelCreativeDragPayload::Catalog(gm_sign),
+                                        gm_sign,
+                                        voxel_editor.creative_hotbar
+                                            [voxel_editor.selected_hotbar_slot]
+                                            == Some(gm_sign),
+                                        48.0,
+                                        None,
+                                    )
+                                    .on_hover_text(
+                                        "右键方块放置，右键告示牌读取/编辑，左键告示牌移除；仅GM可见",
+                                    )
+                                    .clicked()
+                                    {
+                                        picked_item = Some(gm_sign);
                                     }
                                     ui.small(name);
                                 });

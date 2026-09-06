@@ -184,6 +184,9 @@ const ORBITAL_PLANET_GRAVITY_ACCELERATION: f32 = 9.81;
 const ORBITAL_PLANET_GRAVITY_MAX_ALTITUDE: f32 = 32.0;
 const MAX_SCENE_SNAPSHOTS: usize = 20;
 const VOXEL_SCENE_AUTOSAVE_SECONDS: f32 = 30.0;
+const GM_SIGN_MAX_LINES: usize = 4;
+const GM_SIGN_MAX_CHARS_PER_LINE: usize = 32;
+const GM_SIGN_LABEL_VISIBILITY_RADIUS: f32 = 12.0;
 const VOXEL_SCENE_LAYOUT_REVISION: u32 = 4;
 const MAX_EXPLOSION_NEW_PHYSICS_BODIES: usize = 60;
 /// Spaceship hull voxels are partitioned into chunks of this edge length, so a
@@ -1072,6 +1075,7 @@ struct VoxelSceneSnapshot {
     voxels: Vec<(IVec3, u8)>,
     physics_bodies: Vec<VoxelPhysicsBodySnapshot>,
     placed_lights: Vec<VoxelPlacedLight>,
+    gm_signs: Vec<VoxelGmSign>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1105,12 +1109,27 @@ struct PersistedVoxelPlacedLight {
     angular_velocity: [f32; 3],
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PersistedVoxelGmSign {
+    cell: [i32; 3],
+    #[serde(default)]
+    support_cell: [i32; 3],
+    facing: [f32; 3],
+    text: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct PersistedVoxelScene {
     voxels: Vec<PersistedVoxelCell>,
     planet: Option<PersistedVoxelPlanet>,
     physics_bodies: Vec<PersistedVoxelPhysicsBody>,
     placed_lights: Vec<PersistedVoxelPlacedLight>,
+}
+
+#[derive(Resource, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct VoxelGmSignStore {
+    #[serde(default)]
+    signs: Vec<PersistedVoxelGmSign>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1293,6 +1312,7 @@ pub(crate) enum VoxelCreativeItem {
     PortraitTransformTool,
     InvisibilityTool,
     GmClock,
+    GmSign,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1473,6 +1493,16 @@ struct VoxelPlacedLight {
     intensity: f32,
     range: f32,
     direction: Vec3,
+}
+
+/// A Minecraft-style world sign whose board, label, persistence, and editor
+/// all stay on the GM-only side of the scene access boundary.
+#[derive(Component, Clone, Debug, PartialEq)]
+struct VoxelGmSign {
+    cell: IVec3,
+    support_cell: IVec3,
+    facing: Vec3,
+    text: String,
 }
 
 #[derive(Component)]
@@ -2049,6 +2079,8 @@ pub(crate) struct VoxelEditorState {
     teleport_requested: Option<VoxelTeleportDestination>,
     /// 立绘变形器当前选中的玩家；窗口关闭后恢复为 None。
     pub portrait_transform_target: Option<u64>,
+    selected_gm_sign: Option<Entity>,
+    gm_sign_editor_open: bool,
 }
 
 impl Default for VoxelEditorState {
@@ -2117,6 +2149,8 @@ impl Default for VoxelEditorState {
             first_person_cursor_released: true,
             teleport_requested: None,
             portrait_transform_target: None,
+            selected_gm_sign: None,
+            gm_sign_editor_open: false,
         }
     }
 }
@@ -2209,12 +2243,20 @@ impl VoxelEditorState {
                 self.light_tool = None;
                 self.selected_light = None;
             },
+            VoxelCreativeItem::GmSign => {
+                self.light_tool = None;
+                self.selected_light = None;
+            },
         }
         if item != VoxelCreativeItem::TeleportTool {
             self.teleport_menu_open = false;
         }
         if item != VoxelCreativeItem::PortraitTransformTool {
             self.portrait_transform_target = None;
+        }
+        if item != VoxelCreativeItem::GmSign {
+            self.selected_gm_sign = None;
+            self.gm_sign_editor_open = false;
         }
     }
 
@@ -2231,6 +2273,8 @@ impl VoxelEditorState {
             self.selected_light = None;
             self.teleport_menu_open = false;
             self.portrait_transform_target = None;
+            self.selected_gm_sign = None;
+            self.gm_sign_editor_open = false;
         }
     }
 
@@ -2248,6 +2292,8 @@ impl VoxelEditorState {
                 self.selected_light = None;
                 self.teleport_menu_open = false;
                 self.portrait_transform_target = None;
+                self.selected_gm_sign = None;
+                self.gm_sign_editor_open = false;
             }
         }
     }
@@ -2266,6 +2312,8 @@ impl VoxelEditorState {
                 self.selected_light = None;
                 self.teleport_menu_open = false;
                 self.portrait_transform_target = None;
+                self.selected_gm_sign = None;
+                self.gm_sign_editor_open = false;
             }
         }
     }
@@ -2304,6 +2352,9 @@ impl VoxelEditorState {
         }
         if self.is_gm_clock_equipped() {
             return "GM时钟".to_owned();
+        }
+        if self.is_gm_sign_equipped() {
+            return "GM告示牌".to_owned();
         }
         self.light_tool
             .map_or_else(
@@ -2345,6 +2396,10 @@ impl VoxelEditorState {
         self.equipped_item == Some(VoxelCreativeItem::GmClock)
     }
 
+    pub(crate) fn is_gm_sign_equipped(&self) -> bool {
+        self.equipped_item == Some(VoxelCreativeItem::GmSign)
+    }
+
     fn equipped_item_handles_right_click_without_voxel_edit(&self) -> bool {
         matches!(
             self.equipped_item,
@@ -2356,6 +2411,7 @@ impl VoxelEditorState {
                     | VoxelCreativeItem::DoorLockTool
                     | VoxelCreativeItem::InvisibilityTool
                     | VoxelCreativeItem::GmClock
+                    | VoxelCreativeItem::GmSign
             )
         )
     }
@@ -2397,11 +2453,12 @@ impl VoxelEditorState {
             .iter()
             .map(|snapshot| {
                 format!(
-                    "{}（{} 方块 / {} 物理体 / {} 灯光）",
+                    "{}（{} 方块 / {} 物理体 / {} 灯光 / {} GM告示牌）",
                     snapshot.name,
                     snapshot.voxels.len(),
                     snapshot.physics_bodies.len(),
-                    snapshot.placed_lights.len()
+                    snapshot.placed_lights.len(),
+                    snapshot.gm_signs.len()
                 )
             })
             .collect()
@@ -2554,6 +2611,19 @@ impl Plugin for TrpgVoxelPlugin {
             .revert_to_default_on_deserialization_errors(true)
             .build()
             .expect("failed to initialize voxel scene store");
+        let gm_sign_store = Persistent::<VoxelGmSignStore>::builder()
+            .name("voxel_gm_signs")
+            .format(StorageFormat::Toml)
+            .path(
+                Path::new(".data")
+                    .join("willowblossom")
+                    .join("voxel_gm_signs.toml"),
+            )
+            .default(VoxelGmSignStore::default())
+            .revertible(true)
+            .revert_to_default_on_deserialization_errors(true)
+            .build()
+            .expect("failed to initialize GM sign store");
         let spaceship_store = Persistent::<VoxelSpaceshipStore>::builder()
             .name("voxel_spaceships")
             .format(StorageFormat::Toml)
@@ -2603,6 +2673,7 @@ impl Plugin for TrpgVoxelPlugin {
             .insert_resource(inventory_store)
             .insert_resource(toolbar_settings_store)
             .insert_resource(scene_store)
+            .insert_resource(gm_sign_store)
             .insert_resource(spaceship_store);
 
         if !self.runtime_enabled {
@@ -2638,6 +2709,7 @@ impl Plugin for TrpgVoxelPlugin {
                 setup_voxel_view,
                 setup_voxel_planet_shell,
                 load_persisted_voxel_scene,
+                load_persisted_voxel_gm_signs,
                 setup_voxel_spaceships,
                 setup_voxel_player_cameras,
                 initialize_voxel_blood_decay,
@@ -2659,8 +2731,14 @@ impl Plugin for TrpgVoxelPlugin {
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
                     place_creative_light
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
-                    sync_selected_voxel_light,
-                    edit_voxel_grid.run_if(crate::replay::replay_mouse_interaction_inactive),
+                    (
+                        use_voxel_gm_sign
+                            .run_if(crate::replay::replay_mouse_interaction_inactive),
+                        sync_selected_voxel_light,
+                        edit_voxel_grid.run_if(crate::replay::replay_mouse_interaction_inactive),
+                        despawn_unsupported_voxel_gm_signs,
+                    )
+                        .chain(),
                     decay_voxel_blood,
                     use_voxel_door_lock_tool
                         .run_if(crate::replay::replay_mouse_interaction_inactive),
@@ -2719,6 +2797,7 @@ impl Plugin for TrpgVoxelPlugin {
                         persist_voxel_inventory,
                         persist_voxel_toolbar_settings,
                         persist_voxel_scene,
+                        persist_voxel_gm_signs,
                         persist_voxel_spaceships,
                     )
                         .chain(),
@@ -2754,6 +2833,7 @@ impl Plugin for TrpgVoxelPlugin {
             EguiPrimaryContextPass,
             (
                 voxel_workbook_feature_overlay,
+                voxel_gm_sign_overlay_and_editor,
                 voxel_player_camera_panel,
                 voxel_spaceship_panel,
                 voxel_auto_door_lock_panel,
@@ -2871,6 +2951,27 @@ fn persisted_voxel_light(
     }
 }
 
+fn normalize_gm_sign_text(text: &str) -> String {
+    text.lines()
+        .take(GM_SIGN_MAX_LINES)
+        .map(|line| {
+            line.chars()
+                .take(GM_SIGN_MAX_CHARS_PER_LINE)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn persisted_voxel_gm_sign(sign: &VoxelGmSign) -> PersistedVoxelGmSign {
+    PersistedVoxelGmSign {
+        cell: sign.cell.to_array(),
+        support_cell: sign.support_cell.to_array(),
+        facing: sign.facing.to_array(),
+        text: normalize_gm_sign_text(&sign.text),
+    }
+}
+
 fn runtime_voxel_physics_body(
     body: &PersistedVoxelPhysicsBody,
 ) -> (
@@ -2908,6 +3009,63 @@ fn runtime_voxel_light(light: &PersistedVoxelPlacedLight) -> VoxelPlacedLight {
         range: finite_clamp(light.range, VOXEL_SIZE, 100.0, 8.0),
         direction: Vec3::from_array(light.direction),
     }
+}
+
+fn runtime_voxel_gm_sign(sign: &PersistedVoxelGmSign) -> VoxelGmSign {
+    let mut facing = Vec3::from_array(sign.facing);
+    facing.y = 0.0;
+    facing = facing.try_normalize().unwrap_or(Vec3::Z);
+    VoxelGmSign {
+        cell: IVec3::from_array(sign.cell),
+        support_cell: IVec3::from_array(sign.support_cell),
+        facing,
+        text: normalize_gm_sign_text(&sign.text),
+    }
+}
+
+fn gm_sign_world_position(sign: &VoxelGmSign) -> Vec3 {
+    (sign.cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE
+}
+
+fn spawn_voxel_gm_sign(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &VoxelMaterials,
+    sign: VoxelGmSign,
+) -> Entity {
+    let transform =
+        Transform::from_translation(gm_sign_world_position(&sign)).looking_to(sign.facing, Vec3::Y);
+    let gm_only = RenderLayers::layer(VOXEL_DM_GIZMO_RENDER_LAYER);
+    commands
+        .spawn((
+            sign,
+            transform,
+            Visibility::Visible,
+            gm_only.clone(),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Mesh3d(meshes.add(Cuboid::from_size(Vec3::new(
+                    VOXEL_SIZE,
+                    VOXEL_SIZE * 0.62,
+                    VOXEL_SIZE * 0.08,
+                )))),
+                MeshMaterial3d(materials.handles[2].clone()),
+                Transform::from_xyz(0.0, VOXEL_SIZE * 0.16, 0.0),
+                gm_only.clone(),
+            ));
+            parent.spawn((
+                Mesh3d(meshes.add(Cuboid::from_size(Vec3::new(
+                    VOXEL_SIZE * 0.12,
+                    VOXEL_SIZE * 0.7,
+                    VOXEL_SIZE * 0.12,
+                )))),
+                MeshMaterial3d(materials.handles[2].clone()),
+                Transform::from_xyz(0.0, -VOXEL_SIZE * 0.34, 0.0),
+                gm_only,
+            ));
+        })
+        .id()
 }
 
 fn load_persisted_voxel_scene(
@@ -3013,6 +3171,45 @@ fn load_persisted_voxel_scene(
     }
 }
 
+fn load_persisted_voxel_gm_signs(
+    mut commands: Commands,
+    store: Res<Persistent<VoxelGmSignStore>>,
+    existing: Query<Entity, With<VoxelGmSign>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
+) {
+    for entity in &existing {
+        commands.entity(entity).despawn();
+    }
+    for sign in &store.signs {
+        spawn_voxel_gm_sign(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            runtime_voxel_gm_sign(sign),
+        );
+    }
+}
+
+fn persist_voxel_gm_signs(
+    signs: Query<&VoxelGmSign>,
+    mut store: ResMut<Persistent<VoxelGmSignStore>>,
+) {
+    let mut persisted = signs
+        .iter()
+        .map(persisted_voxel_gm_sign)
+        .collect::<Vec<_>>();
+    persisted.sort_unstable_by_key(|sign| sign.cell);
+    let snapshot = VoxelGmSignStore { signs: persisted };
+    if **store == snapshot {
+        return;
+    }
+    **store = snapshot;
+    if let Err(err) = store.persist() {
+        eprintln!("failed to persist GM signs: {err}");
+    }
+}
+
 fn sandbox_replay_voxel_scene(
     mut commands: Commands,
     studio: Res<crate::replay::ReplayStudio>,
@@ -3043,33 +3240,39 @@ fn sandbox_replay_voxel_scene(
     if active && !sandbox.active {
         sandbox.physics_bodies = physics_bodies
             .iter()
-            .map(|(_, body, transform, linear_velocity, angular_velocity)| {
-                persisted_voxel_physics_body(
-                    body,
-                    transform,
-                    linear_velocity,
-                    angular_velocity,
-                )
-            })
-            .chain(physics_loader.unloaded_bodies.iter().map(|snapshot| {
-                persisted_voxel_physics_body(
-                    &snapshot.body,
-                    &snapshot.transform,
-                    &snapshot.linear_velocity,
-                    &snapshot.angular_velocity,
-                )
-            }))
+            .map(
+                |(_, body, transform, linear_velocity, angular_velocity)| {
+                    persisted_voxel_physics_body(
+                        body,
+                        transform,
+                        linear_velocity,
+                        angular_velocity,
+                    )
+                },
+            )
+            .chain(
+                physics_loader.unloaded_bodies.iter().map(|snapshot| {
+                    persisted_voxel_physics_body(
+                        &snapshot.body,
+                        &snapshot.transform,
+                        &snapshot.linear_velocity,
+                        &snapshot.angular_velocity,
+                    )
+                }),
+            )
             .collect();
         sandbox.placed_lights = placed_lights
             .iter()
-            .map(|(_, light, transform, linear_velocity, angular_velocity)| {
-                persisted_voxel_light(
-                    light,
-                    transform,
-                    linear_velocity,
-                    angular_velocity,
-                )
-            })
+            .map(
+                |(_, light, transform, linear_velocity, angular_velocity)| {
+                    persisted_voxel_light(
+                        light,
+                        transform,
+                        linear_velocity,
+                        angular_velocity,
+                    )
+                },
+            )
             .collect();
         sandbox.planet = planets.single().ok().map(|planet| PersistedVoxelPlanet {
             cells: planet
@@ -3129,12 +3332,20 @@ fn sandbox_replay_voxel_scene(
         }
     }
 
-    if let (Some(saved_planet), Ok(mut planet)) = (sandbox.planet.as_ref(), planets.single_mut()) {
+    if let (Some(saved_planet), Ok(mut planet)) = (
+        sandbox.planet.as_ref(),
+        planets.single_mut(),
+    ) {
         planet.cells = saved_planet
             .cells
             .iter()
             .filter(|cell| cell.material != 0)
-            .map(|cell| (IVec3::from_array(cell.position), cell.material))
+            .map(|cell| {
+                (
+                    IVec3::from_array(cell.position),
+                    cell.material,
+                )
+            })
             .collect();
         planet.removed = saved_planet
             .removed
@@ -8578,6 +8789,147 @@ fn voxel_workbook_feature_overlay(
     }
 }
 
+fn voxel_gm_sign_overlay_and_editor(
+    mut commands: Commands,
+    mut contexts: EguiContexts,
+    cameras: Query<
+        (&Camera, &GlobalTransform),
+        (
+            With<VoxelViewportCamera>,
+            Without<VoxelPlayerCaptureCamera>,
+        ),
+    >,
+    mut signs: Query<(
+        Entity,
+        &mut VoxelGmSign,
+        &GlobalTransform,
+    )>,
+    mut editor: ResMut<VoxelEditorState>,
+    mut persistence: ResMut<VoxelScenePersistenceState>,
+) {
+    let (Ok(ctx), Ok((camera, camera_transform))) = (contexts.ctx_mut(), cameras.single()) else {
+        return;
+    };
+    let pixels_per_point = ctx.pixels_per_point().max(f32::EPSILON);
+    let viewport_min = editor.viewport_min / pixels_per_point;
+    let viewport_max = editor.viewport_max / pixels_per_point;
+    let mut labels = Vec::new();
+    for (entity, sign, transform) in signs.iter() {
+        let world = transform.translation() + Vec3::Y * VOXEL_SIZE * 0.16;
+        if camera_transform.translation().distance(world) > GM_SIGN_LABEL_VISIBILITY_RADIUS {
+            continue;
+        }
+        let Ok(projected) = camera.world_to_viewport_with_depth(camera_transform, world) else {
+            continue;
+        };
+        let screen = projected.truncate();
+        if !screen.cmpge(viewport_min).all() || !screen.cmple(viewport_max).all() {
+            continue;
+        }
+        let text = if sign.text.trim().is_empty() {
+            "GM告示牌".to_owned()
+        } else {
+            sign.text.clone()
+        };
+        labels.push((
+            projected.z,
+            entity,
+            egui::pos2(screen.x, screen.y),
+            text,
+        ));
+    }
+    labels.sort_by(|left, right| right.0.total_cmp(&left.0));
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("voxel_gm_sign_labels"),
+    ));
+    for (_, entity, position, text) in labels {
+        let selected = editor.selected_gm_sign == Some(entity);
+        let color = if selected {
+            egui::Color32::from_rgb(255, 236, 150)
+        } else {
+            egui::Color32::from_rgb(244, 220, 166)
+        };
+        let galley = painter.layout(
+            text,
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgb(38, 25, 14),
+            150.0,
+        );
+        let rect = egui::Rect::from_center_size(
+            position,
+            galley.size() + egui::vec2(10.0, 6.0),
+        );
+        painter.rect_filled(rect, 2.0, color.gamma_multiply(0.92));
+        painter.rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(if selected { 2.0 } else { 1.0 }, color),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(
+            rect.min + egui::vec2(5.0, 3.0),
+            galley,
+            egui::Color32::BLACK,
+        );
+    }
+
+    if !editor.gm_sign_editor_open {
+        return;
+    }
+    let Some(selected) = editor.selected_gm_sign else {
+        editor.gm_sign_editor_open = false;
+        return;
+    };
+    let Ok((_, mut sign, _)) = signs.get_mut(selected) else {
+        editor.selected_gm_sign = None;
+        editor.gm_sign_editor_open = false;
+        return;
+    };
+    let mut open = true;
+    let mut delete = false;
+    let mut done = false;
+    egui::Window::new("GM告示牌")
+        .id(egui::Id::new("voxel_gm_sign_editor"))
+        .open(&mut open)
+        .default_width(330.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            ui.small("仅GM可见、可读、可编辑；不会进入玩家截图、QQ消息、AI或MCP上下文。");
+            let response = ui.add(
+                egui::TextEdit::multiline(&mut sign.text)
+                    .hint_text("输入最多4行文字")
+                    .desired_rows(GM_SIGN_MAX_LINES)
+                    .desired_width(f32::INFINITY),
+            );
+            if response.changed() {
+                sign.text = normalize_gm_sign_text(&sign.text);
+                persistence.force_save = true;
+            }
+            ui.small(format!(
+                "最多{}行，每行{}个字符",
+                GM_SIGN_MAX_LINES, GM_SIGN_MAX_CHARS_PER_LINE
+            ));
+            ui.horizontal(|ui| {
+                if ui.button("完成").clicked() {
+                    done = true;
+                }
+                if ui.button("删除告示牌").clicked() {
+                    delete = true;
+                }
+            });
+        });
+    if delete {
+        commands.entity(selected).despawn();
+        editor.selected_gm_sign = None;
+        editor.gm_sign_editor_open = false;
+        editor.physics_status = Some("已移除GM告示牌".to_owned());
+        persistence.force_save = true;
+    } else if !open || done {
+        editor.gm_sign_editor_open = false;
+    }
+}
+
 fn voxel_player_camera_panel(
     mut commands: Commands,
     mut contexts: EguiContexts,
@@ -12959,6 +13311,7 @@ fn handle_editor_requests(
         Option<&VoxelSpaceship>,
     )>,
     placed_lights: Query<Entity, With<VoxelPlacedLight>>,
+    gm_signs: Query<Entity, With<VoxelGmSign>>,
     mut planets: Query<&mut VoxelOrbitalPlanet>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
@@ -12975,6 +13328,9 @@ fn handle_editor_requests(
             commands.entity(entity).despawn();
         }
         for entity in &placed_lights {
+            commands.entity(entity).despawn();
+        }
+        for entity in &gm_signs {
             commands.entity(entity).despawn();
         }
         let occupied = occupied_cells(&grid);
@@ -13009,6 +13365,8 @@ fn handle_editor_requests(
         editor.selection_end = None;
         editor.selection_is_planet = false;
         editor.selected_light = None;
+        editor.selected_gm_sign = None;
+        editor.gm_sign_editor_open = false;
         editor.physics_status = Some("Scene reset to defaults and saved".to_owned());
         editor.reset_requested = false;
         persistence.force_save = true;
@@ -13774,6 +14132,7 @@ fn process_voxel_scene_history(
         Without<VoxelSpaceship>,
     >,
     placed_lights: Query<(Entity, &VoxelPlacedLight)>,
+    gm_signs: Query<(Entity, &VoxelGmSign)>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
@@ -13801,6 +14160,10 @@ fn process_voxel_scene_history(
             .iter()
             .map(|(_, light)| light.clone())
             .collect::<Vec<_>>();
+        let gm_signs = gm_signs
+            .iter()
+            .map(|(_, sign)| sign.clone())
+            .collect::<Vec<_>>();
         let snapshot_number = editor.next_scene_snapshot_number;
         editor.next_scene_snapshot_number += 1;
         editor.scene_snapshots.push(VoxelSceneSnapshot {
@@ -13808,17 +14171,19 @@ fn process_voxel_scene_history(
             voxels,
             physics_bodies,
             placed_lights,
+            gm_signs,
         });
         if editor.scene_snapshots.len() > MAX_SCENE_SNAPSHOTS {
             editor.scene_snapshots.remove(0);
         }
         let snapshot = editor.scene_snapshots.last().unwrap();
         editor.physics_status = Some(format!(
-            "已保存 {}：{} 个方块，{} 个物理体，{} 盏灯",
+            "已保存 {}：{} 个方块，{} 个物理体，{} 盏灯，{} 块GM告示牌",
             snapshot.name,
             snapshot.voxels.len(),
             snapshot.physics_bodies.len(),
-            snapshot.placed_lights.len()
+            snapshot.placed_lights.len(),
+            snapshot.gm_signs.len()
         ));
         persistence.force_save = true;
     }
@@ -13845,6 +14210,9 @@ fn process_voxel_scene_history(
     for (entity, _) in &placed_lights {
         commands.entity(entity).despawn();
     }
+    for (entity, _) in &gm_signs {
+        commands.entity(entity).despawn();
+    }
     for body in &snapshot.physics_bodies {
         spawn_voxel_physics_body_at(
             &mut commands,
@@ -13864,6 +14232,14 @@ fn process_voxel_scene_history(
             light.clone(),
         );
     }
+    for sign in &snapshot.gm_signs {
+        spawn_voxel_gm_sign(
+            &mut commands,
+            &mut meshes,
+            &materials,
+            sign.clone(),
+        );
+    }
 
     editor.undo.clear();
     editor.redo.clear();
@@ -13873,6 +14249,8 @@ fn process_voxel_scene_history(
     editor.selection_end = None;
     editor.selection_is_planet = false;
     editor.selected_light = None;
+    editor.selected_gm_sign = None;
+    editor.gm_sign_editor_open = false;
     editor.physics_action_requested = None;
     editor.physics_status = Some(format!("已恢复 {}", snapshot.name));
     persistence.force_save = true;
@@ -14385,6 +14763,149 @@ fn sync_selected_voxel_light(
         spot_light.color = color;
         spot_light.intensity = light.intensity;
         spot_light.range = light.range;
+    }
+}
+
+fn ray_hit_gm_sign(
+    ray: Ray3d,
+    signs: &Query<(Entity, &VoxelGmSign, &GlobalTransform)>,
+) -> Option<(Entity, f32)> {
+    signs
+        .iter()
+        .filter_map(|(entity, _, transform)| {
+            let center = transform.translation() + Vec3::Y * VOXEL_SIZE * 0.16;
+            let distance = (center - ray.origin).dot(*ray.direction);
+            if !(0.0..=MAX_RAY_DISTANCE).contains(&distance) {
+                return None;
+            }
+            let nearest = ray.origin + *ray.direction * distance;
+            (center.distance(nearest) <= VOXEL_SIZE * 0.7).then_some((entity, distance))
+        })
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+}
+
+fn use_voxel_gm_sign(
+    mut commands: Commands,
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
+    grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
+    signs: Query<(Entity, &VoxelGmSign, &GlobalTransform)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    materials: Res<VoxelMaterials>,
+    possession: Res<VoxelPossessionState>,
+    egui_input: Res<EguiWantsInput>,
+    mut editor: ResMut<VoxelEditorState>,
+    mut persistence: ResMut<VoxelScenePersistenceState>,
+) {
+    if possession.active_user_id.is_some()
+        || !editor.is_gm_sign_equipped()
+        || editor.creative_inventory_open
+        || editor.teleport_menu_open
+        || (!mouse.just_pressed(MouseButton::Left) && !mouse.just_pressed(MouseButton::Right))
+        || voxel_world_pointer_blocked(
+            egui_input.wants_any_pointer_input(),
+            editor.right_started_over_ui || editor.left_started_over_ui,
+        )
+    {
+        return;
+    }
+    let (Ok(window), Ok((camera, camera_transform)), Ok(grid)) = (
+        windows.single(),
+        cameras.single(),
+        grids.single(),
+    ) else {
+        return;
+    };
+    let Some(ray) = viewport_ray(
+        window,
+        camera,
+        camera_transform,
+        &editor,
+    ) else {
+        return;
+    };
+    let grid_hit = raycast_grid(grid, ray);
+    let sign_hit = ray_hit_gm_sign(ray, &signs).filter(|(_, sign_distance)| {
+        grid_hit
+            .as_ref()
+            .is_none_or(|hit| *sign_distance <= hit.distance + VOXEL_SIZE)
+    });
+
+    if mouse.just_pressed(MouseButton::Left) {
+        let Some((entity, _)) = sign_hit else {
+            editor.physics_status = Some("没有瞄准GM告示牌".to_owned());
+            return;
+        };
+        commands.entity(entity).despawn();
+        if editor.selected_gm_sign == Some(entity) {
+            editor.selected_gm_sign = None;
+            editor.gm_sign_editor_open = false;
+        }
+        editor.physics_status = Some("已移除GM告示牌".to_owned());
+        persistence.force_save = true;
+        return;
+    }
+
+    if let Some((entity, _)) = sign_hit {
+        editor.selected_gm_sign = Some(entity);
+        editor.gm_sign_editor_open = true;
+        editor.physics_status = Some("已打开GM告示牌".to_owned());
+        return;
+    }
+    let Some(hit) = grid_hit else {
+        editor.physics_status = Some("没有瞄准可放置告示牌的方块".to_owned());
+        return;
+    };
+    let (Some(cell), Some(support_cell)) = (hit.add, hit.occupied) else {
+        return;
+    };
+    if signs.iter().any(|(_, sign, _)| sign.cell == cell) {
+        editor.physics_status = Some("这个位置已经有GM告示牌".to_owned());
+        return;
+    }
+    let mut facing = ray.origin - (cell.as_vec3() + Vec3::splat(0.5)) * VOXEL_SIZE;
+    facing.y = 0.0;
+    facing = facing.try_normalize().unwrap_or(Vec3::Z);
+    let entity = spawn_voxel_gm_sign(
+        &mut commands,
+        &mut meshes,
+        &materials,
+        VoxelGmSign {
+            cell,
+            support_cell,
+            facing,
+            text: String::new(),
+        },
+    );
+    editor.selected_gm_sign = Some(entity);
+    editor.gm_sign_editor_open = true;
+    editor.physics_status = Some("已放置GM告示牌；仅GM可见、可读、可编辑".to_owned());
+    persistence.force_save = true;
+}
+
+fn despawn_unsupported_voxel_gm_signs(
+    mut commands: Commands,
+    grids: Query<&Grid<u8>, With<TrpgVoxelGrid>>,
+    signs: Query<(Entity, &VoxelGmSign)>,
+    mut editor: ResMut<VoxelEditorState>,
+    mut persistence: ResMut<VoxelScenePersistenceState>,
+) {
+    let Ok(grid) = grids.single() else { return };
+    let mut removed = false;
+    for (entity, sign) in &signs {
+        if grid.get(sign.support_cell).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+        commands.entity(entity).despawn();
+        if editor.selected_gm_sign == Some(entity) {
+            editor.selected_gm_sign = None;
+            editor.gm_sign_editor_open = false;
+        }
+        removed = true;
+    }
+    if removed {
+        persistence.force_save = true;
     }
 }
 
@@ -18314,6 +18835,123 @@ mod tests {
     }
 
     #[test]
+    fn gm_sign_equips_and_limits_text_to_four_short_lines() {
+        let mut editor = VoxelEditorState::default();
+        editor.equip_creative_item(VoxelCreativeItem::GmSign);
+
+        assert!(editor.is_gm_sign_equipped());
+        assert_eq!(editor.active_tool_label(), "GM告示牌");
+        let long_line = "字".repeat(GM_SIGN_MAX_CHARS_PER_LINE + 5);
+        let normalized = normalize_gm_sign_text(&format!(
+            "{long_line}\n第二行\n第三行\n第四行\n不会保留"
+        ));
+        let lines = normalized.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), GM_SIGN_MAX_LINES);
+        assert_eq!(
+            lines[0].chars().count(),
+            GM_SIGN_MAX_CHARS_PER_LINE
+        );
+        assert!(!normalized.contains("不会保留"));
+    }
+
+    #[test]
+    fn old_voxel_scenes_remain_bincode_compatible() {
+        #[derive(Serialize, Deserialize)]
+        struct LegacyVoxelScene {
+            voxels: Vec<PersistedVoxelCell>,
+            planet: Option<PersistedVoxelPlanet>,
+            physics_bodies: Vec<PersistedVoxelPhysicsBody>,
+            placed_lights: Vec<PersistedVoxelPlacedLight>,
+        }
+
+        let scene: PersistedVoxelScene = serde_json::from_str(
+            r#"{"voxels":[],"planet":null,"physics_bodies":[],"placed_lights":[]}"#,
+        )
+        .unwrap();
+        assert!(scene.voxels.is_empty());
+
+        let legacy = LegacyVoxelScene {
+            voxels: Vec::new(),
+            planet: None,
+            physics_bodies: Vec::new(),
+            placed_lights: Vec::new(),
+        };
+        let bytes = StorageFormat::Bincode
+            .serialize("legacy_voxel_scene", &legacy)
+            .unwrap();
+        let restored: PersistedVoxelScene = StorageFormat::Bincode
+            .deserialize("legacy_voxel_scene", &bytes)
+            .unwrap();
+        assert!(restored.voxels.is_empty());
+    }
+
+    #[test]
+    fn gm_sign_store_round_trips_without_changing_the_scene_format() {
+        let store = VoxelGmSignStore {
+            signs: vec![PersistedVoxelGmSign {
+                cell: [20, 21, 22],
+                support_cell: [20, 20, 22],
+                facing: [0.0, 0.0, 1.0],
+                text: "GM秘密".to_owned(),
+            }],
+        };
+        let bytes = StorageFormat::Toml
+            .serialize("gm_sign_store", &store)
+            .unwrap();
+        let restored: VoxelGmSignStore = StorageFormat::Toml
+            .deserialize("gm_sign_store", &bytes)
+            .unwrap();
+
+        assert_eq!(restored, store);
+    }
+
+    #[test]
+    fn gm_sign_board_and_children_use_the_gm_only_render_layer() {
+        fn spawn_sign(
+            mut commands: Commands,
+            mut meshes: ResMut<Assets<Mesh>>,
+            materials: Res<VoxelMaterials>,
+        ) {
+            spawn_voxel_gm_sign(
+                &mut commands,
+                &mut meshes,
+                &materials,
+                VoxelGmSign {
+                    cell: IVec3::Y,
+                    support_cell: IVec3::ZERO,
+                    facing: Vec3::Z,
+                    text: "秘密".to_owned(),
+                },
+            );
+        }
+
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .insert_resource(VoxelMaterials {
+                handles: std::array::from_fn(|_| Handle::default()),
+                planet_ocean: Handle::default(),
+            })
+            .add_systems(Startup, spawn_sign);
+        app.update();
+
+        let (entity, children, layers) = app
+            .world_mut()
+            .query::<(Entity, &Children, &RenderLayers)>()
+            .single(app.world())
+            .unwrap();
+        let gm_only = RenderLayers::layer(VOXEL_DM_GIZMO_RENDER_LAYER);
+        assert_eq!(*layers, gm_only);
+        assert!(app.world().entity(entity).contains::<VoxelGmSign>());
+        assert_eq!(children.len(), 2);
+        for child in children.iter() {
+            assert_eq!(
+                *app.world().entity(child).get::<RenderLayers>().unwrap(),
+                gm_only
+            );
+        }
+    }
+
+    #[test]
     fn invisible_standee_switches_to_the_gm_only_render_layer() {
         let mut app = App::new();
         app.add_systems(
@@ -20350,10 +20988,11 @@ mod tests {
             voxels: vec![(IVec3::ZERO, 1)],
             physics_bodies: Vec::new(),
             placed_lights: Vec::new(),
+            gm_signs: Vec::new(),
         });
 
         assert_eq!(editor.scene_snapshot_labels(), vec![
-            "场景快照 1（1 方块 / 0 物理体 / 0 灯光）"
+            "场景快照 1（1 方块 / 0 物理体 / 0 灯光 / 0 GM告示牌）"
         ]);
         editor.request_scene_restore(0);
         assert_eq!(editor.restore_scene_requested, Some(0));
@@ -20503,6 +21142,16 @@ mod tests {
                 direction: Vec3::Y,
             })
             .id();
+        let saved_sign_cell = IVec3::new(53, 7, 3);
+        let saved_sign = app
+            .world_mut()
+            .spawn(VoxelGmSign {
+                cell: saved_sign_cell,
+                support_cell: saved_position,
+                facing: Vec3::Z,
+                text: "GM秘密".to_owned(),
+            })
+            .id();
         app.world_mut()
             .resource_mut::<VoxelEditorState>()
             .request_scene_snapshot();
@@ -20524,6 +21173,7 @@ mod tests {
             .unwrap()
             .translation = Vec3::splat(99.0);
         app.world_mut().despawn(saved_light);
+        app.world_mut().despawn(saved_sign);
         app.world_mut()
             .resource_mut::<VoxelEditorState>()
             .request_scene_restore(0);
@@ -20547,6 +21197,13 @@ mod tests {
             .unwrap();
         assert_eq!(restored_light.cell, saved_light_cell);
         assert_eq!(restored_light.color, [1.0, 0.5, 0.25]);
+        let restored_sign = app
+            .world_mut()
+            .query::<&VoxelGmSign>()
+            .single(app.world())
+            .unwrap();
+        assert_eq!(restored_sign.cell, saved_sign_cell);
+        assert_eq!(restored_sign.text, "GM秘密");
     }
 
     #[test]

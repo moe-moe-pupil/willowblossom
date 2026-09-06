@@ -310,6 +310,7 @@ pub struct NapcatSendManager {
 struct NapcatAutomaticReplyRequests {
     next_request_id: u64,
     pending: HashMap<u64, PendingAutomaticPrivateReply>,
+    pending_group: HashMap<u64, PendingAutomaticGroupReply>,
 }
 
 #[derive(Debug)]
@@ -317,6 +318,12 @@ struct PendingAutomaticPrivateReply {
     recipient_id: u64,
     text: String,
     forwarded: Option<ForwardedAttribution>,
+}
+
+#[derive(Debug)]
+struct PendingAutomaticGroupReply {
+    group_id: u64,
+    text: String,
 }
 
 #[derive(Resource)]
@@ -6882,6 +6889,7 @@ fn setup(mut commands: Commands) {
     commands.insert_resource(NapcatAutomaticReplyRequests {
         next_request_id: 1_000_000,
         pending: HashMap::default(),
+        pending_group: HashMap::default(),
     });
     commands.insert_resource(NapcatGroupInfoRequests {
         next_request_id: 2_000_000,
@@ -7269,11 +7277,9 @@ fn send_result_system(
 ) {
     let mut manager_changed = false;
     while let Ok(result) = receiver.0.try_recv() {
-        if let Some(changed) = apply_automatic_private_reply_result(
-            &result,
-            &mut automatic_replies,
-            &mut manager,
-        ) {
+        if let Some(changed) =
+            apply_automatic_reply_result(&result, &mut automatic_replies, &mut manager)
+        {
             manager_changed |= changed;
         } else {
             send_manager.results.push(result);
@@ -7286,35 +7292,72 @@ fn send_result_system(
     }
 }
 
-fn apply_automatic_private_reply_result(
+fn apply_automatic_reply_result(
     result: &NapcatSendResult,
     automatic_replies: &mut NapcatAutomaticReplyRequests,
     manager: &mut NapcatMessageManager,
 ) -> Option<bool> {
-    let pending = automatic_replies.pending.remove(&result.request_id)?;
+    if let Some(pending) = automatic_replies.pending.remove(&result.request_id) {
+        return Some(apply_pending_private_reply_result(result, pending, manager));
+    }
+    let pending = automatic_replies.pending_group.remove(&result.request_id)?;
+    Some(apply_pending_group_reply_result(result, pending, manager))
+}
+
+fn apply_pending_private_reply_result(
+    result: &NapcatSendResult,
+    pending: PendingAutomaticPrivateReply,
+    manager: &mut NapcatMessageManager,
+) -> bool {
     let expected_target_id = pending.recipient_id.to_string();
     if result.target_id != expected_target_id {
         eprintln!(
             "ignored mismatched automatic NapCat reply result: expected target {}, got {}",
             expected_target_id, result.target_id
         );
-        return Some(false);
+        return false;
     }
     if let Some(error) = result.error.as_deref() {
         eprintln!(
             "automatic NapCat reply to {} failed: {}",
             pending.recipient_id, error
         );
-        return Some(false);
+        return false;
     }
-    Some(
-        append_local_private_text_response_with_forwarded_attribution(
-            manager,
-            &expected_target_id,
-            pending.recipient_id,
-            &pending.text,
-            pending.forwarded,
-        ),
+    append_local_private_text_response_with_forwarded_attribution(
+        manager,
+        &expected_target_id,
+        pending.recipient_id,
+        &pending.text,
+        pending.forwarded,
+    )
+}
+
+fn apply_pending_group_reply_result(
+    result: &NapcatSendResult,
+    pending: PendingAutomaticGroupReply,
+    manager: &mut NapcatMessageManager,
+) -> bool {
+    let expected_target_id = pending.group_id.to_string();
+    if result.target_id != expected_target_id {
+        eprintln!(
+            "ignored mismatched automatic NapCat group reply result: expected target {}, got {}",
+            expected_target_id, result.target_id
+        );
+        return false;
+    }
+    if let Some(error) = result.error.as_deref() {
+        eprintln!(
+            "automatic NapCat group reply to {} failed: {}",
+            pending.group_id, error
+        );
+        return false;
+    }
+    append_local_group_text_response(
+        manager,
+        &expected_target_id,
+        pending.group_id,
+        &pending.text,
     )
 }
 
@@ -7508,6 +7551,7 @@ fn message_system(
             let is_new_target = !manager.messages.contains_key(&target_id);
             let is_incoming_message = json.data.user_id != json.data.self_id;
             let incoming_user_id = json.data.user_id;
+            let incoming_group_id = json.data.group_id;
             manager.annotate_incoming_message_access(&target_id, &mut json);
 
             let automatic_actions = prepare_inbound_automatic_actions(
@@ -7584,6 +7628,19 @@ fn message_system(
                 );
             }
 
+            if let (Some(sender), Some(response), Some(group_id)) = (
+                sender.as_deref(),
+                automatic_actions.group_response.as_deref(),
+                incoming_group_id,
+            ) {
+                queue_group_text_response(
+                    sender,
+                    &mut automatic_replies,
+                    group_id,
+                    response.to_owned(),
+                );
+            }
+
             if let (Some(sender), Some(auto_forward)) = (
                 sender.as_deref(),
                 automatic_actions.auto_forward,
@@ -7624,6 +7681,7 @@ fn message_system(
 #[derive(Default)]
 struct InboundAutomaticActions {
     private_response: Option<String>,
+    group_response: Option<String>,
     scene_capture: Option<SceneCaptureRequest>,
     auto_forward: Option<AutoForwardRequest>,
 }
@@ -7666,11 +7724,30 @@ fn prepare_inbound_automatic_actions(
     } else {
         None
     };
+    let group_response = if is_incoming_message
+        && matches!(message.data.message_type, NapcatMessageType::Group)
+    {
+        group_dice_response(message)
+    } else {
+        None
+    };
 
     InboundAutomaticActions {
         private_response,
+        group_response,
         scene_capture: scene_capture_request(manager, message),
         auto_forward,
+    }
+}
+
+fn group_dice_response(message: &NapcatMessage) -> Option<String> {
+    let text = message_text(message);
+    let response = roll_dice_command(&text)?;
+    let sender_name = message.data.sender.nickname.trim();
+    if sender_name.is_empty() {
+        Some(response)
+    } else {
+        Some(format!("【{sender_name}】{response}"))
     }
 }
 
@@ -7869,6 +7946,49 @@ fn queue_private_text_response_with_forwarded_attribution(
     }
 }
 
+fn queue_group_text_response(
+    sender: &NapcatIOSender,
+    automatic_replies: &mut NapcatAutomaticReplyRequests,
+    group_id: u64,
+    text: String,
+) -> bool {
+    let request_id = automatic_replies.next_request_id;
+    automatic_replies.next_request_id += 1;
+    let message = Message::Text(
+        json!({
+            "action": "send_group_msg",
+            "params": {
+                "group_id": group_id,
+                "message": [
+                    {
+                        "type": "text",
+                        "data": {
+                            "text": &text
+                        }
+                    }
+                ]
+            }
+        })
+        .to_string()
+        .into(),
+    );
+
+    if let Err(err) = sender.0.try_send(NapcatOutboundMessage {
+        request_id,
+        target_id: group_id.to_string(),
+        message,
+    }) {
+        eprintln!("failed to queue NapCat group text response: {err}");
+        false
+    } else {
+        automatic_replies.pending_group.insert(
+            request_id,
+            PendingAutomaticGroupReply { group_id, text },
+        );
+        true
+    }
+}
+
 fn append_local_private_text_response(
     manager: &mut NapcatMessageManager,
     target_id: &str,
@@ -7959,6 +8079,80 @@ fn append_local_private_text_response_with_forwarded_attribution(
     manager.chat_target_kinds.insert(
         target_id.to_owned(),
         ChatTargetExportKind::Private,
+    );
+    true
+}
+
+fn append_local_group_text_response(
+    manager: &mut NapcatMessageManager,
+    target_id: &str,
+    group_id: u64,
+    text: &str,
+) -> bool {
+    let self_id = manager
+        .messages
+        .get(target_id)
+        .and_then(|messages| messages.first())
+        .map(|message| message.data.self_id)
+        .or_else(|| {
+            manager
+                .messages
+                .values()
+                .find_map(|messages| messages.first().map(|message| message.data.self_id))
+        })
+        .unwrap_or_default();
+    let group_name = manager
+        .messages
+        .get(target_id)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find_map(|message| message.data.group_name.clone())
+        });
+
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let mut message = NapcatMessage {
+        data: NapcatMessageData {
+            time,
+            message_type: NapcatMessageType::Group,
+            message_id: None,
+            message: vec![NapcatMessageChain {
+                variant: NapcatMessageChainType::Text {
+                    data: TextData {
+                        text: text.to_owned(),
+                    },
+                },
+            }],
+            self_id,
+            user_id: self_id,
+            group_id: Some(group_id),
+            group_name,
+            target_id: None,
+            sender: NapcatSender {
+                user_id: self_id,
+                nickname: "GM".to_owned(),
+            },
+            campaign_id: String::new(),
+            character_id: None,
+            party_id: None,
+            visibility: Visibility::Public,
+            access_scope_resolved: false,
+        },
+    };
+    manager.annotate_message_access(target_id, &mut message);
+
+    manager
+        .messages
+        .entry(target_id.to_owned())
+        .or_default()
+        .push(message);
+    manager.chat_target_kinds.insert(
+        target_id.to_owned(),
+        ChatTargetExportKind::Group,
     );
     true
 }
@@ -8369,6 +8563,8 @@ fn format_private_help() -> String {
         "【.兑换】开始创建角色",
         "【.r】或【.rd】投掷D100；【.r2d3】投掷2D3",
         "【.roll 2d6+3】或【.d 2d6+3】计算骰子表达式（支持 + - * / 和括号）",
+        "骰子支持舍弃/保留修饰：例如【.r 4d6dl1】舍弃最低1颗（dl/dh/kh/kl）",
+        "【.dnd5】按D&D5E规则生成6组属性（4d6舍最低，可加说明如 .dnd5 力量）",
         "骰点后可用 # 添加说明，例如【.r 1d20+5 # 侦查】",
         "【.状态】查看角色当前状态",
         "【.属性说明】查看八项属性的完整说明",
@@ -8412,7 +8608,7 @@ fn format_private_weave(manager: &NapcatMessageManager, target_id: &str) -> Stri
     }
     let int_ = character_total_status(character).int_;
     if int_ < 5 {
-        return "你的智力尚未达到10点，无法感知魔网。".to_owned();
+        return "你的智力尚未达到5点，无法感知魔网。".to_owned();
     }
     let Some(group) = manager.group_for_player_target(target_id) else {
         return "你当前不在TRPG组中，无法定位魔网。".to_owned();
@@ -14770,10 +14966,10 @@ position_cells = [4, 5, 6]
     }
 
     #[test]
-    fn private_weave_aliases_require_ten_int_and_report_same_campaign_field() {
+    fn private_weave_aliases_require_five_int_and_report_same_campaign_field() {
         let mut manager = empty_manager();
         let mut character = completed_character("织法者");
-        character.status.int_ = 9;
+        character.status.int_ = 4;
         manager.player_characters.insert("2".to_owned(), character);
         manager.trpg_groups.insert("table".to_owned(), TrpgGroup {
             campaign_id: "weave-test".to_owned(),
@@ -14787,9 +14983,9 @@ position_cells = [4, 5, 6]
             "2",
         )
         .unwrap();
-        assert!(denied.contains("智力尚未达到10点"));
+        assert!(denied.contains("智力尚未达到5点"));
 
-        manager.player_characters.get_mut("2").unwrap().status.int_ = 10;
+        manager.player_characters.get_mut("2").unwrap().status.int_ = 5;
         let halfwidth = handle_character_creation_message(
             &mut manager,
             &test_message_with_text(NapcatMessageType::Private, ".weave"),
@@ -18588,6 +18784,7 @@ position_cells = [4, 5, 6]
         let mut automatic_replies = NapcatAutomaticReplyRequests {
             next_request_id: 1_000_000,
             pending: HashMap::default(),
+            pending_group: HashMap::default(),
         };
 
         assert!(queue_private_text_response(
@@ -18601,7 +18798,7 @@ position_cells = [4, 5, 6]
         assert!(automatic_replies.pending.contains_key(&outbound.request_id));
 
         assert_eq!(
-            apply_automatic_private_reply_result(
+            apply_automatic_reply_result(
                 &NapcatSendResult {
                     request_id: outbound.request_id,
                     target_id: "2".to_owned(),
@@ -18632,6 +18829,7 @@ position_cells = [4, 5, 6]
         let mut automatic_replies = NapcatAutomaticReplyRequests {
             next_request_id: 1_000_000,
             pending: HashMap::default(),
+            pending_group: HashMap::default(),
         };
 
         assert!(queue_private_text_response(
@@ -18643,7 +18841,7 @@ position_cells = [4, 5, 6]
         let outbound = receiver.try_recv().unwrap();
 
         assert_eq!(
-            apply_automatic_private_reply_result(
+            apply_automatic_reply_result(
                 &NapcatSendResult {
                     request_id: outbound.request_id,
                     target_id: "2".to_owned(),
@@ -18657,6 +18855,161 @@ position_cells = [4, 5, 6]
 
         assert!(automatic_replies.pending.is_empty());
         assert_eq!(manager.messages["2"].len(), 1);
+    }
+
+    #[test]
+    fn group_dice_message_triggers_dice_response_with_sender_attribution() {
+        let mut manager = empty_manager();
+        let mut message = test_message_with_text(NapcatMessageType::Group, ".r 4d6dl1");
+        message.data.group_id = Some(9);
+        message.data.group_name = Some("冒险者公会".to_owned());
+
+        let actions = prepare_inbound_automatic_actions(
+            &mut manager,
+            &message,
+            "9",
+            true,
+            None,
+            NapcatInboundOrigin::Live,
+        );
+        let response = actions.group_response.expect("dice command should be answered in groups");
+        assert!(response.starts_with("【tester】掷骰【4d6dl1】"), "{response}");
+        assert!(response.contains("结果："));
+        assert!(actions.private_response.is_none());
+
+        let plain_chat = test_message_with_text(NapcatMessageType::Group, "大家好");
+        let actions = prepare_inbound_automatic_actions(
+            &mut manager,
+            &plain_chat,
+            "9",
+            true,
+            None,
+            NapcatInboundOrigin::Live,
+        );
+        assert!(actions.group_response.is_none());
+    }
+
+    #[test]
+    fn automatic_group_reply_is_persisted_only_after_acknowledgement() {
+        let mut manager = empty_manager();
+        let mut incoming = test_message_with_text(NapcatMessageType::Group, ".r 2d6");
+        incoming.data.group_id = Some(9);
+        incoming.data.group_name = Some("冒险者公会".to_owned());
+        manager.messages.insert("9".to_owned(), vec![incoming]);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let sender = NapcatIOSender(sender);
+        let mut automatic_replies = NapcatAutomaticReplyRequests {
+            next_request_id: 1_000_000,
+            pending: HashMap::default(),
+            pending_group: HashMap::default(),
+        };
+
+        assert!(queue_group_text_response(
+            &sender,
+            &mut automatic_replies,
+            9,
+            "【tester】掷骰【2d6】".to_owned(),
+        ));
+        assert_eq!(manager.messages["9"].len(), 1);
+        let outbound = receiver.try_recv().unwrap();
+        assert_eq!(outbound.target_id, "9");
+        assert!(automatic_replies
+            .pending_group
+            .contains_key(&outbound.request_id));
+        let payload = match &outbound.message {
+            Message::Text(text) => text.to_string(),
+            other => panic!("unexpected outbound message: {other:?}"),
+        };
+        assert!(payload.contains("\"send_group_msg\""), "{payload}");
+        assert!(payload.contains("\"group_id\":9"), "{payload}");
+
+        assert_eq!(
+            apply_automatic_reply_result(
+                &NapcatSendResult {
+                    request_id: outbound.request_id,
+                    target_id: "9".to_owned(),
+                    error: None,
+                },
+                &mut automatic_replies,
+                &mut manager,
+            ),
+            Some(true)
+        );
+
+        assert!(automatic_replies.pending_group.is_empty());
+        assert_eq!(manager.messages["9"].len(), 2);
+        let response = manager.messages["9"].last().unwrap();
+        assert!(matches!(
+            response.data.message_type,
+            NapcatMessageType::Group
+        ));
+        assert_eq!(response.data.group_id, Some(9));
+        assert_eq!(response.data.user_id, response.data.self_id);
+        assert_eq!(
+            message_text(response),
+            "【tester】掷骰【2d6】"
+        );
+        assert_eq!(
+            manager.chat_target_kinds.get("9"),
+            Some(&ChatTargetExportKind::Group)
+        );
+    }
+
+    #[test]
+    fn rejected_automatic_group_reply_does_not_create_local_history() {
+        let mut manager = empty_manager();
+        manager.messages.insert("9".to_owned(), vec![
+            test_message_with_text(NapcatMessageType::Group, ".r 2d6"),
+        ]);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let sender = NapcatIOSender(sender);
+        let mut automatic_replies = NapcatAutomaticReplyRequests {
+            next_request_id: 1_000_000,
+            pending: HashMap::default(),
+            pending_group: HashMap::default(),
+        };
+
+        assert!(queue_group_text_response(
+            &sender,
+            &mut automatic_replies,
+            9,
+            "group answer".to_owned(),
+        ));
+        let outbound = receiver.try_recv().unwrap();
+
+        assert_eq!(
+            apply_automatic_reply_result(
+                &NapcatSendResult {
+                    request_id: outbound.request_id,
+                    target_id: "9".to_owned(),
+                    error: Some("NapCat rejected reply".to_owned()),
+                },
+                &mut automatic_replies,
+                &mut manager,
+            ),
+            Some(false)
+        );
+
+        assert!(automatic_replies.pending_group.is_empty());
+        assert_eq!(manager.messages["9"].len(), 1);
+    }
+
+    #[test]
+    fn journal_replay_does_not_retrigger_group_dice_responses() {
+        let mut manager = empty_manager();
+        let mut message = test_message_with_text(NapcatMessageType::Group, ".r 4d6dl1");
+        message.data.group_id = Some(9);
+
+        let actions = prepare_inbound_automatic_actions(
+            &mut manager,
+            &message,
+            "9",
+            true,
+            None,
+            NapcatInboundOrigin::JournalReplay,
+        );
+        assert!(actions.group_response.is_none());
+        assert!(actions.private_response.is_none());
     }
 
     #[test]
