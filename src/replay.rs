@@ -63,7 +63,11 @@ use bevy::{
     window::PrimaryWindow,
 };
 use bevy_egui::{
-    egui,
+    egui::{
+        self,
+        DragValue,
+        Ui,
+    },
     EguiContexts,
     EguiPrimaryContextPass,
 };
@@ -3873,7 +3877,7 @@ fn replay_controls(
                                 line.included = false;
                             }
                         }
-                        replay.duration_ms = compile_area_block_timeline(replay);
+                        recompile_edited_replay_dialogue(replay);
                         extend_replay_for_speech(replay);
                     }
                     studio.director_request_pending = false;
@@ -5222,7 +5226,7 @@ fn apply_ready_director_plan(
             line.duration_ms = scaled_dialogue_duration_ms(text, replay.master_dialogue_duration);
         }
     }
-    replay.duration_ms = compile_area_block_timeline(replay);
+    recompile_edited_replay_dialogue(replay);
     extend_replay_for_speech(replay);
 
     let base = camera
@@ -5934,6 +5938,29 @@ fn replay_live_edit_panel(
                 });
                 return;
             }
+            if let Some(position) = current_position {
+                if let Some(position) = replay_position_frame_editor(
+                    ui,
+                    position,
+                    playback_active && !take_active,
+                ) {
+                    if let Some(replay) = studio.replay.as_mut() {
+                        replace_replay_movement_segment(
+                            replay,
+                            user_id,
+                            playhead_ms,
+                            playhead_ms,
+                            &[ReplayStandeePosition {
+                                time_ms: playhead_ms,
+                                user_id,
+                                position: position.to_array(),
+                            }],
+                        );
+                        studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
+                        studio.status = format!("已保存角色 {user_id} 在 {} 的位置帧", format_time(playhead_ms));
+                    }
+                }
+            }
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
@@ -6032,6 +6059,28 @@ fn replay_live_edit_panel(
                 return;
             }
             if let Some((_, ship_name, transform)) = selected_ship {
+                if let Some(position) = replay_position_frame_editor(
+                    ui,
+                    transform.translation,
+                    playback_active && !take_active,
+                ) {
+                    if let Some(replay) = studio.replay.as_mut() {
+                        replace_replay_ship_segment(
+                            replay,
+                            &ship_id,
+                            &ship_name,
+                            playhead_ms,
+                            playhead_ms,
+                            &[ReplayShipKeyframe {
+                                time_ms: playhead_ms,
+                                translation: position.to_array(),
+                                rotation: transform.rotation.to_array(),
+                            }],
+                        );
+                        studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
+                        studio.status = format!("已保存飞船 {ship_name} 在 {} 的位置帧", format_time(playhead_ms));
+                    }
+                }
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(playback_active, egui::Button::new("从此停止飞船"))
@@ -6173,6 +6222,25 @@ fn replay_live_edit_panel(
             }
         });
     });
+}
+
+/// Writes through on each coordinate change, so playback applies the authored
+/// pose on its next update. Pausing makes precise frame placement easier.
+fn replay_position_frame_editor(ui: &mut Ui, position: Vec3, enabled: bool) -> Option<Vec3> {
+    let mut cells = (position / VOXEL_SIZE).to_array();
+    let mut changed = false;
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.label("当前位置帧（格）；暂停后可精确调整，修改会立即保存");
+        ui.horizontal_wrapped(|ui| {
+            for (axis, value) in ["X", "Y", "Z"].into_iter().zip(&mut cells) {
+                ui.label(axis);
+                changed |= ui.add(DragValue::new(value).speed(1.0)).changed();
+            }
+            changed |= ui.button("保存当前位置帧").clicked();
+        });
+    });
+    (changed && cells.iter().all(|value| value.is_finite()))
+        .then(|| Vec3::from_array(cells) * VOXEL_SIZE)
 }
 
 fn replay_dialogue_editor(
@@ -6511,7 +6579,7 @@ fn replay_dialogue_editor(
                 rebuild_area_blocks(replay);
             }
             if changed || rebuild_blocks_requested {
-                replay.duration_ms = compile_area_block_timeline(replay);
+                recompile_edited_replay_dialogue(replay);
                 extend_replay_for_speech(replay);
                 let playable = replay
                     .dialogue
@@ -6752,22 +6820,7 @@ fn replay_movement_timing_editor(
         &replay.campaign_id,
         &replay.dialogue,
     );
-    let dialogue_end = replay
-        .dialogue
-        .iter()
-        .filter(|line| line.included && line.time_ms != u64::MAX)
-        .map(|line| line.time_ms.saturating_add(line.duration_ms))
-        .max()
-        .unwrap_or_default()
-        .max(5_000);
-    let movement_end = replay
-        .player_movements
-        .iter()
-        .filter_map(|movement| movement.keyframes.last())
-        .map(|frame| frame.time_ms)
-        .max()
-        .unwrap_or_default();
-    replay.duration_ms = dialogue_end.max(movement_end);
+    refresh_replay_duration(replay, 5_000);
     if let Ok(base) = camera.single() {
         let positions = replay_speaker_positions(&replay.dialogue);
         replay.camera = turn_based_camera_track(
@@ -6971,22 +7024,7 @@ fn rebuild_replay_timeline_with_ships(
     compile_scene_dynamics_timeline(replay, ship_history, 0, &[], &[]);
     replay.ship_trajectory_history_cursor_unix_ms = unix_time_ms();
     extend_replay_for_speech(replay);
-    let dialogue_end = replay
-        .dialogue
-        .iter()
-        .filter(|line| line.included && line.time_ms != u64::MAX)
-        .map(|line| line.time_ms.saturating_add(line.duration_ms))
-        .max()
-        .unwrap_or_default()
-        .max(5_000);
-    let trajectory_end = replay
-        .ship_trajectories
-        .iter()
-        .filter_map(|trajectory| trajectory.keyframes.last())
-        .map(|frame| frame.time_ms)
-        .max()
-        .unwrap_or_default();
-    replay.duration_ms = dialogue_end.max(trajectory_end);
+    refresh_replay_duration(replay, 5_000);
     if let Ok(base) = camera.single() {
         let positions = replay_speaker_positions(&replay.dialogue);
         replay.camera = turn_based_camera_track(
@@ -8378,7 +8416,7 @@ fn minimum_speech_window_ms_for_line(
 }
 
 fn shifted_replay_time(time_ms: u64, boundary_ms: u64, delta_ms: i64) -> u64 {
-    if time_ms < boundary_ms || delta_ms == 0 {
+    if time_ms == u64::MAX || time_ms < boundary_ms || delta_ms == 0 {
         return time_ms;
     }
     if delta_ms > 0 {
@@ -8469,6 +8507,17 @@ fn set_exact_dialogue_duration(
     Some(updated_playback_ms.min(replay.duration_ms))
 }
 
+/// Rebuilding one editor track must never make another authored track
+/// unreachable. Keep a minimum viewing window even for an empty project.
+fn refresh_replay_duration(replay: &mut ReplayFile, minimum_ms: u64) {
+    replay.duration_ms = replay_timeline_content_end(replay).max(minimum_ms);
+}
+
+fn recompile_edited_replay_dialogue(replay: &mut ReplayFile) {
+    let dialogue_end = compile_area_block_timeline(replay);
+    refresh_replay_duration(replay, dialogue_end);
+}
+
 fn replay_timeline_content_end(replay: &ReplayFile) -> u64 {
     replay
         .dialogue
@@ -8505,6 +8554,27 @@ fn replace_replay_movement_segment(
     if samples.is_empty() {
         return 0;
     }
+    // World-position samples take precedence during playback. When editing a
+    // history-only track, seed its existing frames before adding that override;
+    // otherwise a single new frame would hide all earlier and later movement.
+    if !replay
+        .standee_positions
+        .iter()
+        .any(|sample| sample.user_id == user_id)
+    {
+        replay.standee_positions.extend(
+            replay
+                .player_movements
+                .iter()
+                .filter(|movement| movement.user_id == user_id)
+                .flat_map(|movement| movement.keyframes.iter())
+                .map(|frame| ReplayStandeePosition {
+                    time_ms: frame.time_ms,
+                    user_id,
+                    position: (Vec3::from_array(frame.position_cells) * VOXEL_SIZE).to_array(),
+                }),
+        );
+    }
     replay.standee_positions.retain(|sample| {
         sample.user_id != user_id || sample.time_ms < start_ms || sample.time_ms > end_ms
     });
@@ -8537,6 +8607,7 @@ fn replace_replay_movement_segment(
     replay
         .player_movements
         .push(ReplayPlayerMovement { user_id, keyframes });
+    replay.duration_ms = replay.duration_ms.max(replay_timeline_content_end(replay));
     samples.len()
 }
 
@@ -8610,6 +8681,7 @@ fn replace_replay_ship_segment(
         ship_name: existing_name,
         keyframes,
     });
+    replay.duration_ms = replay.duration_ms.max(replay_timeline_content_end(replay));
     samples.len()
 }
 
@@ -12356,8 +12428,59 @@ mod tests {
     use std::time::Duration;
 
     use bevy::ecs::system::RunSystemOnce;
+    use bevy_egui::egui::{
+        Context,
+        Event,
+        Modifiers,
+        PointerButton,
+        RawInput,
+        Shape,
+    };
 
     use super::*;
+
+    #[test]
+    fn position_frame_controls_only_write_when_enabled_and_clicked() {
+        for enabled in [false, true] {
+            let context = Context::default();
+            let position = Vec3::new(4.0, -2.0, 8.0) * VOXEL_SIZE;
+            let mut result = None;
+            let output = context.run_ui(RawInput::default(), |ui| {
+                result = replay_position_frame_editor(ui, position, enabled);
+            });
+            assert!(
+                result.is_none(),
+                "rendering must not author a frame"
+            );
+            let button_center = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    Shape::Text(text) if text.galley.text() == "保存当前位置帧" => {
+                        Some(text.visual_bounding_rect().center())
+                    },
+                    _ => None,
+                })
+                .expect("rendered position-frame button");
+            for pressed in [true, false] {
+                let _ = context.run_ui(
+                    RawInput {
+                        events: vec![Event::PointerMoved(button_center), Event::PointerButton {
+                            pos: button_center,
+                            button: PointerButton::Primary,
+                            pressed,
+                            modifiers: Modifiers::default(),
+                        }],
+                        ..default()
+                    },
+                    |ui| {
+                        result = replay_position_frame_editor(ui, position, enabled);
+                    },
+                );
+            }
+            assert_eq!(result, enabled.then_some(position));
+        }
+    }
 
     #[test]
     fn live_takes_extend_past_the_end_and_normal_playback_still_stops() {
@@ -13514,6 +13637,36 @@ mod tests {
                 .translation,
             Vec3::X
         );
+
+        // Editing a frame during paused playback must invalidate the cached
+        // world track without hiding the original movement on either side.
+        {
+            let mut studio = app.world_mut().resource_mut::<ReplayStudio>();
+            replace_replay_movement_segment(
+                studio.replay.as_mut().unwrap(),
+                42,
+                50,
+                50,
+                &[ReplayStandeePosition {
+                    time_ms: 50,
+                    user_id: 42,
+                    position: Vec3::Y.to_array(),
+                }],
+            );
+            studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
+        }
+        for (time_ms, expected) in [(0, Vec3::ZERO), (50, Vec3::Y), (100, Vec3::X)] {
+            app.world_mut().resource_mut::<ReplayStudio>().playback_ms = time_ms;
+            app.update();
+            assert_eq!(
+                app.world()
+                    .entity(standee)
+                    .get::<Transform>()
+                    .unwrap()
+                    .translation,
+                expected
+            );
+        }
     }
 
     #[test]
@@ -16551,6 +16704,141 @@ mod tests {
             trajectory.keyframes.len() > 100,
             "the compressed segment should still carry the flight frames"
         );
+    }
+
+    #[test]
+    fn ship_position_frames_replace_one_time_and_extend_the_saved_timeline() {
+        let mut replay = test_replay(Vec::new());
+        let rotation = Quat::from_rotation_y(0.7).to_array();
+        for (time_ms, position) in [
+            (0, Vec3::ZERO),
+            (200, Vec3::X),
+            (100, Vec3::Y),
+            (100, Vec3::Z),
+        ] {
+            replace_replay_ship_segment(
+                &mut replay,
+                "ship",
+                "船",
+                time_ms,
+                time_ms,
+                &[ReplayShipKeyframe {
+                    time_ms,
+                    translation: position.to_array(),
+                    rotation,
+                }],
+            );
+        }
+        assert_eq!(replay.duration_ms, 200);
+        let frames = &replay.ship_trajectories[0].keyframes;
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames.iter().map(|frame| frame.time_ms).collect::<Vec<_>>(),
+            vec![0, 100, 200]
+        );
+        assert_eq!(
+            frames[0].translation,
+            Vec3::ZERO.to_array()
+        );
+        assert_eq!(
+            frames[1].translation,
+            Vec3::Z.to_array()
+        );
+        assert_eq!(frames[1].rotation, rotation);
+        assert_eq!(
+            frames[2].translation,
+            Vec3::X.to_array()
+        );
+        let saved = serde_json::to_string(&replay).unwrap();
+        let restored: ReplayFile = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.duration_ms, 200);
+        assert_eq!(
+            restored.ship_trajectories[0].keyframes[1].translation,
+            Vec3::Z.to_array()
+        );
+    }
+
+    #[test]
+    fn timeline_editors_preserve_the_end_of_every_authored_track() {
+        for track in 0..6 {
+            let mut replay = test_replay(vec![test_dialogue(
+                0,
+                1_000,
+                DialogueSide::Left,
+            )]);
+            assign_replay_line_ids(&mut replay.dialogue);
+            rebuild_area_blocks(&mut replay);
+            match track {
+                0 => replay.camera.push(ReplayCameraKeyframe {
+                    time_ms: 9_000,
+                    translation: [0.0; 3],
+                    rotation: Quat::IDENTITY.to_array(),
+                }),
+                1 => replay.player_movements.push(ReplayPlayerMovement {
+                    user_id: 7,
+                    keyframes: vec![ReplayPlayerMovementKeyframe {
+                        time_ms: 9_000,
+                        position_cells: [1.0, 0.0, 0.0],
+                    }],
+                }),
+                2 => replay.ship_trajectories.push(ReplayShipTrajectory {
+                    ship_id: "ship".into(),
+                    ship_name: "船".into(),
+                    keyframes: vec![ReplayShipKeyframe {
+                        time_ms: 9_000,
+                        translation: [0.0; 3],
+                        rotation: Quat::IDENTITY.to_array(),
+                    }],
+                }),
+                3 => replay.standee_positions.push(ReplayStandeePosition {
+                    time_ms: 9_000,
+                    user_id: 7,
+                    position: [0.0; 3],
+                }),
+                4 => replay.terrain_changes.push(ReplayTerrainChange {
+                    time_ms: 9_000,
+                    position: [0; 3],
+                    material: 0,
+                    enabled: true,
+                }),
+                _ => replay.ship_hull_changes.push(ReplayShipHullChange {
+                    time_ms: 9_000,
+                    ship_id: "ship".into(),
+                    position: [0; 3],
+                    material: 0,
+                    enabled: false,
+                }),
+            }
+            refresh_replay_duration(&mut replay, 5_000);
+            assert_eq!(
+                replay.duration_ms, 9_000,
+                "track {track}"
+            );
+            recompile_edited_replay_dialogue(&mut replay);
+            assert_eq!(
+                replay.duration_ms, 9_000,
+                "recompiled track {track}"
+            );
+        }
+    }
+
+    #[test]
+    fn shortening_a_cue_keeps_excluded_and_unassigned_lines_unscheduled() {
+        let active = test_dialogue(0, 2_000, DialogueSide::Left);
+        let mut excluded = test_dialogue(u64::MAX, 1_000, DialogueSide::Right);
+        excluded.included = false;
+        let unassigned = test_dialogue(u64::MAX, 1_000, DialogueSide::Right);
+        let mut replay = test_replay(vec![active, excluded, unassigned]);
+        replay.duration_ms = 3_000;
+
+        set_exact_dialogue_duration(&mut replay, 0, 1_000, 500).unwrap();
+
+        assert_eq!(replay.dialogue[1].time_ms, u64::MAX);
+        assert_eq!(replay.dialogue[2].time_ms, u64::MAX);
+        assert!(!replay_dialogue_is_playable(
+            &replay.dialogue[2]
+        ));
+        assert_eq!(replay.duration_ms, 2_000);
     }
 
     #[test]
