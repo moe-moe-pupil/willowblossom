@@ -1054,6 +1054,7 @@ enum ReplayMode {
 struct ReplayMovementPunchIn {
     user_id: u64,
     start_ms: u64,
+    original_duration_ms: u64,
     last_sample_ms: Option<u64>,
     samples: Vec<ReplayStandeePosition>,
 }
@@ -1063,6 +1064,7 @@ struct ReplayShipPunchIn {
     ship_id: String,
     ship_name: String,
     start_ms: u64,
+    original_duration_ms: u64,
     last_sample_ms: Option<u64>,
     samples: Vec<ReplayShipKeyframe>,
 }
@@ -3663,19 +3665,21 @@ fn replay_controls(
         ));
     }
     replay_live_edit_panel(ui, studio, live_edits, standees);
-    replay_dialogue_editor(ui, studio, camera);
-    replay_movement_timing_editor(
-        ui,
-        studio,
-        player_movement_history,
-        camera,
-    );
-    replay_ship_trajectory_editor(
-        ui,
-        studio,
-        ship_trajectory_history,
-        camera,
-    );
+    ui.add_enabled_ui(!replay_has_live_take(studio), |ui| {
+        replay_dialogue_editor(ui, studio, camera);
+        replay_movement_timing_editor(
+            ui,
+            studio,
+            player_movement_history,
+            camera,
+        );
+        replay_ship_trajectory_editor(
+            ui,
+            studio,
+            ship_trajectory_history,
+            camera,
+        );
+    });
     if !matches!(studio.mode, ReplayMode::Recording) && studio.replay.is_some() {
         let duration = studio.replay.as_ref().unwrap().duration_ms.max(1);
         ui.horizontal(|ui| {
@@ -3755,7 +3759,7 @@ fn replay_controls(
                         .or_else(|| previous_replay_turn(&turns, studio.playback_ms));
                     if ui
                         .add_enabled(
-                            previous.is_some(),
+                            previous.is_some() && !replay_has_live_take(studio),
                             egui::Button::new("⏮ 上一回合"),
                         )
                         .clicked()
@@ -3767,7 +3771,7 @@ fn replay_controls(
                     let next = next_replay_turn(&turns, studio.playback_ms);
                     if ui
                         .add_enabled(
-                            next.is_some(),
+                            next.is_some() && !replay_has_live_take(studio),
                             egui::Button::new("下一回合 ⏭"),
                         )
                         .clicked()
@@ -5749,6 +5753,32 @@ fn replay_live_edit_panel(
             );
         }
 
+        if take_active {
+            ui.colored_label(
+                egui::Color32::from_rgb(225, 90, 70),
+                "● 正在覆录；超过片尾会自动延长回放。保存或取消后可继续编辑时间轴。",
+            );
+            ui.horizontal(|ui| {
+                if ui.button("保存本次录制").clicked() {
+                    if let Some(take) = studio.live_movement_punch_in.as_ref() {
+                        let position = standee_choices.iter()
+                            .find(|(user_id, ..)| *user_id == take.user_id)
+                            .map(|(_, _, position)| *position);
+                        finish_live_movement_take(studio, position);
+                    } else if let Some(take) = studio.live_ship_punch_in.as_ref() {
+                        let transform = ship_choices.iter()
+                            .find(|(ship_id, ..)| *ship_id == take.ship_id)
+                            .map(|(_, _, transform)| *transform);
+                        finish_live_ship_take(studio, transform);
+                    }
+                }
+                if ui.button("取消本次录制").clicked() {
+                    cancel_live_replay_take(studio);
+                }
+            });
+            return;
+        }
+
         ui.collapsing("当前台词：文字、精确时长与声音", |ui| {
             let dialogue_index = studio.replay.as_ref().and_then(|replay| {
                 active_dialogue_index(&replay.dialogue, playhead_ms)
@@ -5918,26 +5948,6 @@ fn replay_live_edit_panel(
                 .iter()
                 .find(|(candidate, _, _)| *candidate == user_id)
                 .map(|(_, _, position)| *position);
-            let recording_this = studio
-                .live_movement_punch_in
-                .as_ref()
-                .is_some_and(|punch_in| punch_in.user_id == user_id);
-            if recording_this {
-                ui.colored_label(
-                    egui::Color32::from_rgb(225, 90, 70),
-                    "● 正在覆录：用角色接管控制移动；超过片尾会自动延长回放",
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("保存移动录制").clicked() {
-                        finish_live_movement_take(studio, current_position);
-                    }
-                    if ui.button("取消本次录制").clicked() {
-                        studio.live_movement_punch_in = None;
-                        studio.status = "已取消角色移动覆录；原轨迹保持不变".to_owned();
-                    }
-                });
-                return;
-            }
             if let Some(position) = current_position {
                 if let Some(position) = replay_position_frame_editor(
                     ui,
@@ -6035,29 +6045,6 @@ fn replay_live_edit_panel(
                 .iter()
                 .find(|(candidate, _, _)| candidate == &ship_id)
                 .cloned();
-            let recording_this = studio
-                .live_ship_punch_in
-                .as_ref()
-                .is_some_and(|punch_in| punch_in.ship_id == ship_id);
-            if recording_this {
-                ui.colored_label(
-                    egui::Color32::from_rgb(225, 90, 70),
-                    "● 正在覆录：驾驶飞船，播放头会同步采样；超过片尾会自动延长回放",
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("保存飞船录制").clicked() {
-                        finish_live_ship_take(
-                            studio,
-                            selected_ship.as_ref().map(|(_, _, transform)| *transform),
-                        );
-                    }
-                    if ui.button("取消本次录制").clicked() {
-                        studio.live_ship_punch_in = None;
-                        studio.status = "已取消飞船移动覆录；原轨迹保持不变".to_owned();
-                    }
-                });
-                return;
-            }
             if let Some((_, ship_name, transform)) = selected_ship {
                 if let Some(position) = replay_position_frame_editor(
                     ui,
@@ -7040,6 +7027,7 @@ fn rebuild_replay_timeline_with_ships(
 }
 
 fn stop_playback(studio: &mut ReplayStudio, grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>) {
+    cancel_live_replay_take(studio);
     if let Some(scene) = studio.pre_playback_scene.take() {
         if let Ok(mut grid) = grids.single_mut() {
             apply_scene(&mut grid, &scene);
@@ -8544,16 +8532,7 @@ fn replay_timeline_content_end(replay: &ReplayFile) -> u64 {
         .unwrap_or_default()
 }
 
-fn replace_replay_movement_segment(
-    replay: &mut ReplayFile,
-    user_id: u64,
-    start_ms: u64,
-    end_ms: u64,
-    samples: &[ReplayStandeePosition],
-) -> usize {
-    if samples.is_empty() {
-        return 0;
-    }
+fn seed_replay_standee_track(replay: &mut ReplayFile, user_id: u64) {
     // World-position samples take precedence during playback. When editing a
     // history-only track, seed its existing frames before adding that override;
     // otherwise a single new frame would hide all earlier and later movement.
@@ -8575,6 +8554,19 @@ fn replace_replay_movement_segment(
                 }),
         );
     }
+}
+
+fn replace_replay_movement_segment(
+    replay: &mut ReplayFile,
+    user_id: u64,
+    start_ms: u64,
+    end_ms: u64,
+    samples: &[ReplayStandeePosition],
+) -> usize {
+    if samples.is_empty() {
+        return 0;
+    }
+    seed_replay_standee_track(replay, user_id);
     replay.standee_positions.retain(|sample| {
         sample.user_id != user_id || sample.time_ms < start_ms || sample.time_ms > end_ms
     });
@@ -8612,6 +8604,7 @@ fn replace_replay_movement_segment(
 }
 
 fn stop_replay_movement_at(replay: &mut ReplayFile, user_id: u64, time_ms: u64, position: Vec3) {
+    seed_replay_standee_track(replay, user_id);
     replay
         .standee_positions
         .retain(|sample| sample.user_id != user_id || sample.time_ms < time_ms);
@@ -8719,7 +8712,39 @@ fn stop_replay_ship_at(
     });
 }
 
+fn replay_has_live_take(studio: &ReplayStudio) -> bool {
+    studio.live_movement_punch_in.is_some() || studio.live_ship_punch_in.is_some()
+}
+
+fn cancel_live_replay_take(studio: &mut ReplayStudio) {
+    let original_duration_ms = studio
+        .live_movement_punch_in
+        .take()
+        .map(|take| take.original_duration_ms)
+        .or_else(|| {
+            studio
+                .live_ship_punch_in
+                .take()
+                .map(|take| take.original_duration_ms)
+        });
+    let Some(original_duration_ms) = original_duration_ms else { return };
+    if let Some(replay) = studio.replay.as_mut() {
+        // Terrain edits are recorded separately and remain authored content even
+        // when the movement take is discarded.
+        refresh_replay_duration(replay, original_duration_ms);
+        studio.playback_ms = studio.playback_ms.min(replay.duration_ms);
+    }
+    studio.mode = ReplayMode::Paused;
+    studio.speech_wait_cue = None;
+    studio.speech_wait_elapsed_seconds = 0.0;
+    studio.status = "已取消本次移动录制；原轨迹保持不变，独立场景编辑仍保留".to_owned();
+}
+
 fn begin_live_movement_take(studio: &mut ReplayStudio, user_id: u64, position: Vec3) {
+    if replay_has_live_take(studio) || studio.replay.is_none() {
+        return;
+    }
+    let original_duration_ms = studio.replay.as_ref().expect("checked above").duration_ms;
     let playback_ms = studio.playback_ms;
     let mut samples = Vec::new();
     push_live_standee_sample(
@@ -8732,13 +8757,14 @@ fn begin_live_movement_take(studio: &mut ReplayStudio, user_id: u64, position: V
     studio.live_movement_punch_in = Some(ReplayMovementPunchIn {
         user_id,
         start_ms: playback_ms,
+        original_duration_ms,
         last_sample_ms: Some(playback_ms),
         samples,
     });
     studio.live_editing_enabled = true;
     studio.mode = ReplayMode::Playing;
     studio.status = format!(
-        "正在从 {} 覆录角色 {user_id} 的移动；移动角色后点击“保存移动录制”",
+        "正在从 {} 覆录角色 {user_id} 的移动；移动角色后点击“保存本次录制”",
         format_time(playback_ms),
     );
 }
@@ -8790,6 +8816,10 @@ fn begin_live_ship_take(
     ship_name: String,
     transform: Transform,
 ) {
+    if replay_has_live_take(studio) || studio.replay.is_none() {
+        return;
+    }
+    let original_duration_ms = studio.replay.as_ref().expect("checked above").duration_ms;
     let playback_ms = studio.playback_ms;
     let mut samples = Vec::new();
     push_live_ship_sample(&mut samples, playback_ms, transform);
@@ -8798,13 +8828,14 @@ fn begin_live_ship_take(
         ship_id: ship_id.clone(),
         ship_name,
         start_ms: playback_ms,
+        original_duration_ms,
         last_sample_ms: Some(playback_ms),
         samples,
     });
     studio.live_editing_enabled = true;
     studio.mode = ReplayMode::Playing;
     studio.status = format!(
-        "正在从 {} 覆录飞船 {ship_id}；驾驶后点击“保存飞船录制”",
+        "正在从 {} 覆录飞船 {ship_id}；驾驶后点击“保存本次录制”",
         format_time(playback_ms),
     );
 }
@@ -9891,6 +9922,9 @@ fn next_replay_turn(turns: &[ReplayTurn], playback_ms: u64) -> Option<usize> {
 }
 
 fn jump_replay_to_turn(studio: &mut ReplayStudio, turns: &[ReplayTurn], index: usize) {
+    if replay_has_live_take(studio) {
+        return;
+    }
     let Some(turn) = turns.get(index) else {
         return;
     };
@@ -12438,6 +12472,150 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn cancelling_live_takes_restores_duration_and_preserves_separate_scene_edits() {
+        for ship_take in [false, true] {
+            for scene_edit in [false, true] {
+                let mut studio = ReplayStudio::default();
+                let mut replay = test_replay(Vec::new());
+                replay.duration_ms = 1_000;
+                studio.replay = Some(replay);
+                studio.playback_ms = 900;
+                if ship_take {
+                    begin_live_ship_take(
+                        &mut studio,
+                        "ship".into(),
+                        "船".into(),
+                        Transform::default(),
+                    );
+                } else {
+                    begin_live_movement_take(&mut studio, 7, Vec3::ZERO);
+                }
+                studio.playback_ms = 2_000;
+                let replay = studio.replay.as_mut().unwrap();
+                replay.duration_ms = 2_000;
+                if scene_edit {
+                    replay.terrain_changes.push(ReplayTerrainChange {
+                        time_ms: 1_500,
+                        position: [0; 3],
+                        material: 0,
+                        enabled: true,
+                    });
+                }
+                cancel_live_replay_take(&mut studio);
+                let replay = studio.replay.as_ref().unwrap();
+                let expected_end = if scene_edit { 1_500 } else { 1_000 };
+                assert_eq!(replay.duration_ms, expected_end);
+                assert_eq!(studio.playback_ms, expected_end);
+                assert_eq!(studio.mode, ReplayMode::Paused);
+                assert!(!replay_has_live_take(&studio));
+                assert!(replay.player_movements.is_empty());
+                assert!(replay.ship_trajectories.is_empty());
+                assert_eq!(
+                    replay.terrain_changes.len(),
+                    usize::from(scene_edit)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stopping_preview_discards_the_pending_take_and_its_empty_tail() {
+        let mut studio = ReplayStudio::default();
+        let mut replay = test_replay(Vec::new());
+        replay.duration_ms = 1_000;
+        studio.replay = Some(replay);
+        begin_live_movement_take(&mut studio, 7, Vec3::ZERO);
+        studio.replay.as_mut().unwrap().duration_ms = 2_000;
+        studio.playback_ms = 2_000;
+        let mut world = World::new();
+        world.insert_resource(studio);
+        world
+            .run_system_once(
+                |mut studio: ResMut<ReplayStudio>,
+                 mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>| {
+                    stop_playback(&mut studio, &mut grids);
+                },
+            )
+            .unwrap();
+        let studio = world.resource::<ReplayStudio>();
+        assert_eq!(studio.mode, ReplayMode::Idle);
+        assert_eq!(studio.playback_ms, 0);
+        assert_eq!(
+            studio.replay.as_ref().unwrap().duration_ms,
+            1_000
+        );
+        assert!(!replay_has_live_take(studio));
+    }
+
+    #[test]
+    fn starting_another_take_cannot_discard_unsaved_samples() {
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(test_replay(vec![test_dialogue(0, 1_000, DialogueSide::Left)]));
+        studio.playback_ms = 500;
+        begin_live_movement_take(&mut studio, 7, Vec3::X);
+        let turns = replay_turns(studio.replay.as_ref().unwrap());
+        jump_replay_to_turn(&mut studio, &turns, 0);
+        assert_eq!(studio.playback_ms, 500);
+        assert_eq!(studio.mode, ReplayMode::Playing);
+        begin_live_movement_take(&mut studio, 8, Vec3::Y);
+        begin_live_ship_take(
+            &mut studio,
+            "ship".into(),
+            "船".into(),
+            Transform::default(),
+        );
+        let take = studio.live_movement_punch_in.as_ref().unwrap();
+        assert_eq!(take.user_id, 7);
+        assert_eq!(
+            take.samples[0].position,
+            Vec3::X.to_array()
+        );
+        assert!(studio.live_ship_punch_in.is_none());
+        cancel_live_replay_take(&mut studio);
+        begin_live_ship_take(
+            &mut studio,
+            "ship".into(),
+            "船".into(),
+            Transform::default(),
+        );
+        begin_live_movement_take(&mut studio, 8, Vec3::Y);
+        assert!(studio.live_movement_punch_in.is_none());
+        assert_eq!(
+            studio.live_ship_punch_in.as_ref().unwrap().ship_id,
+            "ship"
+        );
+    }
+
+    #[test]
+    fn stopping_history_only_movement_preserves_the_earlier_path() {
+        let mut replay = test_replay(Vec::new());
+        replay.player_movements.push(ReplayPlayerMovement {
+            user_id: 7,
+            keyframes: [0, 100, 200]
+                .into_iter()
+                .map(|time_ms| ReplayPlayerMovementKeyframe {
+                    time_ms,
+                    position_cells: [time_ms as f32, 0.0, 0.0],
+                })
+                .collect(),
+        });
+        stop_replay_movement_at(&mut replay, 7, 150, Vec3::Y);
+        assert_eq!(replay.standee_positions.len(), 3);
+        assert_eq!(
+            interpolated_standee_position(&replay.standee_positions, 0),
+            Some(Vec3::ZERO)
+        );
+        assert_eq!(
+            interpolated_standee_position(&replay.standee_positions, 100),
+            Some(Vec3::X * 100.0 * VOXEL_SIZE)
+        );
+        assert_eq!(
+            interpolated_standee_position(&replay.standee_positions, 200),
+            Some(Vec3::Y)
+        );
+    }
 
     #[test]
     fn position_frame_controls_only_write_when_enabled_and_clicked() {
