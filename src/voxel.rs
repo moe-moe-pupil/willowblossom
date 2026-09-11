@@ -146,6 +146,9 @@ use crate::{
 
 // Compact, geometry-only campaign layouts decoded from the group's workbook.
 mod map_design;
+mod tool_parameters;
+
+pub(crate) use tool_parameters::VoxelToolParameter;
 
 #[cfg(test)]
 mod spaceship_tests;
@@ -2036,6 +2039,7 @@ pub(crate) struct VoxelEditorState {
     pub selected_hotbar_slot: usize,
     equipped_item: Option<VoxelCreativeItem>,
     tool_gun_mode: VoxelEditMode,
+    selected_tool_parameter: Option<VoxelToolParameter>,
     pub light_tool: Option<VoxelLightTool>,
     pub placed_light_color: [f32; 3],
     pub placed_light_intensity: f32,
@@ -2109,6 +2113,7 @@ impl Default for VoxelEditorState {
             selected_hotbar_slot: 0,
             equipped_item: Some(VoxelCreativeItem::Material(1)),
             tool_gun_mode: VoxelEditMode::Physics,
+            selected_tool_parameter: None,
             light_tool: None,
             placed_light_color: [1.0, 0.78, 0.48],
             placed_light_intensity: 1_800.0,
@@ -3564,6 +3569,17 @@ fn voxel_editor_shortcuts(
         (KeyCode::Digit0, 9),
     ] {
         if keyboard.just_pressed(key) {
+            let shift =
+                keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
+            if shift
+                && !possession.is_active()
+                && !editor.creative_inventory_open
+                && !editor.teleport_menu_open
+                && !editor.tool_parameters().is_empty()
+            {
+                editor.select_tool_parameter(slot);
+                continue;
+            }
             if let Some(active_user_id) = possession.active_user_id {
                 if slot >= 9 {
                     continue;
@@ -17344,6 +17360,13 @@ fn control_voxel_camera(
                     wheel_steps,
                     9,
                 );
+            } else if (keyboard.pressed(KeyCode::ShiftLeft)
+                || keyboard.pressed(KeyCode::ShiftRight))
+                && !editor.tool_parameters().is_empty()
+            {
+                if !egui_input.wants_any_keyboard_input() {
+                    editor.adjust_tool_parameter(wheel_steps);
+                }
             } else {
                 let slot = cycled_hotbar_slot(
                     editor.selected_hotbar_slot,

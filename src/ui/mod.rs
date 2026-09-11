@@ -1,6 +1,8 @@
 mod chat_analytics;
 mod ime;
 mod legacy_chat;
+mod tool_parameter_hud;
+
 use std::{
     collections::{
         hash_map::DefaultHasher,
@@ -81,6 +83,7 @@ use serde::{
     Serialize,
 };
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tool_parameter_hud::show_tool_parameter_hud;
 
 use crate::{
     app_features::{
@@ -19157,6 +19160,10 @@ pub fn ui_system(
                 ),
                 toolbar_bottom * pixels_per_point,
             );
+
+            if !voxel_possession.is_active() {
+                show_tool_parameter_hud(ctx, voxel_editor, viewport);
+            }
 
             if voxel_possession.is_active() {
                 voxel_editor.creative_inventory_open = false;
