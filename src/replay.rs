@@ -3,9 +3,9 @@ use std::os::windows::process::CommandExt;
 use std::{
     collections::{
         hash_map::DefaultHasher,
+        BTreeSet,
         HashMap,
         HashSet,
-        VecDeque,
     },
     fs,
     hash::{
@@ -86,6 +86,10 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use serde_json::{
+    json,
+    to_string as json_to_string,
+};
 use tempfile::TempDir;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use voxxelmaxx::prelude::*;
@@ -151,7 +155,7 @@ const MAX_DIALOGUE_MS: u64 = 9_750;
 const SHORT_DIALOGUE_MAX_MS: u64 = 2_500;
 const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
-const DIRECTOR_CACHE_FINGERPRINT_VERSION: &str = "deepseek-director-v3";
+const DIRECTOR_CACHE_FINGERPRINT_VERSION: &str = "deepseek-director-v4";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const BACKGROUND_MUSIC_DIRECTORY: &str = "assets/audio";
 const BACKGROUND_MUSIC_EXTENSIONS: &[&str] = &["mp3", "wav", "ogg", "flac", "m4a", "aac"];
@@ -509,6 +513,10 @@ struct ReplayFile {
     player_movement_curve: f32,
     #[serde(default)]
     player_movements: Vec<ReplayPlayerMovement>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    authored_player_movements: BTreeSet<u64>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    authored_ship_trajectories: BTreeSet<String>,
     #[serde(default)]
     player_movement_history_cursor_unix_ms: u64,
     #[serde(default)]
@@ -528,6 +536,9 @@ struct ReplayFile {
     dialogue: Vec<ReplayDialogue>,
     #[serde(default)]
     area_blocks: Vec<ReplayAreaBlock>,
+    /// Explicit DM line dragging takes precedence over historical GM chronology.
+    #[serde(default)]
+    manual_dialogue_order: bool,
     #[serde(default = "default_area_radius_cells")]
     area_radius_cells: u32,
     #[serde(default = "default_master_speech_speed")]
@@ -3784,41 +3795,49 @@ fn replay_controls(
                 });
             }
         }
-        ui.collapsing("飞船移动节奏", |ui| {
-            ui.small("飞船机动会按此速度压缩播放；关闭“下一句等待”后，机动会移到所有台词之后。");
-            let mut speed = studio
-                .replay
-                .as_ref()
-                .map(|replay| replay.ship_motion_speed)
-                .unwrap_or_else(default_ship_motion_speed);
-            let mut waits = studio
-                .replay
-                .as_ref()
-                .map(|replay| replay.dialogue_waits_for_ship_motion)
-                .unwrap_or_else(default_dialogue_waits_for_ship_motion);
-            let speed_changed = ui
-                .add(
-                    egui::Slider::new(&mut speed, 0.5..=10.0)
-                        .step_by(0.5)
-                        .text("飞船移动速度×"),
-                )
-                .changed();
-            let waits_changed = ui
-                .checkbox(&mut waits, "下一句台词等待飞船移动结束")
-                .changed();
-            if speed_changed || waits_changed {
-                if let Some(replay) = studio.replay.as_mut() {
-                    replay.ship_motion_speed = speed;
-                    replay.dialogue_waits_for_ship_motion = waits;
-                    rebuild_replay_timeline_with_ships(replay, ship_trajectory_history, camera);
+        ui.add_enabled_ui(!replay_has_live_take(studio), |ui| {
+            ui.collapsing("飞船移动节奏", |ui| {
+                ui.small(
+                    "飞船机动会按此速度压缩播放；关闭“下一句等待”后，机动会移到所有台词之后。",
+                );
+                let mut speed = studio
+                    .replay
+                    .as_ref()
+                    .map(|replay| replay.ship_motion_speed)
+                    .unwrap_or_else(default_ship_motion_speed);
+                let mut waits = studio
+                    .replay
+                    .as_ref()
+                    .map(|replay| replay.dialogue_waits_for_ship_motion)
+                    .unwrap_or_else(default_dialogue_waits_for_ship_motion);
+                let speed_changed = ui
+                    .add(
+                        egui::Slider::new(&mut speed, 0.5..=10.0)
+                            .step_by(0.5)
+                            .text("飞船移动速度×"),
+                    )
+                    .changed();
+                let waits_changed = ui
+                    .checkbox(&mut waits, "下一句台词等待飞船移动结束")
+                    .changed();
+                if speed_changed || waits_changed {
+                    if let Some(replay) = studio.replay.as_mut() {
+                        replay.ship_motion_speed = speed;
+                        replay.dialogue_waits_for_ship_motion = waits;
+                        rebuild_replay_timeline_with_ships(replay, ship_trajectory_history, camera);
+                    }
+                    studio.playback_ms = 0;
+                    studio.status = "飞船移动节奏已更新".to_owned();
                 }
-                studio.playback_ms = 0;
-                studio.status = "飞船移动节奏已更新".to_owned();
-            }
+            });
         });
     }
 
     ui.separator();
+    if replay_has_live_take(studio) {
+        ui.small("请先保存或取消本次录制，再调整时间轴、应用导演方案、保存/载入项目或导出视频。");
+    }
+    ui.add_enabled_ui(!replay_has_live_take(studio), |ui| {
     ui.collapsing("DeepSeek 视频导演", |ui| {
     ui.small("DeepSeek 可直接润色当前回放中已勾选的台词，并为每句选择固定构图或缓慢推拉；选择“全部 / All”时，上传内容也会包含队伍隐藏消息、玩家私聊、GM 与系统台词。三人及以上时，本地镜头会优先放在队伍正面的中央位置，避免从侧面拍摄时角色互相遮挡；镜头只平滑移动位置，不环绕角色。它还会生成只供 EmotiVoice 使用的中文谐音读法，画面字幕仍显示正常原文，并且不得新增剧情事实。");
     let visible_standees = standees
@@ -4299,9 +4318,8 @@ fn replay_controls(
             ui.label("项目导入路径");
             ui.text_edit_singleline(&mut studio.project_import_path);
             if ui.button("载入回放项目").clicked() {
-                match import_replay(&studio.project_import_path) {
-                    Ok(mut replay) => {
-                        normalize_dialogue_sides(&mut replay, manager);
+                match import_replay(&studio.project_import_path, Some(manager)) {
+                    Ok(replay) => {
                         stop_playback(studio, grids);
                         studio.playback_ms = 0;
                         studio.audience = replay.audience.clone();
@@ -4317,6 +4335,7 @@ fn replay_controls(
             }
         },
     );
+    });
     if !studio.status.is_empty() {
         ui.small(studio.status.as_str());
     }
@@ -4324,6 +4343,7 @@ fn replay_controls(
 
 fn can_start_director_export(studio: &ReplayStudio, has_active_campaign: bool) -> bool {
     studio.mode != ReplayMode::Recording
+        && !replay_has_live_take(studio)
         && studio.video_render.is_none()
         && studio.video_encoding.is_none()
         && !studio.director_request_pending
@@ -4947,34 +4967,31 @@ fn director_fingerprint_key(summary_key: &str, message_count: usize) -> String {
 }
 
 fn replay_edit_fingerprint_state(replay: &ReplayFile) -> Result<String, String> {
-    let dialogue = replay
-        .dialogue
-        .iter()
-        .map(|line| {
-            serde_json::json!({
-                "line_id": line.line_id,
-                "text": &line.text,
-                "included": line.included,
-                "turn_index": line.turn_index,
-                "position_cells": line.position_cells,
-                "area": &line.area,
-            })
-        })
-        .collect::<Vec<_>>();
-    let blocks = replay
-        .area_blocks
-        .iter()
-        .map(|block| {
-            serde_json::json!({
-                "id": block.id,
-                "area": &block.area,
-                "line_ids": &block.line_ids,
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::to_string(&serde_json::json!({
-        "dialogue": dialogue,
-        "blocks": blocks,
+    json_to_string(&json!({
+        "dialogue": &replay.dialogue,
+        "blocks": &replay.area_blocks,
+        "manual_dialogue_order": replay.manual_dialogue_order,
+        "duration_ms": replay.duration_ms,
+        "camera": &replay.camera,
+        "camera_settings": (
+            replay.camera_distance_scale,
+            replay.camera_yaw_degrees,
+            replay.camera_transition_curve,
+        ),
+        "player_movements": &replay.player_movements,
+        "authored_player_movements": &replay.authored_player_movements,
+        "ship_trajectories": &replay.ship_trajectories,
+        "authored_ship_trajectories": &replay.authored_ship_trajectories,
+        "standee_positions": &replay.standee_positions,
+        "terrain_changes": &replay.terrain_changes,
+        "ship_hull_changes": &replay.ship_hull_changes,
+        "timing_settings": (
+            replay.master_dialogue_duration,
+            replay.master_speech_speed,
+            replay.player_movement_curve,
+            replay.ship_motion_speed,
+            replay.dialogue_waits_for_ship_motion,
+        ),
     }))
     .map_err(|err| err.to_string())
 }
@@ -5054,21 +5071,27 @@ fn replay_director_request(
     })
 }
 
+fn director_request_fingerprint_matches(
+    manager: &DeepseekManager,
+    request: &ReplayDirectorRequest,
+) -> bool {
+    let fingerprint_key = director_fingerprint_key(
+        &request.summary_key,
+        request.message_count,
+    );
+    manager
+        .director_request_fingerprints
+        .get(&fingerprint_key)
+        .map(String::as_str)
+        == Some(request.fingerprint.as_str())
+}
+
 fn saved_director_block<'a>(
     replay: &ReplayFile,
     manager: &'a DeepseekManager,
     request: &ReplayDirectorRequest,
 ) -> Option<&'a DeepseekSummaryBlock> {
-    let fingerprint_key = director_fingerprint_key(
-        &request.summary_key,
-        request.message_count,
-    );
-    if manager
-        .director_request_fingerprints
-        .get(&fingerprint_key)
-        .map(String::as_str)
-        != Some(request.fingerprint.as_str())
-    {
+    if !director_request_fingerprint_matches(manager, request) {
         return None;
     }
     replay_summary_block(replay, manager)
@@ -5127,15 +5150,19 @@ fn apply_ready_director_plan(
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
 ) -> Result<bool, String> {
-    if !studio.director_request_pending {
+    if !studio.director_request_pending || replay_has_live_take(studio) {
         return Ok(false);
     }
     let Some(replay) = studio.replay.as_ref() else {
         studio.director_request_pending = false;
+        studio.auto_export_after_director = false;
         return Ok(false);
     };
     let Some(block) = replay_summary_block(replay, manager) else {
-        return Ok(false);
+        studio.director_request_pending = false;
+        studio.auto_export_after_director = false;
+        studio.director_response_hash = None;
+        return Err("回放台词已变化，请重新生成导演方案".to_owned());
     };
     if block.pending {
         return Ok(false);
@@ -5148,6 +5175,21 @@ fn apply_ready_director_plan(
     let raw = block.latest.trim();
     if raw.is_empty() {
         return Ok(false);
+    }
+    // The response is addressed by dialogue count, which does not identify the
+    // edited content. Validate against the fingerprint saved with the request
+    // before allowing an asynchronous response to replace the DM's latest work.
+    let request_matches = replay_director_request(
+        replay,
+        &studio.deepseek_custom_prompt,
+        standees,
+    )
+    .is_ok_and(|request| director_request_fingerprint_matches(manager, &request));
+    if !request_matches {
+        studio.director_request_pending = false;
+        studio.auto_export_after_director = false;
+        studio.director_response_hash = None;
+        return Err("回放内容、轨迹或导演要求已变化，请重新生成导演方案".to_owned());
     }
     let mut hasher = DefaultHasher::new();
     raw.hash(&mut hasher);
@@ -5305,6 +5347,8 @@ fn new_replay(
         camera_transition_curve: normalized_camera_transition_curve(camera_transition_curve),
         player_movement_curve: normalized_player_movement_curve(player_movement_curve),
         player_movements: Vec::new(),
+        authored_player_movements: BTreeSet::new(),
+        authored_ship_trajectories: BTreeSet::new(),
         player_movement_history_cursor_unix_ms: unix_time_ms(),
         ship_trajectories: Vec::new(),
         standee_positions: Vec::new(),
@@ -5315,6 +5359,7 @@ fn new_replay(
         ship_trajectory_history_cursor_unix_ms: unix_time_ms(),
         dialogue: Vec::new(),
         area_blocks: Vec::new(),
+        manual_dialogue_order: false,
         area_radius_cells: default_area_radius_cells(),
         master_speech_speed: default_master_speech_speed(),
         master_dialogue_duration: default_master_dialogue_duration(),
@@ -5357,6 +5402,7 @@ fn start_playback(
 
 fn replay_has_completed(studio: &ReplayStudio) -> bool {
     studio.mode == ReplayMode::Paused
+        && !replay_has_live_take(studio)
         && studio
             .replay
             .as_ref()
@@ -5526,6 +5572,7 @@ fn move_replay_dialogue(
         .expect("target line was checked before removal");
     let insertion_index = target_index + usize::from(insert_after);
     replay.dialogue.insert(insertion_index, dragged);
+    replay.manual_dialogue_order = true;
     true
 }
 
@@ -6329,7 +6376,7 @@ fn replay_dialogue_editor(
                     dialogue_add_requested = true;
                 }
             });
-            ui.small("拖动台词左上角的手柄可排序；拖到卡片上半部/下半部会插到其前/后。删除只影响当前回放草稿。");
+            ui.small("拖动台词左上角的手柄可排序（含 DM 台词）；拖到卡片上半部/下半部会插到其前/后。删除只影响当前回放草稿。");
 
             egui::ScrollArea::vertical()
                 .id_salt("replay-dialogue-editor")
@@ -6568,6 +6615,7 @@ fn replay_dialogue_editor(
                 rebuild_blocks_requested = true;
             }
             if rebuild_blocks_requested {
+                replay.manual_dialogue_order = false;
                 rebuild_area_blocks(replay);
             }
             if changed || rebuild_blocks_requested {
@@ -6629,6 +6677,61 @@ fn replay_dialogue_editor(
     });
 }
 
+fn rebuild_player_movements_from_history(
+    replay: &mut ReplayFile,
+    history: &ReplayPlayerMovementHistory,
+) {
+    let imported = replay_player_movements_from_history(
+        history,
+        &replay.campaign_id,
+        &replay.dialogue,
+    );
+    let replaced_ids = replay
+        .player_movements
+        .iter()
+        .chain(imported.iter())
+        .map(|movement| movement.user_id)
+        .filter(|id| !replay.authored_player_movements.contains(id))
+        .collect::<HashSet<_>>();
+    replay
+        .standee_positions
+        .retain(|sample| !replaced_ids.contains(&sample.user_id));
+    let imported_through = history
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.campaign_id == replay.campaign_id && replaced_ids.contains(&session.user_id)
+        })
+        .flat_map(|session| session.keyframes.iter().map(|frame| frame.source_unix_ms))
+        .max()
+        .unwrap_or_default();
+    replay.player_movement_history_cursor_unix_ms = replay
+        .player_movement_history_cursor_unix_ms
+        .max(imported_through);
+    replay
+        .player_movements
+        .retain(|movement| replay.authored_player_movements.contains(&movement.user_id));
+    replay.player_movements.extend(
+        imported
+            .into_iter()
+            .filter(|movement| !replay.authored_player_movements.contains(&movement.user_id)),
+    );
+}
+
+fn restore_player_movement_history(replay: &mut ReplayFile, user_id: u64) {
+    replay.authored_player_movements.remove(&user_id);
+    replay
+        .standee_positions
+        .retain(|sample| sample.user_id != user_id);
+}
+
+fn restore_ship_trajectory_history(replay: &mut ReplayFile, ship_id: &str) {
+    replay.authored_ship_trajectories.remove(ship_id);
+    replay
+        .ship_trajectories
+        .retain(|trajectory| trajectory.ship_id != ship_id);
+}
+
 fn replay_movement_timing_editor(
     ui: &mut egui::Ui,
     studio: &mut ReplayStudio,
@@ -6672,10 +6775,24 @@ fn replay_movement_timing_editor(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
+    let authored_ids = replay
+        .authored_player_movements
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut requested_restores = Vec::<u64>::new();
     let mut changed = false;
     let mut deleted_sessions = Vec::new();
     ui.collapsing(format!("玩家移动数据与时序（{} 条）", session_indices.len()), |ui| {
         ui.small("DM 可编辑轨迹帧、开始台词和延迟；重新“从现有聊天生成”仍会应用这些持久数据。坐标单位为体素格。");
+        if !authored_ids.is_empty() {
+            ui.small("现场编辑的轨迹优先保留；历史调整只更新其他轨迹。下列按钮会用历史覆盖对应的现场编辑。");
+            for id in &authored_ids {
+                if ui.button(format!("用历史恢复角色 {id}")).clicked() {
+                    requested_restores.push(id.clone());
+                }
+            }
+        }
         if session_indices.is_empty() {
             ui.label("当前回放没有已保存的玩家移动数据。");
         }
@@ -6799,19 +6916,19 @@ fn replay_movement_timing_editor(
         changed = true;
     }
 
-    if !changed {
+    if !changed && requested_restores.is_empty() {
         return;
     }
-    if let Err(err) = history.persist() {
+    let persist_result = if changed { history.persist() } else { Ok(()) };
+    if let Err(err) = persist_result {
         studio.status = format!("无法保存玩家移动时序：{err}");
         return;
     }
     let replay = studio.replay.as_mut().expect("checked above");
-    replay.player_movements = replay_player_movements_from_history(
-        history,
-        &replay.campaign_id,
-        &replay.dialogue,
-    );
+    for id in requested_restores {
+        restore_player_movement_history(replay, id);
+    }
+    rebuild_player_movements_from_history(replay, history);
     refresh_replay_duration(replay, 5_000);
     if let Ok(base) = camera.single() {
         let positions = replay_speaker_positions(&replay.dialogue);
@@ -6862,12 +6979,26 @@ fn replay_ship_trajectory_editor(
         .filter(|(_, session)| session.campaign_id == campaign_id && !session.keyframes.is_empty())
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
+    let authored_ids = replay
+        .authored_ship_trajectories
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut requested_restores = Vec::<String>::new();
     let mut changed = false;
     let mut deleted_sessions = Vec::new();
     ui.collapsing(
         format!("飞船轨迹数据与时序（{} 条）", session_indices.len()),
         |ui| {
             ui.small("DM 可编辑轨迹帧、开始台词和延迟；重新“从现有聊天生成”仍会应用这些持久数据。坐标单位为世界单位。");
+            if !authored_ids.is_empty() {
+                ui.small("现场编辑的轨迹优先保留；历史调整只更新其他轨迹。下列按钮会用历史覆盖对应的现场编辑。");
+                for id in &authored_ids {
+                    if ui.button(format!("用历史恢复飞船 {id}")).clicked() {
+                        requested_restores.push(id.clone());
+                    }
+                }
+            }
             if session_indices.is_empty() {
                 ui.label("当前回放没有已保存的飞船轨迹数据。");
             }
@@ -6993,14 +7124,18 @@ fn replay_ship_trajectory_editor(
         changed = true;
     }
 
-    if !changed {
+    if !changed && requested_restores.is_empty() {
         return;
     }
-    if let Err(err) = ship_history.persist() {
+    let persist_result = if changed { ship_history.persist() } else { Ok(()) };
+    if let Err(err) = persist_result {
         studio.status = format!("无法保存飞船轨迹时序：{err}");
         return;
     }
     let replay = studio.replay.as_mut().expect("checked above");
+    for id in requested_restores {
+        restore_ship_trajectory_history(replay, &id);
+    }
     rebuild_replay_timeline_with_ships(replay, ship_history, camera);
     let duration_ms = replay.duration_ms;
     studio.playback_ms = studio.playback_ms.min(duration_ms);
@@ -7008,15 +7143,27 @@ fn replay_ship_trajectory_editor(
     studio.status = "已保存飞船轨迹、开始台词与延迟".to_owned();
 }
 
+fn rebuild_ship_trajectories_from_history(
+    replay: &mut ReplayFile,
+    ship_history: &ReplayShipTrajectoryHistory,
+) {
+    replay.ship_trajectories.retain(|trajectory| {
+        replay
+            .authored_ship_trajectories
+            .contains(&trajectory.ship_id)
+    });
+    compile_scene_dynamics_timeline(replay, ship_history, 0, &[], &[]);
+    replay.ship_trajectory_history_cursor_unix_ms = unix_time_ms();
+    extend_replay_for_speech(replay);
+    refresh_replay_duration(replay, 5_000);
+}
+
 fn rebuild_replay_timeline_with_ships(
     replay: &mut ReplayFile,
     ship_history: &ReplayShipTrajectoryHistory,
     camera: &Query<&Transform, With<VoxelViewportCamera>>,
 ) {
-    compile_scene_dynamics_timeline(replay, ship_history, 0, &[], &[]);
-    replay.ship_trajectory_history_cursor_unix_ms = unix_time_ms();
-    extend_replay_for_speech(replay);
-    refresh_replay_duration(replay, 5_000);
+    rebuild_ship_trajectories_from_history(replay, ship_history);
     if let Ok(base) = camera.single() {
         let positions = replay_speaker_positions(&replay.dialogue);
         replay.camera = turn_based_camera_track(
@@ -7061,6 +7208,10 @@ fn start_video_export(
     player_movement_history: &ReplayPlayerMovementHistory,
     ship_trajectory_history: &ReplayShipTrajectoryHistory,
 ) {
+    if replay_has_live_take(studio) {
+        studio.status = "请先保存或取消本次录制，再导出视频".to_owned();
+        return;
+    }
     prepare_replay_movement_for_playback(
         studio, player_movement_history, ship_trajectory_history,
     );
@@ -8576,6 +8727,7 @@ fn replace_replay_movement_segment(
     if samples.is_empty() {
         return 0;
     }
+    replay.authored_player_movements.insert(user_id);
     seed_replay_standee_track(replay, user_id);
     replay.standee_positions.retain(|sample| {
         sample.user_id != user_id || sample.time_ms < start_ms || sample.time_ms > end_ms
@@ -8614,6 +8766,7 @@ fn replace_replay_movement_segment(
 }
 
 fn stop_replay_movement_at(replay: &mut ReplayFile, user_id: u64, time_ms: u64, position: Vec3) {
+    replay.authored_player_movements.insert(user_id);
     seed_replay_standee_track(replay, user_id);
     replay
         .standee_positions
@@ -8659,6 +8812,7 @@ fn replace_replay_ship_segment(
     if samples.is_empty() {
         return 0;
     }
+    replay.authored_ship_trajectories.insert(ship_id.to_owned());
     let existing_name = replay
         .ship_trajectories
         .iter()
@@ -8695,6 +8849,7 @@ fn stop_replay_ship_at(
     time_ms: u64,
     transform: Transform,
 ) {
+    replay.authored_ship_trajectories.insert(ship_id.to_owned());
     let existing_name = replay
         .ship_trajectories
         .iter()
@@ -8940,73 +9095,6 @@ fn camera_keyframe(time_ms: u64, transform: &Transform) -> ReplayCameraKeyframe 
         translation: transform.translation.to_array(),
         rotation: transform.rotation.to_array(),
     }
-}
-
-fn spatially_order_dialogue_turns(
-    dialogue: &mut Vec<ReplayDialogue>,
-    speaker_positions: &HashMap<u64, Vec3>,
-) {
-    if dialogue.len() < 2 {
-        return;
-    }
-    let mut queues = HashMap::<u64, VecDeque<ReplayDialogue>>::new();
-    for line in dialogue.drain(..) {
-        queues.entry(line.sender_id).or_default().push_back(line);
-    }
-    let mut ordered = Vec::with_capacity(queues.values().map(VecDeque::len).sum());
-    while queues.values().any(|queue| !queue.is_empty()) {
-        let mut unplayed = queues
-            .iter()
-            .filter(|(_, queue)| !queue.is_empty())
-            .map(|(speaker_id, _)| *speaker_id)
-            .collect::<HashSet<_>>();
-        let Some(mut current_speaker) = unplayed.iter().copied().min_by_key(|speaker_id| {
-            queues
-                .get(speaker_id)
-                .and_then(|queue| queue.front())
-                .map(|line| (line.time_ms, line.sender_id))
-                .unwrap_or((u64::MAX, *speaker_id))
-        }) else {
-            break;
-        };
-        while unplayed.remove(&current_speaker) {
-            if let Some(line) = queues
-                .get_mut(&current_speaker)
-                .and_then(VecDeque::pop_front)
-            {
-                ordered.push(line);
-            }
-            let Some(current_position) = speaker_positions.get(&current_speaker) else {
-                break;
-            };
-            let Some(next_speaker) = unplayed.iter().copied().min_by(|left, right| {
-                let left_distance = speaker_positions
-                    .get(left)
-                    .map(|position| current_position.distance_squared(*position))
-                    .unwrap_or(f32::INFINITY);
-                let right_distance = speaker_positions
-                    .get(right)
-                    .map(|position| current_position.distance_squared(*position))
-                    .unwrap_or(f32::INFINITY);
-                left_distance
-                    .total_cmp(&right_distance)
-                    .then_with(|| left.cmp(right))
-            }) else {
-                break;
-            };
-            current_speaker = next_speaker;
-        }
-    }
-    *dialogue = ordered;
-}
-
-fn retain_dialogue_with_standees(
-    dialogue: &mut Vec<ReplayDialogue>,
-    speaker_positions: &HashMap<u64, Vec3>,
-) -> usize {
-    let previous_len = dialogue.len();
-    dialogue.retain(|line| speaker_positions.contains_key(&line.sender_id));
-    previous_len.saturating_sub(dialogue.len())
 }
 
 fn assign_replay_line_ids(dialogue: &mut [ReplayDialogue]) {
@@ -9803,14 +9891,18 @@ fn compile_area_block_timeline(replay: &mut ReplayFile) -> u64 {
         .dialogue
         .iter()
         .filter(|line| {
-            line.included && line.side == DialogueSide::Left && order.contains_key(&line.line_id)
+            !replay.manual_dialogue_order
+                && line.included
+                && line.side == DialogueSide::Left
+                && order.contains_key(&line.line_id)
         })
         .map(|line| (line.source_time, line.line_id))
         .collect::<Vec<_>>();
     gm_boundaries.sort_unstable();
     replay.dialogue.sort_by_key(|line| {
-        // Area order is allowed to rearrange players only between GM lines. A GM
-        // prompt remains ahead of every later reply, regardless of either area.
+        // Automatic area order rearranges players only between GM lines. An
+        // explicit DM drag disables those boundaries and follows the edited
+        // block order, while retaining the original source timestamps and IDs.
         let source_order = (line.source_time, line.line_id);
         let gm_epoch = gm_boundaries.partition_point(|boundary| *boundary < source_order);
         let is_gm_boundary = line.side == DialogueSide::Left
@@ -10078,6 +10170,7 @@ fn append_new_player_movements_from_history(
         .iter()
         .filter(|session| session.campaign_id == replay.campaign_id)
         .filter(|session| visible_user_ids.contains(&session.user_id))
+        .filter(|session| !replay.authored_player_movements.contains(&session.user_id))
         .filter_map(|session| {
             let frames = session
                 .keyframes
@@ -10349,6 +10442,10 @@ fn compile_scene_dynamics_timeline(
         &replay.campaign_id,
         cutoff_unix_ms,
     );
+    let events = events
+        .into_iter()
+        .filter(|event| !replay.authored_ship_trajectories.contains(&event.ship_id))
+        .collect::<Vec<_>>();
 
     let mut before_first = Vec::new();
     let mut events_by_anchor = HashMap::<usize, Vec<ShipMotionEvent>>::new();
@@ -10478,6 +10575,10 @@ fn append_new_ship_trajectories_from_history(
         &replay.campaign_id,
         cutoff_unix_ms,
     );
+    let events = events
+        .into_iter()
+        .filter(|event| !replay.authored_ship_trajectories.contains(&event.ship_id))
+        .collect::<Vec<_>>();
     if events.is_empty() {
         return 0;
     }
@@ -10580,6 +10681,10 @@ fn merge_ship_trajectories(
     replay: &mut ReplayFile,
     imported_keyframes: HashMap<String, (String, Vec<ReplayShipKeyframe>)>,
 ) -> usize {
+    let imported_keyframes = imported_keyframes
+        .into_iter()
+        .filter(|(ship_id, _)| !replay.authored_ship_trajectories.contains(ship_id))
+        .collect::<HashMap<_, _>>();
     let imported_ships = imported_keyframes.len();
     for (ship_id, (ship_name, mut keyframes)) in imported_keyframes {
         keyframes.sort_by_key(|frame| frame.time_ms);
@@ -12346,7 +12451,7 @@ fn export_replay(replay: &ReplayFile, path: &str) -> Result<(), String> {
     fs::write(&path, bytes).map_err(|err| err.to_string())
 }
 
-fn import_replay(path: &str) -> Result<ReplayFile, String> {
+fn import_replay(path: &str, manager: Option<&NapcatMessageManager>) -> Result<ReplayFile, String> {
     let path = normalized_path(path)?;
     let bytes = fs::read(path).map_err(|err| err.to_string())?;
     let mut replay: ReplayFile = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
@@ -12370,6 +12475,11 @@ fn import_replay(path: &str) -> Result<ReplayFile, String> {
     }
     if replay.audience == ReplayAudience::Gm {
         replay.audience = ReplayAudience::All;
+    }
+    if replay.format_version != REPLAY_FORMAT_VERSION {
+        if let Some(manager) = manager {
+            normalize_dialogue_sides(&mut replay, manager);
+        }
     }
     for line in &mut replay.dialogue {
         line.duration_ms = line.duration_ms.max(1);
@@ -12470,7 +12580,6 @@ fn format_time(time_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
-    use serde_json::to_string;
 
     use bevy::ecs::system::RunSystemOnce;
     use bevy_egui::egui::{
@@ -12480,6 +12589,11 @@ mod tests {
         PointerButton,
         RawInput,
         Shape,
+    };
+    use serde_json::{
+        from_str,
+        to_string,
+        to_value,
     };
 
     use super::*;
@@ -13222,6 +13336,108 @@ mod tests {
                 .unwrap()
                 .area,
             "区域 2"
+        );
+    }
+
+    #[test]
+    fn manually_inserted_dm_dialogue_order_survives_appending_and_import() {
+        let mut replay = test_replay(vec![
+            positioned_dialogue(1, 1, 100, [0, 0, 0]),
+            positioned_dialogue(2, 1, 200, [0, 0, 0]),
+        ]);
+        replay.area_blocks = vec![ReplayAreaBlock {
+            id: 1,
+            area: "甲板".to_owned(),
+            line_ids: vec![1, 2],
+        }];
+        let inserted_id = append_dm_replay_dialogue(&mut replay);
+        replay.dialogue.last_mut().unwrap().text = "门后传来脚步声。".to_owned();
+        recompile_edited_replay_dialogue(&mut replay);
+        assert!(!replay.manual_dialogue_order);
+        assert_eq!(
+            replay.dialogue.last().unwrap().line_id,
+            inserted_id
+        );
+
+        assert!(move_replay_dialogue(
+            &mut replay,
+            inserted_id,
+            2,
+            false
+        ));
+        recompile_edited_replay_dialogue(&mut replay);
+        assert!(replay.manual_dialogue_order);
+        assert_eq!(
+            replay
+                .dialogue
+                .iter()
+                .map(|line| line.line_id)
+                .collect::<Vec<_>>(),
+            vec![1, inserted_id, 2]
+        );
+
+        let appended_id = append_dm_replay_dialogue(&mut replay);
+        replay.dialogue.last_mut().unwrap().text = "脚步声停下了。".to_owned();
+        recompile_edited_replay_dialogue(&mut replay);
+        let expected_ids = vec![1, inserted_id, 2, appended_id];
+        let expected_sources = vec![100, 201, 200, 202];
+        assert_eq!(
+            replay
+                .dialogue
+                .iter()
+                .map(|line| line.line_id)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(
+            replay
+                .dialogue
+                .iter()
+                .map(|line| line.source_time)
+                .collect::<Vec<_>>(),
+            expected_sources
+        );
+
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("manual-dm-order.willow-replay.json");
+        export_replay(&replay, path.to_str().unwrap()).unwrap();
+        let mut imported = import_replay(path.to_str().unwrap(), None).unwrap();
+        recompile_edited_replay_dialogue(&mut imported);
+        assert!(imported.manual_dialogue_order);
+        assert_eq!(
+            imported
+                .dialogue
+                .iter()
+                .map(|line| line.line_id)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(
+            imported
+                .dialogue
+                .iter()
+                .map(|line| line.source_time)
+                .collect::<Vec<_>>(),
+            expected_sources
+        );
+
+        // Projects saved before explicit ordering retain automatic GM boundaries.
+        let mut old_json = to_value(&replay).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("manual_dialogue_order");
+        fs::write(&path, to_string(&old_json).unwrap()).unwrap();
+        let mut imported = import_replay(path.to_str().unwrap(), None).unwrap();
+        recompile_edited_replay_dialogue(&mut imported);
+        assert!(!imported.manual_dialogue_order);
+        assert_eq!(
+            imported
+                .dialogue
+                .iter()
+                .map(|line| line.line_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, inserted_id, appended_id]
         );
     }
 
@@ -14012,62 +14228,6 @@ mod tests {
                 .distance(Vec3::from_array(after_cut.translation))
                 > 1.0
         );
-    }
-
-    #[test]
-    fn turn_order_visits_the_nearest_unplayed_standee_in_each_round() {
-        let mut dialogue = Vec::new();
-        for (index, sender_id) in [1, 2, 3, 1, 2, 3].into_iter().enumerate() {
-            let mut line = test_dialogue(
-                index as u64 * 1_000,
-                600,
-                DialogueSide::Right,
-            );
-            line.sender_id = sender_id;
-            line.text = format!("{sender_id}:{index}");
-            dialogue.push(line);
-        }
-        let positions = HashMap::from([
-            (1, Vec3::ZERO),
-            (2, Vec3::new(10.0, 0.0, 0.0)),
-            (3, Vec3::new(2.0, 0.0, 0.0)),
-        ]);
-
-        spatially_order_dialogue_turns(&mut dialogue, &positions);
-
-        assert_eq!(
-            dialogue
-                .iter()
-                .map(|line| line.sender_id)
-                .collect::<Vec<_>>(),
-            vec![1, 3, 2, 1, 3, 2]
-        );
-        assert_eq!(
-            dialogue
-                .iter()
-                .filter(|line| line.sender_id == 1)
-                .map(|line| line.text.as_str())
-                .collect::<Vec<_>>(),
-            vec!["1:0", "1:3"]
-        );
-    }
-
-    #[test]
-    fn dialogue_without_a_scene_standee_is_removed() {
-        let mut dialogue = vec![
-            test_dialogue(0, 600, DialogueSide::Right),
-            test_dialogue(1_000, 600, DialogueSide::Right),
-        ];
-        dialogue[1].sender_id = 2;
-
-        let ignored = retain_dialogue_with_standees(
-            &mut dialogue,
-            &HashMap::from([(2, Vec3::ZERO)]),
-        );
-
-        assert_eq!(ignored, 1);
-        assert_eq!(dialogue.len(), 1);
-        assert_eq!(dialogue[0].sender_id, 2);
     }
 
     #[test]
@@ -14865,6 +15025,40 @@ mod tests {
     }
 
     #[test]
+    fn paused_take_at_the_extended_end_can_resume_without_restarting() {
+        for ship_take in [false, true] {
+            let mut studio = ReplayStudio::default();
+            let mut replay = test_replay(Vec::new());
+            replay.duration_ms = 10_000;
+            studio.replay = Some(replay);
+            studio.playback_ms = 9_000;
+            if ship_take {
+                begin_live_ship_take(
+                    &mut studio,
+                    "ship".to_owned(),
+                    "飞船".to_owned(),
+                    Transform::default(),
+                );
+            } else {
+                begin_live_movement_take(&mut studio, 7, Vec3::ZERO);
+            }
+            studio.replay.as_mut().unwrap().duration_ms = 12_000;
+            studio.playback_ms = 12_000;
+            studio.mode = ReplayMode::Paused;
+
+            assert!(!replay_has_completed(&studio));
+            assert!(!can_start_director_export(
+                &studio, true
+            ));
+            assert_eq!(studio.playback_ms, 12_000);
+
+            cancel_live_replay_take(&mut studio);
+            assert!(replay_has_completed(&studio));
+            assert!(can_start_director_export(&studio, true));
+        }
+    }
+
+    #[test]
     fn regenerated_replay_inherits_project_and_matching_voice_settings() {
         let retained_voice = test_voice_settings("9000", 42);
         let removed_voice = test_voice_settings("65", -12);
@@ -15261,6 +15455,122 @@ mod tests {
     }
 
     #[test]
+    fn pending_director_response_applies_only_to_the_requested_replay_edits() {
+        for changed in 0..5 {
+            let mut line = test_dialogue(0, 600, DialogueSide::Right);
+            line.line_id = 1;
+            line.sender_id = 7;
+            let mut replay = test_replay(vec![line]);
+            replay.duration_ms = 600;
+            replay.area_blocks = vec![ReplayAreaBlock {
+                id: 1,
+                area: "甲板".to_owned(),
+                line_ids: vec![1],
+            }];
+            let mut studio = ReplayStudio::default();
+            studio.replay = Some(replay);
+            studio.director_request_pending = true;
+            studio.auto_export_after_director = true;
+            let mut world = World::new();
+            world.insert_resource(studio);
+            world.spawn((
+                Transform::default(),
+                VoxelPlayerStandee::replay_test(7),
+            ));
+            world.spawn((
+                Transform::from_xyz(0.0, 3.0, 5.0),
+                VoxelViewportCamera,
+            ));
+            let request = world
+                .run_system_once(
+                    |studio: Res<ReplayStudio>,
+                     standees: Query<
+                        (&Transform, &VoxelPlayerStandee),
+                        Without<VoxelViewportCamera>,
+                    >| {
+                        replay_director_request(
+                            studio.replay.as_ref().unwrap(),
+                            &studio.deepseek_custom_prompt,
+                            &standees,
+                        )
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            let mut manager = DeepseekManager::default();
+            manager.director_request_fingerprints.insert(
+                director_fingerprint_key(
+                    &request.summary_key,
+                    request.message_count,
+                ),
+                request.fingerprint,
+            );
+            manager.summaries.entry(request.summary_key).or_default().upsert_block(
+                DeepseekSummaryBlock {
+                    latest: r#"{"dialogue":[{"index":0,"text":"导演结果","speech_text":"导演结果","shot":"speaker_medium","motion":"static"}]}"#.to_owned(),
+                    message_count: request.message_count,
+                    pending: false,
+                    error: None,
+                },
+            );
+            world.insert_resource(manager);
+            {
+                let mut studio = world.resource_mut::<ReplayStudio>();
+                match changed {
+                    1 => studio.replay.as_mut().unwrap().dialogue[0].text = "DM 新台词".to_owned(),
+                    2 => studio.replay.as_mut().unwrap().standee_positions.push(
+                        ReplayStandeePosition {
+                            time_ms: 300,
+                            user_id: 7,
+                            position: [3.0, 0.0, 0.0],
+                        },
+                    ),
+                    3 => studio.deepseek_custom_prompt.push_str("保留当前镜头"),
+                    4 => studio.replay.as_mut().unwrap().dialogue.clear(),
+                    _ => {},
+                }
+            }
+            let before =
+                json_to_string(world.resource::<ReplayStudio>().replay.as_ref().unwrap()).unwrap();
+            let result = world
+                .run_system_once(
+                    |mut studio: ResMut<ReplayStudio>,
+                     manager: Res<DeepseekManager>,
+                     camera: Query<&Transform, With<VoxelViewportCamera>>,
+                     standees: Query<
+                        (&Transform, &VoxelPlayerStandee),
+                        Without<VoxelViewportCamera>,
+                    >| {
+                        apply_ready_director_plan(
+                            &mut studio,
+                            &manager,
+                            &camera,
+                            &standees,
+                        )
+                    },
+                )
+                .unwrap();
+            let studio = world.resource::<ReplayStudio>();
+            assert!(!studio.director_request_pending);
+            if changed == 0 {
+                assert_eq!(result, Ok(true));
+                assert_eq!(
+                    studio.replay.as_ref().unwrap().dialogue[0].text,
+                    "导演结果"
+                );
+            } else {
+                assert!(result.is_err());
+                assert!(!studio.auto_export_after_director);
+                assert!(studio.director_response_hash.is_none());
+                assert_eq!(
+                    json_to_string(studio.replay.as_ref().unwrap()).unwrap(),
+                    before
+                );
+            }
+        }
+    }
+
+    #[test]
     fn replay_edit_fingerprint_and_tts_signature_cover_all_editor_metadata() {
         let mut replay = test_replay(vec![
             positioned_dialogue(1, 1, 100, [1, 2, 3]),
@@ -15329,6 +15639,48 @@ mod tests {
     }
 
     #[test]
+    fn project_loading_preserves_authored_sides_and_migrates_legacy_sides() {
+        let manager: NapcatMessageManager = from_str(r#"{"messages":{}}"#).unwrap();
+        for version in [
+            LEGACY_REPLAY_FORMAT_VERSION,
+            AREA_REPLAY_FORMAT_VERSION,
+            REPLAY_FORMAT_VERSION,
+        ] {
+            let mut gm = test_dialogue(0, 600, DialogueSide::Right);
+            gm.sender_id = 0;
+            gm.line_id = 1;
+            let mut unregistered_gm = test_dialogue(800, 600, DialogueSide::Left);
+            unregistered_gm.sender_id = 7;
+            unregistered_gm.line_id = 2;
+            let mut replay = test_replay(vec![gm, unregistered_gm]);
+            replay.duration_ms = 1_400;
+            replay.format_version = version;
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("saved-sides.willow-replay.json");
+            export_replay(&replay, path.to_str().unwrap()).unwrap();
+
+            let imported = import_replay(path.to_str().unwrap(), Some(&manager)).unwrap();
+            assert_eq!(
+                imported.format_version,
+                REPLAY_FORMAT_VERSION
+            );
+            let expected = if version == REPLAY_FORMAT_VERSION {
+                [DialogueSide::Right, DialogueSide::Left]
+            } else {
+                [DialogueSide::Left, DialogueSide::Right]
+            };
+            assert_eq!(
+                imported
+                    .dialogue
+                    .iter()
+                    .map(|line| line.side)
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
     fn area_replay_version_two_imports_without_losing_layout() {
         let mut first = positioned_dialogue(11, 2, 1_200, [0, 0, 0]);
         first.area = "舰桥".to_owned();
@@ -15358,7 +15710,7 @@ mod tests {
         )
         .unwrap();
 
-        let imported = import_replay(path.to_str().unwrap()).unwrap();
+        let imported = import_replay(path.to_str().unwrap(), None).unwrap();
 
         assert_eq!(
             imported.format_version,
@@ -15428,7 +15780,7 @@ mod tests {
         )
         .unwrap();
 
-        let imported = import_replay(path.to_str().unwrap()).unwrap();
+        let imported = import_replay(path.to_str().unwrap(), None).unwrap();
 
         assert_eq!(
             imported
@@ -15471,7 +15823,7 @@ mod tests {
             serde_json::to_vec(&legacy).unwrap(),
         )
         .unwrap();
-        let imported = import_replay(path.to_str().unwrap()).unwrap();
+        let imported = import_replay(path.to_str().unwrap(), None).unwrap();
 
         assert_eq!(
             imported.format_version,
@@ -15914,6 +16266,8 @@ mod tests {
             camera_transition_curve: default_camera_transition_curve(),
             player_movement_curve: default_player_movement_curve(),
             player_movements: Vec::new(),
+            authored_player_movements: BTreeSet::new(),
+            authored_ship_trajectories: BTreeSet::new(),
             player_movement_history_cursor_unix_ms: 1,
             ship_trajectories: Vec::new(),
             standee_positions: Vec::new(),
@@ -15924,6 +16278,7 @@ mod tests {
             ship_trajectory_history_cursor_unix_ms: 1,
             dialogue,
             area_blocks: Vec::new(),
+            manual_dialogue_order: false,
             area_radius_cells: DEFAULT_AREA_RADIUS_CELLS,
             master_speech_speed: default_master_speech_speed(),
             master_dialogue_duration: default_master_dialogue_duration(),
@@ -16957,6 +17312,181 @@ mod tests {
             trajectory.keyframes.len() > 100,
             "the compressed segment should still carry the flight frames"
         );
+    }
+
+    #[test]
+    fn authored_player_tracks_survive_history_rebuilds_until_explicitly_restored() {
+        let lines = [7, 8]
+            .into_iter()
+            .map(|id| {
+                let mut line = test_dialogue(0, 600, DialogueSide::Right);
+                line.sender_id = id;
+                line.source_time = 1;
+                line
+            })
+            .collect();
+        let mut replay = test_replay(lines);
+        let mut history = ReplayPlayerMovementHistory {
+            sessions: [7, 8]
+                .into_iter()
+                .map(
+                    |user_id| PersistedPlayerMovementSession {
+                        campaign_id: "campaign".into(),
+                        user_id,
+                        keyframes: vec![
+                            PersistedPlayerMovementKeyframe {
+                                source_unix_ms: 1_000,
+                                position_cells: [0.0; 3],
+                            },
+                            PersistedPlayerMovementKeyframe {
+                                source_unix_ms: 1_100,
+                                position_cells: [4.0, 0.0, 0.0],
+                            },
+                        ],
+                        ..default()
+                    },
+                )
+                .collect(),
+        };
+        rebuild_player_movements_from_history(&mut replay, &history);
+        stop_replay_movement_at(&mut replay, 7, 50, Vec3::Y);
+        let authored = replay
+            .player_movements
+            .iter()
+            .find(|movement| movement.user_id == 7)
+            .unwrap()
+            .clone();
+        let saved = to_string(&replay).unwrap();
+        let mut replay: ReplayFile = from_str(&saved).unwrap();
+        for session in &mut history.sessions {
+            session.keyframes[0].position_cells = [99.0, 0.0, 0.0];
+        }
+        rebuild_player_movements_from_history(&mut replay, &history);
+        assert_eq!(
+            to_string(&replay.player_movements[0]).unwrap(),
+            to_string(&authored).unwrap()
+        );
+        assert_eq!(
+            replay.player_movements[1].keyframes[0].position_cells[0],
+            99.0
+        );
+        let protected_only = ReplayPlayerMovementHistory {
+            sessions: vec![history.sessions[0].clone()],
+        };
+        replay.player_movement_history_cursor_unix_ms = 1;
+        assert_eq!(
+            append_new_player_movements_from_history(&mut replay, &protected_only),
+            0
+        );
+        restore_player_movement_history(&mut replay, 7);
+        rebuild_player_movements_from_history(&mut replay, &history);
+        assert!(replay
+            .standee_positions
+            .iter()
+            .all(|sample| sample.user_id != 7));
+        assert!(!replay.authored_player_movements.contains(&7));
+        assert_eq!(
+            replay.player_movements[0].keyframes[0].position_cells[0],
+            99.0
+        );
+        assert_eq!(
+            append_new_player_movements_from_history(&mut replay, &history),
+            0
+        );
+    }
+
+    #[test]
+    fn authored_ship_tracks_survive_imports_and_old_history_frames_are_replaced() {
+        let mut replay = test_replay(Vec::new());
+        stop_replay_ship_at(
+            &mut replay,
+            "authored",
+            "船",
+            150,
+            Transform::from_translation(Vec3::Y),
+        );
+        let mut history = ReplayShipTrajectoryHistory {
+            sessions: ["authored", "history"]
+                .into_iter()
+                .map(
+                    |ship_id| PersistedShipTrajectorySession {
+                        campaign_id: "campaign".into(),
+                        ship_id: ship_id.into(),
+                        ship_name: ship_id.into(),
+                        keyframes: vec![
+                            PersistedShipKeyframe {
+                                source_unix_ms: 1_000,
+                                translation: [0.0; 3],
+                                rotation: Quat::IDENTITY.to_array(),
+                            },
+                            PersistedShipKeyframe {
+                                source_unix_ms: 1_100,
+                                translation: [4.0, 0.0, 0.0],
+                                rotation: Quat::IDENTITY.to_array(),
+                            },
+                        ],
+                        ..default()
+                    },
+                )
+                .collect(),
+        };
+        let saved = to_string(&replay).unwrap();
+        let mut replay: ReplayFile = from_str(&saved).unwrap();
+        rebuild_ship_trajectories_from_history(&mut replay, &history);
+        for session in &mut history.sessions {
+            session.start_delay_ms = 1_000;
+            session.keyframes[0].translation = [99.0, 0.0, 0.0];
+        }
+        rebuild_ship_trajectories_from_history(&mut replay, &history);
+        assert_eq!(replay.ship_trajectories.len(), 2);
+        let authored = &replay.ship_trajectories[0];
+        assert_eq!(authored.ship_id, "authored");
+        assert_eq!(authored.keyframes.len(), 1);
+        assert_eq!(
+            authored.keyframes[0].translation,
+            Vec3::Y.to_array()
+        );
+        let source = &replay.ship_trajectories[1];
+        assert_eq!(
+            source.keyframes.len(),
+            2,
+            "retiming must not leave old source frames behind"
+        );
+        assert_eq!(source.keyframes[0].translation[0], 99.0);
+        replay.ship_trajectory_history_cursor_unix_ms = 1;
+        let protected_only = ReplayShipTrajectoryHistory {
+            sessions: vec![history.sessions[0].clone()],
+        };
+        let duration = replay.duration_ms;
+        assert_eq!(
+            append_new_ship_trajectories_from_history(&mut replay, &protected_only),
+            0
+        );
+        assert_eq!(
+            replay.duration_ms, duration,
+            "skipped imports must not append empty time"
+        );
+        restore_ship_trajectory_history(&mut replay, "authored");
+        rebuild_ship_trajectories_from_history(&mut replay, &history);
+        let restored = replay
+            .ship_trajectories
+            .iter()
+            .find(|ship| ship.ship_id == "authored")
+            .unwrap();
+        assert_eq!(
+            restored.keyframes[0].translation[0],
+            99.0
+        );
+    }
+
+    #[test]
+    fn older_projects_default_to_history_driven_tracks() {
+        let saved = to_string(&test_replay(Vec::new())).unwrap();
+        assert!(!saved.contains("authored_player_movements"));
+        assert!(!saved.contains("authored_ship_trajectories"));
+        let replay: ReplayFile = from_str(&saved).unwrap();
+        assert!(replay.authored_player_movements.is_empty());
+        assert!(replay.authored_ship_trajectories.is_empty());
     }
 
     #[test]
