@@ -23,6 +23,7 @@ use bevy_persistent::{
     Persistent,
     StorageFormat,
 };
+use egui::{Color32, TextEdit, Ui};
 use serde::{
     Deserialize,
     Serialize,
@@ -146,6 +147,7 @@ use crate::{
         ActorRef,
         BuffTickAction,
         DamageType,
+        EventKind,
         RuleAmountResolution,
         RuleBuffTemplate,
         RuleEngineState,
@@ -236,6 +238,7 @@ pub struct BattleRoundUiState {
     selected_action_target: HashMap<String, String>,
     selected_action_actor: HashMap<String, String>,
     selected_skill_index: HashMap<String, usize>,
+    gm_skill_rules: HashMap<(String, String, usize, String), (bool, String)>,
     selected_item_index: HashMap<String, usize>,
     selected_item_skill_index: HashMap<String, usize>,
     action_amount: HashMap<String, f32>,
@@ -4918,7 +4921,11 @@ fn encounter_action_ui(
                         ui.selectable_value(selected_skill, index, label);
                     }
                 });
-            let skill = &skills[*selected_skill];
+            let (resolved_skill, rule_valid) = battle_skill_rule_editor(
+                ui, &mut ui_state.gm_skill_rules,
+                encounter_id, &actor.target_id, &skills[*selected_skill],
+            );
+            let skill = &resolved_skill;
             let cooldown_remaining = skill_cooldown_remaining(
                 &actor,
                 skill.index,
@@ -4943,7 +4950,7 @@ fn encounter_action_ui(
             );
             let requires_gm_resolution =
                 effects.is_empty() && !skill_has_dedicated_battle_resolution(skill);
-            let can_use = cooldown_remaining == 0 && can_pay && hope_avatar_allows && target_allows;
+            let can_use = rule_valid && cooldown_remaining == 0 && can_pay && hope_avatar_allows && target_allows;
             let use_label = if requires_gm_resolution {
                 "GM裁定并记录"
             } else {
@@ -5018,7 +5025,11 @@ fn encounter_action_ui(
                     ui.selectable_value(selected_item_skill, index, &skill.name);
                 }
             });
-            let skill = &skills[*selected_item_skill];
+            let (resolved_skill, rule_valid) = battle_skill_rule_editor(
+                ui, &mut ui_state.gm_skill_rules,
+                encounter_id, &actor.target_id, &skills[*selected_item_skill],
+            );
+            let skill = &resolved_skill;
             let cooldown_remaining = skill_cooldown_remaining(
                 &actor,
                 skill.index,
@@ -5043,7 +5054,7 @@ fn encounter_action_ui(
                 || skill_effects_are_hope_avatar_healing(&effects);
             if ui
                 .add_enabled(
-                    cooldown_remaining == 0 && can_pay && target_allows && hope_avatar_allows,
+                    rule_valid && cooldown_remaining == 0 && can_pay && target_allows && hope_avatar_allows,
                     egui::Button::new("使用物品施法"),
                 )
                 .clicked()
@@ -10375,6 +10386,87 @@ fn character_for_participant(
     Some(character)
 }
 
+// The ruling belongs to this encounter, actor and skill, including item skill indices.
+// It replaces only the cast effects; identity, resource costs and targeting stay intact.
+fn skill_with_gm_rule(skill: &CharacterSkill, rule: &str) -> Result<CharacterSkill, String> {
+    let ast = parse_rule_with_named_args(
+        rule,
+        &skill.arg_values.numeric_values,
+        &skill.arg_values.text_values,
+    )?;
+    if ast.trigger.event != EventKind::SkillCast
+        || ast.actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::Damage {
+                    amount: ValueExpr::EventDamage,
+                    ..
+                } | Action::Heal {
+                    amount: ValueExpr::EventDamage,
+                    ..
+                }
+            )
+        })
+    {
+        return Err("请输入主动使用规则，伤害和治疗必须有明确数值".to_owned());
+    }
+    Ok(CharacterSkill {
+        note: rule.to_owned(),
+        legacy_buff_machine_json: None,
+        ..skill.clone()
+    })
+}
+
+fn battle_skill_rule_editor(
+    ui: &mut Ui,
+    rules: &mut HashMap<(String, String, usize, String), (bool, String)>,
+    encounter_id: &str,
+    actor_id: &str,
+    skill: &CharacterSkill,
+) -> (CharacterSkill, bool) {
+    if !static_skill_effects(
+        &skill.note,
+        &skill.arg_values,
+        skill.skill_type.as_deref(),
+        skill.legacy_buff_machine_json.as_deref(),
+    )
+    .is_empty()
+        || skill_has_dedicated_battle_resolution(skill)
+    {
+        return (skill.clone(), true);
+    }
+    let (enabled, rule) = rules
+        .entry((
+            encounter_id.to_owned(),
+            actor_id.to_owned(),
+            skill.index,
+            skill.name.clone(),
+        ))
+        .or_default();
+    let mut resolved = Ok(skill.clone());
+    ui.vertical(|ui| {
+        ui.label(&skill.note);
+        ui.checkbox(enabled, "GM指定本技能结算规则");
+        if *enabled {
+            ui.add(TextEdit::multiline(rule).desired_width(300.0).desired_rows(2)
+                .hint_text("主动使用对目标造成6点物理伤害；对自己回复2点生命值"));
+            ui.small("本场战斗使用此规则替代原效果；保留技能名称、消耗、冷却和射程。支持伤害、治疗和施加状态。");
+            resolved = skill_with_gm_rule(skill, rule);
+            if let Err(error) = &resolved {
+                ui.colored_label(Color32::RED, error);
+            } else if let Ok(ast) = parse_rule_with_named_args(
+                rule, &skill.arg_values.numeric_values, &skill.arg_values.text_values,
+            ) {
+                ui.small(ast.explain());
+            }
+        }
+    });
+    match resolved {
+        Ok(skill) => (skill, true),
+        Err(_) => (skill.clone(), false),
+    }
+}
+
 fn character_skills(character: &PlayerCharacter) -> Vec<CharacterSkill> {
     let skills = character
         .skill_names
@@ -11766,6 +11858,107 @@ mod area_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gm_skill_rule_resolves_damage_healing_and_preserves_cost_and_cooldown() {
+        let manager = empty_manager();
+        let character = PlayerCharacter {
+            skill_names: vec!["自定义能力".to_owned()],
+            skill_notes: vec!["由GM裁定的特殊效果".to_owned()],
+            skill_mp_costs: vec![2.0],
+            skill_cooldown_turns: vec![3],
+            ..Default::default()
+        };
+        let original = character_skills(&character).remove(0);
+        let skill = skill_with_gm_rule(
+            &original,
+            "主动使用对目标造成4点物理伤害；对自己回复2点生命值",
+        )
+        .unwrap();
+        assert_eq!(skill.name, original.name);
+        assert_eq!(skill.index, original.index);
+        assert_eq!(skill.mp_cost, original.mp_cost);
+        assert_eq!(
+            skill.cooldown_turns,
+            original.cooldown_turns
+        );
+        assert_eq!(original.note, "由GM裁定的特殊效果");
+        let mut actor = participant("a", 0);
+        actor.mp = 10.0;
+        actor.hp = 5.0;
+        let mut store = BattleRoundStore::default();
+        store
+            .encounters
+            .insert("battle".to_owned(), BattleEncounter {
+                participants: vec![actor, participant("b", 0)],
+                ..Default::default()
+            });
+        let mut normal_store = BattleRoundStore::default();
+        normal_store.encounters = store.encounters.clone();
+        let normal_skill = CharacterSkill {
+            note: "主动使用对目标造成4点物理伤害；对自己回复2点生命值".to_owned(),
+            ..original.clone()
+        };
+        assert!(normal_store.record_skill_use(
+            "battle",
+            "a",
+            "b",
+            &normal_skill,
+            &manager,
+            None
+        ));
+        assert!(store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        let encounter = &store.encounters["battle"];
+        assert_eq!(encounter.participants[0].mp, 8.0);
+        assert_eq!(encounter.participants[0].hp, 7.0);
+        let target_hp = encounter.participants[1].hp;
+        assert!(target_hp < 10.0);
+        assert_eq!(
+            target_hp,
+            normal_store.encounters["battle"].participants[1].hp
+        );
+        assert!(skill_cooldown_remaining(&encounter.participants[0], 0, 3, None) > 0);
+        assert!(!store.record_skill_use("battle", "a", "b", &skill, &manager, None));
+        assert_eq!(
+            store.encounters["battle"].participants[1].hp,
+            target_hp
+        );
+    }
+
+    #[test]
+    fn gm_skill_rule_rejects_passive_and_event_dependent_effects() {
+        let character = PlayerCharacter {
+            skill_names: vec!["自定义能力".to_owned()],
+            ..Default::default()
+        };
+        let skill = character_skills(&character).remove(0);
+        for rule in [
+            "",
+            "无法识别的规则",
+            "每当自己受到伤害时，回复2点生命值",
+            "主动使用对目标造成本次伤害点伤害",
+        ] {
+            assert!(
+                skill_with_gm_rule(&skill, rule).is_err(),
+                "{rule}"
+            );
+        }
+        let ruling = skill_with_gm_rule(
+            &skill,
+            "主动使用对目标施加1回合麻痹状态",
+        )
+        .unwrap();
+        assert!(matches!(
+            static_skill_effects(
+                &ruling.note,
+                &ruling.arg_values,
+                None,
+                None,
+            )
+            .as_slice(),
+            [SkillEffect::GrantBuff { .. }]
+        ));
+    }
 
     #[test]
     fn action_target_moves_off_the_new_actor_when_turn_changes() {

@@ -3688,39 +3688,12 @@ fn replay_controls(
                 ReplayMode::Playing | ReplayMode::Paused
             ) && ui.button("▶ 播放").clicked()
             {
-                let newly_recorded_movement_start = studio
-                    .replay
-                    .as_ref()
-                    .map(|replay| replay.duration_ms)
-                    .unwrap_or_default();
-                let imported = studio
-                    .replay
-                    .as_mut()
-                    .map(|replay| {
-                        append_new_player_movements_from_history(replay, player_movement_history)
-                    })
-                    .unwrap_or_default();
-                let imported_ships = studio
-                    .replay
-                    .as_mut()
-                    .map(|replay| {
-                        append_new_ship_trajectories_from_history(
-                            replay,
-                            ship_trajectory_history,
-                        )
-                    })
-                    .unwrap_or_default();
+                prepare_replay_movement_for_playback(
+                    studio,
+                    player_movement_history,
+                    ship_trajectory_history,
+                );
                 start_playback(studio, grids);
-                if imported > 0 {
-                    studio.playback_ms = newly_recorded_movement_start;
-                    studio.status = format!(
-                        "正在回放（已载入 {imported} 段玩家移动和 {imported_ships} 艘飞船的常态化轨迹）"
-                    );
-                } else if imported_ships > 0 {
-                    studio.status = format!(
-                        "正在回放（已并入 {imported_ships} 艘飞船的常态化轨迹）"
-                    );
-                }
             }
             ui.add_enabled(
                 studio.live_movement_punch_in.is_none() && studio.live_ship_punch_in.is_none(),
@@ -4037,7 +4010,14 @@ fn replay_controls(
     };
     if director_applied && studio.auto_export_after_director {
         studio.auto_export_after_director = false;
-        start_video_export(studio, capture_active, grids, windows);
+        start_video_export(
+            studio,
+            capture_active,
+            grids,
+            windows,
+            player_movement_history,
+            ship_trajectory_history,
+        );
     }
     ui.small("只有开启“录制 DM 自由镜头”才会持续采集镜头。DeepSeek 导演开启后会等待 API 返回，再应用润色台词和镜头决策。");
     ui.small(
@@ -4196,7 +4176,14 @@ fn replay_controls(
             )
             .clicked()
         {
-            start_video_export(studio, capture_active, grids, windows);
+            start_video_export(
+                studio,
+                capture_active,
+                grids,
+                windows,
+                player_movement_history,
+                ship_trajectory_history,
+            );
         }
     });
     let has_applied_director_plan =
@@ -4219,7 +4206,14 @@ fn replay_controls(
         .clicked()
     {
         if has_applied_director_plan {
-            start_video_export(studio, capture_active, grids, windows);
+            start_video_export(
+                studio,
+                capture_active,
+                grids,
+                windows,
+                player_movement_history,
+                ship_trajectory_history,
+            );
             return;
         }
         if matches!(
@@ -5325,6 +5319,17 @@ fn new_replay(
         master_speech_speed: default_master_speech_speed(),
         master_dialogue_duration: default_master_dialogue_duration(),
         speaker_voice_settings: HashMap::new(),
+    }
+}
+
+fn prepare_replay_movement_for_playback(
+    studio: &mut ReplayStudio,
+    player_movement_history: &ReplayPlayerMovementHistory,
+    ship_trajectory_history: &ReplayShipTrajectoryHistory,
+) {
+    if let Some(replay) = studio.replay.as_mut() {
+        append_new_player_movements_from_history(replay, player_movement_history);
+        append_new_ship_trajectories_from_history(replay, ship_trajectory_history);
     }
 }
 
@@ -7053,7 +7058,12 @@ fn start_video_export(
     capture_active: &mut ReplayVideoCaptureActive,
     grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
+    player_movement_history: &ReplayPlayerMovementHistory,
+    ship_trajectory_history: &ReplayShipTrajectoryHistory,
 ) {
+    prepare_replay_movement_for_playback(
+        studio, player_movement_history, ship_trajectory_history,
+    );
     let Some((duration_ms, dialogue, master_speech_speed, speaker_voice_settings)) =
         studio.replay.as_ref().map(|replay| {
             (
@@ -12460,6 +12470,7 @@ fn format_time(time_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+    use serde_json::to_string;
 
     use bevy::ecs::system::RunSystemOnce;
     use bevy_egui::egui::{
@@ -12472,6 +12483,70 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn preview_and_export_movement_preparation_is_shared_and_idempotent() {
+        let mut line = test_dialogue(0, 1_000, DialogueSide::Right);
+        line.sender_id = 7;
+        let mut replay = test_replay(vec![line]);
+        replay.duration_ms = 1_000;
+        replay.campaign_id = "default".to_owned();
+        replay.created_at_unix_ms = 1_000;
+        replay.ship_trajectory_history_cursor_unix_ms = 1_000;
+        let history = ReplayShipTrajectoryHistory {
+            sessions: vec![PersistedShipTrajectorySession {
+                campaign_id: "default".to_owned(),
+                ship_id: "ship".to_owned(),
+                ship_name: "船".to_owned(),
+                keyframes: vec![
+                    PersistedShipKeyframe {
+                        source_unix_ms: 2_000,
+                        translation: [0.0; 3],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                    PersistedShipKeyframe {
+                        source_unix_ms: 3_000,
+                        translation: [10.0, 0.0, 0.0],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                ],
+                ..Default::default()
+            }],
+        };
+        let movements = ReplayPlayerMovementHistory {
+            sessions: vec![PersistedPlayerMovementSession {
+                campaign_id: "default".to_owned(),
+                user_id: 7,
+                keyframes: vec![
+                    PersistedPlayerMovementKeyframe {
+                        source_unix_ms: 2_000,
+                        position_cells: [0.0; 3],
+                    },
+                    PersistedPlayerMovementKeyframe {
+                        source_unix_ms: 3_000,
+                        position_cells: [10.0, 0.0, 0.0],
+                    },
+                ],
+                ..Default::default()
+            }],
+        };
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(replay);
+        prepare_replay_movement_for_playback(&mut studio, &movements, &history);
+        assert_eq!(
+            studio.replay.as_ref().unwrap().ship_trajectories.len(),
+            1
+        );
+        assert_eq!(studio.replay.as_ref().unwrap().player_movements.len(), 1);
+        assert!(studio.replay.as_ref().unwrap().duration_ms > 1_000);
+        assert_eq!(studio.playback_ms, 0);
+        let prepared = to_string(studio.replay.as_ref().unwrap()).unwrap();
+        prepare_replay_movement_for_playback(&mut studio, &movements, &history);
+        assert_eq!(
+            to_string(studio.replay.as_ref().unwrap()).unwrap(),
+            prepared
+        );
+    }
 
     #[test]
     fn cancelling_live_takes_restores_duration_and_preserves_separate_scene_edits() {
