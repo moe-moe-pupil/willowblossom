@@ -1209,7 +1209,6 @@ fn auto_hide_overlay_ui(
 #[derive(Default)]
 pub(crate) struct TrpgGroupSettingsState {
     open: bool,
-    position_radio_auto_sync_groups: HashSet<String>,
     open_global_group_chat_windows: HashSet<String>,
     pool_window_open: bool,
     pool_window_tab: PoolWindowTab,
@@ -16832,12 +16831,11 @@ fn sync_position_radio_parties(
 
 fn sync_enabled_position_radio_parties(
     groups: &mut HashMap<String, TrpgGroup>,
-    enabled_groups: &HashSet<String>,
     player_areas: &HashMap<String, &'static str>,
 ) -> bool {
     let mut changed = false;
-    for group_name in enabled_groups {
-        if let Some(group) = groups.get_mut(group_name) {
+    for group in groups.values_mut() {
+        if group.position_radio_auto_sync_enabled {
             changed |= sync_position_radio_parties(group, player_areas);
         }
     }
@@ -17630,9 +17628,7 @@ fn trpg_group_settings_window(
                                         );
                                     }
                                 }
-                                let auto_sync_enabled = state
-                                    .position_radio_auto_sync_groups
-                                    .contains(&group_name);
+                                let auto_sync_enabled = snapshot.position_radio_auto_sync_enabled;
                                 if ui
                                     .button(if auto_sync_enabled {
                                         "持续自动接入电台：开"
@@ -17644,19 +17640,11 @@ fn trpg_group_settings_window(
                                     )
                                     .clicked()
                                 {
-                                    if auto_sync_enabled {
-                                        state.position_radio_auto_sync_groups.remove(&group_name);
-                                    } else {
-                                        state
-                                            .position_radio_auto_sync_groups
-                                            .insert(group_name.clone());
-                                        if let Some(group) =
-                                            manager.trpg_groups.get_mut(&group_name)
-                                        {
-                                            changed |= sync_position_radio_parties(
-                                                group,
-                                                player_position_areas,
-                                            );
+                                    if let Some(group) = manager.trpg_groups.get_mut(&group_name) {
+                                        group.position_radio_auto_sync_enabled = !auto_sync_enabled;
+                                        changed = true;
+                                        if group.position_radio_auto_sync_enabled {
+                                            sync_position_radio_parties(group, player_position_areas);
                                         }
                                     }
                                 }
@@ -18376,12 +18364,8 @@ pub fn ui_system(
             (standee.user_id.to_string(), area)
         })
         .collect::<HashMap<_, _>>();
-    trpg_group_settings
-        .position_radio_auto_sync_groups
-        .retain(|group_name| manager.trpg_groups.contains_key(group_name));
     if sync_enabled_position_radio_parties(
         &mut manager.trpg_groups,
-        &trpg_group_settings.position_radio_auto_sync_groups,
         &player_position_areas,
     ) {
         manager.persist().ok();
@@ -20473,6 +20457,11 @@ fn append_local_sent_message_with_images(
 
 #[cfg(test)]
 mod tests {
+    use toml::{
+        from_str as toml_from_str,
+        to_string as toml_to_string,
+    };
+
     use super::*;
 
     #[test]
@@ -20621,30 +20610,47 @@ mod tests {
     }
 
     #[test]
+    fn position_radio_setting_defaults_on_and_preserves_saved_choice() {
+        assert!(TrpgGroup::default().position_radio_auto_sync_enabled);
+        let legacy: TrpgGroup = toml_from_str("").unwrap();
+        assert!(legacy.position_radio_auto_sync_enabled);
+        for enabled in [false, true] {
+            let mut group = TrpgGroup::default();
+            group.position_radio_auto_sync_enabled = enabled;
+            let saved = toml_to_string(&group).unwrap();
+            let restored: TrpgGroup = toml_from_str(&saved).unwrap();
+            assert_eq!(
+                restored.position_radio_auto_sync_enabled,
+                enabled
+            );
+        }
+    }
+
+    #[test]
     fn enabled_position_radio_sync_follows_player_movement_until_disabled() {
         let mut group = TrpgGroup::default();
         group.players = vec!["1".to_owned()];
         let mut groups = HashMap::from([("campaign".to_owned(), group)]);
-        let enabled_groups = HashSet::from(["campaign".to_owned()]);
 
         assert!(sync_enabled_position_radio_parties(
             &mut groups,
-            &enabled_groups,
             &HashMap::from([("1".to_owned(), "废弃空间站")]),
         ));
         assert!(groups["campaign"].player_in_party("1", "废弃空间站"));
 
         assert!(sync_enabled_position_radio_parties(
             &mut groups,
-            &enabled_groups,
             &HashMap::from([("1".to_owned(), "Kyo空间站")]),
         ));
         assert!(groups["campaign"].player_in_party("1", "kyo空间站"));
         assert!(!groups["campaign"].player_in_party("1", "废弃空间站"));
 
+        groups
+            .get_mut("campaign")
+            .unwrap()
+            .position_radio_auto_sync_enabled = false;
         assert!(!sync_enabled_position_radio_parties(
             &mut groups,
-            &HashSet::new(),
             &HashMap::from([("1".to_owned(), "狂妄号")]),
         ));
         assert!(groups["campaign"].player_in_party("1", "kyo空间站"));

@@ -2027,6 +2027,8 @@ fn default_exchange_points() -> i32 { 6 }
 
 fn default_allow_join_requests() -> bool { true }
 
+fn default_position_radio_auto_sync_enabled() -> bool { true }
+
 fn default_battle_sort_by_turn() -> bool { true }
 
 fn default_players_scene_capture_enabled() -> bool { true }
@@ -2447,6 +2449,8 @@ pub struct TrpgGroup {
     pub guide: String,
     #[serde(default = "default_allow_join_requests")]
     pub allow_join_requests: bool,
+    #[serde(default = "default_position_radio_auto_sync_enabled")]
+    pub position_radio_auto_sync_enabled: bool,
     /// 是否允许通过 .gc/.gc2（观察/观察视频）聊天命令请求场景截图；
     /// 关闭后聊天命令对所有账号（含GM）失效，GM仍可通过界面按钮强制发送。
     #[serde(default = "default_players_scene_capture_enabled")]
@@ -2517,6 +2521,7 @@ impl Default for TrpgGroup {
             st_description: String::new(),
             guide: String::new(),
             allow_join_requests: default_allow_join_requests(),
+            position_radio_auto_sync_enabled: default_position_radio_auto_sync_enabled(),
             players_scene_capture_enabled: default_players_scene_capture_enabled(),
             initial_status_points: default_status_points(),
             initial_exchange_points: default_exchange_points(),
