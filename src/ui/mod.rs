@@ -478,7 +478,7 @@ fn paint_voxel_creative_item_icon(
             line((-0.62, 0.64), (-0.92, 0.8));
             line((-0.62, 0.96), (-0.92, 0.8));
         },
-        VoxelCreativeItem::SpaceshipPossessionTool => {
+        VoxelCreativeItem::SpaceshipPossessionTool | VoxelCreativeItem::SpaceshipTeleportTool => {
             line((0.0, -0.92), (-0.82, 0.38));
             line((-0.82, 0.38), (-0.3, 0.24));
             line((-0.3, 0.24), (-0.18, 0.82));
@@ -683,6 +683,10 @@ fn voxel_creative_item_visual(item: VoxelCreativeItem) -> (&'static str, egui::C
         VoxelCreativeItem::SpaceshipPossessionTool => (
             "舰船接管器",
             egui::Color32::from_rgb(38, 166, 205),
+        ),
+        VoxelCreativeItem::SpaceshipTeleportTool => (
+            "舰船传送器",
+            egui::Color32::from_rgb(235, 150, 65),
         ),
         VoxelCreativeItem::TeleportTool => (
             "传送器",
@@ -19590,6 +19594,27 @@ pub fn ui_system(
                                     }
                                     ui.small(name);
                                 });
+                                let teleport_tool = VoxelCreativeItem::SpaceshipTeleportTool;
+                                let (name, _) = voxel_creative_item_visual(teleport_tool);
+                                ui.vertical_centered(|ui| {
+                                    if voxel_creative_drag_source(
+                                        ui,
+                                        egui::Id::new("voxel_catalog_spaceship_teleport_tool"),
+                                        VoxelCreativeDragPayload::Catalog(teleport_tool),
+                                        teleport_tool,
+                                        voxel_editor.creative_hotbar
+                                            [voxel_editor.selected_hotbar_slot]
+                                            == Some(teleport_tool),
+                                        48.0,
+                                        None,
+                                    )
+                                    .on_hover_text("GM右键选择舰船，将其驾驶舱传送到GM位置，保留朝向并携带乘员")
+                                    .clicked()
+                                    {
+                                        picked_item = Some(teleport_tool);
+                                    }
+                                    ui.small(name);
+                                });
                                 let tool_gun = VoxelCreativeItem::ToolGun;
                                 let (name, _) = voxel_creative_item_visual(tool_gun);
                                 ui.vertical_centered(|ui| {
@@ -19787,7 +19812,7 @@ pub fn ui_system(
             if voxel_editor.teleport_menu_open {
                 let mut window_open = true;
                 let teleport_window_max_height = (ctx.content_rect().height() - 32.0).max(200.0);
-                egui::Window::new("传送器")
+                egui::Window::new(if voxel_editor.is_spaceship_teleport_tool_equipped() { "舰船传送器" } else { "传送器" })
                     .id(egui::Id::new("voxel_teleport_tool_window"))
                     .anchor(
                         egui::Align2::CENTER_CENTER,
@@ -19799,6 +19824,22 @@ pub fn ui_system(
                     .vscroll(true)
                     .open(&mut window_open)
                     .show(ctx, |ui| {
+                        if voxel_editor.is_spaceship_teleport_tool_equipped() {
+                            ui.label("选择要传送到GM位置的舰船");
+                            ui.small("驾驶舱对齐GM，保留朝向；乘员和停靠舰艇随舰移动。");
+                            let mut ships = teleport_spaceships.iter()
+                                .map(|(ship, ..)| (ship.id.clone(), ship.name.clone()))
+                                .collect::<Vec<_>>();
+                            ships.sort_by(|left, right| left.0.cmp(&right.0));
+                            for (ship_id, name) in ships {
+                                if ui.add_enabled(!voxel_possession.is_active(), egui::Button::new(name))
+                                    .on_disabled_hover_text("请先解除接管，再使用GM舰船传送器")
+                                    .clicked() {
+                                    voxel_editor.request_spaceship_teleport(ship_id);
+                                }
+                            }
+                            return;
+                        }
                         ui.label("选择目的地");
                         ui.small("传送只移动GM；被接管的生存玩家不会受到影响。");
                         ui.separator();

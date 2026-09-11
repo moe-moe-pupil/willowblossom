@@ -951,6 +951,7 @@ pub(crate) struct VoxelSpaceshipDocked {
 struct VoxelSpaceshipPassengerMotion {
     previous_ship_transforms: HashMap<String, Transform>,
     camera_store_dirty: bool,
+    skip_gm_carry_once: bool,
     persist_elapsed: f32,
 }
 
@@ -1309,6 +1310,7 @@ pub(crate) enum VoxelCreativeItem {
     PlayerPossessionTool,
     SpaceshipPossessionTool,
     TeleportTool,
+    SpaceshipTeleportTool,
     DoorLockTool,
     PortraitTransformTool,
     InvisibilityTool,
@@ -2079,6 +2081,7 @@ pub(crate) struct VoxelEditorState {
     first_person_cursor_released: bool,
     teleport_requested: Option<VoxelTeleportDestination>,
     summon_players_requested: Vec<u64>,
+    spaceship_teleport_requested: Option<String>,
     /// 立绘变形器当前选中的玩家；窗口关闭后恢复为 None。
     pub portrait_transform_target: Option<u64>,
     selected_gm_sign: Option<Entity>,
@@ -2151,6 +2154,7 @@ impl Default for VoxelEditorState {
             first_person_cursor_released: true,
             teleport_requested: None,
             summon_players_requested: Vec::new(),
+            spaceship_teleport_requested: None,
             portrait_transform_target: None,
             selected_gm_sign: None,
             gm_sign_editor_open: false,
@@ -2230,7 +2234,7 @@ impl VoxelEditorState {
                 self.light_tool = None;
                 self.selected_light = None;
             },
-            VoxelCreativeItem::TeleportTool => {
+            VoxelCreativeItem::TeleportTool | VoxelCreativeItem::SpaceshipTeleportTool => {
                 self.light_tool = None;
                 self.selected_light = None;
             },
@@ -2251,7 +2255,7 @@ impl VoxelEditorState {
                 self.selected_light = None;
             },
         }
-        if item != VoxelCreativeItem::TeleportTool {
+        if !self.is_teleport_tool_equipped() {
             self.teleport_menu_open = false;
         }
         if item != VoxelCreativeItem::PortraitTransformTool {
@@ -2344,6 +2348,9 @@ impl VoxelEditorState {
         if self.is_spaceship_possession_tool_equipped() {
             return "舰船接管器".to_owned();
         }
+        if self.is_spaceship_teleport_tool_equipped() {
+            return "舰船传送器".to_owned();
+        }
         if self.is_teleport_tool_equipped() {
             return "传送器".to_owned();
         }
@@ -2384,7 +2391,19 @@ impl VoxelEditorState {
     }
 
     pub(crate) fn is_teleport_tool_equipped(&self) -> bool {
-        self.equipped_item == Some(VoxelCreativeItem::TeleportTool)
+        matches!(
+            self.equipped_item,
+            Some(VoxelCreativeItem::TeleportTool | VoxelCreativeItem::SpaceshipTeleportTool)
+        )
+    }
+
+    pub(crate) fn is_spaceship_teleport_tool_equipped(&self) -> bool {
+        self.equipped_item == Some(VoxelCreativeItem::SpaceshipTeleportTool)
+    }
+
+    pub(crate) fn request_spaceship_teleport(&mut self, ship_id: String) {
+        self.spaceship_teleport_requested = Some(ship_id);
+        self.teleport_menu_open = false;
     }
 
     pub(crate) fn is_door_lock_tool_equipped(&self) -> bool {
@@ -2411,6 +2430,7 @@ impl VoxelEditorState {
                     | VoxelCreativeItem::SpaceshipPossessionTool
                     | VoxelCreativeItem::PortraitTransformTool
                     | VoxelCreativeItem::TeleportTool
+                    | VoxelCreativeItem::SpaceshipTeleportTool
                     | VoxelCreativeItem::DoorLockTool
                     | VoxelCreativeItem::InvisibilityTool
                     | VoxelCreativeItem::GmClock
@@ -2777,6 +2797,7 @@ impl Plugin for TrpgVoxelPlugin {
                         apply_voxel_teleport,
                         release_controlled_docked_spaceship,
                         control_voxel_spaceships,
+                        apply_voxel_spaceship_teleport,
                         dock_idle_voxel_spaceships,
                         sync_docked_voxel_spaceships,
                         carry_voxel_players_with_spaceships,
@@ -7870,7 +7891,11 @@ fn carry_voxel_players_with_spaceships(
         passenger_motion.camera_store_dirty = true;
     }
 
+    let skip_gm_carry = take(&mut passenger_motion.skip_gm_carry_once);
     for mut transform in &mut players {
+        if skip_gm_carry {
+            continue;
+        }
         let previous_rotation = transform.rotation;
         let Some(carried) = carried_transform_in_innermost_spaceship(&transform, &motions) else {
             continue;
@@ -16049,6 +16074,72 @@ fn use_voxel_invisibility_tool(
     });
 }
 
+fn apply_voxel_spaceship_teleport(
+    mut commands: Commands,
+    mut editor: ResMut<VoxelEditorState>,
+    possession: Res<VoxelPossessionState>,
+    mut control: ResMut<VoxelSpaceshipControlState>,
+    mut passenger_motion: ResMut<VoxelSpaceshipPassengerMotion>,
+    mut persistence: ResMut<VoxelSpaceshipPersistenceState>,
+    mut ships: Query<(
+        Entity,
+        &VoxelSpaceship,
+        &mut Transform,
+        &mut LinearVelocity,
+        &mut AngularVelocity,
+    )>,
+    ship_chunks: Query<&VoxelSpaceshipChunks>,
+) {
+    let Some(ship_id) = editor.spaceship_teleport_requested.take() else { return };
+    if possession.is_active() {
+        return;
+    }
+    // Seed the passenger history before changing the hull, including docked craft.
+    for (_, ship, transform, ..) in &ships {
+        passenger_motion
+            .previous_ship_transforms
+            .entry(ship.id.clone())
+            .or_insert(*transform);
+    }
+    let Some((entity, ship, mut transform, mut linear, mut angular)) =
+        ships.iter_mut().find(|(_, ship, ..)| ship.id == ship_id)
+    else {
+        return;
+    };
+    transform.translation = editor.gm_standee_position
+        - transform.rotation * (transform.scale * ship.cockpit_eye_local);
+    linear.0 = Vec3::ZERO;
+    angular.0 = Vec3::ZERO;
+    let layers = if ship.id == COMBAT_SPACESHIP_ID {
+        carrier_collision_layers()
+    } else {
+        moving_voxel_spaceship_collision_layers()
+    };
+    commands
+        .entity(entity)
+        .remove::<(VoxelSpaceshipDocked, Sleeping)>()
+        .insert((
+            RigidBody::Dynamic,
+            SweptCcd::default(),
+            layers,
+        ));
+    if let Ok(chunks) = ship_chunks.get(entity) {
+        for chunk in chunks.0.values() {
+            commands.entity(*chunk).insert(layers);
+        }
+    }
+    if control.driving_ship_id.as_deref() == Some(ship_id.as_str()) {
+        control.stop_driving();
+    }
+    passenger_motion.skip_gm_carry_once = true;
+    passenger_motion.persist_elapsed = 0.5;
+    persistence.elapsed_seconds = VOXEL_SPACESHIP_SAVE_SECONDS;
+    editor.physics_status = Some(format!(
+        "已将{}驾驶舱传送到GM位置",
+        ship.name
+    ));
+}
+
 fn apply_chat_player_teleport(
     mut editor: ResMut<VoxelEditorState>,
     possession: Res<VoxelPossessionState>,
@@ -17867,6 +17958,7 @@ mod tests {
     use toml::from_str as toml_from_str;
 
     use super::*;
+    use crate::replay::ReplayStudio;
 
     #[test]
     fn world_time_sun_direction_matches_key_day_night_moments() {
@@ -18702,6 +18794,210 @@ mod tests {
             VoxelTeleportDestination::MapCell(cell).player_position(),
             Some(cell.as_vec3() * VOXEL_SIZE + Vec3::Y * 0.5)
         );
+    }
+
+    #[test]
+    fn spaceship_teleport_moves_docked_craft_and_players_but_keeps_gm_here() {
+        let specs = default_voxel_spaceship_specs();
+        let carrier_spec = &specs[0];
+        let small_spec = &specs[1];
+        let original = carrier_spec.transform;
+        let docking = small_spec.docking.clone().unwrap();
+        let small_original = docked_voxel_spaceship_world_transform(&original, &docking).unwrap();
+        let gm_eye = original.transform_point(carrier_spec.ship.cockpit_eye_local) + Vec3::X;
+        let camera_path = temp_dir().join(format!(
+            "willow_ship_teleport_camera_{}.toml",
+            process_id()
+        ));
+        let ship_path = temp_dir().join(format!(
+            "willow_ship_teleport_ships_{}.toml",
+            process_id()
+        ));
+        let camera_store = Persistent::<VoxelPlayerCameraStore>::builder()
+            .name("ship_teleport_cameras")
+            .format(StorageFormat::Toml)
+            .path(&camera_path)
+            .default(VoxelPlayerCameraStore::default())
+            .build()
+            .unwrap();
+        let ship_store = Persistent::<VoxelSpaceshipStore>::builder()
+            .name("ship_teleport_ships")
+            .format(StorageFormat::Toml)
+            .path(&ship_path)
+            .default(VoxelSpaceshipStore {
+                ships: vec![
+                    persisted_voxel_spaceship_from_spec(carrier_spec, None),
+                    persisted_voxel_spaceship_from_spec(small_spec, None),
+                ],
+                ..default()
+            })
+            .build()
+            .unwrap();
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<VoxelEditorState>()
+            .init_resource::<VoxelPossessionState>()
+            .init_resource::<VoxelSpaceshipControlState>()
+            .init_resource::<VoxelSpaceshipPassengerMotion>()
+            .init_resource::<VoxelSpaceshipPersistenceState>()
+            .init_resource::<ReplayStudio>()
+            .add_message::<AppExit>()
+            .insert_resource(camera_store)
+            .insert_resource(ship_store)
+            .add_systems(
+                Update,
+                (
+                    apply_voxel_spaceship_teleport,
+                    sync_docked_voxel_spaceships,
+                    carry_voxel_players_with_spaceships,
+                    persist_voxel_spaceships,
+                )
+                    .chain(),
+            );
+        let carrier = app
+            .world_mut()
+            .spawn((
+                carrier_spec.ship.clone(),
+                original,
+                VoxelPhysicsBody {
+                    local_center: Vec3::ZERO,
+                    cells: carrier_spec.cells.clone(),
+                },
+                LinearVelocity(Vec3::ONE),
+                AngularVelocity(Vec3::Y),
+                RigidBody::Dynamic,
+            ))
+            .id();
+        let small = app
+            .world_mut()
+            .spawn((
+                small_spec.ship.clone(),
+                small_original,
+                docking.clone(),
+                VoxelPhysicsBody {
+                    local_center: Vec3::ZERO,
+                    cells: small_spec.cells.clone(),
+                },
+                LinearVelocity::ZERO,
+                AngularVelocity::ZERO,
+                RigidBody::Kinematic,
+            ))
+            .id();
+        let player_original = small_original.transform_point(small_spec.ship.cockpit_eye_local);
+        let player = app
+            .world_mut()
+            .spawn((
+                VoxelPlayerCaptureCamera { user_id: 42 },
+                Transform::from_translation(player_original),
+            ))
+            .id();
+        let gm_position = first_person_player_position(gm_eye);
+        let gm = app
+            .world_mut()
+            .spawn((
+                VoxelFirstPersonPlayer,
+                Transform::from_translation(gm_position),
+            ))
+            .id();
+        {
+            let mut editor = app.world_mut().resource_mut::<VoxelEditorState>();
+            editor.gm_standee_position = gm_eye;
+            editor.request_spaceship_teleport(carrier_spec.ship.id.clone());
+        }
+        app.update();
+        let moved = *app.world().entity(carrier).get::<Transform>().unwrap();
+        assert!(moved
+            .transform_point(carrier_spec.ship.cockpit_eye_local)
+            .abs_diff_eq(gm_eye, 0.001));
+        assert_eq!(moved.rotation, original.rotation);
+        assert_eq!(
+            app.world()
+                .entity(carrier)
+                .get::<LinearVelocity>()
+                .unwrap()
+                .0,
+            Vec3::ZERO
+        );
+        assert_eq!(
+            app.world()
+                .entity(carrier)
+                .get::<AngularVelocity>()
+                .unwrap()
+                .0,
+            Vec3::ZERO
+        );
+        assert_eq!(
+            *app.world()
+                .entity(carrier)
+                .get::<CollisionLayers>()
+                .unwrap(),
+            carrier_collision_layers()
+        );
+        let expected_small = docked_voxel_spaceship_world_transform(&moved, &docking).unwrap();
+        assert!(app
+            .world()
+            .entity(small)
+            .get::<Transform>()
+            .unwrap()
+            .translation
+            .abs_diff_eq(expected_small.translation, 0.001));
+        assert!(app
+            .world()
+            .entity(player)
+            .get::<Transform>()
+            .unwrap()
+            .translation
+            .abs_diff_eq(
+                player_original + moved.translation - original.translation,
+                0.001
+            ));
+        assert_eq!(
+            app.world()
+                .entity(gm)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            gm_position
+        );
+        let saved: VoxelSpaceshipStore =
+            toml_from_str(&fs::read_to_string(&ship_path).unwrap()).unwrap();
+        assert_eq!(
+            saved.ships[0].translation,
+            moved.translation.to_array()
+        );
+        let saved_cameras: VoxelPlayerCameraStore =
+            toml_from_str(&fs::read_to_string(&camera_path).unwrap()).unwrap();
+        assert_eq!(saved_cameras.cameras[0].user_id, 42);
+        // A docked small craft can also be recalled without snapping back to its carrier.
+        let destination = gm_eye + Vec3::splat(500.0);
+        {
+            let mut editor = app.world_mut().resource_mut::<VoxelEditorState>();
+            editor.gm_standee_position = destination;
+            editor.request_spaceship_teleport(small_spec.ship.id.clone());
+        }
+        app.update();
+        assert!(!app.world().entity(small).contains::<VoxelSpaceshipDocked>());
+        assert_eq!(
+            *app.world().entity(small).get::<RigidBody>().unwrap(),
+            RigidBody::Dynamic
+        );
+        assert!(app
+            .world()
+            .entity(small)
+            .get::<Transform>()
+            .unwrap()
+            .transform_point(small_spec.ship.cockpit_eye_local)
+            .abs_diff_eq(destination, 0.001));
+        assert_eq!(
+            app.world()
+                .entity(carrier)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            moved.translation
+        );
+        fs::remove_file(camera_path).unwrap();
+        fs::remove_file(ship_path).unwrap();
     }
 
     #[test]
