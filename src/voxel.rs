@@ -10,6 +10,7 @@ use std::{
         Hash,
         Hasher,
     },
+    mem::take,
     path::{
         Path,
         PathBuf,
@@ -2077,6 +2078,7 @@ pub(crate) struct VoxelEditorState {
     first_person_was_enabled: bool,
     first_person_cursor_released: bool,
     teleport_requested: Option<VoxelTeleportDestination>,
+    summon_players_requested: Vec<u64>,
     /// 立绘变形器当前选中的玩家；窗口关闭后恢复为 None。
     pub portrait_transform_target: Option<u64>,
     selected_gm_sign: Option<Entity>,
@@ -2148,6 +2150,7 @@ impl Default for VoxelEditorState {
             // Keep the OS cursor free until the user explicitly clicks the 3D viewport.
             first_person_cursor_released: true,
             teleport_requested: None,
+            summon_players_requested: Vec::new(),
             portrait_transform_target: None,
             selected_gm_sign: None,
             gm_sign_editor_open: false,
@@ -2414,6 +2417,10 @@ impl VoxelEditorState {
                     | VoxelCreativeItem::GmSign
             )
         )
+    }
+
+    pub(crate) fn request_summon_players(&mut self, user_ids: Vec<u64>) {
+        self.summon_players_requested = user_ids;
     }
 
     pub(crate) fn request_teleport(&mut self, destination: VoxelTeleportDestination) {
@@ -2783,6 +2790,7 @@ impl Plugin for TrpgVoxelPlugin {
                         sync_battle_mirror_coat_invisibility,
                         sync_possessed_player_camera,
                         sync_voxel_player_cameras,
+                        apply_chat_player_teleport,
                         sync_voxel_player_standees.in_set(VoxelPlayerStandeeSynced),
                         sync_voxel_standee_invisibility_render_layers,
                         sync_voxel_unit_standees,
@@ -16041,6 +16049,38 @@ fn use_voxel_invisibility_tool(
     });
 }
 
+fn apply_chat_player_teleport(
+    mut editor: ResMut<VoxelEditorState>,
+    possession: Res<VoxelPossessionState>,
+    mut cameras: Query<(
+        &VoxelPlayerCaptureCamera,
+        &mut Transform,
+    )>,
+    mut store: ResMut<Persistent<VoxelPlayerCameraStore>>,
+) {
+    let user_ids = take(&mut editor.summon_players_requested);
+    if user_ids.is_empty() || possession.is_active() {
+        return;
+    }
+    let anchor = user_ids.iter().find_map(|user_id| {
+        cameras
+            .iter()
+            .find(|(camera, _)| camera.user_id == *user_id)
+            .map(|(_, transform)| transform.translation)
+    });
+    let Some(anchor) = anchor else { return };
+    let offset = editor.gm_standee_position - anchor;
+    for (camera, mut transform) in &mut cameras {
+        if user_ids.contains(&camera.user_id) {
+            transform.translation += offset;
+            upsert_voxel_player_camera(&mut store, camera.user_id, &transform);
+        }
+    }
+    if let Err(err) = store.persist() {
+        error!("failed to persist teleported players: {err}");
+    }
+}
+
 fn apply_voxel_teleport(
     mut editor: ResMut<VoxelEditorState>,
     possession: Res<VoxelPossessionState>,
@@ -17819,6 +17859,13 @@ fn draw_voxel_target(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        env::temp_dir,
+        process::id as process_id,
+    };
+
+    use toml::from_str as toml_from_str;
+
     use super::*;
 
     #[test]
@@ -18655,6 +18702,95 @@ mod tests {
             VoxelTeleportDestination::MapCell(cell).player_position(),
             Some(cell.as_vec3() * VOXEL_SIZE + Vec3::Y * 0.5)
         );
+    }
+
+    #[test]
+    fn chat_player_teleport_preserves_formation_and_persists() {
+        let path = temp_dir().join(format!(
+            "willow_chat_teleport_{}.toml",
+            process_id()
+        ));
+        let store = Persistent::<VoxelPlayerCameraStore>::builder()
+            .name("chat_teleport_test")
+            .format(StorageFormat::Toml)
+            .path(&path)
+            .default(VoxelPlayerCameraStore::default())
+            .build()
+            .unwrap();
+        let destination = Vec3::new(40.0, 12.0, -80.0);
+        let mut editor = VoxelEditorState::default();
+        editor.gm_standee_position = destination;
+        editor.request_summon_players(vec![999, 2, 1, 2]);
+        let mut app = App::new();
+        app.insert_resource(editor)
+            .insert_resource(store)
+            .init_resource::<VoxelPossessionState>()
+            .add_systems(Update, apply_chat_player_teleport);
+        let first = Transform::from_xyz(1.0, 2.0, 3.0).with_rotation(Quat::from_rotation_y(0.7));
+        let second = Transform::from_xyz(5.0, 8.0, -2.0);
+        let a = app
+            .world_mut()
+            .spawn((
+                VoxelPlayerCaptureCamera { user_id: 1 },
+                first,
+            ))
+            .id();
+        let b = app
+            .world_mut()
+            .spawn((
+                VoxelPlayerCaptureCamera { user_id: 2 },
+                second,
+            ))
+            .id();
+        let other = app
+            .world_mut()
+            .spawn((
+                VoxelPlayerCaptureCamera { user_id: 3 },
+                Transform::IDENTITY,
+            ))
+            .id();
+        app.update();
+        let moved_a = *app.world().entity(a).get::<Transform>().unwrap();
+        let moved_b = *app.world().entity(b).get::<Transform>().unwrap();
+        assert_eq!(moved_b.translation, destination);
+        assert_eq!(
+            moved_a.translation - moved_b.translation,
+            first.translation - second.translation
+        );
+        assert_eq!(moved_a.rotation, first.rotation);
+        assert_eq!(
+            app.world()
+                .entity(other)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            Vec3::ZERO
+        );
+        let saved: VoxelPlayerCameraStore =
+            toml_from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.cameras.len(), 2);
+        assert_eq!(
+            persisted_voxel_player_camera(&saved, 1)
+                .unwrap()
+                .translation,
+            moved_a.translation.to_array()
+        );
+        app.world_mut()
+            .resource_mut::<VoxelPossessionState>()
+            .active_user_id = Some(1);
+        app.world_mut()
+            .resource_mut::<VoxelEditorState>()
+            .request_summon_players(vec![1]);
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(a)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            moved_a.translation
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

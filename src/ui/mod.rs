@@ -2694,6 +2694,56 @@ fn persist_ui_memory_after_interaction(
     }
 }
 
+fn chat_teleport_buttons(
+    ui: &mut Ui,
+    members: &[String],
+    grouped: bool,
+    manager: &NapcatMessageManager,
+    positions: Option<&SceneCharacterPositions>,
+    editor: &mut VoxelEditorState,
+    possession: &VoxelPossessionState,
+) {
+    let user_ids = members
+        .iter()
+        .filter(|target| !is_group_chat_target(manager, target))
+        .filter(|target| {
+            positions.is_some_and(|positions| positions.positions.contains_key(*target))
+        })
+        .filter_map(|target| target.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    let enabled = !user_ids.is_empty() && !possession.is_active();
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(
+                enabled,
+                egui::Button::new(if grouped { "传送到首位成员" } else { "传送到TA" }),
+            )
+            .on_hover_text("将GM传送到首个已在场景中的成员")
+            .on_disabled_hover_text("需要场景中的玩家立牌，且GM未接管玩家")
+            .clicked()
+        {
+            editor.request_teleport(VoxelTeleportDestination::PlayerStandee(
+                user_ids[0],
+            ));
+        }
+        if ui
+            .add_enabled(
+                enabled,
+                egui::Button::new(if grouped {
+                    "传送全员到这里"
+                } else {
+                    "传送TA到这里"
+                }),
+            )
+            .on_hover_text("以首个在场成员为基准移到GM位置，保持成员间相对位置和朝向")
+            .on_disabled_hover_text("需要场景中的玩家立牌，且GM未接管玩家")
+            .clicked()
+        {
+            editor.request_summon_players(user_ids);
+        }
+    });
+}
+
 fn chat_window(
     nickname: &str,
     id: Id,
@@ -2721,6 +2771,9 @@ fn chat_window(
     rule_engine_state: &mut RuleEngineState,
     mut player_view_request: Option<&mut ScenePlayerViewRequest>,
     mut scene_capture_requests: Option<&mut SceneCaptureRequests>,
+    scene_positions: Option<&SceneCharacterPositions>,
+    voxel_editor: &mut VoxelEditorState,
+    voxel_possession: &VoxelPossessionState,
 ) {
     let mut window_open = true;
     let mut leave_group = false;
@@ -2824,6 +2877,17 @@ fn chat_window(
     let mut player_acted_toggle: Option<(String, String, bool)> = None;
     let player_visible_options = player_visible_preview_options(manager, target_id, messages);
     let response = window.show(ctx, |ui| {
+        if !target_is_group_chat {
+            chat_teleport_buttons(
+                ui,
+                &[target_id.to_owned()],
+                false,
+                manager,
+                scene_positions,
+                voxel_editor,
+                voxel_possession,
+            );
+        }
         if let Some(accent) = chat_window_accent {
             let (accent_rect, accent_response) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), 4.0),
@@ -3749,6 +3813,9 @@ fn trpg_group_global_chat_windows(
     chat_input_msgs: &mut Local<HashMap<String, String>>,
     ime: &mut ResMut<ImeManager>,
     open_groups: &mut HashSet<String>,
+    scene_positions: Option<&SceneCharacterPositions>,
+    voxel_editor: &mut VoxelEditorState,
+    voxel_possession: &VoxelPossessionState,
 ) {
     open_groups.retain(|group_name| manager.trpg_groups.contains_key(group_name));
     let mut group_names = open_groups.iter().cloned().collect::<Vec<_>>();
@@ -3781,6 +3848,15 @@ fn trpg_group_global_chat_windows(
             .default_size(Vec2::new(420.0, 260.0))
             .min_size(Vec2::new(320.0, 200.0))
             .show(ctx, |ui| {
+                chat_teleport_buttons(
+                    ui,
+                    &group.players,
+                    true,
+                    manager,
+                    scene_positions,
+                    voxel_editor,
+                    voxel_possession,
+                );
                 ui.label(format!(
                     "将分别私聊发送给 {} 名玩家",
                     targets.len()
@@ -18451,6 +18527,9 @@ pub fn ui_system(
             chat_input_msgs,
             &mut ime,
             &mut trpg_group_settings.open_global_group_chat_windows,
+            scene_positions.as_deref(),
+            voxel_editor,
+            voxel_possession,
         );
 
         let active_target = show_chat_workspace(
@@ -20036,6 +20115,9 @@ pub fn ui_system(
                 chat_input_msgs,
                 &mut ime,
                 &mut trpg_group_settings.open_global_group_chat_windows,
+                scene_positions.as_deref(),
+                voxel_editor,
+                voxel_possession,
             );
 
             let mut closed_group_names = Vec::new();
@@ -20057,6 +20139,15 @@ pub fn ui_system(
                     .max_size(group_max_size)
                     .resizable(true)
                     .show(ctx, |ui| {
+                        chat_teleport_buttons(
+                            ui,
+                            &v.members,
+                            true,
+                            &manager,
+                            scene_positions.as_deref(),
+                            voxel_editor,
+                            voxel_possession,
+                        );
                         group_chat_timeline_ui(
                             ui,
                             &k,
@@ -20231,6 +20322,9 @@ pub fn ui_system(
                     &mut rule_engine_state,
                     player_view_request.as_deref_mut(),
                     scene_capture_requests.as_deref_mut(),
+                    scene_positions.as_deref(),
+                    voxel_editor,
+                    voxel_possession,
                 );
             }
             if keep_gm_auto_chat_window_topmost(
