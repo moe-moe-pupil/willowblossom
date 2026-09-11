@@ -813,6 +813,23 @@ pub(crate) struct VoxelSpaceship {
     max_speed: f32,
 }
 
+#[cfg(test)]
+impl VoxelSpaceship {
+    pub(crate) fn replay_test(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            class: VoxelSpaceshipClass::Scout,
+            cockpit_eye_local: Vec3::ZERO,
+            forward_axis: Vec3::NEG_Z,
+            thrust_acceleration: 0.0,
+            vertical_acceleration: 0.0,
+            turn_speed: 0.0,
+            max_speed: 0.0,
+        }
+    }
+}
+
 /// Marker on a spaceship's hull voxel mesh children, so in-place local edits
 /// can rebuild exactly the surfaces derived from `VoxelPhysicsBody.cells`.
 #[derive(Component)]

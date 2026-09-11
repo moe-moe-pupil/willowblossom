@@ -65,6 +65,7 @@ use bevy::{
 use bevy_egui::{
     egui::{
         self,
+        Button,
         DragValue,
         Ui,
     },
@@ -503,6 +504,8 @@ struct ReplayFile {
     audience: ReplayAudience,
     scene: ReplayScene,
     camera: Vec<ReplayCameraKeyframe>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    camera_cuts: Vec<ReplayCameraCut>,
     #[serde(default = "default_directed_camera_distance_scale")]
     camera_distance_scale: f32,
     #[serde(default = "default_directed_camera_yaw_degrees")]
@@ -600,6 +603,41 @@ struct ReplayCameraKeyframe {
     time_ms: u64,
     translation: [f32; 3],
     rotation: [f32; 4],
+    /// Generated shots follow their subject; free-camera and older recordings
+    /// keep their original world-space poses until the DM changes the shot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    focus: Option<ReplayCameraFocus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum ReplayCameraSubject {
+    Player(u64),
+    Ship {
+        ship_id: String,
+        local_center: [f32; 3],
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplayCameraFocus {
+    subject: ReplayCameraSubject,
+    position: [f32; 3],
+    axis_origin: [f32; 3],
+    camera_side: [f32; 3],
+}
+
+/// Explicit DM cuts overlay the planned track without changing its easing or
+/// earlier frames. A cut with no shot resumes the original camera track.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplayCameraCut {
+    time_ms: u64,
+    shot: Option<ReplayFollowShot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplayFollowShot {
+    focus: ReplayCameraFocus,
+    offset: [f32; 3],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -738,6 +776,14 @@ struct ReplayLiveEditParams<'w, 's> {
         (
             Without<VoxelPlayerStandee>,
             Without<VoxelViewportCamera>,
+        ),
+    >,
+    ship_bodies: Query<
+        'w,
+        's,
+        (
+            &'static VoxelSpaceship,
+            &'static VoxelPhysicsBody,
         ),
     >,
 }
@@ -3127,13 +3173,22 @@ fn apply_replay_camera(
         (
             With<VoxelViewportCamera>,
             Without<VoxelPlayerStandee>,
+            Without<VoxelSpaceship>,
         ),
     >,
-    standees: Query<
-        (&Transform, &VoxelPlayerStandee),
+    mut standees: Query<
+        (&mut Transform, &VoxelPlayerStandee),
         (
             With<VoxelPlayerStandee>,
             Without<VoxelViewportCamera>,
+            Without<VoxelSpaceship>,
+        ),
+    >,
+    ships: Query<
+        (&Transform, &VoxelSpaceship),
+        (
+            Without<VoxelViewportCamera>,
+            Without<VoxelPlayerStandee>,
         ),
     >,
 ) {
@@ -3153,15 +3208,35 @@ fn apply_replay_camera(
         return;
     }
     let Some(replay) = studio.replay.as_ref() else { return };
-    let Some(transform) = interpolated_camera(
-        &replay.camera,
+    let Some(transform) = replay_camera_at(
+        replay,
         studio.playback_ms,
-        replay.camera_transition_curve,
+        |subject| match subject {
+            ReplayCameraSubject::Player(user_id) => standees
+                .iter()
+                .find(|(_, standee)| standee.user_id == *user_id)
+                .map(|(transform, _)| transform.translation),
+            ReplayCameraSubject::Ship {
+                ship_id,
+                local_center,
+            } => ships
+                .iter()
+                .find(|(_, ship)| ship.id == *ship_id)
+                .map(|(transform, _)| transform.transform_point(Vec3::from_array(*local_center))),
+        },
     ) else {
         return;
     };
     if let Ok(mut camera) = camera.single_mut() {
         *camera = transform;
+        for (mut standee_transform, _) in &mut standees {
+            if let Some(rotation) = replay_standee_facing_rotation(
+                standee_transform.translation,
+                transform.translation,
+            ) {
+                standee_transform.rotation = rotation;
+            }
+        }
         if let Some(fade) = fade.as_mut() {
             set_replay_occlusion_targets(
                 fade,
@@ -4147,12 +4222,15 @@ fn replay_controls(
                 );
             });
         }
-        if let Some(replay) = studio.replay.as_mut() {
-            let previous_duration = replay.master_dialogue_duration;
+        if let Some(mut requested_duration) = studio
+            .replay
+            .as_ref()
+            .map(|replay| replay.master_dialogue_duration)
+        {
             ui.label("整体台词停留");
             let changed = ui
                 .add(
-                    egui::DragValue::new(&mut replay.master_dialogue_duration)
+                    egui::DragValue::new(&mut requested_duration)
                         .speed(0.05)
                         .range(0.10..=f32::INFINITY)
                         .fixed_decimals(2)
@@ -4161,9 +4239,7 @@ fn replay_controls(
                 .on_hover_text("统一缩放字幕停留时间、台词间隔和导演镜头时间；没有上限。")
                 .changed();
             if changed {
-                let new_duration = replay.master_dialogue_duration;
-                retime_replay(replay, previous_duration, new_duration);
-                studio.playback_ms = studio.playback_ms.min(replay.duration_ms);
+                retime_replay_at_playhead(studio, requested_duration);
             }
         }
         if ui.button("角色语音设置…").clicked() {
@@ -4973,6 +5049,7 @@ fn replay_edit_fingerprint_state(replay: &ReplayFile) -> Result<String, String> 
         "manual_dialogue_order": replay.manual_dialogue_order,
         "duration_ms": replay.duration_ms,
         "camera": &replay.camera,
+        "camera_cuts": &replay.camera_cuts,
         "camera_settings": (
             replay.camera_distance_scale,
             replay.camera_yaw_degrees,
@@ -5342,6 +5419,7 @@ fn new_replay(
         audience,
         scene,
         camera: Vec::new(),
+        camera_cuts: Vec::new(),
         camera_distance_scale: normalized_directed_camera_distance_scale(camera_distance_scale),
         camera_yaw_degrees: normalized_directed_camera_yaw_degrees(camera_yaw_degrees),
         camera_transition_curve: normalized_camera_transition_curve(camera_transition_curve),
@@ -5397,6 +5475,7 @@ fn start_playback(
     studio.live_movement_punch_in = None;
     studio.live_ship_punch_in = None;
     studio.mode = ReplayMode::Playing;
+    invalidate_replay_timeline(studio);
     studio.status = REPLAY_PLAYING_STATUS.to_owned();
 }
 
@@ -5831,6 +5910,16 @@ fn replay_live_edit_panel(
             return;
         }
 
+        ui.horizontal_wrapped(|ui| {
+            ui.small("跟随镜头从播放头开始，直到下一次现场切镜；移动时会保持目标入镜。");
+            if ui.add_enabled(playback_active, Button::new("从此恢复原镜头")).clicked() {
+                if let Some(replay) = studio.replay.as_mut() {
+                    insert_replay_camera_cut(replay, playhead_ms, None);
+                    studio.status = format!("已从 {} 恢复原镜头", format_time(playhead_ms));
+                }
+            }
+        });
+
         ui.collapsing("当前台词：文字、精确时长与声音", |ui| {
             let dialogue_index = studio.replay.as_ref().and_then(|replay| {
                 active_dialogue_index(&replay.dialogue, playhead_ms)
@@ -5931,8 +6020,6 @@ fn replay_live_edit_panel(
                 || (speech_rate - line.speech_rate).abs() > f32::EPSILON
                 || (speech_volume - line.speech_volume).abs() > f32::EPSILON;
             if voice_or_text_changed || requested_duration_ms.is_some() {
-                let playback_ms = studio.playback_ms;
-                let mut updated_playback_ms = None;
                 if let Some(replay) = studio.replay.as_mut() {
                     let line = &mut replay.dialogue[dialogue_index];
                     line.text = text;
@@ -5950,18 +6037,9 @@ fn replay_live_edit_panel(
                     } else {
                         line.speech_text = original_speech_text;
                     }
-                    if let Some(duration_ms) = requested_duration_ms {
-                        updated_playback_ms = set_exact_dialogue_duration(
-                            replay,
-                            dialogue_index,
-                            duration_ms,
-                            playback_ms,
-                        );
-                    }
                 }
-                if let Some(playback_ms) = updated_playback_ms {
-                    studio.playback_ms = playback_ms;
-                    studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
+                if let Some(duration_ms) = requested_duration_ms {
+                    set_exact_dialogue_duration_at_playhead(studio, dialogue_index, duration_ms);
                 }
                 studio.speech_wait_cue = None;
                 studio.speech_wait_elapsed_seconds = 0.0;
@@ -6024,6 +6102,13 @@ fn replay_live_edit_panel(
                 }
             }
             ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(playback_active && current_position.is_some(), Button::new("从此镜头跟随角色")).clicked() {
+                    if let (Some(replay), Some(position)) = (studio.replay.as_mut(), current_position) {
+                        let shot = replay_follow_shot(replay, ReplayCameraSubject::Player(user_id), position, 0.0);
+                        insert_replay_camera_cut(replay, playhead_ms, Some(shot));
+                        studio.status = format!("已在 {} 切到角色 {user_id} 的跟随镜头", format_time(playhead_ms));
+                    }
+                }
                 if ui
                     .add_enabled(
                         playback_active && current_position.is_some(),
@@ -6121,6 +6206,26 @@ fn replay_live_edit_panel(
                     }
                 }
                 ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(playback_active, Button::new("从此镜头跟随飞船")).clicked() {
+                        if let Some(replay) = studio.replay.as_mut() {
+                            let (local_center, radius) = live_edits.ship_bodies.iter()
+                                .find(|(ship, _)| ship.id == ship_id)
+                                .and_then(|(_, body)| {
+                                    let min = body.cells.iter().map(|(cell, _)| *cell).reduce(IVec3::min)?;
+                                    let max = body.cells.iter().map(|(cell, _)| *cell).reduce(IVec3::max)?;
+                                    let min = min.as_vec3() * VOXEL_SIZE;
+                                    let max = (max + IVec3::ONE).as_vec3() * VOXEL_SIZE;
+                                    Some(((min + max) * 0.5, (max - min).length() * 0.5))
+                                }).unwrap_or((Vec3::ZERO, 4.0));
+                            let shot = replay_follow_shot(
+                                replay,
+                                ReplayCameraSubject::Ship { ship_id: ship_id.clone(), local_center: local_center.to_array() },
+                                transform.transform_point(local_center), radius * 3.0,
+                            );
+                            insert_replay_camera_cut(replay, playhead_ms, Some(shot));
+                            studio.status = format!("已在 {} 切到飞船 {ship_name} 的跟随镜头", format_time(playhead_ms));
+                        }
+                    }
                     if ui
                         .add_enabled(playback_active, egui::Button::new("从此停止飞船"))
                         .clicked()
@@ -7970,21 +8075,6 @@ fn estimated_speech_duration_ms(text: &str) -> u64 {
     })
 }
 
-fn minimum_speech_window_ms(text: &str, relative_rate: i32, master_speed: f32) -> u64 {
-    let speed = effective_emotivoice_speed(
-        text,
-        combined_onnx_speed(relative_rate, master_speed),
-    ) as f64;
-    let padding_ms = if is_short_utterance(text) {
-        SHORT_UTTERANCE_HEAD_PAD_MS.saturating_add(SHORT_UTTERANCE_TAIL_PAD_MS)
-    } else {
-        0
-    };
-    ((estimated_speech_duration_ms(text) as f64 * 1.20 / speed).ceil() as u64)
-        .saturating_add(250)
-        .saturating_add(padding_ms)
-}
-
 fn stretched_replay_time(time_ms: u64, segments: &[(u64, u64, u64, u64)]) -> u64 {
     let mut accumulated_extension = 0_u64;
     for &(old_start, old_end, new_start, new_end) in segments {
@@ -8058,6 +8148,9 @@ fn extend_replay_for_speech(replay: &mut ReplayFile) -> bool {
     }
     for frame in &mut replay.camera {
         frame.time_ms = stretched_replay_time(frame.time_ms, &segments);
+    }
+    for cut in &mut replay.camera_cuts {
+        cut.time_ms = stretched_replay_time(cut.time_ms, &segments);
     }
     for movement in &mut replay.player_movements {
         for frame in &mut movement.keyframes {
@@ -8167,17 +8260,44 @@ fn scaled_dialogue_duration_ms(text: &str, master_duration: f32) -> u64 {
     )
 }
 
+fn invalidate_replay_timeline(studio: &mut ReplayStudio) {
+    studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
+    studio.scene_revision = studio.scene_revision.wrapping_add(1);
+}
+
+fn retime_replay_at_playhead(studio: &mut ReplayStudio, requested: f32) {
+    if replay_has_live_take(studio) {
+        return;
+    }
+    let Some(replay) = studio.replay.as_mut() else { return };
+    let previous = normalized_master_dialogue_duration(replay.master_dialogue_duration);
+    let requested = normalized_master_dialogue_duration(requested);
+    let ratio = requested as f64 / previous as f64;
+    retime_replay(replay, previous, requested);
+    // Keep the same authored moment selected while every timeline time scales.
+    studio.playback_ms = scaled_millis(studio.playback_ms, ratio).min(replay.duration_ms);
+    invalidate_replay_timeline(studio);
+    studio.speech_wait_cue = None;
+    studio.speech_wait_elapsed_seconds = 0.0;
+    studio.speech_bypass_cues.clear();
+}
+
 fn retime_replay(replay: &mut ReplayFile, previous: f32, requested: f32) {
     let previous = normalized_master_dialogue_duration(previous);
     let requested = normalized_master_dialogue_duration(requested);
     replay.master_dialogue_duration = requested;
     let ratio = requested as f64 / previous as f64;
     for line in &mut replay.dialogue {
-        line.time_ms = scaled_millis(line.time_ms, ratio);
+        if line.time_ms != u64::MAX {
+            line.time_ms = scaled_millis(line.time_ms, ratio);
+        }
         line.duration_ms = scaled_millis(line.duration_ms, ratio).max(1);
     }
     for frame in &mut replay.camera {
         frame.time_ms = scaled_millis(frame.time_ms, ratio);
+    }
+    for cut in &mut replay.camera_cuts {
+        cut.time_ms = scaled_millis(cut.time_ms, ratio);
     }
     for movement in &mut replay.player_movements {
         for frame in &mut movement.keyframes {
@@ -8578,6 +8698,26 @@ fn shifted_replay_time(time_ms: u64, boundary_ms: u64, delta_ms: i64) -> u64 {
 /// Ripple-trims one dialogue cue without rebuilding the replay or returning the
 /// playhead to zero. Events at/after the old cue end retain their relative
 /// order; events already occurring inside the cue keep their authored timing.
+fn set_exact_dialogue_duration_at_playhead(
+    studio: &mut ReplayStudio,
+    dialogue_index: usize,
+    requested_duration_ms: u64,
+) {
+    if replay_has_live_take(studio) {
+        return;
+    }
+    let Some(replay) = studio.replay.as_mut() else { return };
+    if let Some(playback_ms) = set_exact_dialogue_duration(
+        replay,
+        dialogue_index,
+        requested_duration_ms,
+        studio.playback_ms,
+    ) {
+        studio.playback_ms = playback_ms;
+        invalidate_replay_timeline(studio);
+    }
+}
+
 fn set_exact_dialogue_duration(
     replay: &mut ReplayFile,
     dialogue_index: usize,
@@ -8607,6 +8747,10 @@ fn set_exact_dialogue_duration(
     for frame in &mut replay.camera {
         frame.time_ms = shifted_replay_time(frame.time_ms, old_end_ms, delta_ms);
     }
+    for cut in &mut replay.camera_cuts {
+        cut.time_ms = shifted_replay_time(cut.time_ms, old_end_ms, delta_ms);
+    }
+    replay.camera_cuts.sort_by_key(|cut| cut.time_ms);
     for movement in &mut replay.player_movements {
         for frame in &mut movement.keyframes {
             frame.time_ms = shifted_replay_time(frame.time_ms, old_end_ms, delta_ms);
@@ -8674,6 +8818,7 @@ fn replay_timeline_content_end(replay: &ReplayFile) -> u64 {
         .filter(|line| replay_dialogue_is_playable(line))
         .map(|line| line.time_ms.saturating_add(line.duration_ms))
         .chain(replay.camera.iter().map(|frame| frame.time_ms))
+        .chain(replay.camera_cuts.iter().map(|cut| cut.time_ms))
         .chain(
             replay
                 .player_movements
@@ -9094,6 +9239,18 @@ fn camera_keyframe(time_ms: u64, transform: &Transform) -> ReplayCameraKeyframe 
         time_ms,
         translation: transform.translation.to_array(),
         rotation: transform.rotation.to_array(),
+        focus: None,
+    }
+}
+
+fn focused_camera_keyframe(
+    time_ms: u64,
+    transform: &Transform,
+    focus: Option<ReplayCameraFocus>,
+) -> ReplayCameraKeyframe {
+    ReplayCameraKeyframe {
+        focus,
+        ..camera_keyframe(time_ms, transform)
     }
 }
 
@@ -9165,12 +9322,6 @@ fn apply_replay_standee_positions(
                 }
                 state.track = track;
             }
-            let camera_position = interpolated_camera(
-                &replay.camera,
-                studio.playback_ms,
-                replay.camera_transition_curve,
-            )
-            .map(|transform| transform.translation);
             let ship_bounds = spaceships
                 .iter()
                 .filter_map(|(ship, body)| {
@@ -9269,11 +9420,6 @@ fn apply_replay_standee_positions(
                     } else {
                         transform.translation = position;
                     }
-                }
-                if let Some(rotation) = camera_position.and_then(|camera_position| {
-                    replay_standee_facing_rotation(transform.translation, camera_position)
-                }) {
-                    transform.rotation = rotation;
                 }
             }
         }
@@ -10201,55 +10347,47 @@ fn append_new_player_movements_from_history(
         let first_position = Vec3::from_array(frames[0].position_cells) * VOXEL_SIZE;
         speaker_positions.insert(user_id, first_position);
 
-        let movement_start = if let Some(last_camera) = replay.camera.last() {
-            let current = frame_transform(last_camera);
-            if last_camera.time_ms < timeline_cursor {
-                replay.camera.push(camera_keyframe(
-                    timeline_cursor,
-                    &current,
-                ));
-            }
-            let rig = DirectedCameraRig::for_dialogue(
-                &current,
-                &replay.dialogue,
-                &speaker_positions,
-                replay.camera_distance_scale,
-                replay.camera_yaw_degrees,
-            );
-            let focused = rig.speaker_shot(
-                first_position,
-                DirectorShot::SpeakerMedium,
-                0.0,
-                &obstacles,
-            );
-            let movement_start = timeline_cursor.saturating_add(FOCUS_TRANSITION_MS);
-            replay.camera.push(camera_keyframe(
-                movement_start,
-                &focused,
-            ));
-            movement_start
+        let base = replay
+            .camera
+            .first()
+            .map(frame_transform)
+            .unwrap_or_else(|| {
+                Transform::from_translation(first_position + Vec3::new(0.0, 1.5, 5.0))
+                    .looking_at(first_position, Vec3::Y)
+            });
+        let rig = DirectedCameraRig::for_dialogue(
+            &base,
+            &replay.dialogue,
+            &speaker_positions,
+            replay.camera_distance_scale,
+            replay.camera_yaw_degrees,
+        );
+        let focused = rig.speaker_shot(
+            first_position,
+            DirectorShot::SpeakerMedium,
+            0.0,
+            &obstacles,
+        );
+        let movement_start = if let Some(last_camera) = replay.camera.last().cloned() {
+            // Action changes use a cut, not a flight across the map. Preserve
+            // the previous subject anchor on the hold leading into that cut.
+            let mut hold = last_camera;
+            hold.time_ms = timeline_cursor;
+            replay.camera.push(hold);
+            timeline_cursor.saturating_add(1)
         } else {
-            let base = Transform::from_translation(first_position + Vec3::new(0.0, 1.5, 5.0))
-                .looking_at(first_position, Vec3::Y);
-            let rig = DirectedCameraRig::for_dialogue(
-                &base,
-                &replay.dialogue,
-                &speaker_positions,
-                replay.camera_distance_scale,
-                replay.camera_yaw_degrees,
-            );
-            let focused = rig.speaker_shot(
-                first_position,
-                DirectorShot::SpeakerMedium,
-                0.0,
-                &obstacles,
-            );
-            replay.camera.push(camera_keyframe(
-                timeline_cursor,
-                &focused,
-            ));
             timeline_cursor
         };
+        replay.camera.push(focused_camera_keyframe(
+            movement_start,
+            &focused,
+            Some(ReplayCameraFocus {
+                subject: ReplayCameraSubject::Player(user_id),
+                position: first_position.to_array(),
+                axis_origin: rig.axis_origin.to_array(),
+                camera_side: rig.camera_side.to_array(),
+            }),
+        ));
 
         let keyframes = frames
             .iter()
@@ -10814,17 +10952,33 @@ fn rescale_replay_camera_distance(
     let ratio = requested_scale / previous_scale;
     if (ratio - 1.0).abs() > f32::EPSILON {
         for frame in &mut replay.camera {
-            let Some(focus) = replay_camera_focus_at(
-                &replay.dialogue,
-                frame.time_ms,
-                speaker_positions,
-            ) else {
+            let Some(focus) = frame
+                .focus
+                .as_ref()
+                .map(|focus| Vec3::from_array(focus.position))
+                .or_else(|| {
+                    replay_camera_focus_at(
+                        &replay.dialogue,
+                        frame.time_ms,
+                        speaker_positions,
+                    )
+                })
+            else {
                 continue;
             };
             let mut transform = frame_transform(frame);
             transform.translation = focus + (transform.translation - focus) * ratio;
             transform = transform.looking_at(focus, Vec3::Y);
-            *frame = camera_keyframe(frame.time_ms, &transform);
+            *frame = focused_camera_keyframe(
+                frame.time_ms,
+                &transform,
+                frame.focus.clone(),
+            );
+        }
+    }
+    for cut in &mut replay.camera_cuts {
+        if let Some(shot) = cut.shot.as_mut() {
+            shot.offset = (Vec3::from_array(shot.offset) * ratio).to_array();
         }
     }
     replay.camera_distance_scale = requested_scale;
@@ -10840,7 +10994,9 @@ fn rotate_replay_camera_yaw(
     let previous_yaw_degrees = normalized_directed_camera_yaw_degrees(replay.camera_yaw_degrees);
     let requested_yaw_degrees = normalized_directed_camera_yaw_degrees(requested_yaw_degrees);
     let yaw_delta_radians = (requested_yaw_degrees - previous_yaw_degrees).to_radians();
-    if yaw_delta_radians.abs() <= f32::EPSILON || replay.camera.is_empty() {
+    if yaw_delta_radians.abs() <= f32::EPSILON
+        || (replay.camera.is_empty() && replay.camera_cuts.is_empty())
+    {
         replay.camera_yaw_degrees = requested_yaw_degrees;
         return requested_yaw_degrees;
     }
@@ -10860,11 +11016,18 @@ fn rotate_replay_camera_yaw(
         let mut adjusted = Vec::with_capacity(replay.camera.len());
         let mut valid = true;
         for frame in &replay.camera {
-            let Some(focus) = replay_camera_focus_at(
-                &replay.dialogue,
-                frame.time_ms,
-                speaker_positions,
-            ) else {
+            let Some(focus) = frame
+                .focus
+                .as_ref()
+                .map(|focus| Vec3::from_array(focus.position))
+                .or_else(|| {
+                    replay_camera_focus_at(
+                        &replay.dialogue,
+                        frame.time_ms,
+                        speaker_positions,
+                    )
+                })
+            else {
                 adjusted.push(frame.clone());
                 continue;
             };
@@ -10883,15 +11046,35 @@ fn rotate_replay_camera_yaw(
                 valid = false;
                 break;
             }
-            adjusted.push(camera_keyframe(
+            adjusted.push(focused_camera_keyframe(
                 frame.time_ms,
                 &Transform::from_translation(translation).looking_at(focus, Vec3::Y),
+                frame.focus.clone(),
             ));
+        }
+        let mut adjusted_cuts = replay.camera_cuts.clone();
+        if valid {
+            for cut in &mut adjusted_cuts {
+                if let Some(shot) = cut.shot.as_mut() {
+                    let offset = rotation * Vec3::from_array(shot.offset);
+                    let position = Vec3::from_array(shot.focus.position) + offset;
+                    let side = Vec3::from_array(shot.focus.camera_side);
+                    let origin = Vec3::from_array(shot.focus.axis_origin);
+                    if (position - origin).dot(side) < DirectedCameraRig::LINE_MARGIN
+                        || !obstacles.camera_is_clear(position)
+                    {
+                        valid = false;
+                        break;
+                    }
+                    shot.offset = offset.to_array();
+                }
+            }
         }
         if valid {
             let applied_yaw_degrees =
                 previous_yaw_degrees + (requested_yaw_degrees - previous_yaw_degrees) * fraction;
             replay.camera = adjusted;
+            replay.camera_cuts = adjusted_cuts;
             replay.camera_yaw_degrees = applied_yaw_degrees;
             return applied_yaw_degrees;
         }
@@ -11053,6 +11236,24 @@ fn replay_standee_position_at(
         .or_else(|| speaker_positions.get(&subject_id).copied())
 }
 
+fn dialogue_camera_focus(
+    dialogue: &[ReplayDialogue],
+    index: usize,
+    speaker_positions: &HashMap<u64, Vec3>,
+    rig: &DirectedCameraRig,
+) -> Option<ReplayCameraFocus> {
+    Some(ReplayCameraFocus {
+        subject: ReplayCameraSubject::Player(replay_dialogue_focus_id(
+            dialogue,
+            index,
+            speaker_positions,
+        )?),
+        position: replay_dialogue_focus_position(dialogue, index, speaker_positions)?.to_array(),
+        axis_origin: rig.axis_origin.to_array(),
+        camera_side: rig.camera_side.to_array(),
+    })
+}
+
 fn turn_based_camera_track(
     base: &Transform,
     dialogue: &[ReplayDialogue],
@@ -11070,9 +11271,11 @@ fn turn_based_camera_track(
         camera_yaw_degrees,
     );
     let mut frames = Vec::with_capacity(dialogue.len().saturating_mul(3).saturating_add(2));
-    let mut current = (!dialogue.is_empty())
-        .then(|| replay_dialogue_focus_position(dialogue, 0, speaker_positions))
-        .flatten()
+    let first_index = dialogue
+        .iter()
+        .position(replay_dialogue_is_playable)
+        .unwrap_or(dialogue.len());
+    let mut current = replay_dialogue_focus_position(dialogue, first_index, speaker_positions)
         .map(|target| {
             rig.speaker_shot(
                 target,
@@ -11082,12 +11285,27 @@ fn turn_based_camera_track(
             )
         })
         .unwrap_or_else(|| base.clone());
-    let mut current_focus = replay_dialogue_focus_id(dialogue, 0, speaker_positions);
-    frames.push(camera_keyframe(0, &current));
-    for (index, line) in dialogue.iter().enumerate() {
+    let mut current_focus = replay_dialogue_focus_id(dialogue, first_index, speaker_positions);
+    let mut current_tracking = dialogue_camera_focus(
+        dialogue,
+        first_index,
+        speaker_positions,
+        &rig,
+    );
+    frames.push(focused_camera_keyframe(
+        0,
+        &current,
+        current_tracking.clone(),
+    ));
+    for (index, line) in dialogue
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| replay_dialogue_is_playable(line))
+    {
         let line_end = line.time_ms.saturating_add(line.duration_ms);
         if let Some(target) = replay_dialogue_focus_position(dialogue, index, speaker_positions) {
             let focus = replay_dialogue_focus_id(dialogue, index, speaker_positions);
+            let tracking = dialogue_camera_focus(dialogue, index, speaker_positions, &rig);
             let focused = rig.speaker_shot(
                 target,
                 DirectorShot::SpeakerMedium,
@@ -11102,28 +11320,47 @@ fn turn_based_camera_track(
                 && camera_facing_is_unchanged(&current, &focused)
                 && current.translation.distance(focused.translation) <= CAMERA_DOLLY_MAX_DISTANCE
             {
-                frames.push(camera_keyframe(line.time_ms, &current));
-                frames.push(camera_keyframe(
+                frames.push(focused_camera_keyframe(
+                    line.time_ms,
+                    &current,
+                    current_tracking.clone(),
+                ));
+                frames.push(focused_camera_keyframe(
                     transition_end,
                     &focused,
+                    tracking.clone(),
                 ));
             } else {
-                frames.push(camera_keyframe(
+                frames.push(focused_camera_keyframe(
                     line.time_ms.saturating_sub(1),
                     &current,
+                    current_tracking.clone(),
                 ));
-                frames.push(camera_keyframe(line.time_ms, &focused));
+                frames.push(focused_camera_keyframe(
+                    line.time_ms,
+                    &focused,
+                    tracking.clone(),
+                ));
             }
-            frames.push(camera_keyframe(line_end, &settled));
+            frames.push(focused_camera_keyframe(
+                line_end,
+                &settled,
+                tracking.clone(),
+            ));
             current = settled;
             current_focus = focus;
+            current_tracking = tracking;
         }
     }
     if frames
         .last()
         .is_some_and(|frame| frame.time_ms < duration_ms)
     {
-        frames.push(camera_keyframe(duration_ms, &current));
+        frames.push(focused_camera_keyframe(
+            duration_ms,
+            &current,
+            current_tracking.clone(),
+        ));
     }
     frames.sort_by_key(|frame| frame.time_ms);
     frames.dedup_by(|right, left| {
@@ -11155,8 +11392,14 @@ fn director_camera_track(
         camera_yaw_degrees,
     );
     let mut current = base.clone();
-    if let (Some(_line), Some(cue)) = (dialogue.first(), cues.first()) {
-        if let Some(target) = replay_dialogue_focus_position(dialogue, 0, speaker_positions) {
+    let first_index = dialogue
+        .iter()
+        .position(replay_dialogue_is_playable)
+        .unwrap_or(dialogue.len());
+    if let Some(cue) = cues.get(first_index) {
+        if let Some(target) =
+            replay_dialogue_focus_position(dialogue, first_index, speaker_positions)
+        {
             current = rig.director_shot(
                 target,
                 resolved_speaker_shot(cue.shot),
@@ -11166,11 +11409,27 @@ fn director_camera_track(
             );
         }
     }
-    let mut current_focus = replay_dialogue_focus_id(dialogue, 0, speaker_positions);
-    let mut frames = vec![camera_keyframe(0, &current)];
-    for (index, (line, cue)) in dialogue.iter().zip(cues).enumerate() {
+    let mut current_focus = replay_dialogue_focus_id(dialogue, first_index, speaker_positions);
+    let mut current_tracking = dialogue_camera_focus(
+        dialogue,
+        first_index,
+        speaker_positions,
+        &rig,
+    );
+    let mut frames = vec![focused_camera_keyframe(
+        0,
+        &current,
+        current_tracking.clone(),
+    )];
+    for (index, (line, cue)) in dialogue
+        .iter()
+        .zip(cues)
+        .enumerate()
+        .filter(|(_, (line, _))| replay_dialogue_is_playable(line))
+    {
         let line_end = line.time_ms.saturating_add(line.duration_ms);
         let focus = replay_dialogue_focus_id(dialogue, index, speaker_positions);
+        let tracking = dialogue_camera_focus(dialogue, index, speaker_positions, &rig);
         let (arrival, settled) = if let Some(target) =
             replay_dialogue_focus_position(dialogue, index, speaker_positions)
         {
@@ -11208,27 +11467,46 @@ fn director_camera_track(
             && camera_facing_is_unchanged(&current, &arrival)
             && current.translation.distance(arrival.translation) <= CAMERA_DOLLY_MAX_DISTANCE
         {
-            frames.push(camera_keyframe(line.time_ms, &current));
-            frames.push(camera_keyframe(
+            frames.push(focused_camera_keyframe(
+                line.time_ms,
+                &current,
+                current_tracking.clone(),
+            ));
+            frames.push(focused_camera_keyframe(
                 transition_end,
                 &arrival,
+                tracking.clone(),
             ));
         } else {
-            frames.push(camera_keyframe(
+            frames.push(focused_camera_keyframe(
                 line.time_ms.saturating_sub(1),
                 &current,
+                current_tracking.clone(),
             ));
-            frames.push(camera_keyframe(line.time_ms, &arrival));
+            frames.push(focused_camera_keyframe(
+                line.time_ms,
+                &arrival,
+                tracking.clone(),
+            ));
         }
-        frames.push(camera_keyframe(line_end, &settled));
+        frames.push(focused_camera_keyframe(
+            line_end,
+            &settled,
+            tracking.clone(),
+        ));
         current = settled;
         current_focus = focus;
+        current_tracking = tracking;
     }
     if frames
         .last()
         .is_some_and(|frame| frame.time_ms < duration_ms)
     {
-        frames.push(camera_keyframe(duration_ms, &current));
+        frames.push(focused_camera_keyframe(
+            duration_ms,
+            &current,
+            current_tracking.clone(),
+        ));
     }
     frames.sort_by_key(|frame| frame.time_ms);
     frames.dedup_by(|right, left| {
@@ -11579,6 +11857,134 @@ fn interpolated_camera(
         rotation: left_rotation.slerp(right_rotation, t),
         ..default()
     })
+}
+
+fn replay_camera_at(
+    replay: &ReplayFile,
+    time_ms: u64,
+    subject_position: impl Fn(&ReplayCameraSubject) -> Option<Vec3>,
+) -> Option<Transform> {
+    if let Some(shot) = replay
+        .camera_cuts
+        .iter()
+        .rev()
+        .find(|cut| cut.time_ms <= time_ms)
+        .and_then(|cut| cut.shot.as_ref())
+    {
+        let reference = Vec3::from_array(shot.focus.position);
+        let transform = Transform::from_translation(reference + Vec3::from_array(shot.offset))
+            .looking_at(reference, Vec3::Y);
+        return Some(follow_replay_camera(
+            transform,
+            &shot.focus,
+            reference,
+            &subject_position,
+        ));
+    }
+
+    let transform = interpolated_camera(
+        &replay.camera,
+        time_ms,
+        replay.camera_transition_curve,
+    )?;
+    let next = replay
+        .camera
+        .partition_point(|frame| frame.time_ms <= time_ms);
+    let left = replay.camera.get(next.saturating_sub(1))?;
+    let Some(focus) = left.focus.as_ref() else { return Some(transform) };
+    let mut reference = Vec3::from_array(focus.position);
+    if let Some(right) = replay.camera.get(next).filter(|_| next > 0) {
+        if let Some(right_focus) = right
+            .focus
+            .as_ref()
+            .filter(|right| right.subject == focus.subject)
+        {
+            let span = right.time_ms.saturating_sub(left.time_ms).max(1);
+            let t = camera_easing_t(
+                time_ms.saturating_sub(left.time_ms) as f32 / span as f32,
+                replay.camera_transition_curve,
+            );
+            reference = reference.lerp(
+                Vec3::from_array(right_focus.position),
+                t,
+            );
+        }
+    }
+    Some(follow_replay_camera(
+        transform,
+        focus,
+        reference,
+        &subject_position,
+    ))
+}
+
+fn follow_replay_camera(
+    mut transform: Transform,
+    focus: &ReplayCameraFocus,
+    reference: Vec3,
+    subject_position: &impl Fn(&ReplayCameraSubject) -> Option<Vec3>,
+) -> Transform {
+    let Some(target) = subject_position(&focus.subject).filter(|position| position.is_finite())
+    else {
+        return transform;
+    };
+    transform.translation += target - reference;
+    // Keep the side chosen when the shot was planned, even if its moving
+    // subject crosses the original conversation axis. Never rotate with a ship.
+    let side = Vec3::from_array(focus.camera_side).normalize_or_zero();
+    let signed_side = (transform.translation - Vec3::from_array(focus.axis_origin)).dot(side);
+    if signed_side < DirectedCameraRig::LINE_MARGIN {
+        transform.translation += side * (DirectedCameraRig::LINE_MARGIN - signed_side);
+    }
+    if transform.translation.distance_squared(target) > f32::EPSILON {
+        transform = transform.looking_at(target, Vec3::Y);
+    }
+    transform
+}
+
+fn insert_replay_camera_cut(replay: &mut ReplayFile, time_ms: u64, shot: Option<ReplayFollowShot>) {
+    replay.camera_cuts.retain(|cut| cut.time_ms != time_ms);
+    replay.camera_cuts.push(ReplayCameraCut { time_ms, shot });
+    replay.camera_cuts.sort_by_key(|cut| cut.time_ms);
+    refresh_replay_duration(replay, replay.duration_ms.max(time_ms));
+}
+
+fn replay_follow_shot(
+    replay: &ReplayFile,
+    subject: ReplayCameraSubject,
+    position: Vec3,
+    minimum_distance: f32,
+) -> ReplayFollowShot {
+    let base = replay
+        .camera
+        .first()
+        .map(frame_transform)
+        .unwrap_or_else(|| {
+            Transform::from_translation(position + Vec3::new(0.0, 2.0, 8.0))
+                .looking_at(position, Vec3::Y)
+        });
+    let rig = DirectedCameraRig::for_dialogue(
+        &base,
+        &replay.dialogue,
+        &replay_speaker_positions(&replay.dialogue),
+        replay.camera_distance_scale,
+        replay.camera_yaw_degrees,
+    );
+    let camera_position = rig.visible_position(
+        position,
+        (5.0 * rig.distance_scale).max(minimum_distance),
+        (1.5 * rig.distance_scale).max(minimum_distance * 0.3),
+        &ReplayCameraObstacles::from_scene(&replay.scene),
+    );
+    ReplayFollowShot {
+        focus: ReplayCameraFocus {
+            subject,
+            position: position.to_array(),
+            axis_origin: rig.axis_origin.to_array(),
+            camera_side: rig.camera_side.to_array(),
+        },
+        offset: (camera_position - position).to_array(),
+    }
 }
 
 fn camera_easing_t(linear_t: f32, transition_curve: f32) -> f32 {
@@ -12579,7 +12985,10 @@ fn format_time(time_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        fs::write as write_file,
+        time::Duration,
+    };
 
     use bevy::ecs::system::RunSystemOnce;
     use bevy_egui::egui::{
@@ -13692,11 +14101,13 @@ mod tests {
     fn camera_interpolation_is_smooth_and_clamped() {
         let frames = vec![
             ReplayCameraKeyframe {
+                focus: None,
                 time_ms: 0,
                 translation: [0.0, 0.0, 0.0],
                 rotation: Quat::IDENTITY.to_array(),
             },
             ReplayCameraKeyframe {
+                focus: None,
                 time_ms: 1_000,
                 translation: [10.0, 0.0, 0.0],
                 rotation: Quat::from_rotation_y(1.0).to_array(),
@@ -14012,19 +14423,11 @@ mod tests {
                 .iter()
                 .map(|frame| frame.time_ms)
                 .collect::<Vec<_>>(),
-            vec![3_000 + FOCUS_TRANSITION_MS, 4_000 + FOCUS_TRANSITION_MS]
+            vec![3_001, 4_001]
         );
+        assert_eq!(replay.duration_ms, 4_001);
         assert_eq!(
-            replay.duration_ms,
-            4_000 + FOCUS_TRANSITION_MS
-        );
-        assert_eq!(
-            interpolated_player_position(
-                &replay.player_movements,
-                42,
-                3_500 + FOCUS_TRANSITION_MS,
-                0.0,
-            ),
+            interpolated_player_position(&replay.player_movements, 42, 3_501, 0.0,),
             Some(Vec3::new(2.0, 1.0, 0.0) * VOXEL_SIZE)
         );
 
@@ -14156,6 +14559,142 @@ mod tests {
     }
 
     #[test]
+    fn camera_planning_ignores_excluded_and_unscheduled_dialogue() {
+        let mut excluded = test_dialogue(u64::MAX, 1_000, DialogueSide::Right);
+        excluded.sender_id = 9;
+        excluded.included = false;
+        let mut active = test_dialogue(350, 1_000, DialogueSide::Right);
+        active.sender_id = 42;
+        let frames = turn_based_camera_track(
+            &Transform::from_xyz(0.0, 3.0, 8.0),
+            &[excluded, active],
+            1_500,
+            &HashMap::from([(9, Vec3::X * 100.0), (42, Vec3::ZERO)]),
+            1.0,
+            0.0,
+            &ReplayCameraObstacles::default(),
+        );
+        assert!(frames.iter().all(|frame| frame.time_ms <= 1_500));
+        assert!(frames.iter().all(|frame| frame
+            .focus
+            .as_ref()
+            .is_some_and(|focus| focus.subject == ReplayCameraSubject::Player(42))));
+    }
+
+    #[test]
+    fn live_position_edits_and_extended_takes_keep_the_camera_on_the_standee() {
+        let mut line = positioned_dialogue(1, 1, 1_000, [0, 0, 0]);
+        line.sender_id = 42;
+        line.time_ms = 0;
+        line.duration_ms = 1_000;
+        let mut replay = test_replay(vec![line]);
+        replay.duration_ms = 1_000;
+        replay.camera = turn_based_camera_track(
+            &Transform::from_xyz(0.0, 3.0, 8.0),
+            &replay.dialogue,
+            replay.duration_ms,
+            &HashMap::from([(42, Vec3::ZERO)]),
+            replay.camera_distance_scale,
+            replay.camera_yaw_degrees,
+            &ReplayCameraObstacles::default(),
+        );
+        replay.standee_positions.push(ReplayStandeePosition {
+            time_ms: 0,
+            user_id: 42,
+            position: Vec3::ZERO.to_array(),
+        });
+        let mut app = App::new();
+        app.insert_resource(ReplayStudio {
+            mode: ReplayMode::Paused,
+            replay: Some(replay),
+            ..default()
+        })
+        .add_systems(
+            Update,
+            (
+                apply_replay_standee_positions,
+                apply_replay_ship_positions,
+                apply_replay_camera,
+            )
+                .chain(),
+        );
+        let standee = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                VoxelPlayerStandee::replay_test(42),
+            ))
+            .id();
+        let camera = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                VoxelViewportCamera,
+            ))
+            .id();
+        app.update();
+        {
+            let mut studio = app.world_mut().resource_mut::<ReplayStudio>();
+            replace_replay_movement_segment(
+                studio.replay.as_mut().unwrap(),
+                42,
+                750,
+                750,
+                &[ReplayStandeePosition {
+                    time_ms: 750,
+                    user_id: 42,
+                    position: [80.0, 2.0, 0.0],
+                }],
+            );
+            studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
+        }
+        for time_ms in [250, 750, 375, 1_000] {
+            app.world_mut().resource_mut::<ReplayStudio>().playback_ms = time_ms;
+            app.update();
+            let standee_pose = app.world().entity(standee).get::<Transform>().unwrap();
+            let camera_pose = app.world().entity(camera).get::<Transform>().unwrap();
+            let toward = (standee_pose.translation - camera_pose.translation).normalize();
+            assert!(
+                (camera_pose.rotation * Vec3::NEG_Z).dot(toward) > 0.9999,
+                "edited frame at {time_ms}"
+            );
+            assert!(
+                (standee_pose.rotation * Vec3::NEG_Z).dot(horizontal(-toward).normalize()) > 0.9999
+            );
+        }
+        {
+            let mut studio = app.world_mut().resource_mut::<ReplayStudio>();
+            begin_live_movement_take(
+                &mut studio,
+                42,
+                Vec3::new(80.0, 2.0, 0.0),
+            );
+            studio.playback_ms = 3_000;
+            finish_live_movement_take(
+                &mut studio,
+                Some(Vec3::new(240.0, 2.0, 0.0)),
+            );
+            studio.mode = ReplayMode::Paused;
+            assert_eq!(
+                studio.replay.as_ref().unwrap().duration_ms,
+                3_000
+            );
+        }
+        for time_ms in [3_000, 2_000, 3_000] {
+            app.world_mut().resource_mut::<ReplayStudio>().playback_ms = time_ms;
+            app.update();
+            let standee_pose = app.world().entity(standee).get::<Transform>().unwrap();
+            let camera_pose = app.world().entity(camera).get::<Transform>().unwrap();
+            assert!(
+                (camera_pose.rotation * Vec3::NEG_Z)
+                    .dot((standee_pose.translation - camera_pose.translation).normalize())
+                    > 0.9999
+            );
+            assert!(camera_pose.translation.distance(standee_pose.translation) < 10.0);
+        }
+    }
+
+    #[test]
     fn replay_system_keeps_the_standee_front_facing_the_replay_camera() {
         let camera = Transform::from_xyz(5.0, 4.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y);
         let mut replay = test_replay(Vec::new());
@@ -14165,8 +14704,15 @@ mod tests {
         studio.mode = ReplayMode::Paused;
         studio.replay = Some(replay);
         let mut app = App::new();
-        app.insert_resource(studio)
-            .add_systems(Update, apply_replay_standee_positions);
+        app.insert_resource(studio).add_systems(
+            Update,
+            (
+                apply_replay_standee_positions,
+                apply_replay_camera,
+            )
+                .chain(),
+        );
+        app.world_mut().spawn((camera, VoxelViewportCamera));
         let standee = app
             .world_mut()
             .spawn((
@@ -14916,8 +15462,11 @@ mod tests {
     #[test]
     fn emotivoice_keeps_configured_speed_and_extends_long_lines() {
         let configured_speed = combined_onnx_speed(18, 1.30);
-        assert!(minimum_speech_window_ms("短句", 18, 1.30) < MIN_DIALOGUE_MS);
-        assert!(minimum_speech_window_ms(&"很长的中文台词".repeat(8), 18, 1.30) > 4_875);
+        let mut line = test_dialogue(0, 1_500, DialogueSide::Right);
+        line.text = "短句".to_owned();
+        assert!(minimum_speech_window_ms_for_line(&line, 18, 1.30) < MIN_DIALOGUE_MS);
+        line.text = "很长的中文台词".repeat(8);
+        assert!(minimum_speech_window_ms_for_line(&line, 18, 1.30) > 4_875);
         assert!((configured_speed - combined_onnx_speed(18, 1.30)).abs() < f32::EPSILON);
         assert_eq!(
             emotivoice_model_text("可以可以"),
@@ -16261,6 +16810,7 @@ mod tests {
             audience: ReplayAudience::Public,
             scene: ReplayScene::default(),
             camera: Vec::new(),
+            camera_cuts: Vec::new(),
             camera_distance_scale: default_directed_camera_distance_scale(),
             camera_yaw_degrees: default_directed_camera_yaw_degrees(),
             camera_transition_curve: default_camera_transition_curve(),
@@ -17125,6 +17675,169 @@ mod tests {
     }
 
     #[test]
+    fn replay_camera_follows_carried_players_and_ship_centers_in_the_same_update() {
+        for follow_ship in [false, true] {
+            let local_player = IVec3::new(4, 4, 0).as_vec3() * VOXEL_SIZE;
+            let local_center = IVec3::new(2, 4, 4).as_vec3() * VOXEL_SIZE;
+            let destination = Vec3::new(20.0, 0.0, 10.0);
+            let final_rotation = Quat::from_rotation_y(90.0_f32.to_radians());
+            let mut line = positioned_dialogue(1, 1, 0, [4, 4, 0]);
+            line.sender_id = 7;
+            line.time_ms = 0;
+            line.duration_ms = 1_000;
+            let mut replay = test_replay(vec![line]);
+            replay.duration_ms = 6_500;
+            replay
+                .authored_ship_trajectories
+                .insert("carrier".to_owned());
+            replay.ship_trajectories.push(ReplayShipTrajectory {
+                ship_id: "carrier".to_owned(),
+                ship_name: "运载舰".to_owned(),
+                keyframes: vec![
+                    ReplayShipKeyframe {
+                        time_ms: 0,
+                        translation: [0.0; 3],
+                        rotation: Quat::IDENTITY.to_array(),
+                    },
+                    ReplayShipKeyframe {
+                        time_ms: 4_000,
+                        translation: destination.to_array(),
+                        rotation: final_rotation.to_array(),
+                    },
+                ],
+            });
+            replay.camera = turn_based_camera_track(
+                &Transform::from_xyz(0.0, 3.0, 7.0).looking_at(local_player, Vec3::Y),
+                &replay.dialogue,
+                1_000,
+                &HashMap::from([(7, local_player)]),
+                replay.camera_distance_scale,
+                replay.camera_yaw_degrees,
+                &ReplayCameraObstacles::default(),
+            );
+            if follow_ship {
+                let shot = replay_follow_shot(
+                    &replay,
+                    ReplayCameraSubject::Ship {
+                        ship_id: "carrier".to_owned(),
+                        local_center: local_center.to_array(),
+                    },
+                    local_center,
+                    0.0,
+                );
+                insert_replay_camera_cut(&mut replay, 0, Some(shot));
+            }
+            let original_player =
+                Transform::from_xyz(60.0, 2.0, 70.0).with_rotation(Quat::from_rotation_y(0.7));
+            let original_ship =
+                Transform::from_xyz(-30.0, 5.0, 20.0).with_rotation(Quat::from_rotation_y(-0.8));
+            let original_linear = Vec3::new(1.0, 2.0, 3.0);
+            let original_angular = Vec3::new(0.0, 0.5, 0.0);
+            let mut studio = ReplayStudio::default();
+            studio.mode = ReplayMode::Paused;
+            studio.replay = Some(replay);
+            let mut app = App::new();
+            app.insert_resource(studio).add_systems(
+                Update,
+                (
+                    apply_replay_standee_positions,
+                    apply_replay_ship_positions,
+                    apply_replay_camera,
+                )
+                    .chain(),
+            );
+            let player = app
+                .world_mut()
+                .spawn((
+                    original_player,
+                    VoxelPlayerStandee::replay_test(7),
+                ))
+                .id();
+            let ship = app
+                .world_mut()
+                .spawn((
+                    VoxelSpaceship::replay_test("carrier"),
+                    VoxelPhysicsBody {
+                        local_center,
+                        cells: vec![(IVec3::new(-8, 0, -8), 1), (IVec3::new(8, 16, 8), 1)],
+                    },
+                    original_ship,
+                    LinearVelocity(original_linear),
+                    AngularVelocity(original_angular),
+                ))
+                .id();
+            let camera = app
+                .world_mut()
+                .spawn((
+                    Transform::default(),
+                    VoxelViewportCamera,
+                ))
+                .id();
+
+            for time_ms in [0, 2_000, 4_000, 6_500, 1_500] {
+                app.world_mut().resource_mut::<ReplayStudio>().playback_ms = time_ms;
+                app.update();
+                let fraction = time_ms.min(4_000) as f32 / 4_000.0;
+                let expected_ship = Transform::from_translation(destination * fraction)
+                    .with_rotation(Quat::IDENTITY.slerp(final_rotation, fraction));
+                let expected_player = expected_ship.transform_point(local_player);
+                let player_pose = app.world().get::<Transform>(player).unwrap();
+                let ship_pose = app.world().get::<Transform>(ship).unwrap();
+                let camera_pose = app.world().get::<Transform>(camera).unwrap();
+                assert!((player_pose.translation - expected_player).length() < 0.0001);
+                assert!((ship_pose.translation - expected_ship.translation).length() < 0.0001);
+                assert!(ship_pose.rotation.dot(expected_ship.rotation).abs() > 0.9999);
+                assert_eq!(
+                    app.world().get::<LinearVelocity>(ship).unwrap().0,
+                    Vec3::ZERO
+                );
+                assert_eq!(
+                    app.world().get::<AngularVelocity>(ship).unwrap().0,
+                    Vec3::ZERO
+                );
+                let focus = if follow_ship {
+                    expected_ship.transform_point(local_center)
+                } else {
+                    expected_player
+                };
+                assert!(
+                    (camera_pose.rotation * Vec3::NEG_Z)
+                        .dot((focus - camera_pose.translation).normalize())
+                        > 0.9999,
+                    "camera must follow the current frame, ship focus={follow_ship}, time={time_ms}"
+                );
+                let toward_camera =
+                    horizontal(camera_pose.translation - player_pose.translation).normalize();
+                assert!((player_pose.rotation * Vec3::NEG_Z).dot(toward_camera) > 0.9999);
+                assert!((player_pose.rotation * Vec3::Z).dot(toward_camera) < -0.9999);
+            }
+
+            app.world_mut().resource_mut::<ReplayStudio>().mode = ReplayMode::Idle;
+            app.update();
+            let player_pose = app.world().get::<Transform>(player).unwrap();
+            let ship_pose = app.world().get::<Transform>(ship).unwrap();
+            assert_eq!(
+                player_pose.translation,
+                original_player.translation
+            );
+            assert!(player_pose.rotation.dot(original_player.rotation).abs() > 0.9999);
+            assert_eq!(
+                ship_pose.translation,
+                original_ship.translation
+            );
+            assert!(ship_pose.rotation.dot(original_ship.rotation).abs() > 0.9999);
+            assert_eq!(
+                app.world().get::<LinearVelocity>(ship).unwrap().0,
+                original_linear
+            );
+            assert_eq!(
+                app.world().get::<AngularVelocity>(ship).unwrap().0,
+                original_angular
+            );
+        }
+    }
+
+    #[test]
     fn ship_anchor_line_and_delay_are_respected_on_import() {
         let mut lines = vec![
             positioned_dialogue(1, 1, 100, [0, 0, 0]),
@@ -17218,7 +17931,7 @@ mod tests {
         line.snapshot_recorded = true;
         line.duration_ms = dialogue_duration_ms(&line.text);
         replay.dialogue.push(line.clone());
-        let required = minimum_speech_window_ms(&line.text, 18, 1.10);
+        let required = minimum_speech_window_ms_for_line(&line, 18, 1.10);
         assert!(
             required > line.duration_ms,
             "test requires speech longer than the reading duration"
@@ -17553,6 +18266,7 @@ mod tests {
             rebuild_area_blocks(&mut replay);
             match track {
                 0 => replay.camera.push(ReplayCameraKeyframe {
+                    focus: None,
                     time_ms: 9_000,
                     translation: [0.0; 3],
                     rotation: Quat::IDENTITY.to_array(),
@@ -17634,11 +18348,13 @@ mod tests {
         replay.duration_ms = 6_000;
         replay.camera = vec![
             ReplayCameraKeyframe {
+                focus: None,
                 time_ms: 2_500,
                 translation: [0.0; 3],
                 rotation: Quat::IDENTITY.to_array(),
             },
             ReplayCameraKeyframe {
+                focus: None,
                 time_ms: 3_000,
                 translation: [1.0, 0.0, 0.0],
                 rotation: Quat::IDENTITY.to_array(),
@@ -18029,5 +18745,548 @@ mod tests {
                 frame.translation
             );
         }
+    }
+
+    #[test]
+    fn global_retime_refreshes_paused_movement_and_scene_caches() {
+        let mut replay = test_replay(Vec::new());
+        replay.duration_ms = 4_000;
+        replay.scene.voxels.push(ReplayVoxel {
+            position: [0; 3],
+            material: 1,
+        });
+        replay.standee_positions = vec![
+            ReplayStandeePosition {
+                time_ms: 0,
+                user_id: 7,
+                position: [0.0; 3],
+            },
+            ReplayStandeePosition {
+                time_ms: 4_000,
+                user_id: 7,
+                position: (Vec3::X * 8.0 * VOXEL_SIZE).to_array(),
+            },
+        ];
+        replay.terrain_changes.push(ReplayTerrainChange {
+            time_ms: 1_000,
+            position: [0; 3],
+            material: 0,
+            enabled: true,
+        });
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(replay);
+        studio.mode = ReplayMode::Paused;
+        studio.playback_ms = 1_500;
+        let mut app = App::new();
+        app.insert_resource(studio)
+            .init_resource::<VoxelGeometryDirtyChunks>()
+            .add_systems(
+                Update,
+                (
+                    apply_replay_standee_positions,
+                    apply_replay_terrain_changes,
+                )
+                    .chain(),
+            );
+        let standee = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                VoxelPlayerStandee::replay_test(7),
+            ))
+            .id();
+        let terrain = app
+            .world_mut()
+            .spawn((Grid::<u8>::new(), TrpgVoxelGrid))
+            .id();
+        app.world_mut()
+            .get_mut::<Grid<u8>>(terrain)
+            .unwrap()
+            .set(IVec3::ZERO, 1);
+        app.update();
+        assert!(
+            (app.world().get::<Transform>(standee).unwrap().translation.x - 3.0 * VOXEL_SIZE).abs()
+                < 0.0001
+        );
+        assert_eq!(
+            app.world()
+                .get::<Grid<u8>>(terrain)
+                .unwrap()
+                .get(IVec3::ZERO),
+            Some(&0)
+        );
+
+        {
+            let mut studio = app.world_mut().resource_mut::<ReplayStudio>();
+            retime_replay_at_playhead(&mut studio, 2.0);
+            assert_eq!(studio.mode, ReplayMode::Paused);
+            assert_eq!(studio.playback_ms, 3_000);
+            assert_eq!(
+                studio.replay.as_ref().unwrap().duration_ms,
+                8_000
+            );
+            assert_eq!(studio.timeline_revision, 1);
+            assert_eq!(studio.scene_revision, 1);
+            // A DM can seek in the same UI pass before playback systems run.
+            // Equal cached time must still rebuild against the retimed events.
+            studio.playback_ms = 1_500;
+        }
+        app.update();
+        assert!(
+            (app.world().get::<Transform>(standee).unwrap().translation.x - 1.5 * VOXEL_SIZE).abs()
+                < 0.0001
+        );
+        assert_eq!(
+            app.world()
+                .get::<Grid<u8>>(terrain)
+                .unwrap()
+                .get(IVec3::ZERO),
+            Some(&1)
+        );
+
+        app.world_mut().resource_mut::<ReplayStudio>().playback_ms = 2_500;
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<Grid<u8>>(terrain)
+                .unwrap()
+                .get(IVec3::ZERO),
+            Some(&0)
+        );
+    }
+
+    #[test]
+    fn shrinking_global_timing_preserves_unscheduled_dialogue() {
+        let active = test_dialogue(0, 1_000, DialogueSide::Right);
+        let unscheduled = test_dialogue(u64::MAX, 1_000, DialogueSide::Right);
+        let mut excluded = unscheduled.clone();
+        excluded.included = false;
+        let mut replay = test_replay(vec![active, unscheduled, excluded]);
+        replay.duration_ms = 1_000;
+        retime_replay(&mut replay, 1.0, 0.5);
+        assert_eq!(replay.duration_ms, 500);
+        assert_eq!(
+            replay_timeline_content_end(&replay),
+            500
+        );
+        for line in &replay.dialogue[1..] {
+            assert_eq!(line.time_ms, u64::MAX);
+            assert!(!replay_dialogue_is_playable(line));
+        }
+    }
+
+    #[test]
+    fn exact_duration_edit_rebuilds_reordered_scene_events_while_paused() {
+        let mut replay = test_replay(vec![test_dialogue(
+            0,
+            3_000,
+            DialogueSide::Right,
+        )]);
+        replay.duration_ms = 4_000;
+        replay.terrain_changes = vec![
+            ReplayTerrainChange {
+                time_ms: 1_800,
+                position: [1, 0, 0],
+                material: 2,
+                enabled: true,
+            },
+            ReplayTerrainChange {
+                time_ms: 3_100,
+                position: [0, 1, 0],
+                material: 3,
+                enabled: true,
+            },
+        ];
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(replay);
+        studio.mode = ReplayMode::Paused;
+        studio.playback_ms = 2_000;
+        let mut app = App::new();
+        app.insert_resource(studio)
+            .init_resource::<VoxelGeometryDirtyChunks>()
+            .add_systems(Update, apply_replay_terrain_changes);
+        let terrain = app
+            .world_mut()
+            .spawn((Grid::<u8>::new(), TrpgVoxelGrid))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Grid<u8>>(terrain).unwrap().get(IVec3::X),
+            Some(&2)
+        );
+        {
+            let mut studio = app.world_mut().resource_mut::<ReplayStudio>();
+            set_exact_dialogue_duration_at_playhead(&mut studio, 0, 1_500);
+            assert_eq!(studio.playback_ms, 1_499);
+            assert_eq!(studio.timeline_revision, 1);
+            assert_eq!(studio.scene_revision, 1);
+            studio.playback_ms = 2_000;
+        }
+        app.update();
+        let grid = app.world().get::<Grid<u8>>(terrain).unwrap();
+        assert_eq!(grid.get(IVec3::X), Some(&2));
+        assert_eq!(grid.get(IVec3::Y), Some(&3));
+    }
+
+    #[test]
+    fn restarting_playback_in_one_tick_reapplies_events_at_zero() {
+        let mut replay = test_replay(Vec::new());
+        replay.duration_ms = 1_000;
+        replay.scene.voxels.push(ReplayVoxel {
+            position: [0; 3],
+            material: 1,
+        });
+        replay.terrain_changes.push(ReplayTerrainChange {
+            time_ms: 0,
+            position: [0; 3],
+            material: 2,
+            enabled: true,
+        });
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(replay);
+        let mut app = App::new();
+        app.insert_resource(studio)
+            .init_resource::<VoxelGeometryDirtyChunks>()
+            .add_systems(Update, apply_replay_terrain_changes);
+        let terrain = app
+            .world_mut()
+            .spawn((Grid::<u8>::new(), TrpgVoxelGrid))
+            .id();
+        app.world_mut()
+            .get_mut::<Grid<u8>>(terrain)
+            .unwrap()
+            .set(IVec3::ZERO, 1);
+        app.world_mut()
+            .run_system_once(
+                |mut studio: ResMut<ReplayStudio>,
+                 mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>| {
+                    start_playback(&mut studio, &mut grids);
+                    studio.mode = ReplayMode::Paused;
+                },
+            )
+            .unwrap();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<Grid<u8>>(terrain)
+                .unwrap()
+                .get(IVec3::ZERO),
+            Some(&2)
+        );
+
+        app.world_mut()
+            .run_system_once(
+                |mut studio: ResMut<ReplayStudio>,
+                 mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>| {
+                    // Export restarts playback without an intervening Update.
+                    stop_playback(&mut studio, &mut grids);
+                    start_playback(&mut studio, &mut grids);
+                    studio.mode = ReplayMode::Paused;
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            app.world()
+                .get::<Grid<u8>>(terrain)
+                .unwrap()
+                .get(IVec3::ZERO),
+            Some(&1)
+        );
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<Grid<u8>>(terrain)
+                .unwrap()
+                .get(IVec3::ZERO),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn generated_camera_follows_movement_mid_dialogue_and_after_its_last_frame() {
+        let mut line = positioned_dialogue(1, 1, 100, [0; 3]);
+        line.sender_id = 42;
+        line.time_ms = 350;
+        line.duration_ms = 2_000;
+        let mut replay = test_replay(vec![line]);
+        let base = Transform::from_xyz(0.0, 2.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y);
+        replay.camera = turn_based_camera_track(
+            &base,
+            &replay.dialogue,
+            3_000,
+            &HashMap::from([(42, Vec3::ZERO)]),
+            1.0,
+            0.0,
+            &ReplayCameraObstacles::default(),
+        );
+        replay.player_movements.push(ReplayPlayerMovement {
+            user_id: 42,
+            keyframes: vec![
+                ReplayPlayerMovementKeyframe {
+                    time_ms: 0,
+                    position_cells: [0.0; 3],
+                },
+                ReplayPlayerMovementKeyframe {
+                    time_ms: 6_000,
+                    position_cells: [48.0, 0.0, 0.0],
+                },
+            ],
+        });
+        replay.authored_player_movements.insert(42);
+        replay.duration_ms = 6_000;
+        assert_eq!(
+            replay.camera.last().unwrap().time_ms,
+            3_000
+        );
+
+        // Sampling backwards must reproduce exactly the same shot without
+        // accumulating a previous frame's displacement.
+        for time_ms in [1_000, 2_000, 5_000, 1_000] {
+            let target = interpolated_player_position(
+                &replay.player_movements,
+                42,
+                time_ms,
+                replay.player_movement_curve,
+            )
+            .unwrap();
+            let camera = replay_camera_at(&replay, time_ms, |subject| {
+                (*subject == ReplayCameraSubject::Player(42)).then_some(target)
+            })
+            .unwrap();
+            let planned = interpolated_camera(
+                &replay.camera,
+                time_ms,
+                replay.camera_transition_curve,
+            )
+            .unwrap();
+            assert!((camera.translation - planned.translation - target).length() < 0.0001);
+            assert!(
+                (camera.rotation * Vec3::NEG_Z).dot((target - camera.translation).normalize())
+                    > 0.9999
+            );
+            let repeated = replay_camera_at(&replay, time_ms, |_| Some(target)).unwrap();
+            assert_eq!(camera.translation, repeated.translation);
+            assert_eq!(camera.rotation, repeated.rotation);
+        }
+    }
+
+    #[test]
+    fn moving_speaker_cuts_keep_the_original_side_of_the_conversation() {
+        let mut first = positioned_dialogue(1, 1, 100, [0; 3]);
+        first.sender_id = 1;
+        first.time_ms = 0;
+        first.duration_ms = 1_000;
+        let mut second = positioned_dialogue(2, 1, 200, [40, 0, 0]);
+        second.sender_id = 2;
+        second.time_ms = 1_000;
+        second.duration_ms = 2_000;
+        let mut replay = test_replay(vec![first, second]);
+        let base = Transform::from_xyz(5.0, 2.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y);
+        replay.camera = turn_based_camera_track(
+            &base,
+            &replay.dialogue,
+            3_000,
+            &HashMap::from([(1, Vec3::ZERO), (2, Vec3::new(10.0, 0.0, 0.0))]),
+            1.0,
+            0.0,
+            &ReplayCameraObstacles::default(),
+        );
+        let first_target = Vec3::new(2.0, 0.0, -10.0);
+        let second_target = Vec3::new(15.0, 0.0, -8.0);
+        let subject_position = |subject: &ReplayCameraSubject| match subject {
+            ReplayCameraSubject::Player(1) => Some(first_target),
+            ReplayCameraSubject::Player(2) => Some(second_target),
+            _ => None,
+        };
+        let before = replay_camera_at(&replay, 999, subject_position).unwrap();
+        let after = replay_camera_at(&replay, 1_000, subject_position).unwrap();
+        for (camera, target) in [(before, first_target), (after, second_target)] {
+            assert!(camera.translation.z >= DirectedCameraRig::LINE_MARGIN - 0.0001);
+            assert!(
+                (camera.rotation * Vec3::NEG_Z).dot((target - camera.translation).normalize())
+                    > 0.9999
+            );
+        }
+        assert!((before.translation.x - first_target.x).abs() < 0.0001);
+        assert!((after.translation.x - second_target.x).abs() < 0.0001);
+        assert!(after.translation.distance(before.translation) > 10.0);
+    }
+
+    #[test]
+    fn explicit_follow_interval_preserves_the_original_camera_easing_outside_it() {
+        let mut replay = test_replay(Vec::new());
+        replay.camera_transition_curve = 2.0;
+        replay.camera = vec![
+            camera_keyframe(0, &Transform::from_xyz(0.0, 2.0, 8.0)),
+            camera_keyframe(
+                10_000,
+                &Transform::from_xyz(20.0, 4.0, 8.0),
+            ),
+        ];
+        let original_track = to_string(&replay.camera).unwrap();
+        let samples = [0, 1_000, 3_999, 7_000, 9_000, 10_000].map(|time_ms| {
+            (
+                time_ms,
+                replay_camera_at(&replay, time_ms, |_| None).unwrap(),
+            )
+        });
+        let reference = Vec3::new(30.0, 0.0, 0.0);
+        let shot = replay_follow_shot(
+            &replay,
+            ReplayCameraSubject::Player(42),
+            reference,
+            0.0,
+        );
+        insert_replay_camera_cut(&mut replay, 4_000, Some(shot));
+        insert_replay_camera_cut(&mut replay, 7_000, None);
+
+        for (time_ms, expected) in samples {
+            let actual = replay_camera_at(&replay, time_ms, |_| {
+                Some(reference + Vec3::X)
+            })
+            .unwrap();
+            assert_eq!(actual.translation, expected.translation);
+            assert_eq!(actual.rotation, expected.rotation);
+        }
+        assert_eq!(
+            to_string(&replay.camera).unwrap(),
+            original_track
+        );
+        let target = reference + Vec3::X * 3.0;
+        for time_ms in [4_000, 5_500, 6_999] {
+            let camera = replay_camera_at(&replay, time_ms, |_| Some(target)).unwrap();
+            assert!(
+                (camera.rotation * Vec3::NEG_Z).dot((target - camera.translation).normalize())
+                    > 0.9999
+            );
+            assert!(camera.translation.x > 30.0);
+        }
+    }
+
+    #[test]
+    fn explicit_ship_follow_tracks_its_rotated_center_without_orbiting() {
+        let mut replay = test_replay(Vec::new());
+        let local_center = Vec3::new(2.0, 0.0, 0.0);
+        let subject = ReplayCameraSubject::Ship {
+            ship_id: "carrier".to_owned(),
+            local_center: local_center.to_array(),
+        };
+        let shot = replay_follow_shot(&replay, subject, local_center, 0.0);
+        insert_replay_camera_cut(&mut replay, 0, Some(shot));
+        let initial = replay_camera_at(&replay, 0, |_| Some(local_center)).unwrap();
+        let moved_ship = Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)).with_rotation(
+            Quat::from_rotation_y(90.0_f32.to_radians()),
+        );
+        let target = moved_ship.translation + moved_ship.rotation * local_center;
+        let moved = replay_camera_at(
+            &replay,
+            1_000,
+            |subject| match subject {
+                ReplayCameraSubject::Ship {
+                    ship_id,
+                    local_center,
+                } if ship_id == "carrier" => Some(
+                    moved_ship.translation + moved_ship.rotation * Vec3::from_array(*local_center),
+                ),
+                _ => None,
+            },
+        )
+        .unwrap();
+        assert!(
+            (moved.translation - initial.translation - (target - local_center)).length() < 0.0001
+        );
+        assert!(moved.rotation.dot(initial.rotation).abs() > 0.9999);
+        assert!(
+            (moved.rotation * Vec3::NEG_Z).dot((target - moved.translation).normalize()) > 0.9999
+        );
+    }
+
+    #[test]
+    fn new_follow_shots_use_existing_camera_yaw_and_distance_controls() {
+        let mut replay = test_replay(Vec::new());
+        replay.camera_yaw_degrees = 35.0;
+        replay.camera_distance_scale = 1.0;
+        let shot = replay_follow_shot(
+            &replay,
+            ReplayCameraSubject::Player(42),
+            Vec3::ZERO,
+            0.0,
+        );
+        let expected_direction = Quat::from_rotation_y(35.0_f32.to_radians()) * Vec3::Z;
+        assert!(
+            horizontal(Vec3::from_array(shot.offset))
+                .normalize()
+                .dot(expected_direction)
+                > 0.9999
+        );
+        insert_replay_camera_cut(&mut replay, 0, Some(shot));
+        rotate_replay_camera_yaw(&mut replay, 45.0, &HashMap::new());
+        let before = Vec3::from_array(replay.camera_cuts[0].shot.as_ref().unwrap().offset);
+        assert!(
+            horizontal(before)
+                .normalize()
+                .dot(Quat::from_rotation_y(45.0_f32.to_radians()) * Vec3::Z)
+                > 0.9999
+        );
+        rescale_replay_camera_distance(&mut replay, 2.0, &HashMap::new());
+        let after = Vec3::from_array(replay.camera_cuts[0].shot.as_ref().unwrap().offset);
+        assert!((after - before * 2.0).length() < 0.0001);
+    }
+
+    #[test]
+    fn explicit_camera_cuts_round_trip_and_retime_with_dialogue() {
+        let mut replay = test_replay(vec![test_dialogue(
+            0,
+            2_000,
+            DialogueSide::Right,
+        )]);
+        replay.camera.push(camera_keyframe(
+            0,
+            &Transform::from_xyz(0.0, 2.0, 8.0),
+        ));
+        let shot = replay_follow_shot(
+            &replay,
+            ReplayCameraSubject::Player(42),
+            Vec3::ZERO,
+            0.0,
+        );
+        insert_replay_camera_cut(&mut replay, 1_000, Some(shot));
+        insert_replay_camera_cut(&mut replay, 3_000, None);
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("camera-cuts.willow-replay.json");
+        export_replay(&replay, path.to_str().unwrap()).unwrap();
+        let mut imported = import_replay(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(
+            to_string(&imported.camera_cuts).unwrap(),
+            to_string(&replay.camera_cuts).unwrap()
+        );
+
+        set_exact_dialogue_duration(&mut imported, 0, 3_000, 0).unwrap();
+        assert_eq!(
+            imported
+                .camera_cuts
+                .iter()
+                .map(|cut| cut.time_ms)
+                .collect::<Vec<_>>(),
+            vec![1_000, 4_000]
+        );
+        retime_replay(&mut imported, 1.0, 2.0);
+        assert_eq!(
+            imported
+                .camera_cuts
+                .iter()
+                .map(|cut| cut.time_ms)
+                .collect::<Vec<_>>(),
+            vec![2_000, 8_000]
+        );
+        assert!(imported.camera_cuts[0].shot.is_some());
+        assert!(imported.camera_cuts[1].shot.is_none());
+
+        let mut old_json = to_value(&replay).unwrap();
+        old_json.as_object_mut().unwrap().remove("camera_cuts");
+        write_file(&path, to_string(&old_json).unwrap()).unwrap();
+        let old = import_replay(path.to_str().unwrap(), None).unwrap();
+        assert!(old.camera_cuts.is_empty());
+        assert!(old.camera.iter().all(|frame| frame.focus.is_none()));
     }
 }
