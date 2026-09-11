@@ -2070,10 +2070,13 @@ fn advance_replay(
         return;
     };
     let delta_ms = (time.delta_secs() * studio.playback_speed * 1_000.0).round() as u64;
-    let proposed_ms = studio.playback_ms.saturating_add(delta_ms).min(duration_ms);
+    let recording_take =
+        studio.live_movement_punch_in.is_some() || studio.live_ship_punch_in.is_some();
+    let proposed_ms = studio.playback_ms.saturating_add(delta_ms);
+    let proposed_ms = if recording_take { proposed_ms } else { proposed_ms.min(duration_ms) };
     let mut waiting_for_speech = None;
     let mut waiting_for_audio = None;
-    if studio.speech_enabled && onnx_tts_is_available() {
+    if !recording_take && studio.speech_enabled && onnx_tts_is_available() {
         if let Some(replay) = studio.replay.as_ref() {
             let current = active_dialogue_index(&replay.dialogue, studio.playback_ms);
             let proposed = active_dialogue_index(&replay.dialogue, proposed_ms);
@@ -2127,7 +2130,7 @@ fn advance_replay(
             studio.status = REPLAY_PLAYING_STATUS.to_owned();
         }
     }
-    if studio.turn_playback_enabled {
+    if !recording_take && studio.turn_playback_enabled {
         if let Some(replay) = studio.replay.as_ref() {
             let turns = replay_turns(replay);
             if let Some(turn) = turns
@@ -2151,7 +2154,13 @@ fn advance_replay(
         }
     }
     studio.playback_ms = proposed_ms;
-    if studio.playback_ms >= duration_ms {
+    if recording_take {
+        // Live DM movement can append footage beyond the original ending.
+        // Keep the seek range and saved project duration in sync with the take.
+        if let Some(replay) = studio.replay.as_mut() {
+            replay.duration_ms = replay.duration_ms.max(proposed_ms);
+        }
+    } else if studio.playback_ms >= duration_ms {
         studio.mode = ReplayMode::Paused;
     }
 }
@@ -5912,7 +5921,7 @@ fn replay_live_edit_panel(
             if recording_this {
                 ui.colored_label(
                     egui::Color32::from_rgb(225, 90, 70),
-                    "● 正在覆录：用角色接管控制移动",
+                    "● 正在覆录：用角色接管控制移动；超过片尾会自动延长回放",
                 );
                 ui.horizontal(|ui| {
                     if ui.button("保存移动录制").clicked() {
@@ -6006,7 +6015,7 @@ fn replay_live_edit_panel(
             if recording_this {
                 ui.colored_label(
                     egui::Color32::from_rgb(225, 90, 70),
-                    "● 正在覆录：驾驶飞船，播放头会同步采样",
+                    "● 正在覆录：驾驶飞船，播放头会同步采样；超过片尾会自动延长回放",
                 );
                 ui.horizontal(|ui| {
                     if ui.button("保存飞船录制").clicked() {
@@ -8885,20 +8894,6 @@ fn retain_dialogue_with_standees(
     let previous_len = dialogue.len();
     dialogue.retain(|line| speaker_positions.contains_key(&line.sender_id));
     previous_len.saturating_sub(dialogue.len())
-}
-
-fn retime_dialogue_turns(dialogue: &mut [ReplayDialogue]) -> u64 {
-    let mut timeline_ms = 350_u64;
-    for line in dialogue {
-        line.time_ms = timeline_ms;
-        timeline_ms = line
-            .time_ms
-            .saturating_add(line.duration_ms)
-            .saturating_add(HISTORY_DIALOGUE_GAP_MS);
-    }
-    timeline_ms
-        .saturating_sub(HISTORY_DIALOGUE_GAP_MS)
-        .max(5_000)
 }
 
 fn assign_replay_line_ids(dialogue: &mut [ReplayDialogue]) {
@@ -12358,7 +12353,81 @@ fn format_time(time_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use bevy::ecs::system::RunSystemOnce;
+
     use super::*;
+
+    #[test]
+    fn live_takes_extend_past_the_end_and_normal_playback_still_stops() {
+        for ship_take in [false, true] {
+            let mut replay = test_replay(vec![test_dialogue(
+                0,
+                1_000,
+                DialogueSide::Right,
+            )]);
+            replay.duration_ms = 1_000;
+            let mut studio = ReplayStudio::default();
+            studio.replay = Some(replay);
+            studio.playback_ms = 900;
+            studio.speech_enabled = false;
+            studio.turn_playback_enabled = true;
+            if ship_take {
+                begin_live_ship_take(
+                    &mut studio,
+                    "ship".into(),
+                    "Ship".into(),
+                    Transform::default(),
+                );
+            } else {
+                begin_live_movement_take(&mut studio, 7, Vec3::ZERO);
+            }
+            let mut time = Time::<()>::default();
+            time.advance_by(Duration::from_millis(200));
+            let mut world = World::new();
+            world.insert_resource(time);
+            world.insert_resource(studio);
+            world.init_resource::<PreviewSpeechController>();
+            world.run_system_once(advance_replay).unwrap();
+            world.run_system_once(advance_replay).unwrap();
+            let mut studio = world.resource_mut::<ReplayStudio>();
+            assert_eq!(studio.playback_ms, 1_300);
+            assert_eq!(studio.mode, ReplayMode::Playing);
+            assert_eq!(
+                studio.replay.as_ref().unwrap().duration_ms,
+                1_300
+            );
+            if ship_take {
+                finish_live_ship_take(
+                    &mut studio,
+                    Some(Transform::from_xyz(2.0, 0.0, 0.0)),
+                );
+                assert_eq!(
+                    studio.replay.as_ref().unwrap().ship_trajectories[0]
+                        .keyframes
+                        .last()
+                        .unwrap()
+                        .time_ms,
+                    1_300
+                );
+            } else {
+                finish_live_movement_take(&mut studio, Some(Vec3::X));
+                assert_eq!(
+                    studio.replay.as_ref().unwrap().player_movements[0]
+                        .keyframes
+                        .last()
+                        .unwrap()
+                        .time_ms,
+                    1_300
+                );
+            }
+            world.run_system_once(advance_replay).unwrap();
+            let studio = world.resource::<ReplayStudio>();
+            assert_eq!(studio.playback_ms, 1_300);
+            assert_eq!(studio.mode, ReplayMode::Paused);
+        }
+    }
 
     #[test]
     fn replay_occlusion_tracks_every_player_not_only_the_focused_speaker() {
@@ -16097,27 +16166,30 @@ mod tests {
         ));
     }
 
-    /// Loads the on-disk ship trajectory history and verifies that every
-    /// recorded ship — including the Arrogance carrier — is merged into a
-    /// freshly generated replay, and that a GM line addressing a player cuts
-    /// the camera onto that player's standee. Skipped without local data.
+    /// A fixed simultaneous fleet flight must import without serializing the
+    /// ships' durations or depending on the user's changing campaign history.
     #[test]
-    fn real_history_imports_arrogance_and_gm_focuses_the_player_standee() {
-        let history_path =
-            std::path::Path::new(".data/willowblossom/replay_ship_trajectories.toml");
-        if !history_path.is_file() {
-            return;
-        }
-        let history_text = std::fs::read_to_string(history_path).expect("read ship history");
-        let history: ReplayShipTrajectoryHistory =
-            toml::from_str(&history_text).expect("parse ship history");
-        assert!(
-            history
-                .sessions
-                .iter()
-                .any(|session| session.ship_id == "usi-arrogance"),
-            "Arrogance session must exist in the on-disk history"
-        );
+    fn fleet_history_imports_arrogance_and_gm_focuses_the_player_standee() {
+        let history = ReplayShipTrajectoryHistory {
+            sessions: ["usi-arrogance", "escort-1", "escort-2"]
+                .into_iter()
+                .map(|ship_id| PersistedShipTrajectorySession {
+                    campaign_id: "default".to_owned(),
+                    ship_id: ship_id.to_owned(),
+                    ship_name: ship_id.to_owned(),
+                    turn_index: 1,
+                    start_after_source_time: None,
+                    start_delay_ms: 0,
+                    keyframes: (0..120)
+                        .map(|index| PersistedShipKeyframe {
+                            source_unix_ms: 1_785_749_276_000 + index * 100,
+                            translation: [index as f32 * 2.0, 0.0, 0.0],
+                            rotation: Quat::IDENTITY.to_array(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
 
         // A GM line addressing a player and that player's reply.
         let mut gm = test_dialogue(350, 2_400, DialogueSide::Left);
