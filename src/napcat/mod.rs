@@ -8,6 +8,7 @@ use std::{
         HashMap,
         HashSet,
     },
+    env::var,
     fs::{
         self,
         OpenOptions,
@@ -6880,12 +6881,20 @@ fn setup(mut commands: Commands) {
     }
     let napcat_io = NapcatIOReceiver(client_to_game_receiver.clone());
     let napcat_send_results = NapcatSendResultReceiver(send_result_receiver);
-    spawn_napcat_connection(
-        client_to_game_sender.clone(),
-        game_to_client_receiver,
-        send_result_sender,
-        inbound_journal.clone(),
-    );
+    // Isolated UI verification still needs the local resources, but must never
+    // attach to a running QQ session. Release builds always connect normally.
+    let offline = cfg!(debug_assertions)
+        && var("WILLOWBLOSSOM_OFFLINE").is_ok_and(|value| value == "1");
+    if offline {
+        info!("NapCat connection disabled by WILLOWBLOSSOM_OFFLINE=1");
+    } else {
+        spawn_napcat_connection(
+            client_to_game_sender.clone(),
+            game_to_client_receiver,
+            send_result_sender,
+            inbound_journal.clone(),
+        );
+    }
     commands.insert_resource(napcat_io);
     commands.insert_resource(NapcatInboundJournal(inbound_journal));
     commands.insert_resource(napcat_send_results);

@@ -953,6 +953,7 @@ use crate::{
     replay::{
         clear_campaign_replay_data,
         clear_player_replay_movement_history,
+        replay_workspace_inactive,
         ReplayMovementHistoryRecorder,
         ReplayPlayerMovementHistory,
         ReplayShipTrajectoryHistory,
@@ -2675,7 +2676,7 @@ pub fn load_ui_memory(
     ctx.memory_mut(|m| *m = memory);
 }
 
-fn persist_ui_memory_after_interaction(
+pub(crate) fn persist_ui_memory_after_interaction(
     ctx: &Context,
     cached_memory: &mut Persistent<CachedMemory>,
 ) {
@@ -18314,6 +18315,38 @@ pub fn ui_system(
         }
     }
 
+    let player_position_areas = player_standees
+        .iter()
+        .filter(|(_, visibility, _)| **visibility != bevy::prelude::Visibility::Hidden)
+        .map(|(standee, _, transform)| {
+            let area = voxel_player_area_label(
+                transform.translation,
+                teleport_spaceships
+                    .iter()
+                    .filter_map(|(ship, body, transform)| {
+                        Some((
+                            voxel_spaceship_teleport_name(ship)?,
+                            body,
+                            transform,
+                        ))
+                    }),
+            );
+            (standee.user_id.to_string(), area)
+        })
+        .collect::<HashMap<_, _>>();
+    if sync_enabled_position_radio_parties(
+        &mut manager.trpg_groups,
+        &player_position_areas,
+    ) {
+        manager.persist().ok();
+    }
+
+    // Keep asynchronous send completion and local synchronization running while
+    // the replay workspace owns the screen; only skip the main UI surfaces.
+    if !replay_workspace_inactive(replay_studio) {
+        return;
+    }
+
     let mut group_rects: HashMap<String, Rect> = HashMap::default();
     let reset_data = |new_chat_group_modal_string_bool: &mut Local<'_, (String, bool)>| {
         new_chat_group_modal_string_bool.0 = "".to_owned();
@@ -18350,32 +18383,6 @@ pub fn ui_system(
         if modal.should_close() {
             reset_data(new_chat_group_modal_string_open);
         }
-    }
-
-    let player_position_areas = player_standees
-        .iter()
-        .filter(|(_, visibility, _)| **visibility != bevy::prelude::Visibility::Hidden)
-        .map(|(standee, _, transform)| {
-            let area = voxel_player_area_label(
-                transform.translation,
-                teleport_spaceships
-                    .iter()
-                    .filter_map(|(ship, body, transform)| {
-                        Some((
-                            voxel_spaceship_teleport_name(ship)?,
-                            body,
-                            transform,
-                        ))
-                    }),
-            );
-            (standee.user_id.to_string(), area)
-        })
-        .collect::<HashMap<_, _>>();
-    if sync_enabled_position_radio_parties(
-        &mut manager.trpg_groups,
-        &player_position_areas,
-    ) {
-        manager.persist().ok();
     }
 
     trpg_group_settings_window(

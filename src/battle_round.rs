@@ -137,6 +137,11 @@ use crate::{
         UnitRarity,
         STATUS_POINTS_PER_LEVEL,
     },
+    replay::{
+        replay_auxiliary_ui_visible,
+        ReplayStudio,
+        ReplayVideoCaptureActive,
+    },
     rule_engine::{
         apply_skill_type_damage_default,
         current_redeemed_numeric_skill_range,
@@ -176,7 +181,7 @@ impl Plugin for BattleRoundPlugin {
                 Update,
                 (
                     sync_battle_round_entities,
-                    draw_battle_targeting_line,
+                    draw_battle_targeting_line.run_if(replay_auxiliary_ui_visible),
                 ),
             )
             .add_systems(
@@ -3526,8 +3531,10 @@ fn battle_round_panel(
     scene_positions: Option<Res<SceneCharacterPositions>>,
     encounters: Query<&BattleEncounterEntity>,
     mut targeting_line: ResMut<BattleTargetingLine>,
+    studio: Option<Res<ReplayStudio>>,
+    capture_active: Option<Res<ReplayVideoCaptureActive>>,
 ) {
-    if !ui_state.panel_open {
+    if !ui_state.panel_open || !replay_auxiliary_ui_visible(studio, capture_active) {
         targeting_line.actor_id = None;
         targeting_line.target_id = None;
         return;

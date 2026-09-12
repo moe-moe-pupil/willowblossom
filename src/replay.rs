@@ -1,6 +1,11 @@
 mod timeline;
+mod viewport;
+mod workspace;
 
-use timeline::replay_timeline_window;
+use timeline::replay_timeline_ui;
+pub(crate) use viewport::replay_auxiliary_ui_visible;
+use viewport::update_replay_preview_viewport;
+use workspace::{workspace_header, workspace_preview, ReplayWorkspaceTab};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -57,6 +62,7 @@ use base64::{
     Engine,
 };
 use bevy::{
+    camera::CameraUpdateSystems,
     ecs::system::SystemParam,
     prelude::*,
     render::view::screenshot::{
@@ -69,12 +75,14 @@ use bevy::{
 use bevy_egui::{
     egui::{
         self,
+        emath::TSTransform,
         Button,
         DragValue,
         Ui,
     },
     EguiContexts,
     EguiPrimaryContextPass,
+    EguiPostUpdateSet,
 };
 use bevy_persistent::{
     Persistent,
@@ -117,6 +125,7 @@ use crate::{
         Visibility,
     },
     ui,
+    ui::{persist_ui_memory_after_interaction, CachedMemory},
     voxel::{
         cached_or_local_voxel_standee_path,
         TrpgVoxelGrid,
@@ -311,6 +320,12 @@ impl Plugin for ReplayPlugin {
         .add_systems(
             EguiPrimaryContextPass,
             replay_studio_ui.after(ui::ui_system),
+        )
+        .add_systems(
+            PostUpdate,
+            update_replay_preview_viewport
+                .after(EguiPostUpdateSet::ProcessOutput)
+                .before(CameraUpdateSystems),
         );
     }
 }
@@ -326,6 +341,10 @@ pub(crate) struct ReplaySnapshotTracker {
 
 pub(crate) fn replay_video_capture_inactive(active: Res<ReplayVideoCaptureActive>) -> bool {
     !active.0
+}
+
+pub(crate) fn replay_workspace_inactive(studio: &ReplayStudio) -> bool {
+    !studio.panel_open
 }
 
 pub(crate) fn replay_mouse_interaction_inactive(studio: Res<ReplayStudio>) -> bool {
@@ -1136,6 +1155,8 @@ impl Default for ReplayMode {
 
 #[derive(Resource)]
 pub(crate) struct ReplayStudio {
+    preview_rect: Option<egui::Rect>,
+    workspace_tab: ReplayWorkspaceTab,
     mode: ReplayMode,
     replay: Option<ReplayFile>,
     audience: ReplayAudience,
@@ -1265,6 +1286,8 @@ impl Default for ReplayStudio {
         let music_files = discover_background_music();
         let music_file = music_files.first().cloned();
         Self {
+            preview_rect: None,
+            workspace_tab: ReplayWorkspaceTab::default(),
             mode: ReplayMode::Idle,
             replay: None,
             audience: ReplayAudience::All,
@@ -1316,7 +1339,7 @@ impl Default for ReplayStudio {
             video_render: None,
             video_encoding: None,
             status: "尚未创建回放".to_owned(),
-            panel_open: true,
+            panel_open: false,
         }
     }
 }
@@ -3289,9 +3312,13 @@ fn replay_studio_ui(
     mut capture_active: ResMut<ReplayVideoCaptureActive>,
     mut occlusion_fade: Option<ResMut<VoxelReplayOcclusionFade>>,
     mut live_edits: ReplayLiveEditParams,
-    mut avatar_textures: Local<HashMap<String, egui::TextureHandle>>,
+    mut ui_cache: (
+        Local<HashMap<String, egui::TextureHandle>>,
+        Option<ResMut<Persistent<CachedMemory>>>,
+    ),
 ) {
     let Ok(ctx) = contexts.ctx_mut() else { return };
+    let (avatar_textures, cached_memory) = &mut ui_cache;
     let mut occlusion_opacity = occlusion_fade.as_ref().map_or(0.0, |fade| fade.opacity);
     let mut occlusion_cast_width_cells = occlusion_fade.as_ref().map_or(
         DEFAULT_VOXEL_OCCLUSION_CAST_WIDTH_CELLS,
@@ -3311,7 +3338,7 @@ fn replay_studio_ui(
     );
     let mut occlusion_debug_gizmo = occlusion_fade.as_ref().is_some_and(|fade| fade.debug_gizmo);
 
-    if !capture_active.0 {
+    if !capture_active.0 && !studio.panel_open {
         egui::Area::new(egui::Id::new("replay-studio-button"))
             .anchor(
                 egui::Align2::RIGHT_TOP,
@@ -3320,28 +3347,43 @@ fn replay_studio_ui(
             .show(ctx, |ui| {
                 if ui.button("🎬 回放").clicked() {
                     studio.panel_open = true;
-                    ui::raise_and_expand_window(
-                        ui.ctx(),
-                        egui::Id::new("trpg-replay-studio"),
-                    );
                 }
             });
     }
 
+    studio.preview_rect = None;
     if studio.panel_open && !capture_active.0 {
-        let mut open = studio.panel_open;
-        let max_window_width = (ctx.content_rect().width() - 32.0).clamp(360.0, 620.0);
-        egui::Window::new("TRPG 回放工作室")
-            .id(egui::Id::new("trpg-replay-studio"))
-            .open(&mut open)
-            .default_width(390.0)
-            .min_width(360.0)
-            .max_width(max_window_width)
-            .max_height((ctx.content_rect().height() - 32.0).max(320.0))
-            .show(ctx, |ui| {
-                ui.set_max_width(max_window_width);
+        let mut workspace_ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("replay-workspace-root"),
+            egui::UiBuilder::new().max_rect(ctx.content_rect()),
+        );
+        workspace_header(&mut workspace_ui, &mut studio);
+        egui::Panel::bottom("replay-workspace-timeline")
+            .resizable(true)
+            .default_size(290.0)
+            .min_size(160.0)
+            .max_size((ctx.content_rect().height() * 0.6).max(160.0))
+            .show(&mut workspace_ui, |ui| {
+                replay_timeline_ui(
+                    ui,
+                    &mut studio,
+                    &mut grids,
+                    &replay_histories.player_movement_history,
+                    &replay_histories.ship_trajectory_history,
+                );
+            });
+        egui::Panel::left("replay-workspace-properties")
+            .resizable(true)
+            .default_size(340.0)
+            .min_size(280.0)
+            .max_size((ctx.content_rect().width() * 0.45).max(280.0))
+            .show(&mut workspace_ui, |ui| {
                 egui::ScrollArea::vertical()
-                    .id_salt("trpg-replay-studio-scroll")
+                    .id_salt((
+                        "replay-workspace-properties-scroll",
+                        studio.workspace_tab as u8,
+                    ))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         replay_controls(
@@ -3369,15 +3411,9 @@ fn replay_studio_ui(
                         )
                     });
             });
-        studio.panel_open = open;
-        if open {
-            replay_timeline_window(
-                ctx,
-                &mut studio,
-                &mut grids,
-                &replay_histories.player_movement_history,
-                &replay_histories.ship_trajectory_history,
-            );
+        workspace_preview(&mut workspace_ui, &mut studio);
+        if let Some(cached_memory) = cached_memory.as_mut() {
+            persist_ui_memory_after_interaction(ctx, cached_memory);
         }
     }
     if let Some(fade) = occlusion_fade.as_mut() {
@@ -3419,7 +3455,12 @@ fn replay_studio_ui(
                 index,
                 onnx_tts_is_available(),
             ) {
-                dialogue_overlay(ctx, &dialogue, &mut avatar_textures);
+                dialogue_overlay(
+                    ctx,
+                    &dialogue,
+                    avatar_textures,
+                    studio.preview_rect.filter(|_| !capture_active.0),
+                );
             }
         }
     }
@@ -3448,8 +3489,10 @@ fn replay_controls(
     occlusion_cast_end_height_cells: &mut f32,
     occlusion_debug_gizmo: &mut bool,
 ) {
-    ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
-    ui.small("飞船轨迹、地形变化和玩家接管移动都会常态化自动记录，无需先点击“开始录制”；回放生成后新录到的内容会在按“播放”时自动并入时间轴。");
+    if studio.workspace_tab == ReplayWorkspaceTab::Project {
+        ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
+        ui.small("飞船轨迹、地形变化和玩家接管移动都会常态化自动记录，无需先点击“开始录制”；回放生成后新录到的内容会在按“播放”时自动并入时间轴。");
+    }
     if matches!(
         &studio.audience,
         ReplayAudience::All | ReplayAudience::Gm
@@ -3462,8 +3505,8 @@ fn replay_controls(
         });
     }
     ui.separator();
-    ui.collapsing("录制、镜头与遮挡设置", |ui| {
-        ui.horizontal(|ui| {
+    if studio.workspace_tab == ReplayWorkspaceTab::Project {
+        ui.horizontal_wrapped(|ui| {
             ui.label("发布范围");
             egui::ComboBox::from_id_salt("replay-audience")
                 .selected_text(studio.audience.label())
@@ -3504,6 +3547,9 @@ fn replay_controls(
                     );
                 });
         });
+    }
+    if studio.workspace_tab == ReplayWorkspaceTab::Camera {
+        ui.heading("镜头与遮挡");
         ui.checkbox(
             &mut studio.record_camera_enabled,
             "录制 DM 自由镜头（默认关闭，点击后才采集）",
@@ -3564,8 +3610,7 @@ fn replay_controls(
             })
             .inner;
         if camera_yaw_changed {
-            let requested_camera_yaw =
-                normalized_directed_camera_yaw_degrees(requested_camera_yaw);
+            let requested_camera_yaw = normalized_directed_camera_yaw_degrees(requested_camera_yaw);
             let mut applied_camera_yaw = requested_camera_yaw;
             if let Some(replay) = studio.replay.as_mut() {
                 let speaker_positions = standee_positions(standees);
@@ -3682,9 +3727,9 @@ fn replay_controls(
             "显示剔除射线调试框",
         )
         .on_hover_text("显示镜头到每名玩家的中心线和宽高方盒。");
-    });
+    }
 
-    ui.horizontal(|ui| match studio.mode {
+    ui.horizontal_wrapped(|ui| match studio.mode {
         ReplayMode::Recording => {
             ui.label(format!(
                 "● 录制中 {}",
@@ -3741,16 +3786,17 @@ fn replay_controls(
         },
     });
 
-    if let Some(replay) = studio.replay.as_ref() {
-        let movement_frame_count = replay
-            .player_movements
-            .iter()
-            .map(|movement| movement.keyframes.len())
-            .sum::<usize>();
-        let ship_count = replay.ship_trajectories.len();
-        let terrain_change_count = replay.terrain_changes.len();
-        let hull_change_count = replay.ship_hull_changes.len();
-        ui.label(format!(
+    if studio.workspace_tab == ReplayWorkspaceTab::Project {
+        if let Some(replay) = studio.replay.as_ref() {
+            let movement_frame_count = replay
+                .player_movements
+                .iter()
+                .map(|movement| movement.keyframes.len())
+                .sum::<usize>();
+            let ship_count = replay.ship_trajectories.len();
+            let terrain_change_count = replay.terrain_changes.len();
+            let hull_change_count = replay.ship_hull_changes.len();
+            ui.label(format!(
             "{} · {} · {} 个镜头帧 · {} 帧玩家移动 · {} 艘飞船轨迹 · {} 条地形变化 · {} 条船体变化 · {} 条对话 · {} 个体素",
             replay.title,
             format_time(replay.duration_ms),
@@ -3762,171 +3808,178 @@ fn replay_controls(
             replay.dialogue.len(),
             replay.scene.voxels.len(),
         ));
+        }
     }
-    replay_live_edit_panel(ui, studio, live_edits, standees);
-    ui.add_enabled_ui(!replay_has_live_take(studio), |ui| {
-        replay_dialogue_editor(ui, studio, camera);
-        replay_movement_timing_editor(
-            ui,
-            studio,
-            player_movement_history,
-            camera,
-        );
-        replay_ship_trajectory_editor(
-            ui,
-            studio,
-            ship_trajectory_history,
-            camera,
-        );
-    });
-    if !matches!(studio.mode, ReplayMode::Recording) && studio.replay.is_some() {
-        let duration = studio.replay.as_ref().unwrap().duration_ms.max(1);
-        ui.horizontal(|ui| {
-            if !matches!(
-                studio.mode,
-                ReplayMode::Playing | ReplayMode::Paused
-            ) && ui.button("▶ 播放").clicked()
-            {
-                prepare_replay_movement_for_playback(
-                    studio,
-                    player_movement_history,
-                    ship_trajectory_history,
-                );
-                start_playback(studio, grids);
-            }
-            ui.add_enabled(
-                studio.live_movement_punch_in.is_none() && studio.live_ship_punch_in.is_none(),
-                egui::Slider::new(&mut studio.playback_ms, 0..=duration)
-                    .show_value(false)
-                    .text("时间轴"),
+    if studio.workspace_tab == ReplayWorkspaceTab::Edit {
+        replay_live_edit_panel(ui, studio, live_edits, standees);
+        ui.add_enabled_ui(!replay_has_live_take(studio), |ui| {
+            replay_dialogue_editor(ui, studio, camera);
+            replay_movement_timing_editor(
+                ui,
+                studio,
+                player_movement_history,
+                camera,
             );
-            ui.label(format!(
-                "{} / {}",
-                format_time(studio.playback_ms),
-                format_time(duration)
-            ));
+            replay_ship_trajectory_editor(
+                ui,
+                studio,
+                ship_trajectory_history,
+                camera,
+            );
         });
-        replay_speech_progress_ui(ui, studio, speech);
-        ui.horizontal(|ui| {
-            ui.label("速度");
-            for speed in [0.5, 1.0, 2.0, 4.0] {
-                ui.selectable_value(
-                    &mut studio.playback_speed,
-                    speed,
-                    format!("{speed}×"),
+        if !matches!(studio.mode, ReplayMode::Recording) && studio.replay.is_some() {
+            let duration = studio.replay.as_ref().unwrap().duration_ms.max(1);
+            ui.horizontal_wrapped(|ui| {
+                if !matches!(
+                    studio.mode,
+                    ReplayMode::Playing | ReplayMode::Paused
+                ) && ui.button("▶ 播放").clicked()
+                {
+                    prepare_replay_movement_for_playback(
+                        studio,
+                        player_movement_history,
+                        ship_trajectory_history,
+                    );
+                    start_playback(studio, grids);
+                }
+                ui.add_enabled(
+                    studio.live_movement_punch_in.is_none() && studio.live_ship_punch_in.is_none(),
+                    egui::Slider::new(&mut studio.playback_ms, 0..=duration)
+                        .show_value(false)
+                        .text("时间轴"),
                 );
-            }
-        });
-        ui.checkbox(
-            &mut studio.turn_playback_enabled,
-            "按回合播放（每回合结束暂停，如同 GM 带团）",
-        );
-        if let Some(replay) = studio.replay.as_ref() {
-            let turns = replay_turns(replay);
-            if !turns.is_empty() {
-                let current_turn = current_replay_turn(&turns, studio.playback_ms);
-                ui.horizontal(|ui| {
-                    let previous = current_turn
-                        .and_then(|index| index.checked_sub(1))
-                        .or_else(|| previous_replay_turn(&turns, studio.playback_ms));
-                    if ui
-                        .add_enabled(
-                            previous.is_some() && !replay_has_live_take(studio),
-                            egui::Button::new("⏮ 上一回合"),
-                        )
-                        .clicked()
-                    {
-                        if let Some(index) = previous {
-                            jump_replay_to_turn(studio, &turns, index);
-                        }
-                    }
-                    let next = next_replay_turn(&turns, studio.playback_ms);
-                    if ui
-                        .add_enabled(
-                            next.is_some() && !replay_has_live_take(studio),
-                            egui::Button::new("下一回合 ⏭"),
-                        )
-                        .clicked()
-                    {
-                        if let Some(index) = next {
-                            jump_replay_to_turn(studio, &turns, index);
-                        }
-                    }
-                    if let Some(index) = current_turn {
-                        let turn = &turns[index];
-                        ui.label(format!(
-                            "第 {} 段 {}（{}）",
-                            turn.ordinal,
-                            turn.label(),
-                            turn.speaker_names
-                                .first()
-                                .map(String::as_str)
-                                .unwrap_or("等待中"),
-                        ));
-                    } else {
-                        ui.label("尚未进入回合时间轴");
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    for (index, turn) in turns.iter().enumerate() {
-                        let selected = current_turn == Some(index);
+                ui.label(format!(
+                    "{} / {}",
+                    format_time(studio.playback_ms),
+                    format_time(duration)
+                ));
+            });
+            replay_speech_progress_ui(ui, studio, speech);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("速度");
+                for speed in [0.5, 1.0, 2.0, 4.0] {
+                    ui.selectable_value(
+                        &mut studio.playback_speed,
+                        speed,
+                        format!("{speed}×"),
+                    );
+                }
+            });
+            ui.checkbox(
+                &mut studio.turn_playback_enabled,
+                "按回合播放（每回合结束暂停，如同 GM 带团）",
+            );
+            if let Some(replay) = studio.replay.as_ref() {
+                let turns = replay_turns(replay);
+                if !turns.is_empty() {
+                    let current_turn = current_replay_turn(&turns, studio.playback_ms);
+                    ui.horizontal_wrapped(|ui| {
+                        let previous = current_turn
+                            .and_then(|index| index.checked_sub(1))
+                            .or_else(|| previous_replay_turn(&turns, studio.playback_ms));
                         if ui
-                            .selectable_label(
-                                selected,
-                                format!("{}.{}", turn.ordinal, turn.turn_index),
+                            .add_enabled(
+                                previous.is_some() && !replay_has_live_take(studio),
+                                egui::Button::new("⏮ 上一回合"),
                             )
                             .clicked()
                         {
-                            jump_replay_to_turn(studio, &turns, index);
+                            if let Some(index) = previous {
+                                jump_replay_to_turn(studio, &turns, index);
+                            }
                         }
+                        let next = next_replay_turn(&turns, studio.playback_ms);
+                        if ui
+                            .add_enabled(
+                                next.is_some() && !replay_has_live_take(studio),
+                                egui::Button::new("下一回合 ⏭"),
+                            )
+                            .clicked()
+                        {
+                            if let Some(index) = next {
+                                jump_replay_to_turn(studio, &turns, index);
+                            }
+                        }
+                        if let Some(index) = current_turn {
+                            let turn = &turns[index];
+                            ui.label(format!(
+                                "第 {} 段 {}（{}）",
+                                turn.ordinal,
+                                turn.label(),
+                                turn.speaker_names
+                                    .first()
+                                    .map(String::as_str)
+                                    .unwrap_or("等待中"),
+                            ));
+                        } else {
+                            ui.label("尚未进入回合时间轴");
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        for (index, turn) in turns.iter().enumerate() {
+                            let selected = current_turn == Some(index);
+                            if ui
+                                .selectable_label(
+                                    selected,
+                                    format!("{}.{}", turn.ordinal, turn.turn_index),
+                                )
+                                .clicked()
+                            {
+                                jump_replay_to_turn(studio, &turns, index);
+                            }
+                        }
+                    });
+                }
+            }
+            ui.add_enabled_ui(!replay_has_live_take(studio), |ui| {
+                ui.collapsing("飞船移动节奏", |ui| {
+                    ui.small(
+                        "飞船机动会按此速度压缩播放；关闭“下一句等待”后，机动会移到所有台词之后。",
+                    );
+                    let mut speed = studio
+                        .replay
+                        .as_ref()
+                        .map(|replay| replay.ship_motion_speed)
+                        .unwrap_or_else(default_ship_motion_speed);
+                    let mut waits = studio
+                        .replay
+                        .as_ref()
+                        .map(|replay| replay.dialogue_waits_for_ship_motion)
+                        .unwrap_or_else(default_dialogue_waits_for_ship_motion);
+                    let speed_changed = ui
+                        .add(
+                            egui::Slider::new(&mut speed, 0.5..=10.0)
+                                .step_by(0.5)
+                                .text("飞船移动速度×"),
+                        )
+                        .changed();
+                    let waits_changed = ui
+                        .checkbox(&mut waits, "下一句台词等待飞船移动结束")
+                        .changed();
+                    if speed_changed || waits_changed {
+                        if let Some(replay) = studio.replay.as_mut() {
+                            replay.ship_motion_speed = speed;
+                            replay.dialogue_waits_for_ship_motion = waits;
+                            rebuild_replay_timeline_with_ships(
+                                replay,
+                                ship_trajectory_history,
+                                camera,
+                            );
+                        }
+                        studio.playback_ms = 0;
+                        studio.status = "飞船移动节奏已更新".to_owned();
                     }
                 });
-            }
-        }
-        ui.add_enabled_ui(!replay_has_live_take(studio), |ui| {
-            ui.collapsing("飞船移动节奏", |ui| {
-                ui.small(
-                    "飞船机动会按此速度压缩播放；关闭“下一句等待”后，机动会移到所有台词之后。",
-                );
-                let mut speed = studio
-                    .replay
-                    .as_ref()
-                    .map(|replay| replay.ship_motion_speed)
-                    .unwrap_or_else(default_ship_motion_speed);
-                let mut waits = studio
-                    .replay
-                    .as_ref()
-                    .map(|replay| replay.dialogue_waits_for_ship_motion)
-                    .unwrap_or_else(default_dialogue_waits_for_ship_motion);
-                let speed_changed = ui
-                    .add(
-                        egui::Slider::new(&mut speed, 0.5..=10.0)
-                            .step_by(0.5)
-                            .text("飞船移动速度×"),
-                    )
-                    .changed();
-                let waits_changed = ui
-                    .checkbox(&mut waits, "下一句台词等待飞船移动结束")
-                    .changed();
-                if speed_changed || waits_changed {
-                    if let Some(replay) = studio.replay.as_mut() {
-                        replay.ship_motion_speed = speed;
-                        replay.dialogue_waits_for_ship_motion = waits;
-                        rebuild_replay_timeline_with_ships(replay, ship_trajectory_history, camera);
-                    }
-                    studio.playback_ms = 0;
-                    studio.status = "飞船移动节奏已更新".to_owned();
-                }
             });
-        });
+        }
     }
-
     ui.separator();
     if replay_has_live_take(studio) {
         ui.small("请先保存或取消本次录制，再调整时间轴、应用导演方案、保存/载入项目或导出视频。");
     }
     ui.add_enabled_ui(!replay_has_live_take(studio), |ui| {
-    ui.collapsing("DeepSeek 视频导演", |ui| {
+    if studio.workspace_tab == ReplayWorkspaceTab::Director {
+    ui.heading("DeepSeek 视频导演");
     ui.small("DeepSeek 可直接润色当前回放中已勾选的台词，并为每句选择固定构图或缓慢推拉；选择“全部 / All”时，上传内容也会包含队伍隐藏消息、玩家私聊、GM 与系统台词。三人及以上时，本地镜头会优先放在队伍正面的中央位置，避免从侧面拍摄时角色互相遮挡；镜头只平滑移动位置，不环绕角色。它还会生成只供 EmotiVoice 使用的中文谐音读法，画面字幕仍显示正常原文，并且不得新增剧情事实。");
     let visible_standees = standees
         .iter()
@@ -4102,6 +4155,11 @@ fn replay_controls(
             }
         }
     }
+    ui.small("只有开启“录制 DM 自由镜头”才会持续采集镜头。DeepSeek 导演开启后会等待 API 返回，再应用润色台词和镜头决策。");
+    ui.small(
+        "较长回放会自动分批交给 DeepSeek，再按原台词顺序合并；单个批次若被截断会继续拆分重试。",
+    );
+    }
     let director_applied = match apply_ready_director_plan(
         studio,
         deepseek_manager,
@@ -4126,18 +4184,14 @@ fn replay_controls(
             ship_trajectory_history,
         );
     }
-    ui.small("只有开启“录制 DM 自由镜头”才会持续采集镜头。DeepSeek 导演开启后会等待 API 返回，再应用润色台词和镜头决策。");
-    ui.small(
-        "较长回放会自动分批交给 DeepSeek，再按原台词顺序合并；单个批次若被截断会继续拆分重试。",
-    );
-    });
 
+    if studio.workspace_tab == ReplayWorkspaceTab::Export {
     ui.separator();
     ui.heading("导出 MP4 视频");
     ui.collapsing("视频、背景音乐与角色语音设置", |ui| {
     ui.label("视频路径");
     ui.text_edit_singleline(&mut studio.video_path);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("帧率");
         for (fps, label) in [
             (12, "12 FPS 极速"),
@@ -4149,7 +4203,7 @@ fn replay_controls(
             ui.selectable_value(&mut studio.video_fps, fps, label);
         }
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let music_available = studio
             .music_file
             .as_ref()
@@ -4164,7 +4218,7 @@ fn replay_controls(
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("曲目");
         ui.add_enabled_ui(!studio.music_files.is_empty(), |ui| {
             egui::ComboBox::from_id_salt("replay-background-music")
@@ -4209,7 +4263,7 @@ fn replay_controls(
     ui.small(
         "从 assets/audio 加载 MP3、WAV、OGG、FLAC、M4A 或 AAC；音乐只在本地读取，不由 AI 生成。",
     );
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.checkbox(
             &mut studio.speech_enabled,
             "角色语音（预览与导出，EmotiVoice 固定中文音色）",
@@ -4276,7 +4330,7 @@ fn replay_controls(
     let can_export_video = studio.replay.is_some()
         && studio.video_encoding.is_none()
         && studio.mode != ReplayMode::Recording;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(
                 can_export_video,
@@ -4379,6 +4433,8 @@ fn replay_controls(
     ui.small("一键模式会自动完成：读取可见聊天 → DeepSeek 润色逐句台词并选择镜头 → 本地验证和生成平滑轨迹 → 逐帧渲染 → FFmpeg 输出 MP4。");
     ui.small("导出时会隐藏编辑器界面，逐帧渲染台词层，再用 FFmpeg 编码 H.264/AAC 视频。按 Esc 可取消逐帧渲染。");
 
+    }
+    if studio.workspace_tab == ReplayWorkspaceTab::Project {
     ui.collapsing(
         "回放项目数据（JSON，可选）",
         |ui| {
@@ -4424,6 +4480,7 @@ fn replay_controls(
             }
         },
     );
+    }
     });
     if !studio.status.is_empty() {
         ui.small(studio.status.as_str());
@@ -12640,6 +12697,7 @@ fn dialogue_overlay(
     ctx: &egui::Context,
     dialogue: &ReplayDialogue,
     textures: &mut HashMap<String, egui::TextureHandle>,
+    preview: Option<egui::Rect>,
 ) {
     let screen = ctx.content_rect();
     let box_height = (screen.height() * 0.27).clamp(150.0, 290.0);
@@ -12658,6 +12716,14 @@ fn dialogue_overlay(
         egui::Order::Foreground,
         egui::Id::new("replay-dialogue"),
     );
+    let transform = preview.map_or(TSTransform::IDENTITY, |preview| {
+        let scale = preview.width() / screen.width().max(1.0);
+        TSTransform::new(
+            preview.min.to_vec2() - screen.min.to_vec2() * scale,
+            scale,
+        )
+    });
+    ctx.set_transform_layer(layer, transform);
     let painter = ctx.layer_painter(layer);
     let accent = speaker_accent(dialogue.sender_id);
     painter.rect_filled(

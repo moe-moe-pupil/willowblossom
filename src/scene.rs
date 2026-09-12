@@ -112,6 +112,11 @@ use crate::{
         PlanetAtmosphereMaterial,
         PlanetAtmospherePlugin,
     },
+    replay::{
+        replay_auxiliary_ui_visible,
+        ReplayStudio,
+        ReplayVideoCaptureActive,
+    },
 };
 
 pub struct ScenePreviewPlugin;
@@ -1760,10 +1765,10 @@ impl Plugin for ScenePreviewPlugin {
             .add_systems(
                 EguiPrimaryContextPass,
                 (
-                    voxel_editor_panel,
-                    voxel_minimap_panel,
-                    scene_waypoint_panel,
-                    unit_scene_token_panel,
+                    voxel_editor_panel.run_if(replay_auxiliary_ui_visible),
+                    voxel_minimap_panel.run_if(replay_auxiliary_ui_visible),
+                    scene_waypoint_panel.run_if(replay_auxiliary_ui_visible),
+                    unit_scene_token_panel.run_if(replay_auxiliary_ui_visible),
                     capture_camera_panel,
                 ),
             );
@@ -5758,11 +5763,9 @@ fn capture_camera_panel(
         &mut Transform,
         &PlayerCaptureCamera,
     )>,
+    studio: Option<Res<ReplayStudio>>,
+    capture_active: Option<Res<ReplayVideoCaptureActive>>,
 ) {
-    let Ok(ctx) = contexts.ctx_mut() else {
-        return;
-    };
-
     let default_transform = free_camera
         .single_mut()
         .map(|transform| *transform)
@@ -5793,6 +5796,15 @@ fn capture_camera_panel(
             }
         }
     }
+
+    // Group camera creation and persistence must continue while replay editing
+    // or capture hides this auxiliary window.
+    if !replay_auxiliary_ui_visible(studio, capture_active) {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
 
     let camera_ids = capture_cameras
         .iter()

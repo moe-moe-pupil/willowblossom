@@ -20,6 +20,8 @@ use serde_json::{
     Value,
 };
 
+use crate::replay::replay_auxiliary_ui_visible;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuleModifier {
     pub source: String,
@@ -64,7 +66,7 @@ impl Plugin for RuleEnginePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<RuleEngineState>().add_systems(
             EguiPrimaryContextPass,
-            rule_engine_panel.run_if(crate::replay::replay_video_capture_inactive),
+            rule_engine_panel.run_if(replay_auxiliary_ui_visible),
         );
     }
 }

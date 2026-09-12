@@ -30,6 +30,7 @@ use bevy::{
     camera::{
         primitives::Aabb,
         visibility::RenderLayers,
+        CameraOutputMode,
         RenderTarget,
     },
     core_pipeline::prepass::DepthPrepass,
@@ -67,6 +68,7 @@ use bevy::{
     prelude::*,
     render::{
         render_resource::{
+            BlendState,
             Extent3d,
             Face,
             TextureDimension,
@@ -122,6 +124,7 @@ use crate::{
         PlanetAtmosphereMaterial,
         PlanetAtmospherePlugin,
     },
+    replay::replay_auxiliary_ui_visible,
     rule_engine::{
         parse_rule,
         Action,
@@ -2891,7 +2894,7 @@ impl Plugin for TrpgVoxelPlugin {
             )
                 .chain()
                 .after(crate::ui::ui_system)
-                .run_if(crate::replay::replay_video_capture_inactive),
+                .run_if(replay_auxiliary_ui_visible),
         );
     }
 }
@@ -8433,13 +8436,41 @@ fn setup_voxel_view(
         editor_camera_transform(&editor),
         RenderLayers::from_layers(&[0, VOXEL_DM_GIZMO_RENDER_LAYER]),
         VoxelViewportCamera,
-        // Render egui through this camera's target so the 3D clear pass resets
-        // the UI every frame before egui is composited after post-processing.
-        PrimaryEguiContext,
         VoxelRadianceCascade {
             volume: radiance_volume.image.clone(),
         },
         radiance_volume.uniform(editor.radiance_intensity),
+    ));
+    // Clear the entire target even when the replay composition occupies only
+    // part of the window. Old UI and scene pixels cannot survive a panel resize.
+    commands.spawn((
+        Name::new("Viewport background"),
+        Camera2d,
+        Msaa::Off,
+        RenderLayers::none(),
+        Camera {
+            order: -1,
+            clear_color: ClearColorConfig::Custom(Color::srgb(0.055, 0.065, 0.075)),
+            ..default()
+        },
+    ));
+    // Keep egui in window coordinates while the composition camera changes its
+    // viewport. Alpha output preserves the scene already drawn underneath it.
+    commands.spawn((
+        Name::new("Viewport UI"),
+        PrimaryEguiContext,
+        Camera2d,
+        Msaa::Off,
+        RenderLayers::none(),
+        Camera {
+            order: 1,
+            output_mode: CameraOutputMode::Write {
+                blend_state: Some(BlendState::ALPHA_BLENDING),
+                clear_color: ClearColorConfig::None,
+            },
+            clear_color: ClearColorConfig::Custom(Color::NONE),
+            ..default()
+        },
     ));
     spawn_voxel_orbital_planet(
         &mut commands,
