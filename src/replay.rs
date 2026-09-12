@@ -1,11 +1,26 @@
+#[cfg(test)]
+mod gpu_tests;
+mod inspector;
 mod timeline;
+#[cfg(test)]
+mod ui_render;
+#[cfg(test)]
+mod ui_tests;
 mod viewport;
 mod workspace;
 
+use inspector::selected_dialogue_inspector;
 use timeline::replay_timeline_ui;
-pub(crate) use viewport::replay_auxiliary_ui_visible;
+pub(crate) use viewport::{
+    replay_auxiliary_ui_visible,
+    replay_ui_camera,
+};
 use viewport::update_replay_preview_viewport;
-use workspace::{workspace_header, workspace_preview, ReplayWorkspaceTab};
+use workspace::{
+    workspace_header,
+    workspace_preview,
+    ReplayWorkspaceTab,
+};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -1155,6 +1170,7 @@ impl Default for ReplayMode {
 
 #[derive(Resource)]
 pub(crate) struct ReplayStudio {
+    selected_dialogue_id: Option<u64>,
     preview_rect: Option<egui::Rect>,
     workspace_tab: ReplayWorkspaceTab,
     mode: ReplayMode,
@@ -1286,6 +1302,7 @@ impl Default for ReplayStudio {
         let music_files = discover_background_music();
         let music_file = music_files.first().cloned();
         Self {
+            selected_dialogue_id: None,
             preview_rect: None,
             workspace_tab: ReplayWorkspaceTab::default(),
             mode: ReplayMode::Idle,
@@ -3811,6 +3828,7 @@ fn replay_controls(
         }
     }
     if studio.workspace_tab == ReplayWorkspaceTab::Edit {
+        selected_dialogue_inspector(ui, studio);
         replay_live_edit_panel(ui, studio, live_edits, standees);
         ui.add_enabled_ui(!replay_has_live_take(studio), |ui| {
             replay_dialogue_editor(ui, studio, camera);
@@ -6562,7 +6580,7 @@ fn replay_dialogue_editor(
                         let (drop_zone, dropped) = ui.dnd_drop_zone::<ReplayDialogueDrag, _>(
                             egui::Frame::group(ui.style()),
                             |ui| {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.dnd_drag_source(
                                     egui::Id::new(("replay-dialogue-drag", line.line_id)),
                                     ReplayDialogueDrag {

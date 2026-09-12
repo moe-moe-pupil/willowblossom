@@ -31,6 +31,9 @@ use bevy_egui::egui::{
     Slider,
     Stroke,
     Ui,
+    UiBuilder,
+    WidgetInfo,
+    WidgetType,
 };
 use serde_json::{
     from_slice,
@@ -39,7 +42,6 @@ use serde_json::{
 use voxxelmaxx::prelude::Grid;
 
 use super::{
-    format_time,
     frame_time_ms,
     invalidate_replay_timeline,
     prepare_replay_movement_for_playback,
@@ -61,6 +63,7 @@ use super::{
     ReplayStandeePosition,
     ReplayStudio,
     ReplayTerrainChange,
+    ReplayWorkspaceTab,
     TrpgVoxelGrid,
     MAX_LIVE_DIALOGUE_MS,
     MIN_LIVE_DIALOGUE_MS,
@@ -69,11 +72,14 @@ use super::{
 #[derive(Clone)]
 struct TimelineView {
     zoom: f32,
-    selected: Option<(usize, usize)>,
+    selected: Option<Id>,
     duration_seconds: Option<f64>,
     snap: bool,
     trim: Option<TrimGesture>,
     history: TimelineHistory,
+    follow_playhead: bool,
+    scroll_x: f32,
+    last_playback_ms: Option<u64>,
 }
 
 impl Default for TimelineView {
@@ -85,11 +91,15 @@ impl Default for TimelineView {
             snap: true,
             trim: None,
             history: TimelineHistory::default(),
+            follow_playhead: true,
+            scroll_x: 0.0,
+            last_playback_ms: None,
         }
     }
 }
 
 struct Clip {
+    id: Id,
     start: u64,
     end: u64,
     label: String,
@@ -203,12 +213,25 @@ impl TimelineHistory {
                 replay.created_at_unix_ms,
             )
         });
-        let changed = self.project != project || self.revision != studio.timeline_revision;
+        let project_changed = self.project != project;
+        let changed = project_changed || self.revision != studio.timeline_revision;
         if changed {
+            // Entering preview invalidates playback caches even when the authored
+            // tracks are unchanged. That transition must not discard edit history.
+            let expected = self
+                .undo
+                .last()
+                .map(|edit| edit.after.fingerprint)
+                .or_else(|| self.redo.last().map(|edit| edit.before.fingerprint));
+            let authored_changed = expected.is_some_and(|fingerprint| {
+                studio.replay.as_ref().and_then(timeline_fingerprint) != Some(fingerprint)
+            });
+            if project_changed || authored_changed {
+                self.undo.clear();
+                self.redo.clear();
+            }
             self.project = project;
             self.revision = studio.timeline_revision;
-            self.undo.clear();
-            self.redo.clear();
         }
         changed
     }
@@ -353,6 +376,18 @@ fn time_at_x(x: f32, left: f32, width: f32, duration: u64) -> u64 {
     (((x - left) / width.max(1.0)).clamp(0.0, 1.0) as f64 * duration as f64).round() as u64
 }
 
+fn reveal_playhead_offset(target: f32, offset: f32, visible: f32, content: f32) -> f32 {
+    let margin = visible * 0.1;
+    let next = if target < offset + margin {
+        target - margin
+    } else if target > offset + visible - margin {
+        target - visible + margin
+    } else {
+        offset
+    };
+    next.clamp(0.0, (content - visible).max(0.0))
+}
+
 fn adjacent_frame(time: u64, fps: u32, forward: bool) -> u64 {
     let fps = fps.max(1) as u64;
     // Export timestamps round down to milliseconds. Recover the frame index
@@ -368,6 +403,50 @@ fn adjacent_frame(time: u64, fps: u32, forward: bool) -> u64 {
     }
 }
 
+fn timeline_timecode(time_ms: u64, fps: u32) -> String {
+    let fps = u64::from(fps.max(1));
+    // Match export's millisecond truncation without displaying the previous frame.
+    let frame = time_ms
+        .saturating_add(1)
+        .saturating_mul(fps)
+        .div_ceil(1000)
+        .saturating_sub(1);
+    let seconds = frame / fps;
+    format!(
+        "{:02}:{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds / 60) % 60,
+        seconds % 60,
+        frame % fps,
+    )
+}
+
+fn timeline_time_label(time_ms: u64) -> String {
+    format!(
+        "{:02}:{:02}.{:03}",
+        time_ms / 60_000,
+        (time_ms / 1000) % 60,
+        time_ms % 1000,
+    )
+}
+
+fn ruler_tick_step(extent: u64, width: f32) -> u64 {
+    let minimum = (extent as f64 * 105.0 / width.max(1.0) as f64).ceil() as u64;
+    let mut magnitude = 1_u64;
+    loop {
+        for multiple in [1, 2, 5] {
+            let step = magnitude.saturating_mul(multiple);
+            if step >= minimum {
+                return step;
+            }
+        }
+        if magnitude > u64::MAX / 10 {
+            return u64::MAX;
+        }
+        magnitude *= 10;
+    }
+}
+
 pub(super) fn replay_timeline_ui(
     ui: &mut Ui,
     studio: &mut ReplayStudio,
@@ -378,8 +457,22 @@ pub(super) fn replay_timeline_ui(
     let ctx = ui.ctx().clone();
     let id = Id::new("replay-multitrack-view");
     let mut view = ctx.data_mut(|data| data.get_temp::<TimelineView>(id).unwrap_or_default());
-    if view.history.synchronize(studio) {
+    let mut playhead_changed = view.last_playback_ms != Some(studio.playback_ms);
+    // Remember the incoming time so a seek made while drawing this frame is
+    // revealed next frame, including a partially visible clip's offscreen start.
+    view.last_playback_ms = Some(studio.playback_ms);
+    let project = studio.replay.as_ref().map(|replay| {
+        (
+            replay.campaign_id.clone(),
+            replay.created_at_unix_ms,
+        )
+    });
+    if view.history.project != project {
+        playhead_changed = true;
         view.selected = None;
+        studio.selected_dialogue_id = None;
+    }
+    if view.history.synchronize(studio) {
         view.duration_seconds = None;
         view.trim = None;
     }
@@ -402,6 +495,7 @@ pub(super) fn replay_timeline_ui(
                 .enumerate()
                 .filter(|(_, line)| replay_dialogue_is_playable(line))
                 .map(|(index, line)| Clip {
+                    id: Id::new(("dialogue", line.line_id)),
                     start: line.time_ms,
                     end: line.time_ms.saturating_add(line.duration_ms),
                     label: format!("{}：{}", line.name, line.text),
@@ -416,6 +510,7 @@ pub(super) fn replay_timeline_ui(
                 .camera
                 .iter()
                 .map(|frame| Clip {
+                    id: Id::new(("camera", frame.time_ms)),
                     start: frame.time_ms,
                     end: frame.time_ms,
                     label: "镜头关键帧".into(),
@@ -423,6 +518,7 @@ pub(super) fn replay_timeline_ui(
                 })
                 .chain(
                     replay.camera_cuts.iter().map(|cut| Clip {
+                        id: Id::new(("cut", cut.time_ms)),
                         start: cut.time_ms,
                         end: cut.time_ms,
                         label: "手动切镜".into(),
@@ -441,6 +537,7 @@ pub(super) fn replay_timeline_ui(
                 .first()
                 .zip(movement.keyframes.last())
                 .map(|(first, last)| Clip {
+                    id: Id::new(("player", movement.user_id)),
                     start: first.time_ms,
                     end: last.time_ms,
                     label: format!(
@@ -462,6 +559,7 @@ pub(super) fn replay_timeline_ui(
                 .first()
                 .zip(ship.keyframes.last())
                 .map(|(first, last)| Clip {
+                    id: Id::new(("ship", &ship.ship_id)),
                     start: first.time_ms,
                     end: last.time_ms,
                     label: format!(
@@ -496,6 +594,7 @@ pub(super) fn replay_timeline_ui(
         clips: events
             .into_iter()
             .map(|(time, count)| Clip {
+                id: Id::new(("event", time)),
                 start: time,
                 end: time,
                 label: format!("场景修改 · {count} 个体素"),
@@ -504,6 +603,8 @@ pub(super) fn replay_timeline_ui(
             .collect(),
     });
     let mut seek = None;
+    let mut toggle_playback = false;
+    let mut zoom_changed = false;
     let mut trim_request = None;
     let mut undo = false;
     let mut redo = false;
@@ -523,13 +624,33 @@ pub(super) fn replay_timeline_ui(
             ) || input.consume_key(Modifiers::COMMAND, Key::Y)
         });
         undo = !redo && ui.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::Z));
+        if view.trim.is_none() {
+            ui.input_mut(|input| {
+                toggle_playback = input.consume_key(Modifiers::NONE, Key::Space);
+                if input.consume_key(Modifiers::NONE, Key::Home) {
+                    seek = Some(0);
+                }
+                if input.consume_key(Modifiers::NONE, Key::End) {
+                    seek = Some(duration);
+                }
+                let previous = input.consume_key(Modifiers::NONE, Key::ArrowLeft);
+                let next = input.consume_key(Modifiers::NONE, Key::ArrowRight);
+                if previous || next {
+                    let mut time = studio.playback_ms;
+                    for _ in 0..if input.modifiers.shift { 10 } else { 1 } {
+                        time = adjacent_frame(time, studio.video_fps, next);
+                    }
+                    seek = Some(time.min(duration));
+                }
+            });
+        }
     }
     ui.horizontal_wrapped(|ui| {
         ui.strong(&title);
         ui.monospace(format!(
             "{} / {}",
-            format_time(studio.playback_ms),
-            format_time(duration)
+            timeline_timecode(studio.playback_ms, studio.video_fps),
+            timeline_timecode(duration, studio.video_fps)
         ));
         ui.add_enabled_ui(enabled, |ui| {
             if ui.button("⏮ 片头").clicked() {
@@ -546,22 +667,7 @@ pub(super) fn replay_timeline_ui(
                 .button(if studio.mode == ReplayMode::Playing { "暂停" } else { "▶ 播放" })
                 .clicked()
             {
-                match studio.mode {
-                    ReplayMode::Playing => studio.mode = ReplayMode::Paused,
-                    ReplayMode::Paused => {
-                        if studio.playback_ms >= duration {
-                            studio.playback_ms = 0;
-                        }
-                        studio.mode = ReplayMode::Playing;
-                    },
-                    ReplayMode::Idle => {
-                        let time = studio.playback_ms;
-                        prepare_replay_movement_for_playback(studio, player_history, ship_history);
-                        start_playback(studio, grids);
-                        studio.playback_ms = time.min(duration);
-                    },
-                    ReplayMode::Recording => {},
-                }
+                toggle_playback = true;
             }
             if ui.button("后一帧 ▶").clicked() {
                 seek = Some(
@@ -574,15 +680,19 @@ pub(super) fn replay_timeline_ui(
                 );
             }
         });
-        ui.add(
-            Slider::new(&mut view.zoom, 1.0..=20.0)
-                .text("缩放")
-                .logarithmic(true),
-        );
+        zoom_changed = ui
+            .add(
+                Slider::new(&mut view.zoom, 1.0..=20.0)
+                    .text("缩放")
+                    .logarithmic(true),
+            )
+            .changed();
         if ui.button("适合全部").clicked() {
             view.zoom = 1.0;
+            zoom_changed = true;
         }
         ui.checkbox(&mut view.snap, "帧吸附");
+        ui.checkbox(&mut view.follow_playhead, "跟随播放头");
         undo |= ui
             .add_enabled(
                 enabled && !view.history.undo.is_empty(),
@@ -598,9 +708,30 @@ pub(super) fn replay_timeline_ui(
             .on_hover_text("重做台词修剪 · Ctrl+Shift+Z / Ctrl+Y")
             .clicked();
     });
-    let selected_clip = view
-        .selected
-        .and_then(|(row, index)| tracks.get(row)?.clips.get(index));
+    if toggle_playback {
+        match studio.mode {
+            ReplayMode::Playing => studio.mode = ReplayMode::Paused,
+            ReplayMode::Paused => {
+                if studio.playback_ms >= duration {
+                    studio.playback_ms = 0;
+                }
+                studio.mode = ReplayMode::Playing;
+            },
+            ReplayMode::Idle => {
+                let time = studio.playback_ms;
+                prepare_replay_movement_for_playback(studio, player_history, ship_history);
+                start_playback(studio, grids);
+                studio.playback_ms = time.min(duration);
+            },
+            ReplayMode::Recording => {},
+        }
+    }
+    let selected_clip = view.selected.and_then(|selected| {
+        tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .find(|clip| clip.id == selected)
+    });
     // Keep the inspector present before selection so a first edge drag does not
     // move the track vertically underneath the pointer.
     ui.horizontal_wrapped(|ui| {
@@ -614,10 +745,19 @@ pub(super) fn replay_timeline_ui(
         );
         ui.monospace(format!(
             "{} — {}",
-            format_time(selected_clip.map_or(0, |clip| clip.start)),
-            format_time(selected_clip.map_or(0, |clip| clip.end))
+            timeline_time_label(selected_clip.map_or(0, |clip| clip.start)),
+            timeline_time_label(selected_clip.map_or(0, |clip| clip.end))
         ));
         let dialogue_index = selected_clip.and_then(|clip| clip.dialogue_index);
+        if ui
+            .add_enabled(
+                enabled && dialogue_index.is_some(),
+                Button::new("编辑台词"),
+            )
+            .clicked()
+        {
+            studio.workspace_tab = ReplayWorkspaceTab::Edit;
+        }
         let seconds = view
             .duration_seconds
             .get_or_insert(selected_clip.map_or(0.1, |clip| {
@@ -651,204 +791,256 @@ pub(super) fn replay_timeline_ui(
         "拖动标尺定位；拖动台词右边缘修剪，后续轨道同步移动。Shift 临时关闭帧吸附；Esc 取消拖动。",
     );
     let viewport_width = ui.available_width();
-    ScrollArea::both()
+    let label_width = 145.0;
+    let visible_width = (viewport_width - label_width).max(1.0);
+    let width = visible_width * view.zoom;
+    let mut scroll_area = ScrollArea::both()
         .id_salt("replay-tracks-scroll")
         .auto_shrink([false, false])
-        .max_height(ui.available_height().max(60.0))
-        .show(ui, |ui| {
-            let label_width = 145.0;
-            let width = (viewport_width - label_width).max(220.0) * view.zoom;
-            let (rect, _) = ui.allocate_exact_size(
-                vec2(
-                    label_width + width,
-                    30.0 + tracks.len() as f32 * 32.0,
-                ),
-                Sense::hover(),
-            );
-            let left = rect.left() + label_width;
-            let x_at = |time: u64| left + (time as f64 / extent as f64) as f32 * width;
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 0.0, Color32::from_rgb(24, 27, 33));
-            let ruler = Rect::from_min_max(
-                pos2(left, rect.top()),
-                pos2(rect.right(), rect.top() + 30.0),
-            );
-            let response = ui.interact(
-                ruler,
-                id.with("ruler"),
-                Sense::click_and_drag(),
-            );
-            if enabled && (response.clicked() || response.dragged()) {
-                if let Some(pointer) = response.interact_pointer_pos() {
-                    seek = Some(time_at_x(pointer.x, left, width, extent).min(duration));
-                }
+        .max_height(ui.available_height().max(60.0));
+    if view.follow_playhead
+        && (studio.mode == ReplayMode::Playing
+            || playhead_changed
+            || seek.is_some()
+            || zoom_changed)
+    {
+        let target = seek.unwrap_or(studio.playback_ms) as f64 / extent as f64 * width as f64;
+        scroll_area = scroll_area.horizontal_scroll_offset(reveal_playhead_offset(
+            target as f32,
+            view.scroll_x,
+            visible_width,
+            width,
+        ));
+    }
+    let scroll = scroll_area.show_viewport(ui, |ui, viewport| {
+        let (rect, _) = ui.allocate_exact_size(
+            vec2(
+                label_width + width,
+                30.0 + tracks.len() as f32 * 32.0,
+            ),
+            Sense::hover(),
+        );
+        let visible = Rect::from_min_size(
+            rect.min + viewport.min.to_vec2(),
+            viewport.size(),
+        )
+        .intersect(ui.clip_rect());
+        let plot_clip = Rect::from_min_max(
+            pos2(
+                visible.left() + label_width,
+                visible.top() + 30.0,
+            ),
+            visible.max,
+        );
+        let mut plot_ui = ui.new_child(UiBuilder::new().max_rect(rect).id_salt("track-plot"));
+        plot_ui.set_clip_rect(plot_clip);
+        let left = rect.left() + label_width;
+        let x_at = |time: u64| left + (time as f64 / extent as f64) as f32 * width;
+        let full_painter = ui.painter_at(visible);
+        let painter = ui.painter_at(plot_clip);
+        full_painter.rect_filled(
+            visible,
+            0.0,
+            Color32::from_rgb(24, 27, 33),
+        );
+        let ruler = Rect::from_min_max(
+            pos2(plot_clip.left(), visible.top()),
+            pos2(visible.right(), visible.top() + 30.0),
+        );
+        let response = ui.interact(
+            ruler,
+            id.with("ruler"),
+            Sense::click_and_drag(),
+        );
+        if enabled && (response.clicked() || response.dragged()) {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                seek = Some(time_at_x(pointer.x, left, width, extent).min(duration));
             }
-            let ticks = (width / 95.0).ceil().max(1.0) as u64;
-            for tick in 0..=ticks {
-                let time = (extent as f64 * tick as f64 / ticks as f64) as u64;
-                let x = x_at(time);
-                painter.line_segment(
-                    [pos2(x, rect.top() + 22.0), pos2(x, rect.bottom())],
-                    Stroke::new(1.0, Color32::from_gray(48)),
-                );
-                painter.text(
-                    pos2(x + 3.0, rect.top() + 3.0),
-                    Align2::LEFT_TOP,
-                    format_time(time),
-                    FontId::monospace(11.0),
+        }
+        let step = ruler_tick_step(extent, width);
+        let ticks = extent / step;
+        for tick in 0..=ticks {
+            let time = tick * step;
+            let x = x_at(time);
+            painter.line_segment(
+                [pos2(x, rect.top() + 22.0), pos2(x, rect.bottom())],
+                Stroke::new(1.0, Color32::from_gray(48)),
+            );
+            full_painter.with_clip_rect(ruler).text(
+                pos2(x + 3.0, visible.top() + 3.0),
+                Align2::LEFT_TOP,
+                timeline_time_label(time),
+                FontId::monospace(11.0),
+                Color32::LIGHT_GRAY,
+            );
+        }
+        for (row, track) in tracks.iter().enumerate() {
+            let top = rect.top() + 30.0 + row as f32 * 32.0;
+            full_painter
+                .with_clip_rect(Rect::from_min_max(
+                    pos2(visible.left(), visible.top() + 30.0),
+                    pos2(plot_clip.left() - 4.0, visible.bottom()),
+                ))
+                .text(
+                    pos2(visible.left() + 6.0, top + 15.0),
+                    Align2::LEFT_CENTER,
+                    &track.name,
+                    FontId::proportional(12.0),
                     Color32::LIGHT_GRAY,
                 );
-            }
-            for (row, track) in tracks.iter().enumerate() {
-                let top = rect.top() + 30.0 + row as f32 * 32.0;
-                painter
-                    .with_clip_rect(Rect::from_min_max(
-                        pos2(rect.left(), top),
-                        pos2(left - 4.0, top + 32.0),
-                    ))
-                    .text(
-                        pos2(rect.left() + 6.0, top + 15.0),
-                        Align2::LEFT_CENTER,
-                        &track.name,
-                        FontId::proportional(12.0),
-                        Color32::LIGHT_GRAY,
-                    );
-                for (index, clip) in track.clips.iter().enumerate() {
-                    let preview = view
-                        .trim
-                        .filter(|trim| Some(trim.dialogue_index) == clip.dialogue_index);
-                    let clip_end = preview.map_or(clip.end, |trim| {
-                        trim.start.saturating_add(trim.duration_ms)
+            for clip in &track.clips {
+                let preview = view
+                    .trim
+                    .filter(|trim| Some(trim.dialogue_index) == clip.dialogue_index);
+                let clip_end = preview.map_or(clip.end, |trim| {
+                    trim.start.saturating_add(trim.duration_ms)
+                });
+                let clip_left = x_at(clip.start.min(extent)).min(rect.right() - 5.0);
+                let clip_rect = Rect::from_min_max(
+                    pos2(clip_left, top + 3.0),
+                    pos2(
+                        (x_at(clip_end.min(extent)).max(clip_left + 5.0)).min(rect.right()),
+                        top + 28.0,
+                    ),
+                );
+                if !plot_clip.intersects(clip_rect) && preview.is_none() {
+                    continue;
+                }
+                let selected = view.selected == Some(clip.id);
+                painter.rect_filled(
+                    clip_rect,
+                    2.0,
+                    if selected { Color32::from_rgb(180, 145, 55) } else { track.color },
+                );
+                if clip_rect.width() > 35.0 {
+                    let preview_label = preview.map(|trim| {
+                        format!(
+                            "时长 {:.3} 秒",
+                            trim.duration_ms as f64 / 1000.0
+                        )
                     });
-                    let clip_left = x_at(clip.start.min(extent)).min(rect.right() - 5.0);
-                    let clip_rect = Rect::from_min_max(
-                        pos2(clip_left, top + 3.0),
+                    painter.with_clip_rect(clip_rect.shrink(2.0)).text(
+                        clip_rect.left_center() + vec2(4.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        preview_label.as_deref().unwrap_or(&clip.label),
+                        FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                }
+                let mut body_rect = clip_rect;
+                if clip.dialogue_index.is_some() {
+                    body_rect.max.x = (body_rect.right() - 8.0).max(body_rect.left());
+                }
+                let response = plot_ui.interact(
+                    body_rect,
+                    id.with(clip.id),
+                    Sense::click(),
+                );
+                response
+                    .widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &clip.label));
+                if response.clicked() && enabled {
+                    view.selected = Some(clip.id);
+                    studio.selected_dialogue_id = clip
+                        .dialogue_index
+                        .map(|index| studio.replay.as_ref().unwrap().dialogue[index].line_id);
+                    view.duration_seconds = None;
+                    seek = Some(clip.start);
+                }
+                response.on_hover_text(format!(
+                    "{}\n{} — {}",
+                    clip.label,
+                    timeline_time_label(clip.start),
+                    timeline_time_label(clip.end)
+                ));
+                if let Some(dialogue_index) = clip.dialogue_index {
+                    let handle = Rect::from_min_max(
                         pos2(
-                            (x_at(clip_end.min(extent)).max(clip_left + 5.0)).min(rect.right()),
-                            top + 28.0,
+                            (clip_rect.right() - 8.0).max(clip_rect.left()),
+                            clip_rect.top(),
                         ),
+                        clip_rect.max,
                     );
-                    if !ui.is_rect_visible(clip_rect) {
-                        continue;
-                    }
-                    let selected = view.selected == Some((row, index));
                     painter.rect_filled(
-                        clip_rect,
-                        2.0,
-                        if selected { Color32::from_rgb(180, 145, 55) } else { track.color },
+                        handle.shrink2(vec2(2.0, 5.0)),
+                        1.0,
+                        Color32::from_white_alpha(135),
                     );
-                    if clip_rect.width() > 35.0 {
-                        let preview_label = preview.map(|trim| {
-                            format!(
-                                "时长 {:.3} 秒",
-                                trim.duration_ms as f64 / 1000.0
-                            )
-                        });
-                        painter.with_clip_rect(clip_rect.shrink(2.0)).text(
-                            clip_rect.left_center() + vec2(4.0, 0.0),
-                            Align2::LEFT_CENTER,
-                            preview_label.as_deref().unwrap_or(&clip.label),
-                            FontId::proportional(12.0),
-                            Color32::WHITE,
-                        );
-                    }
-                    let mut body_rect = clip_rect;
-                    if clip.dialogue_index.is_some() {
-                        body_rect.max.x = (body_rect.right() - 8.0).max(body_rect.left());
-                    }
-                    let response = ui.interact(
-                        body_rect,
-                        id.with((row, index)),
-                        Sense::click(),
-                    );
-                    if response.clicked() && enabled {
-                        view.selected = Some((row, index));
+                    let response = plot_ui
+                        .interact(
+                            handle,
+                            id.with(("trim", clip.id)),
+                            Sense::click_and_drag(),
+                        )
+                        .on_hover_cursor(CursorIcon::ResizeHorizontal)
+                        .on_hover_text("拖动句尾修剪时长；后续台词、镜头、移动和事件同步移动");
+                    if enabled && response.clicked() {
+                        view.selected = Some(clip.id);
+                        studio.selected_dialogue_id = clip
+                            .dialogue_index
+                            .map(|index| studio.replay.as_ref().unwrap().dialogue[index].line_id);
                         view.duration_seconds = None;
                         seek = Some(clip.start);
                     }
-                    response.on_hover_text(format!(
-                        "{}\n{} — {}",
-                        clip.label,
-                        format_time(clip.start),
-                        format_time(clip.end)
-                    ));
-                    if let Some(dialogue_index) = clip.dialogue_index {
-                        let handle = Rect::from_min_max(
-                            pos2(
-                                (clip_rect.right() - 8.0).max(clip_rect.left()),
-                                clip_rect.top(),
-                            ),
-                            clip_rect.max,
-                        );
-                        painter.rect_filled(
-                            handle.shrink2(vec2(2.0, 5.0)),
-                            1.0,
-                            Color32::from_white_alpha(135),
-                        );
-                        let response = ui
-                            .interact(
-                                handle,
-                                id.with(("trim", dialogue_index)),
-                                Sense::click_and_drag(),
-                            )
-                            .on_hover_cursor(CursorIcon::ResizeHorizontal)
-                            .on_hover_text("拖动句尾修剪时长；后续台词、镜头、移动和事件同步移动");
-                        if enabled && response.clicked() {
-                            view.selected = Some((row, index));
-                            view.duration_seconds = None;
-                            seek = Some(clip.start);
+                    if enabled && response.drag_started() {
+                        view.selected = Some(clip.id);
+                        studio.selected_dialogue_id = clip
+                            .dialogue_index
+                            .map(|index| studio.replay.as_ref().unwrap().dialogue[index].line_id);
+                        view.duration_seconds = None;
+                        if studio.mode == ReplayMode::Playing {
+                            studio.mode = ReplayMode::Paused;
                         }
-                        if enabled && response.drag_started() {
-                            view.selected = Some((row, index));
-                            view.duration_seconds = None;
-                            if studio.mode == ReplayMode::Playing {
-                                studio.mode = ReplayMode::Paused;
+                        view.trim = Some(TrimGesture {
+                            dialogue_index,
+                            start: clip.start,
+                            end: clip.end,
+                            width,
+                            extent,
+                            duration_ms: clip.end - clip.start,
+                        });
+                    }
+                    if enabled && (response.dragged() || response.drag_stopped()) {
+                        if let Some(trim) = view
+                            .trim
+                            .as_mut()
+                            .filter(|trim| trim.dialogue_index == dialogue_index)
+                        {
+                            if let Some(delta) = response.total_drag_delta() {
+                                trim.duration_ms = trimmed_duration(
+                                    trim.start,
+                                    trim.end,
+                                    delta.x,
+                                    trim.width,
+                                    trim.extent,
+                                    studio.video_fps,
+                                    view.snap && !ui.input(|input| input.modifiers.shift),
+                                );
                             }
-                            view.trim = Some(TrimGesture {
-                                dialogue_index,
-                                start: clip.start,
-                                end: clip.end,
-                                width,
-                                extent,
-                                duration_ms: clip.end - clip.start,
-                            });
-                        }
-                        if enabled && (response.dragged() || response.drag_stopped()) {
-                            if let Some(trim) = view
-                                .trim
-                                .as_mut()
-                                .filter(|trim| trim.dialogue_index == dialogue_index)
-                            {
-                                if let Some(delta) = response.total_drag_delta() {
-                                    trim.duration_ms = trimmed_duration(
-                                        trim.start,
-                                        trim.end,
-                                        delta.x,
-                                        trim.width,
-                                        trim.extent,
-                                        studio.video_fps,
-                                        view.snap && !ui.input(|input| input.modifiers.shift),
-                                    );
-                                }
-                                response.clone().on_hover_text(format!(
-                                    "时长 {:.3} 秒",
-                                    trim.duration_ms as f64 / 1000.0
-                                ));
-                                if response.drag_stopped() {
-                                    trim_request = Some((dialogue_index, trim.duration_ms));
-                                    view.trim = None;
-                                }
+                            response.clone().on_hover_text(format!(
+                                "时长 {:.3} 秒",
+                                trim.duration_ms as f64 / 1000.0
+                            ));
+                            if response.drag_stopped() {
+                                trim_request = Some((dialogue_index, trim.duration_ms));
+                                view.trim = None;
                             }
                         }
                     }
                 }
             }
-            let x = x_at(studio.playback_ms.min(duration));
-            painter.line_segment(
-                [pos2(x, rect.top()), pos2(x, rect.bottom())],
+        }
+        let x = x_at(studio.playback_ms.min(duration));
+        full_painter
+            .with_clip_rect(Rect::from_min_max(
+                ruler.min,
+                visible.max,
+            ))
+            .line_segment(
+                [pos2(x, visible.top()), pos2(x, visible.bottom())],
                 Stroke::new(2.0, Color32::from_rgb(245, 100, 90)),
             );
-        });
+    });
+    view.scroll_x = scroll.state.offset.x;
     if undo || redo {
         view.history.restore_edit(studio, redo);
         view.duration_seconds = None;
@@ -858,6 +1050,9 @@ pub(super) fn replay_timeline_ui(
         view.duration_seconds = None;
     }
     if let Some(time) = seek {
+        // A late clip click must reveal its start even if it seeks to the
+        // already-paused time after the user manually scrolled elsewhere.
+        view.last_playback_ms = None;
         if studio.mode == ReplayMode::Idle {
             prepare_replay_movement_for_playback(studio, player_history, ship_history);
             start_playback(studio, grids);
@@ -881,12 +1076,41 @@ mod tests {
     use super::{
         adjacent_frame,
         frame_time_ms,
+        ruler_tick_step,
         time_at_x,
+        timeline_time_label,
+        timeline_timecode,
         trimmed_duration,
         ReplayMode,
         ReplayStudio,
         TimelineHistory,
     };
+
+    #[test]
+    fn timeline_labels_distinguish_export_frames_and_ruler_subseconds() {
+        for fps in [24, 25, 30, 60] {
+            for frame in 0..fps * 3 {
+                let time = frame_time_ms(u64::from(frame), fps);
+                assert_eq!(
+                    timeline_timecode(time, fps),
+                    format!(
+                        "00:00:{:02}:{:02}",
+                        frame / fps,
+                        frame % fps
+                    ),
+                );
+            }
+        }
+        assert_eq!(
+            timeline_timecode(999, 30),
+            "00:00:00:29"
+        );
+        assert_eq!(timeline_time_label(500), "00:00.500");
+        assert_eq!(timeline_time_label(1000), "00:01.000");
+        assert_eq!(ruler_tick_step(9000, 1400.0), 1000);
+        assert_eq!(ruler_tick_step(9000, 14_000.0), 100);
+        assert_eq!(ruler_tick_step(u64::MAX, 1.0), u64::MAX);
+    }
 
     fn editing_studio() -> ReplayStudio {
         let line = |line_id: u64, time_ms: u64| {

@@ -1,14 +1,18 @@
 //! Keeps the composition camera inside the studio while egui covers the window.
 
 use bevy::{
-    camera::Viewport,
+    camera::{
+        CameraOutputMode,
+        Viewport,
+    },
     prelude::*,
+    render::render_resource::BlendState,
     window::PrimaryWindow,
 };
 use bevy_egui::{
+    egui::Rect,
     EguiOutput,
     PrimaryEguiContext,
-    egui::Rect,
 };
 
 use super::{
@@ -16,6 +20,20 @@ use super::{
     ReplayVideoCaptureActive,
 };
 use crate::voxel::VoxelViewportCamera;
+
+/// Egui renders premultiplied colors into this transparent camera target. The
+/// output pass must preserve that convention when compositing over the scene.
+pub(crate) fn replay_ui_camera() -> Camera {
+    Camera {
+        order: 1,
+        output_mode: CameraOutputMode::Write {
+            blend_state: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+            clear_color: ClearColorConfig::None,
+        },
+        clear_color: ClearColorConfig::Custom(Color::NONE),
+        ..default()
+    }
+}
 
 /// Native editing panels stay available when the studio explicitly enables
 /// scene editing. Video capture always excludes them.
@@ -112,12 +130,12 @@ mod tests {
         },
     };
     use bevy_egui::{
+        egui::{
+            pos2,
+            Rect,
+        },
         EguiOutput,
         PrimaryEguiContext,
-        egui::{
-            Rect,
-            pos2,
-        },
     };
 
     use super::{
@@ -230,14 +248,12 @@ mod tests {
         assert!(preview_viewport(rect, f32::NAN, window).is_none());
         assert!(preview_viewport(rect, 1.0, UVec2::ZERO).is_none());
         assert!(preview_viewport(Rect::NOTHING, 1.0, window).is_none());
-        assert!(
-            preview_viewport(
-                Rect::from_min_max(pos2(1300.0, 0.0), pos2(1500.0, 400.0)),
-                1.0,
-                window,
-            )
-            .is_none()
-        );
+        assert!(preview_viewport(
+            Rect::from_min_max(pos2(1300.0, 0.0), pos2(1500.0, 400.0)),
+            1.0,
+            window,
+        )
+        .is_none());
     }
 
     #[test]
@@ -294,13 +310,12 @@ mod tests {
             camera.viewport.as_ref().unwrap().physical_size,
             UVec2::new(900, 520)
         );
-        assert!(
-            app.world()
-                .get::<Camera>(overlay)
-                .unwrap()
-                .viewport
-                .is_none()
-        );
+        assert!(app
+            .world()
+            .get::<Camera>(overlay)
+            .unwrap()
+            .viewport
+            .is_none());
 
         app.world_mut().resource_mut::<ReplayVideoCaptureActive>().0 = true;
         app.update();

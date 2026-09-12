@@ -30,7 +30,6 @@ use bevy::{
     camera::{
         primitives::Aabb,
         visibility::RenderLayers,
-        CameraOutputMode,
         RenderTarget,
     },
     core_pipeline::prepass::DepthPrepass,
@@ -68,7 +67,6 @@ use bevy::{
     prelude::*,
     render::{
         render_resource::{
-            BlendState,
             Extent3d,
             Face,
             TextureDimension,
@@ -124,7 +122,10 @@ use crate::{
         PlanetAtmosphereMaterial,
         PlanetAtmospherePlugin,
     },
-    replay::replay_auxiliary_ui_visible,
+    replay::{
+        replay_auxiliary_ui_visible,
+        replay_ui_camera,
+    },
     rule_engine::{
         parse_rule,
         Action,
@@ -8455,22 +8456,16 @@ fn setup_voxel_view(
         },
     ));
     // Keep egui in window coordinates while the composition camera changes its
-    // viewport. Alpha output preserves the scene already drawn underneath it.
+    // viewport. Egui's transparent target contains premultiplied colors; keep
+    // that blend convention when compositing over the scene so translucent
+    // subtitles and antialiased edges are not multiplied by alpha twice.
     commands.spawn((
         Name::new("Viewport UI"),
         PrimaryEguiContext,
         Camera2d,
         Msaa::Off,
         RenderLayers::none(),
-        Camera {
-            order: 1,
-            output_mode: CameraOutputMode::Write {
-                blend_state: Some(BlendState::ALPHA_BLENDING),
-                clear_color: ClearColorConfig::None,
-            },
-            clear_color: ClearColorConfig::Custom(Color::NONE),
-            ..default()
-        },
+        replay_ui_camera(),
     ));
     spawn_voxel_orbital_planet(
         &mut commands,
