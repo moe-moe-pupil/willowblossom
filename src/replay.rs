@@ -1,3 +1,7 @@
+mod timeline;
+
+use timeline::replay_timeline_window;
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::{
@@ -3366,6 +3370,15 @@ fn replay_studio_ui(
                     });
             });
         studio.panel_open = open;
+        if open {
+            replay_timeline_window(
+                ctx,
+                &mut studio,
+                &mut grids,
+                &replay_histories.player_movement_history,
+                &replay_histories.ship_trajectory_history,
+            );
+        }
     }
     if let Some(fade) = occlusion_fade.as_mut() {
         fade.opacity = occlusion_opacity.clamp(0.0, 1.0);
