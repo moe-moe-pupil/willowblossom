@@ -124,6 +124,7 @@ use crate::{
     },
     replay::{
         replay_auxiliary_ui_visible,
+        replay_mouse_interaction_inactive,
         replay_ui_camera,
     },
     rule_engine::{
@@ -2770,6 +2771,10 @@ impl Plugin for TrpgVoxelPlugin {
                 .chain(),
         )
         .add_systems(Update, sandbox_replay_voxel_scene.before(voxel_editor_shortcuts))
+        .add_systems(
+            Update,
+            release_replay_cursor.run_if(not(replay_mouse_interaction_inactive)),
+        )
         .add_systems(
             Update,
             (
@@ -17260,6 +17265,18 @@ fn orbit_focus_preserving_camera_position(
     camera_position + rotation * Vec3::NEG_Z * distance
 }
 
+// Camera input is suspended during preview, so it cannot release a previous mouse lock.
+fn release_replay_cursor(
+    mut editor: ResMut<VoxelEditorState>,
+    mut cursor_options: Query<&mut CursorOptions, With<PrimaryWindow>>,
+) {
+    editor.first_person_cursor_released = true;
+    if let Ok(mut cursor) = cursor_options.single_mut() {
+        cursor.visible = true;
+        cursor.grab_mode = CursorGrabMode::None;
+    }
+}
+
 fn control_voxel_camera(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -19227,6 +19244,30 @@ mod tests {
             entity.get::<LinearVelocity>().unwrap().0,
             Vec3::ZERO
         );
+    }
+
+    #[test]
+    fn replay_releases_an_existing_first_person_cursor_lock() {
+        let mut app = App::new();
+        let mut editor = VoxelEditorState::default();
+        editor.first_person_cursor_released = false;
+        app.insert_resource(editor)
+            .add_systems(Update, release_replay_cursor);
+        let window = app.world_mut().spawn((
+            PrimaryWindow,
+            CursorOptions {
+                visible: false,
+                grab_mode: CursorGrabMode::Locked,
+                ..default()
+            },
+        )).id();
+
+        app.update();
+
+        let cursor = app.world().get::<CursorOptions>(window).unwrap();
+        assert!(cursor.visible);
+        assert_eq!(cursor.grab_mode, CursorGrabMode::None);
+        assert!(app.world().resource::<VoxelEditorState>().first_person_cursor_released);
     }
 
     #[test]
