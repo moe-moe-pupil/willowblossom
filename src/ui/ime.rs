@@ -56,7 +56,59 @@ impl Plugin for ImePlugin {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc::channel;
+
     use super::*;
+
+    #[test]
+    fn submitting_clears_draft_and_allows_another_send_before_acknowledgement() {
+        let (sender, mut receiver) = channel(4);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+        let mut text = "first message".to_owned();
+        let targets = vec![NapcatSendTarget::Private(42), NapcatSendTarget::Private(43)];
+        ime.submit_draft("broadcast", &mut text, &sender, targets.clone()).unwrap();
+        assert!(text.is_empty());
+        text.push_str("second message");
+        ime.submit_draft("broadcast", &mut text, &sender, targets).unwrap();
+        assert!(text.is_empty());
+        assert_eq!(ime.submitted_sends.len(), 2);
+        let mut results = Vec::new();
+        while let Ok(message) = receiver.try_recv() {
+            results.push(NapcatSendResult {
+                request_id: message.request_id,
+                target_id: message.target_id,
+                error: None,
+            });
+        }
+        results.reverse();
+        let completions = ime.apply_send_results(results);
+        assert_eq!(completions.len(), 2);
+        assert_eq!(completions[0].text, "second message");
+        assert_eq!(completions[1].text, "first message");
+        assert!(completions.iter().all(|completion| !completion.clear_input));
+        assert!(completions.iter().all(|completion| completion.successful_targets.len() == 2));
+        assert!(ime.submitted_sends.is_empty());
+    }
+
+    #[test]
+    fn rejected_submission_keeps_draft_and_delayed_failure_is_reported() {
+        let (sender, mut receiver) = channel(1);
+        let sender = NapcatIOSender(sender);
+        let mut ime = ImeManager::default();
+        let mut text = "keep this".to_owned();
+        assert!(ime.submit_draft("broadcast", &mut text, &sender, vec![]).is_err());
+        assert_eq!(text, "keep this");
+        ime.submit_draft("broadcast", &mut text, &sender, vec![NapcatSendTarget::Private(42)]).unwrap();
+        let message = receiver.try_recv().unwrap();
+        let completions = ime.apply_send_results([NapcatSendResult {
+            request_id: message.request_id,
+            target_id: message.target_id,
+            error: Some("offline".to_owned()),
+        }]);
+        assert!(!completions[0].clear_input);
+        assert!(ime.send_states["broadcast"].error.as_deref().unwrap().contains("keep this"));
+    }
 
     #[test]
     fn queue_text_send_tracks_private_target_until_acknowledged() {
@@ -519,6 +571,7 @@ pub struct ImeManager {
     next_send_request_id: u64,
     next_attachment_id: u64,
     send_states: HashMap<String, ChatInputSendState>,
+    submitted_sends: Vec<(String, ChatInputSendState)>,
     attached_images: HashMap<String, Vec<ChatInputImage>>,
     attachment_previews: HashMap<u64, egui::TextureHandle>,
     ime_composition_input: Option<String>,
@@ -553,6 +606,7 @@ impl std::fmt::Debug for ImeManager {
 #[derive(Debug, Default)]
 struct ChatInputSendState {
     pending_requests: Vec<(u64, NapcatSendTarget)>,
+    input_cleared: bool,
     successful_targets: Vec<NapcatSendTarget>,
     delivered_text: Option<String>,
     delivered_images: Vec<ChatInputImage>,
@@ -577,6 +631,7 @@ impl Default for ImeManager {
             next_send_request_id: 1,
             next_attachment_id: 1,
             send_states: HashMap::new(),
+            submitted_sends: Vec::new(),
             attached_images: HashMap::new(),
             attachment_previews: HashMap::new(),
             ime_composition_input: None,
@@ -692,15 +747,6 @@ impl ImeManager {
         }
 
         if send_on_enter {
-            if self
-                .send_states
-                .get(target_id)
-                .map(|state| !state.pending_requests.is_empty())
-                .unwrap_or(false)
-            {
-                return teo;
-            }
-
             let message_text = text.trim().to_owned();
             let images = self
                 .attached_images
@@ -712,18 +758,30 @@ impl ImeManager {
                 return teo;
             }
 
-            let _ = self.queue_send(
-                target_id,
-                message_text,
-                &images,
-                sender,
-                targets,
-            );
+            let _ = self.submit_draft(target_id, text, sender, targets);
         } else if let Some(error) = paste_error {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
         }
 
         teo
+    }
+
+    fn submit_draft(
+        &mut self,
+        target_id: &str,
+        text: &mut String,
+        sender: &NapcatIOSender,
+        targets: Vec<NapcatSendTarget>,
+    ) -> Result<(), String> {
+        let images = self.attached_images(target_id).to_vec();
+        self.queue_send(target_id, text.as_str(), &images, sender, targets)?;
+        if let Some(mut state) = self.send_states.remove(target_id) {
+            state.input_cleared = true;
+            self.submitted_sends.push((target_id.to_owned(), state));
+        }
+        text.clear();
+        self.clear_attached_images(target_id);
+        Ok(())
     }
 
     pub fn queue_text_send(
@@ -872,7 +930,11 @@ impl ImeManager {
     ) -> Vec<ChatInputSendCompletion> {
         let mut completions = Vec::new();
         for result in results {
-            let Some(state) = self.send_states.get_mut(&result.target_id) else {
+            let Some(state) = self.send_states.get_mut(&result.target_id)
+                .filter(|state| state.pending_requests.iter().any(|(id, _)| *id == result.request_id))
+                .or_else(|| self.submitted_sends.iter_mut().find_map(|(input_id, state)| {
+                    (input_id == &result.target_id && state.pending_requests.iter().any(|(id, _)| *id == result.request_id)).then_some(state)
+                })) else {
                 continue;
             };
             let Some(request_index) = state
@@ -906,13 +968,31 @@ impl ImeManager {
                     text,
                     images,
                     successful_targets: std::mem::take(&mut state.successful_targets),
-                    clear_input,
+                    clear_input: clear_input && !state.input_cleared,
                 });
                 if clear_input {
                     state.delivered_text = None;
                     state.delivered_images.clear();
                     state.delivered_targets.clear();
                 }
+            }
+        }
+        let mut index = 0;
+        while index < self.submitted_sends.len() {
+            if self.submitted_sends[index].1.pending_requests.is_empty() {
+                let (input_id, mut state) = self.submitted_sends.remove(index);
+                if let Some(error) = &mut state.error {
+                    *error = format!("消息「{}」发送失败：{error}", state.delivered_text.as_deref().unwrap_or("图片"));
+                    let current = self.send_states.entry(input_id).or_default();
+                    if current.pending_requests.is_empty() {
+                        state.input_cleared = false;
+                        *current = state;
+                    } else {
+                        current.error = state.error;
+                    }
+                }
+            } else {
+                index += 1;
             }
         }
         completions

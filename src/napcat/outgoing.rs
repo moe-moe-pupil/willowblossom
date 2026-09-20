@@ -8,6 +8,10 @@ use rand::{
     rng,
     RngExt,
 };
+use serde_json::{
+    from_str,
+    Value,
+};
 use tokio::{
     sync::mpsc::Receiver,
     time::{
@@ -17,6 +21,22 @@ use tokio::{
 };
 
 use super::NapcatOutboundMessage;
+
+fn recipient(message: &NapcatOutboundMessage) -> Option<(String, String)> {
+    let payload: Value = from_str(message.message.to_text().ok()?).ok()?;
+    let action = payload["action"].as_str()?;
+    let key = match action {
+        "send_private_msg" => "user_id",
+        "send_group_msg" => "group_id",
+        _ => return None,
+    };
+    let id = &payload["params"][key];
+    let id = id
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| id.as_u64().map(|id| id.to_string()))?;
+    Some((action.to_owned(), id))
+}
 
 /// Separate deadlines prevent a broadcast's recipients from waiting in series.
 #[derive(Default)]
@@ -28,9 +48,10 @@ pub(super) struct OutgoingQueue {
 impl OutgoingQueue {
     fn schedule(&mut self, message: NapcatOutboundMessage, now: Instant, delay: Duration) {
         let mut deadline = now + delay;
+        let destination = recipient(&message);
         // Preserve message order within a conversation without delaying other recipients.
         for ((queued_deadline, _), queued) in &self.messages {
-            if queued.target_id == message.target_id {
+            if destination.is_some() && recipient(queued) == destination {
                 deadline = deadline.max(*queued_deadline);
             }
         }
@@ -80,8 +101,8 @@ mod tests {
     fn message(id: u64, target: &str) -> NapcatOutboundMessage {
         NapcatOutboundMessage {
             request_id: id,
-            target_id: target.to_owned(),
-            message: Message::Text("test".into()),
+            target_id: "shared-broadcast-input".to_owned(),
+            message: Message::Text(format!(r#"{{"action":"send_private_msg","params":{{"user_id":"{target}","message":"test"}}}}"#).into()),
         }
     }
 
