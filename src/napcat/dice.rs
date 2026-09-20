@@ -1,5 +1,7 @@
 use rand::RngExt;
 
+use super::private_command_body;
+
 const DEFAULT_DIE_FACES: u32 = 100;
 const MAX_EXPRESSION_BYTES: usize = 256;
 const MAX_DICE_PER_TERM: u32 = 100;
@@ -114,10 +116,7 @@ fn format_dice_term(term: &DiceTermResult) -> String {
 
 fn roll_dnd5_ability_score_command(text: &str) -> Option<String> {
     let trimmed = text.trim();
-    let body = trimmed
-        .strip_prefix('.')
-        .or_else(|| trimmed.strip_prefix('。'))?
-        .trim_start();
+    let body = private_command_body(trimmed)?;
     let rest = dnd5_command_rest(body)?;
     if !rest.is_empty()
         && !rest.starts_with('#')
@@ -186,11 +185,7 @@ fn roll_dnd5_ability_scores(
 }
 
 fn parse_dice_command(text: &str) -> Option<Result<ParsedDiceCommand, String>> {
-    let body = text
-        .trim()
-        .strip_prefix('.')
-        .or_else(|| text.trim().strip_prefix('。'))?
-        .trim_start();
+    let body = private_command_body(text)?;
     let formula_and_description = dice_command_formula(body)?;
     Some(parse_formula_and_description(
         formula_and_description,
@@ -577,7 +572,7 @@ mod tests {
 
     #[test]
     fn compact_roll_commands_accept_default_and_explicit_dice() {
-        let default = parse_dice_command(".rd").unwrap().unwrap();
+        let default = parse_dice_command("来点rd").unwrap().unwrap();
         assert_eq!(default.formula, "d");
         assert_eq!(
             default.expression,
@@ -588,7 +583,7 @@ mod tests {
             }
         );
 
-        let explicit = parse_dice_command("。r2D3").unwrap().unwrap();
+        let explicit = parse_dice_command("来点r2D3").unwrap().unwrap();
         assert_eq!(
             explicit.expression,
             DiceExpression::Dice {
@@ -601,13 +596,13 @@ mod tests {
 
     #[test]
     fn foundry_style_aliases_arithmetic_parentheses_and_descriptions_parse() {
-        for command in [".r 2d6+3", ".roll (2d6 + d4) / 2", ".d 2d6+3"] {
+        for command in ["来点r 2d6+3", "来点roll (2d6 + d4) / 2", "来点d 2d6+3"] {
             assert!(
                 parse_dice_command(command).unwrap().is_ok(),
                 "{command}"
             );
         }
-        let parsed = parse_dice_command(".roll 1d20 + 5 # 侦查")
+        let parsed = parse_dice_command("来点roll 1d20 + 5 # 侦查")
             .unwrap()
             .unwrap();
         assert_eq!(parsed.formula, "1d20 + 5");
@@ -619,7 +614,7 @@ mod tests {
 
     #[test]
     fn evaluation_reports_each_die_and_obeys_precedence() {
-        let parsed = parse_dice_command(".r 2d3+4*2").unwrap().unwrap();
+        let parsed = parse_dice_command("来点r 2d3+4*2").unwrap().unwrap();
         let mut rolls = [1, 3].into_iter();
         let mut terms = Vec::new();
         let result = evaluate_expression(
@@ -635,7 +630,7 @@ mod tests {
 
     #[test]
     fn malformed_and_abusive_rolls_return_clear_errors() {
-        for command in [".r 0d6", ".r 101d6", ".r d0", ".r (d6", ".r d6/0"] {
+        for command in ["来点r 0d6", "来点r 101d6", "来点r d0", "来点r (d6", "来点r d6/0"] {
             let response = roll_dice_command(command).unwrap();
             assert!(
                 response.starts_with("骰点表达式无效：") || response.starts_with("骰点失败："),
@@ -646,16 +641,16 @@ mod tests {
 
     #[test]
     fn unrelated_private_commands_are_not_claimed() {
-        assert!(parse_dice_command(".状态").is_none());
+        assert!(parse_dice_command("来点状态").is_none());
         assert!(parse_dice_command("普通聊天").is_none());
         assert!(parse_dice_command(".random").is_none());
-        assert!(parse_dice_command(".detect magic").is_none());
-        assert!(parse_dice_command(".weave").is_none());
+        assert!(parse_dice_command("来点detect magic").is_none());
+        assert!(parse_dice_command("来点weave").is_none());
     }
 
     #[test]
     fn drop_and_keep_modifiers_trim_dice_results() {
-        let parsed = parse_dice_command(".r 4d6dl1").unwrap().unwrap();
+        let parsed = parse_dice_command("来点r 4d6dl1").unwrap().unwrap();
         assert_eq!(
             parsed.expression,
             DiceExpression::Dice {
@@ -685,9 +680,9 @@ mod tests {
     #[test]
     fn keep_and_drop_aliases_share_modifier_semantics() {
         for (command, modifier) in [
-            (".roll 4d6kh3", DiceModifier::KeepHighest(3)),
-            (".roll 4d6kl3", DiceModifier::KeepLowest(3)),
-            (".roll 4d6dh1", DiceModifier::DropHighest(1)),
+            ("来点roll 4d6kh3", DiceModifier::KeepHighest(3)),
+            ("来点roll 4d6kl3", DiceModifier::KeepLowest(3)),
+            ("来点roll 4d6dh1", DiceModifier::DropHighest(1)),
         ] {
             let parsed = parse_dice_command(command).unwrap().unwrap();
             assert_eq!(
@@ -701,7 +696,7 @@ mod tests {
             );
         }
 
-        let parsed = parse_dice_command(".r 4d6kl3").unwrap().unwrap();
+        let parsed = parse_dice_command("来点r 4d6kl3").unwrap().unwrap();
         let mut rolls = [2u32, 6, 1, 4].into_iter();
         let mut terms = Vec::new();
         let result = evaluate_expression(
@@ -718,11 +713,11 @@ mod tests {
     #[test]
     fn invalid_modifier_amounts_are_rejected() {
         for command in [
-            ".r 2d6dl2",
-            ".r 2d6dl0",
-            ".r 2d6dl",
-            ".r 2d6kh3",
-            ".r 2d6klX",
+            "来点r 2d6dl2",
+            "来点r 2d6dl0",
+            "来点r 2d6dl",
+            "来点r 2d6kh3",
+            "来点r 2d6klX",
         ] {
             let response = roll_dice_command(command).unwrap();
             assert!(
@@ -734,11 +729,11 @@ mod tests {
 
     #[test]
     fn trailing_words_do_not_swallow_descriptions_into_modifiers() {
-        let parsed = parse_dice_command(".r 2d6 drop 最低").unwrap().unwrap();
+        let parsed = parse_dice_command("来点r 2d6 drop 最低").unwrap().unwrap();
         assert_eq!(parsed.formula, "2d6");
         assert_eq!(parsed.description.as_deref(), Some("drop 最低"));
 
-        let parsed = parse_dice_command(".r 4d6kh3 # 力量").unwrap().unwrap();
+        let parsed = parse_dice_command("来点r 4d6kh3 # 力量").unwrap().unwrap();
         assert_eq!(parsed.formula, "4d6kh3");
         assert_eq!(parsed.description.as_deref(), Some("力量"));
     }
@@ -772,10 +767,10 @@ mod tests {
 
     #[test]
     fn dnd5_aliases_and_unrelated_commands_are_separated() {
-        assert!(roll_dice_command(".dnd5").unwrap().contains("D&D5E属性生成"));
-        assert!(roll_dice_command("。dnd5e").unwrap().contains("D&D5E属性生成"));
-        assert!(roll_dice_command(".DND5 力量").unwrap().contains("说明：力量"));
-        assert!(roll_dice_command(".dnd5力量").is_none());
-        assert!(roll_dice_command(".dnd").is_none());
+        assert!(roll_dice_command("来点dnd5").unwrap().contains("D&D5E属性生成"));
+        assert!(roll_dice_command("来点dnd5e").unwrap().contains("D&D5E属性生成"));
+        assert!(roll_dice_command("来点DND5 力量").unwrap().contains("说明：力量"));
+        assert!(roll_dice_command("来点dnd5力量").is_none());
+        assert!(roll_dice_command("来点dnd").is_none());
     }
 }

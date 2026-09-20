@@ -1,4 +1,5 @@
 mod dice;
+mod outgoing;
 mod receipts;
 
 use std::{
@@ -48,6 +49,7 @@ use futures_util::{
     SinkExt,
     StreamExt,
 };
+use outgoing::OutgoingQueue;
 use rand::RngExt;
 use receipts::{
     InboundMessageReceiptStore,
@@ -2452,7 +2454,7 @@ pub struct TrpgGroup {
     pub allow_join_requests: bool,
     #[serde(default = "default_position_radio_auto_sync_enabled")]
     pub position_radio_auto_sync_enabled: bool,
-    /// 是否允许通过 .gc/.gc2（观察/观察视频）聊天命令请求场景截图；
+    /// 是否允许通过 来点gc/来点gc2（观察/观察视频）聊天命令请求场景截图；
     /// 关闭后聊天命令对所有账号（含GM）失效，GM仍可通过界面按钮强制发送。
     #[serde(default = "default_players_scene_capture_enabled")]
     pub players_scene_capture_enabled: bool,
@@ -7006,6 +7008,7 @@ async fn run_napcat_connection(
 ) {
     const NAPCAT_WS_URL: &str = "ws://localhost:3001";
 
+    let mut outgoing = OutgoingQueue::default();
     loop {
         let (ws_stream, _) = match connect_async(NAPCAT_WS_URL).await {
             Ok(connection) => connection,
@@ -7064,7 +7067,7 @@ async fn run_napcat_connection(
                         None => break,
                     }
                 }
-                outbound = game_to_client_receiver.recv() => {
+                outbound = outgoing.recv(&mut game_to_client_receiver) => {
                     let Some(outbound) = outbound else {
                         fail_pending_napcat_requests(
                             &mut pending_requests,
@@ -8202,13 +8205,13 @@ pub(crate) fn is_scene_capture_command_text(text: &str) -> bool {
 fn scene_capture_command_kind(text: &str) -> Option<SceneCaptureKind> {
     matches!(
         text.trim(),
-        "#观察" | "#gc" | ".观察" | ".gc" | "。观察" | "。gc"
+        "#观察" | "#gc" | "来点观察" | "来点gc"
     )
     .then_some(SceneCaptureKind::Image)
     .or_else(|| {
         matches!(
             text.trim(),
-            "#观察视频" | "#gc2" | ".观察视频" | ".gc2" | "。观察视频" | "。gc2"
+            "#观察视频" | "#gc2" | "来点观察视频" | "来点gc2"
         )
         .then_some(SceneCaptureKind::PanoramaVideo)
     })
@@ -8243,7 +8246,7 @@ fn format_private_detect_magic(
     scene_positions: Option<&SceneCharacterPositions>,
 ) -> String {
     let Some(character) = manager.player_characters.get(target_id) else {
-        return "你还没有角色卡。输入【.兑换】开始建卡。".to_owned();
+        return "你还没有角色卡。输入【来点兑换】开始建卡。".to_owned();
     };
     if !character.inited {
         return "角色卡尚未完成，暂时无法侦测魔法。".to_owned();
@@ -8490,7 +8493,7 @@ fn handle_character_creation_message(
             character.creation_step = CharacterCreationStep::Normal;
             update_character_from_status_with_config(character, &stat_config);
             Some(format!(
-                "是吗？「{}」真是个好名字呢，我十分期待您以后的表现。\n——兑换结束——\n现在可以发送【.抽取天赋】或【.抽取辅助天赋】（命令前缀可混用半角.或全角。）抽取天赋（三选一）；辅助天赋提供15%额外经验获取。",
+                "是吗？「{}」真是个好名字呢，我十分期待您以后的表现。\n——兑换结束——\n现在可以发送【来点抽取天赋】或【来点抽取辅助天赋】抽取天赋（三选一）；辅助天赋提供15%额外经验获取。",
                 character.nickname
             ))
         },
@@ -8498,7 +8501,7 @@ fn handle_character_creation_message(
     }
 }
 
-fn is_exchange_command(text: &str) -> bool { matches!(text.trim(), ".兑换" | "。兑换") }
+fn is_exchange_command(text: &str) -> bool { matches!(text.trim(), "来点兑换") }
 
 fn handle_private_player_command(
     manager: &mut NapcatMessageManager,
@@ -8515,7 +8518,7 @@ fn handle_private_player_command(
     if let Some((status_key, points)) = parse_post_creation_status_spend(text) {
         let stat_config = manager.character_stat_config_for_target(target_id);
         let Some(character) = manager.player_characters.get_mut(target_id) else {
-            return Some("你还没有角色卡。输入【.兑换】开始建卡。".to_owned());
+            return Some("你还没有角色卡。输入【来点兑换】开始建卡。".to_owned());
         };
         return Some(spend_post_creation_status_points(
             character,
@@ -8573,26 +8576,26 @@ fn handle_private_player_command(
 fn format_private_help() -> String {
     [
         "玩家命令帮助",
-        "命令前缀可混用半角【.】或全角【。】，例如 .help / 。help。",
-        "【.兑换】开始创建角色",
-        "【.r】或【.rd】投掷D100；【.r2d3】投掷2D3",
-        "【.roll 2d6+3】或【.d 2d6+3】计算骰子表达式（支持 + - * / 和括号）",
-        "骰子支持舍弃/保留修饰：例如【.r 4d6dl1】舍弃最低1颗（dl/dh/kh/kl）",
-        "【.dnd5】按D&D5E规则生成6组属性（4d6舍最低，可加说明如 .dnd5 力量）",
-        "骰点后可用 # 添加说明，例如【.r 1d20+5 # 侦查】",
-        "【.状态】查看角色当前状态",
-        "【.属性说明】查看八项属性的完整说明",
-        "【.魔网】或【.weave】感知魔网",
-        "【.侦测魔法】或【.detect magic】侦测附近的施法痕迹（需要INT 20）",
-        "【.已兑换】查看技能与兑换内容",
-        "【.冷却】查看技能冷却",
-        "【.频道】查看自己所属的全部频道",
-        "【.频道人员】查看当前可见频道成员",
-        "【.指南】查看当前TRPG组指南",
-        "【.观察】或【.gc】请求玩家观察画面；【.观察视频】或【.gc2】请求360度观察视频",
-        "【.抽取天赋】抽取普通天赋（三选一）",
-        "【.抽取辅助天赋】抽取辅助天赋（三选一，经验获取+15%）",
-        "【.<属性> <点数>】为已完成角色投入属性点，例如 .力量 1 或 。agi 2",
+        "命令使用【来点】前缀，例如 来点help。",
+        "【来点兑换】开始创建角色",
+        "【来点r】或【来点rd】投掷D100；【来点r2d3】投掷2D3",
+        "【来点roll 2d6+3】或【来点d 2d6+3】计算骰子表达式（支持 + - * / 和括号）",
+        "骰子支持舍弃/保留修饰：例如【来点r 4d6dl1】舍弃最低1颗（dl/dh/kh/kl）",
+        "【来点dnd5】按D&D5E规则生成6组属性（4d6舍最低，可加说明如 来点dnd5 力量）",
+        "骰点后可用 # 添加说明，例如【来点r 1d20+5 # 侦查】",
+        "【来点状态】查看角色当前状态",
+        "【来点属性说明】查看八项属性的完整说明",
+        "【来点魔网】或【来点weave】感知魔网",
+        "【来点侦测魔法】或【来点detect magic】侦测附近的施法痕迹（需要INT 20）",
+        "【来点已兑换】查看技能与兑换内容",
+        "【来点冷却】查看技能冷却",
+        "【来点频道】查看自己所属的全部频道",
+        "【来点频道人员】查看当前可见频道成员",
+        "【来点指南】查看当前TRPG组指南",
+        "【来点观察】或【来点gc】请求玩家观察画面；【来点观察视频】或【来点gc2】请求360度观察视频",
+        "【来点抽取天赋】抽取普通天赋（三选一）",
+        "【来点抽取辅助天赋】抽取辅助天赋（三选一，经验获取+15%）",
+        "【来点<属性> <点数>】为已完成角色投入属性点，例如 来点力量 1 或 来点agi 2",
         "建卡过程中：【.】下一步，【..】上一步；属性阶段直接发送数字。",
     ]
     .join("\n")
@@ -8615,7 +8618,7 @@ fn format_private_attribute_help() -> String {
 
 fn format_private_weave(manager: &NapcatMessageManager, target_id: &str) -> String {
     let Some(character) = manager.player_characters.get(target_id) else {
-        return "你还没有角色卡。输入【.兑换】开始建卡。".to_owned();
+        return "你还没有角色卡。输入【来点兑换】开始建卡。".to_owned();
     };
     if !character.inited {
         return "角色卡尚未完成，暂时无法感知魔网。".to_owned();
@@ -8649,7 +8652,7 @@ fn begin_talent_choice(
 ) -> String {
     let has_character = manager.player_characters.contains_key(target_id);
     if !has_character {
-        return "你还没有角色卡。输入【.兑换】开始建卡。".to_owned();
+        return "你还没有角色卡。输入【来点兑换】开始建卡。".to_owned();
     }
     if !manager.player_characters[target_id].inited {
         return "角色卡尚未完成。请先完成建卡流程。".to_owned();
@@ -8777,7 +8780,7 @@ fn grant_character_talent(
 ) -> String {
     let stat_config = manager.character_stat_config_for_target(target_id);
     let Some(character) = manager.player_characters.get_mut(target_id) else {
-        return "你还没有角色卡。输入【.兑换】开始建卡。".to_owned();
+        return "你还没有角色卡。输入【来点兑换】开始建卡。".to_owned();
     };
     if !character.inited {
         return "角色卡尚未完成。请先完成建卡流程。".to_owned();
@@ -9070,8 +9073,7 @@ fn stable_talent_option_indices(
 
 fn private_command_body(text: &str) -> Option<&str> {
     let text = text.trim();
-    text.strip_prefix('.')
-        .or_else(|| text.strip_prefix('。'))
+    text.strip_prefix("来点")
         .map(str::trim)
         .filter(|command| !command.is_empty())
 }
@@ -9140,7 +9142,7 @@ fn spend_post_creation_status_points(
 
 fn format_private_character_status(manager: &NapcatMessageManager, target_id: &str) -> String {
     let Some(character) = manager.player_characters.get(target_id) else {
-        return "你还没有角色卡。输入【.兑换】开始建卡。".to_owned();
+        return "你还没有角色卡。输入【来点兑换】开始建卡。".to_owned();
     };
     if !character.inited {
         return format!(
@@ -9209,7 +9211,7 @@ fn private_character_hp_status(hp: f32, max_hp: f32) -> &'static str {
 
 fn format_private_character_skills(manager: &NapcatMessageManager, target_id: &str) -> String {
     let Some(character) = manager.player_characters.get(target_id) else {
-        return "你还没有角色卡。输入【.兑换】开始建卡。".to_owned();
+        return "你还没有角色卡。输入【来点兑换】开始建卡。".to_owned();
     };
     let skill_count = character_skill_count(character);
     if skill_count == 0 {
@@ -9308,7 +9310,7 @@ fn format_private_character_cooldowns(
 ) -> String {
     let current_turn = current_player_cooldown_turn(manager, target_id);
     let Some(character) = manager.player_characters.get_mut(target_id) else {
-        return "你还没有角色卡。输入【.兑换】开始建卡。".to_owned();
+        return "你还没有角色卡。输入【来点兑换】开始建卡。".to_owned();
     };
     materialize_imported_skill_cooldowns(character, current_turn);
     let skill_count = character_skill_count(character);
@@ -9367,7 +9369,7 @@ fn format_private_channel_members(manager: &NapcatMessageManager, target_id: &st
 
     let party_ids = group.party_ids_for_player(target_id);
     if party_ids.len() > 1 {
-        return "你属于多个频道。输入【.频道】查看全部频道；频道成员不能跨频道合并显示。"
+        return "你属于多个频道。输入【来点频道】查看全部频道；频道成员不能跨频道合并显示。"
             .to_owned();
     }
     let access = target_id
@@ -9659,7 +9661,7 @@ fn character_creation_back(character: &mut PlayerCharacter) -> String {
             character.image.clear();
             "已退回图片录入。请发送人物立绘图片或图片链接；如果暂时没有，输入【.】跳过。".to_owned()
         },
-        CharacterCreationStep::Normal => "未处于建卡流程。输入【.兑换】开始。".to_owned(),
+        CharacterCreationStep::Normal => "未处于建卡流程。输入【来点兑换】开始。".to_owned(),
         CharacterCreationStep::ConfirmStatus
         | CharacterCreationStep::Str
         | CharacterCreationStep::Agi
@@ -9693,7 +9695,7 @@ fn character_creation_prompt(character: &PlayerCharacter) -> String {
         CharacterCreationStep::ConfirmSkill => "技能数据已录入，输入【.】继续。".to_owned(),
         CharacterCreationStep::Image => "请发送人物立绘图片链接；输入【.】跳过。".to_owned(),
         CharacterCreationStep::Nickname => "最后，请告诉我你的角色名。".to_owned(),
-        CharacterCreationStep::Normal => "未处于建卡流程。输入【.兑换】开始。".to_owned(),
+        CharacterCreationStep::Normal => "未处于建卡流程。输入【来点兑换】开始。".to_owned(),
         _ => "请继续当前建卡步骤。".to_owned(),
     }
 }
@@ -11397,7 +11399,7 @@ fn party_channel_auto_forward_request(
             .collect::<Vec<_>>();
         if matching_ids.len() != 1 {
             return Some(PartyChannelAutoForward::Guidance(
-                "没有找到唯一匹配的所属频道。输入【.频道】查看频道，并使用[频道名: 内容]发送。"
+                "没有找到唯一匹配的所属频道。输入【来点频道】查看频道，并使用[频道名: 内容]发送。"
                     .to_owned(),
             ));
         }
@@ -11408,7 +11410,7 @@ fn party_channel_auto_forward_request(
             [party_id] => *party_id,
             _ => {
                 return Some(PartyChannelAutoForward::Guidance(
-                    "你属于多个频道，请使用[频道名: 内容]发送，例如[狂妄号:你好]。输入【.频道】查看全部频道。"
+                    "你属于多个频道，请使用[频道名: 内容]发送，例如[狂妄号:你好]。输入【来点频道】查看全部频道。"
                         .to_owned(),
                 ));
             },
@@ -12100,7 +12102,7 @@ position_cells = [4, 5, 6]
     #[test]
     fn inbound_receipts_survive_chat_history_deletion() {
         let mut manager = empty_manager();
-        let mut stored = test_private_message_from(42, ".gc");
+        let mut stored = test_private_message_from(42, "来点gc");
         stored.data.message_id = Some(7001);
         stored.data.self_id = 99;
         manager
@@ -12131,7 +12133,7 @@ position_cells = [4, 5, 6]
             ..Default::default()
         });
         manager.current_trpg_group = Some("alpha".to_owned());
-        let message = test_private_message_from(2, ".gc");
+        let message = test_private_message_from(2, "来点gc");
 
         let replayed = prepare_inbound_automatic_actions(
             &mut manager,
@@ -14848,7 +14850,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".状态"),
+            &test_message_with_text(NapcatMessageType::Private, "来点状态"),
             "2",
         )
         .unwrap();
@@ -14873,7 +14875,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, "。状态"),
+            &test_message_with_text(NapcatMessageType::Private, "来点状态"),
             "2",
         )
         .unwrap();
@@ -14884,7 +14886,7 @@ position_cells = [4, 5, 6]
     #[test]
     fn private_attribute_help_accepts_both_prefixes_and_lists_all_attributes() {
         let mut manager = empty_manager();
-        for command in [".属性说明", "。属性说明"] {
+        for command in ["来点属性说明", " 来点属性说明 "] {
             let response = handle_character_creation_message(
                 &mut manager,
                 &test_message_with_text(NapcatMessageType::Private, command),
@@ -14993,31 +14995,31 @@ position_cells = [4, 5, 6]
 
         let denied = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".weave"),
+            &test_message_with_text(NapcatMessageType::Private, "来点weave"),
             "2",
         )
         .unwrap();
         assert!(denied.contains("智力尚未达到5点"));
 
         manager.player_characters.get_mut("2").unwrap().status.int_ = 5;
-        let halfwidth = handle_character_creation_message(
+        let english_alias = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".weave"),
+            &test_message_with_text(NapcatMessageType::Private, "来点weave"),
             "2",
         )
         .unwrap();
-        let fullwidth = handle_character_creation_message(
+        let chinese_alias = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, "。魔网"),
+            &test_message_with_text(NapcatMessageType::Private, "来点魔网"),
             "2",
         )
         .unwrap();
 
-        assert_eq!(halfwidth, fullwidth);
-        assert!(halfwidth.contains("目前魔网法力浓度:"));
-        assert!(halfwidth.contains("最强魔网节点方向："));
-        assert!(halfwidth.contains("法术伤害+"));
-        assert!(halfwidth.contains("魔法回复+"));
+        assert_eq!(english_alias, chinese_alias);
+        assert!(english_alias.contains("目前魔网法力浓度:"));
+        assert!(english_alias.contains("最强魔网节点方向："));
+        assert!(english_alias.contains("法术伤害+"));
+        assert!(english_alias.contains("魔法回复+"));
     }
 
     #[test]
@@ -15067,7 +15069,7 @@ position_cells = [4, 5, 6]
         );
         let message = test_message_with_text(
             NapcatMessageType::Private,
-            ".detect magic",
+            "来点detect magic",
         );
         assert_eq!(
             private_detect_magic_response(
@@ -15079,13 +15081,13 @@ position_cells = [4, 5, 6]
             Some(response)
         );
         assert!(is_detect_magic_command_text(
-            "。侦测魔法"
+            "来点侦测魔法"
         ));
         assert!(is_detect_magic_command_text(
-            ".Detect   Magic"
+            "来点Detect   Magic"
         ));
         assert!(!is_detect_magic_command_text(
-            ".魔网 流星术"
+            "来点魔网 流星术"
         ));
         assert_eq!(detect_magic_radius(19), None);
         assert_eq!(detect_magic_radius(20), Some(50.0));
@@ -15156,11 +15158,17 @@ position_cells = [4, 5, 6]
     }
 
     #[test]
-    fn private_help_command_accepts_halfwidth_and_fullwidth_prefixes() {
+    fn private_help_command_accepts_laidian_prefix() {
+        for old_command in [".help", "。help", ".gc", "。gc", ".兑换", ".r 2d6"] {
+            assert!(private_command_body(old_command).is_none());
+            assert!(!is_scene_capture_command_text(old_command));
+            assert!(!is_exchange_command(old_command));
+            assert!(roll_dice_command(old_command).is_none());
+        }
         let mut manager = empty_manager();
         let mut responses = Vec::new();
 
-        for command in [".help", "。help"] {
+        for command in ["来点help", "  来点help  "] {
             responses.push(
                 handle_character_creation_message(
                     &mut manager,
@@ -15173,10 +15181,10 @@ position_cells = [4, 5, 6]
 
         assert_eq!(responses[0], responses[1]);
         assert!(responses[0].contains("玩家命令帮助"));
-        assert!(responses[0].contains(".兑换"));
-        assert!(responses[0].contains(".属性说明"));
-        assert!(responses[0].contains(".detect magic"));
-        assert!(responses[0].contains("。agi 2"));
+        assert!(responses[0].contains("来点兑换"));
+        assert!(responses[0].contains("来点属性说明"));
+        assert!(responses[0].contains("来点detect magic"));
+        assert!(responses[0].contains("来点agi 2"));
         assert!(responses[0].contains("【..】上一步"));
     }
 
@@ -15197,7 +15205,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".已兑换"),
+            &test_message_with_text(NapcatMessageType::Private, "来点已兑换"),
             "2",
         )
         .unwrap();
@@ -15220,13 +15228,13 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".指南"),
+            &test_message_with_text(NapcatMessageType::Private, "来点指南"),
             "2",
         )
         .unwrap();
         let denied = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".指南"),
+            &test_message_with_text(NapcatMessageType::Private, "来点指南"),
             "3",
         )
         .unwrap();
@@ -15264,13 +15272,13 @@ position_cells = [4, 5, 6]
 
         let guide = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".指南"),
+            &test_message_with_text(NapcatMessageType::Private, "来点指南"),
             "2",
         )
         .unwrap();
         let members = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".频道人员"),
+            &test_message_with_text(NapcatMessageType::Private, "来点频道人员"),
             "2",
         )
         .unwrap();
@@ -15301,7 +15309,7 @@ position_cells = [4, 5, 6]
 
         let normal_response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".抽取天赋"),
+            &test_message_with_text(NapcatMessageType::Private, "来点抽取天赋"),
             "2",
         )
         .unwrap();
@@ -15326,7 +15334,7 @@ position_cells = [4, 5, 6]
             &mut manager,
             &test_message_with_text(
                 NapcatMessageType::Private,
-                ".抽取辅助天赋",
+                "来点抽取辅助天赋",
             ),
             "2",
         )
@@ -15543,7 +15551,7 @@ position_cells = [4, 5, 6]
                 ) == talent_index
             })
             .unwrap();
-        let mut message = test_message_with_text(NapcatMessageType::Private, ".抽取天赋");
+        let mut message = test_message_with_text(NapcatMessageType::Private, "来点抽取天赋");
         message.data.time = message_time;
 
         let offer = handle_character_creation_message(&mut manager, &message, "2").unwrap();
@@ -15585,7 +15593,7 @@ position_cells = [4, 5, 6]
             &mut manager,
             &test_message_with_text(
                 NapcatMessageType::Private,
-                ".抽取辅助天赋",
+                "来点抽取辅助天赋",
             ),
             "2",
         )
@@ -15627,7 +15635,7 @@ position_cells = [4, 5, 6]
 
         let first_offer = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".抽取天赋"),
+            &test_message_with_text(NapcatMessageType::Private, "来点抽取天赋"),
             "2",
         )
         .unwrap();
@@ -15652,7 +15660,7 @@ position_cells = [4, 5, 6]
 
         let second_offer = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".抽取天赋"),
+            &test_message_with_text(NapcatMessageType::Private, "来点抽取天赋"),
             "3",
         )
         .unwrap();
@@ -15677,7 +15685,7 @@ position_cells = [4, 5, 6]
 
         handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".抽取天赋"),
+            &test_message_with_text(NapcatMessageType::Private, "来点抽取天赋"),
             "2",
         )
         .unwrap();
@@ -15724,7 +15732,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".抽取天赋"),
+            &test_message_with_text(NapcatMessageType::Private, "来点抽取天赋"),
             "2",
         )
         .unwrap();
@@ -15755,7 +15763,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".冷却"),
+            &test_message_with_text(NapcatMessageType::Private, "来点冷却"),
             "2",
         )
         .unwrap();
@@ -15785,7 +15793,7 @@ position_cells = [4, 5, 6]
 
         let first_response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".冷却"),
+            &test_message_with_text(NapcatMessageType::Private, "来点冷却"),
             "2",
         )
         .unwrap();
@@ -15802,7 +15810,7 @@ position_cells = [4, 5, 6]
             .set_player_turns_passed("2", 1);
         let second_response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".冷却"),
+            &test_message_with_text(NapcatMessageType::Private, "来点冷却"),
             "2",
         )
         .unwrap();
@@ -15815,7 +15823,7 @@ position_cells = [4, 5, 6]
             .set_player_turns_passed("2", 2);
         let ready_response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".冷却"),
+            &test_message_with_text(NapcatMessageType::Private, "来点冷却"),
             "2",
         )
         .unwrap();
@@ -15851,7 +15859,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".频道人员"),
+            &test_message_with_text(NapcatMessageType::Private, "来点频道人员"),
             "2",
         )
         .unwrap();
@@ -15871,7 +15879,7 @@ position_cells = [4, 5, 6]
             .anonymous = true;
         let anonymous_response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".频道人员"),
+            &test_message_with_text(NapcatMessageType::Private, "来点频道人员"),
             "2",
         )
         .unwrap();
@@ -15901,7 +15909,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".频道"),
+            &test_message_with_text(NapcatMessageType::Private, "来点频道"),
             "2",
         )
         .unwrap();
@@ -15942,7 +15950,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".频道人员"),
+            &test_message_with_text(NapcatMessageType::Private, "来点频道人员"),
             "2",
         )
         .unwrap();
@@ -15975,7 +15983,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".力量 2"),
+            &test_message_with_text(NapcatMessageType::Private, "来点力量 2"),
             "2",
         )
         .unwrap();
@@ -16107,8 +16115,8 @@ position_cells = [4, 5, 6]
     }
 
     #[test]
-    fn scene_capture_command_accepts_hash_and_dot_aliases() {
-        for command in ["#观察", "#gc", ".观察", ".gc", "。观察", "。gc"] {
+    fn scene_capture_command_accepts_hash_and_laidian_aliases() {
+        for command in ["#观察", "#gc", "来点观察", "来点gc"] {
             let message = test_message_with_text(NapcatMessageType::Private, command);
             assert!(
                 is_scene_capture_command(&message),
@@ -16118,10 +16126,8 @@ position_cells = [4, 5, 6]
         for command in [
             "#观察视频",
             "#gc2",
-            ".观察视频",
-            ".gc2",
-            "。观察视频",
-            "。gc2",
+            "来点观察视频",
+            "来点gc2",
         ] {
             assert_eq!(
                 scene_capture_command_kind(command),
@@ -16149,12 +16155,12 @@ position_cells = [4, 5, 6]
 
         let player_request = scene_capture_request(
             &manager,
-            &test_private_message_from(2, ".观察"),
+            &test_private_message_from(2, "来点观察"),
         )
         .unwrap();
         let gm_request = scene_capture_request(
             &manager,
-            &test_private_message_from(9, ".观察"),
+            &test_private_message_from(9, "来点观察"),
         )
         .unwrap();
 
@@ -16172,12 +16178,12 @@ position_cells = [4, 5, 6]
         ));
         assert!(scene_capture_request(
             &manager,
-            &test_private_message_from(3, ".观察"),
+            &test_private_message_from(3, "来点观察"),
         )
         .is_none());
         assert!(scene_capture_request(
             &manager,
-            &test_private_message_from(4, ".观察"),
+            &test_private_message_from(4, "来点观察"),
         )
         .is_none());
 
@@ -16202,17 +16208,17 @@ position_cells = [4, 5, 6]
 
         assert!(scene_capture_request(
             &manager,
-            &test_private_message_from(2, ".gc"),
+            &test_private_message_from(2, "来点gc"),
         )
         .is_none());
         assert!(scene_capture_request(
             &manager,
-            &test_private_message_from(2, ".gc2"),
+            &test_private_message_from(2, "来点gc2"),
         )
         .is_none());
         assert!(scene_capture_request(
             &manager,
-            &test_private_message_from(9, ".gc"),
+            &test_private_message_from(9, "来点gc"),
         )
         .is_none());
         assert!(manager.can_serve_scene_capture(9, "campaign-a"));
@@ -16224,7 +16230,7 @@ position_cells = [4, 5, 6]
             .players_scene_capture_enabled = true;
         let player_request = scene_capture_request(
             &manager,
-            &test_private_message_from(2, ".gc2"),
+            &test_private_message_from(2, "来点gc2"),
         )
         .unwrap();
         assert_eq!(
@@ -16234,7 +16240,7 @@ position_cells = [4, 5, 6]
         assert_eq!(
             scene_capture_request(
                 &manager,
-                &test_private_message_from(9, ".gc"),
+                &test_private_message_from(9, "来点gc"),
             )
             .unwrap()
             .user_id,
@@ -17426,7 +17432,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            &test_message_with_text(NapcatMessageType::Private, "来点兑换"),
             target_id,
         )
         .unwrap();
@@ -17501,7 +17507,7 @@ position_cells = [4, 5, 6]
 
         handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            &test_message_with_text(NapcatMessageType::Private, "来点兑换"),
             target_id,
         )
         .unwrap();
@@ -17532,8 +17538,8 @@ position_cells = [4, 5, 6]
         )
         .unwrap();
         assert!(response.contains("兑换结束"));
-        assert!(response.contains(".抽取天赋"));
-        assert!(response.contains(".抽取辅助天赋"));
+        assert!(response.contains("来点抽取天赋"));
+        assert!(response.contains("来点抽取辅助天赋"));
         assert!(response.contains("15%"));
     }
 
@@ -17549,7 +17555,7 @@ position_cells = [4, 5, 6]
 
         handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            &test_message_with_text(NapcatMessageType::Private, "来点兑换"),
             target_id,
         );
         for value in ["2", "1", "1", "1"] {
@@ -17607,7 +17613,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            &test_message_with_text(NapcatMessageType::Private, "来点兑换"),
             target_id,
         )
         .unwrap();
@@ -17657,7 +17663,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            &test_message_with_text(NapcatMessageType::Private, "来点兑换"),
             "2",
         )
         .unwrap();
@@ -17685,7 +17691,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            &test_message_with_text(NapcatMessageType::Private, "来点兑换"),
             target_id,
         )
         .unwrap();
@@ -17703,7 +17709,7 @@ position_cells = [4, 5, 6]
 
         let response = handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            &test_message_with_text(NapcatMessageType::Private, "来点兑换"),
             "2",
         )
         .unwrap();
@@ -18874,7 +18880,7 @@ position_cells = [4, 5, 6]
     #[test]
     fn group_dice_message_triggers_dice_response_with_sender_attribution() {
         let mut manager = empty_manager();
-        let mut message = test_message_with_text(NapcatMessageType::Group, ".r 4d6dl1");
+        let mut message = test_message_with_text(NapcatMessageType::Group, "来点r 4d6dl1");
         message.data.group_id = Some(9);
         message.data.group_name = Some("冒险者公会".to_owned());
 
@@ -18906,7 +18912,7 @@ position_cells = [4, 5, 6]
     #[test]
     fn automatic_group_reply_is_persisted_only_after_acknowledgement() {
         let mut manager = empty_manager();
-        let mut incoming = test_message_with_text(NapcatMessageType::Group, ".r 2d6");
+        let mut incoming = test_message_with_text(NapcatMessageType::Group, "来点r 2d6");
         incoming.data.group_id = Some(9);
         incoming.data.group_name = Some("冒险者公会".to_owned());
         manager.messages.insert("9".to_owned(), vec![incoming]);
@@ -18973,7 +18979,7 @@ position_cells = [4, 5, 6]
     fn rejected_automatic_group_reply_does_not_create_local_history() {
         let mut manager = empty_manager();
         manager.messages.insert("9".to_owned(), vec![
-            test_message_with_text(NapcatMessageType::Group, ".r 2d6"),
+            test_message_with_text(NapcatMessageType::Group, "来点r 2d6"),
         ]);
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let sender = NapcatIOSender(sender);
@@ -19011,7 +19017,7 @@ position_cells = [4, 5, 6]
     #[test]
     fn journal_replay_does_not_retrigger_group_dice_responses() {
         let mut manager = empty_manager();
-        let mut message = test_message_with_text(NapcatMessageType::Group, ".r 4d6dl1");
+        let mut message = test_message_with_text(NapcatMessageType::Group, "来点r 4d6dl1");
         message.data.group_id = Some(9);
 
         let actions = prepare_inbound_automatic_actions(
@@ -19031,7 +19037,7 @@ position_cells = [4, 5, 6]
         let mut manager = empty_manager();
         let target_id = "2";
         manager.messages.insert(target_id.to_owned(), vec![
-            test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            test_message_with_text(NapcatMessageType::Private, "来点兑换"),
         ]);
 
         append_local_private_text_response(&mut manager, target_id, 2, "兑换回复");
@@ -19129,7 +19135,7 @@ position_cells = [4, 5, 6]
 
         handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            &test_message_with_text(NapcatMessageType::Private, "来点兑换"),
             target_id,
         );
         for value in ["5"] {
@@ -19177,7 +19183,7 @@ position_cells = [4, 5, 6]
 
         handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            &test_message_with_text(NapcatMessageType::Private, "来点兑换"),
             target_id,
         );
         for value in ["2", "1", "1", "1", ".", "."] {
@@ -19225,7 +19231,7 @@ position_cells = [4, 5, 6]
 
         handle_character_creation_message(
             &mut manager,
-            &test_message_with_text(NapcatMessageType::Private, ".兑换"),
+            &test_message_with_text(NapcatMessageType::Private, "来点兑换"),
             target_id,
         );
         for value in ["2", "1", "1", "1", ".", "."] {

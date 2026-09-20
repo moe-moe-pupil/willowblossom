@@ -2968,7 +2968,7 @@ fn chat_window(
                             egui::Button::new("发送当前pl观察"),
                         )
                         .on_hover_text(
-                            "像该玩家私聊发送 .gc 一样，抓取其当前场景视角画面并私聊发送",
+                            "像该玩家私聊发送 来点gc 一样，抓取其当前场景视角画面并私聊发送",
                         )
                         .clicked()
                     {
@@ -2990,7 +2990,7 @@ fn chat_window(
                             egui::Button::new("发送当前pl视频观察"),
                         )
                         .on_hover_text(
-                            "像该玩家私聊发送 .gc2 一样，抓取其当前场景360度观察视频并私聊发送",
+                            "像该玩家私聊发送 来点gc2 一样，抓取其当前场景360度观察视频并私聊发送",
                         )
                         .clicked()
                     {
@@ -17380,12 +17380,12 @@ fn trpg_group_settings_window(
                                             group.players_scene_capture_enabled;
                                         if ui
                                             .button(if players_capture_enabled {
-                                                "禁止所有玩家使用观察(.gc/.gc2)"
+                                                "禁止所有玩家使用观察(来点gc/来点gc2)"
                                             } else {
-                                                "允许所有玩家使用观察(.gc/.gc2)"
+                                                "允许所有玩家使用观察(来点gc/来点gc2)"
                                             })
                                             .on_hover_text(
-                                                "一键允许或禁止所有账号（含GM）私聊发送 .gc/.gc2 观察请求；GM 仍可通过聊天窗口按钮强制发送",
+                                                "一键允许或禁止所有账号（含GM）私聊发送 来点gc/来点gc2 观察请求；GM 仍可通过聊天窗口按钮强制发送",
                                             )
                                             .clicked()
                                         {
