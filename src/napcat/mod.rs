@@ -1818,7 +1818,10 @@ fn portrait_transformed_display_name(
             .get(other_id)
             .map(|other| character_display_name(other, fallback))
             .unwrap_or_else(|| fallback.to_owned()),
-        None => fallback.to_owned(),
+        None => {
+            let name = character.name.trim();
+            if name.is_empty() { fallback.to_owned() } else { name.to_owned() }
+        },
     }
 }
 
@@ -16616,6 +16619,55 @@ position_cells = [4, 5, 6]
             "2",
         )
         .is_none());
+    }
+
+    #[test]
+    fn auto_forward_uses_current_character_name_in_discussions_and_channels() {
+        let mut manager = empty_manager();
+        for user_id in [2, 3] {
+            manager.messages.insert(user_id.to_string(), vec![
+                test_private_message_from(user_id, "hello"),
+            ]);
+        }
+        manager.groups.insert("讨论组".to_owned(), ChatGroup {
+            members: vec!["2".to_owned(), "3".to_owned()],
+        });
+        manager.player_characters.insert("2".to_owned(), PlayerCharacter {
+            nickname: "角色昵称".to_owned(),
+            ..Default::default()
+        });
+        manager.chat_targets.entry("2".to_owned()).or_default().display_name =
+            "聊天备注".to_owned();
+        let mut group = TrpgGroup {
+            players: vec!["2".to_owned(), "3".to_owned()],
+            ..Default::default()
+        };
+        group.ensure_party("red");
+        group.parties.get_mut("red").unwrap().name = "红队".to_owned();
+        group.set_player_party("2", Some("red"));
+        group.set_player_party("3", Some("red"));
+        manager.trpg_groups.insert("table".to_owned(), group);
+        manager.current_trpg_group = Some("table".to_owned());
+
+        for (name, expected) in [("  角色原名  ", "角色原名"), ("角色新名", "角色新名"), ("  ", "user-2")] {
+            manager.player_characters.get_mut("2").unwrap().name = name.to_owned();
+            let discussion = auto_forward_request(
+                &manager,
+                &test_private_message_from(2, "\"你好\""),
+                "2",
+            ).expect("discussion forwarding should be available");
+            assert_eq!(discussion.text, format!("{expected}: 你好"));
+            assert_eq!(discussion.forwarded.unwrap().sender_name, expected);
+            let Some(PartyChannelAutoForward::Forward(channel)) = party_channel_auto_forward_request(
+                &manager,
+                &test_private_message_from(2, "[你好]"),
+                "2",
+            ) else {
+                panic!("channel forwarding should be available");
+            };
+            assert_eq!(channel.text, format!("【红队频道】{expected}: 你好"));
+            assert_eq!(channel.forwarded.unwrap().sender_name, expected);
+        }
     }
 
     #[test]
