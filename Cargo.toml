@@ -27,6 +27,7 @@ resizable = []
 save_schedule = []
 mock_touch = []
 egui_mcp = ["dep:egui_inspection"]
+profiling = ["bevy/trace_tracy", "bevy/debug"]
 
 [dependencies]
 # The bevy engine <3

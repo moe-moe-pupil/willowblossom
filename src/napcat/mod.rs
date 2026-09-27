@@ -1,3 +1,6 @@
+#[cfg(feature = "profiling")]
+use bevy::log::info_span;
+
 mod dice;
 mod outgoing;
 mod receipts;
@@ -5135,6 +5138,8 @@ impl NapcatMessageManager {
     }
 
     pub fn migrate_chat_window_state(&mut self) -> bool {
+        #[cfg(feature = "profiling")]
+        let _profile = info_span!("migrate_chat_window_state").entered();
         if !self.open_chat_targets.is_empty() || !self.pending_chat_targets.is_empty() {
             return false;
         }
@@ -5158,6 +5163,8 @@ impl NapcatMessageManager {
     }
 
     pub fn sync_chat_targets(&mut self) -> bool {
+        #[cfg(feature = "profiling")]
+        let _profile = info_span!("sync_chat_targets").entered();
         let mut changed = false;
         let chat_target_len = self.chat_targets.len();
         self.chat_targets
@@ -5737,6 +5744,8 @@ impl NapcatMessageManager {
     }
 
     pub fn sync_skill_pool_from_completed_characters(&mut self) -> bool {
+        #[cfg(feature = "profiling")]
+        let _profile = info_span!("sync_skill_pool_from_completed_characters").entered();
         let mut next_auto_entries = self
             .player_characters
             .iter()

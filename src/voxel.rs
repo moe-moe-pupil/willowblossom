@@ -773,7 +773,15 @@ impl VoxelGeometryDirtyChunks {
     }
 }
 
+const VOXEL_PHYSICS_LIFETIME_SECONDS: f32 = 15.0;
+
+#[derive(Component, Clone, Copy, Default)]
+struct VoxelPhysicsLifetime {
+    active_seconds: f32,
+}
+
 #[derive(Component, Clone)]
+#[require(VoxelPhysicsLifetime)]
 pub(crate) struct VoxelPhysicsBody {
     pub(crate) local_center: Vec3,
     pub(crate) cells: Vec<(IVec3, u8)>,
@@ -1083,6 +1091,8 @@ impl VoxelPhysicsChunkLoader {
 
 #[derive(Clone)]
 struct VoxelPhysicsBodySnapshot {
+    rigid_body: RigidBody,
+    lifetime: VoxelPhysicsLifetime,
     body: VoxelPhysicsBody,
     transform: Transform,
     linear_velocity: LinearVelocity,
@@ -2874,6 +2884,14 @@ impl Plugin for TrpgVoxelPlugin {
             )
                 .after(VoxelPlayerStandeeSynced)
                 .run_if(crate::replay::replay_video_capture_inactive),
+        )
+        .add_systems(
+            Update,
+            settle_old_voxel_physics_bodies
+                .after(apply_voxel_physics_action)
+                .after(drag_voxel_physics_body)
+                .before(stream_voxel_physics_bodies)
+                .before(persist_voxel_scene),
         )
         .add_systems(
             PhysicsSchedule,
@@ -11787,7 +11805,8 @@ fn apply_voxel_planet_gravity(
             planet_transform.translation,
         );
         if acceleration != Vec3::ZERO {
-            forces.apply_linear_acceleration(acceleration);
+            // Constant gravity must not wake resting debris every physics tick.
+            forces.non_waking().apply_linear_acceleration(acceleration);
         }
     }
 }
@@ -12525,17 +12544,23 @@ fn stream_voxel_physics_bodies(
             &Transform,
             &LinearVelocity,
             &AngularVelocity,
+            &RigidBody,
+            &VoxelPhysicsLifetime,
         ),
         Without<VoxelSpaceship>,
     >,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
-    for (entity, body, transform, linear_velocity, angular_velocity) in &bodies {
+    for (entity, body, transform, linear_velocity, angular_velocity, rigid_body, lifetime) in
+        &bodies
+    {
         if voxel_physics_body_is_loaded(body, transform, &loader) {
             continue;
         }
         loader.unloaded_bodies.push(VoxelPhysicsBodySnapshot {
+            rigid_body: *rigid_body,
+            lifetime: *lifetime,
             body: body.clone(),
             transform: *transform,
             linear_velocity: *linear_velocity,
@@ -12554,7 +12579,7 @@ fn stream_voxel_physics_bodies(
             loader.unloaded_bodies.push(snapshot);
             continue;
         }
-        spawn_voxel_physics_body_at(
+        let entity = spawn_voxel_physics_body_at(
             &mut commands,
             &mut meshes,
             &materials,
@@ -12563,6 +12588,7 @@ fn stream_voxel_physics_bodies(
             snapshot.linear_velocity,
             snapshot.angular_velocity,
         );
+        commands.entity(entity).insert((snapshot.rigid_body, snapshot.lifetime));
     }
 }
 
@@ -14225,6 +14251,8 @@ fn process_voxel_scene_history(
             &Transform,
             &LinearVelocity,
             &AngularVelocity,
+            &RigidBody,
+            &VoxelPhysicsLifetime,
         ),
         Without<VoxelSpaceship>,
     >,
@@ -14242,8 +14270,10 @@ fn process_voxel_scene_history(
         let mut physics_bodies = physics_bodies
             .iter()
             .map(
-                |(_, body, transform, linear_velocity, angular_velocity)| {
+                |(_, body, transform, linear_velocity, angular_velocity, rigid_body, lifetime)| {
                     VoxelPhysicsBodySnapshot {
+                        rigid_body: *rigid_body,
+                        lifetime: *lifetime,
                         body: body.clone(),
                         transform: *transform,
                         linear_velocity: *linear_velocity,
@@ -14311,7 +14341,7 @@ fn process_voxel_scene_history(
         commands.entity(entity).despawn();
     }
     for body in &snapshot.physics_bodies {
-        spawn_voxel_physics_body_at(
+        let entity = spawn_voxel_physics_body_at(
             &mut commands,
             &mut meshes,
             &materials,
@@ -14320,6 +14350,7 @@ fn process_voxel_scene_history(
             body.linear_velocity,
             body.angular_velocity,
         );
+        commands.entity(entity).insert((body.rigid_body, body.lifetime));
     }
     for light in &snapshot.placed_lights {
         spawn_voxel_placed_light(
@@ -14432,6 +14463,7 @@ fn refresh_voxel_minimap_snapshot(
 }
 
 fn apply_voxel_physics_action(
+    mut commands: Commands,
     mut editor: ResMut<VoxelEditorState>,
     cameras: Query<&GlobalTransform, With<VoxelViewportCamera>>,
     mut bodies: Query<(
@@ -14439,6 +14471,8 @@ fn apply_voxel_physics_action(
         Forces,
         &Transform,
         &VoxelPhysicsBody,
+        &RigidBody,
+        &mut VoxelPhysicsLifetime,
     )>,
 ) {
     let Some(request) = editor.physics_action_requested else {
@@ -14460,7 +14494,7 @@ fn apply_voxel_physics_action(
     let explosion_radius = editor.physics_explosion_radius.max(VOXEL_SIZE);
     let mut affected = 0;
 
-    for (entity, mut forces, transform, body) in &mut bodies {
+    for (entity, mut forces, transform, body, rigid_body, mut lifetime) in &mut bodies {
         if request.action != VoxelPhysicsAction::Explode && request.target != Some(entity) {
             continue;
         }
@@ -14478,6 +14512,10 @@ fn apply_voxel_physics_action(
         ) else {
             continue;
         };
+        if *rigid_body == RigidBody::Static {
+            commands.entity(entity).insert(RigidBody::Dynamic);
+        }
+        lifetime.active_seconds = 0.0;
         forces.apply_linear_impulse(impulse);
         affected += 1;
     }
@@ -15007,6 +15045,7 @@ fn despawn_unsupported_voxel_gm_signs(
 }
 
 fn drag_voxel_physics_body(
+    mut commands: Commands,
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<VoxelViewportCamera>>,
@@ -15015,6 +15054,8 @@ fn drag_voxel_physics_body(
             &Transform,
             &mut LinearVelocity,
             &mut AngularVelocity,
+            &RigidBody,
+            &mut VoxelPhysicsLifetime,
         ),
         With<VoxelPhysicsBody>,
     >,
@@ -15076,11 +15117,56 @@ fn drag_voxel_physics_body(
         return;
     };
     let desired = ray.origin + *ray.direction * drag.distance + drag.body_offset;
-    if let Ok((transform, mut velocity, mut angular_velocity)) = bodies.get_mut(target) {
+    if let Ok((transform, mut velocity, mut angular_velocity, rigid_body, mut lifetime)) =
+        bodies.get_mut(target)
+    {
+        if *rigid_body == RigidBody::Static {
+            commands.entity(target).insert(RigidBody::Dynamic);
+        }
+        lifetime.active_seconds = 0.0;
         velocity.0 = tool_gun_drag_velocity(transform.translation, desired);
         angular_velocity.0 *= 0.8;
     } else {
         drag.target = None;
+    }
+}
+
+/// Loose props and fragments keep their exact collider, but stop consuming
+/// simulation time after 15 seconds. Ships are controlled long-lived bodies.
+fn settle_old_voxel_physics_bodies(
+    mut commands: Commands,
+    time: Res<Time>,
+    drag: Res<VoxelToolGunDragState>,
+    mut bodies: Query<
+        (
+            Entity,
+            &RigidBody,
+            &mut VoxelPhysicsLifetime,
+        ),
+        (
+            With<VoxelPhysicsBody>,
+            Without<VoxelSpaceship>,
+        ),
+    >,
+    mut persistence: ResMut<VoxelScenePersistenceState>,
+) {
+    for (entity, body, mut lifetime) in &mut bodies {
+        if *body != RigidBody::Dynamic {
+            continue;
+        }
+        if drag.target == Some(entity) {
+            lifetime.active_seconds = 0.0;
+            continue;
+        }
+        lifetime.active_seconds += time.delta_secs();
+        if lifetime.active_seconds >= VOXEL_PHYSICS_LIFETIME_SECONDS {
+            commands.entity(entity).insert((
+                RigidBody::Static,
+                LinearVelocity::ZERO,
+                AngularVelocity::ZERO,
+            ));
+            persistence.force_save = true;
+        }
     }
 }
 

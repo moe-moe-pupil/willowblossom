@@ -1,3 +1,6 @@
+#[cfg(feature = "profiling")]
+use bevy::log::info_span;
+
 mod chat_analytics;
 mod chat_rows;
 mod ime;
@@ -1945,6 +1948,8 @@ fn dm_voxel_map_windows(
     editor: &mut VoxelEditorState,
     gm_state: &VoxelGmMapState,
 ) {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("dm_voxel_map_windows").entered();
     // This desktop egui layer is never part of the player capture-camera render targets.
     egui::Window::new("DM 小地图")
         .id(Id::new("dm_voxel_minimap"))
@@ -2786,6 +2791,8 @@ fn chat_window(
     voxel_editor: &mut VoxelEditorState,
     voxel_possession: &VoxelPossessionState,
 ) {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("chat_window").entered();
     let empty_messages = Vec::new();
     let messages = manager.messages.get(target_id).unwrap_or(&empty_messages);
     let message_count = messages.len();
@@ -3425,6 +3432,8 @@ fn player_visible_preview_options(
     target_id: &str,
     messages: &[NapcatMessage],
 ) -> Vec<String> {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("player_visible_preview_options").entered();
     match target_kind_with_messages(manager, target_id, messages) {
         ChatTargetExportKind::Private => target_id
             .parse::<u64>()
@@ -3641,6 +3650,8 @@ fn chat_body_ui(
     image_textures: &mut HashMap<String, TextureHandle>,
     desired_height: Option<f32>,
 ) {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("chat_body_ui").entered();
     let available_size = ui.available_size();
     let viewport_height = desired_height
         .unwrap_or(available_size.y)
@@ -4787,6 +4798,8 @@ fn combined_group_messages<'a>(
     manager: &'a NapcatMessageManager,
     members: &'a [String],
 ) -> Vec<CombinedGroupMessage<'a>> {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("combined_group_messages").entered();
     let mut candidates = members
         .iter()
         .enumerate()
@@ -4943,6 +4956,8 @@ fn group_chat_timeline_ui(
     image_textures: &mut HashMap<String, TextureHandle>,
     remove_from_group: &mut Option<String>,
 ) {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("group_chat_timeline_ui").entered();
     let body_height =
         (ui.available_height() - GROUP_BROADCAST_INPUT_HEIGHT - ui.spacing().item_spacing.y)
             .max(GROUP_CHAT_MIN_HEIGHT);
@@ -5626,6 +5641,8 @@ fn queue_summaries_if_needed(
     deepseek_sender: Option<&DeepseekIOSender>,
     deepseek_manager: &mut DeepseekManager,
 ) -> bool {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("queue_summaries_if_needed").entered();
     if deepseek_sender.is_none() {
         return false;
     }
@@ -5935,6 +5952,8 @@ fn clear_player_related_summaries(
 }
 
 fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: &DeepseekManager) {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("summary_panel").entered();
     ui.heading("DeepSeek 总结");
     ui.separator();
 
@@ -6374,6 +6393,8 @@ fn chat_list_panel(
     player_visible_filter: &mut Option<String>,
     trpg_group_settings: &mut TrpgGroupSettingsState,
 ) {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("chat_list_panel").entered();
     ui.heading("TRPG组");
     ui.add_space(4.0);
 
@@ -16828,6 +16849,8 @@ fn sync_enabled_position_radio_parties(
     groups: &mut HashMap<String, TrpgGroup>,
     player_areas: &HashMap<String, &'static str>,
 ) -> bool {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("sync_enabled_position_radio_parties").entered();
     let mut changed = false;
     for group in groups.values_mut() {
         if group.position_radio_auto_sync_enabled {
@@ -16864,6 +16887,8 @@ fn trpg_group_settings_window(
     backup_settings: &mut Persistent<BackupSettings>,
     backup_state: &mut BackupState,
 ) {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("trpg_group_settings_window").entered();
     if !state.open {
         return;
     }

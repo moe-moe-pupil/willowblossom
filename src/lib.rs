@@ -7,6 +7,8 @@ mod hidden_roles;
 mod moonberry_talents;
 mod napcat;
 mod planet_atmosphere;
+#[cfg(feature = "profiling")]
+mod profiling;
 mod replay;
 pub mod rule_engine;
 mod scene;
@@ -37,6 +39,8 @@ use bevy_persistent::{
     Persistent,
     StorageFormat,
 };
+#[cfg(feature = "profiling")]
+use profiling::report_physics_workload;
 use serde::{
     Deserialize,
     Serialize,
@@ -263,6 +267,8 @@ impl Plugin for GamePlugin {
             voxel::TrpgVoxelPlugin::new(game_scene_enabled),
         ));
         app.add_systems(Update, persist_primary_window_size);
+        #[cfg(feature = "profiling")]
+        app.add_systems(Update, report_physics_workload);
     }
 }
 

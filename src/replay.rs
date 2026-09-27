@@ -1467,6 +1467,7 @@ fn record_ship_trajectory_history(
     spaceships: Query<(Entity, &VoxelSpaceship, &Transform), Without<VoxelViewportCamera>>,
     mut history: ResMut<Persistent<ReplayShipTrajectoryHistory>>,
     mut recorder: ResMut<ReplayShipTrajectoryRecorder>,
+    mut pending_save: Local<bool>,
 ) {
     let active_campaign = if replay_scene_dynamics_active(&studio) {
         None
@@ -1504,7 +1505,10 @@ fn record_ship_trajectory_history(
         let moved = |left: [f32; 3], right: [f32; 3]| left != right;
         if let Some(&session_index) = recorder.sessions.get(&key) {
             let session = &mut history.sessions[session_index];
-            session.ship_name = ship.name.clone();
+            if session.ship_name != ship.name {
+                session.ship_name = ship.name.clone();
+                *pending_save = true;
+            }
             if gm_manipulated {
                 let unchanged = session.keyframes.last().is_some_and(|last| {
                     !moved(last.translation, keyframe.translation)
@@ -1512,6 +1516,7 @@ fn record_ship_trajectory_history(
                 });
                 if !unchanged {
                     session.keyframes.push(keyframe);
+                    *pending_save = true;
                 }
             }
             continue;
@@ -1545,6 +1550,7 @@ fn record_ship_trajectory_history(
             ship,
             &manager,
         );
+        *pending_save = true;
         recorder.sessions.insert(key.clone(), session_index);
         recorder.pending_poses.remove(&key);
         let session = &mut history.sessions[session_index];
@@ -1560,8 +1566,13 @@ fn record_ship_trajectory_history(
     }
     if recorder.persist_accumulator >= SHIP_TRAJECTORY_HISTORY_PERSIST_SECONDS {
         recorder.persist_accumulator %= SHIP_TRAJECTORY_HISTORY_PERSIST_SECONDS;
-        if let Err(err) = history.persist() {
-            eprintln!("failed to persist replay ship trajectory history: {err}");
+        // Parked ships do not change the history. Avoid serializing and writing
+        // the entire file twice per second while the GM is only using chat.
+        if *pending_save {
+            match history.persist() {
+                Ok(()) => *pending_save = false,
+                Err(err) => eprintln!("failed to persist replay ship trajectory history: {err}"),
+            }
         }
     }
 }

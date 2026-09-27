@@ -10,6 +10,8 @@ use std::{
     },
 };
 
+#[cfg(feature = "profiling")]
+use bevy::log::info_span;
 use bevy_egui::egui;
 
 use crate::{
@@ -275,6 +277,8 @@ pub(super) fn ranked_private_chat_timings(
     manager: &NapcatMessageManager,
     group: &TrpgGroup,
 ) -> Vec<PrivateChatTiming> {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("ranked_private_chat_timings").entered();
     let now = unix_timestamp_secs();
     let session_started_at = current_session_started_at(manager, group);
     let mut seen = HashSet::new();
