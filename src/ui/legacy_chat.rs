@@ -186,7 +186,9 @@ pub(super) fn show_chat_workspace(
             });
             ui.separator();
 
-            let messages = manager.messages.get(target_id).cloned().unwrap_or_default();
+            let empty_messages = Vec::new();
+            let messages = manager.messages.get(target_id).unwrap_or(&empty_messages);
+            let message_count = messages.len();
             let unread_count = target_unread_count(manager, target_id);
             chat_body_ui(
                 ui,
@@ -202,7 +204,7 @@ pub(super) fn show_chat_workspace(
                 image_textures,
                 None,
             );
-            mark_target_read(manager, target_id, messages.len());
+            mark_target_read(manager, target_id, message_count);
         });
 
     active_target

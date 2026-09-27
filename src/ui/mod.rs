@@ -1,4 +1,5 @@
 mod chat_analytics;
+mod chat_rows;
 mod ime;
 mod legacy_chat;
 mod tool_parameter_hud;
@@ -69,6 +70,10 @@ use chat_analytics::{
     show_gm_auto_chat_toast,
     update_gm_auto_chat_mode,
     GmAutoChatModeState,
+};
+use chat_rows::{
+    message_layout_fingerprint,
+    ChatRowCache,
 };
 use ime::*;
 use legacy_chat::{
@@ -1025,6 +1030,7 @@ pub struct GIFImages {
 pub(crate) struct ChatScrollState {
     message_count: usize,
     near_bottom: bool,
+    rows: ChatRowCache,
 }
 
 const AUTO_HIDE_EDGE_SIZE: f32 = 8.0;
@@ -2693,10 +2699,10 @@ pub(crate) fn persist_ui_memory_after_interaction(
                 )
             })
     });
-    ctx.memory(|memory| {
-        cached_memory.ui_memory = memory.clone();
-    });
     if should_persist {
+        ctx.memory(|memory| {
+            cached_memory.ui_memory = memory.clone();
+        });
         cached_memory.persist().ok();
     }
 }
@@ -2756,8 +2762,6 @@ fn chat_window(
     id: Id,
     rect: Rect,
     ctx: &Context,
-    _lens: Vec<usize>,
-    messages: &Vec<NapcatMessage>,
     napcat_sender: Option<&NapcatIOSender>,
     target_id: &str,
     chat_input_msgs: &mut Local<HashMap<String, String>>,
@@ -2782,6 +2786,9 @@ fn chat_window(
     voxel_editor: &mut VoxelEditorState,
     voxel_possession: &VoxelPossessionState,
 ) {
+    let empty_messages = Vec::new();
+    let messages = manager.messages.get(target_id).unwrap_or(&empty_messages);
+    let message_count = messages.len();
     let mut window_open = true;
     let mut leave_group = false;
     let grouped = current_group.is_some();
@@ -3286,7 +3293,7 @@ fn chat_window(
         }
 
         if window_received_focus(ctx, &response.response) {
-            mark_target_read(manager, target_id, messages.len());
+            mark_target_read(manager, target_id, message_count);
         }
 
         if current_group.is_some() {
@@ -3676,6 +3683,7 @@ fn chat_body_ui(
                     .or_insert_with(|| ChatScrollState {
                         message_count: messages.len(),
                         near_bottom: true,
+                        ..default()
                     });
                 let should_stick_to_bottom =
                     messages.len() > scroll_state.message_count && scroll_state.near_bottom;
@@ -3694,17 +3702,18 @@ fn chat_body_ui(
                         |ui| {
                             let new_message_start =
                                 newest_unread_incoming_start(messages, unread_count);
+                            scroll_state.rows.prepare(ui, messages.len());
                             for (message_index, message) in messages.iter().enumerate() {
                                 let is_new = message_index >= new_message_start
                                     && message.data.user_id != message.data.self_id;
-                                message_row_ui(
+                                scroll_state.rows.show(
                                     ui,
-                                    message,
-                                    is_new,
-                                    message_width,
-                                    image_textures,
+                                    message_index,
+                                    message_layout_fingerprint(message),
+                                    |ui| {
+                                        message_row_ui(ui, message, is_new, message_width, image_textures);
+                                    },
                                 );
-                                ui.add_space(ui.spacing().item_spacing.y);
                             }
                         },
                     );
@@ -4988,6 +4997,7 @@ fn group_chat_timeline_ui(
                     .or_insert_with(|| ChatScrollState {
                         message_count: combined_messages.len(),
                         near_bottom: true,
+                        ..default()
                     });
             let should_stick_to_bottom =
                 combined_messages.len() > scroll_state.message_count && scroll_state.near_bottom;
@@ -5004,16 +5014,21 @@ fn group_chat_timeline_ui(
                 ui.with_layout(
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
-                        for combined in combined_messages {
+                        scroll_state.rows.prepare(ui, combined_messages.len());
+                        for (index, combined) in combined_messages.iter().enumerate() {
                             let row_width = ui.available_width();
-                            combined_group_message_row_ui(
-                                ui,
-                                combined,
-                                manager,
-                                row_width,
-                                image_textures,
-                            );
-                            ui.add_space(ui.spacing().item_spacing.y);
+                            let mut hash = DefaultHasher::new();
+                            message_layout_fingerprint(combined.message).hash(&mut hash);
+                            for target_id in &combined.target_ids {
+                                target_id.hash(&mut hash);
+                                target_display_name(manager, target_id).hash(&mut hash);
+                                is_group_chat_target(manager, target_id).hash(&mut hash);
+                            }
+                            scroll_state.rows.show(ui, index, hash.finish(), |ui| {
+                                combined_group_message_row_ui(
+                                    ui, combined, manager, row_width, image_textures,
+                                );
+                            });
                         }
                     },
                 );
@@ -5267,37 +5282,15 @@ fn fit_image_size(original: Vec2, max_size: Vec2) -> Vec2 {
     original * scale
 }
 
-pub fn get_nickname_lens(target_id: String, messages: &Vec<NapcatMessage>) -> (&str, Vec<usize>) {
-    let mut nickname = "";
-    let mut lens: Vec<usize> = vec![];
-    for message in messages {
-        let mut len: usize = 0;
-        for chain in &message.data.message {
-            match &chain.variant {
-                NapcatMessageChainType::Source(_) => {},
-                NapcatMessageChainType::Text { data } => {
-                    len += data.text.len();
-                },
-                NapcatMessageChainType::Image { .. } => {
-                    len += 12;
-                },
-                NapcatMessageChainType::ForwardedReplay { .. } => {},
-                NapcatMessageChainType::Unsupported => {},
-            };
-        }
-
-        if message.data.sender.user_id.to_string() == *target_id {
-            nickname = &message.data.sender.nickname;
-        }
-        lens.push(len)
-    }
-
-    (nickname, lens)
-}
-
 fn target_default_display_name(target_id: &str, messages: Option<&Vec<NapcatMessage>>) -> String {
+    let user_id = target_id.parse::<u64>().ok();
     messages
-        .map(|messages| get_nickname_lens(target_id.to_owned(), messages).0)
+        .and_then(|messages| {
+            messages.iter().rev().find(|message| {
+                Some(message.data.sender.user_id) == user_id
+            })
+        })
+        .map(|message| message.data.sender.nickname.as_str())
         .filter(|nickname| !nickname.is_empty())
         .unwrap_or(target_id)
         .to_owned()
@@ -5633,6 +5626,9 @@ fn queue_summaries_if_needed(
     deepseek_sender: Option<&DeepseekIOSender>,
     deepseek_manager: &mut DeepseekManager,
 ) -> bool {
+    if deepseek_sender.is_none() {
+        return false;
+    }
     let mut changed = false;
     let Some(campaign_id) = manager.active_campaign_id() else {
         return false;
@@ -5876,16 +5872,7 @@ fn summary_display_parts<'a>(
     if let Some(campaign_id) = campaign_id {
         scope = format!("{scope} · 战役：{campaign_id}");
     }
-    let display_name = manager
-        .messages
-        .get(target_id)
-        .map(|messages| {
-            get_nickname_lens(target_id.to_string(), messages)
-                .0
-                .to_owned()
-        })
-        .filter(|nickname| !nickname.is_empty())
-        .unwrap_or_else(|| target_id.to_string());
+    let display_name = target_default_display_name(target_id, manager.messages.get(target_id));
 
     (display_name, scope)
 }
@@ -18544,11 +18531,8 @@ pub fn ui_system(
             legacy_chat_layout,
         );
         if let Some(target_id) = active_target {
-            let messages = manager
-                .messages
-                .get(&target_id)
-                .cloned()
-                .unwrap_or_default();
+            let empty_messages = Vec::new();
+            let messages = manager.messages.get(&target_id).unwrap_or(&empty_messages);
             if queue_summaries_if_needed(
                 &manager,
                 &target_id,
@@ -20275,11 +20259,8 @@ pub fn ui_system(
             }
 
             for target_id in visible_targets {
-                let messages = manager
-                    .messages
-                    .get(&target_id)
-                    .cloned()
-                    .unwrap_or_default();
+                let empty_messages = Vec::new();
+                let messages = manager.messages.get(&target_id).unwrap_or(&empty_messages);
                 let id = egui::Id::new(&target_id);
                 let mut default_rect: Rect = Rect::from_pos(Pos2::new(0.0, 0.0));
                 if !**has_run_once {
@@ -20312,7 +20293,6 @@ pub fn ui_system(
                 } else {
                     ui.max_rect()
                 };
-                let (_nickname, heights) = get_nickname_lens(target_id.clone(), &messages);
                 let window_title = target_display_name(&manager, &target_id);
                 let targets = targets_for_target(&manager, &target_id);
                 let unread_count = target_unread_count(&manager, &target_id);
@@ -20339,8 +20319,6 @@ pub fn ui_system(
                     id,
                     rect,
                     ctx,
-                    heights,
-                    &messages,
                     napcat_sender,
                     &target_id,
                     chat_input_msgs,
