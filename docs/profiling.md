@@ -29,8 +29,9 @@ when measuring steady-state performance: loose voxel props and fragments become
 static after **15 seconds** of simulation. They keep their geometry and collision
 shape, and dragging or applying a physics-tool impulse reactivates them and resets
 the timer. Ships are excluded. Chunk streaming and in-memory scene snapshots retain
-the timer and static state; reloading the saved application scene starts a fresh
-15-second period. No existing binary scene format is changed.
+the timer and static state. On application startup, all saved loose voxel bodies
+load as static with zero velocity, including bodies in older saves. They do not
+restart the 15-second timer. No existing binary scene format is changed.
 
 The initial September 27 capture measured 215.3 ms mean steady-state CPU frame
 time (about 4.6 FPS). The fixed physics loop consumed 168.3 ms/frame on average;

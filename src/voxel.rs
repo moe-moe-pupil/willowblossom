@@ -3213,21 +3213,32 @@ fn load_persisted_voxel_scene(
     }
     physics_loader.unloaded_bodies.clear();
     for body in &scene.physics_bodies {
-        let (cells, transform, linear_velocity, angular_velocity) =
-            runtime_voxel_physics_body(body);
+        let (cells, transform, _, _) = runtime_voxel_physics_body(body);
         if cells.is_empty() {
             continue;
         }
-        spawn_voxel_physics_body_at(
+        let entity = spawn_voxel_physics_body_at(
             &mut commands,
             &mut meshes,
             &materials,
             cells,
             transform,
-            linear_velocity,
-            angular_velocity,
+            LinearVelocity::ZERO,
+            AngularVelocity::ZERO,
         );
+        // Saved loose bodies are settled scenery on startup, including old saves.
+        // Physics tools can reactivate them with a fresh simulation lifetime.
+        commands.entity(entity).insert((
+            RigidBody::Static,
+            VoxelPhysicsLifetime {
+                active_seconds: VOXEL_PHYSICS_LIFETIME_SECONDS,
+            },
+        ));
     }
+    info!(
+        "Loaded {} saved voxel physics bodies as static",
+        scene.physics_bodies.iter().filter(|body| !body.cells.is_empty()).count()
+    );
     for light in &scene.placed_lights {
         let entity = spawn_voxel_placed_light(
             &mut commands,
