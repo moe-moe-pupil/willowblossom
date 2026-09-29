@@ -1,3 +1,7 @@
+#[cfg(test)]
+mod character_edit_tests;
+#[cfg(test)]
+mod character_sync_tests;
 mod post_match;
 
 use std::{
@@ -28,6 +32,7 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use serde_json::to_vec;
 
 #[cfg(test)]
 use crate::rule_engine::{
@@ -117,6 +122,7 @@ use crate::{
         trpg_config_with_weave,
         update_character_from_status_with_config,
         wounded_healing_dealt_multiplier,
+        CharacterBuffBaseStats,
         CharacterSkillMetadata,
         CharacterSkillSourceKind,
         CharacterStatus,
@@ -163,6 +169,8 @@ use crate::{
     scene::SceneCharacterPositions,
     ui::{
         advance_buffs_for_players,
+        record_character_stat_edits,
+        refresh_character_derived_stats,
         sync_character_buffs,
     },
 };
@@ -248,6 +256,13 @@ pub struct BattleRoundUiState {
     selected_item_skill_index: HashMap<String, usize>,
     action_amount: HashMap<String, f32>,
     confirm_next_round: HashSet<String>,
+    character_sync_stamps: HashMap<(String, String), CharacterSyncStamp>,
+}
+
+struct CharacterSyncStamp {
+    signature: u64,
+    hp: f32,
+    mp: f32,
 }
 
 impl BattleRoundUiState {
@@ -3591,6 +3606,7 @@ fn battle_round_panel(
                     }
 
                     for encounter_entity in encounter_rows {
+                        let mut encounter_manager_changed = false;
                         let encounter_changed = encounter_ui(
                             ui,
                             &mut ui_state,
@@ -3600,13 +3616,19 @@ fn battle_round_panel(
                             scene_positions.as_deref(),
                             &mut targeting_line,
                             encounter_entity,
+                            &mut encounter_manager_changed,
                         );
                         changed |= encounter_changed;
-                        if encounter_changed {
-                            manager_changed |= sync_encounter_to_manager(
-                                store.encounters.get(encounter_entity.id.as_str()),
-                                manager,
-                            );
+                        manager_changed |= encounter_manager_changed;
+                        if encounter_manager_changed {
+                            if let Some(encounter) = store.encounters.get(&encounter_entity.id) {
+                                remember_encounter_characters(
+                                    encounter,
+                                    &encounter_entity.id,
+                                    manager,
+                                    &mut ui_state.character_sync_stamps,
+                                );
+                            }
                         }
                         ui.add_space(6.0);
                     }
@@ -3775,6 +3797,7 @@ fn encounter_ui(
     scene_positions: Option<&SceneCharacterPositions>,
     targeting_line: &mut BattleTargetingLine,
     encounter_entity: &BattleEncounterEntity,
+    manager_changed: &mut bool,
 ) -> bool {
     let mut changed = false;
     let encounter_id = encounter_entity.id.as_str();
@@ -3786,13 +3809,20 @@ fn encounter_ui(
         .get(encounter_id)
         .is_some_and(|encounter| encounter.manager_sync_quarantined)
     {
-        return quarantined_encounter_ui(
+        let changed = quarantined_encounter_ui(
             ui,
             store,
             manager,
             encounter_id,
             &encounter_entity.name,
         );
+        if changed {
+            *manager_changed |= sync_encounter_to_manager(
+                store.encounters.get(encounter_id),
+                manager,
+            );
+        }
+        return changed;
     }
     let linked_group_name = store
         .encounters
@@ -3865,6 +3895,12 @@ fn encounter_ui(
     if let Some(encounter) = store.encounters.get_mut(encounter_id) {
         changed |= prune_unbound_group_participants(encounter, manager);
     }
+    let character_changed = sync_encounter_characters(
+        store,
+        encounter_id,
+        manager,
+        &mut ui_state.character_sync_stamps,
+    );
     let initial_round = store
         .encounters
         .get(encounter_id)
@@ -3980,6 +4016,7 @@ fn encounter_ui(
             encounter_id,
             store,
             manager,
+            rule_engine_state,
             scene_positions,
         );
         ui.separator();
@@ -4012,7 +4049,15 @@ fn encounter_ui(
         changed = true;
     }
 
-    changed
+    if changed {
+        sync_encounter_to_manager(
+            store.encounters.get(encounter_id),
+            manager,
+        );
+        // Roster edits and skill actions also mutate the manager directly.
+        *manager_changed = true;
+    }
+    changed || character_changed
 }
 
 fn locked_encounter_ui(
@@ -4121,7 +4166,8 @@ fn encounter_roster_ui(
     ui_state: &mut BattleRoundUiState,
     encounter_id: &str,
     store: &mut BattleRoundStore,
-    manager: &NapcatMessageManager,
+    manager: &mut NapcatMessageManager,
+    rule_engine_state: &mut RuleEngineState,
     _scene_positions: Option<&SceneCharacterPositions>,
 ) -> bool {
     let mut changed = false;
@@ -4136,6 +4182,7 @@ fn encounter_roster_ui(
     for (order_index, participant_index) in order.iter().copied().enumerate() {
         let mut remove = false;
         let participant = &mut encounter.participants[participant_index];
+        let before_edit = BattleCharacterEdit::from_participant(participant);
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{}.", order_index + 1));
             let mut requested_done = participant.action_done;
@@ -4494,6 +4541,12 @@ fn encounter_roster_ui(
                 remove = true;
             }
         });
+        changed |= apply_battle_character_edit(
+            participant,
+            &before_edit,
+            manager,
+            rule_engine_state,
+        );
         if remove {
             encounter.participants.remove(participant_index);
             changed = true;
@@ -7619,6 +7672,217 @@ impl BattleRoundStore {
         let _ = participant;
         self.finish_actor_action(encounter_id, target_id)
     }
+}
+
+fn character_sync_stamp(
+    participant: &BattleParticipantSnapshot,
+    manager: &NapcatMessageManager,
+    group_modifiers: TrpgGlobalCombatModifiers,
+) -> Option<CharacterSyncStamp> {
+    if !participant.player_character
+        || participant.is_summon
+        || participant.unit_template_id.is_some()
+    {
+        return None;
+    }
+    let character = manager.player_characters.get(&participant.target_id)?;
+    let mut hasher = DefaultHasher::new();
+    to_vec(&(
+        character,
+        manager.hidden_roles.get(&participant.target_id),
+        group_modifiers,
+    ))
+    .ok()?
+    .hash(&mut hasher);
+    Some(CharacterSyncStamp {
+        signature: hasher.finish(),
+        hp: character.hp,
+        mp: character.mp,
+    })
+}
+
+fn remember_encounter_characters(
+    encounter: &BattleEncounter,
+    encounter_id: &str,
+    manager: &NapcatMessageManager,
+    stamps: &mut HashMap<(String, String), CharacterSyncStamp>,
+) {
+    let group_modifiers = encounter_group_combat_modifiers(encounter, manager);
+    for participant in &encounter.participants {
+        if let Some(stamp) = character_sync_stamp(participant, manager, group_modifiers) {
+            stamps.insert(
+                (
+                    encounter_id.to_owned(),
+                    participant.target_id.clone(),
+                ),
+                stamp,
+            );
+        }
+    }
+}
+
+fn sync_encounter_characters(
+    store: &mut BattleRoundStore,
+    encounter_id: &str,
+    manager: &NapcatMessageManager,
+    stamps: &mut HashMap<(String, String), CharacterSyncStamp>,
+) -> bool {
+    if !store.encounter_is_canonical(encounter_id)
+        || !store.encounter_group_exists(encounter_id, manager)
+    {
+        return false;
+    }
+    let Some(encounter) = store.encounters.get_mut(encounter_id) else {
+        return false;
+    };
+    if encounter.manager_sync_quarantined {
+        return false;
+    }
+    let group_modifiers = encounter_group_combat_modifiers(encounter, manager);
+    let linked_players = encounter
+        .trpg_group
+        .as_ref()
+        .and_then(|name| manager.trpg_groups.get(name))
+        .map(|group| &group.players);
+    let mut changed = false;
+    for participant in &mut encounter.participants {
+        if linked_players.is_some_and(|players| !players.contains(&participant.target_id)) {
+            continue;
+        }
+        let Some(stamp) = character_sync_stamp(participant, manager, group_modifiers) else {
+            continue;
+        };
+        let key = (
+            encounter_id.to_owned(),
+            participant.target_id.clone(),
+        );
+        let previous = stamps.get(&key);
+        if previous.is_some_and(|previous| previous.signature == stamp.signature) {
+            continue;
+        }
+        let hp = participant.hp;
+        let mp = participant.mp;
+        sync_participant_from_manager(participant, manager);
+        // Combat-only bonus pools must not refill when an unrelated character field changes.
+        let character = &manager.player_characters[&participant.target_id];
+        let preserve_role_vitals = previous.is_none()
+            && manager.hidden_roles.contains_key(&participant.target_id)
+            && (participant.max_hp != character.max_hp + character.dominion_max_hp_bonus
+                || participant.max_mp != character.max_mp);
+        if preserve_role_vitals || previous.is_some_and(|previous| previous.hp == stamp.hp) {
+            participant.hp = hp.clamp(0.0, participant.max_hp.max(0.0));
+        } else {
+            participant.hp = stamp.hp.clamp(0.0, participant.max_hp.max(0.0));
+        }
+        if preserve_role_vitals || previous.is_some_and(|previous| previous.mp == stamp.mp) {
+            participant.mp = mp.clamp(0.0, participant.max_mp.max(0.0));
+        } else {
+            participant.mp = stamp.mp.clamp(0.0, participant.max_mp.max(0.0));
+        }
+        participant.alive = participant.hp > 0.0 || participant_hope_avatar_active(participant);
+        participant.damage_taken_this_turn = character.damage_taken_this_turn;
+        participant.healing_taken_this_turn = character.healing_taken_this_turn;
+        participant.skill_last_used_turns = character.skill_last_cast_turns.clone();
+        participant.skill_cooldown_ready_turns = character.skill_cooldown_ready_turns.clone();
+        participant.group_modifiers = group_modifiers;
+        stamps.insert(key, stamp);
+        changed = true;
+    }
+    changed
+}
+
+#[derive(PartialEq)]
+struct BattleCharacterEdit {
+    display_name: String,
+    agi: i32,
+    speed: f32,
+    hp: f32,
+    max_hp: f32,
+    mp: f32,
+    max_mp: f32,
+}
+
+impl BattleCharacterEdit {
+    fn from_participant(participant: &BattleParticipantSnapshot) -> Self {
+        Self {
+            display_name: participant.display_name.clone(),
+            agi: participant.agi,
+            speed: participant.speed,
+            hp: participant.hp,
+            max_hp: participant.max_hp,
+            mp: participant.mp,
+            max_mp: participant.max_mp,
+        }
+    }
+}
+
+fn apply_battle_character_edit(
+    participant: &mut BattleParticipantSnapshot,
+    previous: &BattleCharacterEdit,
+    manager: &mut NapcatMessageManager,
+    rule_engine_state: &mut RuleEngineState,
+) -> bool {
+    if !participant.player_character
+        || participant.is_summon
+        || participant.unit_template_id.is_some()
+        || BattleCharacterEdit::from_participant(participant) == *previous
+    {
+        return false;
+    }
+    let target_id = &participant.target_id;
+    let config = manager.character_stat_config_for_target(target_id);
+    let Some(character) = manager.player_characters.get_mut(target_id) else {
+        return false;
+    };
+    if participant.display_name != previous.display_name {
+        if character.nickname.trim().is_empty() {
+            character.name = participant.display_name.clone();
+        } else {
+            character.nickname = participant.display_name.clone();
+        }
+    }
+    if participant.agi != previous.agi {
+        character.status.agi += participant.agi - previous.agi;
+        refresh_character_derived_stats(
+            target_id,
+            character,
+            &config,
+            rule_engine_state,
+            &manager.skill_pool,
+        );
+    }
+    let stats_before_edit = CharacterBuffBaseStats::from_character(character);
+    // Apply only manual deltas: effective battle bonuses are not permanent base stats.
+    if participant.max_hp != previous.max_hp {
+        character.max_hp = (character.max_hp + participant.max_hp - previous.max_hp).max(0.0);
+    }
+    if participant.max_mp != previous.max_mp {
+        character.max_mp = (character.max_mp + participant.max_mp - previous.max_mp).max(0.0);
+    }
+    if participant.speed != previous.speed {
+        let speed_scale = if character.buff_base_stats.is_none()
+            && character_gale_force_battle_speeds(character).is_some()
+        {
+            1.2
+        } else {
+            1.0
+        };
+        character.speed =
+            (character.speed + (participant.speed - previous.speed) / speed_scale).max(0.0);
+    }
+    character.hp = (character.hp + participant.hp - previous.hp).clamp(
+        0.0,
+        (character.max_hp + character.dominion_max_hp_bonus).max(0.0),
+    );
+    character.mp =
+        (character.mp + participant.mp - previous.mp).clamp(0.0, character.max_mp.max(0.0));
+    record_character_stat_edits(target_id, character, &stats_before_edit);
+    if participant.agi != previous.agi {
+        sync_participant_from_manager_with_vitals(participant, manager);
+    } else {
+        sync_participant_from_manager(participant, manager);
+    }
+    true
 }
 
 fn refresh_encounter_players(

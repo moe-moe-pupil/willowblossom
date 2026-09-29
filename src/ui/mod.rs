@@ -8898,12 +8898,7 @@ fn character_editor_ui(
         stats_changed |= healing_taken_changed;
     });
     if stats_changed {
-        let stat_scales = character_buff_stat_scales(target_id, character);
-        record_manual_character_stat_edits(
-            character,
-            &stats_before_edit,
-            &stat_scales,
-        );
+        record_character_stat_edits(target_id, character, &stats_before_edit);
     }
     ui.horizontal_wrapped(|ui| {
         changed |= ui
@@ -8973,11 +8968,7 @@ fn character_editor_ui(
     );
 
     if derived_stats_changed {
-        if let Some(base_stats) = character.buff_base_stats.take() {
-            restore_character_base_stats(character, base_stats);
-        }
-        update_character_from_status_with_config(character, &stat_config);
-        sync_character_buffs(
+        refresh_character_derived_stats(
             target_id,
             character,
             &stat_config,
@@ -10364,6 +10355,35 @@ fn adjusted_character_base_stat(base: f32, current: f32, previous: f32, scale: f
     } else {
         base + effective_delta
     }
+}
+
+pub(crate) fn record_character_stat_edits(
+    target_id: &str,
+    character: &mut PlayerCharacter,
+    previous: &CharacterBuffBaseStats,
+) {
+    let stat_scales = character_buff_stat_scales(target_id, character);
+    record_manual_character_stat_edits(character, previous, &stat_scales);
+}
+
+pub(crate) fn refresh_character_derived_stats(
+    target_id: &str,
+    character: &mut PlayerCharacter,
+    stat_config: &TrpgBasicConfig,
+    rule_engine_state: &mut RuleEngineState,
+    skill_pool: &[SkillPoolEntry],
+) {
+    if let Some(base_stats) = character.buff_base_stats.take() {
+        restore_character_base_stats(character, base_stats);
+    }
+    update_character_from_status_with_config(character, stat_config);
+    sync_character_buffs(
+        target_id,
+        character,
+        stat_config,
+        rule_engine_state,
+        skill_pool,
+    );
 }
 
 fn record_manual_character_stat_edits(
