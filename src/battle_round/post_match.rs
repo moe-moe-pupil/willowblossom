@@ -1240,7 +1240,16 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::napcat::UnitRarity;
+    use crate::{
+        battle_round::{
+            advance_participant_delayed_damage_ticks,
+            advance_participant_delayed_healing_ticks,
+            BattleDelayedDamageTick,
+            BattleDelayedHealingTick,
+        },
+        napcat::UnitRarity,
+        rule_engine::DamageType,
+    };
 
     fn participant(
         id: &str,
@@ -1682,16 +1691,17 @@ mod tests {
         let mut target = participant("target", "Target", false);
         target.hp = 50.0;
         target.max_hp = 100.0;
-        target.delayed_damage_ticks = vec![super::super::BattleDelayedDamageTick {
+        target.delayed_damage_ticks = vec![BattleDelayedDamageTick {
             name: "苏萨斯之爪".to_owned(),
             source_id: "alice".to_owned(),
             source_name: "Alice".to_owned(),
             amount: 12.0,
-            damage_type: crate::rule_engine::DamageType::Magical,
+            damage_type: DamageType::Magical,
             turns_remaining: 2,
+            repeat_each_round: false,
         }];
 
-        let damage = super::super::advance_participant_delayed_damage_ticks(&mut target, true, 7);
+        let damage = advance_participant_delayed_damage_ticks(&mut target, true, 7);
 
         assert_eq!(damage.combat_log.len(), 1);
         assert_eq!(damage.combat_log[0].round, 7);
@@ -1704,15 +1714,16 @@ mod tests {
             12.0
         );
 
-        target.delayed_healing_ticks = vec![super::super::BattleDelayedHealingTick {
+        target.delayed_healing_ticks = vec![BattleDelayedHealingTick {
             name: "千万回忆".to_owned(),
             source_id: "bob".to_owned(),
             source_name: "Bob".to_owned(),
             amount: 8.0,
             overhealing_shield_cap_rate: 0.0,
             turns_remaining: 1,
+            repeat_each_round: false,
         }];
-        let healing = super::super::advance_participant_delayed_healing_ticks(&mut target, 8);
+        let healing = advance_participant_delayed_healing_ticks(&mut target, 8);
 
         assert_eq!(healing.combat_log.len(), 1);
         assert_eq!(healing.combat_log[0].round, 8);

@@ -2,6 +2,15 @@
 mod character_edit_tests;
 #[cfg(test)]
 mod character_sync_tests;
+#[cfg(test)]
+mod dot_tests;
+#[cfg(test)]
+mod dot_ui_tests;
+mod healing;
+#[cfg(test)]
+mod hot_tests;
+mod ordinary_heal;
+mod over_time;
 mod post_match;
 
 use std::{
@@ -27,7 +36,17 @@ use bevy_persistent::{
     Persistent,
     StorageFormat,
 };
-use egui::{Color32, TextEdit, Ui};
+use egui::{
+    Button,
+    Color32,
+    TextEdit,
+    Ui,
+};
+use healing::resolve_battle_healing;
+use over_time::{
+    gm_over_time_ui,
+    GmOverTimeDraft,
+};
 use serde::{
     Deserialize,
     Serialize,
@@ -68,7 +87,6 @@ use crate::{
         character_dominion_max_hp_bonus_cap,
         character_dominion_max_hp_gain_rate,
         character_dying_target_healing_modifier,
-        character_echoing_memory_healing_rates,
         character_effective_skill_mp_cost,
         character_endless_pain_bonus_damage_per_stack,
         character_fatigue_walker_available,
@@ -257,6 +275,7 @@ pub struct BattleRoundUiState {
     action_amount: HashMap<String, f32>,
     confirm_next_round: HashSet<String>,
     character_sync_stamps: HashMap<(String, String), CharacterSyncStamp>,
+    gm_over_time_drafts: HashMap<String, GmOverTimeDraft>,
 }
 
 struct CharacterSyncStamp {
@@ -748,6 +767,9 @@ pub struct BattleDelayedDamageTick {
     pub amount: f32,
     pub damage_type: DamageType,
     pub turns_remaining: i32,
+    /// For DOTs, `turns_remaining` counts future damage ticks instead of a one-shot delay.
+    #[serde(default)]
+    pub repeat_each_round: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -759,6 +781,9 @@ pub struct BattleDelayedHealingTick {
     #[serde(default)]
     pub overhealing_shield_cap_rate: f32,
     pub turns_remaining: i32,
+    /// For HOTs, `turns_remaining` counts future healing ticks instead of a one-shot delay.
+    #[serde(default)]
+    pub repeat_each_round: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2819,6 +2844,7 @@ fn schedule_participant_delayed_damage(
             amount: amount.max(0.0),
             damage_type,
             turns_remaining: 2,
+            repeat_each_round: false,
         });
 }
 
@@ -2840,6 +2866,7 @@ fn schedule_participant_delayed_healing(
             amount: amount.max(0.0),
             overhealing_shield_cap_rate: overhealing_shield_cap_rate.max(0.0),
             turns_remaining: turns_remaining.max(1),
+            repeat_each_round: false,
         });
 }
 
@@ -2947,6 +2974,14 @@ fn advance_participant_delayed_damage_ticks(
     let display_name = participant.display_name.clone();
     let mut due = Vec::new();
     participant.delayed_damage_ticks.retain_mut(|tick| {
+        if tick.repeat_each_round {
+            if tick.turns_remaining <= 0 {
+                return false;
+            }
+            due.push(tick.clone());
+            tick.turns_remaining -= 1;
+            return tick.turns_remaining > 0;
+        }
         // Persisted ticks use 2 before their one execution; older builds left 1 behind after it.
         if tick.turns_remaining <= 0 {
             return false;
@@ -3138,6 +3173,14 @@ fn advance_participant_delayed_healing_ticks(
     let display_name = participant.display_name.clone();
     let mut due = Vec::new();
     participant.delayed_healing_ticks.retain_mut(|tick| {
+        if tick.repeat_each_round {
+            if tick.turns_remaining <= 0 {
+                return false;
+            }
+            due.push(tick.clone());
+            tick.turns_remaining -= 1;
+            return tick.turns_remaining > 0;
+        }
         tick.turns_remaining -= 1;
         if tick.turns_remaining <= 0 {
             due.push(tick.clone());
@@ -3508,6 +3551,7 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
                 tick.amount.to_bits().hash(&mut hasher);
                 tick.damage_type.hash(&mut hasher);
                 tick.turns_remaining.hash(&mut hasher);
+                tick.repeat_each_round.hash(&mut hasher);
             }
             for tick in &participant.delayed_healing_ticks {
                 tick.name.hash(&mut hasher);
@@ -3516,6 +3560,7 @@ fn battle_store_signature(store: &BattleRoundStore) -> u64 {
                 tick.amount.to_bits().hash(&mut hasher);
                 tick.overhealing_shield_cap_rate.to_bits().hash(&mut hasher);
                 tick.turns_remaining.hash(&mut hasher);
+                tick.repeat_each_round.hash(&mut hasher);
             }
             for stack in &participant.corrosion_stacks {
                 stack.source_id.hash(&mut hasher);
@@ -4019,6 +4064,20 @@ fn encounter_ui(
             rule_engine_state,
             scene_positions,
         );
+        if let Some(encounter) = store.encounters.get_mut(encounter_id) {
+            changed |= ui
+                .push_id(("gm_over_time", encounter_id), |ui| {
+                    gm_over_time_ui(
+                        ui,
+                        ui_state
+                            .gm_over_time_drafts
+                            .entry(encounter_id.to_owned())
+                            .or_default(),
+                        encounter,
+                    )
+                })
+                .inner;
+        }
         ui.separator();
         changed |= encounter_action_ui(
             ui,
@@ -4864,7 +4923,7 @@ fn encounter_action_ui(
                 ui.selectable_value(target, target_id.clone(), name);
             }
         });
-        ui.label("伤害");
+        ui.label("数值");
         ui.add(egui::DragValue::new(amount).speed(1.0).range(0.0..=9999.0));
         let target_alive = living_target_ids.contains(target.as_str());
         if ui
@@ -4879,6 +4938,22 @@ fn encounter_action_ui(
                 &actor.target_id,
                 target,
                 "普通攻击",
+                *amount,
+                manager,
+            );
+        }
+        if ui
+            .add_enabled(
+                participant_can_act(&actor) && amount.is_finite() && *amount > 0.0,
+                Button::new("普通治疗"),
+            )
+            .on_hover_text("使用填写的数值进行单目标治疗，按治疗修正结算；不消耗MP或技能冷却，完成当前行动。")
+            .clicked()
+        {
+            changed |= store.apply_common_heal_and_finish(
+                encounter_id,
+                &actor.target_id,
+                target,
                 *amount,
                 manager,
             );
@@ -6759,28 +6834,6 @@ impl BattleRoundStore {
                     }
                 },
                 SkillEffect::Heal { amount, target } => {
-                    let actor_healing_modifiers = participant_healing_modifiers(
-                        &actor_snapshot,
-                        actor_character.as_ref(),
-                        &basic_config,
-                    );
-                    let actor_healing_multiplier =
-                        actor_healing_modifiers.iter().fold(1.0, |value, modifier| {
-                            value * modifier.multiplier
-                        });
-                    let actor_mutual_aid_healing_rate = actor_character
-                        .as_ref()
-                        .map(character_mutual_aid_healing_rate)
-                        .unwrap_or(0.0);
-                    let actor_source_notes =
-                        character_combat_source_notes(actor_character.as_ref(), "施法者");
-                    let actor_echoing_memory_healing_rates = actor_character
-                        .as_ref()
-                        .and_then(|character| character_echoing_memory_healing_rates(character));
-                    let actor_dying_target_healing_modifier = actor_character
-                        .as_ref()
-                        .map(character_dying_target_healing_modifier)
-                        .unwrap_or(1.0);
                     let target_ids = resolve_skill_targets(
                         target,
                         actor_id,
@@ -6803,254 +6856,17 @@ impl BattleRoundStore {
                         &target_ids,
                         skill.target_class.as_deref(),
                     );
-                    if target_ids.is_empty() {
-                        encounter.action_log.push(format!(
-                            "{}使用{}，但范围内没有目标",
-                            actor_name, skill.name
-                        ));
-                    }
-                    let mut pending_actor_mutual_aid_healing = 0.0;
-                    let mut pending_actor_revenge_soul_healing = 0.0;
-                    let mut healed_one_heart_target_id = None::<String>;
-                    let mut healed_inspiration_target_id = None::<String>;
-                    for resolved_target_id in target_ids {
-                        let Some(target) = encounter
-                            .participants
-                            .iter_mut()
-                            .find(|participant| participant.target_id == resolved_target_id)
-                        else {
-                            continue;
-                        };
-                        let target_character = character_for_participant(target, manager);
-                        let target_source_notes =
-                            character_combat_source_notes(target_character.as_ref(), "目标");
-                        let target_mutual_aid_healing_rate = target_character
-                            .as_ref()
-                            .map(character_mutual_aid_healing_rate)
-                            .unwrap_or(0.0);
-                        let wound_multiplier = participant_wound_healing_multiplier(target);
-                        let dying_multiplier = dying_target_healing_multiplier(
-                            target.hp,
-                            target.max_hp,
-                            actor_dying_target_healing_modifier,
-                        );
-                        let target_healing_multiplier =
-                            participant_healing_taken_multiplier(target)
-                                * wound_multiplier
-                                * dying_multiplier;
-                        let one_heart_multiplier = if encounter.active
-                            && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
-                        {
-                            participant_one_heart_healing_multiplier(
-                                &actor_snapshot,
-                                &resolved_target_id,
-                            )
-                        } else {
-                            1.0
-                        };
-                        let final_amount = (amount
-                            * actor_healing_multiplier
-                            * one_heart_multiplier
-                            * target_healing_multiplier)
-                            .max(0.0);
-                        let healing_resolution = apply_participant_healing_for_battle(
-                            target,
-                            final_amount,
-                            actor_snapshot.overhealing_shield_cap_rate,
-                        );
-                        let effective_amount = healing_resolution.effective_amount();
-                        pending_actor_revenge_soul_healing += healing_resolution.hp_restored;
-                        if resolved_target_id != actor_id && effective_amount > f32::EPSILON {
-                            pending_actor_mutual_aid_healing += effective_amount
-                                * (actor_mutual_aid_healing_rate + target_mutual_aid_healing_rate);
-                        }
-                        if effective_amount > f32::EPSILON
-                            && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
-                        {
-                            healed_one_heart_target_id = Some(resolved_target_id.clone());
-                            healed_inspiration_target_id = Some(resolved_target_id.clone());
-                        }
-                        if effective_amount > f32::EPSILON
-                            && single_heal_target_id.as_deref() == Some(resolved_target_id.as_str())
-                        {
-                            if let Some((first_echo_rate, second_echo_rate)) =
-                                actor_echoing_memory_healing_rates
-                            {
-                                schedule_participant_delayed_healing(
-                                    target,
-                                    actor_id,
-                                    &actor_name,
-                                    "千万回忆",
-                                    effective_amount * first_echo_rate,
-                                    actor_snapshot.overhealing_shield_cap_rate,
-                                    1,
-                                );
-                                schedule_participant_delayed_healing(
-                                    target,
-                                    actor_id,
-                                    &actor_name,
-                                    "千万回忆",
-                                    effective_amount * second_echo_rate,
-                                    actor_snapshot.overhealing_shield_cap_rate,
-                                    2,
-                                );
-                            }
-                        }
-                        encounter.action_log.push(format!(
-                            "{}对{}使用{}，回复{}点生命值",
-                            actor_name,
-                            target.display_name,
-                            skill.name,
-                            format_number(effective_amount)
-                        ));
-                        let mut modifiers = actor_healing_modifiers.clone();
-                        if (target.healing_taken_modifier - 1.0).abs() > f32::EPSILON {
-                            modifiers.push(RuleAmountResolution::factor(
-                                "目标受到治疗修正（角色/装备/BUFF）",
-                                target.healing_taken_modifier,
-                            ));
-                        }
-                        let group_healing_taken = participant_group_modifiers(target).healing_taken;
-                        if (group_healing_taken - 1.0).abs() > f32::EPSILON {
-                            modifiers.push(RuleAmountResolution::factor(
-                                "TRPG组全局承受治疗修正",
-                                group_healing_taken,
-                            ));
-                        }
-                        if (wound_multiplier - 1.0).abs() > f32::EPSILON {
-                            modifiers.push(RuleAmountResolution::factor(
-                                "溃伤",
-                                wound_multiplier,
-                            ));
-                        }
-                        if (dying_multiplier - 1.0).abs() > f32::EPSILON {
-                            modifiers.push(RuleAmountResolution::factor(
-                                "濒死治疗",
-                                dying_multiplier,
-                            ));
-                        }
-                        if (one_heart_multiplier - 1.0).abs() > f32::EPSILON {
-                            modifiers.push(RuleAmountResolution::factor(
-                                "一心",
-                                one_heart_multiplier,
-                            ));
-                        }
-                        let mut benefits = actor_source_notes.clone();
-                        benefits.extend(target_source_notes);
-                        if healing_resolution.shield_gained > f32::EPSILON {
-                            benefits.push(format!(
-                                "过量治疗转化{}点护盾",
-                                format_number(healing_resolution.shield_gained)
-                            ));
-                        }
-                        encounter.combat_log.push(CombatLogEntry {
-                            round: encounter.round,
-                            kind: CombatLogKind::Healing,
-                            source_id: actor_id.to_owned(),
-                            source_name: actor_name.clone(),
-                            target_id: resolved_target_id.clone(),
-                            target_name: target.display_name.clone(),
-                            action_name: skill.name.clone(),
-                            base_amount: amount,
-                            effective_amount,
-                            modifiers,
-                            benefits,
-                        });
-                        if one_heart_multiplier > 1.0 + f32::EPSILON {
-                            encounter.action_log.push(format!(
-                                "{}触发一心，治疗效果提高{}%",
-                                actor_name,
-                                format_number((one_heart_multiplier - 1.0) * 100.0)
-                            ));
-                        }
-                    }
-                    if encounter.active && pending_actor_revenge_soul_healing > f32::EPSILON {
-                        if let Some(actor) = encounter
-                            .participants
-                            .iter_mut()
-                            .find(|participant| participant.target_id == actor_id)
-                        {
-                            let shield_gained = grant_participant_revenge_soul_shield(
-                                actor,
-                                pending_actor_revenge_soul_healing,
-                            );
-                            if shield_gained > f32::EPSILON {
-                                encounter.action_log.push(format!(
-                                    "{}触发复仇之魂，获得{}点护盾（当前{}点）",
-                                    actor_name,
-                                    format_number(shield_gained),
-                                    format_number(actor.revenge_soul_shield)
-                                ));
-                            }
-                        }
-                    }
-                    if encounter.active {
-                        if let Some(target_id) = healed_one_heart_target_id {
-                            if let Some(actor) = encounter
-                                .participants
-                                .iter_mut()
-                                .find(|participant| participant.target_id == actor_id)
-                            {
-                                record_participant_one_heart_heal(actor, &target_id);
-                            }
-                        }
-                    }
-                    if encounter.active {
-                        if let Some(target_id) = healed_inspiration_target_id {
-                            let target_name = encounter
-                                .participants
-                                .iter()
-                                .find(|participant| participant.target_id == target_id)
-                                .map(|participant| participant.display_name.clone())
-                                .unwrap_or_else(|| target_id.clone());
-                            if apply_encounter_inspiration(encounter, actor_id, &target_id) {
-                                encounter.action_log.push(format!(
-                                    "{}触发振奋，使{}获得10%速度与伤害加成，持续1回合",
-                                    actor_name, target_name
-                                ));
-                            }
-                        }
-                    }
-                    if pending_actor_mutual_aid_healing > f32::EPSILON {
-                        if let Some(actor) = encounter
-                            .participants
-                            .iter_mut()
-                            .find(|participant| participant.target_id == actor_id)
-                        {
-                            let shield_cap_rate = actor.overhealing_shield_cap_rate;
-                            let resolution = apply_participant_healing_for_battle(
-                                actor,
-                                pending_actor_mutual_aid_healing,
-                                shield_cap_rate,
-                            );
-                            let effective_amount = resolution.effective_amount();
-                            let mut benefits = Vec::new();
-                            if resolution.shield_gained > f32::EPSILON {
-                                benefits.push(format!(
-                                    "过量治疗转化{}点护盾",
-                                    format_number(resolution.shield_gained)
-                                ));
-                            }
-                            encounter.action_log.push(format!(
-                                "{}触发互帮互助，回复{}点生命值",
-                                actor_name,
-                                format_number(effective_amount)
-                            ));
-                            encounter.combat_log.push(CombatLogEntry {
-                                round: encounter.round,
-                                kind: CombatLogKind::Healing,
-                                source_id: actor_id.to_owned(),
-                                source_name: actor_name.clone(),
-                                target_id: actor_id.to_owned(),
-                                target_name: actor_name.clone(),
-                                action_name: "互帮互助".to_owned(),
-                                base_amount: pending_actor_mutual_aid_healing,
-                                effective_amount,
-                                modifiers: Vec::new(),
-                                benefits,
-                            });
-                        }
-                    }
+                    resolve_battle_healing(
+                        encounter,
+                        &actor_snapshot,
+                        &actor_character,
+                        &basic_config,
+                        &skill.name,
+                        amount,
+                        target_ids,
+                        single_heal_target_id,
+                        manager,
+                    );
                 },
                 SkillEffect::GrantBuff { target, buff } => {
                     let target_ids = resolve_skill_targets(
@@ -9154,6 +8970,7 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
             tick.amount.to_bits().hash(&mut hasher);
             tick.damage_type.hash(&mut hasher);
             tick.turns_remaining.hash(&mut hasher);
+            tick.repeat_each_round.hash(&mut hasher);
         }
         for tick in &participant.delayed_healing_ticks {
             tick.name.hash(&mut hasher);
@@ -9162,6 +8979,7 @@ fn encounter_participants_signature(participants: &[BattleParticipantSnapshot]) 
             tick.amount.to_bits().hash(&mut hasher);
             tick.overhealing_shield_cap_rate.to_bits().hash(&mut hasher);
             tick.turns_remaining.hash(&mut hasher);
+            tick.repeat_each_round.hash(&mut hasher);
         }
         for stack in &participant.corrosion_stacks {
             stack.source_id.hash(&mut hasher);
@@ -15990,6 +15808,7 @@ mod tests {
                 amount: 5.0,
                 damage_type: DamageType::Magical,
                 turns_remaining: 1,
+                repeat_each_round: false,
             });
         store
             .encounters

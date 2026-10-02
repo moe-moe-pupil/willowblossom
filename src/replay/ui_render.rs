@@ -43,7 +43,7 @@ struct CpuTexture {
     options: TextureOptions,
 }
 
-pub(super) struct EguiFrameRenderer {
+pub(crate) struct EguiFrameRenderer {
     textures: HashMap<TextureId, CpuTexture>,
     pending_free: Vec<TextureId>,
     background: Color32,
@@ -62,7 +62,7 @@ impl Default for EguiFrameRenderer {
 impl EguiFrameRenderer {
     /// Consume deltas once per frame. Frees apply at the next frame so a texture
     /// released during this frame remains available to its final draw commands.
-    pub(super) fn apply(&mut self, delta: &TexturesDelta) -> Result<(), String> {
+    pub(crate) fn apply(&mut self, delta: &TexturesDelta) -> Result<(), String> {
         for id in self.pending_free.drain(..) {
             self.textures.remove(&id);
         }
@@ -114,7 +114,7 @@ impl EguiFrameRenderer {
 
     /// Render a frame whose deltas have already been applied. `size` is physical
     /// pixels; point coordinates are scaled by `output.pixels_per_point`.
-    pub(super) fn render(
+    pub(crate) fn render(
         &self,
         context: &Context,
         output: &FullOutput,

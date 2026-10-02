@@ -3,7 +3,7 @@ mod gpu_tests;
 mod inspector;
 mod timeline;
 #[cfg(test)]
-mod ui_render;
+pub(crate) mod ui_render;
 #[cfg(test)]
 mod ui_tests;
 mod viewport;
