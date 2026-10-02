@@ -1811,6 +1811,18 @@ impl Character {
 }
 
 impl RuleAst {
+    pub fn is_static_skill_cast(&self) -> bool {
+        self.trigger.event == EventKind::SkillCast
+            && self.trigger.subject != ActorRef::Target
+            && !self.actions.is_empty()
+            && self.actions.iter().all(|action| match action {
+                Action::Damage { amount, .. } | Action::Heal { amount, .. } => {
+                    matches!(amount, ValueExpr::Number(value) if value.is_finite() && *value >= 0.0)
+                },
+                Action::GrantBuff { .. } => true,
+            })
+    }
+
     pub fn explain(&self) -> String {
         let mut lines = vec![format!(
             "触发：每当{}{}。",
@@ -2678,7 +2690,7 @@ impl RuleEngine {
         }
         if let Some(mut base) = self.ecs_world.get_mut::<BaseCombatant>(entity) {
             base.0.hp = hp;
-            base.0.max_hp = max_hp;
+            // Maximum HP is derived from the base and active buffs, never from a hit or heal.
         }
     }
 }
@@ -2810,7 +2822,7 @@ pub fn parse_rule_with_named_args(
         );
     }
 
-    let trigger = parse_trigger(&normalized)?;
+    let trigger = parse_trigger(&normalized[..trigger_end])?;
     let actions = parse_actions(&normalized, &named_values)?;
     if actions.is_empty() {
         return Err("没有找到可执行动作，例如：回复2点生命值".to_owned());
@@ -3476,9 +3488,11 @@ fn resolve_actor(actor: ActorRef, owner_id: &str, event: &RuleEvent) -> Option<S
 fn resolve_targets(selector: TargetSelector, owner_id: &str, event: &RuleEvent) -> Vec<String> {
     if selector.area.is_some() {
         if let RuleEvent::SkillCast { target_ids, .. } = event {
+            let mut seen = HashSet::new();
             return target_ids
                 .iter()
                 .filter(|target_id| target_id.as_str() != owner_id)
+                .filter(|target_id| seen.insert(target_id.as_str()))
                 .cloned()
                 .collect();
         }
@@ -3741,6 +3755,76 @@ fn rule_words(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_subject_does_not_depend_on_action_target_or_punctuation() {
+        for rule in [
+            "每当自己释放技能时对目标造成3点物理伤害",
+            "每当自己释放技能时，对目标造成3点物理伤害",
+        ] {
+            let ast = parse_rule(rule).unwrap();
+            assert_eq!(ast.trigger.subject, ActorRef::SelfActor);
+            assert!(ast.is_static_skill_cast());
+        }
+    }
+
+    #[test]
+    fn max_hp_buff_expires_after_damage_and_healing() {
+        for bonus in [10.0, -5.0] {
+            let mut engine = RuleEngine::default();
+            engine.add_character(Character::new("target", "目标", 20.0));
+            engine.give_buff("target", BuffSpec {
+                name: "临时生命上限".to_owned(),
+                kind: BuffKind::None,
+                priority: 0,
+                turns_remaining: 2,
+                source_id: "target".to_owned(),
+                beneficial: bonus > 0.0,
+                effects: vec![BuffEffect {
+                    field: BuffField::MaxHp,
+                    value: BuffValue::Add(bonus),
+                }],
+                tick_actions: Vec::new(),
+            });
+            engine.attack(
+                "target",
+                "target",
+                3.0,
+                DamageType::Physical,
+            );
+            engine.heal("target", "target", 1.0);
+            let hp = engine.characters["target"].hp;
+
+            engine.advance_turn();
+            assert_eq!(
+                engine.characters["target"].max_hp,
+                20.0 + bonus
+            );
+            assert_eq!(engine.characters["target"].hp, hp);
+            engine.advance_turn();
+            assert_eq!(engine.characters["target"].max_hp, 20.0);
+            assert_eq!(engine.characters["target"].hp, hp);
+        }
+    }
+
+    #[test]
+    fn area_cast_applies_each_action_once_per_unique_target() {
+        let mut engine = RuleEngine::default();
+        for id in ["caster", "first", "second"] {
+            engine.add_character(Character::new(id, id, 20.0));
+        }
+        engine.add_rule(
+            "caster",
+            parse_rule("主动使用对周围3米内的目标造成4点物理伤害").unwrap(),
+        );
+        engine.cast_skill(
+            "caster",
+            ["first", "caster", "first", "second", "second"].map(str::to_owned),
+        );
+        assert_eq!(engine.characters["caster"].hp, 20.0);
+        assert_eq!(engine.characters["first"].hp, 16.0);
+        assert_eq!(engine.characters["second"].hp, 16.0);
+    }
 
     #[test]
     fn parses_damage_taken_heal_rule() {

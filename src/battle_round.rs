@@ -176,7 +176,6 @@ use crate::{
         ActorRef,
         BuffTickAction,
         DamageType,
-        EventKind,
         RuleAmountResolution,
         RuleBuffTemplate,
         RuleEngineState,
@@ -6250,6 +6249,21 @@ impl BattleRoundStore {
             skill.skill_type.as_deref(),
             skill.legacy_buff_machine_json.as_deref(),
         );
+        if effects.is_empty()
+            && !skill_has_dedicated_battle_resolution(skill)
+            && parse_rule_with_named_args(
+                &skill.note,
+                &skill.arg_values.numeric_values,
+                &skill.arg_values.text_values,
+            )
+            .is_ok_and(|ast| !ast.is_static_skill_cast())
+        {
+            encounter.action_log.push(format!(
+                "{}不能主动使用{}；规则需要对应触发事件且所有效果必须可结算",
+                actor_snapshot.display_name, skill.name
+            ));
+            return false;
+        }
         let available_needles = u16::from(actor_snapshot.flying_needles_ready)
             + u16::from(actor_snapshot.needle_case_ready);
         let uses_single_needle = is_current_redeemed_flying_needle(skill);
@@ -10483,20 +10497,7 @@ fn skill_with_gm_rule(skill: &CharacterSkill, rule: &str) -> Result<CharacterSki
         &skill.arg_values.numeric_values,
         &skill.arg_values.text_values,
     )?;
-    if ast.trigger.event != EventKind::SkillCast
-        || ast.actions.iter().any(|action| {
-            matches!(
-                action,
-                Action::Damage {
-                    amount: ValueExpr::EventDamage,
-                    ..
-                } | Action::Heal {
-                    amount: ValueExpr::EventDamage,
-                    ..
-                }
-            )
-        })
-    {
+    if !ast.is_static_skill_cast() {
         return Err("请输入主动使用规则，伤害和治疗必须有明确数值".to_owned());
     }
     Ok(CharacterSkill {
@@ -11190,6 +11191,9 @@ fn static_skill_effects(
     }) else {
         return Vec::new();
     };
+    if !ast.is_static_skill_cast() {
+        return Vec::new();
+    }
     ast.actions
         .into_iter()
         .filter_map(|action| match action {
@@ -12047,6 +12051,57 @@ mod tests {
             .as_slice(),
             [SkillEffect::GrantBuff { .. }]
         ));
+    }
+
+    #[test]
+    fn invalid_cast_rules_do_not_apply_partial_effects_or_spend_resources() {
+        let manager = empty_manager();
+        for note in [
+            "每当自己受到伤害时，回复2点生命值",
+            "每当自己造成伤害时，对目标造成3点物理伤害",
+            "每当目标释放技能时，对目标造成3点物理伤害",
+            "主动使用对自己回复2点生命值；对目标造成本次伤害点物理伤害",
+        ] {
+            let character = PlayerCharacter {
+                skill_names: vec!["测试技能".to_owned()],
+                skill_notes: vec![note.to_owned()],
+                skill_mp_costs: vec![2.0],
+                skill_cooldown_turns: vec![3],
+                ..Default::default()
+            };
+            let skill = character_skills(&character).remove(0);
+            assert!(
+                static_skill_effects(note, &skill.arg_values, None, None).is_empty(),
+                "{note}"
+            );
+            assert!(
+                skill_with_gm_rule(&skill, note).is_err(),
+                "{note}"
+            );
+            let mut actor = participant("a", 0);
+            actor.mp = 10.0;
+            actor.hp = 5.0;
+            let mut store = BattleRoundStore::default();
+            store
+                .encounters
+                .insert("battle".to_owned(), BattleEncounter {
+                    participants: vec![actor, participant("b", 0)],
+                    ..Default::default()
+                });
+            assert!(
+                !store.record_skill_use("battle", "a", "b", &skill, &manager, None),
+                "{note}"
+            );
+            let encounter = &store.encounters["battle"];
+            assert_eq!(encounter.participants[0].hp, 5.0);
+            assert_eq!(encounter.participants[0].mp, 10.0);
+            assert_eq!(encounter.participants[1].hp, 10.0);
+            assert_eq!(
+                skill_cooldown_remaining(&encounter.participants[0], 0, 3, None),
+                0
+            );
+            assert!(encounter.combat_log.is_empty());
+        }
     }
 
     #[test]
