@@ -8,6 +8,8 @@ mod dot_tests;
 mod dot_ui_tests;
 mod healing;
 #[cfg(test)]
+mod hidden_regen_tests;
+#[cfg(test)]
 mod hot_tests;
 mod ordinary_heal;
 mod over_time;
@@ -68,6 +70,7 @@ use crate::{
         hidden_role_intrinsic_opening_shield,
         protective_suit_opening_magic_shield,
         HiddenRoleBattleState,
+        HiddenRoleKind,
     },
     napcat::{
         arrogance_damage_dealt_multiplier,
@@ -7801,6 +7804,60 @@ fn prune_unbound_group_participants(
                     .is_some_and(|owner_id| group.players.contains(owner_id)))
     });
     before_len != encounter.participants.len()
+}
+
+/// Characters in an encounter recover through its round settlement instead.
+pub fn regenerate_unrostered_hidden_roles(
+    manager: &mut NapcatMessageManager,
+    store: Option<&BattleRoundStore>,
+    player_ids: &[String],
+) -> bool {
+    let mut changed = false;
+    for target_id in player_ids.iter().collect::<HashSet<_>>() {
+        let Some(role) = manager.hidden_roles.get(target_id) else {
+            continue;
+        };
+        if !matches!(
+            role.role,
+            HiddenRoleKind::Alien | HiddenRoleKind::Mutant
+        ) || !role.transformed
+            || role.is_cocooning()
+        {
+            continue;
+        }
+        if store.is_some_and(|store| {
+            store.encounters.iter().any(|(id, encounter)| {
+                !encounter.manager_sync_quarantined
+                    && store.encounter_is_canonical(id)
+                    && store.encounter_group_exists(id, manager)
+                    && encounter.participants.iter().any(|participant| {
+                        participant.player_character && participant.target_id == *target_id
+                    })
+            })
+        }) {
+            continue;
+        }
+        let Some(character) = manager.player_characters.get_mut(target_id) else {
+            continue;
+        };
+        if character.hp <= 0.0 || character.hp >= character.max_hp {
+            continue;
+        }
+        let effective = effective_hidden_role_character(
+            target_id,
+            character,
+            &manager.hidden_roles,
+        );
+        let restored = effective.hp_regen.min(character.max_hp - character.hp);
+        if restored > 0.0 {
+            character.hp += restored;
+            if let Some(base_stats) = character.buff_base_stats.as_mut() {
+                base_stats.hp += restored;
+            }
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn sync_encounter_from_group_clock(

@@ -828,6 +828,7 @@ const MOONBERRY_TARGET_CLASSES: &[&str] = &["无目标", "单目标", "多目标
 use crate::{
     battle_round::{
         clear_trpg_group_dominion_bonuses,
+        regenerate_unrostered_hidden_roles,
         BattleRoundStore,
         BattleRoundUiState,
         BATTLE_ROUND_EXPORT_VERSION,
@@ -2790,6 +2791,7 @@ fn chat_window(
     scene_positions: Option<&SceneCharacterPositions>,
     voxel_editor: &mut VoxelEditorState,
     voxel_possession: &VoxelPossessionState,
+    battle_store: Option<&BattleRoundStore>,
 ) {
     #[cfg(feature = "profiling")]
     let _profile = info_span!("chat_window").entered();
@@ -3206,6 +3208,7 @@ fn chat_window(
                 &target_id,
                 true,
                 rule_engine_state,
+                battle_store,
             )
         } else {
             set_group_player_waiting(
@@ -11961,6 +11964,7 @@ fn advance_group_world_turn(
     manager: &mut NapcatMessageManager,
     group_name: &str,
     rule_engine_state: &mut RuleEngineState,
+    battle_store: Option<&BattleRoundStore>,
 ) -> bool {
     let should_capture = manager
         .trpg_groups
@@ -11979,6 +11983,7 @@ fn advance_group_world_turn(
     let world_turn = group.world_turn;
     let mut changed = captured > 0 || advanced;
     if advanced {
+        changed |= regenerate_unrostered_hidden_roles(manager, battle_store, &players);
         changed |= advance_hidden_roles_for_world_turn(
             &mut manager.hidden_roles,
             &players,
@@ -12002,6 +12007,7 @@ fn mark_group_player_turn(
     target_id: &str,
     acted: bool,
     rule_engine_state: &mut RuleEngineState,
+    battle_store: Option<&BattleRoundStore>,
 ) -> bool {
     let should_capture = manager
         .trpg_groups
@@ -12024,6 +12030,7 @@ fn mark_group_player_turn(
     };
     let world_turn = group.world_turn;
     if changed && group.world_turn > previous_world_turn {
+        regenerate_unrostered_hidden_roles(manager, battle_store, &players);
         let _ = advance_hidden_roles_for_world_turn(
             &mut manager.hidden_roles,
             &players,
@@ -17991,6 +17998,7 @@ fn trpg_group_settings_window(
             &target_id,
             acted,
             rule_engine_state,
+            battle_store.as_deref().map(|store| &**store),
         );
     }
     if let Some(group_name) = turn_reset {
@@ -18003,6 +18011,7 @@ fn trpg_group_settings_window(
             manager.as_mut(),
             &group_name,
             rule_engine_state,
+            battle_store.as_deref().map(|store| &**store),
         );
     }
     if let Some(group_name) = turn_zero_reset {
@@ -18127,6 +18136,7 @@ fn trpg_group_settings_window(
                             &target_id,
                             false,
                             rule_engine_state,
+                            battle_store.as_deref().map(|store| &**store),
                         )
                     } else {
                         false
@@ -20405,6 +20415,7 @@ pub fn ui_system(
                     scene_positions.as_deref(),
                     voxel_editor,
                     voxel_possession,
+                    battle_store.as_deref().map(|store| &**store),
                 );
             }
             if keep_gm_auto_chat_window_topmost(
@@ -24116,7 +24127,8 @@ mod tests {
         assert!(advance_group_world_turn(
             &mut manager,
             "party",
-            &mut rule_engine_state
+            &mut rule_engine_state,
+            None,
         ));
         let target = &manager.player_characters["target"];
         assert_eq!(target.hp, 7.0);
@@ -24133,7 +24145,8 @@ mod tests {
         assert!(advance_group_world_turn(
             &mut manager,
             "party",
-            &mut rule_engine_state
+            &mut rule_engine_state,
+            None,
         ));
         let target = &manager.player_characters["target"];
         assert_eq!(target.hp, 7.0);
@@ -26398,6 +26411,75 @@ mod tests {
     }
 
     #[test]
+    fn hidden_regen_runs_on_manual_and_completed_world_turns() {
+        for kind in [HiddenRoleKind::Alien, HiddenRoleKind::Mutant] {
+            let mut manager = empty_manager();
+            manager
+                .player_characters
+                .insert("player".to_owned(), PlayerCharacter {
+                    hp: 4.0,
+                    max_hp: 20.0,
+                    hp_regen: 2.0,
+                    ..Default::default()
+                });
+            let mut role = HiddenRoleState::new(kind);
+            role.stage = 2;
+            role.transformed = true;
+            manager.hidden_roles.insert("player".to_owned(), role);
+            manager.trpg_groups.insert("party".to_owned(), TrpgGroup {
+                players: vec!["player".to_owned(), "other".to_owned()],
+                ..Default::default()
+            });
+            let mut rules = RuleEngineState::default();
+            assert!(advance_group_world_turn(
+                &mut manager,
+                "party",
+                &mut rules,
+                None
+            ));
+            assert_eq!(
+                manager.player_characters["player"].hp,
+                11.0
+            );
+            assert!(mark_group_player_turn(
+                &mut manager,
+                "party",
+                "player",
+                true,
+                &mut rules,
+                None
+            ));
+            assert_eq!(
+                manager.player_characters["player"].hp,
+                11.0
+            );
+            assert!(mark_group_player_turn(
+                &mut manager,
+                "party",
+                "other",
+                false,
+                &mut rules,
+                None
+            ));
+            assert_eq!(
+                manager.player_characters["player"].hp,
+                18.0
+            );
+            manager.hidden_roles.get_mut("player").unwrap().transformed = false;
+            assert!(advance_group_world_turn(
+                &mut manager,
+                "party",
+                &mut rules,
+                None
+            ));
+            assert_eq!(
+                manager.player_characters["player"].hp,
+                18.0
+            );
+        }
+    }
+
+    #[test]
     fn group_world_turn_resets_character_turn_totals() {
         let mut manager = empty_manager();
         manager
@@ -26416,7 +26498,8 @@ mod tests {
         assert!(advance_group_world_turn(
             &mut manager,
             "party",
-            &mut rule_engine_state
+            &mut rule_engine_state,
+            None,
         ));
 
         let target = &manager.player_characters["target"];
@@ -26449,6 +26532,7 @@ mod tests {
             &mut manager,
             "party",
             &mut rule_engine_state,
+            None,
         ));
         assert_eq!(
             manager.trpg_groups["party"].initial_player_states["target"].hp,
