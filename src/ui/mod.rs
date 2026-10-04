@@ -3829,8 +3829,18 @@ fn trpg_group_global_chat_input_id(group_name: &str) -> String {
 fn trpg_group_global_private_targets(
     manager: &NapcatMessageManager,
     group: &TrpgGroup,
+    exclude_dead_players: bool,
 ) -> Vec<NapcatSendTarget> {
-    private_targets_for_member_ids(manager, group.players.iter())
+    private_targets_for_member_ids(
+        manager,
+        group.players.iter().filter(|player_id| {
+            !exclude_dead_players
+                || manager
+                    .player_characters
+                    .get(*player_id)
+                    .is_none_or(|character| character.hp > 0.0)
+        }),
+    )
 }
 
 fn trpg_group_global_chat_windows(
@@ -3852,17 +3862,6 @@ fn trpg_group_global_chat_windows(
         let Some(group) = manager.trpg_groups.get(&group_name) else {
             continue;
         };
-        let targets = trpg_group_global_private_targets(manager, group);
-        let recipient_names = targets
-            .iter()
-            .filter_map(|target| match target {
-                NapcatSendTarget::Private(user_id) => Some(target_display_name(
-                    manager,
-                    &user_id.to_string(),
-                )),
-                NapcatSendTarget::Group(_) => None,
-            })
-            .collect::<Vec<_>>();
         let input_id = trpg_group_global_chat_input_id(&group_name);
         chat_input_msgs.entry(input_id.clone()).or_default();
         let mut open = true;
@@ -3884,6 +3883,25 @@ fn trpg_group_global_chat_windows(
                     voxel_editor,
                     voxel_possession,
                 );
+                let filter_id = trpg_group_global_chat_window_id(&group_name)
+                    .with("exclude_dead_players");
+                let mut exclude_dead_players =
+                    ctx.data(|data| data.get_temp::<bool>(filter_id).unwrap_or(true));
+                if ui.checkbox(&mut exclude_dead_players, "排除死亡玩家").changed() {
+                    ctx.data_mut(|data| data.insert_temp(filter_id, exclude_dead_players));
+                }
+                let targets =
+                    trpg_group_global_private_targets(manager, group, exclude_dead_players);
+                let recipient_names = targets
+                    .iter()
+                    .filter_map(|target| match target {
+                        NapcatSendTarget::Private(user_id) => Some(target_display_name(
+                            manager,
+                            &user_id.to_string(),
+                        )),
+                        NapcatSendTarget::Group(_) => None,
+                    })
+                    .collect::<Vec<_>>();
                 ui.label(format!(
                     "将分别私聊发送给 {} 名玩家",
                     targets.len()
@@ -22538,8 +22556,53 @@ mod tests {
         };
 
         assert_eq!(
-            trpg_group_global_private_targets(&manager, &group),
+            trpg_group_global_private_targets(&manager, &group, true),
             vec![NapcatSendTarget::Private(2), NapcatSendTarget::Private(3),]
+        );
+    }
+
+    #[test]
+    fn trpg_group_global_chat_can_exclude_dead_players() {
+        let mut manager = empty_manager();
+        for player_id in [2, 3, 4, 5] {
+            manager.messages.insert(player_id.to_string(), vec![
+                test_private_message(player_id),
+            ]);
+        }
+        for (player_id, hp) in [(2, 10.0), (3, 0.0), (4, -1.0)] {
+            manager
+                .player_characters
+                .insert(player_id.to_string(), PlayerCharacter {
+                    hp,
+                    ..Default::default()
+                });
+        }
+        let group = TrpgGroup {
+            players: [2, 3, 4, 5].map(|id| id.to_string()).to_vec(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            trpg_group_global_private_targets(&manager, &group, true),
+            vec![NapcatSendTarget::Private(2), NapcatSendTarget::Private(5)]
+        );
+        assert_eq!(
+            trpg_group_global_private_targets(&manager, &group, false),
+            vec![
+                NapcatSendTarget::Private(2),
+                NapcatSendTarget::Private(3),
+                NapcatSendTarget::Private(4),
+                NapcatSendTarget::Private(5),
+            ]
+        );
+        manager.player_characters.get_mut("3").unwrap().hp = 1.0;
+        assert_eq!(
+            trpg_group_global_private_targets(&manager, &group, true),
+            vec![
+                NapcatSendTarget::Private(2),
+                NapcatSendTarget::Private(3),
+                NapcatSendTarget::Private(5),
+            ]
         );
     }
 
