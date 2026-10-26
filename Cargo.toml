@@ -85,3 +85,7 @@ voxxelmaxx = { path = "crates/bevy_voxel" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 arboard = "3.4"
+
+[target.'cfg(windows)'.dependencies]
+# 已在依赖树中（bevy 的传递依赖）；仅用于操作日志取本地时间。
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }

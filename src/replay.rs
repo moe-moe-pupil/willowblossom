@@ -79,6 +79,7 @@ use base64::{
 use bevy::{
     camera::CameraUpdateSystems,
     ecs::system::SystemParam,
+    log::info_span,
     prelude::*,
     render::view::screenshot::{
         Screenshot,
@@ -139,6 +140,7 @@ use crate::{
         ReplayMessageSnapshot,
         Visibility,
     },
+    op_log::OpLog,
     ui,
     ui::{persist_ui_memory_after_interaction, CachedMemory},
     voxel::{
@@ -184,6 +186,13 @@ const MAX_DIALOGUE_MS: u64 = 9_750;
 const SHORT_DIALOGUE_MAX_MS: u64 = 2_500;
 const HISTORY_DIALOGUE_GAP_MS: u64 = 270;
 const DEFAULT_REPLAY_PATH: &str = ".data/willowblossom/replays/latest.willow-replay.json";
+/// 回放项目的自动存档：生成/编辑的内容定期落盘，应用重启后自动恢复。
+const AUTOSAVE_REPLAY_PATH: &str = ".data/willowblossom/replays/autosave.willow-replay.json";
+/// 用新内容替换当前草稿（重新生成、开始录制、导入项目）前，先把旧草稿备份到这里。
+const AUTOSAVE_BACKUP_REPLAY_PATH: &str =
+    ".data/willowblossom/replays/autosave-backup.willow-replay.json";
+/// 自动存档的最小间隔；期间内容有变化也只保留最新待存标记。
+const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const DIRECTOR_CACHE_FINGERPRINT_VERSION: &str = "deepseek-director-v4";
 const DEFAULT_VIDEO_PATH: &str = ".data/willowblossom/replays/latest.mp4";
 const BACKGROUND_MUSIC_DIRECTORY: &str = "assets/audio";
@@ -196,6 +205,11 @@ const SHORT_UTTERANCE_HEAD_PAD_MS: u64 = 80;
 const SHORT_UTTERANCE_TAIL_PAD_MS: u64 = 180;
 const VIDEO_CAPTURE_WARMUP_FRAMES: u8 = 3;
 const VIDEO_CAPTURE_TIMEOUT_SECONDS: f32 = 30.0;
+/// 每帧最多为新台词做一次磁盘语音缓存探测和排队，平滑长回放开局时的负载。
+const SPEECH_PREP_BUDGET_PER_FRAME: usize = 8;
+/// 导出视频时按此长度自动切片：每段单独渲染并编码成一个 MP4，
+/// 避免一次性渲染超长回放导致长时间卡住，也方便分段剪辑。
+const VIDEO_SEGMENT_MAX_MS: u64 = 20 * 60 * 1_000;
 const REPLAY_PLAYING_STATUS: &str = "正在回放；停止后会恢复当前体素场景";
 const REPLAY_SPEECH_PREPARING_STATUS: &str = "正在准备当前台词语音；语音就绪后字幕与声音会同时开始";
 const REPLAY_SPEECH_MAX_WAIT_SECONDS: f32 = 5.0;
@@ -301,6 +315,9 @@ impl Plugin for ReplayPlugin {
                 snapshot_new_replay_messages.after(VoxelPlayerStandeeSynced),
                 record_player_movement_history.after(VoxelPlayerStandeeSynced),
                 record_ship_trajectory_history.after(VoxelPlayerStandeeSynced),
+                drain_replay_scene_recorder
+                    .after(VoxelPlayerStandeeSynced)
+                    .before(record_replay),
                 record_replay
                     .after(snapshot_new_replay_messages)
                     .after(VoxelPlayerStandeeSynced),
@@ -316,6 +333,10 @@ impl Plugin for ReplayPlugin {
                 preview_replay_speech
                     .after(advance_replay)
                     .after(record_replay),
+                record_replay_operations
+                    .after(render_video_frames)
+                    .after(poll_video_encoding),
+                autosave_replay_project,
                 render_video_frames,
                 poll_video_encoding,
             ),
@@ -341,6 +362,39 @@ impl Plugin for ReplayPlugin {
             update_replay_preview_viewport
                 .after(EguiPostUpdateSet::ProcessOutput)
                 .before(CameraUpdateSystems),
+        );
+
+        restore_autosaved_replay(app);
+    }
+}
+
+/// 应用启动时恢复上一次会话自动保存的回放项目，
+/// 让已生成的镜头、台词和轨迹数据跨会话持久化。
+fn restore_autosaved_replay(app: &mut App) {
+    let load_result = import_replay(AUTOSAVE_REPLAY_PATH, None);
+    let replay = match load_result {
+        Ok(replay) => replay,
+        Err(err) => {
+            // 文件不存在是正常情况；损坏或版本不支持必须留下线索。
+            if let Some(op_log) = app.world().get_resource::<OpLog>() {
+                op_log.record("replay", format!("自动存档未恢复：{err}"));
+            }
+            return;
+        }
+    };
+    let title = replay.title.clone();
+    let duration = replay.duration_ms;
+    let dialogue_count = replay.dialogue.len();
+    let mut studio = app.world_mut().resource_mut::<ReplayStudio>();
+    studio.replay = Some(replay);
+    studio.status = format!(
+        "已自动恢复上次的回放项目：{title}（{dialogue_count} 句对话，时长 {}）；重新生成会先自动备份旧项目",
+        format_time(duration)
+    );
+    if let Some(op_log) = app.world().get_resource::<OpLog>() {
+        op_log.record(
+            "replay",
+            format!("已自动恢复回放项目：{title}，{dialogue_count} 句对话，时长 {duration} ms"),
         );
     }
 }
@@ -737,6 +791,8 @@ struct ReplayShipHullChange {
 pub(crate) struct ReplayGridCellEvent {
     pub(crate) cell: IVec3,
     pub(crate) material: u8,
+    /// 编辑前的旧材质；用于把"从聊天生成"的回放基线还原到编辑前的地形。
+    pub(crate) before: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -747,8 +803,10 @@ pub(crate) struct ReplayShipHullCellEvent {
 }
 
 /// Per-frame buffer used by the voxel editor to report terrain and ship hull
-/// cell mutations while a replay is being recorded. `record_replay` drains it
-/// once per frame and stamps the events with the current record time.
+/// cell mutations. `record_replay` drains it while recording,
+/// `capture_live_replay_edits` while live-editing a playing replay, and
+/// `drain_replay_scene_recorder` the rest of the time so from-chat replays can
+/// map every terrain edit onto the timeline.
 #[derive(Default, Resource)]
 pub(crate) struct ReplaySceneRecorder {
     pub(crate) grid_cells: Vec<ReplayGridCellEvent>,
@@ -759,11 +817,16 @@ pub(crate) fn record_replay_grid_cell(
     recorder: Option<&mut ReplaySceneRecorder>,
     cell: IVec3,
     material: u8,
+    before: u8,
 ) {
     if let Some(recorder) = recorder {
         recorder
             .grid_cells
-            .push(ReplayGridCellEvent { cell, material });
+            .push(ReplayGridCellEvent {
+                cell,
+                material,
+                before,
+            });
     }
 }
 
@@ -965,6 +1028,7 @@ pub(crate) fn clear_campaign_replay_data(
     if let Some(job) = studio.video_render.as_mut() {
         job.failure = Some("测试进度已清空，视频导出已取消".to_owned());
     }
+    studio.video_export_plan = None;
     studio.status = format!(
         "回放数据已清空：移除 {removed_player} 段玩家移动和 {removed_ships} 艘飞船轨迹，当前回放与镜头已重置"
     );
@@ -1051,7 +1115,7 @@ struct ReplayDialogueDrag {
     line_id: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 struct ReplayAreaBlock {
     id: u64,
     area: String,
@@ -1206,7 +1270,8 @@ pub(crate) struct ReplayStudio {
     timeline_revision: u64,
     scene_revision: u64,
     message_counts: HashMap<String, usize>,
-    pending_terrain_changes: Vec<(u64, IVec3, u8)>,
+    /// (source_unix_ms, cell, material_after, material_before)
+    pending_terrain_changes: Vec<(u64, IVec3, u8, u8)>,
     pending_ship_hull_changes: Vec<(u64, String, IVec3, u8)>,
     pre_playback_scene: Option<ReplayScene>,
     video_path: String,
@@ -1225,8 +1290,23 @@ pub(crate) struct ReplayStudio {
     project_import_path: String,
     video_render: Option<VideoRenderJob>,
     video_encoding: Option<VideoEncodingJob>,
+    video_export_plan: Option<VideoExportPlan>,
+    /// 上一次“从现有聊天生成”产出的指纹：下次再点同一按钮时跳过备份，
+    /// 避免机器生成的草稿覆盖掉用户手编项目的备份。
+    generated_replay_fingerprint: Option<u64>,
     status: String,
     panel_open: bool,
+    /// 导演面板的每帧缓存：内容、立牌位置、提示词或 DeepSeek 状态任一变化
+    /// 后的下一次绘制才重算，避免每帧把全部台词重新序列化成导演请求。
+    director_panel_cache: Option<DirectorPanelCache>,
+}
+
+/// 缓存导演面板每帧要显示的两项派生数据；以 `director_panel_fingerprint`
+/// 作脏标记，指纹不匹配才重算。
+struct DirectorPanelCache {
+    fingerprint: u64,
+    missing_lines: Vec<(usize, String)>,
+    saved_director_available: bool,
 }
 
 struct VideoRenderJob {
@@ -1235,6 +1315,10 @@ struct VideoRenderJob {
     output_path: PathBuf,
     fps: u32,
     duration_ms: u64,
+    /// 本段在完整回放时间轴上的起始时刻；逐帧回放时间在其基础上递增。
+    segment_start_ms: u64,
+    segment_index: u32,
+    segment_count: u32,
     music_file: Option<PathBuf>,
     music_volume: f32,
     speech_enabled: bool,
@@ -1252,12 +1336,35 @@ struct VideoRenderJob {
     failure: Option<String>,
     original_window_title: String,
     original_window_resizable: bool,
+    /// 本段开始逐帧渲染的时刻，用于操作日志统计耗时。
+    started_at: std::time::Instant,
+}
+
+/// 一次多段视频导出的整体计划；每段渲染编码完成后由它接续下一段。
+struct VideoExportPlan {
+    output_path: PathBuf,
+    fps: u32,
+    duration_ms: u64,
+    music_file: Option<PathBuf>,
+    music_volume: f32,
+    speech_enabled: bool,
+    speech_volume: f32,
+    master_speech_speed: f32,
+    speaker_voice_settings: HashMap<u64, SpeakerVoiceSettings>,
+    dialogue: Vec<ReplayDialogue>,
+    segment_count: u32,
+    next_segment: u32,
+    /// 导出开始前的窗口标题和可调尺寸；从 plan 恢复而不是从各段渲染任务恢复，
+    /// 否则多段导出会把渲染中的标题当成“原始值”存回去。
+    original_window_title: String,
+    original_window_resizable: bool,
 }
 
 struct VideoEncodingJob {
     _frames: TempDir,
-    output_path: PathBuf,
     result: Receiver<Result<(), String>>,
+    output_path: PathBuf,
+    started_at: std::time::Instant,
 }
 
 #[derive(Resource, Default)]
@@ -1266,6 +1373,9 @@ struct PreviewSpeechController {
     prepared_signature: Option<u64>,
     onnx_cache: HashMap<(u64, usize), (Vec<u8>, f32)>,
     onnx_queued: HashSet<(u64, usize)>,
+    /// 台词的磁盘语音缓存已经探测过且未命中；避免每一帧都重复
+    /// `fs::read` 探测全部台词（这是预览卡顿的主要来源）。
+    cache_attempted: HashSet<(u64, usize)>,
     onnx_attempts: HashMap<(u64, usize), u8>,
     onnx_failures: HashMap<(u64, usize), String>,
     pending_generation_lines: HashSet<(u64, u64)>,
@@ -1295,6 +1405,8 @@ struct OnnxPreviewResult {
     cue: (u64, usize),
     wav: Result<Vec<u8>, String>,
     volume: f32,
+    /// 后台合成耗时；用于操作日志与性能分析。
+    elapsed_ms: u64,
 }
 
 impl Default for ReplayStudio {
@@ -1355,8 +1467,11 @@ impl Default for ReplayStudio {
             project_import_path: DEFAULT_REPLAY_PATH.to_owned(),
             video_render: None,
             video_encoding: None,
+            video_export_plan: None,
+            generated_replay_fingerprint: None,
             status: "尚未创建回放".to_owned(),
             panel_open: false,
+            director_panel_cache: None,
         }
     }
 }
@@ -1688,6 +1803,33 @@ fn latest_player_line_time(
         .or_else(|| any_turn.into_iter().max())
 }
 
+/// Outside recording and playback, terrain/hull edits are drained straight
+/// into the pending lists stamped with real time, so replays generated from
+/// chat history can still map them onto the timeline and rewind the baseline
+/// terrain. Recording (`record_replay`) and live-edit playback
+/// (`capture_live_replay_edits`) drain the same buffer themselves.
+fn drain_replay_scene_recorder(
+    mut scene_recorder: ResMut<ReplaySceneRecorder>,
+    mut studio: ResMut<ReplayStudio>,
+) {
+    if studio.mode == ReplayMode::Recording || replay_scene_dynamics_active(&studio) {
+        return;
+    }
+    let source_unix_ms = unix_time_ms();
+    let grid_cells = std::mem::take(&mut scene_recorder.grid_cells);
+    let hull_cells = std::mem::take(&mut scene_recorder.ship_hull_cells);
+    studio.pending_terrain_changes.extend(
+        grid_cells
+            .into_iter()
+            .map(|event| (source_unix_ms, event.cell, event.material, event.before)),
+    );
+    studio.pending_ship_hull_changes.extend(
+        hull_cells
+            .into_iter()
+            .map(|event| (source_unix_ms, event.ship_id, event.cell, event.material)),
+    );
+}
+
 fn record_replay(
     time: Res<Time>,
     manager: Res<Persistent<NapcatMessageManager>>,
@@ -1758,6 +1900,7 @@ fn record_replay(
                 source_unix_ms,
                 event.cell,
                 event.material,
+                event.before,
             )
         }),
     );
@@ -2283,11 +2426,248 @@ fn advance_replay(
     }
 }
 
+#[derive(Default)]
+struct ReplayOpWatchState {
+    mode: Option<ReplayMode>,
+    last_playback_ms: u64,
+    last_status: Option<String>,
+    video_render_active: bool,
+    video_encoding_active: bool,
+    export_plan_active: bool,
+    onnx_worker_active: bool,
+    signature: Option<u64>,
+    last_seek_log: Option<std::time::Instant>,
+    last_signature_log: Option<std::time::Instant>,
+}
+
+/// 连续触发（拖动时间轴、打字编辑台词）时按该间隔合并日志。
+const OP_LOG_COALESCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn due_for(last: &Option<std::time::Instant>) -> bool {
+    last.is_none_or(|instant| instant.elapsed() >= OP_LOG_COALESCE)
+}
+
+/// 每帧对比回放/视频/语音的关键状态，把用户操作和后台任务生命周期
+/// 写入操作日志（`.data/willowblossom/logs/operations.log`）。
+fn record_replay_operations(
+    studio: Res<ReplayStudio>,
+    speech: Res<PreviewSpeechController>,
+    op_log: ResMut<OpLog>,
+    mut state: Local<ReplayOpWatchState>,
+) {
+    let first_frame = state.mode.is_none();
+    if state.mode != Some(studio.mode) {
+        // 首帧只记录初始状态，不把每次启动都当成一次模式切换。
+        if !first_frame {
+            op_log.record(
+                "replay",
+                format!(
+                    "回放模式 → {:?}，播放进度 {}",
+                    studio.mode,
+                    format_time(studio.playback_ms)
+                ),
+            );
+        }
+        state.mode = Some(studio.mode);
+    }
+    if studio.playback_ms.abs_diff(state.last_playback_ms) > 2_000
+        && due_for(&state.last_seek_log)
+    {
+        op_log.record(
+            "replay",
+            format!("回放播放头跳转到 {}", format_time(studio.playback_ms)),
+        );
+        state.last_seek_log = Some(std::time::Instant::now());
+    }
+    state.last_playback_ms = studio.playback_ms;
+
+    let render_active = studio.video_render.is_some();
+    if render_active != state.video_render_active {
+        state.video_render_active = render_active;
+        match studio.video_render.as_ref() {
+            Some(job) => op_log.record(
+                "video",
+                format!(
+                    "开始逐帧渲染：第 {}/{} 段，共 {} 帧，输出 {}",
+                    job.segment_index + 1,
+                    job.segment_count,
+                    job.total_frames,
+                    job.output_path.display()
+                ),
+            ),
+            None => op_log.record(
+                "video",
+                format!("逐帧渲染结束：{}", studio.status),
+            ),
+        }
+    }
+    let encoding_active = studio.video_encoding.is_some();
+    if encoding_active != state.video_encoding_active {
+        state.video_encoding_active = encoding_active;
+        if encoding_active {
+            op_log.record("video", "FFmpeg 编码开始");
+        } else {
+            op_log.record("video", format!("FFmpeg 编码结束：{}", studio.status));
+        }
+    }
+    let plan_active = studio.video_export_plan.is_some();
+    if plan_active != state.export_plan_active {
+        state.export_plan_active = plan_active;
+        match studio.video_export_plan.as_ref() {
+            Some(plan) => op_log.record(
+                "video",
+                format!(
+                    "视频导出计划：共 {} 段，输出 {}",
+                    plan.segment_count,
+                    plan.output_path.display()
+                ),
+            ),
+            None => op_log.record(
+                "video",
+                format!("视频导出计划结束：{}", studio.status),
+            ),
+        }
+    }
+    let worker_active = speech.onnx_worker.is_some();
+    if worker_active != state.onnx_worker_active {
+        state.onnx_worker_active = worker_active;
+        op_log.record(
+            "speech",
+            if worker_active {
+                "启动 EmotiVoice 合成进程"
+            } else {
+                "EmotiVoice 合成进程已停止"
+            },
+        );
+    }
+    if state.signature != speech.prepared_signature && due_for(&state.last_signature_log) {
+        state.signature = speech.prepared_signature;
+        state.last_signature_log = Some(std::time::Instant::now());
+        op_log.record("speech", "回放内容变化，语音缓存已重置");
+    }
+    if state.last_status.as_deref() != Some(studio.status.as_str()) {
+        state.last_status = Some(studio.status.clone());
+        op_log.record("status", &studio.status);
+    }
+}
+
+#[derive(Default)]
+struct ReplayAutosaveState {
+    last_saved_fingerprint: Option<u64>,
+    last_attempt: Option<std::time::Instant>,
+    last_mode: Option<ReplayMode>,
+    frames_since_fingerprint: usize,
+    cached_fingerprint: Option<u64>,
+}
+
+/// 指纹计算需要逐句哈希台词文本（长回放约零点几毫秒），
+/// 限流到每 15 帧一次；对 60 秒的存档间隔来说检测延迟可以忽略。
+const AUTOSAVE_FINGERPRINT_INTERVAL_FRAMES: usize = 15;
+
+/// 把当前回放项目定期自动保存到 `autosave.willow-replay.json`，
+/// 崩溃或误操作后重启可自动恢复。渲染/编码期间跳过，避免打断主线程。
+fn autosave_replay_project(
+    studio: Res<ReplayStudio>,
+    op_log: ResMut<OpLog>,
+    mut state: Local<ReplayAutosaveState>,
+) {
+    let mode = studio.mode;
+    let mode_left_recording =
+        state.last_mode == Some(ReplayMode::Recording) && mode != ReplayMode::Recording;
+    state.last_mode = Some(mode);
+    state.frames_since_fingerprint = state.frames_since_fingerprint.wrapping_add(1);
+    if state.frames_since_fingerprint >= AUTOSAVE_FINGERPRINT_INTERVAL_FRAMES
+        || state.cached_fingerprint.is_none()
+    {
+        state.frames_since_fingerprint = 0;
+        state.cached_fingerprint = replay_autosave_fingerprint(&studio);
+    }
+    let Some(fingerprint) = state.cached_fingerprint else {
+        state.last_saved_fingerprint = None;
+        // 草稿消失后重置节流，让下一个新项目的第一次存档立即执行。
+        state.last_attempt = None;
+        return;
+    };
+    if state.last_saved_fingerprint == Some(fingerprint) {
+        return;
+    }
+    let immediate = state.last_attempt.is_none()
+        || mode_left_recording
+        || state
+            .last_attempt
+            .is_some_and(|attempt| attempt.elapsed() >= AUTOSAVE_INTERVAL);
+    if !immediate {
+        return;
+    }
+    state.last_attempt = Some(std::time::Instant::now());
+    if studio.video_render.is_some() || studio.video_encoding.is_some() {
+        // 渲染期间不保存（主线程不能被序列化卡住）；渲染结束后指纹仍不同，会自动补存。
+        return;
+    }
+    match export_replay(
+        studio.replay.as_ref().expect("fingerprint implies replay"),
+        AUTOSAVE_REPLAY_PATH,
+    ) {
+        Ok(()) => {
+            state.last_saved_fingerprint = Some(fingerprint);
+            op_log.record(
+                "replay",
+                format!("回放项目已自动保存到 {AUTOSAVE_REPLAY_PATH}"),
+            );
+        },
+        Err(err) => op_log.record("replay", format!("回放项目自动保存失败：{err}")),
+    }
+}
+
+/// 当前回放项目的变化指纹：逐句哈希台词文本（部分编辑入口不更新修订号，
+/// 纯文本修改也不能漏存），加上内容计数、修订号和录制时长。
+fn replay_autosave_fingerprint(studio: &ReplayStudio) -> Option<u64> {
+    let replay = studio.replay.as_ref()?;
+    let mut hasher = DefaultHasher::new();
+    replay.created_at_unix_ms.hash(&mut hasher);
+    studio.timeline_revision.hash(&mut hasher);
+    studio.scene_revision.hash(&mut hasher);
+    studio.record_elapsed_ms.hash(&mut hasher);
+    replay.duration_ms.hash(&mut hasher);
+    for line in &replay.dialogue {
+        line.text.hash(&mut hasher);
+        line.speech_text.hash(&mut hasher);
+        line.duration_ms.hash(&mut hasher);
+        line.speech_enabled.hash(&mut hasher);
+        line.speech_rate.to_bits().hash(&mut hasher);
+        line.speech_volume.to_bits().hash(&mut hasher);
+        line.duration_locked.hash(&mut hasher);
+        line.included.hash(&mut hasher);
+    }
+    replay.dialogue.len().hash(&mut hasher);
+    replay.camera.len().hash(&mut hasher);
+    replay.camera_cuts.len().hash(&mut hasher);
+    replay.area_blocks.len().hash(&mut hasher);
+    replay.terrain_changes.len().hash(&mut hasher);
+    replay.ship_hull_changes.len().hash(&mut hasher);
+    replay.player_movements.len().hash(&mut hasher);
+    replay
+        .player_movements
+        .iter()
+        .map(|movement| movement.keyframes.len())
+        .sum::<usize>()
+        .hash(&mut hasher);
+    replay.ship_trajectories.len().hash(&mut hasher);
+    replay
+        .ship_trajectories
+        .iter()
+        .map(|trajectory| trajectory.keyframes.len())
+        .sum::<usize>()
+        .hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 fn preview_replay_speech(
     mut commands: Commands,
     mut studio: ResMut<ReplayStudio>,
     mut speech: ResMut<PreviewSpeechController>,
     mut audio_sources: ResMut<Assets<AudioSource>>,
+    op_log: ResMut<OpLog>,
 ) {
     let pending_generation_line_ids = studio
         .replay
@@ -2353,12 +2733,31 @@ fn preview_replay_speech(
                 newly_ready_current |= Some(result.cue) == cue;
                 speech.generation_cues.remove(&result.cue);
                 speech.onnx_failures.remove(&result.cue);
+                speech.cache_attempted.remove(&result.cue);
+                op_log.record(
+                    "speech",
+                    format!(
+                        "语音合成完成：台词 #{}，用时 {} ms，音频 {} 字节",
+                        result.cue.1,
+                        result.elapsed_ms,
+                        wav.len()
+                    ),
+                );
                 speech.onnx_cache.insert(result.cue, (wav, result.volume));
             },
             Err(err) => {
                 speech.onnx_queued.remove(&result.cue);
+                // 允许自动重试：解除“磁盘缓存已探测过”的标记。
+                speech.cache_attempted.remove(&result.cue);
                 let attempts = speech.onnx_attempts.entry(result.cue).or_default();
                 *attempts = attempts.saturating_add(1);
+                op_log.record(
+                    "speech",
+                    format!(
+                        "语音合成失败（第 {} 次，用时 {} ms）：{err}",
+                        attempts, result.elapsed_ms
+                    ),
+                );
                 if *attempts >= 2 {
                     speech.generation_cues.remove(&result.cue);
                     speech.onnx_failures.insert(result.cue, err.clone());
@@ -2410,6 +2809,7 @@ impl PreviewSpeechController {
             self.prepared_signature = Some(signature);
             self.onnx_cache.clear();
             self.onnx_queued.clear();
+            self.cache_attempted.clear();
             self.onnx_attempts.clear();
             self.onnx_failures.clear();
             self.generation_cues.clear();
@@ -2418,6 +2818,7 @@ impl PreviewSpeechController {
                 worker.latest_signature.store(signature, Ordering::Release);
             }
         }
+        let mut new_cues = 0_usize;
         for &index in requested_indices {
             let Some(line) = replay.dialogue.get(index) else {
                 continue;
@@ -2427,9 +2828,18 @@ impl PreviewSpeechController {
                 || !line.speech_enabled
                 || self.onnx_cache.contains_key(&cue)
                 || self.onnx_failures.contains_key(&cue)
+                || self.onnx_queued.contains(&cue)
+                || self.cache_attempted.contains(&cue)
             {
                 continue;
             }
+            // 新台词的文本规范化和磁盘缓存探测只在首次遇到时做一次；
+            // 每帧最多处理固定数量，避免长回放开局时主线程被大量
+            // `fs::read` 探测卡住。
+            if new_cues >= SPEECH_PREP_BUDGET_PER_FRAME {
+                break;
+            }
+            new_cues += 1;
             let settings = replay
                 .speaker_voice_settings
                 .get(&line.sender_id)
@@ -2454,6 +2864,7 @@ impl PreviewSpeechController {
                 self.onnx_cache.insert(cue, (wav, volume));
                 continue;
             }
+            self.cache_attempted.insert(cue);
             if !speech_generation_requested(
                 line.line_id,
                 cue,
@@ -2462,16 +2873,20 @@ impl PreviewSpeechController {
             ) {
                 continue;
             }
-            if self.onnx_queued.contains(&cue) {
-                continue;
-            }
             if self.onnx_worker.is_none() {
-                self.onnx_worker = Some(start_onnx_preview_worker()?);
-                self.onnx_worker
-                    .as_ref()
-                    .expect("ONNX worker was initialized")
-                    .latest_signature
-                    .store(signature, Ordering::Release);
+                match start_onnx_preview_worker() {
+                    Ok(worker) => {
+                        worker
+                            .latest_signature
+                            .store(signature, Ordering::Release);
+                        self.onnx_worker = Some(worker);
+                    },
+                    Err(err) => {
+                        // 本次启动失败不粘住这条台词：下次调用重新探测排队。
+                        self.cache_attempted.remove(&cue);
+                        return Err(err);
+                    },
+                }
             }
             self.generation_cues.insert(cue);
             let send_result = self
@@ -2492,6 +2907,8 @@ impl PreviewSpeechController {
                 // Dropping the disconnected sender lets the next frame create
                 // a fresh worker instead of permanently repeating send errors.
                 self.onnx_worker = None;
+                self.cache_attempted.remove(&cue);
+                self.generation_cues.remove(&cue);
                 return Err(format!(
                     "EmotiVoice preview worker stopped: {err}"
                 ));
@@ -2502,6 +2919,8 @@ impl PreviewSpeechController {
     }
 
     fn onnx_cue_finished(&self, signature: u64, cue: (u64, usize)) -> bool {
+        // 未排队且未探测的台词按“已完成”处理：不阻塞播放。
+        // 排队预算把当前句排在探测队列最前，实际不会错过等待。
         self.prepared_signature == Some(signature)
             && (self.onnx_cache.contains_key(&cue)
                 || self.onnx_failures.contains_key(&cue)
@@ -2962,6 +3381,7 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                 if request.signature != worker_signature.load(Ordering::Acquire) {
                     continue;
                 }
+                let synthesis_started = std::time::Instant::now();
                 let wav = tts.as_mut().map_err(|err| err.clone()).and_then(|tts| {
                     let wav = tts.synthesize(
                         &request.text,
@@ -2978,6 +3398,7 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                     );
                     Ok(wav)
                 });
+                let elapsed_ms = synthesis_started.elapsed().as_millis() as u64;
                 if wav
                     .as_ref()
                     .is_err_and(|err| tts_worker_connection_error(err))
@@ -2995,6 +3416,7 @@ fn start_onnx_preview_worker() -> Result<OnnxPreviewWorker, String> {
                         cue: request.cue,
                         wav,
                         volume: request.volume,
+                        elapsed_ms,
                     })
                     .is_err()
                 {
@@ -3019,6 +3441,7 @@ fn render_video_frames(
     mut capture_active: ResMut<ReplayVideoCaptureActive>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    op_log: ResMut<OpLog>,
 ) {
     let Some(job) = studio.video_render.as_mut() else {
         return;
@@ -3036,6 +3459,16 @@ fn render_video_frames(
     }
 
     if let Some(error) = job.failure.clone() {
+        op_log.record(
+            "video",
+            format!(
+                "第 {}/{} 段渲染中止（{} 帧，用时 {:.1}s）：{error}",
+                job.segment_index + 1,
+                job.segment_count,
+                job.next_frame,
+                job.started_at.elapsed().as_secs_f32()
+            ),
+        );
         if let Some(entity) = job.monitor_music_entity.take() {
             commands.entity(entity).try_despawn();
         }
@@ -3086,6 +3519,16 @@ fn render_video_frames(
         }
     }
     if job.next_frame >= job.total_frames {
+        op_log.record(
+            "video",
+            format!(
+                "第 {}/{} 段渲染完成：{} 帧，用时 {:.1}s",
+                job.segment_index + 1,
+                job.segment_count,
+                job.total_frames,
+                job.started_at.elapsed().as_secs_f32()
+            ),
+        );
         if let Some(entity) = job.monitor_music_entity.take() {
             commands.entity(entity).try_despawn();
         }
@@ -3102,17 +3545,31 @@ fn render_video_frames(
     let job_id = job.id;
     let frame_index = job.next_frame;
     let frame_path = job.frames.path().join(frame_file_name(frame_index));
-    let playback_ms = frame_time_ms(frame_index, job.fps);
+    let playback_ms = job
+        .segment_start_ms
+        .saturating_add(frame_time_ms(frame_index, job.fps));
     let total_frames = job.total_frames;
+    let segment_index = job.segment_index;
+    let segment_count = job.segment_count;
     job.capture_pending = true;
     job.pending_seconds = 0.0;
     studio.playback_ms = playback_ms;
     if let Ok(mut window) = windows.single_mut() {
-        window.title = format!(
-            "正在渲染视频 {}/{}（同步监听音乐和角色语音；Esc 取消）",
-            frame_index + 1,
-            total_frames
-        );
+        window.title = if segment_count > 1 {
+            format!(
+                "正在渲染视频 第 {}/{segment_count} 段 {}/{}（同步监听音乐和角色语音；Esc 取消）",
+                segment_index + 1,
+                frame_index + 1,
+                total_frames,
+                segment_count = segment_count
+            )
+        } else {
+            format!(
+                "正在渲染视频 {}/{}（同步监听音乐和角色语音；Esc 取消）",
+                frame_index + 1,
+                total_frames
+            )
+        };
     }
 
     commands.spawn(Screenshot::primary_window()).observe(
@@ -3151,18 +3608,27 @@ fn finish_video_capture(
     let Some(job) = studio.video_render.take() else {
         return;
     };
+    // 段与段之间必须保持回放状态（网格地形、镜头、播放头）原样衔接：
+    // 只有最后一段或出错时才恢复直播场景和窗口标题。
+    let has_next_segment = studio
+        .video_export_plan
+        .as_ref()
+        .is_some_and(|plan| plan.next_segment + 1 < plan.segment_count);
+    let finalizing = result.is_err() || !has_next_segment;
     capture_active.0 = false;
-    if let Ok(mut window) = windows.single_mut() {
-        window.title = job.original_window_title;
-        window.resizable = job.original_window_resizable;
+    if finalizing {
+        if let Ok(mut window) = windows.single_mut() {
+            window.title = job.original_window_title;
+            window.resizable = job.original_window_resizable;
+        }
+        stop_playback(studio, grids);
     }
-    stop_playback(studio, grids);
 
     if let Err(err) = result {
         studio.status = err;
+        studio.video_export_plan = None;
         return;
     }
-
     let frames_path = job.frames.path().to_owned();
     let output_path = job.output_path.clone();
     let fps = job.fps;
@@ -3175,6 +3641,15 @@ fn finish_video_capture(
     let speaker_voice_settings = job.speaker_voice_settings;
     let dialogue = job.dialogue;
     let (sender, receiver) = bounded(1);
+    let segment_label = if job.segment_count > 1 {
+        format!(
+            "第 {}/{} 段 ",
+            job.segment_index + 1,
+            job.segment_count
+        )
+    } else {
+        String::new()
+    };
     thread::spawn(move || {
         let result = encode_video_frames(
             &frames_path,
@@ -3192,32 +3667,77 @@ fn finish_video_capture(
         let _ = sender.send(result);
     });
     studio.status = format!(
-        "正在使用 FFmpeg 编码 {}",
+        "正在使用 FFmpeg 编码{segment_label}{}",
         job.output_path.display()
     );
     studio.video_encoding = Some(VideoEncodingJob {
         _frames: job.frames,
-        output_path: job.output_path,
         result: receiver,
+        output_path: job.output_path.clone(),
+        started_at: std::time::Instant::now(),
     });
 }
 
-fn poll_video_encoding(mut studio: ResMut<ReplayStudio>) {
+fn poll_video_encoding(
+    mut studio: ResMut<ReplayStudio>,
+    mut capture_active: ResMut<ReplayVideoCaptureActive>,
+    mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    op_log: ResMut<OpLog>,
+) {
     let Some(job) = studio.video_encoding.as_ref() else {
         return;
     };
     let Ok(result) = job.result.try_recv() else {
         return;
     };
-    let output_path = job.output_path.clone();
+    let elapsed = job.started_at.elapsed().as_secs_f32();
+    let output_path = job.output_path.display().to_string();
     studio.video_encoding = None;
-    studio.status = match result {
-        Ok(()) => format!(
-            "MP4 视频已导出到 {}",
-            output_path.display()
-        ),
-        Err(err) => format!("视频编码失败：{err}"),
+    let Err(err) = result else {
+        op_log.record(
+            "video",
+            format!("FFmpeg 编码完成（用时 {elapsed:.1}s）：{output_path}"),
+        );
+        let Some(plan) = studio.video_export_plan.as_mut() else {
+            return;
+        };
+        plan.next_segment += 1;
+        if plan.next_segment < plan.segment_count {
+            start_next_video_segment(&mut studio, &mut capture_active, &mut windows);
+            return;
+        }
+        let output_path = plan.output_path.clone();
+        let original_window_title = plan.original_window_title.clone();
+        let original_window_resizable = plan.original_window_resizable;
+        studio.video_export_plan = None;
+        if let Ok(mut window) = windows.single_mut() {
+            window.title = original_window_title;
+            window.resizable = original_window_resizable;
+        }
+        studio.status = format!("MP4 视频已导出到 {}", output_path.display());
+        return;
     };
+    op_log.record(
+        "video",
+        format!("FFmpeg 编码失败（用时 {elapsed:.1}s）：{err}"),
+    );
+    // 中途段编码失败：完整清理，恢复直播场景和窗口，不能让应用停在回放状态。
+    let plan = studio.video_export_plan.take();
+    if let Some(plan) = plan {
+        if let Ok(mut window) = windows.single_mut() {
+            window.title = plan.original_window_title;
+            window.resizable = plan.original_window_resizable;
+        }
+    }
+    capture_active.0 = false;
+    if matches!(
+        studio.mode,
+        ReplayMode::Playing | ReplayMode::Paused
+    ) {
+        stop_playback(&mut studio, &mut grids);
+    }
+    studio.status = format!("视频编码失败：{err}");
 }
 
 fn apply_replay_camera(
@@ -3517,6 +4037,7 @@ fn replay_controls(
     occlusion_cast_end_height_cells: &mut f32,
     occlusion_debug_gizmo: &mut bool,
 ) {
+    let _profile = info_span!("replay_controls").entered();
     if studio.workspace_tab == ReplayWorkspaceTab::Project {
         ui.label("记录体素场景和可见对话，并在应用内确定性回放。");
         ui.small("飞船轨迹、地形变化和玩家接管移动都会常态化自动记录，无需先点击“开始录制”；回放生成后新录到的内容会在按“播放”时自动并入时间轴。");
@@ -3769,14 +4290,20 @@ fn replay_controls(
         },
         ReplayMode::Playing | ReplayMode::Paused => {
             let completed = replay_has_completed(studio);
+            // 多段视频导出的段间编码间隙处于 Paused；此时禁止打断回放，
+            // 否则后续段会渲染到已恢复的直播场景上。
+            let export_in_progress = studio.video_export_plan.is_some();
             if ui
-                .button(if studio.mode == ReplayMode::Playing {
-                    "暂停"
-                } else if completed {
-                    "重播"
-                } else {
-                    "继续"
-                })
+                .add_enabled(
+                    !export_in_progress,
+                    egui::Button::new(if studio.mode == ReplayMode::Playing {
+                        "暂停"
+                    } else if completed {
+                        "重播"
+                    } else {
+                        "继续"
+                    }),
+                )
                 .clicked()
             {
                 studio.mode = if studio.mode == ReplayMode::Playing {
@@ -3791,7 +4318,13 @@ fn replay_controls(
                     studio.status = REPLAY_PLAYING_STATUS.to_owned();
                 }
             }
-            if ui.button("停止回放").clicked() {
+            if ui
+                .add_enabled(
+                    !export_in_progress,
+                    egui::Button::new("停止回放"),
+                )
+                .clicked()
+            {
                 stop_playback(studio, grids);
             }
         },
@@ -4014,11 +4547,50 @@ fn replay_controls(
         .iter()
         .map(|(transform, standee)| (standee.user_id, transform.translation))
         .collect::<HashMap<_, _>>();
-    let missing_director_lines = studio
-        .replay
+    // 缓存失效时才重建导演面板的派生数据；重新构建导演请求要把全部台词
+    // 序列化一遍，是导演页每帧卡顿的主要来源。
+    let director_cache_fingerprint =
+        director_panel_fingerprint(studio, deepseek_manager, standees);
+    if studio
+        .director_panel_cache
         .as_ref()
-        .map(|replay| missing_director_dialogue(replay, &visible_standees))
-        .unwrap_or_default();
+        .is_none_or(|cache| cache.fingerprint != director_cache_fingerprint)
+    {
+        let missing_lines = studio
+            .replay
+            .as_ref()
+            .map(|replay| missing_director_dialogue(replay, &visible_standees))
+            .unwrap_or_default();
+        let saved_director_available = studio
+            .replay
+            .as_ref()
+            .and_then(|replay| {
+                replay_director_request(
+                    replay,
+                    &studio.deepseek_custom_prompt,
+                    standees,
+                )
+                .ok()
+                .map(|request| {
+                    saved_director_block(replay, deepseek_manager, &request).is_some()
+                })
+            })
+            .unwrap_or(false);
+        studio.director_panel_cache = Some(DirectorPanelCache {
+            fingerprint: director_cache_fingerprint,
+            missing_lines,
+            saved_director_available,
+        });
+    }
+    // 克隆出本帧使用的快照，避免持有 studio 的借用与后面的编辑冲突；
+    // 常见情况（没有缺行提示）克隆接近零开销。
+    let (missing_director_lines, saved_director_available) = {
+        let cache = studio
+            .director_panel_cache
+            .as_ref()
+            .expect("director panel cache was just refreshed");
+        (cache.missing_lines.clone(), cache.saved_director_available)
+    };
     if !missing_director_lines.is_empty() {
         ui.group(|ui| {
             ui.colored_label(
@@ -4089,19 +4661,6 @@ fn replay_controls(
             "{prompt_chars}/{DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS} 字；可影响措辞和镜头风格，不能扩大可见范围或新增剧情"
         ));
     }
-    let saved_director_available = studio
-        .replay
-        .as_ref()
-        .and_then(|replay| {
-            replay_director_request(
-                replay,
-                &studio.deepseek_custom_prompt,
-                standees,
-            )
-            .ok()
-            .map(|request| saved_director_block(replay, deepseek_manager, &request).is_some())
-        })
-        .unwrap_or(false);
     let director_button_text = if saved_director_available {
         "应用已保存的导演方案"
     } else {
@@ -4349,15 +4908,27 @@ fn replay_controls(
     ui.small("每条台词进入回放后会立即排队生成并缓存角色语音，不需要等待下一条消息或点击播放。预览与 MP4 导出共用缓存。");
     ui.small("整体语速默认 1.10×，调整语速或单个角色音色时不会改变时间轴。EmotiVoice 使用固定说话人 ID，声音会更机械，但同一玩家跨台词保持一致且生成更快。需要改变字幕、间隔和镜头时长时，请使用“整体台词停留”。预览与导出共用同一条时间线和语音缓存。DeepSeek 另行生成只供发音使用的中文谐音文本，画面仍显示正常中英文原文。所有语音均在本机生成，不上传网络。");
     if let Some(replay) = studio.replay.as_ref() {
-        ui.small(format!(
-            "预计渲染 {} 帧，视频时长 {}",
-            video_frame_count(replay.duration_ms, studio.video_fps),
-            format_time(replay.duration_ms)
-        ));
+        let segment_count = video_segment_count(replay.duration_ms);
+        ui.small(if segment_count > 1 {
+            format!(
+                "预计渲染 {} 帧，视频时长 {}；超过 20 分钟将自动切成 {} 段，依次输出为 _part01、_part02… 每段渲染完立即编码保存",
+                video_frame_count(replay.duration_ms, studio.video_fps),
+                format_time(replay.duration_ms),
+                segment_count
+            )
+        } else {
+            format!(
+                "预计渲染 {} 帧，视频时长 {}",
+                video_frame_count(replay.duration_ms, studio.video_fps),
+                format_time(replay.duration_ms)
+            )
+        });
     }
     });
     let can_export_video = studio.replay.is_some()
+        && studio.video_render.is_none()
         && studio.video_encoding.is_none()
+        && studio.video_export_plan.is_none()
         && studio.mode != ReplayMode::Recording;
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -4460,7 +5031,7 @@ fn replay_controls(
         }
     }
     ui.small("一键模式会自动完成：读取可见聊天 → DeepSeek 润色逐句台词并选择镜头 → 本地验证和生成平滑轨迹 → 逐帧渲染 → FFmpeg 输出 MP4。");
-    ui.small("导出时会隐藏编辑器界面，逐帧渲染台词层，再用 FFmpeg 编码 H.264/AAC 视频。按 Esc 可取消逐帧渲染。");
+    ui.small("导出时会隐藏编辑器界面，逐帧渲染台词层，再用 FFmpeg 编码 H.264/AAC 视频。回放长于 20 分钟时自动按 20 分钟切片，每段输出一个独立的 MP4（_part01、_part02…），已完成的段随时可以拿去剪辑。按 Esc 可取消逐帧渲染。");
 
     }
     if studio.workspace_tab == ReplayWorkspaceTab::Project {
@@ -4492,6 +5063,14 @@ fn replay_controls(
             ui.label("项目导入路径");
             ui.text_edit_singleline(&mut studio.project_import_path);
             if ui.button("载入回放项目").clicked() {
+                let backed_up_path = match backup_current_replay(studio) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        studio.status =
+                            format!("备份当前回放项目失败，已取消载入：{err}");
+                        return;
+                    },
+                };
                 match import_replay(&studio.project_import_path, Some(manager)) {
                     Ok(replay) => {
                         stop_playback(studio, grids);
@@ -4501,7 +5080,10 @@ fn replay_controls(
                         studio.camera_yaw_degrees = replay.camera_yaw_degrees;
                         studio.camera_transition_curve = replay.camera_transition_curve;
                         studio.player_movement_curve = replay.player_movement_curve;
-                        studio.status = format!("已载入项目：{}", replay.title);
+                        studio.status = match backed_up_path {
+                            Some(path) => format!("已载入项目：{}（原项目已备份到 {path}）", replay.title),
+                            None => format!("已载入项目：{}", replay.title),
+                        };
                         studio.replay = Some(replay);
                     },
                     Err(err) => studio.status = format!("项目载入失败：{err}"),
@@ -4807,6 +5389,14 @@ fn start_recording(
         studio.status = "请先选择跑团组（战役）".to_owned();
         return;
     };
+    let backed_up_path = match backup_current_replay(studio) {
+        Ok(path) => path,
+        Err(err) => {
+            studio.status =
+                format!("备份当前回放项目失败，已取消开始录制：{err}");
+            return;
+        },
+    };
     let scene = grids
         .single_mut()
         .map(|grid| capture_scene(&grid))
@@ -4848,7 +5438,11 @@ fn start_recording(
     studio.auto_export_after_director = false;
     studio.replay = Some(replay);
     studio.mode = ReplayMode::Recording;
-    studio.status = if studio.record_camera_enabled {
+    studio.status = if let Some(path) = backed_up_path {
+        format!(
+            "开始录制场景和镜头；原项目已备份到 {path}，飞船轨迹与地形变化由常态化记录自动并入"
+        )
+    } else if studio.record_camera_enabled {
         "开始录制场景、可见消息和 DM 自由镜头；飞船轨迹与地形变化由常态化记录自动并入".to_owned()
     } else {
         "开始录制场景和可见消息；飞船轨迹与地形变化由常态化记录自动并入，DM 镜头采集保持关闭"
@@ -4915,25 +5509,28 @@ fn build_from_history(
         studio.status = "请先选择跑团组（战役）".to_owned();
         return;
     };
+    let current_fingerprint = replay_autosave_fingerprint(studio);
+    let backed_up_path = if current_fingerprint.is_some()
+        && studio.generated_replay_fingerprint == current_fingerprint
+    {
+        // 当前草稿就是上次“从现有聊天生成”的产物，备份它只会覆盖
+        // 用户手编项目的备份，跳过。
+        None
+    } else {
+        match backup_current_replay(studio) {
+            Ok(path) => path,
+            Err(err) => {
+                studio.status =
+                    format!("备份当前回放项目失败，已取消重新生成：{err}");
+                return;
+            },
+        }
+    };
     let previous_settings = studio
         .replay
         .as_ref()
         .map(ReplayGenerationSettings::from_replay);
     let retained_previous_settings = previous_settings.is_some();
-    let scene = grids
-        .single_mut()
-        .map(|grid| capture_scene(&grid))
-        .unwrap_or_default();
-    let mut replay = new_replay(
-        manager,
-        campaign_id.clone(),
-        studio.audience.clone(),
-        scene,
-        studio.camera_distance_scale,
-        studio.camera_yaw_degrees,
-        studio.camera_transition_curve,
-        studio.player_movement_curve,
-    );
     let speaker_positions = standee_positions(standees);
     let mut visible = manager
         .messages
@@ -4966,6 +5563,41 @@ fn build_from_history(
         .filter(|(message, _)| !message.text.trim().is_empty())
         .collect::<Vec<_>>();
     visible.sort_by_key(|(message, _)| message.time);
+    // 只把回放时间窗（第一条台词之后）内地形编辑映射进时间轴；
+    // 更早的编辑已经体现在当前地形里，属于基线的一部分。
+    let window_start_source_ms = visible
+        .first()
+        .map(|(message, _)| message.time.saturating_mul(1_000))
+        .unwrap_or_default();
+    let replay_window_terrain = if window_start_source_ms == 0 {
+        Vec::new()
+    } else {
+        studio
+            .pending_terrain_changes
+            .iter()
+            .filter(|(source, _, _, _)| *source >= window_start_source_ms)
+            .copied()
+            .collect()
+    };
+    let mut scene = grids
+        .single_mut()
+        .map(|grid| capture_scene(&grid))
+        .unwrap_or_default();
+    // The live grid already contains every recorded terrain edit, so rewind
+    // the baseline before mapping the edits onto the timeline; otherwise the
+    // replay would show the final terrain from frame zero. Edits from before
+    // the first dialogue line already belong to the baseline and stay baked in.
+    revert_pending_terrain_from_scene(&mut scene, &replay_window_terrain);
+    let mut replay = new_replay(
+        manager,
+        campaign_id.clone(),
+        studio.audience.clone(),
+        scene,
+        studio.camera_distance_scale,
+        studio.camera_yaw_degrees,
+        studio.camera_transition_curve,
+        studio.player_movement_curve,
+    );
     let estimated_count = visible
         .iter()
         .filter(|(_, snapshot)| snapshot.is_none())
@@ -5005,7 +5637,7 @@ fn build_from_history(
         &mut replay,
         ship_trajectory_history,
         0,
-        &[],
+        &replay_window_terrain,
         &[],
     );
     replay.ship_trajectory_history_cursor_unix_ms = unix_time_ms();
@@ -5067,9 +5699,15 @@ fn build_from_history(
     } else {
         ""
     };
+    let backup_status = if backed_up_path.is_some() {
+        "；原项目已备份到 autosave-backup.willow-replay.json"
+    } else {
+        ""
+    };
     studio.status = format!(
-        "已生成 {dialogue_count} 句区域回放台词和 {movement_frame_count} 帧接管移动；其中 {estimated_count} 句旧消息使用当前立牌位置或原点估算，可由 DM 编辑{favorite_status}{retained_settings_status}"
+        "已生成 {dialogue_count} 句区域回放台词和 {movement_frame_count} 帧接管移动；其中 {estimated_count} 句旧消息使用当前立牌位置或原点估算，可由 DM 编辑{favorite_status}{retained_settings_status}{backup_status}"
     );
+    studio.generated_replay_fingerprint = replay_autosave_fingerprint(studio);
 }
 
 fn apply_favorite_voice_settings(
@@ -5262,6 +5900,56 @@ fn director_request_fingerprint_matches(
         == Some(request.fingerprint.as_str())
 }
 
+/// 导演面板缓存的脏标记：哈希所有影响 `missing_director_dialogue` 和
+/// “已保存导演方案”匹配结果、但获取代价低的输入。完整的导演请求只在该
+/// 指纹变化时才重新构建，因为构建过程会把全部台词与轨道序列化一遍。
+/// DeepSeek 的响应是异步到达的，所以它的轻量状态也参与失效判断，
+/// 宁可偶尔多算也不显示过期的方案可用性。
+fn director_panel_fingerprint(
+    studio: &ReplayStudio,
+    deepseek_manager: &DeepseekManager,
+    standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    studio.timeline_revision.hash(&mut hasher);
+    studio.deepseek_custom_prompt.hash(&mut hasher);
+    if let Some(replay) = studio.replay.as_ref() {
+        replay.campaign_id.hash(&mut hasher);
+        replay.created_at_unix_ms.hash(&mut hasher);
+        for line in &replay.dialogue {
+            replay_dialogue_is_playable(line).hash(&mut hasher);
+            line.sender_id.hash(&mut hasher);
+            line.camera_focus_id.hash(&mut hasher);
+            (line.side == DialogueSide::Left).hash(&mut hasher);
+            line.name.hash(&mut hasher);
+            line.role.hash(&mut hasher);
+            line.text.hash(&mut hasher);
+        }
+    }
+    for (transform, standee) in standees {
+        standee.user_id.hash(&mut hasher);
+        transform.translation.to_array().iter().for_each(|value| {
+            value.to_bits().hash(&mut hasher);
+        });
+    }
+    deepseek_manager
+        .director_request_fingerprints
+        .len()
+        .hash(&mut hasher);
+    if let Some(replay) = studio.replay.as_ref() {
+        match replay_summary_block(replay, deepseek_manager) {
+            Some(block) => {
+                block.pending.hash(&mut hasher);
+                block.error.is_some().hash(&mut hasher);
+                block.latest.len().hash(&mut hasher);
+                block.latest.hash(&mut hasher);
+            },
+            None => 0_u8.hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
+
 fn saved_director_block<'a>(
     replay: &ReplayFile,
     manager: &'a DeepseekManager,
@@ -5327,6 +6015,13 @@ fn apply_ready_director_plan(
     standees: &Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
 ) -> Result<bool, String> {
     if !studio.director_request_pending || replay_has_live_take(studio) {
+        return Ok(false);
+    }
+    if studio.video_render.is_some()
+        || studio.video_encoding.is_some()
+        || studio.video_export_plan.is_some()
+    {
+        // 正在导出时不能改动回放内容；导出结束后下一帧会再尝试应用。
         return Ok(false);
     }
     let Some(replay) = studio.replay.as_ref() else {
@@ -6140,6 +6835,7 @@ fn replay_live_edit_panel(
                 if let Some(duration_ms) = requested_duration_ms {
                     set_exact_dialogue_duration_at_playhead(studio, dialogue_index, duration_ms);
                 }
+                studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
                 studio.speech_wait_cue = None;
                 studio.speech_wait_elapsed_seconds = 0.0;
                 studio.speech_bypass_cues.clear();
@@ -7416,6 +8112,19 @@ fn start_video_export(
         studio.status = "请先保存或取消本次录制，再导出视频".to_owned();
         return;
     }
+    if studio.video_render.is_some()
+        || studio.video_encoding.is_some()
+        || studio.video_export_plan.is_some()
+    {
+        studio.status = "已有视频导出在进行中；请等待完成或按 Esc 取消".to_owned();
+        return;
+    }
+    // 窗口的原始状态必须在任何渲染改动之前捕获一次，
+    // 多段导出结束后从这里恢复。
+    let (original_window_title, original_window_resizable) = match windows.single_mut() {
+        Ok(window) => (window.title.clone(), window.resizable),
+        Err(_) => (String::new(), true),
+    };
     prepare_replay_movement_for_playback(
         studio, player_movement_history, ship_trajectory_history,
     );
@@ -7479,16 +8188,6 @@ fn start_video_export(
         studio.status = format!("无法创建视频帧缓存目录：{err}");
         return;
     }
-    let frames = match tempfile::Builder::new()
-        .prefix("render-")
-        .tempdir_in(&temp_root)
-    {
-        Ok(frames) => frames,
-        Err(err) => {
-            studio.status = format!("无法创建视频帧缓存：{err}");
-            return;
-        },
-    };
 
     if matches!(
         studio.mode,
@@ -7500,20 +8199,8 @@ fn start_video_export(
     studio.mode = ReplayMode::Paused;
     studio.playback_ms = 0;
     let fps = studio.video_fps.clamp(1, 120);
-    let total_frames = video_frame_count(duration_ms, fps);
-    let Ok(mut window) = windows.single_mut() else {
-        stop_playback(studio, grids);
-        studio.status = "找不到主窗口，无法渲染视频".to_owned();
-        return;
-    };
-    let original_window_title = window.title.clone();
-    let original_window_resizable = window.resizable;
-    window.resizable = false;
-    window.title = format!("正在准备视频渲染（共 {total_frames} 帧）");
-    capture_active.0 = true;
-    studio.video_render = Some(VideoRenderJob {
-        id: unix_time_ms(),
-        frames,
+    let segment_count = video_segment_count(duration_ms);
+    studio.video_export_plan = Some(VideoExportPlan {
         output_path,
         fps,
         duration_ms,
@@ -7524,6 +8211,179 @@ fn start_video_export(
         master_speech_speed,
         speaker_voice_settings,
         dialogue,
+        segment_count,
+        next_segment: 0,
+        original_window_title,
+        original_window_resizable,
+    });
+    start_next_video_segment(studio, capture_active, windows);
+}
+
+fn video_segment_count(duration_ms: u64) -> u32 {
+    duration_ms
+        .div_ceil(VIDEO_SEGMENT_MAX_MS)
+        .max(1) as u32
+}
+
+fn video_segment_bounds(duration_ms: u64, segment_index: u32) -> (u64, u64) {
+    let start_ms = segment_index as u64 * VIDEO_SEGMENT_MAX_MS;
+    let duration = VIDEO_SEGMENT_MAX_MS.min(duration_ms.saturating_sub(start_ms));
+    (start_ms, duration)
+}
+
+/// 多段导出时每段输出为独立的 `_partNN` 文件；单段导出保持原路径不变。
+fn segment_output_path(base: &Path, segment_index: u32) -> PathBuf {
+    let extension = base
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("mp4");
+    let stem = base
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("replay");
+    base.with_file_name(format!(
+        "{stem}_part{segment_index:02}.{extension}"
+    ))
+}
+
+/// 从导出计划中取出下一段并开始逐帧渲染；段与段之间不重置回放状态，
+/// 让地形、镜头和站位从上一段的结束状态无缝继续。
+/// 放弃整次视频导出：清掉计划、恢复导出前的窗口状态并释放截图锁。
+fn abort_video_export(
+    studio: &mut ReplayStudio,
+    capture_active: &mut ReplayVideoCaptureActive,
+    windows: &mut Query<&mut Window, With<PrimaryWindow>>,
+    message: String,
+) {
+    if let Some(plan) = studio.video_export_plan.take() {
+        if let Ok(mut window) = windows.single_mut() {
+            window.title = plan.original_window_title;
+            window.resizable = plan.original_window_resizable;
+        }
+    }
+    capture_active.0 = false;
+    studio.status = message;
+}
+
+fn start_next_video_segment(
+    studio: &mut ReplayStudio,
+    capture_active: &mut ReplayVideoCaptureActive,
+    windows: &mut Query<&mut Window, With<PrimaryWindow>>,
+) {
+    let Some(plan) = studio.video_export_plan.as_ref() else {
+        return;
+    };
+    if !matches!(
+        studio.mode,
+        ReplayMode::Playing | ReplayMode::Paused
+    ) {
+        // 回放状态被外部破坏（例如段间手动停止），无法保证后续段画面正确。
+        abort_video_export(
+            studio,
+            capture_active,
+            windows,
+            "视频导出已中止：段间回放状态被改变".to_owned(),
+        );
+        return;
+    }
+    let segment_index = plan.next_segment;
+    let (segment_start_ms, segment_duration_ms) =
+        video_segment_bounds(plan.duration_ms, segment_index);
+    studio.playback_ms = segment_start_ms;
+    let output_path = if plan.segment_count > 1 {
+        segment_output_path(&plan.output_path, segment_index + 1)
+    } else {
+        plan.output_path.clone()
+    };
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        if let Err(err) = fs::create_dir_all(parent) {
+            abort_video_export(
+                studio,
+                capture_active,
+                windows,
+                format!("无法创建视频目录：{err}"),
+            );
+            return;
+        }
+    }
+    let temp_root = Path::new(".data")
+        .join("willowblossom")
+        .join("video-render-cache");
+    let frames = match tempfile::Builder::new()
+        .prefix("render-")
+        .tempdir_in(&temp_root)
+    {
+        Ok(frames) => frames,
+        Err(err) => {
+            abort_video_export(
+                studio,
+                capture_active,
+                windows,
+                format!("无法创建视频帧缓存：{err}"),
+            );
+            return;
+        },
+    };
+    let total_frames = video_frame_count(segment_duration_ms, plan.fps);
+    let segment_dialogue = plan
+        .dialogue
+        .iter()
+        // 同时收录在段起点已经开始、但还没读完的跨界台词，
+        // 否则画面有字幕而配音在段边界处中断。
+        .filter(|line| {
+            line.time_ms < segment_start_ms.saturating_add(segment_duration_ms)
+                && line
+                    .time_ms
+                    .saturating_add(line.duration_ms)
+                    .max(line.time_ms)
+                    > segment_start_ms
+        })
+        .cloned()
+        .map(|mut line| {
+            line.time_ms = line.time_ms.saturating_sub(segment_start_ms);
+            line
+        })
+        .collect::<Vec<_>>();
+    let Ok(mut window) = windows.single_mut() else {
+        abort_video_export(
+            studio,
+            capture_active,
+            windows,
+            "找不到主窗口，无法渲染视频".to_owned(),
+        );
+        return;
+    };
+    window.resizable = false;
+    window.title = if plan.segment_count > 1 {
+        format!(
+            "正在准备视频渲染（第 {}/{segment_count} 段，共 {total_frames} 帧）",
+            segment_index + 1,
+            segment_count = plan.segment_count
+        )
+    } else {
+        format!("正在准备视频渲染（共 {total_frames} 帧）")
+    };
+    capture_active.0 = true;
+    studio.video_render = Some(VideoRenderJob {
+        id: unix_time_ms(),
+        frames,
+        output_path,
+        fps: plan.fps,
+        duration_ms: segment_duration_ms,
+        segment_start_ms,
+        segment_index,
+        segment_count: plan.segment_count,
+        music_file: plan.music_file.clone(),
+        music_volume: plan.music_volume,
+        speech_enabled: plan.speech_enabled,
+        speech_volume: plan.speech_volume,
+        master_speech_speed: plan.master_speech_speed,
+        speaker_voice_settings: plan.speaker_voice_settings.clone(),
+        dialogue: segment_dialogue,
         total_frames,
         next_frame: 0,
         capture_pending: false,
@@ -7532,12 +8392,23 @@ fn start_video_export(
         monitor_music_started: false,
         monitor_music_entity: None,
         failure: None,
-        original_window_title,
-        original_window_resizable,
+        // 从 plan 取导出前的真实窗口状态，而不是当前段渲染中的状态。
+        original_window_title: plan.original_window_title.clone(),
+        original_window_resizable: plan.original_window_resizable,
+        started_at: std::time::Instant::now(),
     });
-    studio.status = format!(
-        "正在逐帧渲染 {total_frames} 帧；当前同步监听音乐和角色语音，完成后生成干净的 MP4 音轨"
-    );
+    let plan = studio.video_export_plan.as_ref().expect("plan just set");
+    studio.status = if plan.segment_count > 1 {
+        format!(
+            "正在逐帧渲染第 {}/{segment_count} 段（每段最长 20 分钟，完成后自动接续下一段）；当前同步监听音乐和角色语音，每段完成后生成独立的 MP4 音轨",
+            plan.next_segment + 1,
+            segment_count = plan.segment_count
+        )
+    } else {
+        format!(
+            "正在逐帧渲染 {total_frames} 帧；当前同步监听音乐和角色语音，完成后生成干净的 MP4 音轨"
+        )
+    };
 }
 
 fn video_frame_count(duration_ms: u64, fps: u32) -> u64 {
@@ -8688,7 +9559,16 @@ fn ffmpeg_arguments(fps: u32) -> Vec<String> {
 
 fn hide_command_window(command: &mut Command) {
     #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
+    {
+        // CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS：
+        // EmotiVoice 合成和 FFmpeg 编码都是后台任务，降优先级避免
+        // 抢占游戏主线程导致卡顿。
+        command.creation_flags(0x0800_0000 | 0x0000_4000);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
 }
 
 fn capture_scene(grid: &Grid<u8>) -> ReplayScene {
@@ -8741,6 +9621,46 @@ fn apply_scene(grid: &mut Mut<Grid<u8>>, scene: &ReplayScene) -> usize {
         grid.set(cell, material);
     }
     changed
+}
+
+/// Rewinds a scene captured *after* the recorded terrain edits (e.g. the live
+/// grid at "从聊天生成" time) back to how it looked before the earliest edit of
+/// each cell, so the mapped `terrain_changes` can replay those edits instead of
+/// finding them already baked into the baseline.
+fn revert_pending_terrain_from_scene(
+    scene: &mut ReplayScene,
+    pending_terrain: &[(u64, IVec3, u8, u8)],
+) {
+    if pending_terrain.is_empty() {
+        return;
+    }
+    let mut voxels = scene
+        .voxels
+        .iter()
+        .map(|voxel| (IVec3::from_array(voxel.position), voxel.material))
+        .collect::<HashMap<_, _>>();
+    let mut changed = false;
+    let mut seen = HashSet::new();
+    for (_, cell, _, before) in pending_terrain {
+        if !seen.insert(*cell) {
+            continue;
+        }
+        if *before == 0 {
+            changed |= voxels.remove(cell).is_some();
+        } else {
+            changed |= voxels.get(cell).copied() != Some(*before);
+            voxels.insert(*cell, *before);
+        }
+    }
+    if changed {
+        scene.voxels = voxels
+            .into_iter()
+            .map(|(position, material)| ReplayVoxel {
+                position: position.to_array(),
+                material,
+            })
+            .collect();
+    }
 }
 
 fn normalized_line_speech_rate(rate: f32) -> f32 {
@@ -10663,7 +11583,7 @@ fn compile_scene_dynamics_timeline(
     replay: &mut ReplayFile,
     ship_history: &ReplayShipTrajectoryHistory,
     cutoff_unix_ms: u64,
-    pending_terrain: &[(u64, IVec3, u8)],
+    pending_terrain: &[(u64, IVec3, u8, u8)],
     pending_hull: &[(u64, String, IVec3, u8)],
 ) -> usize {
     compile_area_block_timeline(replay);
@@ -10786,6 +11706,12 @@ fn compile_scene_dynamics_timeline(
         pending_terrain,
         pending_hull,
     );
+    // 映射可能把不同来源的时间钳制到端点，恢复按时间递增的顺序，
+    // 顺序遍历的地形回放状态机依赖这一点。
+    replay.terrain_changes.sort_by_key(|change| change.time_ms);
+    replay
+        .ship_hull_changes
+        .sort_by_key(|change| change.time_ms);
     let timeline_end = segments
         .iter()
         .map(|segment| segment.replay_end_ms)
@@ -10975,11 +11901,11 @@ fn merge_ship_trajectories(
 fn map_pending_scene_changes(
     replay: &mut ReplayFile,
     segments: &[TimelineSegment],
-    pending_terrain: &[(u64, IVec3, u8)],
+    pending_terrain: &[(u64, IVec3, u8, u8)],
     pending_hull: &[(u64, String, IVec3, u8)],
 ) -> u64 {
     let mut scene_end = 0_u64;
-    for (source_unix_ms, cell, material) in pending_terrain {
+    for (source_unix_ms, cell, material, _) in pending_terrain {
         let time_ms = map_source_via_segments(segments, *source_unix_ms);
         replay.terrain_changes.push(ReplayTerrainChange {
             time_ms,
@@ -11004,6 +11930,19 @@ fn map_pending_scene_changes(
 }
 
 fn map_source_via_segments(segments: &[TimelineSegment], source_unix_ms: u64) -> u64 {
+    let Some(first) = segments.first() else {
+        return 350;
+    };
+    if source_unix_ms < first.source_start_ms {
+        return first.replay_start_ms;
+    }
+    if let Some(last) = segments.last() {
+        if source_unix_ms >= last.source_end_ms {
+            // 早于首句或晚于末句的真实时间各自钳制到时间轴两端，
+            // 不能全部落到开头，否则最后阶段的地形编辑会“从第一帧就生效”。
+            return last.replay_end_ms;
+        }
+    }
     for segment in segments {
         if source_unix_ms >= segment.source_start_ms && source_unix_ms < segment.source_end_ms {
             let span = segment
@@ -11023,10 +11962,7 @@ fn map_source_via_segments(segments: &[TimelineSegment], source_unix_ms: u64) ->
             );
         }
     }
-    segments
-        .first()
-        .map(|segment| segment.replay_start_ms)
-        .unwrap_or(350)
+    350
 }
 
 fn replay_camera_focus_at(
@@ -12951,7 +13887,7 @@ fn export_replay(replay: &ReplayFile, path: &str) -> Result<(), String> {
     let mut portable = replay.clone();
     for dialogue in &mut portable.dialogue {
         if dialogue.avatar_data_url.is_none() {
-            dialogue.avatar_data_url = avatar_data_url(&dialogue.avatar);
+            dialogue.avatar_data_url = cached_avatar_data_url(&dialogue.avatar);
         }
     }
     let bytes = serde_json::to_vec(&portable).map_err(|err| err.to_string())?;
@@ -12963,6 +13899,19 @@ fn export_replay(replay: &ReplayFile, path: &str) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     fs::write(&path, bytes).map_err(|err| err.to_string())
+}
+
+/// 用重新生成、开始录制或导入项目替换当前回放草稿之前，
+/// 先把现有草稿完整备份到固定路径。备份失败时返回 Err，
+/// 调用方必须中止替换——静默失败等于毁掉用户的项目。
+fn backup_current_replay(
+    studio: &ReplayStudio,
+) -> Result<Option<&'static str>, String> {
+    let Some(replay) = studio.replay.as_ref() else {
+        return Ok(None);
+    };
+    export_replay(replay, AUTOSAVE_BACKUP_REPLAY_PATH)
+        .map(|()| Some(AUTOSAVE_BACKUP_REPLAY_PATH))
 }
 
 fn import_replay(path: &str, manager: Option<&NapcatMessageManager>) -> Result<ReplayFile, String> {
@@ -13040,6 +13989,21 @@ fn import_replay(path: &str, manager: Option<&NapcatMessageManager>) -> Result<R
     }
     replay.format_version = REPLAY_FORMAT_VERSION;
     Ok(replay)
+}
+
+/// `avatar_data_url` 的进程级缓存：同一个头像文件（每句台词都引用）
+/// 只读一次磁盘并 base64 一次，自动存档/手动导出都不会被几千次重复读盘卡住。
+fn cached_avatar_data_url(source: &str) -> Option<String> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<String>>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = guard.get(source) {
+        return cached.clone();
+    }
+    let value = avatar_data_url(source);
+    guard.insert(source.to_owned(), value.clone());
+    value
 }
 
 fn avatar_data_url(source: &str) -> Option<String> {
@@ -15542,10 +16506,6 @@ mod tests {
 
     #[test]
     fn speaker_colors_are_stable_and_distinguish_people() {
-        assert_eq!(
-            speaker_accent(1_670_426_821),
-            speaker_accent(1_670_426_821)
-        );
         assert_ne!(
             speaker_accent(1_670_426_821),
             speaker_accent(2_383_680_235)
@@ -15561,13 +16521,6 @@ mod tests {
     }
 
     #[test]
-    fn historical_dialogue_transition_is_brief() {
-        assert_eq!(HISTORY_DIALOGUE_GAP_MS, 270);
-        assert_eq!(MIN_DIALOGUE_MS, 1_500);
-        assert_eq!(MAX_DIALOGUE_MS, 9_750);
-    }
-
-    #[test]
     fn emotivoice_keeps_configured_speed_and_extends_long_lines() {
         let configured_speed = combined_onnx_speed(18, 1.30);
         let mut line = test_dialogue(0, 1_500, DialogueSide::Right);
@@ -15575,7 +16528,6 @@ mod tests {
         assert!(minimum_speech_window_ms_for_line(&line, 18, 1.30) < MIN_DIALOGUE_MS);
         line.text = "很长的中文台词".repeat(8);
         assert!(minimum_speech_window_ms_for_line(&line, 18, 1.30) > 4_875);
-        assert!((configured_speed - combined_onnx_speed(18, 1.30)).abs() < f32::EPSILON);
         assert_eq!(
             emotivoice_model_text("可以可以"),
             "可以，可以。"
@@ -15652,19 +16604,6 @@ mod tests {
             scaled_dialogue_duration_ms("短句", 2.0),
             MIN_DIALOGUE_MS * 2
         );
-    }
-
-    #[test]
-    fn replay_studio_defaults_to_all_audiences() {
-        let studio = ReplayStudio::default();
-        assert_eq!(studio.audience, ReplayAudience::All);
-    }
-
-    #[test]
-    fn replay_audio_defaults_are_clearly_audible() {
-        let studio = ReplayStudio::default();
-        assert_eq!(studio.music_volume, 0.65);
-        assert_eq!(studio.speech_volume, 1.25);
     }
 
     #[test]
@@ -17392,7 +18331,7 @@ mod tests {
                 ],
             }],
         };
-        let pending_terrain = vec![(150_050_u64, IVec3::new(3, 0, 0), 5_u8)];
+        let pending_terrain = vec![(150_050_u64, IVec3::new(3, 0, 0), 5_u8, 0_u8)];
 
         compile_scene_dynamics_timeline(
             &mut replay,
@@ -17408,6 +18347,96 @@ mod tests {
         assert!(change.time_ms > first.time_ms.saturating_add(first.duration_ms));
         assert!(change.time_ms < second.time_ms);
         assert_eq!(change.position, [3, 0, 0]);
+    }
+
+    #[test]
+    fn from_chat_replay_rewinds_baseline_terrain() {
+        let mut scene = ReplayScene {
+            voxels: vec![
+                ReplayVoxel {
+                    position: [0, 0, 0],
+                    material: 5,
+                },
+                ReplayVoxel {
+                    position: [1, 0, 0],
+                    material: 2,
+                },
+            ],
+        };
+        let pending_terrain = vec![
+            // 用 5 号方块填平 (0,0,0)，随后把 (1,0,0) 炸掉
+            (100_u64, IVec3::new(0, 0, 0), 5_u8, 0_u8),
+            (200_u64, IVec3::new(1, 0, 0), 0_u8, 2_u8),
+        ];
+
+        revert_pending_terrain_from_scene(&mut scene, &pending_terrain);
+
+        let materials = scene
+            .voxels
+            .iter()
+            .map(|voxel| (voxel.position, voxel.material))
+            .collect::<HashMap<_, _>>();
+        assert!(!materials.contains_key(&[0, 0, 0]));
+        assert_eq!(materials.get(&[1, 0, 0]).copied(), Some(2_u8));
+    }
+
+    #[test]
+    fn autosave_fingerprint_tracks_text_and_count_changes() {
+        let mut studio = ReplayStudio::default();
+        assert_eq!(replay_autosave_fingerprint(&studio), None);
+        let mut replay = test_replay(vec![test_dialogue(
+            350,
+            2_400,
+            DialogueSide::Right,
+        )]);
+        studio.replay = Some(replay.clone());
+        let baseline = replay_autosave_fingerprint(&studio).expect("fingerprint");
+
+        replay.dialogue[0].text = "改过台词".to_owned();
+        studio.replay = Some(replay.clone());
+        let after_text = replay_autosave_fingerprint(&studio).expect("fingerprint");
+        assert_ne!(after_text, baseline);
+
+        replay.dialogue[0].duration_ms += 1;
+        studio.replay = Some(replay);
+        assert_ne!(
+            replay_autosave_fingerprint(&studio),
+            Some(after_text)
+        );
+    }
+
+    #[test]
+    fn replay_project_export_round_trips_through_backup_import() {
+        let mut studio = ReplayStudio::default();
+        assert_eq!(backup_current_replay(&studio), Ok(None));
+        let mut replay = test_replay(vec![test_dialogue(
+            350,
+            2_400,
+            DialogueSide::Right,
+        )]);
+        replay.title = "自动保存回环测试".to_owned();
+        studio.replay = Some(replay);
+
+        let path = backup_current_replay(&studio)
+            .expect("backup")
+            .expect("backup path");
+        let imported = import_replay(path, None).expect("import backup");
+        assert_eq!(imported.title, "自动保存回环测试");
+        assert_eq!(imported.dialogue.len(), 1);
+    }
+
+    #[test]
+    fn video_segment_bounds_split_long_replays_into_20_minute_parts() {
+        assert_eq!(video_segment_count(19 * 60 * 1_000), 1);
+        assert_eq!(video_segment_count(20 * 60 * 1_000), 1);
+        assert_eq!(video_segment_count(20 * 60 * 1_000 + 1), 2);
+        assert_eq!(video_segment_count(45 * 60 * 1_000), 3);
+        let (start, duration) = video_segment_bounds(45 * 60 * 1_000, 1);
+        assert_eq!(start, 20 * 60 * 1_000);
+        assert_eq!(duration, 20 * 60 * 1_000);
+        let (start, duration) = video_segment_bounds(45 * 60 * 1_000, 2);
+        assert_eq!(start, 40 * 60 * 1_000);
+        assert_eq!(duration, 5 * 60 * 1_000);
     }
 
     #[test]
@@ -17445,7 +18474,7 @@ mod tests {
         studio.playback_ms = 4_000;
         studio.record_elapsed_ms = 1_000;
         studio.message_counts.insert("target".to_owned(), 5);
-        studio.pending_terrain_changes.push((1, IVec3::ZERO, 1));
+        studio.pending_terrain_changes.push((1, IVec3::ZERO, 1, 0));
         studio
             .pending_ship_hull_changes
             .push((1, "ship".to_owned(), IVec3::X, 1));

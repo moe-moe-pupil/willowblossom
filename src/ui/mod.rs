@@ -20,6 +20,10 @@ use std::{
         Hasher,
     },
     path::Path,
+    sync::{
+        Mutex,
+        OnceLock,
+    },
     time::{
         SystemTime,
         UNIX_EPOCH,
@@ -73,6 +77,7 @@ use chat_analytics::{
     show_gm_auto_chat_toast,
     update_gm_auto_chat_mode,
     GmAutoChatModeState,
+    PrivateChatTiming,
 };
 use chat_rows::{
     message_layout_fingerprint,
@@ -1385,6 +1390,7 @@ pub struct UiSystemLocals<'w, 's> {
     group_broadcast_scopes: Local<'s, HashMap<String, String>>,
     chat_player_visible_previews: Local<'s, HashMap<String, String>>,
     chat_analytics_targets: Local<'s, HashSet<String>>,
+    ranked_private_chat_timings_cache: Local<'s, RankedPrivateChatTimingsCache>,
     gm_auto_chat_mode: Local<'s, GmAutoChatModeState>,
     chat_list_player_visible_filter: Local<'s, Option<String>>,
     chat_workspace: Local<'s, ChatWorkspaceState>,
@@ -5230,19 +5236,19 @@ fn message_image_ui(
     let texture = if let Some(texture) = image_textures.get(&path) {
         texture.clone()
     } else {
-        let max_texture_side = ui.ctx().input(|i| i.max_texture_side);
-        let Some(color_image) = load_cached_color_image(&path, max_texture_side) else {
+        let decode_queue = chat_image_decode_queue();
+        if decode_queue.is_failed(&path) {
             ui.label("[图片]");
             ui.small("缓存图片解码失败");
             return;
-        };
-        let texture = ui.ctx().load_texture(
-            format!("chat-image:{path}"),
-            color_image,
-            egui::TextureOptions::LINEAR,
-        );
-        image_textures.insert(path.clone(), texture.clone());
-        texture
+        }
+        let max_texture_side = ui.ctx().input(|i| i.max_texture_side);
+        // 解码已交给后台线程，先显示占位；完成后由 ui_system 每帧
+        // 轮询结果并写入纹理缓存，纹理本身仍在主线程创建。
+        decode_queue.request(&path, max_texture_side);
+        ui.label("[图片]");
+        ui.small("图片加载中...");
+        return;
     };
 
     let max_width = ui.available_width().min(CHAT_IMAGE_MAX_SIZE.x).max(1.0);
@@ -5305,6 +5311,113 @@ fn load_cached_color_image(path: &str, max_texture_side: usize) -> Option<egui::
 
     let size = [image.width() as usize, image.height() as usize];
     Some(egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()))
+}
+
+/// 聊天图片后台解码队列：
+/// 解码在独立线程执行，渲染线程只负责提交请求和轮询结果，
+/// 避免打开聊天窗口时同步解码大量图片阻塞帧。
+struct ChatImageDecodeQueue {
+    request_sender: crossbeam_channel::Sender<(String, usize)>,
+    result_receiver: crossbeam_channel::Receiver<(String, Option<egui::ColorImage>)>,
+    requested: Mutex<HashSet<String>>,
+    failed: Mutex<HashSet<String>>,
+}
+
+static CHAT_IMAGE_DECODE_QUEUE: OnceLock<ChatImageDecodeQueue> = OnceLock::new();
+
+fn chat_image_decode_queue() -> &'static ChatImageDecodeQueue {
+    CHAT_IMAGE_DECODE_QUEUE.get_or_init(|| {
+        let (request_sender, request_receiver) =
+            crossbeam_channel::unbounded::<(String, usize)>();
+        let (result_sender, result_receiver) =
+            crossbeam_channel::unbounded::<(String, Option<egui::ColorImage>)>();
+        if let Err(err) = std::thread::Builder::new()
+            .name("chat-image-decode".to_owned())
+            .spawn(move || {
+                for (path, max_texture_side) in request_receiver {
+                    let decoded = load_cached_color_image(&path, max_texture_side);
+                    if result_sender.send((path, decoded)).is_err() {
+                        break;
+                    }
+                }
+            })
+        {
+            eprintln!("failed to spawn chat image decode thread: {err}");
+        }
+        ChatImageDecodeQueue {
+            request_sender,
+            result_receiver,
+            requested: Mutex::new(HashSet::new()),
+            failed: Mutex::new(HashSet::new()),
+        }
+    })
+}
+
+impl ChatImageDecodeQueue {
+    /// 提交解码请求；同一图片只会提交一次，失败过的不再重试。
+    fn request(&self, path: &str, max_texture_side: usize) {
+        if self.is_failed(path) {
+            return;
+        }
+        let mut requested = self
+            .requested
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if requested.contains(path) {
+            return;
+        }
+        requested.insert(path.to_owned());
+        drop(requested);
+        let _ = self.request_sender.send((path.to_owned(), max_texture_side));
+    }
+
+    fn is_failed(&self, path: &str) -> bool {
+        self.failed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(path)
+    }
+
+    /// 由 ui_system 每帧调用：取走全部解码结果。
+    /// 成功的直接转成纹理写入缓存，失败的记录下来以便渲染时显示失败占位。
+    fn poll_completed(
+        &self,
+        ctx: &Context,
+        image_textures: &mut HashMap<String, TextureHandle>,
+    ) -> bool {
+        let mut received = false;
+        while let Ok((path, decoded)) = self.result_receiver.try_recv() {
+            received = true;
+            self.requested
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&path);
+            match decoded {
+                Some(color_image) => {
+                    let texture = ctx.load_texture(
+                        format!("chat-image:{path}"),
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    image_textures.insert(path, texture);
+                },
+                None => {
+                    self.failed
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(path);
+                },
+            }
+        }
+        received
+    }
+}
+
+fn poll_chat_image_decodes(ctx: &Context, image_textures: &mut HashMap<String, TextureHandle>) {
+    if chat_image_decode_queue().poll_completed(ctx, image_textures) {
+        // 有图片解码完成，安排一次重绘让占位尽快替换成图片。
+        ctx.request_repaint();
+    }
 }
 
 fn fit_image_size(original: Vec2, max_size: Vec2) -> Vec2 {
@@ -6105,10 +6218,63 @@ fn approval_onboarding_text(manager: &NapcatMessageManager, target_id: &str) -> 
     }
 }
 
+/// 私聊回复耗时排行的脏标记缓存：
+/// 只有消息数量或首尾消息变化（聊天记录按时间追加，数量与首尾即可覆盖）时
+/// 才重新扫描全部消息并排序，避免每帧统计阻塞 ui_system。
+#[derive(Default)]
+struct RankedPrivateChatTimingsCache {
+    fingerprint: u64,
+    timings: Vec<PrivateChatTiming>,
+}
+
+fn ranked_private_chat_timings_fingerprint(
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    manager.current_trpg_group.hash(&mut hasher);
+    group.campaign_id.hash(&mut hasher);
+    group.campaign_active.hash(&mut hasher);
+    group.campaign_started_at.hash(&mut hasher);
+    group.world_turn.hash(&mut hasher);
+    group.players.hash(&mut hasher);
+    for target_id in &group.players {
+        let Some(messages) = manager.messages.get(target_id) else {
+            continue;
+        };
+        target_id.hash(&mut hasher);
+        messages.len().hash(&mut hasher);
+        if let Some(first) = messages.first() {
+            first.data.time.hash(&mut hasher);
+            first.data.message_id.hash(&mut hasher);
+        }
+        if let Some(last) = messages.last() {
+            last.data.time.hash(&mut hasher);
+            last.data.message_id.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn cached_ranked_private_chat_timings(
+    manager: &NapcatMessageManager,
+    group: &TrpgGroup,
+    cache: &mut RankedPrivateChatTimingsCache,
+) -> Vec<PrivateChatTiming> {
+    let fingerprint = ranked_private_chat_timings_fingerprint(manager, group);
+    if cache.fingerprint == fingerprint {
+        return cache.timings.clone();
+    }
+    cache.timings = ranked_private_chat_timings(manager, group);
+    cache.fingerprint = fingerprint;
+    cache.timings.clone()
+}
+
 fn waiting_turn_manager_window(
     ctx: &Context,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
     auto_mode: &mut GmAutoChatModeState,
+    timings_cache: &mut RankedPrivateChatTimingsCache,
 ) {
     let Some(group_name) = manager.current_trpg_group.clone() else {
         return;
@@ -6117,7 +6283,7 @@ fn waiting_turn_manager_window(
         return;
     };
 
-    let waiting_players = ranked_private_chat_timings(manager, group)
+    let waiting_players = cached_ranked_private_chat_timings(manager, group, timings_cache)
         .into_iter()
         .filter(|timing| {
             group
@@ -18307,6 +18473,8 @@ pub fn ui_system(
     let chat_player_visible_previews: &mut Local<HashMap<String, String>> =
         &mut locals.chat_player_visible_previews;
     let chat_analytics_targets: &mut Local<HashSet<String>> = &mut locals.chat_analytics_targets;
+    let ranked_timings_cache: &mut Local<RankedPrivateChatTimingsCache> =
+        &mut locals.ranked_private_chat_timings_cache;
     let gm_auto_chat_mode: &mut Local<GmAutoChatModeState> = &mut locals.gm_auto_chat_mode;
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
@@ -18337,6 +18505,9 @@ pub fn ui_system(
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
+    // 轮询后台线程解码完成的聊天图片并写入纹理缓存；
+    // 放在回放工作区早退之前，保证空闲时也能取回结果。
+    poll_chat_image_decodes(ctx, image_textures);
     if map_toggle_requested && !ctx.memory(|memory| memory.focused().is_some()) {
         voxel_map_ui_state.full_map_open = !voxel_map_ui_state.full_map_open;
     }
@@ -20195,7 +20366,12 @@ pub fn ui_system(
                 napcat_sender,
                 &mut ime,
             );
-            waiting_turn_manager_window(ctx, &mut manager, gm_auto_chat_mode);
+            waiting_turn_manager_window(
+                ctx,
+                &mut manager,
+                gm_auto_chat_mode,
+                ranked_timings_cache,
+            );
             if update_gm_auto_chat_mode(
                 ctx,
                 manager.as_mut(),

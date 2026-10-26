@@ -9,4 +9,6 @@ librosa
 pyworld
 jsonlines
 scipy
-transformers
+# EmotiVoice 自带的 simbert config.json 没有 model_type 字段，
+# transformers 5.x 会拒绝加载（Unrecognized model），锁在 4.x。
+transformers<5

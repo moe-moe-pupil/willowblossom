@@ -6,6 +6,7 @@ mod deepseek;
 mod hidden_roles;
 mod moonberry_talents;
 mod napcat;
+mod op_log;
 mod planet_atmosphere;
 #[cfg(feature = "profiling")]
 mod profiling;
@@ -251,6 +252,18 @@ impl Plugin for GamePlugin {
         app.insert_resource(AppFeatureRuntime {
             game_scene_loaded: game_scene_enabled,
         });
+        // OpLog 必须先于各插件注册：ReplayPlugin::build 在启动时会读自动存档
+        // 并通过 world().get_resource::<OpLog>() 记录恢复结果。
+        app.init_resource::<op_log::OpLog>();
+        app.world_mut()
+            .resource::<op_log::OpLog>()
+            .record(
+                "app",
+                format!(
+                    "应用启动：willowblossom v{}（场景模式 {game_scene_enabled}）",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            );
 
         app.add_plugins((
             backup::BackupPlugin,

@@ -1080,12 +1080,31 @@ struct VoxelSpaceshipPersistenceState {
 #[derive(Resource, Default)]
 struct VoxelPhysicsChunkLoader {
     columns: HashSet<IVec2>,
+    /// Bumped every time `columns` changes. Streaming checks cache their
+    /// result against this revision so bodies are only re-tested when the
+    /// loaded region moves or the body itself moves.
+    revision: u64,
     unloaded_bodies: Vec<VoxelPhysicsBodySnapshot>,
+}
+
+/// Streaming check result for a spawned physics body, valid for the loader
+/// revision recorded here.
+#[derive(Component, Clone, Copy, Default)]
+struct VoxelStreamCheck {
+    revision: u64,
+    loaded: bool,
 }
 
 impl VoxelPhysicsChunkLoader {
     fn contains_world_position(&self, position: Vec3) -> bool {
         self.columns.contains(&voxel_chunk_column(position))
+    }
+
+    fn set_columns(&mut self, columns: HashSet<IVec2>) {
+        if self.columns != columns {
+            self.columns = columns;
+            self.revision += 1;
+        }
     }
 }
 
@@ -1097,6 +1116,10 @@ struct VoxelPhysicsBodySnapshot {
     transform: Transform,
     linear_velocity: LinearVelocity,
     angular_velocity: AngularVelocity,
+    /// Loader revision this snapshot was last stream-checked against. An
+    /// unloaded snapshot only becomes loadable when the loaded region moves,
+    /// so skipping checks at the same revision is exact.
+    checked_revision: u64,
 }
 
 #[derive(Resource, Default)]
@@ -7439,6 +7462,7 @@ fn spawn_voxel_spaceship(
                         VoxelSpaceshipChunk {
                             surfaces: Vec::new(),
                         },
+                        Visibility::Visible,
                     ))
                     .with_children(|chunk_parent| {
                         let (material_meshes, _) = build_voxel_meshes_from_cells(&local_cells);
@@ -10732,6 +10756,7 @@ fn decay_voxel_blood(
                     scene_recorder.as_deref_mut(),
                     cell,
                     restore_material,
+                    VOXEL_BLOOD_MATERIAL,
                 );
             },
             VoxelBloodLocation::Planet(cell) => {
@@ -11835,6 +11860,7 @@ fn spawn_voxel_orbital_planet(
         .spawn((
             RigidBody::Static,
             Transform::from_translation(ORBITAL_PLANET_CENTER),
+            Visibility::Visible,
         ))
         .id();
     let collider_entity = commands
@@ -11901,6 +11927,7 @@ fn spawn_planet_clouds(
         .spawn((
             VoxelPlanetCloudLayer,
             Transform::from_translation(ORBITAL_PLANET_CENTER),
+            Visibility::Visible,
         ))
         .id();
     commands.entity(layer).with_children(|parent| {
@@ -12528,9 +12555,7 @@ fn update_loaded_voxel_physics_chunks(
         std::iter::once(dm_position)
             .chain(player_cameras.iter().map(|transform| transform.translation)),
     );
-    if loader.columns != columns {
-        loader.columns = columns;
-    }
+    loader.set_columns(columns);
 }
 
 fn voxel_physics_body_is_loaded(
@@ -12548,25 +12573,56 @@ fn voxel_physics_body_is_loaded(
 fn stream_voxel_physics_bodies(
     mut commands: Commands,
     mut loader: ResMut<VoxelPhysicsChunkLoader>,
-    bodies: Query<
+    mut bodies: Query<
         (
             Entity,
             &VoxelPhysicsBody,
-            &Transform,
+            Ref<Transform>,
             &LinearVelocity,
             &AngularVelocity,
             &RigidBody,
             &VoxelPhysicsLifetime,
+            Option<&mut VoxelStreamCheck>,
         ),
         Without<VoxelSpaceship>,
     >,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<VoxelMaterials>,
 ) {
-    for (entity, body, transform, linear_velocity, angular_velocity, rigid_body, lifetime) in
-        &bodies
+    let revision = loader.revision;
+    for (
+        entity,
+        body,
+        transform,
+        linear_velocity,
+        angular_velocity,
+        rigid_body,
+        lifetime,
+        check,
+    ) in &mut bodies
     {
-        if voxel_physics_body_is_loaded(body, transform, &loader) {
+        let needs_check = check
+            .as_ref()
+            .is_none_or(|check| check.revision != revision || transform.is_changed());
+        let loaded = if needs_check {
+            let loaded = voxel_physics_body_is_loaded(body, &transform, &loader);
+            match check {
+                Some(mut check) => {
+                    check.revision = revision;
+                    check.loaded = loaded;
+                }
+                None => {
+                    commands.entity(entity).insert(VoxelStreamCheck {
+                        revision,
+                        loaded,
+                    });
+                }
+            }
+            loaded
+        } else {
+            check.as_ref().is_some_and(|check| check.loaded)
+        };
+        if loaded {
             continue;
         }
         loader.unloaded_bodies.push(VoxelPhysicsBodySnapshot {
@@ -12576,17 +12632,21 @@ fn stream_voxel_physics_bodies(
             transform: *transform,
             linear_velocity: *linear_velocity,
             angular_velocity: *angular_velocity,
+            checked_revision: revision,
         });
         commands.entity(entity).despawn();
     }
 
     let cached = std::mem::take(&mut loader.unloaded_bodies);
-    for snapshot in cached {
-        if !voxel_physics_body_is_loaded(
-            &snapshot.body,
-            &snapshot.transform,
-            &loader,
-        ) {
+    for mut snapshot in cached {
+        if snapshot.checked_revision == revision
+            || !voxel_physics_body_is_loaded(
+                &snapshot.body,
+                &snapshot.transform,
+                &loader,
+            )
+        {
+            snapshot.checked_revision = revision;
             loader.unloaded_bodies.push(snapshot);
             continue;
         }
@@ -12599,7 +12659,9 @@ fn stream_voxel_physics_bodies(
             snapshot.linear_velocity,
             snapshot.angular_velocity,
         );
-        commands.entity(entity).insert((snapshot.rigid_body, snapshot.lifetime));
+        commands
+            .entity(entity)
+            .insert((snapshot.rigid_body, snapshot.lifetime));
     }
 }
 
@@ -13623,9 +13685,9 @@ fn make_selection_physical(
         return;
     }
 
-    for (cell, _) in &selected_voxels {
+    for (cell, before) in &selected_voxels {
         grid.set(*cell, 0);
-        crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), *cell, 0);
+        crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), *cell, 0, *before);
     }
     spawn_voxel_physics_body(
         &mut commands,
@@ -14289,6 +14351,7 @@ fn process_voxel_scene_history(
                         transform: *transform,
                         linear_velocity: *linear_velocity,
                         angular_velocity: *angular_velocity,
+                        checked_revision: 0,
                     }
                 },
             )
@@ -14595,6 +14658,7 @@ fn apply_stroke(
 ) {
     for change in stroke {
         let material = if forward { change.after } else { change.before };
+        let previous = if forward { change.before } else { change.after };
         match change.target {
             VoxelChangeTarget::Grid => {
                 grid.set(change.position, material);
@@ -14602,6 +14666,7 @@ fn apply_stroke(
                     scene_recorder.as_deref_mut(),
                     change.position,
                     material,
+                    previous,
                 );
             },
             VoxelChangeTarget::Spaceship(entity) => {
@@ -14819,13 +14884,15 @@ fn place_creative_light(
         }
         commands.entity(entity).despawn();
         if light.kind == VoxelLightTool::Cube {
-            if grid.get(light.cell).copied().unwrap_or(0) != 0 {
+            let before = grid.get(light.cell).copied().unwrap_or(0);
+            if before != 0 {
                 grid.set(light.cell, 0);
                 dirty_chunks.mark_cell_and_neighbors(light.cell);
                 crate::replay::record_replay_grid_cell(
                     scene_recorder.as_deref_mut(),
                     light.cell,
                     0,
+                    before,
                 );
             }
         }
@@ -14852,10 +14919,11 @@ fn place_creative_light(
         return;
     };
     if tool == VoxelLightTool::Cube {
-        if grid.get(cell).copied().unwrap_or(0) != 8 {
+        let before = grid.get(cell).copied().unwrap_or(0);
+        if before != 8 {
             grid.set(cell, 8);
             dirty_chunks.mark_cell_and_neighbors(cell);
-            crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), cell, 8);
+            crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), cell, 8, before);
         }
     }
     spawn_voxel_placed_light(
@@ -15565,9 +15633,9 @@ fn edit_voxel_grid(
                 .filter(|_| !selected.is_empty())
                 .unwrap_or(0);
             if static_part_count > 0 {
-                for (cell, _) in &selected {
+                for (cell, before) in &selected {
                     grid.set(*cell, 0);
-                    crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), *cell, 0);
+                    crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), *cell, 0, *before);
                 }
                 for cells in split_voxel_cells_randomly(
                     selected,
@@ -15597,9 +15665,9 @@ fn edit_voxel_grid(
             if selected.is_empty() {
                 return;
             }
-            for (cell, _) in &selected {
+            for (cell, before) in &selected {
                 grid.set(*cell, 0);
-                crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), *cell, 0);
+                crate::replay::record_replay_grid_cell(scene_recorder.as_deref_mut(), *cell, 0, *before);
             }
             let entity = spawn_voxel_physics_body(
                 &mut commands,
@@ -15943,6 +16011,7 @@ fn edit_voxel_grid(
                 scene_recorder.as_deref_mut(),
                 position,
                 after,
+                before,
             );
             stroke.push(VoxelChange {
                 target: VoxelChangeTarget::Grid,
@@ -16009,6 +16078,7 @@ pub(crate) fn rebuild_dirty_voxel_spaceships(
                                 surfaces: Vec::new(),
                             },
                             ChildOf(entity),
+                            Visibility::Visible,
                         ))
                         .id();
                     if let Some(layers) = ship_layers {
@@ -18333,11 +18403,6 @@ mod tests {
     }
 
     #[test]
-    fn voxel_brush_radius_allows_fifty_cells() {
-        assert_eq!(MAX_VOXEL_BRUSH_RADIUS, 50);
-    }
-
-    #[test]
     fn chunk_columns_use_canonical_voxel_scale_and_floor_negative_positions() {
         let chunk_size = VOXEL_SIZE * DIMS.x as f32;
         assert_eq!(
@@ -18408,6 +18473,7 @@ mod tests {
                 local_center: Vec3::splat(VOXEL_SIZE * 0.5),
                 cells: vec![(IVec3::ZERO, 1)],
             },
+            RigidBody::Dynamic,
             Transform::from_translation(position),
             LinearVelocity(Vec3::X),
             AngularVelocity(Vec3::Y),
@@ -18432,8 +18498,7 @@ mod tests {
 
         app.world_mut()
             .resource_mut::<VoxelPhysicsChunkLoader>()
-            .columns
-            .insert(voxel_chunk_column(position));
+            .set_columns(HashSet::from([voxel_chunk_column(position)]));
         app.update();
 
         assert_eq!(

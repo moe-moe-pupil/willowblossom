@@ -1,3 +1,4 @@
+use bevy::log::info_span;
 use bevy_egui::egui::{
     pos2,
     vec2,
@@ -30,6 +31,7 @@ pub(super) enum ReplayWorkspaceTab {
 }
 
 pub(super) fn workspace_header(root_ui: &mut Ui, studio: &mut ReplayStudio) {
+    let _profile = info_span!("workspace_header").entered();
     Panel::top("replay-workspace-header").show(root_ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.strong("回放合成");
@@ -74,6 +76,7 @@ pub(super) fn fit_preview_rect(available: Rect, aspect: f32) -> Rect {
 }
 
 pub(super) fn workspace_preview(root_ui: &mut Ui, studio: &mut ReplayStudio) {
+    let _profile = info_span!("workspace_preview").entered();
     CentralPanel::default()
         .frame(Frame::NONE)
         .show(root_ui, |ui| {

@@ -8,8 +8,20 @@ $sourceRoot = Join-Path $runtimeRoot "EmotiVoice"
 $venvRoot = Join-Path $runtimeRoot ".venv313"
 $venvPython = Join-Path $venvRoot "Scripts\python.exe"
 
-$cudaPython = (Get-Command python -ErrorAction Stop).Source
-& $cudaPython -c "import torch; assert torch.cuda.is_available(), 'CUDA PyTorch is required'"
+# 优先使用仓库自带的 Python（.data 已被 gitignore，外部安装被误删也不影响）。
+# torch 断言对既有 venv 用 venv 内解释器检查（torch 装在 venv 或其基础解释器里）。
+$repoPython = Join-Path $runtimeRoot "python313\python.exe"
+if (Test-Path -LiteralPath $repoPython) {
+    $cudaPython = $repoPython
+} else {
+    $cudaPython = (Get-Command python -ErrorAction Stop).Source
+}
+
+if (Test-Path -LiteralPath $venvPython) {
+    & $venvPython -c "import torch; assert torch.cuda.is_available(), 'CUDA PyTorch is required'"
+} else {
+    & $cudaPython -c "import torch; assert torch.cuda.is_available(), 'CUDA PyTorch is required'"
+}
 
 New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
 if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot ".git"))) {

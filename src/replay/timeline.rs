@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use bevy::log::info_span;
 use bevy::prelude::{
     Query,
     With,
@@ -32,6 +33,7 @@ use bevy_egui::egui::{
     Stroke,
     Ui,
     UiBuilder,
+    Vec2,
     WidgetInfo,
     WidgetType,
 };
@@ -46,12 +48,14 @@ use super::{
     invalidate_replay_timeline,
     prepare_replay_movement_for_playback,
     replay_dialogue_is_playable,
-    replay_edit_fingerprint_state,
     replay_has_live_take,
     set_exact_dialogue_duration_at_playhead,
     start_playback,
+    DialogueSide,
     ReplayCameraCut,
+    ReplayCameraFocus,
     ReplayCameraKeyframe,
+    ReplayCameraSubject,
     ReplayDialogue,
     ReplayFile,
     ReplayMode,
@@ -80,6 +84,9 @@ struct TimelineView {
     follow_playhead: bool,
     scroll_x: f32,
     last_playback_ms: Option<u64>,
+    /// 已构建的轨道数据缓存；指纹不匹配时才整体重建，避免每帧为全部
+    /// 台词和场景事件重新分配字符串、Clip 和 BTreeMap。
+    tracks_cache: Option<TimelineTracksCache>,
 }
 
 impl Default for TimelineView {
@@ -94,6 +101,7 @@ impl Default for TimelineView {
             follow_playhead: true,
             scroll_x: 0.0,
             last_playback_ms: None,
+            tracks_cache: None,
         }
     }
 }
@@ -138,11 +146,141 @@ type TimelineTracks = (
 );
 
 fn timeline_fingerprint(replay: &ReplayFile) -> Option<u64> {
+    // 覆盖与 replay_edit_fingerprint_state 相同的轨道字段，但直接哈希，
+    // 不再把全部轨道深拷贝成 JSON 字符串——那是打开面板瞬间与每次修剪
+    // 快照的毫秒级尖峰来源。该指纹只在本次会话的时间轴撤销栈里比较，
+    // 不会持久化，因此实现与导演请求的持久指纹相互独立。
     let mut hasher = DefaultHasher::new();
-    replay_edit_fingerprint_state(replay)
-        .ok()?
-        .hash(&mut hasher);
+    replay.duration_ms.hash(&mut hasher);
+    for line in &replay.dialogue {
+        line.time_ms.hash(&mut hasher);
+        line.duration_ms.hash(&mut hasher);
+        line.duration_locked.hash(&mut hasher);
+        line.sender_id.hash(&mut hasher);
+        line.camera_focus_id.hash(&mut hasher);
+        line.name.hash(&mut hasher);
+        line.role.hash(&mut hasher);
+        line.text.hash(&mut hasher);
+        line.speech_text.hash(&mut hasher);
+        line.speech_enabled.hash(&mut hasher);
+        line.speech_rate.to_bits().hash(&mut hasher);
+        line.speech_volume.to_bits().hash(&mut hasher);
+        line.avatar.hash(&mut hasher);
+        line.avatar_data_url.hash(&mut hasher);
+        // Visibility 未实现 Hash；序列化成 JSON 代替，保证内容变化必然
+        // 改变指纹。
+        if let Ok(visibility) = serde_json::to_string(&line.visibility) {
+            visibility.hash(&mut hasher);
+        }
+        (line.side == DialogueSide::Left).hash(&mut hasher);
+        line.line_id.hash(&mut hasher);
+        line.source_time.hash(&mut hasher);
+        line.turn_index.hash(&mut hasher);
+        line.position_cells.hash(&mut hasher);
+        line.area.hash(&mut hasher);
+        line.included.hash(&mut hasher);
+        line.snapshot_recorded.hash(&mut hasher);
+        line.metadata_estimated.hash(&mut hasher);
+        line.forwarded.hash(&mut hasher);
+    }
+    for block in &replay.area_blocks {
+        block.hash(&mut hasher);
+    }
+    replay.manual_dialogue_order.hash(&mut hasher);
+    for frame in &replay.camera {
+        frame.time_ms.hash(&mut hasher);
+        hash_f32s(&mut hasher, &frame.translation);
+        hash_f32s(&mut hasher, &frame.rotation);
+        match &frame.focus {
+            Some(focus) => {
+                1_u8.hash(&mut hasher);
+                hash_replay_camera_focus(&mut hasher, focus);
+            },
+            None => 0_u8.hash(&mut hasher),
+        }
+    }
+    for cut in &replay.camera_cuts {
+        cut.time_ms.hash(&mut hasher);
+        match &cut.shot {
+            Some(shot) => {
+                1_u8.hash(&mut hasher);
+                hash_replay_camera_focus(&mut hasher, &shot.focus);
+                hash_f32s(&mut hasher, &shot.offset);
+            },
+            None => 0_u8.hash(&mut hasher),
+        }
+    }
+    replay.camera_distance_scale.to_bits().hash(&mut hasher);
+    replay.camera_yaw_degrees.to_bits().hash(&mut hasher);
+    replay.camera_transition_curve.to_bits().hash(&mut hasher);
+    for movement in &replay.player_movements {
+        movement.user_id.hash(&mut hasher);
+        for keyframe in &movement.keyframes {
+            keyframe.time_ms.hash(&mut hasher);
+            hash_f32s(&mut hasher, &keyframe.position_cells);
+        }
+    }
+    replay.authored_player_movements.hash(&mut hasher);
+    replay.authored_ship_trajectories.hash(&mut hasher);
+    for trajectory in &replay.ship_trajectories {
+        trajectory.ship_id.hash(&mut hasher);
+        trajectory.ship_name.hash(&mut hasher);
+        for keyframe in &trajectory.keyframes {
+            keyframe.time_ms.hash(&mut hasher);
+            hash_f32s(&mut hasher, &keyframe.translation);
+            hash_f32s(&mut hasher, &keyframe.rotation);
+        }
+    }
+    for sample in &replay.standee_positions {
+        sample.time_ms.hash(&mut hasher);
+        sample.user_id.hash(&mut hasher);
+        hash_f32s(&mut hasher, &sample.position);
+    }
+    for change in &replay.terrain_changes {
+        change.time_ms.hash(&mut hasher);
+        change.position.hash(&mut hasher);
+        change.material.hash(&mut hasher);
+        change.enabled.hash(&mut hasher);
+    }
+    for change in &replay.ship_hull_changes {
+        change.time_ms.hash(&mut hasher);
+        change.ship_id.hash(&mut hasher);
+        change.position.hash(&mut hasher);
+        change.material.hash(&mut hasher);
+        change.enabled.hash(&mut hasher);
+    }
+    replay.master_dialogue_duration.to_bits().hash(&mut hasher);
+    replay.master_speech_speed.to_bits().hash(&mut hasher);
+    replay.player_movement_curve.to_bits().hash(&mut hasher);
+    replay.ship_motion_speed.to_bits().hash(&mut hasher);
+    replay.dialogue_waits_for_ship_motion.hash(&mut hasher);
     Some(hasher.finish())
+}
+
+fn hash_f32s(hasher: &mut DefaultHasher, values: &[f32]) {
+    for value in values {
+        value.to_bits().hash(hasher);
+    }
+}
+
+fn hash_replay_camera_focus(hasher: &mut DefaultHasher, focus: &ReplayCameraFocus) {
+    match &focus.subject {
+        ReplayCameraSubject::Player(user_id) => {
+            0_u8.hash(hasher);
+            user_id.hash(hasher);
+        },
+        ReplayCameraSubject::Ship {
+            ship_id,
+            local_center,
+        } => {
+            1_u8.hash(hasher);
+            ship_id.hash(hasher);
+            hash_f32s(hasher, local_center);
+        },
+    }
+    hash_f32s(hasher, &focus.position);
+    hash_f32s(hasher, &focus.axis_origin);
+    hash_f32s(hasher, &focus.camera_side);
 }
 
 impl TimelineSnapshot {
@@ -372,119 +510,69 @@ struct Track {
     clips: Vec<Clip>,
 }
 
-fn time_at_x(x: f32, left: f32, width: f32, duration: u64) -> u64 {
-    (((x - left) / width.max(1.0)).clamp(0.0, 1.0) as f64 * duration as f64).round() as u64
+#[derive(Clone)]
+struct TimelineTracksCache {
+    fingerprint: u64,
+    tracks: Arc<Vec<Track>>,
 }
 
-fn reveal_playhead_offset(target: f32, offset: f32, visible: f32, content: f32) -> f32 {
-    let margin = visible * 0.1;
-    let next = if target < offset + margin {
-        target - margin
-    } else if target > offset + visible - margin {
-        target - visible + margin
-    } else {
-        offset
-    };
-    next.clamp(0.0, (content - visible).max(0.0))
-}
-
-fn adjacent_frame(time: u64, fps: u32, forward: bool) -> u64 {
-    let fps = fps.max(1) as u64;
-    // Export timestamps round down to milliseconds. Recover the frame index
-    // with ceiling division so repeated stepping never accumulates rounding drift.
-    let frame = time.saturating_mul(fps).div_ceil(1000);
-    if forward {
-        frame_time_ms(
-            time.saturating_add(1).saturating_mul(fps).div_ceil(1000),
-            fps as u32,
-        )
-    } else {
-        frame_time_ms(frame.saturating_sub(1), fps as u32)
-    }
-}
-
-fn timeline_timecode(time_ms: u64, fps: u32) -> String {
-    let fps = u64::from(fps.max(1));
-    // Match export's millisecond truncation without displaying the previous frame.
-    let frame = time_ms
-        .saturating_add(1)
-        .saturating_mul(fps)
-        .div_ceil(1000)
-        .saturating_sub(1);
-    let seconds = frame / fps;
-    format!(
-        "{:02}:{:02}:{:02}:{:02}",
-        seconds / 3600,
-        (seconds / 60) % 60,
-        seconds % 60,
-        frame % fps,
-    )
-}
-
-fn timeline_time_label(time_ms: u64) -> String {
-    format!(
-        "{:02}:{:02}.{:03}",
-        time_ms / 60_000,
-        (time_ms / 1000) % 60,
-        time_ms % 1000,
-    )
-}
-
-fn ruler_tick_step(extent: u64, width: f32) -> u64 {
-    let minimum = (extent as f64 * 105.0 / width.max(1.0) as f64).ceil() as u64;
-    let mut magnitude = 1_u64;
-    loop {
-        for multiple in [1, 2, 5] {
-            let step = magnitude.saturating_mul(multiple);
-            if step >= minimum {
-                return step;
+/// 每帧用廉价哈希检测时间轴轨道显示是否变化；只哈希轨道绘制用到的字段，
+/// 任何会影响显示的修改（含未经 timeline_revision 的台词文字编辑）都会
+/// 改变指纹，未变化的帧直接复用缓存，宁可多算也不显示过期数据。
+fn timeline_tracks_fingerprint(studio: &ReplayStudio) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    studio.timeline_revision.hash(&mut hasher);
+    if let Some(replay) = studio.replay.as_ref() {
+        replay.campaign_id.hash(&mut hasher);
+        replay.created_at_unix_ms.hash(&mut hasher);
+        for line in &replay.dialogue {
+            replay_dialogue_is_playable(line).hash(&mut hasher);
+            line.line_id.hash(&mut hasher);
+            line.time_ms.hash(&mut hasher);
+            line.duration_ms.hash(&mut hasher);
+            line.name.hash(&mut hasher);
+            line.text.hash(&mut hasher);
+        }
+        for frame in &replay.camera {
+            frame.time_ms.hash(&mut hasher);
+        }
+        for cut in &replay.camera_cuts {
+            cut.time_ms.hash(&mut hasher);
+        }
+        for movement in &replay.player_movements {
+            movement.user_id.hash(&mut hasher);
+            movement.keyframes.len().hash(&mut hasher);
+            if let Some(first) = movement.keyframes.first() {
+                first.time_ms.hash(&mut hasher);
+            }
+            if let Some(last) = movement.keyframes.last() {
+                last.time_ms.hash(&mut hasher);
             }
         }
-        if magnitude > u64::MAX / 10 {
-            return u64::MAX;
+        for ship in &replay.ship_trajectories {
+            ship.ship_id.hash(&mut hasher);
+            ship.ship_name.hash(&mut hasher);
+            ship.keyframes.len().hash(&mut hasher);
+            if let Some(first) = ship.keyframes.first() {
+                first.time_ms.hash(&mut hasher);
+            }
+            if let Some(last) = ship.keyframes.last() {
+                last.time_ms.hash(&mut hasher);
+            }
         }
-        magnitude *= 10;
+        for change in &replay.terrain_changes {
+            change.time_ms.hash(&mut hasher);
+            change.enabled.hash(&mut hasher);
+        }
+        for change in &replay.ship_hull_changes {
+            change.time_ms.hash(&mut hasher);
+            change.enabled.hash(&mut hasher);
+        }
     }
+    hasher.finish()
 }
 
-pub(super) fn replay_timeline_ui(
-    ui: &mut Ui,
-    studio: &mut ReplayStudio,
-    grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
-    player_history: &ReplayPlayerMovementHistory,
-    ship_history: &ReplayShipTrajectoryHistory,
-) {
-    let ctx = ui.ctx().clone();
-    let id = Id::new("replay-multitrack-view");
-    let mut view = ctx.data_mut(|data| data.get_temp::<TimelineView>(id).unwrap_or_default());
-    let mut playhead_changed = view.last_playback_ms != Some(studio.playback_ms);
-    // Remember the incoming time so a seek made while drawing this frame is
-    // revealed next frame, including a partially visible clip's offscreen start.
-    view.last_playback_ms = Some(studio.playback_ms);
-    let project = studio.replay.as_ref().map(|replay| {
-        (
-            replay.campaign_id.clone(),
-            replay.created_at_unix_ms,
-        )
-    });
-    if view.history.project != project {
-        playhead_changed = true;
-        view.selected = None;
-        studio.selected_dialogue_id = None;
-    }
-    if view.history.synchronize(studio) {
-        view.duration_seconds = None;
-        view.trim = None;
-    }
-    let Some(replay) = studio.replay.as_ref() else {
-        ui.strong("时间轴");
-        ui.weak("从项目面板生成或导入回放，台词、镜头、角色移动和场景事件会显示在这里。");
-        ctx.data_mut(|data| data.insert_temp(id, view));
-        return;
-    };
-    let duration = replay.duration_ms.max(1);
-    let extent = duration.saturating_add((duration / 10).max(1000));
-    let title = replay.title.clone();
+fn build_timeline_tracks(replay: &ReplayFile) -> Vec<Track> {
     let mut tracks = vec![
         Track {
             name: "台词 / 字幕".into(),
@@ -602,6 +690,140 @@ pub(super) fn replay_timeline_ui(
             })
             .collect(),
     });
+    tracks
+}
+
+fn time_at_x(x: f32, left: f32, width: f32, duration: u64) -> u64 {
+    (((x - left) / width.max(1.0)).clamp(0.0, 1.0) as f64 * duration as f64).round() as u64
+}
+
+fn reveal_playhead_offset(target: f32, offset: f32, visible: f32, content: f32) -> f32 {
+    let margin = visible * 0.1;
+    let next = if target < offset + margin {
+        target - margin
+    } else if target > offset + visible - margin {
+        target - visible + margin
+    } else {
+        offset
+    };
+    next.clamp(0.0, (content - visible).max(0.0))
+}
+
+fn adjacent_frame(time: u64, fps: u32, forward: bool) -> u64 {
+    let fps = fps.max(1) as u64;
+    // Export timestamps round down to milliseconds. Recover the frame index
+    // with ceiling division so repeated stepping never accumulates rounding drift.
+    let frame = time.saturating_mul(fps).div_ceil(1000);
+    if forward {
+        frame_time_ms(
+            time.saturating_add(1).saturating_mul(fps).div_ceil(1000),
+            fps as u32,
+        )
+    } else {
+        frame_time_ms(frame.saturating_sub(1), fps as u32)
+    }
+}
+
+fn timeline_timecode(time_ms: u64, fps: u32) -> String {
+    let fps = u64::from(fps.max(1));
+    // Match export's millisecond truncation without displaying the previous frame.
+    let frame = time_ms
+        .saturating_add(1)
+        .saturating_mul(fps)
+        .div_ceil(1000)
+        .saturating_sub(1);
+    let seconds = frame / fps;
+    format!(
+        "{:02}:{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds / 60) % 60,
+        seconds % 60,
+        frame % fps,
+    )
+}
+
+fn timeline_time_label(time_ms: u64) -> String {
+    format!(
+        "{:02}:{:02}.{:03}",
+        time_ms / 60_000,
+        (time_ms / 1000) % 60,
+        time_ms % 1000,
+    )
+}
+
+fn ruler_tick_step(extent: u64, width: f32) -> u64 {
+    let minimum = (extent as f64 * 105.0 / width.max(1.0) as f64).ceil() as u64;
+    let mut magnitude = 1_u64;
+    loop {
+        for multiple in [1, 2, 5] {
+            let step = magnitude.saturating_mul(multiple);
+            if step >= minimum {
+                return step;
+            }
+        }
+        if magnitude > u64::MAX / 10 {
+            return u64::MAX;
+        }
+        magnitude *= 10;
+    }
+}
+
+pub(super) fn replay_timeline_ui(
+    ui: &mut Ui,
+    studio: &mut ReplayStudio,
+    grids: &mut Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
+    player_history: &ReplayPlayerMovementHistory,
+    ship_history: &ReplayShipTrajectoryHistory,
+) {
+    let _profile = info_span!("replay_timeline_ui").entered();
+    let ctx = ui.ctx().clone();
+    let id = Id::new("replay-multitrack-view");
+    let mut view = ctx.data_mut(|data| data.get_temp::<TimelineView>(id).unwrap_or_default());
+    let mut playhead_changed = view.last_playback_ms != Some(studio.playback_ms);
+    // Remember the incoming time so a seek made while drawing this frame is
+    // revealed next frame, including a partially visible clip's offscreen start.
+    view.last_playback_ms = Some(studio.playback_ms);
+    let project = studio.replay.as_ref().map(|replay| {
+        (
+            replay.campaign_id.clone(),
+            replay.created_at_unix_ms,
+        )
+    });
+    if view.history.project != project {
+        playhead_changed = true;
+        view.selected = None;
+        studio.selected_dialogue_id = None;
+    }
+    if view.history.synchronize(studio) {
+        view.duration_seconds = None;
+        view.trim = None;
+    }
+    let Some(replay) = studio.replay.as_ref() else {
+        ui.strong("时间轴");
+        ui.weak("从项目面板生成或导入回放，台词、镜头、角色移动和场景事件会显示在这里。");
+        ctx.data_mut(|data| data.insert_temp(id, view));
+        return;
+    };
+    let duration = replay.duration_ms.max(1);
+    let extent = duration.saturating_add((duration / 10).max(1000));
+    let title = replay.title.clone();
+    let tracks_fingerprint = timeline_tracks_fingerprint(studio);
+    if view
+        .tracks_cache
+        .as_ref()
+        .is_none_or(|cache| cache.fingerprint != tracks_fingerprint)
+    {
+        view.tracks_cache = Some(TimelineTracksCache {
+            fingerprint: tracks_fingerprint,
+            tracks: Arc::new(build_timeline_tracks(replay)),
+        });
+    }
+    let tracks = view
+        .tracks_cache
+        .as_ref()
+        .expect("tracks cache was just refreshed")
+        .tracks
+        .clone();
     let mut seek = None;
     let mut toggle_playback = false;
     let mut zoom_changed = false;
@@ -788,12 +1010,40 @@ pub(super) fn replay_timeline_ui(
         );
     });
     ui.small(
-        "拖动标尺定位；拖动台词右边缘修剪，后续轨道同步移动。Shift 临时关闭帧吸附；Esc 取消拖动。",
+        "拖动标尺或空白轨道定位；拖动台词右边缘修剪，后续轨道同步移动；Ctrl+滚轮以指针为中心缩放。Shift 临时关闭帧吸附；Esc 取消拖动。",
     );
     let viewport_width = ui.available_width();
     let label_width = 145.0;
     let visible_width = (viewport_width - label_width).max(1.0);
     let width = visible_width * view.zoom;
+    // Ctrl+滚轮在指针位置缩放时间轴，缩放前后指针下的时间点保持不动
+    // （AE / Premiere 的标准行为）；普通滚轮仍用于滚动。
+    let mut ctrl_zoom_offset = None;
+    let timeline_rect = ui.max_rect();
+    if ui.rect_contains_pointer(timeline_rect)
+        && ui.input(|input| input.modifiers.ctrl && input.smooth_scroll_delta.y != 0.0)
+    {
+        let (delta_y, pointer) = ui.input(|input| {
+            (input.smooth_scroll_delta.y, input.pointer.hover_pos())
+        });
+        if let Some(pointer) = pointer {
+            let pointer_local = pointer.x - timeline_rect.left();
+            let time = (((view.scroll_x + pointer_local - label_width) / width).max(0.0)
+                * extent as f32) as f64;
+            let new_zoom = (view.zoom * (delta_y * 0.004_f32).exp()).clamp(1.0, 20.0);
+            if (new_zoom - view.zoom).abs() > f32::EPSILON {
+                let new_width = visible_width * new_zoom;
+                view.zoom = new_zoom;
+                zoom_changed = true;
+                ctrl_zoom_offset = Some(
+                    (time / extent as f64 * new_width as f64
+                        - (pointer_local - label_width) as f64)
+                        .max(0.0) as f32,
+                );
+            }
+            ui.input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
+        }
+    }
     let mut scroll_area = ScrollArea::both()
         .id_salt("replay-tracks-scroll")
         .auto_shrink([false, false])
@@ -811,6 +1061,10 @@ pub(super) fn replay_timeline_ui(
             visible_width,
             width,
         ));
+    }
+    if let Some(offset) = ctrl_zoom_offset {
+        // Ctrl 缩放以指针为锚点，优先于跟随播放头的定位。
+        scroll_area = scroll_area.horizontal_scroll_offset(offset);
     }
     let scroll = scroll_area.show_viewport(ui, |ui, viewport| {
         let (rect, _) = ui.allocate_exact_size(
@@ -857,6 +1111,23 @@ pub(super) fn replay_timeline_ui(
                 seek = Some(time_at_x(pointer.x, left, width, extent).min(duration));
             }
         }
+        if response.hovered() {
+            // 悬停标尺时显示指针处的时间码和半透明指示线，方便对位。
+            if let Some(pointer) = response.hover_pos() {
+                let hover_time = time_at_x(pointer.x, left, width, extent);
+                painter.line_segment(
+                    [pos2(pointer.x, visible.top() + 30.0), pos2(pointer.x, visible.bottom())],
+                    Stroke::new(1.0, Color32::from_white_alpha(28)),
+                );
+                full_painter.with_clip_rect(ruler).text(
+                    pos2(pointer.x + 4.0, visible.top() + 3.0),
+                    Align2::LEFT_TOP,
+                    timeline_time_label(hover_time),
+                    FontId::monospace(11.0),
+                    Color32::WHITE,
+                );
+            }
+        }
         let step = ruler_tick_step(extent, width);
         let ticks = extent / step;
         for tick in 0..=ticks {
@@ -873,6 +1144,27 @@ pub(super) fn replay_timeline_ui(
                 FontId::monospace(11.0),
                 Color32::LIGHT_GRAY,
             );
+        }
+        // 空白轨道区域直接点击/拖动定位播放头（AE 习惯）；片段和修剪手柄
+        // 注册得更晚，在自己的矩形内优先响应，不会冲突。
+        let background = Rect::from_min_max(
+            pos2(plot_clip.left(), visible.top() + 30.0),
+            pos2(visible.right(), visible.bottom()),
+        );
+        let scrub = ui.interact(
+            background,
+            id.with("timeline-scrub"),
+            Sense::click_and_drag(),
+        );
+        if scrub.clicked() {
+            view.selected = None;
+            studio.selected_dialogue_id = None;
+            view.duration_seconds = None;
+        }
+        if enabled && (scrub.clicked() || scrub.dragged()) {
+            if let Some(pointer) = scrub.interact_pointer_pos() {
+                seek = Some(time_at_x(pointer.x, left, width, extent).min(duration));
+            }
         }
         for (row, track) in tracks.iter().enumerate() {
             let top = rect.top() + 30.0 + row as f32 * 32.0;
