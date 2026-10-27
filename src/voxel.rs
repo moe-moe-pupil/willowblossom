@@ -360,7 +360,7 @@ pub(crate) const DEFAULT_VOXEL_OCCLUSION_CAST_WIDTH_CELLS: f32 = 2.0;
 pub(crate) const DEFAULT_VOXEL_OCCLUSION_CAST_HEIGHT_CELLS: f32 = 2.0;
 pub(crate) const DEFAULT_VOXEL_OCCLUSION_CAST_END_WIDTH_CELLS: f32 = 1.0;
 pub(crate) const DEFAULT_VOXEL_OCCLUSION_CAST_END_HEIGHT_CELLS: f32 = 2.0;
-pub(crate) const MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS: f32 = 1.0;
+pub(crate) const MIN_VOXEL_OCCLUSION_CAST_SIZE_CELLS: f32 = 0.0;
 pub(crate) const MAX_VOXEL_OCCLUSION_CAST_SIZE_CELLS: f32 = 16.0;
 
 pub struct TrpgVoxelPlugin {
@@ -403,11 +403,16 @@ impl Default for VoxelReplayOcclusionFade {
 }
 
 #[derive(Component)]
+#[derive(Clone)]
 struct VoxelOcclusionMesh {
     original_mesh: Handle<Mesh>,
     opaque_mesh: Handle<Mesh>,
     transparent_mesh: Handle<Mesh>,
     transparent_entity: Entity,
+    /// 上次分区输入的指纹（源 mesh、Transform、cast 参数）。输出只由
+    /// 这三者决定；未变时跳过分区与 mesh 写回，避免每帧触发
+    /// AssetChanged 让所有引用实体重算包围盒。
+    partition_fingerprint: u64,
 }
 
 #[derive(Component)]
@@ -785,6 +790,20 @@ struct VoxelPhysicsLifetime {
 pub(crate) struct VoxelPhysicsBody {
     pub(crate) local_center: Vec3,
     pub(crate) cells: Vec<(IVec3, u8)>,
+    /// 从 cells 派生的局部包围盒缓存。cells 不可变：任何修改都会整体
+    /// 替换组件，因此首次计算后缓存永远有效。逐 cell 求 min/max 曾让
+    /// 每帧的玩家位置标签计算遍历数万个体素。
+    pub(crate) local_bounds: std::sync::OnceLock<Option<(Vec3, Vec3)>>,
+}
+
+impl VoxelPhysicsBody {
+    pub(crate) fn new(local_center: Vec3, cells: Vec<(IVec3, u8)>) -> Self {
+        Self {
+            local_center,
+            cells,
+            local_bounds: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7415,10 +7434,7 @@ fn spawn_voxel_spaceship(
         .spawn((
             Name::new(spec.ship.name.clone()),
             spec.ship.clone(),
-            VoxelPhysicsBody {
-                local_center,
-                cells: spec.cells.clone(),
-            },
+            VoxelPhysicsBody::new(local_center, spec.cells.clone()),
             rigid_body,
             SweptCcd::default(),
             GravityScale(0.0),
@@ -7796,20 +7812,22 @@ fn sync_docked_voxel_spaceships(
 }
 
 fn voxel_spaceship_local_bounds(body: &VoxelPhysicsBody) -> Option<(Vec3, Vec3)> {
-    let min = body
-        .cells
-        .iter()
-        .map(|(cell, _)| *cell)
-        .reduce(IVec3::min)?;
-    let max = body
-        .cells
-        .iter()
-        .map(|(cell, _)| *cell)
-        .reduce(IVec3::max)?;
-    Some((
-        min.as_vec3() * VOXEL_SIZE,
-        (max + IVec3::ONE).as_vec3() * VOXEL_SIZE,
-    ))
+    *body.local_bounds.get_or_init(|| {
+        let min = body
+            .cells
+            .iter()
+            .map(|(cell, _)| *cell)
+            .reduce(IVec3::min)?;
+        let max = body
+            .cells
+            .iter()
+            .map(|(cell, _)| *cell)
+            .reduce(IVec3::max)?;
+        Some((
+            min.as_vec3() * VOXEL_SIZE,
+            (max + IVec3::ONE).as_vec3() * VOXEL_SIZE,
+        ))
+    })
 }
 
 fn voxel_spaceship_chase_camera_transform(
@@ -13059,6 +13077,8 @@ fn sync_voxel_occlusion_fade(
     locked_door_materials: Res<VoxelLockedDoorMaterials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
+    // 上次写入材质的透明度：不变时跳过 get_mut，避免每帧把材质资产标记为已修改。
+    mut last_written_opacity: Local<f32>,
     voxel_meshes: Query<
         (
             Entity,
@@ -13072,6 +13092,7 @@ fn sync_voxel_occlusion_fade(
     >,
 ) {
     let opacity = fade.opacity.clamp(0.0, 1.0);
+    let opacity_changed = (*last_written_opacity - opacity).abs() > f32::EPSILON;
     for handle in fade_materials
         .handles
         .iter()
@@ -13082,10 +13103,13 @@ fn sync_voxel_occlusion_fade(
             &locked_door_materials.fade,
         ))
     {
-        if let Some(mut material) = materials.get_mut(handle) {
-            material.base_color = material.base_color.with_alpha(opacity);
+        if opacity_changed {
+            if let Some(mut material) = materials.get_mut(handle) {
+                material.base_color = material.base_color.with_alpha(opacity);
+            }
         }
     }
+    *last_written_opacity = opacity;
 
     let fade_enabled = fade.active && opacity < 0.999 && !fade.targets.is_empty();
     let broadphase_half_extent = voxel_occlusion_cast_broadphase_half_extent(&fade);
@@ -13123,6 +13147,17 @@ fn sync_voxel_occlusion_fade(
             continue;
         }
 
+        // 指纹未变：分区输出必然与已写回的 mesh 相同，直接跳过。
+        let partition_fingerprint = occlusion_partition_fingerprint(
+            original_mesh,
+            transform,
+            &fade,
+        );
+        if let Some(state) = occlusion_mesh {
+            if state.partition_fingerprint == partition_fingerprint {
+                continue;
+            }
+        }
         let Some(source_mesh) = meshes.get(original_mesh).cloned() else {
             continue;
         };
@@ -13147,6 +13182,14 @@ fn sync_voxel_occlusion_fade(
             if let Some(mut mesh) = meshes.get_mut(&state.transparent_mesh) {
                 *mesh = transparent_mesh;
             }
+            // 记录本次分区输入指纹，之后输入不变时跳过重分区。
+            commands.entity(entity).insert(VoxelOcclusionMesh {
+                original_mesh: state.original_mesh.clone(),
+                opaque_mesh: state.opaque_mesh.clone(),
+                transparent_mesh: state.transparent_mesh.clone(),
+                transparent_entity: state.transparent_entity,
+                partition_fingerprint,
+            });
         } else {
             let original_mesh = current_mesh.0.clone();
             let opaque_mesh = meshes.add(opaque_mesh);
@@ -13169,6 +13212,7 @@ fn sync_voxel_occlusion_fade(
                         opaque_mesh,
                         transparent_mesh,
                         transparent_entity,
+                        partition_fingerprint: 0,
                     },
                 ));
         }
@@ -13188,6 +13232,51 @@ fn restore_voxel_occlusion_mesh(
     commands.entity(state.transparent_entity).despawn();
     meshes.remove(state.opaque_mesh.id());
     meshes.remove(state.transparent_mesh.id());
+}
+
+/// 分区输出只由（源 mesh、Transform、相机/目标、cast 参数）决定；
+/// 这些输入的指纹用于跳过无意义的每帧重分区。
+fn occlusion_partition_fingerprint(
+    original_mesh: &Handle<Mesh>,
+    transform: &GlobalTransform,
+    fade: &VoxelReplayOcclusionFade,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    original_mesh.id().hash(&mut hasher);
+    // Transform 量化后再入哈希：回放里飞船缓慢移动时，绝大多数帧
+    // 的位移不足以改变遮挡分区结果，量化让这些帧直接命中缓存。
+    let (scale, rotation, translation) = transform.to_scale_rotation_translation();
+    for component in translation
+        .to_array()
+        .into_iter()
+        .chain(scale.to_array())
+        .map(|value| (value / 0.1).round() as i32)
+    {
+        component.hash(&mut hasher);
+    }
+    for component in rotation
+        .to_array()
+        .map(|value| (value / 0.01).round() as i32)
+    {
+        component.hash(&mut hasher);
+    }
+    for component in fade.camera.to_array() {
+        component.to_bits().hash(&mut hasher);
+    }
+    for target in &fade.targets {
+        for component in target.to_array() {
+            component.to_bits().hash(&mut hasher);
+        }
+    }
+    for value in [
+        fade.cast_width_cells,
+        fade.cast_height_cells,
+        fade.cast_end_width_cells,
+        fade.cast_end_height_cells,
+    ] {
+        value.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn partition_voxel_mesh_for_replay_cast(
@@ -14246,10 +14335,7 @@ fn spawn_voxel_physics_body_at(
     let local_center = (local_max + IVec3::ONE).as_vec3() * VOXEL_SIZE * 0.5;
     commands
         .spawn((
-            VoxelPhysicsBody {
-                local_center,
-                cells,
-            },
+            VoxelPhysicsBody::new(local_center, cells),
             VoxelPlanetGravityBody,
             RigidBody::Dynamic,
             canonical_voxel_collider(&collider_voxels),
@@ -16153,10 +16239,10 @@ pub(crate) fn rebuild_dirty_voxel_spaceships(
             .map(|(cell, material)| (*cell, *material))
             .collect();
         if let Ok(mut entity_commands) = commands.get_entity(*entity) {
-            entity_commands.insert(VoxelPhysicsBody {
-                local_center: voxel_spaceship_local_center(&cells),
+            entity_commands.insert(VoxelPhysicsBody::new(
+                voxel_spaceship_local_center(&cells),
                 cells,
-            });
+            ));
         }
         entry.cells_dirty = false;
     }
@@ -18433,10 +18519,10 @@ mod tests {
 
     #[test]
     fn physics_body_loads_when_any_cell_overlaps_an_observer_chunk() {
-        let body = VoxelPhysicsBody {
-            local_center: Vec3::ZERO,
-            cells: vec![(IVec3::ZERO, 1), (IVec3::new(DIMS.x, 0, 0), 1)],
-        };
+        let body = VoxelPhysicsBody::new(
+            Vec3::ZERO,
+            vec![(IVec3::ZERO, 1), (IVec3::new(DIMS.x, 0, 0), 1)],
+        );
         let loader = VoxelPhysicsChunkLoader {
             columns: HashSet::from([IVec2::X]),
             ..default()
@@ -18469,10 +18555,7 @@ mod tests {
             0.0,
         );
         app.world_mut().spawn((
-            VoxelPhysicsBody {
-                local_center: Vec3::splat(VOXEL_SIZE * 0.5),
-                cells: vec![(IVec3::ZERO, 1)],
-            },
+            VoxelPhysicsBody::new(Vec3::splat(VOXEL_SIZE * 0.5), vec![(IVec3::ZERO, 1)]),
             RigidBody::Dynamic,
             Transform::from_translation(position),
             LinearVelocity(Vec3::X),
@@ -18963,14 +19046,8 @@ mod tests {
 
     #[test]
     fn teleporter_area_prefers_the_smallest_containing_spaceship() {
-        let large_body = VoxelPhysicsBody {
-            local_center: Vec3::ZERO,
-            cells: vec![(IVec3::ZERO, 1), (IVec3::splat(20), 1)],
-        };
-        let small_body = VoxelPhysicsBody {
-            local_center: Vec3::ZERO,
-            cells: vec![(IVec3::ZERO, 1), (IVec3::splat(2), 1)],
-        };
+        let large_body = VoxelPhysicsBody::new(Vec3::ZERO, vec![(IVec3::ZERO, 1), (IVec3::splat(20), 1)]);
+        let small_body = VoxelPhysicsBody::new(Vec3::ZERO, vec![(IVec3::ZERO, 1), (IVec3::splat(2), 1)]);
         let transform = Transform::default();
         let position = Vec3::splat(VOXEL_SIZE);
 
@@ -19104,10 +19181,7 @@ mod tests {
             .spawn((
                 carrier_spec.ship.clone(),
                 original,
-                VoxelPhysicsBody {
-                    local_center: Vec3::ZERO,
-                    cells: carrier_spec.cells.clone(),
-                },
+                VoxelPhysicsBody::new(Vec3::ZERO, carrier_spec.cells.clone()),
                 LinearVelocity(Vec3::ONE),
                 AngularVelocity(Vec3::Y),
                 RigidBody::Dynamic,
@@ -19119,10 +19193,7 @@ mod tests {
                 small_spec.ship.clone(),
                 small_original,
                 docking.clone(),
-                VoxelPhysicsBody {
-                    local_center: Vec3::ZERO,
-                    cells: small_spec.cells.clone(),
-                },
+                VoxelPhysicsBody::new(Vec3::ZERO, small_spec.cells.clone()),
                 LinearVelocity::ZERO,
                 AngularVelocity::ZERO,
                 RigidBody::Kinematic,
@@ -21724,10 +21795,7 @@ mod tests {
             rotation: Quat::from_rotation_y(0.75),
             scale: Vec3::new(1.0, 1.5, 0.8),
         };
-        let body = VoxelPhysicsBody {
-            local_center: Vec3::splat(VOXEL_SIZE),
-            cells: vec![(IVec3::new(1, 2, 3), 7)],
-        };
+        let body = VoxelPhysicsBody::new(Vec3::splat(VOXEL_SIZE), vec![(IVec3::new(1, 2, 3), 7)]);
         let persisted_body = persisted_voxel_physics_body(
             &body,
             &transform,
@@ -21823,10 +21891,7 @@ mod tests {
             .unwrap()
             .set(saved_position, 3);
         app.world_mut().spawn((
-            VoxelPhysicsBody {
-                local_center: Vec3::splat(0.5),
-                cells: vec![(IVec3::ZERO, 2)],
-            },
+            VoxelPhysicsBody::new(Vec3::splat(0.5), vec![(IVec3::ZERO, 2)]),
             Transform::from_translation(Vec3::new(2.0, 3.0, 4.0)),
             LinearVelocity(Vec3::X),
             AngularVelocity(Vec3::Y),
@@ -22424,10 +22489,7 @@ mod tests {
 
     #[test]
     fn explosion_radius_detects_voxels_inside_a_moving_body() {
-        let body = VoxelPhysicsBody {
-            local_center: Vec3::splat(VOXEL_SIZE),
-            cells: vec![(IVec3::ZERO, 1), (IVec3::X, 2)],
-        };
+        let body = VoxelPhysicsBody::new(Vec3::splat(VOXEL_SIZE), vec![(IVec3::ZERO, 1), (IVec3::X, 2)]);
         let transform = Transform::from_xyz(4.0, 2.0, -3.0).with_rotation(Quat::from_rotation_y(
             std::f32::consts::FRAC_PI_2,
         ));

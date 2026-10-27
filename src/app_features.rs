@@ -20,6 +20,10 @@ pub(crate) struct AppFeatureSettings {
     /// Uses the fixed-sidebar, single-conversation Moonberry chat workspace.
     #[serde(default)]
     pub(crate) legacy_chat_layout_enabled: bool,
+    /// Disables vsync so the frame rate is not capped at the monitor refresh
+    /// rate. Restart required.
+    #[serde(default = "default_unlimited_frame_rate")]
+    pub(crate) unlimited_frame_rate: bool,
 }
 
 impl Default for AppFeatureSettings {
@@ -27,11 +31,14 @@ impl Default for AppFeatureSettings {
         Self {
             game_scene_enabled: default_game_scene_enabled(),
             legacy_chat_layout_enabled: false,
+            unlimited_frame_rate: default_unlimited_frame_rate(),
         }
     }
 }
 
 fn default_game_scene_enabled() -> bool { true }
+
+fn default_unlimited_frame_rate() -> bool { true }
 
 pub(crate) fn load_app_feature_settings() -> Persistent<AppFeatureSettings> {
     Persistent::<AppFeatureSettings>::builder()

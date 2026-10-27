@@ -27,6 +27,7 @@ use std::os::windows::process::CommandExt;
 use std::{
     collections::{
         hash_map::DefaultHasher,
+        BTreeMap,
         BTreeSet,
         HashMap,
         HashSet,
@@ -214,13 +215,13 @@ const REPLAY_PLAYING_STATUS: &str = "正在回放；停止后会恢复当前体�
 const REPLAY_SPEECH_PREPARING_STATUS: &str = "正在准备当前台词语音；语音就绪后字幕与声音会同时开始";
 const REPLAY_SPEECH_MAX_WAIT_SECONDS: f32 = 5.0;
 const DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 1.5;
-const MIN_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 0.5;
+const MIN_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 0.1;
 const MAX_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 4.0;
 const DEFAULT_DIRECTED_CAMERA_YAW_DEGREES: f32 = 0.0;
 const MIN_DIRECTED_CAMERA_YAW_DEGREES: f32 = -60.0;
 const MAX_DIRECTED_CAMERA_YAW_DEGREES: f32 = 60.0;
 const DEFAULT_CAMERA_TRANSITION_CURVE: f32 = 2.0;
-const MIN_CAMERA_TRANSITION_CURVE: f32 = 1.0;
+const MIN_CAMERA_TRANSITION_CURVE: f32 = 0.0;
 const MAX_CAMERA_TRANSITION_CURVE: f32 = 4.0;
 const FOCUS_TRANSITION_MS: u64 = 900;
 const STANDEE_POSITION_SAMPLE_SECONDS: f32 = 0.1;
@@ -304,6 +305,7 @@ impl Plugin for ReplayPlugin {
             .insert_resource(voice_favorites)
             .insert_resource(player_movement_history)
             .insert_resource(ship_trajectory_history);
+        load_pending_scene_edits(&mut app.world_mut().resource_mut::<ReplayStudio>());
 
         if !self.runtime_enabled {
             return;
@@ -642,6 +644,11 @@ struct ReplayFile {
     master_dialogue_duration: f32,
     #[serde(default)]
     speaker_voice_settings: HashMap<u64, SpeakerVoiceSettings>,
+    /// 头像数据表（来源 → data URL）。内嵌到每句台词里的头像 base64 曾让
+    /// 长会话的自动保存膨胀到数 GB 并把主线程卡住十几秒；导出时把所有
+    /// 头像集中到这里，台词行里不再重复内嵌。导入时再回填到台词行。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    avatar_data_urls: BTreeMap<String, Arc<str>>,
 }
 
 #[derive(Debug, Clone)]
@@ -807,6 +814,109 @@ pub(crate) struct ReplayShipHullCellEvent {
 /// `capture_live_replay_edits` while live-editing a playing replay, and
 /// `drain_replay_scene_recorder` the rest of the time so from-chat replays can
 /// map every terrain edit onto the timeline.
+const PENDING_SCENE_EDITS_PATH: &str =
+    ".data/willowblossom/replays/pending-scene-edits.json";
+
+#[derive(Serialize, Deserialize, Default)]
+struct PendingSceneEditsFile {
+    #[serde(default)]
+    terrain: Vec<PendingTerrainEntryFile>,
+    #[serde(default)]
+    hull: Vec<PendingHullEntryFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingTerrainEntryFile {
+    source_unix_ms: u64,
+    cell: [i32; 3],
+    material: u8,
+    before: u8,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingHullEntryFile {
+    source_unix_ms: u64,
+    ship_id: String,
+    cell: [i32; 3],
+    material: u8,
+}
+
+/// 场景编辑缓冲的持久化：跨应用会话保留体素编辑记录，让"从现有聊天
+/// 生成"能把历史会话里的场景破坏映射到时间轴并回退基线，而不是把
+/// 最终场景烤进基线（破坏之前的对话会因此显示破坏后的场景）。
+fn load_pending_scene_edits(studio: &mut ReplayStudio) {
+    load_pending_scene_edits_from(Path::new(PENDING_SCENE_EDITS_PATH), studio);
+}
+
+fn load_pending_scene_edits_from(path: &Path, studio: &mut ReplayStudio) {
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let Ok(file) = serde_json::from_slice::<PendingSceneEditsFile>(&bytes) else {
+        return;
+    };
+    studio.pending_terrain_changes = file
+        .terrain
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.source_unix_ms,
+                IVec3::from_array(entry.cell),
+                entry.material,
+                entry.before,
+            )
+        })
+        .collect();
+    studio.pending_ship_hull_changes = file
+        .hull
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.source_unix_ms,
+                entry.ship_id,
+                IVec3::from_array(entry.cell),
+                entry.material,
+            )
+        })
+        .collect();
+}
+
+fn save_pending_scene_edits(studio: &ReplayStudio) {
+    save_pending_scene_edits_to(Path::new(PENDING_SCENE_EDITS_PATH), studio);
+}
+
+fn save_pending_scene_edits_to(path: &Path, studio: &ReplayStudio) {
+    let file = PendingSceneEditsFile {
+        terrain: studio
+            .pending_terrain_changes
+            .iter()
+            .map(|(source, cell, material, before)| PendingTerrainEntryFile {
+                source_unix_ms: *source,
+                cell: cell.to_array(),
+                material: *material,
+                before: *before,
+            })
+            .collect(),
+        hull: studio
+            .pending_ship_hull_changes
+            .iter()
+            .map(|(source, ship_id, cell, material)| PendingHullEntryFile {
+                source_unix_ms: *source,
+                ship_id: ship_id.clone(),
+                cell: cell.to_array(),
+                material: *material,
+            })
+            .collect(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&file) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, bytes);
+}
+
 #[derive(Default, Resource)]
 pub(crate) struct ReplaySceneRecorder {
     pub(crate) grid_cells: Vec<ReplayGridCellEvent>,
@@ -1016,6 +1126,7 @@ pub(crate) fn clear_campaign_replay_data(
     studio.message_counts.clear();
     studio.pending_terrain_changes.clear();
     studio.pending_ship_hull_changes.clear();
+    save_pending_scene_edits(&studio);
     studio.pre_playback_scene = None;
     studio.live_editing_enabled = false;
     studio.live_movement_punch_in = None;
@@ -1078,7 +1189,7 @@ struct ReplayDialogue {
     speech_volume: f32,
     avatar: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    avatar_data_url: Option<String>,
+    avatar_data_url: Option<Arc<str>>,
     visibility: Visibility,
     #[serde(default)]
     side: DialogueSide,
@@ -1382,6 +1493,12 @@ struct PreviewSpeechController {
     generation_cues: HashSet<(u64, usize)>,
     onnx_worker: Option<OnnxPreviewWorker>,
     audio_entity: Option<Entity>,
+    /// 语音预览的懒加载缓存：签名、台词 id 集合、预备索引都从回放内容
+    /// 派生。全量哈希几千句台词曾每帧占用 ~3ms；键含修订号，编辑时
+    /// 自动失效重算。
+    cached_signature: Option<(u64, usize, u64, u32, u64)>,
+    cached_generation_line_ids: Option<(u64, usize, u64, HashSet<u64>)>,
+    cached_preparation_indices: Option<(u64, u64, u64, Vec<usize>)>,
 }
 
 struct OnnxPreviewWorker {
@@ -1828,6 +1945,7 @@ fn drain_replay_scene_recorder(
             .into_iter()
             .map(|event| (source_unix_ms, event.ship_id, event.cell, event.material)),
     );
+    save_pending_scene_edits(&studio);
 }
 
 fn record_replay(
@@ -1914,6 +2032,7 @@ fn record_replay(
             )
         }),
     );
+    save_pending_scene_edits(&studio);
 
     let audience = studio.audience.clone();
     let replay_campaign_id = studio
@@ -2415,6 +2534,14 @@ fn advance_replay(
         }
     }
     studio.playback_ms = proposed_ms;
+    #[cfg(feature = "profiling")]
+    {
+        static POLL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = POLL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % 5 == 0 {
+            info!(playback_ms = studio.playback_ms, mode = ?studio.mode, "replay tick");
+        }
+    }
     if recording_take {
         // Live DM movement can append footage beyond the original ending.
         // Keep the seek range and saved project duration in sync with the take.
@@ -2669,18 +2796,65 @@ fn preview_replay_speech(
     mut audio_sources: ResMut<Assets<AudioSource>>,
     op_log: ResMut<OpLog>,
 ) {
-    let pending_generation_line_ids = studio
-        .replay
-        .as_ref()
-        .map(replay_speech_generation_line_ids)
-        .unwrap_or_default();
-    let mut generation_request_consumed = false;
-    if studio.speech_enabled && onnx_tts_is_available() {
+    // 面板关闭且完全空闲时跳过逐帧的台词全量扫描（几千句台词的
+    // HashSet 构建 + 语音缓存探测曾每帧花掉 2ms+）；重新打开面板或
+    // 进入播放/录制/视频渲染后会立即恢复，worker 结果留在通道里
+    // 不会丢失。
+    let panel_active = studio.panel_open
+        || studio.mode != ReplayMode::Idle
+        || studio.video_render.is_some();
+    // 以下三个派生数据全部懒加载缓存：键含修订号，编辑时自动失效。
+    let pending_generation_line_ids = if panel_active {
         if let Some(replay) = studio.replay.as_ref() {
-            let requested = replay_speech_preparation_indices(replay, studio.playback_ms);
+            let key = (
+                replay.created_at_unix_ms,
+                replay.dialogue.len(),
+                studio.timeline_revision,
+            );
+            let stale = speech
+                .cached_generation_line_ids
+                .as_ref()
+                .is_none_or(|(k0, k1, k2, _)| (*k0, *k1, *k2) != key);
+            if stale {
+                let ids = replay_speech_generation_line_ids(replay);
+                speech.cached_generation_line_ids = Some((key.0, key.1, key.2, ids));
+            }
+        }
+        speech
+            .cached_generation_line_ids
+            .as_ref()
+            .map(|(_, _, _, ids)| ids.clone())
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let mut generation_request_consumed = false;
+    if panel_active && studio.speech_enabled && onnx_tts_is_available() {
+        if let Some(replay) = studio.replay.as_ref() {
+            let prep_key = (
+                replay.created_at_unix_ms,
+                studio.playback_ms,
+                studio.timeline_revision,
+            );
+            let prep_stale = speech
+                .cached_preparation_indices
+                .as_ref()
+                .is_none_or(|(k0, k1, k2, _)| (*k0, *k1, *k2) != prep_key);
+            if prep_stale {
+                let indices =
+                    replay_speech_preparation_indices(replay, studio.playback_ms);
+                speech.cached_preparation_indices =
+                    Some((prep_key.0, prep_key.1, prep_key.2, indices));
+            }
+            let requested = speech
+                .cached_preparation_indices
+                .as_ref()
+                .map(|(_, _, _, indices)| indices.clone())
+                .unwrap_or_default();
             match speech.prepare_onnx_replay(
                 replay,
                 studio.speech_volume,
+                studio.timeline_revision,
                 &requested,
                 &pending_generation_line_ids,
             ) {
@@ -2797,14 +2971,39 @@ fn preview_replay_speech(
 }
 
 impl PreviewSpeechController {
+    /// 懒加载的语音签名：内容键（回放 id、句数、修订号、音量）不变时
+    /// 直接复用上次的全文哈希，不再逐帧哈希几千句台词。
+    fn cached_voice_signature(
+        &mut self,
+        replay: &ReplayFile,
+        global_volume: f32,
+        timeline_revision: u64,
+    ) -> u64 {
+        let key = (
+            replay.created_at_unix_ms,
+            replay.dialogue.len(),
+            timeline_revision,
+            global_volume.to_bits(),
+        );
+        if let Some((k0, k1, k2, k3, signature)) = self.cached_signature {
+            if (k0, k1, k2, k3) == key {
+                return signature;
+            }
+        }
+        let signature = replay_voice_signature(replay, global_volume);
+        self.cached_signature = Some((key.0, key.1, key.2, key.3, signature));
+        signature
+    }
+
     fn prepare_onnx_replay(
         &mut self,
         replay: &ReplayFile,
         global_volume: f32,
+        timeline_revision: u64,
         requested_indices: &[usize],
         generation_line_ids: &HashSet<u64>,
     ) -> Result<(), String> {
-        let signature = replay_voice_signature(replay, global_volume);
+        let signature = self.cached_voice_signature(replay, global_volume, timeline_revision);
         if self.prepared_signature != Some(signature) {
             self.prepared_signature = Some(signature);
             self.onnx_cache.clear();
@@ -3782,6 +3981,12 @@ fn apply_replay_camera(
         // authored camera resumes as soon as the take is saved or cancelled.
         return;
     }
+    if studio.live_editing_enabled {
+        // 现场编辑：把镜头交还平时的带团视窗（DM 第一人称/自由相机），
+        // 不再每帧钉在回放关键帧轨道上；关闭现场编辑后轨道自动恢复。
+        // 遮挡淡出在上面已随本系统关闭，方便编辑时看清场景。
+        return;
+    }
     let Some(replay) = studio.replay.as_ref() else { return };
     let Some(transform) = replay_camera_at(
         replay,
@@ -3803,6 +4008,16 @@ fn apply_replay_camera(
         return;
     };
     if let Ok(mut camera) = camera.single_mut() {
+        #[cfg(feature = "profiling")]
+        {
+            static CAM_POLL: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = CAM_POLL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 5 == 0 {
+                let t = transform.translation;
+                info!(cam_x = t.x, cam_y = t.y, cam_z = t.z, "replay cam");
+            }
+        }
         *camera = transform;
         for (mut standee_transform, _) in &mut standees {
             if let Some(rotation) = replay_standee_facing_rotation(
@@ -4117,7 +4332,7 @@ fn replay_controls(
                         .fixed_decimals(2)
                         .suffix("×"),
                 )
-                .on_hover_text("调整自动生成和 DeepSeek 导演镜头与当前说话玩家之间的距离。")
+                .on_hover_text("调整自动生成和 DeepSeek 导演镜头与当前说话玩家之间的距离；0.1 为几乎贴脸。")
                 .changed()
             })
             .inner;
@@ -4187,7 +4402,7 @@ fn replay_controls(
                     .step_by(0.1)
                     .fixed_decimals(1),
                 )
-                .on_hover_text("1.0 为匀速；数值越高，切换玩家时镜头起步和停下越柔和。")
+                .on_hover_text("0 为直接切换（无缓动）；1.0 为匀速；数值越高，切换玩家时镜头起步和停下越柔和。")
                 .changed()
             })
             .inner;
@@ -5427,6 +5642,7 @@ fn start_recording(
     studio.player_movement_sample_accumulator = 0.0;
     studio.pending_terrain_changes.clear();
     studio.pending_ship_hull_changes.clear();
+    save_pending_scene_edits(&studio);
     studio.recorded_possession_user_id = None;
     studio.recorded_player_movement_index = None;
     studio.live_editing_enabled = false;
@@ -6236,6 +6452,7 @@ fn new_replay(
         master_speech_speed: default_master_speech_speed(),
         master_dialogue_duration: default_master_dialogue_duration(),
         speaker_voice_settings: HashMap::new(),
+        avatar_data_urls: BTreeMap::new(),
     }
 }
 
@@ -6668,7 +6885,7 @@ fn replay_live_edit_panel(
             playback_active && !take_active,
             egui::Checkbox::new(&mut studio.live_editing_enabled, "解锁场景与接管工具"),
         );
-        live_toggle.on_hover_text("解锁后可在回放画面里使用现有体素、爆炸、角色接管和飞船接管工具。项目编辑不会保存成战役现场。");
+        live_toggle.on_hover_text("解锁后可在回放画面里使用现有体素、爆炸、角色接管和飞船接管工具，镜头也会交还你平时的第一人称带团视窗（WASD 行走、常规工具编辑）；关闭后回到回放镜头轨道。项目编辑不会保存成战役现场。");
         if !playback_active {
             ui.small("先点击“播放”，再在这里现场修改。");
         } else if studio.live_editing_enabled {
@@ -13885,11 +14102,23 @@ fn replay_avatar_texture(
 
 fn export_replay(replay: &ReplayFile, path: &str) -> Result<(), String> {
     let mut portable = replay.clone();
+    // 头像数据按来源去重成一张表：同一头像曾按台词句数重复内嵌，
+    // 长会话的自动保存因此膨胀到数 GB。行内数据 URL 一律清空集中存放，
+    // 导入时再回填，反复导出导入保持幂等。
+    let mut avatar_data_urls: BTreeMap<String, Arc<str>> = BTreeMap::new();
     for dialogue in &mut portable.dialogue {
-        if dialogue.avatar_data_url.is_none() {
-            dialogue.avatar_data_url = cached_avatar_data_url(&dialogue.avatar);
-        }
+        let url = match dialogue.avatar_data_url.take() {
+            Some(url) => url,
+            None => match cached_avatar_data_url(&dialogue.avatar) {
+                Some(url) => url,
+                None => continue,
+            },
+        };
+        avatar_data_urls
+            .entry(dialogue.avatar.clone())
+            .or_insert(url);
     }
+    portable.avatar_data_urls = avatar_data_urls;
     let bytes = serde_json::to_vec(&portable).map_err(|err| err.to_string())?;
     let path = normalized_path(path)?;
     if let Some(parent) = path
@@ -13918,6 +14147,17 @@ fn import_replay(path: &str, manager: Option<&NapcatMessageManager>) -> Result<R
     let path = normalized_path(path)?;
     let bytes = fs::read(path).map_err(|err| err.to_string())?;
     let mut replay: ReplayFile = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
+    // 头像数据集中在表里的项目文件：把 data URL 回填到每句台词，
+    // Arc 克隆只复制指针，几千句台词也不会产生大字符串拷贝。
+    if !replay.avatar_data_urls.is_empty() {
+        for line in &mut replay.dialogue {
+            if line.avatar_data_url.is_none() {
+                if let Some(url) = replay.avatar_data_urls.get(&line.avatar) {
+                    line.avatar_data_url = Some(url.clone());
+                }
+            }
+        }
+    }
     replay.camera_distance_scale =
         normalized_directed_camera_distance_scale(replay.camera_distance_scale);
     replay.camera_yaw_degrees = normalized_directed_camera_yaw_degrees(replay.camera_yaw_degrees);
@@ -13993,15 +14233,15 @@ fn import_replay(path: &str, manager: Option<&NapcatMessageManager>) -> Result<R
 
 /// `avatar_data_url` 的进程级缓存：同一个头像文件（每句台词都引用）
 /// 只读一次磁盘并 base64 一次，自动存档/手动导出都不会被几千次重复读盘卡住。
-fn cached_avatar_data_url(source: &str) -> Option<String> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<String>>>> =
+fn cached_avatar_data_url(source: &str) -> Option<Arc<str>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<Arc<str>>>>> =
         std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(cached) = guard.get(source) {
         return cached.clone();
     }
-    let value = avatar_data_url(source);
+    let value = avatar_data_url(source).map(Arc::from);
     guard.insert(source.to_owned(), value.clone());
     value
 }
@@ -15752,6 +15992,26 @@ mod tests {
                 3_000
             );
         }
+        // 现场编辑仍开启：相机属于 DM 视窗，回放不得覆写。
+        let frozen_pose = app
+            .world()
+            .entity(camera)
+            .get::<Transform>()
+            .unwrap()
+            .clone();
+        for time_ms in [3_000, 2_000] {
+            app.world_mut().resource_mut::<ReplayStudio>().playback_ms = time_ms;
+            app.update();
+            let camera_pose = app.world().entity(camera).get::<Transform>().unwrap();
+            assert_eq!(
+                *camera_pose, frozen_pose,
+                "live edit keeps the DM camera free"
+            );
+        }
+        // 关闭现场编辑后，回放镜头轨道恢复并继续跟随台词角色。
+        app.world_mut()
+            .resource_mut::<ReplayStudio>()
+            .live_editing_enabled = false;
         for time_ms in [3_000, 2_000, 3_000] {
             app.world_mut().resource_mut::<ReplayStudio>().playback_ms = time_ms;
             app.update();
@@ -15764,6 +16024,55 @@ mod tests {
             );
             assert!(camera_pose.translation.distance(standee_pose.translation) < 10.0);
         }
+    }
+
+    #[test]
+    fn live_editing_hands_the_camera_back_to_the_dm_view() {
+        let camera = Transform::from_xyz(5.0, 4.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y);
+        let mut replay = test_replay(Vec::new());
+        replay.duration_ms = 100;
+        replay.camera = vec![camera_keyframe(0, &camera)];
+        let mut studio = ReplayStudio::default();
+        studio.mode = ReplayMode::Paused;
+        studio.replay = Some(replay);
+        studio.live_editing_enabled = true;
+        let mut app = App::new();
+        app.insert_resource(studio).add_systems(
+            Update,
+            (apply_replay_standee_positions, apply_replay_camera).chain(),
+        );
+        let camera_entity = app
+            .world_mut()
+            .spawn((
+                Transform::from_xyz(100.0, 50.0, 25.0),
+                VoxelViewportCamera,
+            ))
+            .id();
+        app.update();
+        // 现场编辑开启：回放关键帧不得覆写 DM 相机（第一人称带团视窗）。
+        let pose = app
+            .world()
+            .entity(camera_entity)
+            .get::<Transform>()
+            .unwrap()
+            .clone();
+        assert_eq!(pose.translation, Vec3::new(100.0, 50.0, 25.0));
+
+        // 关闭现场编辑后，回放镜头轨道恢复接管。
+        app.world_mut()
+            .resource_mut::<ReplayStudio>()
+            .live_editing_enabled = false;
+        app.update();
+        let pose = app
+            .world()
+            .entity(camera_entity)
+            .get::<Transform>()
+            .unwrap()
+            .clone();
+        assert!(
+            pose.translation.distance(camera.translation) < 1.0,
+            "replay camera should resume the authored rail after live edit turns off"
+        );
     }
 
     #[test]
@@ -17880,6 +18189,7 @@ mod tests {
             master_speech_speed: default_master_speech_speed(),
             master_dialogue_duration: default_master_dialogue_duration(),
             speaker_voice_settings: HashMap::new(),
+            avatar_data_urls: BTreeMap::new(),
         }
     }
 
@@ -18894,10 +19204,7 @@ mod tests {
                 .world_mut()
                 .spawn((
                     VoxelSpaceship::replay_test("carrier"),
-                    VoxelPhysicsBody {
-                        local_center,
-                        cells: vec![(IVec3::new(-8, 0, -8), 1), (IVec3::new(8, 16, 8), 1)],
-                    },
+                    VoxelPhysicsBody::new(local_center, vec![(IVec3::new(-8, 0, -8), 1), (IVec3::new(8, 16, 8), 1)]),
                     original_ship,
                     LinearVelocity(original_linear),
                     AngularVelocity(original_angular),
@@ -20063,6 +20370,86 @@ mod tests {
         let grid = app.world().get::<Grid<u8>>(terrain).unwrap();
         assert_eq!(grid.get(IVec3::X), Some(&2));
         assert_eq!(grid.get(IVec3::Y), Some(&3));
+    }
+
+    #[test]
+    fn pending_scene_edits_persist_across_restarts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("pending-scene-edits.json");
+        let mut studio = ReplayStudio::default();
+        studio.pending_terrain_changes = vec![
+            (1_000, IVec3::new(1, 2, 3), 5, 0),
+            (2_000, IVec3::ZERO, 0, 7),
+        ];
+        studio.pending_ship_hull_changes = vec![(
+            3_000,
+            "carrier".to_owned(),
+            IVec3::new(4, 5, 6),
+            9,
+        )];
+
+        save_pending_scene_edits_to(&path, &studio);
+        let mut reloaded = ReplayStudio::default();
+        load_pending_scene_edits_from(&path, &mut reloaded);
+
+        assert_eq!(reloaded.pending_terrain_changes, studio.pending_terrain_changes);
+        assert_eq!(reloaded.pending_ship_hull_changes, studio.pending_ship_hull_changes);
+    }
+
+    #[test]
+    fn seeking_back_before_a_destruction_restores_the_older_scene() {
+        // 用户报告：破坏之前的对话显示的是最后时刻的场景。回拖播放头
+        // 必须把格子回滚到该时刻的状态，而不是停留在破坏后的样子。
+        let mut replay = test_replay(Vec::new());
+        replay.duration_ms = 6_000;
+        replay.scene.voxels.push(ReplayVoxel {
+            position: [0; 3],
+            material: 3,
+        });
+        replay.terrain_changes.push(ReplayTerrainChange {
+            time_ms: 5_000,
+            position: [0; 3],
+            material: 0,
+            enabled: true,
+        });
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(replay);
+        studio.mode = ReplayMode::Paused;
+        let mut app = App::new();
+        app.insert_resource(studio)
+            .init_resource::<VoxelGeometryDirtyChunks>()
+            .add_systems(Update, apply_replay_terrain_changes);
+        let terrain = app
+            .world_mut()
+            .spawn((Grid::<u8>::new(), TrpgVoxelGrid))
+            .id();
+        let material_at = |app: &App| {
+            app.world()
+                .get::<Grid<u8>>(terrain)
+                .unwrap()
+                .get(IVec3::ZERO)
+                .copied()
+                .unwrap_or_default()
+        };
+
+        // 先直接跳到破坏之后的时刻。
+        app.world_mut().resource_mut::<ReplayStudio>().playback_ms = 5_500;
+        app.update();
+        assert_eq!(material_at(&app), 0, "destruction applies at 5500ms");
+
+        // 回拖到破坏之前的台词（1000ms）：必须恢复破坏前的场景。
+        app.world_mut().resource_mut::<ReplayStudio>().playback_ms = 1_000;
+        app.update();
+        assert_eq!(
+            material_at(&app),
+            3,
+            "seeking back before the destruction must restore the older scene"
+        );
+
+        // 再前进越过破坏点：破坏重新出现。
+        app.world_mut().resource_mut::<ReplayStudio>().playback_ms = 6_000;
+        app.update();
+        assert_eq!(material_at(&app), 0, "seeking forward re-applies the destruction");
     }
 
     #[test]

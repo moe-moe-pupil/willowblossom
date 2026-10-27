@@ -844,6 +844,7 @@ use crate::{
         DeepseekManager,
         DeepseekPlugin,
         DeepseekRequest,
+        DeepseekSummary,
         DeepseekSummaryBlock,
         DEEPSEEK_CUSTOM_PROMPT_MAX_CHARS,
         DEEPSEEK_SUMMARY_EXPORT_VERSION,
@@ -1391,6 +1392,8 @@ pub struct UiSystemLocals<'w, 's> {
     chat_player_visible_previews: Local<'s, HashMap<String, String>>,
     chat_analytics_targets: Local<'s, HashSet<String>>,
     ranked_private_chat_timings_cache: Local<'s, RankedPrivateChatTimingsCache>,
+    summary_panel_cache: Local<'s, SummaryPanelCache>,
+    summary_queue_cache: Local<'s, HashMap<String, u64>>,
     gm_auto_chat_mode: Local<'s, GmAutoChatModeState>,
     chat_list_player_visible_filter: Local<'s, Option<String>>,
     chat_workspace: Local<'s, ChatWorkspaceState>,
@@ -2118,6 +2121,16 @@ fn feature_menu_button(
             .on_hover_text("使用旧版固定聊天列表和单聊天主区域；默认关闭，可立即切换")
             .changed();
         ui.small("旧版布局只改变显示方式，仍使用NapCat和当前可见性规则。");
+
+        ui.separator();
+        changed |= ui
+            .checkbox(
+                &mut settings.unlimited_frame_rate,
+                "解除帧率上限（关闭垂直同步）",
+            )
+            .on_hover_text("帧率不再被显示器刷新率封顶；重启后生效。开启后可能出现画面撕裂")
+            .changed();
+        ui.small("默认开启以支持高刷新率显示器；若出现画面撕裂可关闭。");
 
         if changed {
             if let Err(err) = settings.persist() {
@@ -3723,7 +3736,64 @@ fn chat_body_ui(
                             let new_message_start =
                                 newest_unread_incoming_start(messages, unread_count);
                             scroll_state.rows.prepare(ui, messages.len());
-                            for (message_index, message) in messages.iter().enumerate() {
+                            // 行级虚拟化：几千条消息的窗口曾每帧花 ~5ms
+                            // 逐行推进光标。屏外且已测量的行按缓存高度
+                            // 批量跳过，只渲染视口附近的行；未测量行用
+                            // 平均高度估算（进入视口时用实际高度重排）。
+                            let spacing = ui.spacing().item_spacing.y;
+                            let clip = ui.clip_rect();
+                            let clip_top = clip.top() - 300.0;
+                            let clip_bottom = clip.bottom() + 300.0;
+                            let estimated_row_height = scroll_state
+                                .rows
+                                .average_height()
+                                .unwrap_or(48.0)
+                                .clamp(12.0, 600.0);
+                            let row_height = |index: usize| {
+                                scroll_state.rows.height_at(index).unwrap_or(estimated_row_height)
+                            };
+                            let row_advance = |index: usize| row_height(index) + spacing;
+                            let content_top = ui.next_widget_position().y;
+                            let mut first_visible = messages.len();
+                            let mut prefix_height = 0.0;
+                            let mut y = content_top;
+                            for message_index in 0..messages.len() {
+                                let advance = row_advance(message_index);
+                                if first_visible == messages.len()
+                                    && y + row_height(message_index) >= clip_top
+                                {
+                                    first_visible = message_index;
+                                    break;
+                                }
+                                y += advance;
+                                prefix_height += advance;
+                            }
+                            // 找最后一个需要渲染的行：越过视口下界且已有
+                            // 缓存高度的行进入后缀。
+                            let mut render_end = messages.len();
+                            let mut y = content_top + prefix_height;
+                            for message_index in first_visible..messages.len() {
+                                if message_index > first_visible && y > clip_bottom {
+                                    render_end = message_index;
+                                    break;
+                                }
+                                y += row_advance(message_index);
+                            }
+                            let mut suffix_height = 0.0;
+                            for message_index in render_end..messages.len() {
+                                suffix_height += row_advance(message_index);
+                            }
+                            // 批量推进不产生行间 spacing，补齐差额以保持
+                            // 与逐行渲染完全相同的布局几何。
+                            if prefix_height > spacing {
+                                ui.allocate_space(egui::vec2(
+                                    message_width.max(1.0),
+                                    prefix_height - spacing,
+                                ));
+                            }
+                            for (message_index, message) in
+                                messages.iter().enumerate().take(render_end).skip(first_visible)
+                            {
                                 let is_new = message_index >= new_message_start
                                     && message.data.user_id != message.data.self_id;
                                 scroll_state.rows.show(
@@ -3734,6 +3804,12 @@ fn chat_body_ui(
                                         message_row_ui(ui, message, is_new, message_width, image_textures);
                                     },
                                 );
+                            }
+                            if suffix_height > 0.0 {
+                                ui.allocate_space(egui::vec2(
+                                    message_width.max(1.0),
+                                    suffix_height - spacing,
+                                ));
                             }
                         },
                     );
@@ -3863,6 +3939,8 @@ fn trpg_group_global_chat_windows(
     voxel_editor: &mut VoxelEditorState,
     voxel_possession: &VoxelPossessionState,
 ) {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("trpg_group_global_chat_windows").entered();
     open_groups.retain(|group_name| manager.trpg_groups.contains_key(group_name));
     let mut group_names = open_groups.iter().cloned().collect::<Vec<_>>();
     group_names.sort();
@@ -5774,16 +5852,33 @@ fn queue_summaries_if_needed(
     summarized_message_counts: &HashMap<String, usize>,
     deepseek_sender: Option<&DeepseekIOSender>,
     deepseek_manager: &mut DeepseekManager,
+    queue_cache: &mut HashMap<String, u64>,
 ) -> bool {
     #[cfg(feature = "profiling")]
     let _profile = info_span!("queue_summaries_if_needed").entered();
     if deepseek_sender.is_none() {
         return false;
     }
-    let mut changed = false;
     let Some(campaign_id) = manager.active_campaign_id() else {
         return false;
     };
+    // 聊天记录按时间追加、总结块由异步请求更新：对决策输入做指纹早退，
+    // 消息与总结状态不变时跳过 O(消息数) 的全量扫描与文本行构建。
+    let fingerprint = summary_queue_fingerprint(
+        manager,
+        target_id,
+        messages,
+        summarized_message_counts,
+        deepseek_manager,
+        &campaign_id,
+    );
+    if queue_cache
+        .get(target_id)
+        .is_some_and(|cached| *cached == fingerprint)
+    {
+        return false;
+    }
+    let mut changed = false;
     for scope in summary_scopes_for_target(manager, target_id, messages) {
         let summary_key = scope.summary_key(&campaign_id, target_id);
         let summarized_message_count = summarized_message_counts
@@ -5801,7 +5896,49 @@ fn queue_summaries_if_needed(
             deepseek_manager,
         );
     }
+    queue_cache.insert(target_id.to_owned(), fingerprint);
     changed
+}
+
+fn summary_queue_fingerprint(
+    manager: &NapcatMessageManager,
+    target_id: &str,
+    messages: &[NapcatMessage],
+    summarized_message_counts: &HashMap<String, usize>,
+    deepseek_manager: &DeepseekManager,
+    campaign_id: &str,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    target_id.hash(&mut hasher);
+    campaign_id.hash(&mut hasher);
+    messages.len().hash(&mut hasher);
+    if let Some(first) = messages.first() {
+        first.data.time.hash(&mut hasher);
+        first.data.message_id.hash(&mut hasher);
+    }
+    if let Some(last) = messages.last() {
+        last.data.time.hash(&mut hasher);
+        last.data.message_id.hash(&mut hasher);
+    }
+    for scope in summary_scopes_for_target(manager, target_id, messages) {
+        let summary_key = scope.summary_key(campaign_id, target_id);
+        summary_key.hash(&mut hasher);
+        summarized_message_counts
+            .get(&summary_key)
+            .copied()
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        if let Some(summary) = deepseek_manager.summaries.get(&summary_key) {
+            summary.blocks.len().hash(&mut hasher);
+            for block in &summary.blocks {
+                block.message_count.hash(&mut hasher);
+                block.pending.hash(&mut hasher);
+                block.error.hash(&mut hasher);
+                block.latest.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
 }
 
 fn queue_summary_if_needed_for_scope(
@@ -6085,7 +6222,12 @@ fn clear_player_related_summaries(
     deepseek_manager.last_post_text.clear();
 }
 
-fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: &DeepseekManager) {
+fn summary_panel(
+    ui: &mut Ui,
+    manager: &NapcatMessageManager,
+    deepseek_manager: &DeepseekManager,
+    cache: &mut SummaryPanelCache,
+) {
     #[cfg(feature = "profiling")]
     let _profile = info_span!("summary_panel").entered();
     ui.heading("DeepSeek 总结");
@@ -6100,38 +6242,94 @@ fn summary_panel(ui: &mut Ui, manager: &NapcatMessageManager, deepseek_manager: 
         return;
     }
 
+    let fingerprint = summary_panel_fingerprint(deepseek_manager);
+    if cache.fingerprint != fingerprint {
+        cache.rows = summary_panel_rows(manager, deepseek_manager);
+        cache.heights.clear();
+        cache.fingerprint = fingerprint;
+    }
+
+    // 行虚拟化：几百个总结块的行只有视口附近的几行需要注册控件，
+    // 屏外行按实测行进距批量推进光标（同聊天窗口的做法）。行高包含
+    // 行首分隔线与行距，批量推进时减去一次多余尾行距保持几何一致。
+    if cache.heights.len() != cache.rows.len() {
+        cache.heights.resize(cache.rows.len(), None);
+    }
+    let row_count = cache.rows.len();
     egui::ScrollArea::vertical().show(ui, |ui| {
-        let mut summaries = deepseek_manager.summaries.iter().collect::<Vec<_>>();
-        summaries.sort_by_key(|(target_id, _)| target_id.as_str());
-
-        for (target_id, summary) in summaries {
-            let (nickname, scope) = summary_display_parts(manager, target_id);
-
-            ui.group(|ui| {
-                ui.label(format!(
-                    "{} / {} / {} 个总结",
-                    nickname,
-                    scope,
-                    summary.blocks.len()
-                ));
-                for block in &summary.blocks {
-                    let start = block.message_count.saturating_sub(4);
-                    ui.separator();
-                    ui.label(format!(
-                        "{}-{} 条",
-                        start, block.message_count
-                    ));
-                    if block.pending {
-                        ui.label("总结中...");
-                    } else if let Some(error) = &block.error {
-                        ui.colored_label(egui::Color32::LIGHT_RED, error);
-                    } else {
-                        ui.label(block.latest.trim());
-                    }
-                }
-            });
+        if row_count == 0 {
+            return;
+        }
+        let spacing = ui.spacing().item_spacing.y;
+        let clip = ui.clip_rect();
+        let clip_top = clip.top() - 300.0;
+        let clip_bottom = clip.bottom() + 300.0;
+        let measured = cache
+            .heights
+            .iter()
+            .filter_map(|height| *height)
+            .collect::<Vec<_>>();
+        let estimated_row_height = if measured.is_empty() {
+            100.0
+        } else {
+            (measured.iter().sum::<f32>() / measured.len() as f32).clamp(30.0, 1200.0)
+        };
+        let row_advance = |index: usize| {
+            cache.heights[index].unwrap_or(estimated_row_height)
+        };
+        let content_top = ui.next_widget_position().y;
+        let mut first_visible = row_count;
+        let mut prefix_height = 0.0;
+        let mut y = content_top;
+        for index in 0..row_count {
+            let advance = row_advance(index);
+            if first_visible == row_count && y + advance >= clip_top {
+                first_visible = index;
+                break;
+            }
+            y += advance;
+            prefix_height += advance;
+        }
+        let mut render_end = row_count;
+        let mut y = content_top + prefix_height;
+        for index in first_visible..row_count {
+            if index > first_visible && y > clip_bottom {
+                render_end = index;
+                break;
+            }
+            y += row_advance(index);
+        }
+        let mut suffix_height = 0.0;
+        for index in render_end..row_count {
+            suffix_height += row_advance(index);
+        }
+        // allocate_space 自带一次尾行距；批量推进 k 行本应有 k 个行距，
+        // 因此这里各减一次 spacing 与逐行渲染几何对齐。
+        if prefix_height > spacing {
+            ui.allocate_space(egui::vec2(
+                ui.available_width().max(1.0),
+                prefix_height - spacing,
+            ));
+        }
+        for index in first_visible..render_end {
+            let row = &cache.rows[index];
+            let row_top = ui.cursor().top();
+            ui.separator();
+            ui.label(egui::RichText::new(row.heading.as_str()).strong());
+            ui.label(row.body.as_str());
+            for error in &row.errors {
+                ui.colored_label(egui::Color32::LIGHT_RED, error.as_str());
+            }
+            cache.heights[index] = Some((ui.cursor().top() - row_top).max(0.0));
+        }
+        if suffix_height > 0.0 {
+            ui.allocate_space(egui::vec2(
+                ui.available_width().max(1.0),
+                suffix_height - spacing,
+            ));
         }
     });
+    ui.separator();
 }
 
 fn pending_chat_requests_window(
@@ -6140,6 +6338,8 @@ fn pending_chat_requests_window(
     napcat_sender: Option<&NapcatIOSender>,
     ime: &mut ResMut<ImeManager>,
 ) {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("pending_chat_requests_window").entered();
     if manager.pending_chat_targets.is_empty() {
         return;
     }
@@ -6270,12 +6470,94 @@ fn cached_ranked_private_chat_timings(
     cache.timings.clone()
 }
 
+/// "DeepSeek 总结"面板的渲染缓存：总结内容不变时复用预排序、预格式化的
+/// 行文本，避免每帧解析 summary key、排序并重新分配全部字符串。
+#[derive(Default)]
+struct SummaryPanelCache {
+    fingerprint: u64,
+    rows: Vec<SummaryPanelRow>,
+    /// 每行实测高度（与 rows 对齐，重建时清空）：滚动虚拟化用。
+    heights: Vec<Option<f32>>,
+}
+
+struct SummaryPanelRow {
+    heading: String,
+    /// 全部总结块预拼接成一个文本（块间空行分隔）：控件数与块数解耦，
+    /// 长会话几百个总结块也只有每行一个 label 的 egui 开销。
+    body: String,
+    /// 出错的块单独以红色显示（正常情况下极少）。
+    errors: Vec<String>,
+}
+
+fn summary_panel_fingerprint(
+    deepseek_manager: &DeepseekManager,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    // 按键排序后哈希，保证同一内容在任意插入顺序下得到相同指纹。
+    let mut keys: Vec<&String> = deepseek_manager.summaries.keys().collect();
+    keys.sort();
+    keys.len().hash(&mut hasher);
+    for key in keys {
+        let summary = &deepseek_manager.summaries[key];
+        key.hash(&mut hasher);
+        summary.blocks.len().hash(&mut hasher);
+        for block in &summary.blocks {
+            block.message_count.hash(&mut hasher);
+            block.pending.hash(&mut hasher);
+            block.error.hash(&mut hasher);
+            block.latest.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn summary_panel_rows(
+    manager: &NapcatMessageManager,
+    deepseek_manager: &DeepseekManager,
+) -> Vec<SummaryPanelRow> {
+    let mut entries: Vec<(&String, &DeepseekSummary)> =
+        deepseek_manager.summaries.iter().collect();
+    entries.sort_by_key(|(target_id, _)| target_id.as_str());
+    entries
+        .into_iter()
+        .map(|(target_id, summary)| {
+                let (nickname, scope) = summary_display_parts(manager, target_id);
+                let heading = format!(
+                    "{} / {} / {} 个总结",
+                    nickname,
+                    scope,
+                    summary.blocks.len()
+                );
+                let mut body_blocks = Vec::with_capacity(summary.blocks.len());
+                let mut errors = Vec::new();
+                for block in &summary.blocks {
+                    let start = block.message_count.saturating_sub(4);
+                    let range = format!("{}-{} 条", start, block.message_count);
+                    if let Some(error) = &block.error {
+                        errors.push(format!("{range}\n{error}"));
+                    } else if block.pending {
+                        body_blocks.push(format!("{range}\n总结中..."));
+                    } else {
+                        body_blocks.push(format!("{range}\n{}", block.latest.trim()));
+                    }
+                }
+                SummaryPanelRow {
+                    heading,
+                    body: body_blocks.join("\n\n"),
+                    errors,
+                }
+            })
+        .collect()
+}
+
 fn waiting_turn_manager_window(
     ctx: &Context,
     manager: &mut ResMut<Persistent<NapcatMessageManager>>,
     auto_mode: &mut GmAutoChatModeState,
     timings_cache: &mut RankedPrivateChatTimingsCache,
 ) {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("waiting_turn_manager_window").entered();
     let Some(group_name) = manager.current_trpg_group.clone() else {
         return;
     };
@@ -17062,13 +17344,71 @@ fn sync_enabled_position_radio_parties(
 ) -> bool {
     #[cfg(feature = "profiling")]
     let _profile = info_span!("sync_enabled_position_radio_parties").entered();
+    // 指纹早退：分组配置与玩家所在区域都不变时跳过每帧的 parties
+    // 克隆与重排（长会话下这曾占用每帧 ~5ms）。
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(u64, bool)>> =
+        std::sync::OnceLock::new();
+    let fingerprint = position_radio_sync_fingerprint(groups, player_areas);
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new((0, false)));
+    {
+        let guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.0 == fingerprint {
+            return guard.1;
+        }
+    }
     let mut changed = false;
     for group in groups.values_mut() {
         if group.position_radio_auto_sync_enabled {
             changed |= sync_position_radio_parties(group, player_areas);
         }
     }
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = (fingerprint, changed);
     changed
+}
+
+fn position_radio_sync_fingerprint(
+    groups: &HashMap<String, TrpgGroup>,
+    player_areas: &HashMap<String, &'static str>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    // 玩家位置条目少；异或合并做到顺序无关。
+    let mut areas_hash = 0_u64;
+    for (target_id, area) in player_areas {
+        let mut entry = DefaultHasher::new();
+        target_id.hash(&mut entry);
+        area.hash(&mut entry);
+        areas_hash ^= entry.finish();
+    }
+    areas_hash.hash(&mut hasher);
+    for (name, group) in groups {
+        let mut entry = DefaultHasher::new();
+        name.hash(&mut entry);
+        group.position_radio_auto_sync_enabled.hash(&mut entry);
+        group.players.hash(&mut entry);
+        // HashMap 未实现 Hash：条目异或合并做到顺序无关。
+        let mut player_parties_hash = 0_u64;
+        for (player_id, party_name) in &group.player_parties {
+            let mut party_entry = DefaultHasher::new();
+            player_id.hash(&mut party_entry);
+            party_name.hash(&mut party_entry);
+            player_parties_hash ^= party_entry.finish();
+        }
+        player_parties_hash.hash(&mut entry);
+        // parties 顺序无关；成员列表本身参与哈希。
+        let mut parties_hash = 0_u64;
+        for (party_name, party) in &group.parties {
+            let mut party_entry = DefaultHasher::new();
+            party_name.hash(&mut party_entry);
+            party.name.hash(&mut party_entry);
+            party.players.hash(&mut party_entry);
+            party.anonymous.hash(&mut party_entry);
+            parties_hash ^= party_entry.finish();
+        }
+        parties_hash.hash(&mut entry);
+        entry.finish().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn trpg_group_settings_window(
@@ -18475,6 +18815,10 @@ pub fn ui_system(
     let chat_analytics_targets: &mut Local<HashSet<String>> = &mut locals.chat_analytics_targets;
     let ranked_timings_cache: &mut Local<RankedPrivateChatTimingsCache> =
         &mut locals.ranked_private_chat_timings_cache;
+    let summary_panel_cache: &mut Local<SummaryPanelCache> =
+        &mut locals.summary_panel_cache;
+    let summary_queue_cache: &mut Local<HashMap<String, u64>> =
+        &mut locals.summary_queue_cache;
     let gm_auto_chat_mode: &mut Local<GmAutoChatModeState> = &mut locals.gm_auto_chat_mode;
     let chat_list_player_visible_filter: &mut Local<Option<String>> =
         &mut locals.chat_list_player_visible_filter;
@@ -18511,10 +18855,14 @@ pub fn ui_system(
     if map_toggle_requested && !ctx.memory(|memory| memory.focused().is_some()) {
         voxel_map_ui_state.full_map_open = !voxel_map_ui_state.full_map_open;
     }
-    if manager.migrate_chat_window_state()
-        || manager.sync_chat_targets()
-        || manager.sync_skill_pool_from_completed_characters()
-    {
+    let chat_state_synced = {
+        #[cfg(feature = "profiling")]
+        let _span_sync = info_span!("ui_sync_chat_state").entered();
+        manager.migrate_chat_window_state()
+            || manager.sync_chat_targets()
+            || manager.sync_skill_pool_from_completed_characters()
+    };
+    if chat_state_synced {
         manager.persist().ok();
     }
     let napcat_sender = napcat_sender.as_deref();
@@ -18546,8 +18894,11 @@ pub fn ui_system(
         }
     }
 
-    let player_position_areas = player_standees
-        .iter()
+    let player_position_areas = {
+        #[cfg(feature = "profiling")]
+        let _span_pos_sync = info_span!("ui_player_position_sync").entered();
+        player_standees
+            .iter()
         .filter(|(_, visibility, _)| **visibility != bevy::prelude::Visibility::Hidden)
         .map(|(standee, _, transform)| {
             let area = voxel_player_area_label(
@@ -18564,7 +18915,8 @@ pub fn ui_system(
             );
             (standee.user_id.to_string(), area)
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<HashMap<_, _>>()
+    };
     if sync_enabled_position_radio_parties(
         &mut manager.trpg_groups,
         &player_position_areas,
@@ -18743,6 +19095,8 @@ pub fn ui_system(
             });
         });
 
+        #[cfg(feature = "profiling")]
+        let _span_workspace = info_span!("ui_chat_workspace_branch").entered();
         pending_chat_requests_window(
             ctx,
             &mut manager,
@@ -18772,6 +19126,7 @@ pub fn ui_system(
             chat_scroll_states,
             image_textures,
             chat_workspace,
+            summary_panel_cache,
             legacy_chat_layout,
         );
         if let Some(target_id) = active_target {
@@ -18784,6 +19139,7 @@ pub fn ui_system(
                 &manager.summarized_message_counts,
                 deepseek_sender,
                 &mut deepseek_manager,
+                summary_queue_cache,
             ) {
                 if let Err(err) = deepseek_manager.persist() {
                     eprintln!("failed to persist DeepSeek summary request: {err}");
@@ -18909,7 +19265,7 @@ pub fn ui_system(
                     ui.label("DeepSeek后台未就绪");
                 }
 
-                summary_panel(ui, &manager, &deepseek_manager);
+                summary_panel(ui, &manager, &deepseek_manager, summary_panel_cache);
             });
         main_view_fullscreen.right_rect = Some(right_panel.response.rect);
     }
@@ -18956,6 +19312,8 @@ pub fn ui_system(
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(&mut viewport_ui, |ui| {
+            #[cfg(feature = "profiling")]
+            let _span_central = info_span!("ui_central_panel").entered();
             let viewport = ui.max_rect();
             let pixels_per_point = ctx.pixels_per_point();
 
@@ -19416,6 +19774,8 @@ pub fn ui_system(
                     } else {
                         affected_names.join("、")
                     };
+                    #[cfg(feature = "profiling")]
+                    let _span_aoe = info_span!("ui_aoe_targets").entered();
                     egui::Area::new(egui::Id::new("voxel_player_aoe_targets"))
                         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -72.0))
                         .order(egui::Order::Foreground)
@@ -19444,6 +19804,8 @@ pub fn ui_system(
                 });
                 let mut release_control_requested = false;
                 if panel_visibility.bottom {
+                    #[cfg(feature = "profiling")]
+                    let _span_hotbar = info_span!("ui_controlled_hotbar").entered();
                     egui::Area::new(egui::Id::new("voxel_controlled_hotbar"))
                         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
                         .order(egui::Order::Foreground)
@@ -19581,6 +19943,8 @@ pub fn ui_system(
             let mut hotbar_clicked = None;
             let mut hotbar_delete = None;
             let hotbar_rect = if panel_visibility.bottom {
+                #[cfg(feature = "profiling")]
+                let _hotbar_profile = info_span!("creative_hotbar").entered();
                 let hotbar_area = egui::Area::new(egui::Id::new("voxel_creative_hotbar"))
                     .anchor(
                         egui::Align2::CENTER_BOTTOM,
@@ -19649,6 +20013,8 @@ pub fn ui_system(
 
             let mut inventory_rect = None;
             if voxel_editor.creative_inventory_open {
+                #[cfg(feature = "profiling")]
+                let _profile = info_span!("creative_inventory_window").entered();
                 const CREATIVE_INVENTORY_WIDTH: f32 = 440.0;
                 let mut picked_item = None;
                 let mut delete_selected = false;
@@ -20053,6 +20419,8 @@ pub fn ui_system(
 
             if voxel_editor.teleport_menu_open {
                 let mut window_open = true;
+                #[cfg(feature = "profiling")]
+                let _span_tp = info_span!("ui_teleport_window").entered();
                 let teleport_window_max_height = (ctx.content_rect().height() - 32.0).max(200.0);
                 egui::Window::new(if voxel_editor.is_spaceship_teleport_tool_equipped() { "舰船传送器" } else { "传送器" })
                     .id(egui::Id::new("voxel_teleport_tool_window"))
@@ -20396,6 +20764,8 @@ pub fn ui_system(
             for (k, v) in &manager.groups.clone() {
                 let group_title = chat_group_title(&k, v, &manager);
                 let unread_count = chat_group_unread_count(&manager, v);
+                #[cfg(feature = "profiling")]
+                let _span_groups = info_span!("ui_group_chat_windows").entered();
                 let combined_messages = combined_group_messages(&manager, &v.members);
                 let group_size = group_chat_inner_size(v.members.len(), ui.max_rect());
                 let group_max_size = group_chat_max_size(ui.max_rect());
@@ -20507,6 +20877,8 @@ pub fn ui_system(
                 visible_targets.extend(group.members.iter().cloned());
             }
 
+            #[cfg(feature = "profiling")]
+            let _span_chat_windows = info_span!("ui_chat_windows_loop").entered();
             for target_id in visible_targets {
                 let empty_messages = Vec::new();
                 let messages = manager.messages.get(&target_id).unwrap_or(&empty_messages);
@@ -20552,6 +20924,7 @@ pub fn ui_system(
                     &manager.summarized_message_counts,
                     deepseek_sender,
                     &mut deepseek_manager,
+                    summary_queue_cache,
                 );
                 if summary_request_changed {
                     if let Err(err) = deepseek_manager.persist() {
@@ -23223,6 +23596,7 @@ mod tests {
             &HashMap::default(),
             None,
             &mut deepseek_manager,
+            &mut HashMap::new(),
         ));
         assert!(deepseek_manager.summaries.is_empty());
     }
@@ -23302,6 +23676,7 @@ mod tests {
             &HashMap::default(),
             Some(&deepseek_sender),
             &mut deepseek_manager,
+            &mut HashMap::new(),
         ));
 
         let public_key = SummaryScope::GroupPublic.summary_key("default", "99");

@@ -73,6 +73,12 @@ use super::{
     MIN_LIVE_DIALOGUE_MS,
 };
 
+/// 片段宽度低于该值（像素）时只绘制不注册交互：全景缩放下每句台词只有
+/// 几个像素，逐片段注册 egui 交互、无障碍信息和悬停文本的开销是平方级的。
+const MIN_CLIP_INTERACT_WIDTH: f32 = 6.0;
+/// 修剪手柄的最小可交互宽度：更窄的片段放大后再修剪。
+const MIN_TRIM_HANDLE_WIDTH: f32 = 16.0;
+
 #[derive(Clone)]
 struct TimelineView {
     zoom: f32,
@@ -516,9 +522,10 @@ struct TimelineTracksCache {
     tracks: Arc<Vec<Track>>,
 }
 
-/// 每帧用廉价哈希检测时间轴轨道显示是否变化；只哈希轨道绘制用到的字段，
-/// 任何会影响显示的修改（含未经 timeline_revision 的台词文字编辑）都会
-/// 改变指纹，未变化的帧直接复用缓存，宁可多算也不显示过期数据。
+/// 每帧用廉价哈希检测时间轴轨道显示是否变化；只哈希轨道绘制用到的字段。
+/// 台词文本与名字的编辑路径都会递增 timeline_revision（台词编辑窗口、
+/// 修剪、撤销重做等），因此这里无需逐句哈希文本——逐句哈希上万句台词
+/// 的全文曾让打开大项目的时间轴每帧多花约 40ms。
 fn timeline_tracks_fingerprint(studio: &ReplayStudio) -> u64 {
     let mut hasher = DefaultHasher::new();
     studio.timeline_revision.hash(&mut hasher);
@@ -530,8 +537,6 @@ fn timeline_tracks_fingerprint(studio: &ReplayStudio) -> u64 {
             line.line_id.hash(&mut hasher);
             line.time_ms.hash(&mut hasher);
             line.duration_ms.hash(&mut hasher);
-            line.name.hash(&mut hasher);
-            line.text.hash(&mut hasher);
         }
         for frame in &replay.camera {
             frame.time_ms.hash(&mut hasher);
@@ -1168,6 +1173,8 @@ pub(super) fn replay_timeline_ui(
         }
         for (row, track) in tracks.iter().enumerate() {
             let top = rect.top() + 30.0 + row as f32 * 32.0;
+            // 当前行内相接的窄片段色带，遇到可交互片段或行结束时落笔。
+            let mut band: Option<(Rect, Color32)> = None;
             full_painter
                 .with_clip_rect(Rect::from_min_max(
                     pos2(visible.left(), visible.top() + 30.0),
@@ -1198,7 +1205,32 @@ pub(super) fn replay_timeline_ui(
                 if !plot_clip.intersects(clip_rect) && preview.is_none() {
                     continue;
                 }
+                // 缩放到全景时几千句台词每句只有几个像素宽；每帧为每个
+                // 片段注册交互、无障碍信息和悬停文本曾让时间轴每帧多花
+                // 几十毫秒。过窄的片段只绘制色块，点击落到背景上仍然
+                // 定位播放头；放大后即可正常选中与修剪。
                 let selected = view.selected == Some(clip.id);
+                let interactive =
+                    clip_rect.width() >= MIN_CLIP_INTERACT_WIDTH || selected;
+                if !interactive {
+                    // 相邻的窄片段合并成一条色带：逐片段填充会让
+                    // tessellation 每帧生成上万个矩形，视觉完全相同。
+                    match &mut band {
+                        Some((rect, _)) if rect.right() + 1.5 >= clip_rect.left() => {
+                            rect.max.x = rect.max.x.max(clip_rect.max.x);
+                        },
+                        _ => {
+                            if let Some((rect, color)) = band.take() {
+                                painter.rect_filled(rect, 2.0, color);
+                            }
+                            band = Some((clip_rect, track.color));
+                        },
+                    }
+                    continue;
+                }
+                if let Some((rect, color)) = band.take() {
+                    painter.rect_filled(rect, 2.0, color);
+                }
                 painter.rect_filled(
                     clip_rect,
                     2.0,
@@ -1223,27 +1255,35 @@ pub(super) fn replay_timeline_ui(
                 if clip.dialogue_index.is_some() {
                     body_rect.max.x = (body_rect.right() - 8.0).max(body_rect.left());
                 }
-                let response = plot_ui.interact(
-                    body_rect,
-                    id.with(clip.id),
-                    Sense::click(),
-                );
-                response
-                    .widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &clip.label));
-                if response.clicked() && enabled {
-                    view.selected = Some(clip.id);
-                    studio.selected_dialogue_id = clip
-                        .dialogue_index
-                        .map(|index| studio.replay.as_ref().unwrap().dialogue[index].line_id);
-                    view.duration_seconds = None;
-                    seek = Some(clip.start);
+                let response = if interactive {
+                    let response = plot_ui.interact(
+                        body_rect,
+                        id.with(clip.id),
+                        Sense::click(),
+                    );
+                    response
+                        .widget_info(|| {
+                            WidgetInfo::labeled(WidgetType::Button, enabled, &clip.label)
+                        });
+                    Some(response.on_hover_text(format!(
+                        "{}\n{} — {}",
+                        clip.label,
+                        timeline_time_label(clip.start),
+                        timeline_time_label(clip.end)
+                    )))
+                } else {
+                    None
+                };
+                if let Some(response) = &response {
+                    if response.clicked() && enabled {
+                        view.selected = Some(clip.id);
+                        studio.selected_dialogue_id = clip.dialogue_index.map(|index| {
+                            studio.replay.as_ref().unwrap().dialogue[index].line_id
+                        });
+                        view.duration_seconds = None;
+                        seek = Some(clip.start);
+                    }
                 }
-                response.on_hover_text(format!(
-                    "{}\n{} — {}",
-                    clip.label,
-                    timeline_time_label(clip.start),
-                    timeline_time_label(clip.end)
-                ));
                 if let Some(dialogue_index) = clip.dialogue_index {
                     let handle = Rect::from_min_max(
                         pos2(
@@ -1257,6 +1297,9 @@ pub(super) fn replay_timeline_ui(
                         1.0,
                         Color32::from_white_alpha(135),
                     );
+                    if !interactive || clip_rect.width() < MIN_TRIM_HANDLE_WIDTH {
+                        continue;
+                    }
                     let response = plot_ui
                         .interact(
                             handle,
@@ -1319,6 +1362,9 @@ pub(super) fn replay_timeline_ui(
                         }
                     }
                 }
+            }
+            if let Some((rect, color)) = band.take() {
+                painter.rect_filled(rect, 2.0, color);
             }
         }
         let x = x_at(studio.playback_ms.min(duration));

@@ -212,6 +212,12 @@ impl Plugin for GamePlugin {
                     .window_position()
                     .map(WindowPosition::At)
                     .unwrap_or_default(),
+                // 解除垂直同步，让帧率不再被显示器刷新率封顶。
+                present_mode: if feature_settings.unlimited_frame_rate {
+                    bevy::window::PresentMode::AutoNoVsync
+                } else {
+                    bevy::window::PresentMode::default()
+                },
                 canvas: Some("#bevy".to_string()),
                 ..default()
             }),

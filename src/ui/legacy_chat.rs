@@ -31,6 +31,7 @@ pub(super) fn show_chat_workspace(
     chat_scroll_states: &mut HashMap<String, ChatScrollState>,
     image_textures: &mut HashMap<String, TextureHandle>,
     state: &mut ChatWorkspaceState,
+    summary_panel_cache: &mut SummaryPanelCache,
     legacy_layout: bool,
 ) -> Option<String> {
     let views = workspace_target_views(manager);
@@ -42,7 +43,7 @@ pub(super) fn show_chat_workspace(
             .default_size(260.0)
             .size_range(200.0..=420.0)
             .show(root_ui, |ui| {
-                summary_panel(ui, manager, deepseek_manager);
+                summary_panel(ui, manager, deepseek_manager, summary_panel_cache);
             });
     }
 

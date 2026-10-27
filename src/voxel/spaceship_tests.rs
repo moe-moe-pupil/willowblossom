@@ -1015,10 +1015,7 @@ fn players_follow_the_innermost_ship_without_needing_a_floor_contact() {
 
 #[test]
 fn spaceship_occupant_bounds_use_canonical_voxel_extents() {
-    let body = VoxelPhysicsBody {
-        local_center: Vec3::ZERO,
-        cells: vec![(IVec3::new(-2, 1, 4), 1), (IVec3::new(3, 5, 8), 1)],
-    };
+    let body = VoxelPhysicsBody::new(Vec3::ZERO, vec![(IVec3::new(-2, 1, 4), 1), (IVec3::new(3, 5, 8), 1)]);
 
     let (min, max) = voxel_spaceship_local_bounds(&body).unwrap();
 
@@ -1084,10 +1081,7 @@ fn spaceship_takeover_item_uses_the_assigned_pilot_identity() {
 
 #[test]
 fn spaceship_chase_camera_stays_behind_and_above_the_canonical_hull() {
-    let body = VoxelPhysicsBody {
-        local_center: Vec3::ZERO,
-        cells: vec![(IVec3::new(-4, -1, -8), 1), (IVec3::new(4, 3, 8), 1)],
-    };
+    let body = VoxelPhysicsBody::new(Vec3::ZERO, vec![(IVec3::new(-4, -1, -8), 1), (IVec3::new(4, 3, 8), 1)]);
     let ship_transform = Transform::from_rotation(Quat::from_rotation_y(0.7));
 
     let camera =
@@ -1105,10 +1099,7 @@ fn spaceship_chase_camera_stays_behind_and_above_the_canonical_hull() {
 
 #[test]
 fn spaceship_chase_camera_follows_a_forward_axis_other_than_local_z() {
-    let body = VoxelPhysicsBody {
-        local_center: Vec3::ZERO,
-        cells: vec![(IVec3::new(-20, -1, -6), 1), (IVec3::new(20, 3, 6), 1)],
-    };
+    let body = VoxelPhysicsBody::new(Vec3::ZERO, vec![(IVec3::new(-20, -1, -6), 1), (IVec3::new(20, 3, 6), 1)]);
     let ship_transform = Transform::from_rotation(Quat::from_rotation_y(0.7));
 
     let camera =
@@ -1154,14 +1145,8 @@ fn default_spaceship_specs_author_forward_axes_matching_each_hull() {
 
 #[test]
 fn spaceship_chase_camera_distance_scales_with_voxel_hull_size() {
-    let small = VoxelPhysicsBody {
-        local_center: Vec3::ZERO,
-        cells: vec![(IVec3::new(-2, 0, -4), 1), (IVec3::new(2, 2, 4), 1)],
-    };
-    let large = VoxelPhysicsBody {
-        local_center: Vec3::ZERO,
-        cells: vec![(IVec3::new(-20, 0, -40), 1), (IVec3::new(20, 16, 40), 1)],
-    };
+    let small = VoxelPhysicsBody::new(Vec3::ZERO, vec![(IVec3::new(-2, 0, -4), 1), (IVec3::new(2, 2, 4), 1)]);
+    let large = VoxelPhysicsBody::new(Vec3::ZERO, vec![(IVec3::new(-20, 0, -40), 1), (IVec3::new(20, 16, 40), 1)]);
     let ship_transform = Transform::IDENTITY;
 
     let small_camera =

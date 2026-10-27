@@ -13,11 +13,15 @@ use egui::{
 
 use crate::voxel::VoxelEditorState;
 
+use crate::info_span;
+
 pub(super) fn show_tool_parameter_hud(
     ctx: &Context,
     editor: &mut VoxelEditorState,
     viewport: Rect,
 ) {
+    #[cfg(feature = "profiling")]
+    let _profile = info_span!("tool_parameter_hud").entered();
     let parameters = editor.tool_parameters();
     if parameters.is_empty() && !editor.is_tool_gun_equipped() {
         return;
