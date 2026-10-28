@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use bevy::log::info_span;
+use bevy::log::{info, info_span};
 use bevy::prelude::{
     Query,
     With,
@@ -86,6 +86,11 @@ struct TimelineView {
     duration_seconds: Option<f64>,
     snap: bool,
     trim: Option<TrimGesture>,
+    /// 正在拖动移动的台词卡片：（对话索引，抓取偏移，当前起始时间）。
+    /// current_start 每帧随指针更新，绘制与最终提交都以此为准。
+    move_drag: Option<(usize, u64, u64)>,
+    /// 键盘 Delete 标记的待删台词（行 id），函数末尾统一删除。
+    pending_delete_line_id: Option<u64>,
     history: TimelineHistory,
     follow_playhead: bool,
     scroll_x: f32,
@@ -103,6 +108,8 @@ impl Default for TimelineView {
             duration_seconds: None,
             snap: true,
             trim: None,
+            move_drag: None,
+            pending_delete_line_id: None,
             history: TimelineHistory::default(),
             follow_playhead: true,
             scroll_x: 0.0,
@@ -529,6 +536,12 @@ struct TimelineTracksCache {
 fn timeline_tracks_fingerprint(studio: &ReplayStudio) -> u64 {
     let mut hasher = DefaultHasher::new();
     studio.timeline_revision.hash(&mut hasher);
+    // 分段视图窗口参与指纹：切换分段时轨道按段内数据重建。
+    let window = studio
+        .replay
+        .as_ref()
+        .and_then(|replay| super::active_speech_window(studio, replay));
+    window.hash(&mut hasher);
     if let Some(replay) = studio.replay.as_ref() {
         replay.campaign_id.hash(&mut hasher);
         replay.created_at_unix_ms.hash(&mut hasher);
@@ -577,7 +590,19 @@ fn timeline_tracks_fingerprint(studio: &ReplayStudio) -> u64 {
     hasher.finish()
 }
 
-fn build_timeline_tracks(replay: &ReplayFile) -> Vec<Track> {
+fn build_timeline_tracks(replay: &ReplayFile, window: Option<(u64, u64)>) -> Vec<Track> {
+    // 分段视图：段外数据不进入轨道（数据级隔离，构建与绘制的开销都
+    // 只与段内内容成正比）。
+    let in_window = |time_ms: u64| {
+        window.map_or(true, |(start_ms, end_ms)| {
+            time_ms >= start_ms && time_ms < end_ms
+        })
+    };
+    let spans_window = |first_ms: u64, last_ms: u64| {
+        window.map_or(true, |(start_ms, end_ms)| {
+            first_ms < end_ms && last_ms >= start_ms
+        })
+    };
     let mut tracks = vec![
         Track {
             name: "台词 / 字幕".into(),
@@ -586,7 +611,13 @@ fn build_timeline_tracks(replay: &ReplayFile) -> Vec<Track> {
                 .dialogue
                 .iter()
                 .enumerate()
-                .filter(|(_, line)| replay_dialogue_is_playable(line))
+                .filter(|(_, line)| {
+                    replay_dialogue_is_playable(line)
+                        && spans_window(
+                            line.time_ms,
+                            line.time_ms.saturating_add(line.duration_ms),
+                        )
+                })
                 .map(|(index, line)| Clip {
                     id: Id::new(("dialogue", line.line_id)),
                     start: line.time_ms,
@@ -602,6 +633,7 @@ fn build_timeline_tracks(replay: &ReplayFile) -> Vec<Track> {
             clips: replay
                 .camera
                 .iter()
+                .filter(|frame| in_window(frame.time_ms))
                 .map(|frame| Clip {
                     id: Id::new(("camera", frame.time_ms)),
                     start: frame.time_ms,
@@ -610,18 +642,28 @@ fn build_timeline_tracks(replay: &ReplayFile) -> Vec<Track> {
                     dialogue_index: None,
                 })
                 .chain(
-                    replay.camera_cuts.iter().map(|cut| Clip {
-                        id: Id::new(("cut", cut.time_ms)),
-                        start: cut.time_ms,
-                        end: cut.time_ms,
-                        label: "手动切镜".into(),
-                        dialogue_index: None,
-                    }),
+                    replay
+                        .camera_cuts
+                        .iter()
+                        .filter(|cut| in_window(cut.time_ms))
+                        .map(|cut| Clip {
+                            id: Id::new(("cut", cut.time_ms)),
+                            start: cut.time_ms,
+                            end: cut.time_ms,
+                            label: "手动切镜".into(),
+                            dialogue_index: None,
+                        }),
                 )
                 .collect(),
         },
     ];
-    for movement in &replay.player_movements {
+    for movement in replay.player_movements.iter().filter(|movement| {
+        movement
+            .keyframes
+            .first()
+            .zip(movement.keyframes.last())
+            .is_some_and(|(first, last)| spans_window(first.time_ms, last.time_ms))
+    }) {
         tracks.push(Track {
             name: format!("玩家 {}", movement.user_id),
             color: Color32::from_rgb(55, 145, 110),
@@ -643,7 +685,12 @@ fn build_timeline_tracks(replay: &ReplayFile) -> Vec<Track> {
                 .collect(),
         });
     }
-    for ship in &replay.ship_trajectories {
+    for ship in replay.ship_trajectories.iter().filter(|ship| {
+        ship.keyframes
+            .first()
+            .zip(ship.keyframes.last())
+            .is_some_and(|(first, last)| spans_window(first.time_ms, last.time_ms))
+    }) {
         tracks.push(Track {
             name: format!("飞船 {}", ship.ship_name),
             color: Color32::from_rgb(160, 115, 55),
@@ -669,13 +716,13 @@ fn build_timeline_tracks(replay: &ReplayFile) -> Vec<Track> {
     for time in replay
         .terrain_changes
         .iter()
-        .filter(|change| change.enabled)
+        .filter(|change| change.enabled && in_window(change.time_ms))
         .map(|change| change.time_ms)
         .chain(
             replay
                 .ship_hull_changes
                 .iter()
-                .filter(|change| change.enabled)
+                .filter(|change| change.enabled && in_window(change.time_ms))
                 .map(|change| change.time_ms),
         )
     {
@@ -698,8 +745,10 @@ fn build_timeline_tracks(replay: &ReplayFile) -> Vec<Track> {
     tracks
 }
 
-fn time_at_x(x: f32, left: f32, width: f32, duration: u64) -> u64 {
-    (((x - left) / width.max(1.0)).clamp(0.0, 1.0) as f64 * duration as f64).round() as u64
+fn time_at_x(x: f32, left: f32, width: f32, duration: u64, origin: u64) -> u64 {
+    origin
+        + (((x - left) / width.max(1.0)).clamp(0.0, 1.0) as f64 * duration as f64)
+            .round() as u64
 }
 
 fn reveal_playhead_offset(target: f32, offset: f32, visible: f32, content: f32) -> f32 {
@@ -747,7 +796,7 @@ fn timeline_timecode(time_ms: u64, fps: u32) -> String {
     )
 }
 
-fn timeline_time_label(time_ms: u64) -> String {
+pub(super) fn timeline_time_label(time_ms: u64) -> String {
     format!(
         "{:02}:{:02}.{:03}",
         time_ms / 60_000,
@@ -797,6 +846,7 @@ pub(super) fn replay_timeline_ui(
     if view.history.project != project {
         playhead_changed = true;
         view.selected = None;
+        view.move_drag = None;
         studio.selected_dialogue_id = None;
     }
     if view.history.synchronize(studio) {
@@ -810,7 +860,23 @@ pub(super) fn replay_timeline_ui(
         return;
     };
     let duration = replay.duration_ms.max(1);
-    let extent = duration.saturating_add((duration / 10).max(1000));
+    // 分段视图：时间轴域收缩为分段窗口（标尺从段起点开始，段外片段
+    // 自然被裁剪），seek 与播放头都被钳制在窗口内。
+    let view_segment = studio
+        .active_custom_tab
+        .and_then(|tab_id| replay.custom_tabs.iter().find(|tab| tab.id == tab_id));
+    let view_origin = view_segment.map_or(0, |segment| segment.start_ms);
+    let view_end = match view_segment {
+        Some(segment) => segment.end_ms.min(duration),
+        None => duration,
+    };
+    let extent = match view_segment {
+        Some(segment) => {
+            let span = segment.end_ms.saturating_sub(segment.start_ms).max(1);
+            span.saturating_add((span / 10).max(500))
+        },
+        None => duration.saturating_add((duration / 10).max(1000)),
+    };
     let title = replay.title.clone();
     let tracks_fingerprint = timeline_tracks_fingerprint(studio);
     if view
@@ -820,7 +886,10 @@ pub(super) fn replay_timeline_ui(
     {
         view.tracks_cache = Some(TimelineTracksCache {
             fingerprint: tracks_fingerprint,
-            tracks: Arc::new(build_timeline_tracks(replay)),
+            tracks: Arc::new(build_timeline_tracks(
+                replay,
+                super::active_speech_window(studio, replay),
+            )),
         });
     }
     let tracks = view
@@ -829,7 +898,37 @@ pub(super) fn replay_timeline_ui(
         .expect("tracks cache was just refreshed")
         .tracks
         .clone();
+    // Delete/Backspace 快速删除选中的台词片段：全局按键（不要求指针
+    // 悬停在时间轴上），但键盘焦点在文本框时让位给 egui。
+    if timeline_editing_enabled(studio)
+        && view.selected.is_some()
+        && view.trim.is_none()
+        && !ctx.egui_wants_keyboard_input()
+    {
+        let delete_requested = ui.input_mut(|input| {
+            input.consume_key(Modifiers::NONE, Key::Delete)
+                || input.consume_key(Modifiers::NONE, Key::Backspace)
+        });
+        if delete_requested {
+            let selected_line_id = tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .find(|clip| Some(clip.id) == view.selected)
+                .and_then(|clip| clip.dialogue_index)
+                .and_then(|index| replay.dialogue.get(index))
+                .map(|line| line.line_id);
+            if let Some(line_id) = selected_line_id {
+                info!(?line_id, "timeline delete requested");
+                view.pending_delete_line_id = Some(line_id);
+                view.selected = None;
+                view.duration_seconds = None;
+            }
+        }
+    }
     let mut seek = None;
+    let mut custom_tab_to_add: Option<super::ReplayCustomTab> = None;
+    // 拖动结束后统一提交的台词移动（对话索引，新起始时间）。
+    let mut deferred_moves: Vec<(usize, u64)> = Vec::new();
     let mut toggle_playback = false;
     let mut zoom_changed = false;
     let mut trim_request = None;
@@ -855,10 +954,10 @@ pub(super) fn replay_timeline_ui(
             ui.input_mut(|input| {
                 toggle_playback = input.consume_key(Modifiers::NONE, Key::Space);
                 if input.consume_key(Modifiers::NONE, Key::Home) {
-                    seek = Some(0);
+                    seek = Some(view_origin);
                 }
                 if input.consume_key(Modifiers::NONE, Key::End) {
-                    seek = Some(duration);
+                    seek = Some(view_end);
                 }
                 let previous = input.consume_key(Modifiers::NONE, Key::ArrowLeft);
                 let next = input.consume_key(Modifiers::NONE, Key::ArrowRight);
@@ -867,7 +966,7 @@ pub(super) fn replay_timeline_ui(
                     for _ in 0..if input.modifiers.shift { 10 } else { 1 } {
                         time = adjacent_frame(time, studio.video_fps, next);
                     }
-                    seek = Some(time.min(duration));
+                    seek = Some(time.min(view_end));
                 }
             });
         }
@@ -881,7 +980,7 @@ pub(super) fn replay_timeline_ui(
         ));
         ui.add_enabled_ui(enabled, |ui| {
             if ui.button("⏮ 片头").clicked() {
-                seek = Some(0);
+                seek = Some(view_origin);
             }
             if ui.button("◀ 前一帧").clicked() {
                 seek = Some(adjacent_frame(
@@ -903,7 +1002,7 @@ pub(super) fn replay_timeline_ui(
                         studio.video_fps,
                         true,
                     )
-                    .min(duration),
+                    .min(view_end),
                 );
             }
         });
@@ -917,6 +1016,116 @@ pub(super) fn replay_timeline_ui(
         if ui.button("适合全部").clicked() {
             view.zoom = 1.0;
             zoom_changed = true;
+        }
+        ui.checkbox(&mut studio.speech_enabled, "生成语音")
+            .on_hover_text(
+                "开启后回放会为台词生成并等待语音；编辑时间轴或不想等待时关闭，回放立即推进、不生成语音。",
+            );
+        ui.separator();
+        // 快速分割：输入起止时间，在顶边栏创建一个只含该时段台词的
+        // 分段视图 tab（随回放项目持久化），用于专注编辑某些时间段。
+        let split_start_id = Id::new("replay-quick-split-start");
+        let split_end_id = Id::new("replay-quick-split-end");
+        let (mut start_draft, mut end_draft) = ui.ctx().data_mut(|data| {
+            (
+                data.get_temp::<String>(split_start_id)
+                    .unwrap_or_default(),
+                data.get_temp::<String>(split_end_id)
+                    .unwrap_or_default(),
+            )
+        });
+        let start_edit = ui.add(
+            Label::new(
+                egui::RichText::new("起").small(),
+            ),
+        );
+        let _ = start_edit;
+        ui.add(
+            egui::TextEdit::singleline(&mut start_draft)
+                .desired_width(72.0)
+                .hint_text("分:秒"),
+        );
+        ui.label("~");
+        ui.add(
+            egui::TextEdit::singleline(&mut end_draft)
+                .desired_width(72.0)
+                .hint_text("分:秒"),
+        );
+        if start_edit.changed()
+            || start_draft
+                != ui
+                    .ctx()
+                    .data_mut(|data| {
+                        data.get_temp::<String>(split_start_id)
+                            .unwrap_or_default()
+                    })
+        {
+            let draft = start_draft.clone();
+            ui.ctx().data_mut(|data| data.insert_temp(split_start_id, draft));
+        }
+        if end_draft
+            != ui
+                .ctx()
+                .data_mut(|data| {
+                    data.get_temp::<String>(split_end_id)
+                        .unwrap_or_default()
+                })
+        {
+            let draft = end_draft.clone();
+            ui.ctx().data_mut(|data| data.insert_temp(split_end_id, draft));
+        }
+        if ui.button("✂ 快速分割").clicked() {
+            match (
+                super::parse_user_time_ms(&start_draft),
+                super::parse_user_time_ms(&end_draft),
+            ) {
+                (Some(start_ms), Some(end_ms)) if start_ms < end_ms => {
+                    let start_ms = start_ms.min(duration);
+                    let end_ms = end_ms.min(duration);
+                    let speaking_lines = replay
+                        .dialogue
+                        .iter()
+                        .filter(|line| {
+                            replay_dialogue_is_playable(line)
+                                && line.time_ms >= start_ms
+                                && line.time_ms < end_ms
+                        })
+                        .count();
+                    // 借用中的 replay 不能在此处可变访问：先收集，
+                    // 函数末尾统一提交到回放项目。
+                    custom_tab_to_add = Some(super::ReplayCustomTab {
+                        id: replay
+                            .custom_tabs
+                            .iter()
+                            .map(|tab| tab.id)
+                            .max()
+                            .unwrap_or_default()
+                            .saturating_add(1),
+                        label: format!(
+                            "{}~{}",
+                            timeline_time_label(start_ms),
+                            timeline_time_label(end_ms)
+                        ),
+                        start_ms,
+                        end_ms,
+                    });
+                    studio.status = format!(
+                        "已创建分段视图（{speaking_lines} 句台词），顶边栏可随时切换"
+                    );
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(split_start_id, String::new());
+                        data.insert_temp(split_end_id, String::new());
+                    });
+                },
+                (Some(start_ms), Some(end_ms)) => {
+                    studio.status = format!(
+                        "分割起点必须早于终点（{start_ms}ms ≥ {end_ms}ms）"
+                    );
+                },
+                _ => {
+                    studio.status = "时间格式：分:秒 或 时:分:秒，可带 .毫秒（例如 3:20 或 1:03:20.5）".to_owned();
+                },
+            }
         }
         ui.checkbox(&mut view.snap, "帧吸附");
         ui.checkbox(&mut view.follow_playhead, "跟随播放头");
@@ -1094,7 +1303,10 @@ pub(super) fn replay_timeline_ui(
         let mut plot_ui = ui.new_child(UiBuilder::new().max_rect(rect).id_salt("track-plot"));
         plot_ui.set_clip_rect(plot_clip);
         let left = rect.left() + label_width;
-        let x_at = |time: u64| left + (time as f64 / extent as f64) as f32 * width;
+        let x_at = |time: u64| {
+            left + (time.saturating_sub(view_origin) as f64 / extent as f64) as f32
+                * width
+        };
         let full_painter = ui.painter_at(visible);
         let painter = ui.painter_at(plot_clip);
         full_painter.rect_filled(
@@ -1113,13 +1325,17 @@ pub(super) fn replay_timeline_ui(
         );
         if enabled && (response.clicked() || response.dragged()) {
             if let Some(pointer) = response.interact_pointer_pos() {
-                seek = Some(time_at_x(pointer.x, left, width, extent).min(duration));
+                seek = Some(
+                    time_at_x(pointer.x, left, width, extent, view_origin)
+                        .min(view_end),
+                );
             }
         }
         if response.hovered() {
             // 悬停标尺时显示指针处的时间码和半透明指示线，方便对位。
             if let Some(pointer) = response.hover_pos() {
-                let hover_time = time_at_x(pointer.x, left, width, extent);
+                let hover_time =
+                    time_at_x(pointer.x, left, width, extent, view_origin);
                 painter.line_segment(
                     [pos2(pointer.x, visible.top() + 30.0), pos2(pointer.x, visible.bottom())],
                     Stroke::new(1.0, Color32::from_white_alpha(28)),
@@ -1168,7 +1384,10 @@ pub(super) fn replay_timeline_ui(
         }
         if enabled && (scrub.clicked() || scrub.dragged()) {
             if let Some(pointer) = scrub.interact_pointer_pos() {
-                seek = Some(time_at_x(pointer.x, left, width, extent).min(duration));
+                seek = Some(
+                    time_at_x(pointer.x, left, width, extent, view_origin)
+                        .min(view_end),
+                );
             }
         }
         for (row, track) in tracks.iter().enumerate() {
@@ -1191,10 +1410,21 @@ pub(super) fn replay_timeline_ui(
                 let preview = view
                     .trim
                     .filter(|trim| Some(trim.dialogue_index) == clip.dialogue_index);
-                let clip_end = preview.map_or(clip.end, |trim| {
+                // 被拖动的卡片以 move_drag 的当前位置实时绘制（跟随指针）；
+                // 其余卡片用轨道缓存的位置（编辑后随修订号重建而更新）。
+                let dragged_times = view
+                    .move_drag
+                    .filter(|(index, _, _)| Some(*index) == clip.dialogue_index)
+                    .map(|(_, _, current_start)| {
+                        let duration = clip.end.saturating_sub(clip.start);
+                        (current_start, current_start.saturating_add(duration))
+                    });
+                let (draw_start, draw_base_end) =
+                    dragged_times.unwrap_or((clip.start, clip.end));
+                let clip_end = preview.map_or(draw_base_end, |trim| {
                     trim.start.saturating_add(trim.duration_ms)
                 });
-                let clip_left = x_at(clip.start.min(extent)).min(rect.right() - 5.0);
+                let clip_left = x_at(draw_start.min(view_end)).min(rect.right() - 5.0);
                 let clip_rect = Rect::from_min_max(
                     pos2(clip_left, top + 3.0),
                     pos2(
@@ -1259,7 +1489,7 @@ pub(super) fn replay_timeline_ui(
                     let response = plot_ui.interact(
                         body_rect,
                         id.with(clip.id),
-                        Sense::click(),
+                        Sense::click_and_drag(),
                     );
                     response
                         .widget_info(|| {
@@ -1282,6 +1512,63 @@ pub(super) fn replay_timeline_ui(
                         });
                         view.duration_seconds = None;
                         seek = Some(clip.start);
+                    }
+                    // 拖动卡片主体 = 把该台词移动到指针处的时间位置
+                    // （重新排序其播放位置）；修剪仍由右侧手柄处理。
+                    // 拖动期间只更新 move_drag 的当前位置（回放项目在本
+                    // 函数里是不可变借用），松手后统一提交到 replay。
+                    if enabled && clip.dialogue_index.is_some() && view.trim.is_none() {
+                        let dragging_this = view
+                            .move_drag
+                            .is_some_and(|(index, _, _)| Some(index) == clip.dialogue_index);
+                        if response.drag_started() {
+                            if let Some(pointer) = response.interact_pointer_pos() {
+                                let grab_offset = time_at_x(
+                                    pointer.x,
+                                    left,
+                                    width,
+                                    extent,
+                                    view_origin,
+                                )
+                                .saturating_sub(draw_start);
+                                view.move_drag = Some((
+                                    clip.dialogue_index.unwrap_or(usize::MAX),
+                                    grab_offset,
+                                    clip.start,
+                                ));
+                            }
+                        } else if dragging_this && response.dragged() {
+                            if let Some(pointer) = response.interact_pointer_pos() {
+                                let pointer_time = time_at_x(
+                                    pointer.x,
+                                    left,
+                                    width,
+                                    extent,
+                                    view_origin,
+                                );
+                                let grab_offset = view
+                                    .move_drag
+                                    .map(|(_, offset, _)| offset)
+                                    .unwrap_or_default();
+                                let new_start =
+                                    pointer_time.saturating_sub(grab_offset);
+                                if let Some((_, _, current_start)) = view.move_drag.as_mut() {
+                                    if *current_start != new_start {
+                                        *current_start = new_start;
+                                    }
+                                }
+                            }
+                        }
+                        if dragging_this && response.drag_stopped() {
+                            if let Some((index, _, current_start)) = view.move_drag {
+                                if Some(index) == clip.dialogue_index
+                                    && current_start != clip.start
+                                {
+                                    deferred_moves.push((index, current_start));
+                                }
+                            }
+                            view.move_drag = None;
+                        }
                     }
                 }
                 if let Some(dialogue_index) = clip.dialogue_index {
@@ -1399,6 +1686,67 @@ pub(super) fn replay_timeline_ui(
         studio.mode = ReplayMode::Paused;
         studio.speech_wait_cue = None;
         studio.speech_wait_elapsed_seconds = 0.0;
+    }
+    if let Some(tab) = custom_tab_to_add {
+        let tab_id = tab.id;
+        if let Some(replay) = studio.replay.as_mut() {
+            replay.custom_tabs.push(tab);
+        }
+        studio.workspace_tab = ReplayWorkspaceTab::Edit;
+        studio.active_custom_tab = Some(tab_id);
+        studio.pending_replay_autosave = true;
+    }
+    // Delete 快速删除的统一提交：删除台词、递增修订号并触发自动保存。
+    if let Some(line_id) = view.pending_delete_line_id.take() {
+        if let Some(replay) = studio.replay.as_mut() {
+            if super::delete_replay_dialogue(replay, line_id) {
+                studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
+                studio.pending_replay_autosave = true;
+            }
+        }
+    }
+    // 拖动移动的台词统一提交到回放项目（一次修订 + 触发自动保存）。
+    if !deferred_moves.is_empty() {
+        if let Some(replay) = studio.replay.as_mut() {
+            for (dialogue_index, new_start) in &deferred_moves {
+                if let Some(line) = replay.dialogue.get_mut(*dialogue_index) {
+                    let duration = line.duration_ms.max(1);
+                    line.time_ms = *new_start;
+                    // 推挤：与其他台词重叠时，把它们按时间顺序往后顺延
+                    // （保持各自的时长），不允许两个片段重叠。
+                    let mut cursor_end = new_start.saturating_add(duration);
+                    let mut others: Vec<(usize, u64, u64)> = replay
+                        .dialogue
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != *dialogue_index)
+                        .map(|(i, line)| {
+                            (i, line.time_ms, line.duration_ms.max(1))
+                        })
+                        .collect();
+                    others.sort_by_key(|(_, time, _)| *time);
+                    for (other_index, time, other_duration) in others {
+                        // 完全在移动后片段之前（或之后足够远）的台词不动；
+                        // 只推挤真正与新片段重叠的台词。
+                        let other_end = time.saturating_add(other_duration);
+                        if other_end <= *new_start {
+                            continue;
+                        }
+                        if time >= cursor_end {
+                            cursor_end = other_end;
+                            continue;
+                        }
+                        if let Some(other) = replay.dialogue.get_mut(other_index) {
+                            other.time_ms = cursor_end;
+                        }
+                        cursor_end = cursor_end.saturating_add(other_duration);
+                    }
+                }
+            }
+        }
+        studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
+        studio.selected_dialogue_id = None;
+        studio.pending_replay_autosave = true;
     }
     ctx.data_mut(|data| data.insert_temp(id, view));
 }
@@ -1651,19 +1999,19 @@ mod tests {
     #[test]
     fn ruler_coordinates_clamp_and_scale() {
         assert_eq!(
-            time_at_x(150.0, 100.0, 200.0, 10_000),
+            time_at_x(150.0, 100.0, 200.0, 10_000, 0),
             2_500
         );
         assert_eq!(
-            time_at_x(-10.0, 100.0, 200.0, 10_000),
+            time_at_x(-10.0, 100.0, 200.0, 10_000, 0),
             0
         );
         assert_eq!(
-            time_at_x(900.0, 100.0, 200.0, 10_000),
+            time_at_x(900.0, 100.0, 200.0, 10_000, 0),
             10_000
         );
         assert_eq!(
-            time_at_x(150.0, 100.0, 400.0, 10_000),
+            time_at_x(150.0, 100.0, 400.0, 10_000, 0),
             1_250
         );
     }

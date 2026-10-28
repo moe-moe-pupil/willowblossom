@@ -423,11 +423,15 @@ pub(crate) fn replay_mouse_interaction_inactive(studio: Res<ReplayStudio>) -> bo
 }
 
 fn replay_blocks_mouse_interaction(studio: &ReplayStudio) -> bool {
-    (matches!(
-        studio.mode,
-        ReplayMode::Playing | ReplayMode::Paused
-    ) && !studio.live_editing_enabled)
-        || studio.video_render.is_some()
+    studio.video_render.is_some()
+        || (matches!(
+            studio.mode,
+            ReplayMode::Playing | ReplayMode::Paused
+        ) && !studio.live_editing_enabled)
+        // 工作台打开但未播放：整屏被回放界面覆盖，场景相机与指针锁定
+        // 必须交还给 UI，否则点击面板会因 egui 输入状态滞后一帧而误触
+        // 第一人称指针锁定（光标被锁进预览窗口）。
+        || (studio.panel_open && studio.mode == ReplayMode::Idle)
 }
 
 fn snapshot_new_replay_messages(
@@ -588,6 +592,16 @@ impl ReplayAudience {
     }
 }
 
+/// 顶边栏的自定义分段视图：只显示/编辑 [start_ms, end_ms) 内的台词。
+/// 随回放项目持久化，用于专注编辑某些时间段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ReplayCustomTab {
+    id: u64,
+    label: String,
+    start_ms: u64,
+    end_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReplayFile {
     format_version: u32,
@@ -649,6 +663,9 @@ struct ReplayFile {
     /// 头像集中到这里，台词行里不再重复内嵌。导入时再回填到台词行。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     avatar_data_urls: BTreeMap<String, Arc<str>>,
+    /// 顶边栏自定义分段视图（快速分割创建），随项目持久化。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    custom_tabs: Vec<ReplayCustomTab>,
 }
 
 #[derive(Debug, Clone)]
@@ -1374,6 +1391,10 @@ pub(crate) struct ReplayStudio {
     /// Unlocks normal viewport tools while preview playback remains active.
     /// Replay playback still suppresses campaign persistence.
     live_editing_enabled: bool,
+    /// 当前激活的顶边栏自定义分段视图；None 表示标准工作台视图。
+    active_custom_tab: Option<u64>,
+    /// 时间轴拖动移动/分段变更后立即触发一次自动保存。
+    pending_replay_autosave: bool,
     live_movement_user_id: Option<u64>,
     live_ship_id: Option<String>,
     live_movement_punch_in: Option<ReplayMovementPunchIn>,
@@ -1497,8 +1518,13 @@ struct PreviewSpeechController {
     /// 派生。全量哈希几千句台词曾每帧占用 ~3ms；键含修订号，编辑时
     /// 自动失效重算。
     cached_signature: Option<(u64, usize, u64, u32, u64)>,
-    cached_generation_line_ids: Option<(u64, usize, u64, HashSet<u64>)>,
-    cached_preparation_indices: Option<(u64, u64, u64, Vec<usize>)>,
+    cached_generation_line_ids: Option<(u64, usize, u64, Option<(u64, u64)>, HashSet<u64>)>,
+    cached_preparation_indices: Option<(u64, u64, u64, Option<(u64, u64)>, Vec<usize>)>,
+    /// 上次准备时的逐行语音指纹（行 id → 内容指纹）：cue 以行索引为键，
+    /// 删除/插入台词会平移索引；按行 id 与指纹把未变化台词的**已生成
+    /// 音频**整体搬移，删一句台词不再重新合成全部语音。排队/探测状态
+    /// 不迁移（在途结果随旧签名被丢弃，保留只会造成僵尸排队态）。
+    last_line_fingerprints: Vec<(u64, u64)>,
 }
 
 struct OnnxPreviewWorker {
@@ -1558,6 +1584,8 @@ impl Default for ReplayStudio {
             speech_wait_elapsed_seconds: 0.0,
             speech_bypass_cues: HashSet::new(),
             live_editing_enabled: false,
+            active_custom_tab: None,
+            pending_replay_autosave: false,
             live_movement_user_id: None,
             live_ship_id: None,
             live_movement_punch_in: None,
@@ -2458,6 +2486,14 @@ fn advance_replay(
     let mut waiting_for_audio = None;
     if !recording_take && studio.speech_enabled && onnx_tts_is_available() {
         if let Some(replay) = studio.replay.as_ref() {
+            // 分段视图激活时：段外台词不生成语音、也不阻塞播放。
+            let speech_window = active_speech_window(&studio, replay);
+            let in_speech_window = |index: usize| {
+                replay
+                    .dialogue
+                    .get(index)
+                    .is_some_and(|line| line_in_speech_window(line, speech_window))
+            };
             let current = active_dialogue_index(&replay.dialogue, studio.playback_ms);
             let proposed = active_dialogue_index(&replay.dialogue, proposed_ms);
             let quick_exchange = |index: usize| {
@@ -2466,7 +2502,7 @@ fn advance_replay(
                 })
             };
             if let Some(index) = current {
-                if !quick_exchange(index) {
+                if !quick_exchange(index) && in_speech_window(index) {
                     let signature = replay_voice_signature(replay, studio.speech_volume);
                     let cue = (replay.created_at_unix_ms, index);
                     if !speech.onnx_cue_finished(signature, cue) {
@@ -2480,7 +2516,7 @@ fn advance_replay(
             }
             if proposed != current {
                 if let Some(index) = proposed {
-                    if !quick_exchange(index) {
+                    if !quick_exchange(index) && in_speech_window(index) {
                         let signature = replay_voice_signature(replay, studio.speech_volume);
                         if !speech.onnx_cue_finished(
                             signature,
@@ -2534,14 +2570,6 @@ fn advance_replay(
         }
     }
     studio.playback_ms = proposed_ms;
-    #[cfg(feature = "profiling")]
-    {
-        static POLL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = POLL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n % 5 == 0 {
-            info!(playback_ms = studio.playback_ms, mode = ?studio.mode, "replay tick");
-        }
-    }
     if recording_take {
         // Live DM movement can append footage beyond the original ending.
         // Keep the seek range and saved project duration in sync with the take.
@@ -2694,7 +2722,7 @@ const AUTOSAVE_FINGERPRINT_INTERVAL_FRAMES: usize = 15;
 /// 把当前回放项目定期自动保存到 `autosave.willow-replay.json`，
 /// 崩溃或误操作后重启可自动恢复。渲染/编码期间跳过，避免打断主线程。
 fn autosave_replay_project(
-    studio: Res<ReplayStudio>,
+    mut studio: ResMut<ReplayStudio>,
     op_log: ResMut<OpLog>,
     mut state: Local<ReplayAutosaveState>,
 ) {
@@ -2718,7 +2746,9 @@ fn autosave_replay_project(
     if state.last_saved_fingerprint == Some(fingerprint) {
         return;
     }
-    let immediate = state.last_attempt.is_none()
+    let force_now = std::mem::take(&mut studio.pending_replay_autosave);
+    let immediate = force_now
+        || state.last_attempt.is_none()
         || mode_left_recording
         || state
             .last_attempt
@@ -2771,6 +2801,12 @@ fn replay_autosave_fingerprint(studio: &ReplayStudio) -> Option<u64> {
     replay.camera_cuts.len().hash(&mut hasher);
     replay.area_blocks.len().hash(&mut hasher);
     replay.terrain_changes.len().hash(&mut hasher);
+    for tab in &replay.custom_tabs {
+        tab.id.hash(&mut hasher);
+        tab.label.hash(&mut hasher);
+        tab.start_ms.hash(&mut hasher);
+        tab.end_ms.hash(&mut hasher);
+    }
     replay.ship_hull_changes.len().hash(&mut hasher);
     replay.player_movements.len().hash(&mut hasher);
     replay
@@ -2806,24 +2842,29 @@ fn preview_replay_speech(
     // 以下三个派生数据全部懒加载缓存：键含修订号，编辑时自动失效。
     let pending_generation_line_ids = if panel_active {
         if let Some(replay) = studio.replay.as_ref() {
+            let window = active_speech_window(&studio, replay);
             let key = (
                 replay.created_at_unix_ms,
                 replay.dialogue.len(),
                 studio.timeline_revision,
+                window,
             );
             let stale = speech
                 .cached_generation_line_ids
                 .as_ref()
-                .is_none_or(|(k0, k1, k2, _)| (*k0, *k1, *k2) != key);
+                .is_none_or(|(k0, k1, k2, k3, _)| {
+                    (*k0, *k1, *k2, *k3) != key
+                });
             if stale {
-                let ids = replay_speech_generation_line_ids(replay);
-                speech.cached_generation_line_ids = Some((key.0, key.1, key.2, ids));
+                let ids = replay_speech_generation_line_ids(replay, window);
+                speech.cached_generation_line_ids =
+                    Some((key.0, key.1, key.2, key.3, ids));
             }
         }
         speech
             .cached_generation_line_ids
             .as_ref()
-            .map(|(_, _, _, ids)| ids.clone())
+            .map(|(_, _, _, _, ids)| ids.clone())
             .unwrap_or_default()
     } else {
         Default::default()
@@ -2831,25 +2872,36 @@ fn preview_replay_speech(
     let mut generation_request_consumed = false;
     if panel_active && studio.speech_enabled && onnx_tts_is_available() {
         if let Some(replay) = studio.replay.as_ref() {
+            let window = active_speech_window(&studio, replay);
             let prep_key = (
                 replay.created_at_unix_ms,
                 studio.playback_ms,
                 studio.timeline_revision,
+                window,
             );
+            // prep_key 五元组：末位为分段窗口。
             let prep_stale = speech
                 .cached_preparation_indices
                 .as_ref()
-                .is_none_or(|(k0, k1, k2, _)| (*k0, *k1, *k2) != prep_key);
+                .is_none_or(|(k0, k1, k2, k3, _)| (*k0, *k1, *k2, *k3) != prep_key);
             if prep_stale {
-                let indices =
-                    replay_speech_preparation_indices(replay, studio.playback_ms);
-                speech.cached_preparation_indices =
-                    Some((prep_key.0, prep_key.1, prep_key.2, indices));
+                let indices = replay_speech_preparation_indices(
+                    replay,
+                    studio.playback_ms,
+                    window,
+                );
+                speech.cached_preparation_indices = Some((
+                    prep_key.0,
+                    prep_key.1,
+                    prep_key.2,
+                    prep_key.3,
+                    indices,
+                ));
             }
             let requested = speech
                 .cached_preparation_indices
                 .as_ref()
-                .map(|(_, _, _, indices)| indices.clone())
+                .map(|(_, _, _, _, indices)| indices.clone())
                 .unwrap_or_default();
             match speech.prepare_onnx_replay(
                 replay,
@@ -3005,14 +3057,49 @@ impl PreviewSpeechController {
     ) -> Result<(), String> {
         let signature = self.cached_voice_signature(replay, global_volume, timeline_revision);
         if self.prepared_signature != Some(signature) {
-            self.prepared_signature = Some(signature);
-            self.onnx_cache.clear();
+            // 逐行迁移已生成的音频缓存：cue 以行索引为键，删除/插入台词
+            // 会平移索引。按（行 id、内容指纹——含音色/语速/全局参数）
+            // 把未变化台词的音频搬移，删一句台词只影响那一句。排队与
+            // 探测状态不迁移：旧签名的在途结果会被 worker 丢弃，保留
+            // 只会制造永远等待的僵尸行；这些行按新签名重新探测重排队。
+            let last_fingerprints = std::mem::take(&mut self.last_line_fingerprints);
+            let global_fp = global_speech_fingerprint(replay, global_volume);
+            let new_lines: Vec<(u64, u64)> = replay
+                .dialogue
+                .iter()
+                .map(|line| (line.line_id, line_speech_fingerprint(line, global_fp)))
+                .collect();
+            let mut new_index_by_line: HashMap<u64, usize> = HashMap::new();
+            for (index, (line_id, _)) in new_lines.iter().enumerate() {
+                new_index_by_line.entry(*line_id).or_insert(index);
+            }
+            let mut remapped_cache = HashMap::with_capacity(self.onnx_cache.len());
+            for (cue, audio) in self.onnx_cache.drain() {
+                let Some(old_index) = usize::try_from(cue.1).ok().map(|v| v) else {
+                    continue;
+                };
+                let Some((line_id, fingerprint)) = last_fingerprints.get(old_index)
+                    .copied()
+                else {
+                    continue;
+                };
+                let Some(new_index) = new_index_by_line.get(&line_id).copied() else {
+                    continue;
+                };
+                if new_lines[new_index].1 != fingerprint {
+                    continue;
+                }
+                remapped_cache.insert((cue.0, new_index), audio);
+            }
+            self.onnx_cache = remapped_cache;
             self.onnx_queued.clear();
             self.cache_attempted.clear();
             self.onnx_attempts.clear();
             self.onnx_failures.clear();
             self.generation_cues.clear();
             self.active_cue = None;
+            self.last_line_fingerprints = new_lines;
+            self.prepared_signature = Some(signature);
             if let Some(worker) = self.onnx_worker.as_ref() {
                 worker.latest_signature.store(signature, Ordering::Release);
             }
@@ -3045,6 +3132,12 @@ impl PreviewSpeechController {
                 .cloned()
                 .unwrap_or_else(|| default_speaker_voice_settings(line.sender_id));
             let text = speech_text_for_line(line);
+            // 与 EmotiVoice 前端的音素过滤一致：没有中文/数字的台词无法
+            // 朗读，不排队也不重试，直接标记“已探测”让播放跳过该句语音。
+            if !has_speakable_chinese(&text) {
+                self.cache_attempted.insert(cue);
+                continue;
+            }
             let speaker = resolved_emotivoice_speaker(
                 settings.voice_name.as_deref(),
                 line.sender_id,
@@ -3155,7 +3248,10 @@ impl PreviewSpeechController {
         let total = replay
             .dialogue
             .iter()
-            .filter(|line| replay_dialogue_is_playable(line))
+            .filter(|line| {
+                replay_dialogue_is_playable(line)
+                    && has_speakable_chinese(&line.text)
+            })
             .count();
         if self.prepared_signature
             != Some(replay_voice_signature(
@@ -4008,16 +4104,6 @@ fn apply_replay_camera(
         return;
     };
     if let Ok(mut camera) = camera.single_mut() {
-        #[cfg(feature = "profiling")]
-        {
-            static CAM_POLL: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = CAM_POLL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n % 5 == 0 {
-                let t = transform.translation;
-                info!(cam_x = t.x, cam_y = t.y, cam_z = t.z, "replay cam");
-            }
-        }
         *camera = transform;
         for (mut standee_transform, _) in &mut standees {
             if let Some(rotation) = replay_standee_facing_rotation(
@@ -5299,6 +5385,7 @@ fn replay_controls(
                             Some(path) => format!("已载入项目：{}（原项目已备份到 {path}）", replay.title),
                             None => format!("已载入项目：{}", replay.title),
                         };
+    studio.active_custom_tab = None;
                         studio.replay = Some(replay);
                     },
                     Err(err) => studio.status = format!("项目载入失败：{err}"),
@@ -5651,6 +5738,7 @@ fn start_recording(
     studio.playback_ms = 0;
     studio.director_request_pending = false;
     studio.director_response_hash = None;
+    studio.active_custom_tab = None;
     studio.auto_export_after_director = false;
     studio.replay = Some(replay);
     studio.mode = ReplayMode::Recording;
@@ -6453,6 +6541,7 @@ fn new_replay(
         master_dialogue_duration: default_master_dialogue_duration(),
         speaker_voice_settings: HashMap::new(),
         avatar_data_urls: BTreeMap::new(),
+        custom_tabs: Vec::new(),
     }
 }
 
@@ -6664,6 +6753,70 @@ fn move_replay_dialogue(
     replay.dialogue.insert(insertion_index, dragged);
     replay.manual_dialogue_order = true;
     true
+}
+
+/// 解析用户输入的时间点：接受 “秒”、“分:秒”、“时:分:秒”，末段可带
+/// “.毫秒”。返回毫秒；解析失败返回 None。
+fn parse_user_time_ms(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (main, fraction_ms) = match text.split_once('.') {
+        Some((main, fraction)) => {
+            let fraction = format!("{:0<3}", fraction);
+            let milliseconds: u64 = fraction.get(..3)?.parse().ok()?;
+            (main, milliseconds)
+        },
+        None => (text, 0),
+    };
+    let mut values = [0_u64; 3];
+    for (index, part) in main.split(':').enumerate() {
+        if index >= 3 {
+            return None;
+        }
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        // 防御粘贴超长数字：u64 溢出在 dev 构建会 panic。
+        values[index] = part.parse::<u64>().ok()?.min(u64::MAX / 3_600_000);
+    }
+    let consumed = main.split(':').count();
+    let (hours, minutes, seconds) = match consumed {
+        1 => (0, 0, values[0]),
+        2 => (0, values[0], values[1]),
+        _ => (values[0], values[1], values[2]),
+    };
+    Some(((hours * 60 + minutes) * 60 + seconds) * 1000 + fraction_ms)
+}
+
+/// 简易分:秒.毫秒标签（与时间轴的行标签一致）。
+fn timeline_time_label_local(time_ms: u64) -> String {
+    format!(
+        "{:02}:{:02}.{:03}",
+        time_ms / 60_000,
+        (time_ms / 1000) % 60,
+        time_ms % 1000
+    )
+}
+
+/// 分段视图版的全选/取消：只影响时间段内的台词。
+fn set_range_replay_dialogue_included(
+    replay: &mut ReplayFile,
+    segment: &ReplayCustomTab,
+    included: bool,
+) -> bool {
+    let mut changed = false;
+    for line in &mut replay.dialogue {
+        if line.time_ms >= segment.start_ms && line.time_ms < segment.end_ms {
+            if line.included != included {
+                line.included = included;
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 fn set_all_replay_dialogue_included(replay: &mut ReplayFile, included: bool) -> bool {
@@ -7482,12 +7635,75 @@ fn replay_dialogue_editor(
             } else {
                 ui.small("按 XZ 水平距离自动分区；重新分区或重建三回合区块会覆盖区域名和手动区块顺序。");
             }
+            let active_segment = studio.active_custom_tab.and_then(|tab_id| {
+                replay
+                    .custom_tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .cloned()
+            });
+            if let Some(segment) = active_segment.as_ref() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(80, 190, 120),
+                        format!(
+                            "✂ 分段视图 {}（{} ~ {}）",
+                            segment.label,
+                            timeline_time_label_local(segment.start_ms),
+                            timeline_time_label_local(segment.end_ms),
+                        ),
+                    );
+                    if ui.button("导出该时间段台词（JSON）").clicked() {
+                        let exported = serde_json::json!({
+                            "format_version": 1,
+                            "title": replay.title,
+                            "start_ms": segment.start_ms,
+                            "end_ms": segment.end_ms,
+                            "dialogue": replay
+                                .dialogue
+                                .iter()
+                                .filter(|line| {
+                                    line.time_ms >= segment.start_ms
+                                        && line.time_ms < segment.end_ms
+                                })
+                                .collect::<Vec<_>>(),
+                        });
+                        let path = format!(
+                            ".data/willowblossom/replays/segment-{}-{}.json",
+                            segment.start_ms, segment.end_ms
+                        );
+                        match serde_json::to_vec_pretty(&exported).map_err(|err| err.to_string())
+                            .and_then(|bytes| {
+                                fs::write(&path, bytes).map_err(|err| err.to_string())
+                            }) {
+                            Ok(()) => {
+                                studio.status = format!("已导出该时间段台词到 {path}");
+                            },
+                            Err(err) => {
+                                studio.status = format!("导出该时间段台词失败：{err}");
+                            },
+                        }
+                    }
+                    if ui.button("退出分段视图").clicked() {
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 if ui.button("全选").clicked() {
-                    changed |= set_all_replay_dialogue_included(replay, true);
+                    changed |= match active_segment.as_ref() {
+                        Some(segment) => {
+                            set_range_replay_dialogue_included(replay, segment, true)
+                        },
+                        None => set_all_replay_dialogue_included(replay, true),
+                    };
                 }
                 if ui.button("全部取消").clicked() {
-                    changed |= set_all_replay_dialogue_included(replay, false);
+                    changed |= match active_segment.as_ref() {
+                        Some(segment) => {
+                            set_range_replay_dialogue_included(replay, segment, false)
+                        },
+                        None => set_all_replay_dialogue_included(replay, false),
+                    };
                 }
                 if ui.button("新增 DM 台词").clicked() {
                     dialogue_add_requested = true;
@@ -7499,7 +7715,88 @@ fn replay_dialogue_editor(
                 .id_salt("replay-dialogue-editor")
                 .max_height(320.0)
                 .show(ui, |ui| {
-                    for line in &mut replay.dialogue {
+                    // 行虚拟化：几千张台词卡片每张有十几个控件，全部渲染曾
+                    // 让编辑页掉到个位数帧率。只渲染视口附近的卡片，屏外
+                    // 卡片按缓存高度批量推进光标；拖拽排序只在可见卡片间
+                    // 可用（与常规虚拟列表一致）。
+                    let list_spacing = ui.spacing().item_spacing.y;
+                    let list_clip = ui.clip_rect();
+                    let list_clip_top = list_clip.top() - 500.0;
+                    let list_clip_bottom = list_clip.bottom() + 500.0;
+                    let row_heights_id = egui::Id::new("replay-dialogue-editor-row-heights");
+                    let mut row_heights: Vec<Option<f32>> = ui
+                        .ctx()
+                        .data_mut(|data| data.get_temp(row_heights_id).unwrap_or_default());
+                    row_heights.resize(replay.dialogue.len(), None);
+                    // 分段视图激活时只遍历时间段内的台词。
+                    let visible_indices: Vec<usize> = match active_segment.as_ref() {
+                        Some(segment) => replay
+                            .dialogue
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, line)| {
+                                line.time_ms >= segment.start_ms
+                                    && line.time_ms < segment.end_ms
+                            })
+                            .map(|(index, _)| index)
+                            .collect(),
+                        None => (0..replay.dialogue.len()).collect(),
+                    };
+                    let measured_heights = row_heights
+                        .iter()
+                        .filter_map(|height| *height)
+                        .collect::<Vec<_>>();
+                    let estimated_row = if measured_heights.is_empty() {
+                        140.0
+                    } else {
+                        (measured_heights.iter().sum::<f32>()
+                            / measured_heights.len() as f32)
+                            .clamp(60.0, 900.0)
+                    };
+                    let row_advance = |position: usize| {
+                        row_heights[visible_indices[position]]
+                            .unwrap_or(estimated_row)
+                            + list_spacing
+                    };
+                    let content_top = ui.cursor().top();
+                    let row_total = visible_indices.len();
+                    let mut first_visible = row_total;
+                    let mut prefix_height = 0.0;
+                    let mut y = content_top;
+                    for position in 0..row_total {
+                        let advance = row_advance(position);
+                        if first_visible == row_total
+                            && y + row_advance(position) - list_spacing >= list_clip_top
+                        {
+                            first_visible = position;
+                            break;
+                        }
+                        y += advance;
+                        prefix_height += advance;
+                    }
+                    let mut render_end = row_total;
+                    let mut y = content_top + prefix_height;
+                    for position in first_visible..row_total {
+                        if position > first_visible && y > list_clip_bottom {
+                            render_end = position;
+                            break;
+                        }
+                        y += row_advance(position);
+                    }
+                    let mut suffix_height = 0.0;
+                    for position in render_end..row_total {
+                        suffix_height += row_advance(position);
+                    }
+                    if prefix_height > list_spacing {
+                        ui.allocate_space(egui::vec2(
+                            ui.available_width().max(1.0),
+                            prefix_height - list_spacing,
+                        ));
+                    }
+                    for position in first_visible..render_end {
+                        let line = &mut replay.dialogue[visible_indices[position]];
+                        let row_index = visible_indices[position];
+                        let row_top = ui.cursor().top();
                         let target_line_id = line.line_id;
                         let (drop_zone, dropped) = ui.dnd_drop_zone::<ReplayDialogueDrag, _>(
                             egui::Frame::group(ui.style()),
@@ -7613,11 +7910,32 @@ fn replay_dialogue_editor(
                                     Some((dragged.line_id, target_line_id, insert_after));
                             }
                         }
+                        row_heights[row_index] =
+                            Some((ui.cursor().top() - row_top).max(0.0));
                     }
+                    if suffix_height > list_spacing {
+                        ui.allocate_space(egui::vec2(
+                            ui.available_width().max(1.0),
+                            suffix_height - list_spacing,
+                        ));
+                    }
+                    ui.ctx().data_mut(|data| data.insert_temp(row_heights_id, row_heights));
                 });
             if dialogue_add_requested {
-                append_dm_replay_dialogue(replay);
+                let new_line_id = append_dm_replay_dialogue(replay);
                 changed = true;
+                // 分段视图：新台词落在段尾（而非 u64::MAX 的全项目末尾），
+                // 保证在当前视图中立即可见。
+                if let Some(segment) = active_segment.as_ref() {
+                    let time_ms = segment.end_ms.min(replay.duration_ms.max(1));
+                    if let Some(line) = replay
+                        .dialogue
+                        .iter_mut()
+                        .find(|line| line.line_id == new_line_id)
+                    {
+                        line.time_ms = time_ms;
+                    }
+                }
             }
             if let Some(line_id) = dialogue_delete {
                 changed |= delete_replay_dialogue(replay, line_id);
@@ -7641,6 +7959,9 @@ fn replay_dialogue_editor(
             for index in 0..replay.area_blocks.len() {
                 let block_count = replay.area_blocks.len();
                 let block = &mut replay.area_blocks[index];
+                // 稳定的行 id：位置推导的自动 id 在列表变化时会整体移位，
+                // 触发 egui 的 id 变更警告与注册表每帧重建。
+                ui.push_id(block.id, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!("{}.", index + 1));
                     let area_changed = ui
@@ -7681,6 +8002,7 @@ fn replay_dialogue_editor(
                     {
                         block_merge = Some(index);
                     }
+                });
                 });
             }
             for (block_id, area) in block_renames {
@@ -13799,13 +14121,21 @@ fn active_dialogue_index(dialogue: &[ReplayDialogue], time_ms: u64) -> Option<us
     })
 }
 
-fn replay_speech_preparation_indices(replay: &ReplayFile, playback_ms: u64) -> Vec<usize> {
+fn replay_speech_preparation_indices(
+    replay: &ReplayFile,
+    playback_ms: u64,
+    window: Option<(u64, u64)>,
+) -> Vec<usize> {
     let priority = active_dialogue_index(&replay.dialogue, playback_ms)
-        .filter(|index| replay.dialogue[*index].speech_enabled)
+        .filter(|index| {
+            let line = &replay.dialogue[*index];
+            line.speech_enabled && line_in_speech_window(line, window)
+        })
         .or_else(|| {
             replay.dialogue.iter().position(|line| {
                 replay_dialogue_is_playable(line)
                     && line.speech_enabled
+                    && line_in_speech_window(line, window)
                     && line.time_ms >= playback_ms
             })
         });
@@ -13819,6 +14149,7 @@ fn replay_speech_preparation_indices(replay: &ReplayFile, playback_ms: u64) -> V
                 .filter_map(|(index, line)| {
                     (replay_dialogue_is_playable(line)
                         && line.speech_enabled
+                        && line_in_speech_window(line, window)
                         && Some(index) != priority)
                         .then_some(index)
                 }),
@@ -13826,11 +14157,83 @@ fn replay_speech_preparation_indices(replay: &ReplayFile, playback_ms: u64) -> V
         .collect()
 }
 
-fn replay_speech_generation_line_ids(replay: &ReplayFile) -> HashSet<u64> {
+/// 与 EmotiVoice 前端的音素过滤一致：只保留中文与数字。完全没有
+/// 可朗读字符的台词跳过语音合成。
+fn has_speakable_chinese(text: &str) -> bool {
+    text.chars()
+        .any(|c| ('\u{3400}'..='\u{9fff}').contains(&c) || c.is_ascii_digit())
+}
+
+/// 全局语音参数指纹（整体语速、全局音量、每个说话者的音色/情感/音量
+/// 设置）：任一变化都会让全部行级语音指纹失效并触发重新生成。
+fn global_speech_fingerprint(replay: &ReplayFile, global_volume: f32) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    replay.master_speech_speed.to_bits().hash(&mut hasher);
+    global_volume.to_bits().hash(&mut hasher);
+    let mut settings: Vec<(u64, &SpeakerVoiceSettings)> = replay
+        .speaker_voice_settings
+        .iter()
+        .map(|(sender_id, settings)| (*sender_id, settings))
+        .collect();
+    settings.sort_by_key(|(sender_id, _)| *sender_id);
+    for (sender_id, settings) in settings {
+        sender_id.hash(&mut hasher);
+        settings.voice_name.hash(&mut hasher);
+        settings.emotion.hash(&mut hasher);
+        settings.volume.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// 逐行语音内容指纹：文本、发音脚本、说话者与音量/语速任一变化都会
+/// 改变指纹；用于编辑台词后按行判断语音是否需要重新生成。
+fn line_speech_fingerprint(line: &ReplayDialogue, global_fp: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    global_fp.hash(&mut hasher);
+    line.line_id.hash(&mut hasher);
+    line.text.hash(&mut hasher);
+    line.speech_text.hash(&mut hasher);
+    line.sender_id.hash(&mut hasher);
+    line.speech_enabled.hash(&mut hasher);
+    line.speech_rate.to_bits().hash(&mut hasher);
+    line.speech_volume.to_bits().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 当前激活分段的时间窗（无分段视图时返回 None = 全部台词）。
+fn active_speech_window(
+    studio: &ReplayStudio,
+    replay: &ReplayFile,
+) -> Option<(u64, u64)> {
+    let tab_id = studio.active_custom_tab?;
+    let tab = replay.custom_tabs.iter().find(|tab| tab.id == tab_id)?;
+    Some((tab.start_ms, tab.end_ms))
+}
+
+fn line_in_speech_window(
+    line: &ReplayDialogue,
+    window: Option<(u64, u64)>,
+) -> bool {
+    match window {
+        Some((start_ms, end_ms)) => {
+            line.time_ms >= start_ms && line.time_ms < end_ms
+        },
+        None => true,
+    }
+}
+
+fn replay_speech_generation_line_ids(
+    replay: &ReplayFile,
+    window: Option<(u64, u64)>,
+) -> HashSet<u64> {
     replay
         .dialogue
         .iter()
-        .filter(|line| replay_dialogue_is_playable(line) && line.speech_enabled)
+        .filter(|line| {
+            replay_dialogue_is_playable(line)
+                && line.speech_enabled
+                && line_in_speech_window(line, window)
+        })
         .map(|line| line.line_id)
         .collect()
 }
@@ -17118,7 +17521,7 @@ mod tests {
         replay.dialogue[1].included = false;
 
         assert_eq!(
-            replay_speech_preparation_indices(&replay, 2_100),
+            replay_speech_preparation_indices(&replay, 2_100, None),
             vec![2, 0]
         );
 
@@ -17232,7 +17635,7 @@ mod tests {
         replay.dialogue[2].included = false;
 
         assert_eq!(
-            replay_speech_generation_line_ids(&replay),
+            replay_speech_generation_line_ids(&replay, None),
             HashSet::from([10, 20]),
         );
     }
@@ -18190,6 +18593,7 @@ mod tests {
             master_dialogue_duration: default_master_dialogue_duration(),
             speaker_voice_settings: HashMap::new(),
             avatar_data_urls: BTreeMap::new(),
+            custom_tabs: Vec::new(),
         }
     }
 
@@ -20373,6 +20777,82 @@ mod tests {
     }
 
     #[test]
+    fn parse_user_time_ms_accepts_common_formats() {
+        assert_eq!(parse_user_time_ms("0"), Some(0));
+        assert_eq!(parse_user_time_ms("90"), Some(90_000));
+        assert_eq!(parse_user_time_ms("1:30"), Some(90_000));
+        assert_eq!(parse_user_time_ms("1:03:20.5"), Some(3_800_500));
+        assert_eq!(parse_user_time_ms("2:03.25"), Some(123_250));
+        assert_eq!(parse_user_time_ms(""), None);
+        assert_eq!(parse_user_time_ms("abc"), None);
+    }
+
+    #[test]
+    fn custom_tabs_persist_through_serde_and_filter_dialogue() {
+        let mut replay = test_replay(vec![
+            test_dialogue(0, 1_000, DialogueSide::Right),
+            test_dialogue(5_000, 1_000, DialogueSide::Right),
+            test_dialogue(10_000, 1_000, DialogueSide::Right),
+        ]);
+        replay.custom_tabs.push(ReplayCustomTab {
+            id: 11,
+            label: "测试段".to_owned(),
+            start_ms: 4_000,
+            end_ms: 11_000,
+        });
+        // serde 往返：自定义 tab 随项目持久化。
+        let bytes = serde_json::to_vec(&replay).unwrap();
+        let imported: ReplayFile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(imported.custom_tabs.len(), 1);
+        assert_eq!(imported.custom_tabs[0].start_ms, 4_000);
+
+        // 分段视图只包含时间段内的台词。
+        let segment = &imported.custom_tabs[0];
+        let visible = imported
+            .dialogue
+            .iter()
+            .filter(|line| {
+                line.time_ms >= segment.start_ms && line.time_ms < segment.end_ms
+            })
+            .count();
+        assert_eq!(visible, 2);
+    }
+
+    #[test]
+    fn editing_one_line_keeps_other_lines_cached_audio() {
+        // 删除一句台词只应影响那一句：其余台词的语音缓存按行 id 迁移，
+        // 不再整体清空重新生成。
+        let mut replay = test_replay(vec![
+            test_dialogue(0, 1_000, DialogueSide::Right),
+            test_dialogue(1_000, 1_000, DialogueSide::Right),
+            test_dialogue(2_000, 1_000, DialogueSide::Right),
+        ]);
+        for (index, line) in replay.dialogue.iter_mut().enumerate() {
+            line.line_id = index as u64 + 1;
+        }
+        replay.created_at_unix_ms = 7;
+        let mut speech = PreviewSpeechController::default();
+        speech
+            .prepare_onnx_replay(&replay, 1.0, 0, &[], &HashSet::new())
+            .unwrap();
+        let cue_b = (7, 1);
+        speech.onnx_cache.insert(cue_b, (vec![1, 2, 3], 0.8));
+
+        // 删除第一行：B 的索引 1 → 0，修订号变化触发签名变化。
+        replay.dialogue.remove(0);
+        speech
+            .prepare_onnx_replay(&replay, 1.0, 1, &[], &HashSet::new())
+            .unwrap();
+
+        assert_eq!(
+            speech.onnx_cache.get(&(7, 0)),
+            Some(&(vec![1, 2, 3], 0.8)),
+            "unchanged line B keeps its cached audio at the shifted index"
+        );
+        assert!(!speech.onnx_cache.contains_key(&(7, 1)));
+    }
+
+    #[test]
     fn pending_scene_edits_persist_across_restarts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("pending-scene-edits.json");
@@ -20393,6 +20873,7 @@ mod tests {
         load_pending_scene_edits_from(&path, &mut reloaded);
 
         assert_eq!(reloaded.pending_terrain_changes, studio.pending_terrain_changes);
+    studio.active_custom_tab = None;
         assert_eq!(reloaded.pending_ship_hull_changes, studio.pending_ship_hull_changes);
     }
 

@@ -16,6 +16,7 @@ use bevy_egui::egui::{
 };
 
 use super::{
+    timeline::timeline_time_label,
     ReplayMode,
     ReplayStudio,
 };
@@ -49,7 +50,43 @@ pub(super) fn workspace_header(root_ui: &mut Ui, studio: &mut ReplayStudio) {
                 (ReplayWorkspaceTab::Director, "导演"),
                 (ReplayWorkspaceTab::Export, "输出"),
             ] {
-                ui.selectable_value(&mut studio.workspace_tab, tab, label);
+                let response = ui.selectable_value(&mut studio.workspace_tab, tab, label);
+                if response.clicked() {
+                    studio.active_custom_tab = None;
+                }
+            }
+            // 快速分割创建的分段视图 tab：随回放项目持久化。
+            if let Some(replay) = studio.replay.as_ref() {
+                let mut removed_tab = None;
+                for tab in &replay.custom_tabs {
+                    let selected = studio.active_custom_tab == Some(tab.id);
+                    let response = ui.selectable_label(
+                        selected,
+                        format!("✂ {}", tab.label),
+                    );
+                    if response.clicked() {
+                        studio.workspace_tab = ReplayWorkspaceTab::Edit;
+                        studio.active_custom_tab = Some(tab.id);
+                    }
+                    response.on_hover_text(format!(
+                        "分段视图：只显示/编辑 {} ~ {} 的台词（随项目保存）",
+                        timeline_time_label(tab.start_ms),
+                        timeline_time_label(tab.end_ms),
+                    ));
+                    if ui.small_button("×").clicked() {
+                        removed_tab = Some(tab.id);
+                    }
+                }
+                if let Some(removed) = removed_tab {
+                    if studio.active_custom_tab == Some(removed) {
+                        studio.active_custom_tab = None;
+                    }
+                    if let Some(replay) = studio.replay.as_mut() {
+                        replay.custom_tabs.retain(|tab| tab.id != removed);
+                    }
+                    // 分段移除也立即触发自动保存，避免重启后复活。
+                    studio.pending_replay_autosave = true;
+                }
             }
             ui.separator();
             if ui.button("返回主界面").clicked() {

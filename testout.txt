@@ -1,0 +1,313 @@
+warning: field `child` is never read
+  --> crates\bevy_voxel\src\grid.rs:63:5
+   |
+60 | struct Entry<T> {
+   |        ----- field in this struct
+...
+63 |     child: Option<Entity>,
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxxelmaxx` (lib) generated 1 warning
+   Compiling willowblossom v0.0.2 (D:\rust_repo\willowblossom)
+warning: unused import: `crate::info_span`
+  --> src\ui\tool_parameter_hud.rs:16:5
+   |
+16 | use crate::info_span;
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+     --> src\battle_round.rs:18949:13
+      |
+18949 |         let mut manager = empty_manager();
+      |             ----^^^^^^^
+      |             |
+      |             help: remove this `mut`
+      |
+      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `manager`
+     --> src\battle_round.rs:18949:13
+      |
+18949 |         let mut manager = empty_manager();
+      |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_manager`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+     --> src\battle_round.rs:19341:13
+      |
+19341 |         let mut manager = empty_manager();
+      |             ----^^^^^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> src\battle_round.rs:19378:13
+      |
+19378 |         let mut manager = empty_manager();
+      |             ----^^^^^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: unused variable: `manager`
+     --> src\battle_round.rs:19378:13
+      |
+19378 |         let mut manager = empty_manager();
+      |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_manager`
+
+warning: field `round` is never read
+   --> src\battle_round.rs:828:9
+    |
+824 | pub struct BattleEncounterEntity {
+    |            --------------------- field in this struct
+...
+828 |     pub round: u32,
+    |         ^^^^^
+    |
+    = note: `BattleEncounterEntity` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `encounter_id`, `target_id`, and `display_name` are never read
+   --> src\battle_round.rs:834:9
+    |
+833 | pub struct BattleParticipantEntity {
+    |            ----------------------- fields in this struct
+834 |     pub encounter_id: String,
+    |         ^^^^^^^^^^^^
+835 |     pub target_id: String,
+    |         ^^^^^^^^^
+836 |     pub display_name: String,
+    |         ^^^^^^^^^^^^
+    |
+    = note: `BattleParticipantEntity` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `current` is never read
+   --> src\battle_round.rs:841:9
+    |
+840 | pub struct TurnCounter {
+    |            ----------- field in this struct
+841 |     pub current: u32,
+    |         ^^^^^^^
+    |
+    = note: `TurnCounter` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `alive`, `negative_layers`, and `pending_negative` are never read
+   --> src\battle_round.rs:846:9
+    |
+845 | pub struct BattlePresence {
+    |            -------------- fields in this struct
+846 |     pub alive: bool,
+    |         ^^^^^
+847 |     pub negative_layers: u32,
+    |         ^^^^^^^^^^^^^^^
+848 |     pub pending_negative: bool,
+    |         ^^^^^^^^^^^^^^^^
+    |
+    = note: `BattlePresence` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `hp`, `max_hp`, `mp`, `max_mp`, `hp_regen`, and `mp_regen` are never read
+   --> src\battle_round.rs:853:9
+    |
+852 | pub struct BattleVitals {
+    |            ------------ fields in this struct
+853 |     pub hp: f32,
+    |         ^^
+854 |     pub max_hp: f32,
+    |         ^^^^^^
+855 |     pub mp: f32,
+    |         ^^
+856 |     pub max_mp: f32,
+    |         ^^^^^^
+857 |     pub hp_regen: f32,
+    |         ^^^^^^^^
+858 |     pub mp_regen: f32,
+    |         ^^^^^^^^
+    |
+    = note: `BattleVitals` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: constant `SUNSET_DAMAGE_REDUCTION_PER_YARD` is never used
+   --> src\battle_round.rs:876:11
+    |
+876 | pub const SUNSET_DAMAGE_REDUCTION_PER_YARD: f32 = 1.0;
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MUTANT_PROTECTIVE_SUIT_OPENING_SHIELD` is never used
+  --> src\hidden_roles.rs:26:11
+   |
+26 | pub const MUTANT_PROTECTIVE_SUIT_OPENING_SHIELD: f32 = 3.0;
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `Connected` is never constructed
+   --> src\napcat\mod.rs:115:5
+    |
+112 | pub enum ConnectionState {
+    |          --------------- variant in this enum
+...
+115 |     Connected,
+    |     ^^^^^^^^^
+    |
+    = note: `ConnectionState` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `images` is never read
+    --> src\ui\mod.rs:1036:5
+     |
+1035 | pub struct GIFImages {
+     |            --------- field in this struct
+1036 |     images: HashMap<String, Vec<(TextureHandle, u32)>>,
+     |     ^^^^^^
+
+warning: struct `CircleImageButton` is never constructed
+    --> src\ui\mod.rs:2031:12
+     |
+2031 | pub struct CircleImageButton {
+     |            ^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+    --> src\ui\mod.rs:2042:12
+     |
+2041 | impl CircleImageButton {
+     | ---------------------- associated function in this implementation
+2042 |     pub fn new(image: egui::TextureId, size: f32) -> Self { Self { image, size } }
+     |            ^^^
+
+error: linking with `rust-lld.exe` failed: exit code: 1
+  |
+  = note: "rust-lld.exe" "-flavor" "link" "/NOLOGO" "D:\\rust_repo\\willowblossom\\target\\debug\\deps\\rustckQuPoY\\symbols.o" "<257 object files omitted>" "D:\\rust_repo\\willowblossom\\target\\debug\\deps/{libegui_extras-2b54bc1f6740e465,libehttp-353a6eeb08b84cdc,libureq-73888c537ae2820f,libwebpki_roots-732f1e0ea9379066,librustls-fbf8dc48aa827333,libsubtle-272749925fdfa74d,libwebpki-7a764a716458f77e,libring-f1760f6b6dab1dc9,libuntrusted-cd6287db045135d5,libzeroize-6efea5e7513a4888,libutf8_zero-10602fc2244e208f,libureq_proto-3843c9928853d65c,libmime_guess2-9bc38063c1132ec8,libunicase-2a56d188b6b6c29c,libenum_map-1b139f7f61c5d9fa,libresvg-db06608bf30df6dc,libusvg-81f327f61c16895d,libimagesize-b9a8b2f93e38d500,libdata_url-57e9920574e4dfe9,libxmlwriter-f589fd9363c6d7d6,libsimplecss-3c1c5a03b09c0107,libroxmltree-0def5b3ec9251093,libsvgtypes-7ab1c1bfb2b04196,libkurbo-ae8e3b212b3343d0,libsiphasher-e1a342673c298112,libtiny_skia-dfd5e184e54b38dd,libpng-219a473b6d6c4be7,libbitflags-5f3a996d48b5ceb7,libtiny_skia_path-3e4e87b6f60c7c38,libstrict_num-cd172ed3c91f0107,libfloat_cmp-21960f5a8729c6c3,libreqwest-1ef3f1afc5ab59c7,librustls_pki_types-6cea67eea1ba73cc,libhyper_tls-7d815f620d8b29c6,libtokio_native_tls-179402393279fe6a,libserde_urlencoded-a04df142341b6c70,libmime-ef8ad33c7b581c84,libencoding_rs-117bfdb8edb3bca5,libtower_http-6193c16b82b7676d,libtower-ed35b0c36ccc3a5d,libtower_layer-033a2dee813c6086,libnative_tls-6669694ae3a47148,libhyper_util-5deb3edb8797e071,libwindows_registry-53df027260b971aa,libwindows_targets-97a5adbcf305944a,libipnet-d1bb2e7226eb58da,libtower_service-c68ff5916257bfcf,libhyper-8accaf3d7b4dad85,libwant-8b7742dd661b524b,libtry_lock-d81ed8c8421f1431,libh2-1c85565547a2c336,libtokio_util-59665c6d860a1495,libfutures_channel-f6bf6a43b53d97c4,libhttp_body_util-3c3c31416aeced0d,libhttp_body-242416eeb4d00eee,libsync_wrapper-9a17c3ed070d9115}.rlib" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-msvc\\lib/{libtest-*,libgetopts-*,librustc_std_workspace_std-*}.rlib" "D:\\rust_repo\\willowblossom\\target\\debug\\deps/{libab_glyph-562ea4c8f1d5f517,libowned_ttf_parser-122707b24df98dfd,libttf_parser-e6115cfb71ec7dba,libab_glyph_rasterizer-a6238579c0d2bef8,libbevy_voxel_world-beacced3f439f19b,libblock_mesh-c6e9c799e4928833,libndcopy-c2c09394a9fa856b,libilattice-16e0f5e21694fc70,libglam-b6aa9a4979c16676,libndshape-914f88af46ce0116,libavian3d-8867e8559506c846,libbevy_transform_interpolation-d31b207e1684da05,libbevy_heavy-0bced180d7a3f834,libglam_matrix_extras-cf4351d867768e90,libitertools-4d1ee2304a719f2c,libobvhs-a97055cdad5edbff,librdst-55736319b67090ee,libarbitrary_chunks-ca4bbc59140858bf,libpartition-4cb2d1412c68f5ea,libglam-85a1ca9b93794bbb,libparry3d-06fad33a2e7d929b,librstar-73f3e63de23cf770,libheapless-1bc860e270bf6b97,libhash32-1f67a81329ac70cd,libena-cbc309a34d52456a,libspade-230d612dbadf1a07,librobust-3247d2e1a7994876,libglamx-28c32ecc78b47464,libsimba-c68b11d1077c1baa,libwide-7aa82b67dfd933b6,libsafe_arch-5ec358407097417b,libnum_complex-58d8813ac5faf0ab,libvoxxelmaxx-a8026b23dd22fc30,libbitvec-d9d02ade9253252a,libwyz-5602f3d27644cd31,libtap-b5eca3f85520d472,libradium-99dbf9a8d5eb2423,libfunty-00033e601f293eae,libtokio_tungstenite-a0c7475538d6a46e,libtungstenite-b48f2aa097c93d8f,librand-929e83c55afded5c,librand_chacha-86937986d8bf02ea,libppv_lite86-e0972ac95b3fe12f,librand_core-b6fe5b539f5bc547,libsha1-c96a78321fb88ab1,libcpufeatures-6945057750430969,libdigest-0e804fc9f294e95f,libblock_buffer-e2707192b8174508,libcrypto_common-d575d7a59e7c0ffe,libgeneric_array-b8439fc471de7499,libtypenum-16181bb1cc932485,libhttparse-c42d71af3e2391b8,libhttp-c9ea48a1760c6c8f,libcurl-a1b0c5ee0b58ef0d,libcurl_sys-7a03fae57b6ad0a6,liblibz_sys-5991899c8751927c,libschannel-d289e09ce93d541d,libsocket2-c90a7bc5c5466630,libasync_compat-7ad6cfa23273f227,libtokio-620068477501ae01,libsocket2-3de5f8ffcf5d724b,libbytes-7636dbb645882a7d,libmio-62cb0603d6d95652,libbevy_egui-7cb896d7ae5bb4d9,libarboard-3ab921997fe9d245,libclipboard_win-301ab267fcf36a14,liberror_code-434b7049b2541ef6,libwindows_sys-e5ca4653233a30ec,libwindows_targets-e238407b482b0d42,libwebbrowser-2788c1d554a74f1c,liburl-27eeec80d2347a1a,libidna-d1e0e1c34a2194ed,libidna_adapter-8e3204bda548486e,libicu_normalizer-64f49aa8afc09d4f,libicu_normalizer_data-be7d618fe0238dcc,libwrite16-545daa4a03670d7b,libutf16_iter-12673fa3324dd166,libicu_properties-6fcd675dd5a0f9b3,libicu_properties_data-8096b706a61752a6,libicu_locid_transform-635d315e9a2df81d,libicu_locid_transform_data-962b4ac734197ae6,libicu_collections-036221565030e090,libicu_provider-fac6ee32eff78da3,libicu_locid-4e83f683020b8dfe,liblitemap-6cb4c80667a17b08,libtinystr-6750fc3a38d9ca96,libzerovec-6b78c3010588d5aa,libwriteable-96bde759b80470c6,libyoke-5972ea70f3e12e61,libform_urlencoded-d23bf5764300ca73,libegui-3b1cadfc45fb70c3,libepaint-365ea4a55cf435b6,libahash-6eaa037f9a05bf8a,libgetrandom-8525f057317ed524,libharfrust-68e588e1c9c12aff,libnohash_hasher-1c56af825db72b27,libunicode_general_category-77c6a06508e97c8f,libepaint_default_fonts-08997b93e66dd4a0,libvello_cpu-a55a1cebd2dab34b,libvello_common-90109ac46bd839c5,libguillotiere-4656bbcfdf5df8bc,libpeniko-9c4edbd6f3f3948a,libkurbo-f26e858df8697cf0,libpolycool-3791d0541f0560fc,libcolor-0633e7f3a62ecf29,libfearless_simd-ef81e312a26a5ce3,libself_cell-9fcd81b4b5f1f18b,libecolor-561dc88ee56159e1,libemath-cb9e0d9035a9378b,libtempfile-d038d504cc8727c7,libbevy_persistent-04d37660d8f47c06,libserde_yaml-3b8ff163151d3b9f,libryu-46a900a8c140ffb8,libunsafe_libyaml-7f210e4d2e5e4b19,libtoml-17801f43d76694e2,libtoml_writer-9f73e441ea713606,libwinnow-f80d5a37fba6f36c,libtoml_parser-20144f9f3c26289e,libwinnow-65c1e513fbdc41ac,libserde_spanned-f5f103218c0c1407,libtoml_datetime-f2ed26219c442926,libserde_ini-ad43b4f677eb67d9,libvoid-7aa42df5495e959c,libresult-af3ebd3b7b800e8a,libbincode-dd96fceb2b45f7c5,libron-f2b95d4a49531f5d,libbevy-7ed9856c8f857317,libbevy_internal-bb1e2cae9dfbd13b,libbevy_winit-d4e4a5f2d1294728,libaccesskit_winit-688cbb14685cf35f,libaccesskit_windows-1d1bd4ed180c3c92,libaccesskit_consumer-965aa0df99f5cd5e,libwinit-83023b743129060b,libunicode_segmentation-0ffabe3f2ba8932b,libwindows_sys-cd398ba0f028906c,libcursor_icon-daf51fdb30074bc7,libdpi-6b8389786569683f,libbevy_ui_widgets-1dd3b5c7ea7fcc98,libbevy_ui_render-c9a23a586a730227,libbevy_ui-1e944eda24d87de0,libtaffy-05b3a6f28964f15b,libgrid-4960946937e0789d,libbevy_state-2f09dbdd82a2f32a,libbevy_scene-66fe9f7139f0d4ef,libbevy_post_process-b831858934c5ae57,libbevy_input_focus-1a9275f16a1b55cb,libbevy_gizmos_render-d38cb13e900d3271,libbevy_sprite_render-75b125a8b1e29995,libbevy_sprite-c2f601f4974122e8,libradsort-a81e323ee074414b,libbevy_text-67797ad39d4afc22,libswash-6d130bf96dbe08e3,libyazi-32bd954928b1f9d1,libskrifa-44c69e4aa138948b,libread_fonts-1c8cadba6d358e92,libzeno-4a10990f7e7d5698,libparley-d74ba5460d169996,libskrifa-ea0b02d31b08c0fd,libharfrust-e7264ae62f8773c7,libparley_data-1d055c9a103641dc,libicu_segmenter-33bda1df706f4464,libicu_locale-0a2d390d8853cfcc,libicu_locale_data-ff7ab5703e8a3a86,libicu_segmenter_data-9cd890d44a3aa186,libicu_properties-8fe8bf1e7796e636,libicu_properties_data-965ee2bb313901c5,libicu_normalizer-2e19c529993ccfca,libicu_normalizer_data-bb4e5e1c3f449dfb,libicu_collections-05319d32ae30f91c,libutf8_iter-ad8f3bb377a75364,libpotential_utf-1108cab88850918e,libicu_provider-40ed6133ae49d668,libicu_locale_core-a06f4d06c6039ba9,libtinystr-59dc4d93fd31bca5,liblitemap-54861d92934ac226,libwriteable-ef589d3ffb01c264,libzerovec-a0645d0464b1c6fd,libzerotrie-bafe83bdf4363eb1,libyoke-a024a7b835cf22d0,libzerofrom-e9835a17eaff0d9e,libfontique-1dcf9241e209764c,libmemmap2-d3a3565efd2350d7,liblinebender_resource_handle-690f84e0d3864704,libread_fonts-02f84d65968ea525,libfont_types-6974e38d963c154e,libparlance-e717c410c4059232,libbevy_picking-aefcbadc9ad19f03,libbevy_pbr-2c28933b5b28ae1f,libbevy_gltf-e1b2253276f1e28f,libpercent_encoding-9ffe14bc8cad9ab2,libbase64-6d7a3e3d2293c876,libgltf-afb0b6d8df7602f8,libgltf_json-78db289eb3fd08a1,libserde_json-4ab7277b5d570688,libitoa-28ed2e33d4bb5d45,libzmij-3d8197b83f6f6a4e,libbevy_world_serialization-eb5089de75a58f43,libbevy_gilrs-2d00fdbb2b6c9908,libgilrs-15e3c27ee10c6c78,libvec_map-892ecb0cd5a2c61f,libfnv-1ae49470987d004b,libgilrs_core-fd67f9637debf036,libwindows-12182fece9ca1694,libwindows_numerics-cc8cc47eeca856bf,libwindows_collections-e5fad43a8bf5f723,libwindows_future-c9d9b1bdd2773cbb,libwindows_core-cc2ea1381b1b85ff,libwindows_strings-df1449c35815936a,libwindows_result-07a5e6c885d16c1f,libwindows_link-6da221eb57b32125,libbevy_clipboard-e20ce06e92218393,libbevy_audio-0b7fca2533bb48fa,librodio-544acee09d758089,libhound-9b4119bd5784e267,liblewton-ce719bde5da38110,libogg-e3414516ae436372,libtinyvec-a5655891df2fed5e,libtinyvec_macros-30d2473cb9744173,libbyteorder-537d967cf059b9d0,libcpal-008c4598020f6dba,libdasp_sample-fbb6a4ed160f08ae,libbevy_anti_alias-31e345ac473b9207,libbevy_core_pipeline-35190eee6679603d,libbevy_light-81bf43c19f078a4b,libbevy_gizmos-38c83eef0c84c0ce,libbevy_render-14750a7772626c40,liboffset_allocator-cdfd787f198385eb,libweak_table-61ca001895cc079c,libahash-db10abeddfa423b1,libgetrandom-4a7f577160860452,libwgpu-6b21ea40debc5485,libstatic_assertions-609382ccdb7846de,libwgpu_core-f7128914f387c88e,libwgpu_hal-789e395afb24a99a,librenderdoc_sys-092f0d3eea4c5ee7,libgpu_descriptor-917dfb3099ed5558,libgpu_descriptor_types-a2eedc045a8a023e,libgpu_allocator-34dc29c2c5f32f35,libpresser-355bc25edf360202,libash-2876c1b6f20d2012,liblibloading-dfa81a82971202fe,libordered_float-2afdab2b8fbe9613,librange_alloc-1de6134da75ebf51,libparking_lot-4c7923c62064fe04,libparking_lot_core-36dcc2bb2b579f22,liblock_api-ae86172d0eaf313b,libscopeguard-54e6b6c67009e85b,libbevy_log-912f0751ed4fb8c1,libtracing_subscriber-dae6a0852eb891c4,libsharded_slab-e1ef0c03f2499aa3,liblazy_static-9ed6b004db095743,libmatchers-d33d545f3bcc84d2,libnu_ansi_term-7235990e9bb0546e,libtracing_log-15467adc18f22fd6,libbevy_material-cbb7d5952799f6c1,libbevy_shader-8d2621221175dd47,libwgpu_naga_bridge-5b45bd09842c6ec3,libnaga_oil-2fc7652cbd4e7b90,libdata_encoding-02630ca5627798ec,libcodespan_reporting-6a3d6d6eb6251875,libregex-14771b90ac9f425a,libregex_automata-26d8da4fd9334230,libaho_corasick-26b44b69dade035d,libregex_syntax-9fa366748e5c0f27,libnaga-bc742e0b00e042a5,librustc_hash-f4a5d7596b395e55,liblibm-b664c973b8fca28e,libhexf_parse-d1564bb7e439cf09,libbit_set-798d3b1219c9e801,libbit_vec-a96554c04f170543,libcodespan_reporting-bc88e199b41103ab,libunicode_width-be1470d04d0cf60a,libtermcolor-fe738cc0661e3376,libwinapi_util-0cf153bada3d5da5,libspirv-9eda33a7b633376c,libbevy_camera-4c5249435e51e636,libbevy_window-7b72476189852799,libbevy_input-ace1c61347ea1a35,libbevy_image-283ca9d236e7ffa7,libruzstd-c639b42f8486aec7,libtwox_hash-fdd7e295f47b51b7,librectangle_pack-4146e883e93955d2,libktx2-d686f63f8b2c81e1,libimage-512e7745cb65cc85,libqoi-e8f924fba417d27a,libmoxcms-c0d0d9279ac1143a,libpxfm-ac56c8fb95555942,libimage_webp-880f0ab92ffba271,libtiff-947619fa896245f1,libfax-3c99bba06e9ce4a9,libpng-ad632dc931b10b8a,libflate2-3a86fb82389e6961,libfdeflate-91dc36f90838528d,libcrc32fast-8d7ada81df406e1f,libexr-8846d8cee792761c,libminiz_oxide-fd3345066edbf325,libzune_inflate-1e01651689912433,libsimd_adler32-f50d32b397bbbf44,libbit_field-e86d95f17dd07fe6,liblebe-22ecbdbf0d1548da,libzune_jpeg-0a67f78bace2d01f,libzune_core-75281ebf7e2e9577,libgif-483a17a9e45df872,libcolor_quant-4744becfd06e3fb4,libweezl-7d69a61c9e1730b6,libbyteorder_lite-59b27c213d518db1,libravif-c0dcd8ca8ad403f8,libloop9-59d5cee9e7596836,libavif_serialize-fdcbd10e024fb661,libquick_error-df9a3cda4d6667d5,librgb-ecc83f3d2968acf9,librav1e-ddeff418e65e8005,libprofiling-bcbb88f67c75ce1f,libav_scenechange-87fd833b6affbfd6,liby4m-55fa6ace34ae8352,libaligned-e6c1d1ad095362f7,libas_slice-191dcf7f5bf03c96,libstable_deref_trait-d6d4d3c71edeb72b,libav1_grain-733260cda9b5b29e,libnom-d8262ea64406ce42,libnum_rational-196e8a9ea4edb6be,libnum_bigint-56244e1b50055c52,libnum_integer-5373c5f8e846d02a,libanyhow-51f66b8c62ef034f,libmaybe_rayon-200f73ac2f7a0f50,librayon-1ea3722bf55569e4,librayon_core-532af5679683be0d,libcrossbeam_deque-bfbd47a6cdef1133,libcrossbeam_epoch-afaef3748c6b8337,libv_frame-449a0fd7afe1e50e,libaligned_vec-2ef2007635407e08,libaligned_vec-a4b3ba9381349729,libequator-b56ba6df65d42fad,libbitstream_io-429fa3047bbd84f9,libimgref-d42088e290c28fae,libguillotiere-eab25c30bb8fe7c0,libsvg_fmt-c8cc5405be77a253,libeuclid-e62fd089bcab5f07,libbevy_animation-31fef02aabfe5e10,libbevy_mesh-8a627fe8bea00d2c,libhalf-fda640972f623ffe,libzerocopy-58a7a291f4903cea,libbevy_mikktspace-38217001a1e8cfb6,libhexasphere-fd567b3ad4d54812,libconstgebra-a63d6ad026432157,libconst_soft_float-7fc341544b52ba75,libbevy_asset-3bb740da9cd3bdb2,libblake3-31c9b5263dac0a98,libconstant_time_eq-6de6a05bbb616bcb,libarrayref-86ff03d70062578d,libbevy_diagnostic-318fd34a01e205ea,libsysinfo-1fa1de4e62dc93e7,libntapi-a2bc89f88c8211ba,libwinapi-80785501fa6d432f,liblibc-d484c3b8c8f1aa82,libwindows-8b6a00a535cccd55,libwindows_numerics-c43deeb91ff02d42,libwindows_core-812cf947665076ca,libwindows_strings-9d1976ad39f7b638,libwindows_result-68f5d7e4c06df83f,libbevy_time-f35f00e4384f26b1,libconst_fnv1a_hash-fd6532cc4b66bf01,libasync_broadcast-5bf5fb25d05bac6f,libcrossbeam_channel-6fda9f23a211e89b,libfutures_util-bd62cdb84befb1e2,libmemchr-92971a79a85cfa2d,libfutures_sink-72497cccd585b75e,libfutures_task-6696c3788cae3b0c,libron-2dd96914d8dd0c14,libunicode_ident-bfbf8624bf9aed7d,libstackfuture-4967f30f710ad852,libatomicow-f21405abdd002e34,libtracing-1688c61f780d484e,libtracing_core-349fdea8e57a86e1,libasync_fs-8b4c75c912a5dc26,libblocking-51e486710c39b1c8,libpiper-194d2ea14d9a7bcd,libatomic_waker-25695b1243ce7f2a,libasync_lock-34f1065281670c6c,libbevy_transform-59f407790c47f901,libbevy_color-cdd2b103d526253d,libbevy_math-ba0a761085dd61ea,librand_distr-0f5658c641800bbc,libitertools-d4f69d118875b52a,libeither-e0e54aa5ce16a699,libbevy_a11y-a618ac1702e8e708,libaccesskit-3a6a4c5fd7a5b651,libbevy_app-34e45da9d3d81d0c,libctrlc-3812413c729668b1,libwindows_sys-51758fcf199dc60c,libwindows_targets-4aeedc726e2795ee,libbevy_ecs-fdbd971eccf70ba0,libslotmap-13cbed6dd8db667d,libbevy_tasks-a64bc724ccb3db3d,libasync_executor-238ec8b0e6467a66,libslab-1a254b445399033c,libasync_task-3674826127143080,libarrayvec-4a3eddbcd5282981,libbevy_reflect-4005fc963783385d,libwgpu_types-b4ea4f3783ed8e15,libraw_window_handle-c3dfff414c23c8d6,liblog-5cc656de362fa5c1,libbitflags-bb7a1afcd4018065,libuuid-95b785333dd363a2,libsmol_str-b98478a5eeb0aee1,libpetgraph-dc519238123fa4b2,libhashbrown-5c6987f1a807b79d,libfoldhash-798c254d96750d29,libfixedbitset-d19a99f3452313bd,libinventory-a0b2364a7f28ef17,liberased_serde-e2859084b0b296e5,libtypeid-666b37a18e11068d,libsmallvec-b06bbc9dd0571f96,libglam-71c0ecf1bd26a992,librand-fd22116bc8199d9b,libgetrandom-138a68b507f96053,libchacha20-98ede97fe57027fc,libcpufeatures-9edccfe9be2cf36e,librand_core-3d93707b29dbabb3,libbytemuck-43c2b586fa5ebd12,libencase-00c29bb195f52624,libconst_panic-54d80c52862b3de1,libapprox-1ec738f3e4ce6453,libnum_traits-e3b67357143d0a2e,libdowncast_rs-a81b2d0c6aa69e3d,libderive_more-518972abfe003b0f,libthiserror-b84ddc26172dd473,libbumpalo-fef865179058240e,libbevy_utils-2ee35ccf3d98120c,libthread_local-c021a57a376f59ec,libcfg_if-c90fecb54af8880b,libonce_cell-4551566b143011be,libasync_channel-e2d997e456a9ed00,libevent_listener_strategy-7e2894b7ef609f36,libevent_listener-f567d243ad8a9158,libconcurrent_queue-abf7a26fe4228c6e,libcrossbeam_utils-6589c86150159196,libindexmap-d51a705ca0fd89b3,libhashbrown-71aeba8e89b886f5,libdisqualified-33a1aba730c4eb97,libbevy_ptr-71d6cbdfa696692c,libnonmax-ab6bf5efa07a8ec0,libbevy_platform-12710ce354a2812b,libserde-567ec7b71f6a70d2,libhashbrown-284870c4d2b61852,libequivalent-bc373fe47f7788a7,libserde_core-0aeac6158126768d,liballocator_api2-997d28477bbe163c,libfutures_lite-8998309cc2440764,libfutures_io-6bbeb877ecdb5d03,libfutures_core-a5d803d1680a2864,libparking-0910b07151de9b26,libpin_project_lite-b9df74d5567a97fd,libfastrand-7436d66a468d137f,libfoldhash-166deed70f22fa33,libdirs-75ae6b1215871f4b,libdirs_sys-784ce85cb6d2f6f3,libwindows_sys-18c43903af1eac59,libwindows_link-9b1cdae3e8fe3edc,liboption_ext-b0fd07b7aee6d289}.rlib" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-msvc\\lib/{libstd-*,libpanic_unwind-*,libcfg_if-*,libwindows_link-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libunwind-*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "C:\\Users\\Administrator\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.53.0\\lib\\windows.0.53.0.lib" "kernel32.lib" "ws2_32.lib" "crypt32.lib" "kernel32.lib" "user32.lib" "shell32.lib" "gdi32.lib" "advapi32.lib" "C:\\Users\\Administrator\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.48.5\\lib\\windows.0.48.5.lib" "shlwapi.lib" "C:\\Users\\Administrator\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "bcrypt.lib" "advapi32.lib" "C:\\Users\\Administrator\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "ntdll.lib" "advapi32.lib" "credui.lib" "kernel32.lib" "secur32.lib" "legacy_stdio_definitions.lib" "C:\\Users\\Administrator\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "kernel32.lib" "kernel32.lib" "kernel32.lib" "ntdll.lib" "userenv.lib" "ws2_32.lib" "dbghelp.lib" "/defaultlib:msvcrt" "/NXCOMPAT" "/LIBPATH:D:\\rust_repo\\willowblossom\\target\\debug\\build\\blake3-ec14d7bf706130bf\\out" "/LIBPATH:D:\\rust_repo\\willowblossom\\target\\debug\\build\\curl-sys-adacf0e29d737099\\out\\build" "/LIBPATH:D:\\rust_repo\\willowblossom\\target\\debug\\build\\libz-sys-acb151c9e8ae4eca\\out\\lib" "/LIBPATH:D:\\rust_repo\\willowblossom\\target\\debug\\build\\ring-bb652b4961680e0a\\out" "/LIBPATH:C:\\Users\\Administrator\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.48.5\\lib" "/LIBPATH:C:\\Users\\Administrator\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib" "/LIBPATH:C:\\Users\\Administrator\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.53.0\\lib" "/OUT:D:\\rust_repo\\willowblossom\\target\\debug\\deps\\willowblossom-5844171047a93da4.exe" "/OPT:REF,ICF" "/DEBUG" "/PDBALTPATH:%_PDB%" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\intrinsic.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\liballoc.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libcore.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libstd.natvis" "/NATVIS:D:\\rust_repo\\willowblossom\\target\\debug\\deps\\rustckQuPoY\\willowblossom-0.natvis" "/NATVIS:D:\\rust_repo\\willowblossom\\target\\debug\\deps\\rustckQuPoY\\willowblossom-1.natvis" "/NATVIS:D:\\rust_repo\\willowblossom\\target\\debug\\deps\\rustckQuPoY\\willowblossom-2.natvis"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: rust-lld: error: undefined symbol: anon.1178d5e2b2b5c7ac7109379c40b3453d.13.llvm.3996988599881565596
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\ptr\single.rs:246
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::ptr::single::BitPtr<wyz::comu::Mut>>::span_unchecked)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\ptr\single.rs:246
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::ptr::single::BitPtr<wyz::comu::Mut, bitvec::access::BitSafeUsize>>::span_unchecked)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\ptr\single.rs:246
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::ptr::single::BitPtr>::span_unchecked)
+          >>> referenced 4 more times
+          
+          rust-lld: error: undefined symbol: anon.1178d5e2b2b5c7ac7109379c40b3453d.12.llvm.3996988599881565596
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\ptr\single.rs:246
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::ptr::single::BitPtr<wyz::comu::Mut>>::span_unchecked)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\ptr\single.rs:246
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::ptr::single::BitPtr<wyz::comu::Mut, bitvec::access::BitSafeUsize>>::span_unchecked)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\ptr\single.rs:246
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::ptr::single::BitPtr>::span_unchecked)
+          >>> referenced 1 more times
+          
+          rust-lld: error: undefined symbol: anon.e39282e64e91ae4c96ec4d78131b68a2.20.llvm.16136142323987409145
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:454
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain<wyz::comu::Mut>>::partial_head (.llvm.6850520637833329916))
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:477
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain<wyz::comu::Mut>>::partial_tail (.llvm.6850520637833329916))
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:419
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain<wyz::comu::Mut>>::major (.llvm.6850520637833329916))
+          >>> referenced 1 more times
+          
+          rust-lld: error: undefined symbol: anon.e39282e64e91ae4c96ec4d78131b68a2.25.llvm.16136142323987409145
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:454
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain<wyz::comu::Mut>>::partial_head (.llvm.6850520637833329916))
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:477
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain<wyz::comu::Mut>>::partial_tail (.llvm.6850520637833329916))
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:419
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain<wyz::comu::Mut>>::major (.llvm.6850520637833329916))
+          >>> referenced 1 more times
+          
+          rust-lld: error: undefined symbol: anon.1178d5e2b2b5c7ac7109379c40b3453d.5.llvm.3996988599881565596
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:383
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain<wyz::comu::Mut>>::new)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:383
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain>::new)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\slice\specialization\lsb0.rs:65
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice>::sp_bitop_assign)
+          
+          rust-lld: error: undefined symbol: anon.1178d5e2b2b5c7ac7109379c40b3453d.10.llvm.3996988599881565596
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:382
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain<wyz::comu::Mut>>::new)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:382
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain>::new)
+          
+          rust-lld: error: undefined symbol: anon.1178d5e2b2b5c7ac7109379c40b3453d.11.llvm.3996988599881565596
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:382
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain<wyz::comu::Mut>>::new)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:382
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain>::new)
+          
+          rust-lld: error: undefined symbol: anon.e39282e64e91ae4c96ec4d78131b68a2.19.llvm.16136142323987409145
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:454
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain>::partial_head (.llvm.6850520637833329916))
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:477
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain>::partial_tail (.llvm.6850520637833329916))
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:419
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain>::major (.llvm.6850520637833329916))
+          >>> referenced 1 more times
+          
+          rust-lld: error: undefined symbol: anon.e39282e64e91ae4c96ec4d78131b68a2.24.llvm.16136142323987409145
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:454
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain>::partial_head (.llvm.6850520637833329916))
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:477
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain>::partial_tail (.llvm.6850520637833329916))
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\domain.rs:419
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.6g62edlmetoo57lfd2pwy3cnd.1uln3ld.rcgu.o:(<bitvec::domain::Domain>::major (.llvm.6850520637833329916))
+          >>> referenced 1 more times
+          
+          rust-lld: error: undefined symbol: anon.b6b516282955ba5d553d7d4952e446d1.13.llvm.2026145483310980751
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\field.rs:151
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice as bitvec::field::BitField>::load_le::<usize>)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\slice\specialization\lsb0.rs:65
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice>::sp_bitop_assign)
+          
+          rust-lld: error: undefined symbol: anon.b6b516282955ba5d553d7d4952e446d1.1.llvm.2026145483310980751
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\field.rs:151
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice as bitvec::field::BitField>::load_le::<usize>)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\slice\specialization\lsb0.rs:65
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice>::sp_bitop_assign)
+          
+          rust-lld: error: undefined symbol: anon.b6b516282955ba5d553d7d4952e446d1.5.llvm.2026145483310980751
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\field.rs:121
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice as bitvec::field::BitField>::load_le::<usize>)
+          
+          rust-lld: error: undefined symbol: anon.b6b516282955ba5d553d7d4952e446d1.6.llvm.2026145483310980751
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\field.rs:121
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice as bitvec::field::BitField>::load_le::<usize>)
+          
+          rust-lld: error: undefined symbol: anon.b6b516282955ba5d553d7d4952e446d1.11.llvm.2026145483310980751
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\field.rs:0
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice as bitvec::field::BitField>::load_le::<usize>)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\field.rs:130
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice as bitvec::field::BitField>::load_le::<usize>)
+          
+          rust-lld: error: undefined symbol: anon.b6b516282955ba5d553d7d4952e446d1.3.llvm.2026145483310980751
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\field.rs:0
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice as bitvec::field::BitField>::load_le::<usize>)
+          
+          rust-lld: error: undefined symbol: anon.e39282e64e91ae4c96ec4d78131b68a2.16.llvm.16136142323987409145
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\slice\specialization\lsb0.rs:65
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice>::sp_bitop_assign)
+          
+          rust-lld: error: undefined symbol: anon.e39282e64e91ae4c96ec4d78131b68a2.8.llvm.16136142323987409145
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\slice\specialization\lsb0.rs:65
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice>::sp_bitop_assign)
+          
+          rust-lld: error: undefined symbol: anon.1178d5e2b2b5c7ac7109379c40b3453d.9.llvm.3996988599881565596
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\slice\specialization\lsb0.rs:47
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice>::sp_bitop_assign)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\slice\specialization\lsb0.rs:48
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice>::sp_bitop_assign)
+          
+          rust-lld: error: undefined symbol: anon.1178d5e2b2b5c7ac7109379c40b3453d.2.llvm.3996988599881565596
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\slice\specialization\lsb0.rs:47
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice>::sp_bitop_assign)
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\slice\specialization\lsb0.rs:48
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice>::sp_bitop_assign)
+          
+          rust-lld: error: undefined symbol: anon.1178d5e2b2b5c7ac7109379c40b3453d.3.llvm.3996988599881565596
+          >>> referenced by C:\Users\Administrator\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bitvec-1.1.1\src\slice\specialization\lsb0.rs:47
+          >>>               D:\rust_repo\willowblossom\target\debug\deps\willowblossom-5844171047a93da4.dikluzru6x4hnrxmvarnxjsjr.1uln3ld.rcgu.o:(<bitvec::slice::BitSlice>::sp_bitop_assign)
+          
+          rust-lld: error: too many errors emitted, stopping now (use /errorlimit:0 to see all errors)
+          
+
+warning: `willowblossom` (lib test) generated 17 warnings
+error: could not compile `willowblossom` (lib test) due to 1 previous error; 17 warnings emitted

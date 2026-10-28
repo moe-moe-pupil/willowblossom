@@ -96,7 +96,14 @@ except Exception as error:
 
 
 def style_embedding(text):
-    encoded = tokenizer(text, return_tensors="pt")
+    # BERT 位置编码上限 512：超长台词必须截断，否则张量尺寸不匹配直接崩溃。
+    max_positions = int(getattr(style_encoder.config, "max_position_embeddings", 512))
+    encoded = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_positions,
+    )
     with torch.no_grad():
         result = style_encoder(
             input_ids=encoded["input_ids"],
