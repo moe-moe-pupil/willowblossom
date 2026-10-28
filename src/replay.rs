@@ -396,6 +396,7 @@ fn restore_autosaved_replay(app: &mut App) {
     let dialogue_count = replay.dialogue.len();
     let mut studio = app.world_mut().resource_mut::<ReplayStudio>();
     studio.replay = Some(replay);
+    reset_replay_edit_state(&mut studio);
     studio.status = format!(
         "已自动恢复上次的回放项目：{title}（{dialogue_count} 句对话，时长 {}）；重新生成会先自动备份旧项目",
         format_time(duration)
@@ -1405,6 +1406,40 @@ impl Default for ReplayMode {
     fn default() -> Self { Self::Idle }
 }
 
+impl ReplayStudio {
+    /// 发言人身份列表（带每帧缓存）：修订号或台词数变化才重算。
+    fn cached_speaker_identities(&mut self) -> Vec<ReplaySpeakerIdentity> {
+        let (replay_id, revision, line_count) = self
+            .replay
+            .as_ref()
+            .map_or((0, self.timeline_revision, 0), |replay| {
+                (
+                    replay.created_at_unix_ms,
+                    self.timeline_revision,
+                    replay.dialogue.len(),
+                )
+            });
+        if let Some((cached_id, cached_revision, cached_count, identities)) =
+            &self.speaker_identities_cache
+        {
+            if *cached_id == replay_id
+                && *cached_revision == revision
+                && *cached_count == line_count
+            {
+                return identities.clone();
+            }
+        }
+        let identities = self
+            .replay
+            .as_ref()
+            .map(replay_speaker_identities)
+            .unwrap_or_default();
+        self.speaker_identities_cache =
+            Some((replay_id, revision, line_count, identities.clone()));
+        identities
+    }
+}
+
 #[derive(Resource)]
 pub(crate) struct ReplayStudio {
     selected_dialogue_id: Option<u64>,
@@ -1448,6 +1483,11 @@ pub(crate) struct ReplayStudio {
     speech_area_edit_requested: bool,
     /// 现场编辑全屏操控时是否临时显示回放面板（角色移动/位置帧等）。
     live_edit_panels_shown: bool,
+    /// 发言人身份列表的每帧缓存：键含回放 id、修订号与台词数，
+    /// 编辑或载入新项目时自动失效，避免长回放每帧克隆几千句台词的
+    /// 名称与头像。
+    speaker_identities_cache:
+        Option<(u64, u64, usize, Vec<ReplaySpeakerIdentity>)>,
     /// 当前激活的顶边栏自定义分段视图；None 表示标准工作台视图。
     active_custom_tab: Option<u64>,
     /// 时间轴拖动移动/分段变更后立即触发一次自动保存。
@@ -1646,6 +1686,7 @@ impl Default for ReplayStudio {
             speech_insert: None,
             speech_area_edit_requested: false,
             live_edit_panels_shown: false,
+            speaker_identities_cache: None,
             active_custom_tab: None,
             pending_replay_autosave: false,
             live_movement_user_id: None,
@@ -4285,6 +4326,9 @@ fn replay_studio_ui(
             studio.pending_replay_autosave = true;
             studio.status = "已保存并退回合成预览".into();
         }
+        // 退出即放弃未提交的重命名/插入草稿，避免窗口残留在工作台上。
+        studio.speaker_rename = None;
+        studio.speech_insert = None;
     }
     let (avatar_textures, cached_memory) = &mut ui_cache;
     let mut occlusion_opacity = occlusion_fade.as_ref().map_or(0.0, |fade| fade.opacity);
@@ -5543,6 +5587,7 @@ fn replay_controls(
                         };
     studio.active_custom_tab = None;
                         studio.replay = Some(replay);
+                        reset_replay_edit_state(studio);
                     },
                     Err(err) => studio.status = format!("项目载入失败：{err}"),
                 }
@@ -5897,11 +5942,10 @@ fn start_recording(
     studio.active_custom_tab = None;
     studio.auto_export_after_director = false;
     studio.replay = Some(replay);
+    reset_replay_edit_state(studio);
     studio.mode = ReplayMode::Recording;
     studio.status = if let Some(path) = backed_up_path {
-        format!(
-            "开始录制场景和镜头；原项目已备份到 {path}，飞船轨迹与地形变化由常态化记录自动并入"
-        )
+        format!("开始录制场景和镜头；原项目已备份到 {path}，飞船轨迹与地形变化由常态化记录自动并入")
     } else if studio.record_camera_enabled {
         "开始录制场景、可见消息和 DM 自由镜头；飞船轨迹与地形变化由常态化记录自动并入".to_owned()
     } else {
@@ -6149,6 +6193,7 @@ fn build_from_history(
         .map(|movement| movement.keyframes.len())
         .sum::<usize>();
     studio.replay = Some(replay);
+    reset_replay_edit_state(studio);
     let favorite_status = if favorite_count == 0 {
         String::new()
     } else {
@@ -7195,8 +7240,11 @@ fn replay_live_edit_panel(
             egui::Checkbox::new(&mut studio.live_editing_enabled, "解锁场景与接管工具"),
         );
         if live_toggle.clicked() {
-            // 开启现场编辑即进入全屏第一人称操控，回放面板交给 HUD 召回。
+            // 开启现场编辑即进入全屏第一人称操控，回放面板交给 HUD 召回；
+            // 未保存的重命名/插入草稿一并放弃。
             studio.live_edit_panels_shown = false;
+            studio.speaker_rename = None;
+            studio.speech_insert = None;
         }
         live_toggle.on_hover_text("解锁后可在回放画面里使用现有体素、爆炸、角色接管和飞船接管工具，镜头也会交还你平时的第一人称带团视窗（WASD 行走、常规工具编辑）；关闭后回到回放镜头轨道。项目编辑不会保存成战役现场。");
         if !playback_active {
@@ -7222,6 +7270,15 @@ fn replay_live_edit_panel(
                 if studio.speech_area_edit.is_none() {
                     studio.speech_area_edit_requested = true;
                 }
+            }
+            if ui
+                .button("回到全屏操控")
+                .on_hover_text("隐藏回放面板，回到现场编辑的全屏第一人称画面（右上角 HUD 可召回面板）")
+                .clicked()
+            {
+                studio.live_edit_panels_shown = false;
+                studio.speaker_rename = None;
+                studio.speech_insert = None;
             }
             ui.small("与“解锁场景与接管工具”不同：这个按钮会隐藏回放界面，全屏进入带团视窗。");
         });
@@ -10209,6 +10266,11 @@ fn follow_speech_area_edit_camera(
     else {
         return;
     };
+    if !replay_dialogue_is_playable(line) {
+        // 台词被区域重排标成未排期（u64::MAX）时保持只读，避免把
+        // 位置写进不会播放的台词里。
+        return;
+    }
     line.position_cells = cells;
 }
 
@@ -10393,13 +10455,22 @@ fn live_edit_fullscreen_hud(ctx: &egui::Context, studio: &mut ReplayStudio) {
                         format_time(studio.playback_ms)
                     ),
                 );
-                if ui
-                    .button("第一人称修改发言区域")
-                    .on_hover_text("全屏走到目标位置，把播放头这句台词的发言位置与镜头改到那里；结束时可保存或放弃")
-                    .clicked()
-                {
-                    start_speech_area_edit(studio);
-                }
+                ui.horizontal(|ui| {
+                    if studio.mode == ReplayMode::Playing {
+                        if ui.button("暂停预览").clicked() {
+                            studio.mode = ReplayMode::Paused;
+                        }
+                    } else if ui.button("继续播放").clicked() {
+                        studio.mode = ReplayMode::Playing;
+                    }
+                    if ui
+                        .button("第一人称修改发言区域")
+                        .on_hover_text("全屏走到目标位置，把播放头这句台词的发言位置与镜头改到那里；结束时可保存或放弃")
+                        .clicked()
+                    {
+                        start_speech_area_edit(studio);
+                    }
+                });
             }
             ui.separator();
             if ui
@@ -14286,6 +14357,16 @@ fn sync_replay_camera_to_subject(
     true
 }
 
+/// 回放项目被整体替换（录制、生成、载入、自动存档恢复）时，
+/// 清掉绑定在旧项目上的编辑会话与草稿，避免残留的行 id 指到新项目。
+fn reset_replay_edit_state(studio: &mut ReplayStudio) {
+    studio.speech_area_edit = None;
+    studio.speech_area_edit_requested = false;
+    studio.speaker_rename = None;
+    studio.speech_insert = None;
+    studio.live_edit_panels_shown = false;
+}
+
 /// 地形/船体修改后同步镜头：在播放头处补一个看向修改格的固定机位，
 /// 让时间轴后续渲染能拍到这次改动。±1 秒内已有机位时跳过，
 /// 避免连续绘制时把镜头轨刷成碎片。
@@ -14302,6 +14383,20 @@ fn sync_replay_camera_to_scene_change(replay: &mut ReplayFile, cell: Vec3, time_
         .looking_at(cell, Vec3::Y);
     replay.camera.push(camera_keyframe(time_ms, &transform));
     replay.camera.sort_by_key(|frame| frame.time_ms);
+    // 跟随切镜的优先级高于基础轨道：若此刻有跟随镜头在生效，
+    // 补一个空切镜恢复基础轨道，新机位才能生效。
+    // 恰好在同一时刻的既有切镜保持不动（DM 的显式切镜优先）。
+    let cut_here = replay.camera_cuts.iter().any(|cut| cut.time_ms == time_ms);
+    if !cut_here
+        && replay
+            .camera_cuts
+            .iter()
+            .rev()
+            .find(|cut| cut.time_ms <= time_ms)
+            .is_some_and(|cut| cut.shot.is_some())
+    {
+        insert_replay_camera_cut(replay, time_ms, None);
+    }
     true
 }
 
@@ -15008,11 +15103,7 @@ fn speech_insert_window(ctx: &egui::Context, studio: &mut ReplayStudio, camera: 
         studio.speech_insert = None;
         return;
     };
-    let speakers = studio
-        .replay
-        .as_ref()
-        .map(replay_speaker_identities)
-        .unwrap_or_default();
+    let speakers = studio.cached_speaker_identities();
 
     let mut open = true;
     egui::Window::new("在此后插入发言")
@@ -22813,6 +22904,53 @@ mod tests {
             cell,
             4000,
         ));
+
+        // 跟随切镜生效时会补空切镜恢复基础轨道，让新机位生效。
+        let shot = replay_follow_shot(
+            &replay,
+            ReplayCameraSubject::Player(7),
+            Vec3::new(1.0, 0.0, 1.0),
+            0.0,
+        );
+        insert_replay_camera_cut(&mut replay, 6000, Some(shot));
+        assert!(sync_replay_camera_to_scene_change(
+            &mut replay,
+            cell,
+            6500,
+        ));
+        let resumed = replay
+            .camera_cuts
+            .iter()
+            .find(|cut| cut.time_ms == 6500)
+            .expect("恢复基础轨道的空切镜");
+        assert!(resumed.shot.is_none());
+    }
+
+    #[test]
+    fn speaker_identity_cache_refreshes_only_when_the_revision_moves() {
+        let mut line = test_dialogue_for_speaker(7);
+        line.line_id = 1;
+        line.name = "玩家".into();
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(test_replay(vec![line]));
+
+        let first = studio.cached_speaker_identities();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name, "玩家");
+
+        // 台词名称变了但修订号没动：缓存必须仍然命中（调用方负责推进修订）。
+        studio.replay.as_mut().unwrap().dialogue[0].name = "又改".into();
+        assert_eq!(
+            studio.cached_speaker_identities()[0].name,
+            "玩家"
+        );
+
+        // 修订号推进：缓存刷新为最新身份。
+        studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
+        assert_eq!(
+            studio.cached_speaker_identities()[0].name,
+            "又改"
+        );
     }
 
     #[test]

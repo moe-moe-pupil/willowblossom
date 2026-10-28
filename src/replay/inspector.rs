@@ -10,7 +10,6 @@ use super::{
     open_speaker_rename,
     replay_dialogue_is_playable,
     replay_has_live_take,
-    replay_speaker_identities,
     start_speech_area_edit,
     ReplayDialogue,
     ReplayMode,
@@ -131,11 +130,7 @@ pub(super) fn selected_dialogue_inspector(ui: &mut Ui, studio: &mut ReplayStudio
         line.duration_ms as f64 / 1_000.0,
     );
     ui.strong("所选台词");
-    let speakers = studio
-        .replay
-        .as_ref()
-        .map(replay_speaker_identities)
-        .unwrap_or_default();
+    let speakers = studio.cached_speaker_identities();
     let mut chosen_speaker = current_sender;
     ui.horizontal_wrapped(|ui| {
         ui.label("发言人");
