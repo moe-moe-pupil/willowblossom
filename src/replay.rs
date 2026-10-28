@@ -2277,7 +2277,20 @@ fn capture_live_replay_edits(
     let hull_cells = std::mem::take(&mut scene_recorder.ship_hull_cells);
     let scene_change_count = grid_cells.len().saturating_add(hull_cells.len());
     if scene_change_count > 0 {
+        // 同步镜头：把播放头处的机位对准这一次修改的格子，让时间轴
+        // 后续渲染能拍到改动；±1 秒内已有机位时跳过（连续绘制防刷）。
+        let first_changed_cell = grid_cells
+            .first()
+            .map(|event| event.cell.as_vec3() * VOXEL_SIZE)
+            .or_else(|| {
+                hull_cells
+                    .first()
+                    .map(|event| event.cell.as_vec3() * VOXEL_SIZE)
+            });
         if let Some(replay) = studio.replay.as_mut() {
+            if let Some(cell) = first_changed_cell {
+                sync_replay_camera_to_scene_change(replay, cell, playback_ms);
+            }
             replay
                 .terrain_changes
                 .extend(
@@ -7374,8 +7387,23 @@ fn replay_live_edit_panel(
                                 position: position.to_array(),
                             }],
                         );
+                        let camera_synced = sync_replay_camera_to_subject(
+                            replay,
+                            ReplayCameraSubject::Player(user_id),
+                            position,
+                            0.0,
+                            playhead_ms,
+                        );
                         studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
-                        studio.status = format!("已保存角色 {user_id} 在 {} 的位置帧", format_time(playhead_ms));
+                        studio.status = format!(
+                            "已保存角色 {user_id} 在 {} 的位置帧{}",
+                            format_time(playhead_ms),
+                            if camera_synced {
+                                "，镜头已切到该角色的跟随镜头"
+                            } else {
+                                ""
+                            },
+                        );
                     }
                 }
             }
@@ -7384,6 +7412,7 @@ fn replay_live_edit_panel(
                     if let (Some(replay), Some(position)) = (studio.replay.as_mut(), current_position) {
                         let shot = replay_follow_shot(replay, ReplayCameraSubject::Player(user_id), position, 0.0);
                         insert_replay_camera_cut(replay, playhead_ms, Some(shot));
+                        studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
                         studio.status = format!("已在 {} 切到角色 {user_id} 的跟随镜头", format_time(playhead_ms));
                     }
                 }
@@ -7398,10 +7427,22 @@ fn replay_live_edit_panel(
                         (studio.replay.as_mut(), current_position)
                     {
                         stop_replay_movement_at(replay, user_id, playhead_ms, position);
+                        let camera_synced = sync_replay_camera_to_subject(
+                            replay,
+                            ReplayCameraSubject::Player(user_id),
+                            position,
+                            0.0,
+                            playhead_ms,
+                        );
                         studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
                         studio.status = format!(
-                            "已让角色 {user_id} 从 {} 起停在当前位置",
+                            "已让角色 {user_id} 从 {} 起停在当前位置{}",
                             format_time(playhead_ms),
+                            if camera_synced {
+                                "，镜头已切到该角色的跟随镜头"
+                            } else {
+                                ""
+                            },
                         );
                     }
                 }
@@ -7501,6 +7542,7 @@ fn replay_live_edit_panel(
                                 transform.transform_point(local_center), radius * 3.0,
                             );
                             insert_replay_camera_cut(replay, playhead_ms, Some(shot));
+                            studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
                             studio.status = format!("已在 {} 切到飞船 {ship_name} 的跟随镜头", format_time(playhead_ms));
                         }
                     }
@@ -7516,10 +7558,35 @@ fn replay_live_edit_panel(
                                 playhead_ms,
                                 transform,
                             );
+                            let (local_center, radius) = live_edits.ship_bodies.iter()
+                                .find(|(ship, _)| ship.id == ship_id)
+                                .and_then(|(_, body)| {
+                                    let min = body.cells.iter().map(|(cell, _)| *cell).reduce(IVec3::min)?;
+                                    let max = body.cells.iter().map(|(cell, _)| *cell).reduce(IVec3::max)?;
+                                    let min = min.as_vec3() * VOXEL_SIZE;
+                                    let max = (max + IVec3::ONE).as_vec3() * VOXEL_SIZE;
+                                    Some(((min + max) * 0.5, (max - min).length() * 0.5))
+                                })
+                                .unwrap_or((Vec3::ZERO, 4.0));
+                            let camera_synced = sync_replay_camera_to_subject(
+                                replay,
+                                ReplayCameraSubject::Ship {
+                                    ship_id: ship_id.clone(),
+                                    local_center: local_center.to_array(),
+                                },
+                                transform.transform_point(local_center),
+                                radius * 3.0,
+                                playhead_ms,
+                            );
                             studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
                             studio.status = format!(
-                                "已让飞船 {ship_name} 从 {} 起停止",
+                                "已让飞船 {ship_name} 从 {} 起停止{}",
                                 format_time(playhead_ms),
+                                if camera_synced {
+                                    "，镜头已切到该飞船的跟随镜头"
+                                } else {
+                                    ""
+                                },
                             );
                         }
                     }
@@ -11131,6 +11198,23 @@ fn finish_live_movement_take(studio: &mut ReplayStudio, final_position: Option<V
         .unwrap_or_default();
     if count > 0 {
         studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
+        // 覆录改变了角色轨迹：从覆录起点同步镜头到该角色的跟随镜头，
+        // 时间轴后续渲染才能拍到新轨迹。
+        if let Some(anchor) = punch_in
+            .samples
+            .first()
+            .map(|sample| Vec3::from_array(sample.position))
+        {
+            if let Some(replay) = studio.replay.as_mut() {
+                sync_replay_camera_to_subject(
+                    replay,
+                    ReplayCameraSubject::Player(punch_in.user_id),
+                    anchor,
+                    0.0,
+                    punch_in.start_ms,
+                );
+            }
+        }
         studio.status = format!(
             "已保存角色 {} 在 {}–{} 的 {count} 帧移动覆录",
             punch_in.user_id,
@@ -14022,6 +14106,75 @@ fn replay_follow_shot(
         },
         offset: (camera_position - position).to_array(),
     }
+}
+
+/// 播放头处的镜头是否已经在跟随该主体：显式切镜优先于基础轨道；
+/// shot 为空的切镜表示恢复基础轨道，继续看关键帧焦点。
+fn replay_camera_follows_subject(
+    replay: &ReplayFile,
+    subject: &ReplayCameraSubject,
+    time_ms: u64,
+) -> bool {
+    if let Some(cut) = replay
+        .camera_cuts
+        .iter()
+        .rev()
+        .find(|cut| cut.time_ms <= time_ms)
+    {
+        if let Some(shot) = cut.shot.as_ref() {
+            return shot.focus.subject == *subject;
+        }
+    }
+    let next = replay
+        .camera
+        .partition_point(|frame| frame.time_ms <= time_ms);
+    replay
+        .camera
+        .get(next.saturating_sub(1))
+        .and_then(|frame| frame.focus.as_ref())
+        .is_some_and(|focus| &focus.subject == subject)
+}
+
+/// 位置编辑后同步镜头：若播放头处的镜头没有跟随被移动的主体，
+/// 自动切到该主体的跟随镜头（与“从此镜头跟随角色/飞船”一致）。
+/// 跟随镜头按主体实时位置取景，之后的位置编辑无需再动镜头。
+fn sync_replay_camera_to_subject(
+    replay: &mut ReplayFile,
+    subject: ReplayCameraSubject,
+    position: Vec3,
+    minimum_distance: f32,
+    time_ms: u64,
+) -> bool {
+    if replay_camera_follows_subject(replay, &subject, time_ms) {
+        return false;
+    }
+    let shot = replay_follow_shot(
+        replay,
+        subject,
+        position,
+        minimum_distance,
+    );
+    insert_replay_camera_cut(replay, time_ms, Some(shot));
+    true
+}
+
+/// 地形/船体修改后同步镜头：在播放头处补一个看向修改格的固定机位，
+/// 让时间轴后续渲染能拍到这次改动。±1 秒内已有机位时跳过，
+/// 避免连续绘制时把镜头轨刷成碎片。
+fn sync_replay_camera_to_scene_change(replay: &mut ReplayFile, cell: Vec3, time_ms: u64) -> bool {
+    if replay
+        .camera
+        .iter()
+        .any(|frame| frame.time_ms.abs_diff(time_ms) <= 1000)
+    {
+        return false;
+    }
+    let scale = replay.camera_distance_scale.max(1.0);
+    let transform = Transform::from_translation(cell + Vec3::new(0.0, 2.0, 8.0) * scale)
+        .looking_at(cell, Vec3::Y);
+    replay.camera.push(camera_keyframe(time_ms, &transform));
+    replay.camera.sort_by_key(|frame| frame.time_ms);
+    true
 }
 
 fn camera_easing_t(linear_t: f32, transition_curve: f32) -> f32 {
@@ -22398,6 +22551,132 @@ mod tests {
             "现场编辑入口无需时间轴选中，退回播放头当前句"
         );
         assert_eq!(studio.selected_dialogue_id, Some(2));
+    }
+
+    #[test]
+    fn position_edits_sync_the_camera_onto_the_moved_player() {
+        let mut replay = test_replay(vec![positioned_dialogue(1, 0, 0, [0, 0, 0])]);
+        replay.duration_ms = 5000;
+        // 基础轨道是无焦点的自由机位：不跟随任何角色。
+        replay.camera = vec![camera_keyframe(
+            0,
+            &Transform::from_xyz(5.0, 4.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
+        )];
+        let player = |user_id| ReplayCameraSubject::Player(user_id);
+        assert!(!replay_camera_follows_subject(
+            &replay,
+            &player(7),
+            1000
+        ));
+
+        // 保存位置帧：自动切到该角色的跟随镜头，且跟随段持续到下一个切镜。
+        assert!(sync_replay_camera_to_subject(
+            &mut replay,
+            player(7),
+            Vec3::new(1.0, 0.0, 1.0),
+            0.0,
+            1000,
+        ));
+        assert!(replay_camera_follows_subject(
+            &replay,
+            &player(7),
+            1000
+        ));
+        assert!(replay_camera_follows_subject(
+            &replay,
+            &player(7),
+            2500
+        ));
+        let cut_count = replay.camera_cuts.len();
+
+        // 已经跟随：重复同步不再插入切镜。
+        assert!(!sync_replay_camera_to_subject(
+            &mut replay,
+            player(7),
+            Vec3::new(2.0, 0.0, 1.0),
+            0.0,
+            1000,
+        ));
+        assert_eq!(replay.camera_cuts.len(), cut_count);
+
+        // shot 为空的切镜恢复基础轨道：不再跟随。
+        insert_replay_camera_cut(&mut replay, 2000, None);
+        assert!(!replay_camera_follows_subject(
+            &replay,
+            &player(7),
+            2500
+        ));
+
+        // 带焦点的关键帧视为跟随该角色；其他角色不算。
+        replay.camera.push(focused_camera_keyframe(
+            3000,
+            &Transform::from_xyz(1.0, 2.0, 3.0),
+            Some(ReplayCameraFocus {
+                subject: ReplayCameraSubject::Player(7),
+                position: [0.0, 0.0, 0.0],
+                axis_origin: [0.0, 0.0, 0.0],
+                camera_side: [1.0, 0.0, 0.0],
+            }),
+        ));
+        replay.camera.sort_by_key(|frame| frame.time_ms);
+        assert!(replay_camera_follows_subject(
+            &replay,
+            &player(7),
+            3100
+        ));
+        assert!(!replay_camera_follows_subject(
+            &replay,
+            &player(8),
+            3100
+        ));
+    }
+
+    #[test]
+    fn scene_change_edits_place_a_camera_looking_at_the_changed_cell() {
+        let mut replay = test_replay(vec![positioned_dialogue(1, 0, 0, [
+            0, 0, 0,
+        ])]);
+        replay.duration_ms = 5000;
+        replay.camera = vec![camera_keyframe(
+            0,
+            &Transform::from_xyz(5.0, 4.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
+        )];
+
+        let cell = Vec3::new(4.0, 0.5, 6.0);
+        assert!(sync_replay_camera_to_scene_change(
+            &mut replay,
+            cell,
+            2000
+        ));
+        let frame = replay
+            .camera
+            .iter()
+            .find(|frame| frame.time_ms == 2000)
+            .expect("修改时刻的机位");
+        let translation = Vec3::from_array(frame.translation);
+        assert!(
+            (translation - cell).length() > 2.0,
+            "机位从修改格上方偏移取景"
+        );
+        let facing = (cell - translation).normalize();
+        let expected = Transform::from_translation(translation).looking_at(cell, Vec3::Y);
+        assert!(
+            (facing.dot(expected.forward().as_vec3()) - 1.0).abs() < 0.01,
+            "机位朝向修改格"
+        );
+
+        // ±1 秒内已有机位：跳过，防止连续绘制刷机位。
+        assert!(!sync_replay_camera_to_scene_change(
+            &mut replay,
+            cell,
+            2600,
+        ));
+        // 超出窗口：允许再次同步。
+        assert!(sync_replay_camera_to_scene_change(
+            &mut replay,
+            cell,
+            4000,
+        ));
     }
 
     #[test]
