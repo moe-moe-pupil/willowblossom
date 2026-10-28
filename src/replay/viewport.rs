@@ -54,7 +54,9 @@ pub(super) fn update_replay_preview_viewport(
     contexts: Query<&EguiOutput, With<PrimaryEguiContext>>,
     mut cameras: Query<&mut Camera, With<VoxelViewportCamera>>,
 ) {
-    let viewport = if studio.panel_open && !capture_active.0 {
+    // 第一人称修改发言区域：预览相机让位，全屏显示真实带团第一人称画面。
+    let session_active = studio.speech_area_edit.is_some();
+    let viewport = if studio.panel_open && !capture_active.0 && !session_active {
         studio.preview_rect.and_then(|rect| {
             let window = windows.single().ok()?;
             let pixels_per_point = contexts.single().ok()?.pixels_per_point;
@@ -73,6 +75,10 @@ pub(super) fn update_replay_preview_viewport(
             viewport.as_ref(),
         ) {
             camera.viewport = viewport.clone();
+        }
+        let should_render = !(studio.panel_open && session_active);
+        if camera.is_active != should_render {
+            camera.is_active = should_render;
         }
     }
 }

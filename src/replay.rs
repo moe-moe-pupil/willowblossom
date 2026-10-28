@@ -125,6 +125,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use voxxelmaxx::prelude::*;
 
 use crate::{
+    camera::GameCamera,
     deepseek::{
         DeepseekIOSender,
         DeepseekManager,
@@ -212,6 +213,12 @@ const SPEECH_PREP_BUDGET_PER_FRAME: usize = 8;
 /// 避免一次性渲染超长回放导致长时间卡住，也方便分段剪辑。
 const VIDEO_SEGMENT_MAX_MS: u64 = 20 * 60 * 1_000;
 const REPLAY_PLAYING_STATUS: &str = "正在回放；停止后会恢复当前体素场景";
+/// 「区域与台词编辑」里台词列表的默认高度与拖拽调节范围。
+const DEFAULT_DIALOGUE_EDITOR_LIST_HEIGHT: f32 = 560.0;
+const MIN_DIALOGUE_EDITOR_LIST_HEIGHT: f32 = 180.0;
+const MAX_DIALOGUE_EDITOR_LIST_HEIGHT: f32 = 2000.0;
+/// 播放区块列表的固定限高；区块很多时在内部滚动。
+const AREA_BLOCK_LIST_MAX_HEIGHT: f32 = 180.0;
 const REPLAY_SPEECH_PREPARING_STATUS: &str = "正在准备当前台词语音；语音就绪后字幕与声音会同时开始";
 const REPLAY_SPEECH_MAX_WAIT_SECONDS: f32 = 5.0;
 const DEFAULT_DIRECTED_CAMERA_DISTANCE_SCALE: f32 = 1.5;
@@ -989,6 +996,13 @@ struct ReplayHistoryParams<'w> {
     ship_trajectory_history: ResMut<'w, Persistent<ReplayShipTrajectoryHistory>>,
 }
 
+/// 合成预览相机与带团第一人称相机的合并查询，控制系统参数数量。
+#[derive(SystemParam)]
+struct ReplayCameraViews<'w, 's> {
+    viewport_camera: Query<'w, 's, &'static Transform, With<VoxelViewportCamera>>,
+    game_camera: Query<'w, 's, &'static Transform, With<GameCamera>>,
+}
+
 #[derive(SystemParam)]
 struct ReplayLiveEditParams<'w, 's> {
     possession: Res<'w, VoxelPossessionState>,
@@ -1356,6 +1370,37 @@ struct ReplayShipPunchIn {
     samples: Vec<ReplayShipKeyframe>,
 }
 
+/// 「在此后插入发言」的草稿：任选发言人，沿用其最新位置，
+/// 插入到指定台词之后并顺延后续台词。
+#[derive(Debug, Clone)]
+struct SpeechInsertDraft {
+    after_line_id: u64,
+    sender_id: u64,
+    text: String,
+}
+
+/// 重命名发言人的草稿：显示名与角色标签会应用到该发言人的全部台词。
+#[derive(Debug, Clone)]
+struct SpeakerRenameDraft {
+    sender_id: u64,
+    original_name: String,
+    name: String,
+    role: String,
+}
+
+/// 「第一人称修改发言区域」的会话：预览暂停到台词时刻并解锁带团视窗，
+/// DM 移动后的相机位姿实时应用到所选台词；结束时可保存应用或无保存退出。
+#[derive(Debug, Clone)]
+struct SpeechAreaEditSession {
+    line_id: u64,
+    restore_live_editing: bool,
+    confirming: bool,
+    original_position_cells: [i32; 3],
+    original_snapshot_recorded: bool,
+    original_metadata_estimated: bool,
+    camera_pose: Option<([f32; 3], [f32; 4])>,
+}
+
 impl Default for ReplayMode {
     fn default() -> Self { Self::Idle }
 }
@@ -1391,6 +1436,16 @@ pub(crate) struct ReplayStudio {
     /// Unlocks normal viewport tools while preview playback remains active.
     /// Replay playback still suppresses campaign persistence.
     live_editing_enabled: bool,
+    /// 第一人称修改发言区域的进行中会话；Some 时工作台面板隐藏，
+    /// 只保留 HUD 窗口与真实带团画面。
+    speech_area_edit: Option<SpeechAreaEditSession>,
+    /// 进行中的发言人重命名草稿；Some 时显示重命名窗口。
+    speaker_rename: Option<SpeakerRenameDraft>,
+    /// 进行中的「在此后插入发言」草稿；Some 时显示插入窗口。
+    speech_insert: Option<SpeechInsertDraft>,
+    /// 请求进入第一人称发言区域编辑；在下一帧开头统一处理，
+    /// 保证点击后的同一渲染周期内工作台就会切换到会话画面。
+    speech_area_edit_requested: bool,
     /// 当前激活的顶边栏自定义分段视图；None 表示标准工作台视图。
     active_custom_tab: Option<u64>,
     /// 时间轴拖动移动/分段变更后立即触发一次自动保存。
@@ -1584,6 +1639,10 @@ impl Default for ReplayStudio {
             speech_wait_elapsed_seconds: 0.0,
             speech_bypass_cues: HashSet::new(),
             live_editing_enabled: false,
+            speech_area_edit: None,
+            speaker_rename: None,
+            speech_insert: None,
+            speech_area_edit_requested: false,
             active_custom_tab: None,
             pending_replay_autosave: false,
             live_movement_user_id: None,
@@ -4154,7 +4213,7 @@ fn replay_studio_ui(
     mut voice_favorites: ResMut<Persistent<ReplayVoiceFavorites>>,
     mut replay_histories: ReplayHistoryParams,
     speech: Res<PreviewSpeechController>,
-    camera: Query<&Transform, With<VoxelViewportCamera>>,
+    camera_views: ReplayCameraViews,
     standees: Query<(&Transform, &VoxelPlayerStandee), Without<VoxelViewportCamera>>,
     mut grids: Query<&mut Grid<u8>, With<TrpgVoxelGrid>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
@@ -4167,6 +4226,12 @@ fn replay_studio_ui(
     ),
 ) {
     let Ok(ctx) = contexts.ctx_mut() else { return };
+    if studio.speech_area_edit_requested {
+        studio.speech_area_edit_requested = false;
+        if studio.speech_area_edit.is_none() {
+            start_speech_area_edit(&mut studio);
+        }
+    }
     let (avatar_textures, cached_memory) = &mut ui_cache;
     let mut occlusion_opacity = occlusion_fade.as_ref().map_or(0.0, |fade| fade.opacity);
     let mut occlusion_cast_width_cells = occlusion_fade.as_ref().map_or(
@@ -4202,67 +4267,89 @@ fn replay_studio_ui(
 
     studio.preview_rect = None;
     if studio.panel_open && !capture_active.0 {
-        let mut workspace_ui = egui::Ui::new(
-            ctx.clone(),
-            egui::Id::new("replay-workspace-root"),
-            egui::UiBuilder::new().max_rect(ctx.content_rect()),
-        );
-        workspace_header(&mut workspace_ui, &mut studio);
-        egui::Panel::bottom("replay-workspace-timeline")
-            .resizable(true)
-            .default_size(290.0)
-            .min_size(160.0)
-            .max_size((ctx.content_rect().height() * 0.6).max(160.0))
-            .show(&mut workspace_ui, |ui| {
-                replay_timeline_ui(
-                    ui,
+        if studio.speech_area_edit.is_some() {
+            if !speech_area_edit_session_valid(&studio) {
+                finish_speech_area_edit(&mut studio, false);
+            } else {
+                let camera_pose = camera_views.game_camera.iter().next().map(|transform| {
+                    (
+                        transform.translation,
+                        transform.rotation,
+                    )
+                });
+                follow_speech_area_edit_camera(
                     &mut studio,
-                    &mut grids,
-                    &replay_histories.player_movement_history,
-                    &replay_histories.ship_trajectory_history,
+                    camera_pose.map(|(translation, _)| translation),
+                    camera_pose.map(|(_, rotation)| rotation),
                 );
-            });
-        egui::Panel::left("replay-workspace-properties")
-            .resizable(true)
-            .default_size(340.0)
-            .min_size(280.0)
-            .max_size((ctx.content_rect().width() * 0.45).max(280.0))
-            .show(&mut workspace_ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt((
-                        "replay-workspace-properties-scroll",
-                        studio.workspace_tab as u8,
-                    ))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        replay_controls(
-                            ui,
-                            &manager,
-                            deepseek_sender.as_deref(),
-                            &mut deepseek_manager,
-                            &mut studio,
-                            &voice_favorites,
-                            &mut replay_histories.player_movement_history,
-                            &mut replay_histories.ship_trajectory_history,
-                            &speech,
-                            &camera,
-                            &standees,
-                            &mut grids,
-                            &mut windows,
-                            &mut capture_active,
-                            &mut live_edits,
-                            &mut occlusion_opacity,
-                            &mut occlusion_cast_width_cells,
-                            &mut occlusion_cast_height_cells,
-                            &mut occlusion_cast_end_width_cells,
-                            &mut occlusion_cast_end_height_cells,
-                            &mut occlusion_debug_gizmo,
-                        )
-                    });
-            });
-        workspace_preview(&mut workspace_ui, &mut studio);
-        if let Some(cached_memory) = cached_memory.as_mut() {
-            persist_ui_memory_after_interaction(ctx, cached_memory);
+                speech_area_edit_window(ctx, &mut studio);
+                if let Some(cached_memory) = cached_memory.as_mut() {
+                    persist_ui_memory_after_interaction(ctx, cached_memory);
+                }
+            }
+        } else {
+            let mut workspace_ui = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("replay-workspace-root"),
+                egui::UiBuilder::new().max_rect(ctx.content_rect()),
+            );
+            workspace_header(&mut workspace_ui, &mut studio);
+            egui::Panel::bottom("replay-workspace-timeline")
+                .resizable(true)
+                .default_size(290.0)
+                .min_size(160.0)
+                .max_size((ctx.content_rect().height() * 0.6).max(160.0))
+                .show(&mut workspace_ui, |ui| {
+                    replay_timeline_ui(
+                        ui,
+                        &mut studio,
+                        &mut grids,
+                        &replay_histories.player_movement_history,
+                        &replay_histories.ship_trajectory_history,
+                    );
+                });
+            egui::Panel::left("replay-workspace-properties")
+                .resizable(true)
+                .default_size(340.0)
+                .min_size(280.0)
+                .max_size((ctx.content_rect().width() * 0.6).max(280.0))
+                .show(&mut workspace_ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt((
+                            "replay-workspace-properties-scroll",
+                            studio.workspace_tab as u8,
+                        ))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            replay_controls(
+                                ui,
+                                &manager,
+                                deepseek_sender.as_deref(),
+                                &mut deepseek_manager,
+                                &mut studio,
+                                &voice_favorites,
+                                &mut replay_histories.player_movement_history,
+                                &mut replay_histories.ship_trajectory_history,
+                                &speech,
+                                &camera_views.viewport_camera,
+                                &standees,
+                                &mut grids,
+                                &mut windows,
+                                &mut capture_active,
+                                &mut live_edits,
+                                &mut occlusion_opacity,
+                                &mut occlusion_cast_width_cells,
+                                &mut occlusion_cast_height_cells,
+                                &mut occlusion_cast_end_width_cells,
+                                &mut occlusion_cast_end_height_cells,
+                                &mut occlusion_debug_gizmo,
+                            )
+                        });
+                });
+            workspace_preview(&mut workspace_ui, &mut studio);
+            if let Some(cached_memory) = cached_memory.as_mut() {
+                persist_ui_memory_after_interaction(ctx, cached_memory);
+            }
         }
     }
     if let Some(fade) = occlusion_fade.as_mut() {
@@ -4288,6 +4375,14 @@ fn replay_studio_ui(
 
     if studio.speech_settings_open && !capture_active.0 {
         speech_settings_window(ctx, &mut studio, &mut voice_favorites);
+    }
+    if (studio.speaker_rename.is_some() || studio.speech_insert.is_some())
+        && !capture_active.0
+        && studio.speech_area_edit.is_none()
+    {
+        speaker_rename_window(ctx, &mut studio);
+        let camera_pose = camera_views.viewport_camera.iter().next().copied();
+        speech_insert_window(ctx, &mut studio, camera_pose);
     }
 
     if matches!(
@@ -7047,6 +7142,24 @@ fn replay_live_edit_panel(
                 format!("● 现场编辑已开启 · 播放头 {}", format_time(playhead_ms)),
             );
         }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    playback_active && !take_active,
+                    egui::Button::new("第一人称修改发言区域"),
+                )
+                .on_hover_text(
+                    "全屏进入真实带团画面（WASD 行走、可使用物品栏），把播放头当前这句台词的发言位置改到你走到的地方；结束时可保存或放弃。",
+                )
+                .clicked()
+            {
+                start_speech_area_edit(studio);
+                if studio.speech_area_edit.is_none() {
+                    studio.speech_area_edit_requested = true;
+                }
+            }
+            ui.small("与“解锁场景与接管工具”不同：这个按钮会隐藏回放界面，全屏进入带团视窗。");
+        });
 
         if take_active {
             ui.colored_label(
@@ -7582,6 +7695,8 @@ fn replay_dialogue_editor(
         let mut block_renames = Vec::new();
         let mut dialogue_drop = None;
         let mut dialogue_delete = None;
+        let mut speaker_rename_request = None;
+        let mut speech_insert_request = None;
         let mut dialogue_add_requested = false;
         {
             let replay = studio.replay.as_mut().expect("checked above");
@@ -7609,6 +7724,9 @@ fn replay_dialogue_editor(
                 .collect::<HashMap<_, _>>();
             let mut line_reassignments = Vec::new();
             let mut line_area_changes = Vec::new();
+            // 行循环内的台词列表是可变借用，发言人快照必须提前取得。
+            let speaker_choices = replay_speaker_identities(replay);
+            let mut line_speaker_changes = Vec::new();
             ui.add_enabled_ui(!legacy_layout, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("自动同区距离");
@@ -7711,9 +7829,18 @@ fn replay_dialogue_editor(
             });
             ui.small("拖动台词左上角的手柄可排序（含 DM 台词）；拖到卡片上半部/下半部会插到其前/后。删除只影响当前回放草稿。");
 
+            // 台词列表高度可拖拽调节（把手在列表下方），用户的选择
+            // 存进 egui 持久记忆，随界面配置一起保存。
+            let list_height_id = egui::Id::new("replay-dialogue-editor-height");
+            let mut list_height = ui
+                .ctx()
+                .data_mut(|data| data.get_persisted::<f32>(list_height_id))
+                .unwrap_or(DEFAULT_DIALOGUE_EDITOR_LIST_HEIGHT);
             egui::ScrollArea::vertical()
                 .id_salt("replay-dialogue-editor")
-                .max_height(320.0)
+                .auto_shrink([false, false])
+                .min_scrolled_height(list_height)
+                .max_height(list_height)
                 .show(ui, |ui| {
                     // 行虚拟化：几千张台词卡片每张有十几个控件，全部渲染曾
                     // 让编辑页掉到个位数帧率。只渲染视口附近的卡片，屏外
@@ -7810,9 +7937,48 @@ fn replay_dialogue_editor(
                                     |ui| ui.label("⠿ 拖动"),
                                 );
                                 changed |= ui.checkbox(&mut line.included, "使用").changed();
+                                let mut chosen_speaker = line.sender_id;
+                                egui::ComboBox::from_id_salt((
+                                    "replay-line-speaker",
+                                    line.line_id,
+                                ))
+                                .selected_text(format!(
+                                    "{}（{}）",
+                                    line.name, line.sender_id
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for speaker in &speaker_choices {
+                                        ui.selectable_value(
+                                            &mut chosen_speaker,
+                                            speaker.sender_id,
+                                            format!("{}（{}）", speaker.name, speaker.sender_id),
+                                        );
+                                    }
+                                })
+                                .response
+                                .on_hover_text("把这句话换成另一位发言人：名称、头像、左右侧与语音一起切换");
+                                if chosen_speaker != line.sender_id {
+                                    line_speaker_changes.push((line.line_id, chosen_speaker));
+                                }
+                                if ui
+                                    .small_button("重命名")
+                                    .on_hover_text("重命名这位发言人（应用到其全部台词）")
+                                    .clicked()
+                                {
+                                    speaker_rename_request = Some(line.sender_id);
+                                }
+                                if ui
+                                    .small_button("在此后插入发言")
+                                    .on_hover_text(
+                                        "在这句台词后面插入一句任选发言人的台词；                                         新台词沿用所选发言人的最新位置，后续台词自动顺延",
+                                    )
+                                    .clicked()
+                                {
+                                    speech_insert_request = Some(line.line_id);
+                                }
                                 ui.label(format!(
-                                    "{} · 原始时间 {} · ID {}",
-                                    line.name, line.source_time, line.line_id
+                                    "原始时间 {} · ID {}",
+                                    line.source_time, line.line_id
                                 ));
                                 if line.metadata_estimated {
                                     ui.colored_label(
@@ -7921,6 +8087,39 @@ fn replay_dialogue_editor(
                     }
                     ui.ctx().data_mut(|data| data.insert_temp(row_heights_id, row_heights));
                 });
+            // 拖动把手调整台词列表高度：向下拖加高，向上拖缩短。
+            let (handle_rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 12.0),
+                egui::Sense::hover(),
+            );
+            let handle = ui
+                .interact(
+                    handle_rect,
+                    egui::Id::new("replay-dialogue-editor-resize"),
+                    egui::Sense::drag(),
+                )
+                .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+                .on_hover_text("拖动调整台词列表高度");
+            ui.painter().rect_filled(
+                egui::Rect::from_center_size(
+                    handle_rect.center(),
+                    egui::vec2(handle_rect.width() * 0.3, 3.0),
+                ),
+                1.5,
+                if handle.hovered() || handle.dragged() {
+                    egui::Color32::from_rgb(120, 170, 230)
+                } else {
+                    egui::Color32::from_gray(90)
+                },
+            );
+            if handle.dragged() {
+                list_height = (list_height + handle.drag_delta().y).clamp(
+                    MIN_DIALOGUE_EDITOR_LIST_HEIGHT,
+                    MAX_DIALOGUE_EDITOR_LIST_HEIGHT,
+                );
+                ui.ctx()
+                    .data_mut(|data| data.insert_persisted(list_height_id, list_height));
+            }
             if dialogue_add_requested {
                 let new_line_id = append_dm_replay_dialogue(replay);
                 changed = true;
@@ -7951,60 +8150,69 @@ fn replay_dialogue_editor(
             for (line_id, area) in line_area_changes {
                 changed |= apply_replay_dialogue_area_edit(replay, line_id, area);
             }
+            for (line_id, sender_id) in line_speaker_changes {
+                changed |= apply_replay_dialogue_speaker(replay, line_id, sender_id);
+            }
             for (line_id, target_block) in line_reassignments {
                 changed |= reassign_replay_dialogue_to_block(replay, line_id, target_block);
             }
 
             ui.label("播放区块（每块最多三个不同回合）");
-            for index in 0..replay.area_blocks.len() {
-                let block_count = replay.area_blocks.len();
-                let block = &mut replay.area_blocks[index];
-                // 稳定的行 id：位置推导的自动 id 在列表变化时会整体移位，
-                // 触发 egui 的 id 变更警告与注册表每帧重建。
-                ui.push_id(block.id, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(format!("{}.", index + 1));
-                    let area_changed = ui
-                        .add(egui::TextEdit::singleline(&mut block.area).desired_width(100.0))
-                        .changed();
-                    if area_changed {
-                        block_renames.push((block.id, block.area.clone()));
-                        changed = true;
-                    }
-                    ui.label(format!("{} 句", block.line_ids.len()));
-                    if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
-                        block_move = Some((index, index - 1));
-                    }
-                    if ui
-                        .add_enabled(
-                            index + 1 < block_count,
-                            egui::Button::new("↓"),
-                        )
-                        .clicked()
-                    {
-                        block_move = Some((index, index + 1));
-                    }
-                    if ui
-                        .add_enabled(
-                            block.line_ids.len() > 1,
-                            egui::Button::new("拆分"),
-                        )
-                        .clicked()
-                    {
-                        block_split = Some(index);
-                    }
-                    if ui
-                        .add_enabled(
-                            index + 1 < block_count,
-                            egui::Button::new("与下块合并"),
-                        )
-                        .clicked()
-                    {
-                        block_merge = Some(index);
-                    }
+            // 区块可能很多：固定限高，超出部分在列表内部滚动。
+            egui::ScrollArea::vertical()
+                .id_salt("replay-area-blocks-editor")
+                .max_height(AREA_BLOCK_LIST_MAX_HEIGHT)
+                .show(ui, |ui| {
+                for index in 0..replay.area_blocks.len() {
+                    let block_count = replay.area_blocks.len();
+                    let block = &mut replay.area_blocks[index];
+                    // 稳定的行 id：位置推导的自动 id 在列表变化时会整体移位，
+                    // 触发 egui 的 id 变更警告与注册表每帧重建。
+                    ui.push_id(block.id, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}.", index + 1));
+                        let area_changed = ui
+                            .add(egui::TextEdit::singleline(&mut block.area).desired_width(100.0))
+                            .changed();
+                        if area_changed {
+                            block_renames.push((block.id, block.area.clone()));
+                            changed = true;
+                        }
+                        ui.label(format!("{} 句", block.line_ids.len()));
+                        if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
+                            block_move = Some((index, index - 1));
+                        }
+                        if ui
+                            .add_enabled(
+                                index + 1 < block_count,
+                                egui::Button::new("↓"),
+                            )
+                            .clicked()
+                        {
+                            block_move = Some((index, index + 1));
+                        }
+                        if ui
+                            .add_enabled(
+                                block.line_ids.len() > 1,
+                                egui::Button::new("拆分"),
+                            )
+                            .clicked()
+                        {
+                            block_split = Some(index);
+                        }
+                        if ui
+                            .add_enabled(
+                                index + 1 < block_count,
+                                egui::Button::new("与下块合并"),
+                            )
+                            .clicked()
+                        {
+                            block_merge = Some(index);
+                        }
+                    });
+                    });
+                }
                 });
-                });
-            }
             for (block_id, area) in block_renames {
                 if let Some(block) = replay.area_blocks.iter().find(|block| block.id == block_id) {
                     let line_ids = block.line_ids.iter().copied().collect::<HashSet<_>>();
@@ -8111,7 +8319,13 @@ fn replay_dialogue_editor(
             studio.director_response_hash = None;
             studio.director_request_pending = false;
             studio.auto_export_after_director = false;
-            studio.status = "已应用 DM 的台词、回合、位置、区域或区块编辑".to_owned();
+            studio.status = "已应用 DM 的台词、发言人、回合、位置、区域或区块编辑".to_owned();
+        }
+        if let Some(sender_id) = speaker_rename_request {
+            open_speaker_rename(studio, sender_id);
+        }
+        if let Some(line_id) = speech_insert_request {
+            open_speech_insert_after(studio, line_id);
         }
     });
 }
@@ -9772,6 +9986,255 @@ fn scaled_dialogue_duration_ms(text: &str, master_duration: f32) -> u64 {
 fn invalidate_replay_timeline(studio: &mut ReplayStudio) {
     studio.timeline_revision = studio.timeline_revision.wrapping_add(1);
     studio.scene_revision = studio.scene_revision.wrapping_add(1);
+}
+
+/// 进入「第一人称修改发言区域」：预览暂停到台词时刻并解锁带团视窗，
+/// 工作台面板让位给全屏真实带团画面与 HUD。
+fn start_speech_area_edit(studio: &mut ReplayStudio) -> bool {
+    if studio.speech_area_edit.is_some() {
+        return false;
+    }
+    if studio.mode == ReplayMode::Recording
+        || !matches!(
+            studio.mode,
+            ReplayMode::Playing | ReplayMode::Paused
+        )
+        || replay_has_live_take(studio)
+        || studio.video_render.is_some()
+        || studio.video_encoding.is_some()
+    {
+        studio.status = "先播放或暂停回放预览，再进入第一人称发言区域编辑".into();
+        return false;
+    }
+    let selected = studio.selected_dialogue_id;
+    let playhead_ms = studio.playback_ms;
+    // 与「当前台词」面板同一套解析：选中优先，其次播放头正在说的那句，
+    // 再次播放头之前最近的一句，最后任意一句可用台词——播放头落在
+    // 台词间隙时也必须能进入，不能静默失败。
+    let line = studio.replay.as_ref().and_then(|replay| {
+        replay
+            .dialogue
+            .iter()
+            .find(|line| Some(line.line_id) == selected && replay_dialogue_is_playable(line))
+            .or_else(|| {
+                active_dialogue_index(&replay.dialogue, playhead_ms)
+                    .map(|index| &replay.dialogue[index])
+                    .filter(|line| replay_dialogue_is_playable(line))
+            })
+            .or_else(|| {
+                replay
+                    .dialogue
+                    .iter()
+                    .rposition(|line| {
+                        replay_dialogue_is_playable(line) && line.time_ms <= playhead_ms
+                    })
+                    .map(|index| &replay.dialogue[index])
+            })
+            .or_else(|| {
+                replay
+                    .dialogue
+                    .iter()
+                    .find(|line| replay_dialogue_is_playable(line))
+            })
+    });
+    let Some(line) = line else {
+        studio.status = "回放里没有可用台词，无法进入第一人称发言区域编辑".into();
+        return false;
+    };
+    let session = SpeechAreaEditSession {
+        line_id: line.line_id,
+        restore_live_editing: studio.live_editing_enabled,
+        confirming: false,
+        original_position_cells: line.position_cells,
+        original_snapshot_recorded: line.snapshot_recorded,
+        original_metadata_estimated: line.metadata_estimated,
+        camera_pose: None,
+    };
+    let time_ms = line.time_ms;
+    studio.selected_dialogue_id = Some(line.line_id);
+    studio.mode = ReplayMode::Paused;
+    studio.playback_ms = time_ms;
+    studio.live_editing_enabled = true;
+    studio.speech_wait_cue = None;
+    studio.speech_wait_elapsed_seconds = 0.0;
+    studio.speech_bypass_cues.clear();
+    studio.speaker_rename = None;
+    studio.speech_insert = None;
+    studio.speech_area_edit = Some(session);
+    studio.status = "第一人称发言区域编辑：走到目标位置后点「结束操作」".into();
+    true
+}
+
+/// 每帧把 DM 相机位姿同步到所选台词：位置实时成为发言区域，
+/// 位姿缓存在会话里，保存时写入该台词时刻的镜头关键帧。
+fn follow_speech_area_edit_camera(
+    studio: &mut ReplayStudio,
+    translation: Option<Vec3>,
+    rotation: Option<Quat>,
+) {
+    let Some(translation) = translation else { return };
+    let Some(session) = studio.speech_area_edit.as_mut() else { return };
+    let line_id = session.line_id;
+    let cells = (translation / VOXEL_SIZE).round().as_ivec3().to_array();
+    session.camera_pose = rotation.map(|rotation| {
+        (
+            translation.to_array(),
+            rotation.to_array(),
+        )
+    });
+    let Some(replay) = studio.replay.as_mut() else { return };
+    let Some(line) = replay
+        .dialogue
+        .iter_mut()
+        .find(|line| line.line_id == line_id)
+    else {
+        return;
+    };
+    line.position_cells = cells;
+}
+
+/// 结束第一人称编辑：保存则固化位置与镜头，放弃则完全恢复会话前的台词。
+fn finish_speech_area_edit(studio: &mut ReplayStudio, save: bool) {
+    let Some(session) = studio.speech_area_edit.take() else { return };
+    studio.live_editing_enabled = session.restore_live_editing;
+    let line_id = session.line_id;
+    if let Some(replay) = studio.replay.as_mut() {
+        if let Some(line) = replay
+            .dialogue
+            .iter_mut()
+            .find(|line| line.line_id == line_id)
+        {
+            if save {
+                line.snapshot_recorded = true;
+                line.metadata_estimated = false;
+                if let Some((translation, rotation)) = session.camera_pose {
+                    replay.camera.retain(|frame| frame.time_ms != line.time_ms);
+                    replay.camera.push(ReplayCameraKeyframe {
+                        time_ms: line.time_ms,
+                        translation,
+                        rotation,
+                        focus: None,
+                    });
+                    replay.camera.sort_by_key(|frame| frame.time_ms);
+                }
+            } else {
+                line.position_cells = session.original_position_cells;
+                line.snapshot_recorded = session.original_snapshot_recorded;
+                line.metadata_estimated = session.original_metadata_estimated;
+            }
+        }
+    }
+    if save {
+        invalidate_replay_timeline(studio);
+        studio.speech_wait_cue = None;
+        studio.speech_wait_elapsed_seconds = 0.0;
+        studio.speech_bypass_cues.clear();
+        studio.director_response_hash = None;
+        studio.director_request_pending = false;
+        studio.auto_export_after_director = false;
+        studio.pending_replay_autosave = true;
+        studio.status = "已保存第一人称发言区域与移动后的镜头".into();
+    } else {
+        studio.status = "已退出第一人称发言区域编辑，未保存修改".into();
+    }
+}
+
+/// 会话失效（进入录制、视频导出、台词被删等）时自动放弃并恢复视窗。
+fn speech_area_edit_session_valid(studio: &ReplayStudio) -> bool {
+    if !matches!(
+        studio.mode,
+        ReplayMode::Playing | ReplayMode::Paused
+    ) || studio.video_render.is_some()
+        || studio.video_encoding.is_some()
+        || replay_has_live_take(studio)
+    {
+        return false;
+    }
+    let Some(session) = studio.speech_area_edit.as_ref() else {
+        return false;
+    };
+    studio.replay.as_ref().is_some_and(|replay| {
+        replay
+            .dialogue
+            .iter()
+            .any(|line| line.line_id == session.line_id && replay_dialogue_is_playable(line))
+    })
+}
+
+/// 第一人称编辑期间的唯一 UI：显示所选台词与实时应用的发言位置，
+/// 「结束操作」后询问保存应用或无保存退出。
+fn speech_area_edit_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
+    let session_view = studio.speech_area_edit.as_ref().map(|session| {
+        (
+            session.line_id,
+            session.confirming,
+            session.camera_pose.map(|(translation, _)| translation),
+        )
+    });
+    let Some((line_id, confirming, camera_translation)) = session_view else {
+        return;
+    };
+    let line_view = studio.replay.as_ref().and_then(|replay| {
+        replay
+            .dialogue
+            .iter()
+            .find(|line| line.line_id == line_id)
+            .map(|line| {
+                (
+                    line.name.clone(),
+                    line.text.chars().take(48).collect::<String>(),
+                    line.position_cells,
+                )
+            })
+    });
+    let Some((speaker, text_preview, position)) = line_view else {
+        return;
+    };
+    let camera_cells = camera_translation.map(|translation| {
+        (Vec3::from_array(translation) / VOXEL_SIZE)
+            .round()
+            .as_ivec3()
+            .to_array()
+    });
+
+    egui::Window::new("第一人称发言区域编辑")
+        .id(egui::Id::new("replay-speech-area-edit"))
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::RIGHT_TOP, [-16.0, 56.0])
+        .show(ctx, |ui| {
+            ui.label(format!("发言人：{speaker}"));
+            ui.small(text_preview);
+            ui.label(format!(
+                "发言位置（格）：X {} · Y {} · Z {}",
+                position[0],
+                position[1],
+                position[2]
+            ));
+            if let Some((x, y, z)) = camera_cells.map(|cells| (cells[0], cells[1], cells[2])) {
+                ui.weak(format!("当前所在（格）：X {x} · Y {y} · Z {z}"));
+            }
+            ui.separator();
+            ui.small("现在是全屏真实带团画面：WASD 行走，可使用物品栏；移动后的镜头会实时应用到这句台词。");
+            if !confirming {
+                if ui.button("结束操作").clicked() {
+                    if let Some(session) = studio.speech_area_edit.as_mut() {
+                        session.confirming = true;
+                    }
+                }
+            } else {
+                ui.strong("是否保存并应用？");
+                ui.horizontal(|ui| {
+                    if ui.button("保存并应用").clicked() {
+                        finish_speech_area_edit(studio, true);
+                    }
+                    if ui.button("不保存退出").clicked() {
+                        finish_speech_area_edit(studio, false);
+                    }
+                });
+                ui.small("保存会把当前位置写为发言区域、把移动后的镜头写入该台词时刻；不保存则恢复原状退出。");
+            }
+        });
 }
 
 fn retime_replay_at_playhead(studio: &mut ReplayStudio, requested: f32) {
@@ -13847,6 +14310,496 @@ fn dialogue_identity(
     let avatar =
         crate::napcat::resolve_player_portrait_image(&manager.player_characters, character);
     (name, role, avatar)
+}
+
+/// 回放中一位发言人的完整身份：修改发言人时整组复制，
+/// 让显示名、角色、头像、左右侧与语音设置一起切换。
+#[derive(Debug, Clone)]
+struct ReplaySpeakerIdentity {
+    sender_id: u64,
+    name: String,
+    role: String,
+    avatar: String,
+    avatar_data_url: Option<Arc<str>>,
+    side: DialogueSide,
+}
+
+/// 按台词出现顺序去重收集发言人；同一发言人的展示信息取最新一句、
+/// 头像取最新一个非空来源，保证换发言人后沿用对方当前的形象。
+fn replay_speaker_identities(replay: &ReplayFile) -> Vec<ReplaySpeakerIdentity> {
+    let mut speakers = Vec::<ReplaySpeakerIdentity>::new();
+    for line in &replay.dialogue {
+        match speakers
+            .iter_mut()
+            .find(|speaker| speaker.sender_id == line.sender_id)
+        {
+            Some(speaker) => {
+                speaker.name = line.name.clone();
+                speaker.role = line.role.clone();
+                speaker.side = line.side;
+                if !line.avatar.trim().is_empty() {
+                    speaker.avatar = line.avatar.clone();
+                    speaker.avatar_data_url = line.avatar_data_url.clone();
+                }
+            },
+            None => speakers.push(ReplaySpeakerIdentity {
+                sender_id: line.sender_id,
+                name: line.name.clone(),
+                role: line.role.clone(),
+                avatar: line.avatar.clone(),
+                avatar_data_url: line.avatar_data_url.clone(),
+                side: line.side,
+            }),
+        }
+    }
+    speakers
+}
+
+/// 把台词的发言人换成目标身份：名称、角色、头像与左右侧一起更新；
+/// 玩家台词不再保留原发言人的镜头焦点，语音自动改用目标发言人的
+/// 音色设置（语音缓存键包含音色，会按新音色重新生成）。
+fn apply_replay_dialogue_speaker(replay: &mut ReplayFile, line_id: u64, sender_id: u64) -> bool {
+    let Some(identity) = replay_speaker_identities(replay)
+        .into_iter()
+        .find(|speaker| speaker.sender_id == sender_id)
+    else {
+        return false;
+    };
+    let Some(line) = replay
+        .dialogue
+        .iter_mut()
+        .find(|line| line.line_id == line_id)
+    else {
+        return false;
+    };
+    if line.sender_id == identity.sender_id {
+        return false;
+    }
+    line.sender_id = identity.sender_id;
+    line.name = identity.name;
+    line.role = identity.role;
+    line.avatar = identity.avatar;
+    line.avatar_data_url = identity.avatar_data_url;
+    line.side = identity.side;
+    if identity.side == DialogueSide::Right {
+        line.camera_focus_id = None;
+    }
+    true
+}
+
+/// 把一位发言人的显示名与角色标签重写到其全部台词；
+/// 语音设置按 sender_id 存储，重命名不影响音色与已生成的语音。
+fn rename_replay_speaker(replay: &mut ReplayFile, sender_id: u64, name: &str, role: &str) -> bool {
+    let mut changed = false;
+    for line in &mut replay.dialogue {
+        if line.sender_id != sender_id {
+            continue;
+        }
+        if line.name != name || line.role != role {
+            line.name = name.to_owned();
+            line.role = role.to_owned();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// 打开重命名窗口并用该发言人当前的形象预填草稿。
+fn open_speaker_rename(studio: &mut ReplayStudio, sender_id: u64) {
+    let Some(identity) = studio
+        .replay
+        .as_ref()
+        .map(replay_speaker_identities)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|speaker| speaker.sender_id == sender_id)
+    else {
+        return;
+    };
+    studio.speaker_rename = Some(SpeakerRenameDraft {
+        sender_id,
+        original_name: identity.name.clone(),
+        name: identity.name,
+        role: identity.role,
+    });
+}
+
+/// 应用重命名窗口的草稿：空名称拒绝提交，其余写入该发言人的全部台词。
+fn apply_speaker_rename(studio: &mut ReplayStudio) {
+    if studio.mode == ReplayMode::Recording
+        || replay_has_live_take(studio)
+        || studio.video_render.is_some()
+        || studio.video_encoding.is_some()
+    {
+        studio.status = "录制或导出期间不能重命名发言人".into();
+        return;
+    }
+    let Some(draft) = studio.speaker_rename.as_ref() else { return };
+    let name = draft.name.trim().to_owned();
+    if name.is_empty() {
+        studio.status = "显示名不能为空，请输入新名称".into();
+        return;
+    }
+    let role = draft.role.trim().to_owned();
+    let sender_id = draft.sender_id;
+    let original_name = draft.original_name.clone();
+    let changed = studio
+        .replay
+        .as_mut()
+        .is_some_and(|replay| rename_replay_speaker(replay, sender_id, &name, &role));
+    if !changed {
+        studio.speaker_rename = None;
+        return;
+    }
+    invalidate_replay_timeline(studio);
+    studio.pending_replay_autosave = true;
+    studio.speaker_rename = None;
+    studio.status = format!("已将 {original_name}（{sender_id}）重命名为 {name}");
+}
+
+/// 重命名窗口：预填当前显示名与角色标签，可应用到该发言人的全部台词。
+fn speaker_rename_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
+    let Some(draft) = studio.speaker_rename.as_ref() else { return };
+    let sender_id = draft.sender_id;
+    let original_name = draft.original_name.clone();
+    let mut name = draft.name.clone();
+    let mut role = draft.role.clone();
+    let line_count = studio
+        .replay
+        .as_ref()
+        .map(|replay| {
+            replay
+                .dialogue
+                .iter()
+                .filter(|line| line.sender_id == sender_id)
+                .count()
+        })
+        .unwrap_or_default();
+
+    let mut open = true;
+    egui::Window::new("重命名发言人")
+        .id(egui::Id::new("replay-speaker-rename"))
+        .open(&mut open)
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
+        .show(ctx, |ui| {
+            ui.label(format!(
+                "{original_name}（{sender_id}）· {line_count} 句台词"
+            ));
+            ui.horizontal(|ui| {
+                ui.label("显示名");
+                ui.add(
+                    egui::TextEdit::singleline(&mut name)
+                        .desired_width(180.0)
+                        .id_salt(("replay-speaker-rename-name", sender_id)),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("角色标签");
+                ui.add(
+                    egui::TextEdit::singleline(&mut role)
+                        .desired_width(180.0)
+                        .id_salt(("replay-speaker-rename-role", sender_id)),
+                );
+            });
+            ui.small("重命名会应用到这位发言人的全部台词；角色标签可留空，语音设置保持不变。");
+            ui.horizontal(|ui| {
+                if ui.button("应用").clicked() {
+                    if let Some(draft) = studio.speaker_rename.as_mut() {
+                        draft.name = name.clone();
+                        draft.role = role.clone();
+                    }
+                    apply_speaker_rename(studio);
+                }
+                if ui.button("取消").clicked() {
+                    studio.speaker_rename = None;
+                }
+            });
+        });
+    if !open {
+        studio.speaker_rename = None;
+    }
+    if let Some(draft) = studio.speaker_rename.as_mut() {
+        draft.name = name;
+        draft.role = role;
+    }
+}
+
+/// 打开「在此后插入发言」窗口：默认发言人沿用目标台词的发言人。
+fn open_speech_insert_after(studio: &mut ReplayStudio, after_line_id: u64) {
+    let Some(replay) = studio.replay.as_ref() else {
+        return;
+    };
+    let Some(target) = replay
+        .dialogue
+        .iter()
+        .find(|line| line.line_id == after_line_id)
+    else {
+        return;
+    };
+    studio.speech_insert = Some(SpeechInsertDraft {
+        after_line_id,
+        sender_id: target.sender_id,
+        text: String::new(),
+    });
+}
+
+/// 应用插入草稿：新台词放在目标台词之后，沿用所选发言人的身份与
+/// 最新位置，后续台词整体顺延避免重叠，并按编辑管线重建时长与镜头。
+fn apply_speech_insert(studio: &mut ReplayStudio, camera: Option<Transform>) -> bool {
+    if studio.mode == ReplayMode::Recording
+        || replay_has_live_take(studio)
+        || studio.video_render.is_some()
+        || studio.video_encoding.is_some()
+    {
+        studio.status = "录制或导出期间不能插入台词".into();
+        return false;
+    }
+    let Some(draft) = studio.speech_insert.as_ref() else {
+        return false;
+    };
+    let insert_text = draft.text.trim().to_owned();
+    if insert_text.is_empty() {
+        studio.status = "请先输入要插入的台词内容".into();
+        return false;
+    }
+    let after_line_id = draft.after_line_id;
+    let sender_id = draft.sender_id;
+    let Some(replay) = studio.replay.as_mut() else {
+        return false;
+    };
+    let Some(target_index) = replay
+        .dialogue
+        .iter()
+        .position(|line| line.line_id == after_line_id)
+    else {
+        studio.speech_insert = None;
+        studio.status = "原台词已被删除，无法在此后插入".into();
+        return false;
+    };
+    let Some(identity) = replay_speaker_identities(replay)
+        .into_iter()
+        .find(|speaker| speaker.sender_id == sender_id)
+    else {
+        studio.status = "所选发言人已不在回放中".into();
+        return false;
+    };
+    let target = &replay.dialogue[target_index];
+    let insert_time = target
+        .time_ms
+        .saturating_add(target.duration_ms)
+        .saturating_add(HISTORY_DIALOGUE_GAP_MS);
+    let turn_index = target.turn_index;
+    let area = target.area.clone();
+    let visibility = target.visibility.clone();
+    let fallback_position = target.position_cells;
+    let source_time = target.source_time;
+    // GM 台词沿用目标台词的镜头焦点；玩家台词聚焦自己的立绘。
+    let camera_focus_id = if identity.side == DialogueSide::Left {
+        Some(
+            target
+                .camera_focus_id
+                .or_else(|| (target.side == DialogueSide::Right).then_some(target.sender_id)),
+        )
+        .flatten()
+    } else {
+        None
+    };
+    // 「沿用那个人的位置」：取该发言人最后一句可用台词的位置。
+    let position_cells = replay
+        .dialogue
+        .iter()
+        .filter(|line| {
+            line.sender_id == sender_id
+                && replay_dialogue_is_playable(line)
+                && line.line_id != after_line_id
+        })
+        .map(|line| line.position_cells)
+        .last()
+        .unwrap_or(fallback_position);
+    let line_id = replay
+        .dialogue
+        .iter()
+        .map(|line| line.line_id)
+        .max()
+        .unwrap_or_default()
+        .saturating_add(1);
+    let duration_ms = dialogue_duration_ms(&insert_text);
+    replay.dialogue.insert(target_index + 1, ReplayDialogue {
+        time_ms: insert_time,
+        duration_ms,
+        duration_locked: false,
+        sender_id: identity.sender_id,
+        camera_focus_id,
+        name: identity.name.clone(),
+        role: identity.role,
+        text: insert_text.clone(),
+        speech_text: None,
+        speech_enabled: true,
+        speech_rate: default_line_speech_rate(),
+        speech_volume: default_line_speech_volume(),
+        avatar: identity.avatar,
+        avatar_data_url: identity.avatar_data_url,
+        visibility,
+        side: identity.side,
+        line_id,
+        source_time,
+        turn_index,
+        position_cells,
+        area,
+        included: true,
+        snapshot_recorded: true,
+        metadata_estimated: false,
+        forwarded: false,
+    });
+    // 分配到目标台词所在的播放区块，区块内紧跟目标台词：
+    // 台词向量的规范顺序按区块成员与来源时间排列。
+    if let Some(block) = replay
+        .area_blocks
+        .iter_mut()
+        .find(|block| block.line_ids.contains(&after_line_id))
+    {
+        if let Some(position) = block.line_ids.iter().position(|id| *id == after_line_id) {
+            block.line_ids.insert(position + 1, line_id);
+        }
+    }
+    // 台词时间轴由区块顺序统一重排：新行已紧跟目标台词，
+    // 重编译会自动排期并顺延后续台词，无需手动搬运时间。
+    recompile_edited_replay_dialogue(replay);
+    extend_replay_for_speech(replay);
+    if let Some(base) = camera {
+        let playable = replay
+            .dialogue
+            .iter()
+            .filter(|line| replay_dialogue_is_playable(line))
+            .cloned()
+            .collect::<Vec<_>>();
+        let positions = replay_speaker_positions(&playable);
+        replay.camera = turn_based_camera_track(
+            &base,
+            &playable,
+            replay.duration_ms,
+            &positions,
+            replay.camera_distance_scale,
+            replay.camera_yaw_degrees,
+            &ReplayCameraObstacles::from_scene(&replay.scene),
+        );
+    }
+    invalidate_replay_timeline(studio);
+    studio.speech_wait_cue = None;
+    studio.speech_wait_elapsed_seconds = 0.0;
+    studio.speech_bypass_cues.clear();
+    studio.director_response_hash = None;
+    studio.director_request_pending = false;
+    studio.auto_export_after_director = false;
+    studio.pending_replay_autosave = true;
+    studio.selected_dialogue_id = Some(line_id);
+    studio.speech_insert = None;
+    studio.status = format!(
+        "已插入 {0} 的台词，后续台词已顺延",
+        identity.name
+    );
+    true
+}
+
+/// 「在此后插入发言」窗口：任选发言人、输入台词内容后插入。
+fn speech_insert_window(ctx: &egui::Context, studio: &mut ReplayStudio, camera: Option<Transform>) {
+    let Some(draft) = studio.speech_insert.as_ref() else {
+        return;
+    };
+    let after_line_id = draft.after_line_id;
+    let mut sender_id = draft.sender_id;
+    let mut text = draft.text.clone();
+    let target_view = studio.replay.as_ref().and_then(|replay| {
+        replay
+            .dialogue
+            .iter()
+            .find(|line| line.line_id == after_line_id)
+            .map(|line| {
+                (
+                    line.name.clone(),
+                    line.text.chars().take(32).collect::<String>(),
+                )
+            })
+    });
+    let Some((target_name, target_preview)) = target_view else {
+        studio.speech_insert = None;
+        return;
+    };
+    let speakers = studio
+        .replay
+        .as_ref()
+        .map(replay_speaker_identities)
+        .unwrap_or_default();
+
+    let mut open = true;
+    egui::Window::new("在此后插入发言")
+        .id(egui::Id::new("replay-speech-insert"))
+        .open(&mut open)
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
+        .show(ctx, |ui| {
+            ui.label(format!(
+                "在 {target_name} 的“{target_preview}”之后插入"
+            ));
+            ui.horizontal(|ui| {
+                ui.label("发言人");
+                let selected_text = speakers
+                    .iter()
+                    .find(|speaker| speaker.sender_id == sender_id)
+                    .map(|speaker| {
+                        format!(
+                            "{}（{}）",
+                            speaker.name, speaker.sender_id
+                        )
+                    })
+                    .unwrap_or_else(|| "选择发言人".to_owned());
+                egui::ComboBox::from_id_salt("replay-speech-insert-speaker")
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        for speaker in &speakers {
+                            ui.selectable_value(
+                                &mut sender_id,
+                                speaker.sender_id,
+                                format!(
+                                    "{}（{}）",
+                                    speaker.name, speaker.sender_id
+                                ),
+                            );
+                        }
+                    });
+            });
+            ui.label("台词内容");
+            egui::TextEdit::multiline(&mut text)
+                .desired_width(320.0)
+                .desired_rows(3)
+                .id_salt("replay-speech-insert-text")
+                .show(ui);
+            ui.small(
+                "新台词沿用所选发言人的最新位置，后续台词自动顺延；语音按该发言人的音色生成。",
+            );
+            ui.horizontal(|ui| {
+                if ui.button("插入").clicked() {
+                    if let Some(draft) = studio.speech_insert.as_mut() {
+                        draft.sender_id = sender_id;
+                        draft.text = text.clone();
+                    }
+                    apply_speech_insert(studio, camera);
+                }
+                if ui.button("取消").clicked() {
+                    studio.speech_insert = None;
+                }
+            });
+        });
+    if !open {
+        studio.speech_insert = None;
+    }
+    if let Some(draft) = studio.speech_insert.as_mut() {
+        draft.sender_id = sender_id;
+        draft.text = text;
+    }
 }
 
 fn dialogue_duration_ms(text: &str) -> u64 {
@@ -18598,6 +19551,394 @@ mod tests {
     }
 
     #[test]
+    fn speaker_identities_deduplicate_and_prefer_the_freshest_identity() {
+        let mut first = test_dialogue_for_speaker(7);
+        first.line_id = 1;
+        first.name = "旧名".into();
+        let mut second = test_dialogue_for_speaker(7);
+        second.line_id = 2;
+        second.name = "新名".into();
+        second.role = "刺客".into();
+        second.avatar = "来源B".into();
+        second.avatar_data_url = Some("data:image/png;base64,BB".into());
+        let mut gm = test_dialogue_for_speaker(0);
+        gm.line_id = 3;
+        gm.name = "GM".into();
+        gm.side = DialogueSide::Left;
+        let replay = test_replay(vec![first, second, gm]);
+
+        let speakers = replay_speaker_identities(&replay);
+        assert_eq!(
+            speakers.len(),
+            2,
+            "同一 sender_id 只出现一次"
+        );
+        let seven = &speakers[0];
+        assert_eq!(seven.sender_id, 7);
+        assert_eq!(seven.name, "新名");
+        assert_eq!(seven.role, "刺客");
+        assert_eq!(seven.avatar, "来源B");
+        assert_eq!(
+            seven.avatar_data_url.as_deref(),
+            Some("data:image/png;base64,BB")
+        );
+        assert_eq!(speakers[1].sender_id, 0);
+        assert_eq!(speakers[1].side, DialogueSide::Left);
+    }
+
+    #[test]
+    fn apply_replay_dialogue_speaker_swaps_identity_and_clears_player_focus() {
+        let mut line = test_dialogue_for_speaker(7);
+        line.line_id = 1;
+        line.name = "甲".into();
+        line.camera_focus_id = Some(42);
+        line.speech_text = Some("原有读音".into());
+        let mut target = test_dialogue_for_speaker(9);
+        target.line_id = 2;
+        target.name = "乙".into();
+        target.role = "医师".into();
+        target.avatar = "乙来源".into();
+        target.avatar_data_url = Some("data:image/png;base64,YY".into());
+        let mut replay = test_replay(vec![line, target]);
+
+        assert!(apply_replay_dialogue_speaker(
+            &mut replay,
+            1,
+            9
+        ));
+        let moved = &replay.dialogue[0];
+        assert_eq!(moved.sender_id, 9);
+        assert_eq!(moved.name, "乙");
+        assert_eq!(moved.role, "医师");
+        assert_eq!(moved.avatar, "乙来源");
+        assert_eq!(
+            moved.avatar_data_url.as_deref(),
+            Some("data:image/png;base64,YY")
+        );
+        assert_eq!(moved.side, DialogueSide::Right);
+        assert_eq!(
+            moved.camera_focus_id, None,
+            "玩家台词清除原发言人的镜头焦点"
+        );
+        assert_eq!(
+            moved.speech_text.as_deref(),
+            Some("原有读音"),
+            "读音与文字无关"
+        );
+        assert_eq!(
+            replay.dialogue[1].sender_id, 9,
+            "其他台词不受影响"
+        );
+
+        // 同一发言人或未知目标都是无操作。
+        assert!(!apply_replay_dialogue_speaker(
+            &mut replay,
+            1,
+            9
+        ));
+        assert!(!apply_replay_dialogue_speaker(
+            &mut replay,
+            1,
+            123
+        ));
+
+        // 换成 GM 时保留镜头焦点并改为左侧。
+        replay.dialogue[0].camera_focus_id = Some(7);
+        let mut gm = test_dialogue_for_speaker(0);
+        gm.line_id = 3;
+        gm.name = "GM".into();
+        gm.side = DialogueSide::Left;
+        replay.dialogue.push(gm);
+        assert!(apply_replay_dialogue_speaker(
+            &mut replay,
+            1,
+            0
+        ));
+        assert_eq!(
+            replay.dialogue[0].camera_focus_id,
+            Some(7)
+        );
+        assert_eq!(
+            replay.dialogue[0].side,
+            DialogueSide::Left
+        );
+    }
+
+    #[test]
+    fn speech_area_edit_follows_the_dm_camera_until_saved() {
+        let mut first = positioned_dialogue(1, 0, 0, [3, 0, 3]);
+        first.time_ms = 1000;
+        first.duration_ms = 1500;
+        let mut second = positioned_dialogue(2, 0, 2, [5, 0, 5]);
+        second.time_ms = 3000;
+        second.duration_ms = 1500;
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(test_replay(vec![first, second]));
+        studio.replay.as_mut().unwrap().duration_ms = 5000;
+        studio.selected_dialogue_id = Some(2);
+        studio.playback_ms = 4000;
+
+        // 空闲预览不能进入。
+        assert!(!start_speech_area_edit(&mut studio));
+        assert!(studio.speech_area_edit.is_none());
+
+        // 暂停且未选中台词：回退到播放头所在的那句（现场编辑入口）。
+        studio.mode = ReplayMode::Paused;
+        studio.selected_dialogue_id = None;
+        assert!(start_speech_area_edit(&mut studio));
+        assert_eq!(
+            studio.speech_area_edit.as_ref().unwrap().line_id,
+            2,
+            "播放头 4000ms 落在第二句内"
+        );
+        finish_speech_area_edit(&mut studio, false);
+        studio.speech_area_edit = None;
+
+        // 播放头落在台词间隙（第一句已结束、第二句未开始）时也能进入：
+        // 取播放头之前最近的一句，与「当前台词」面板的解析一致。
+        studio.playback_ms = 2_700;
+        studio.selected_dialogue_id = None;
+        assert!(start_speech_area_edit(&mut studio));
+        assert_eq!(
+            studio.speech_area_edit.as_ref().unwrap().line_id,
+            1,
+            "间隙中取播放头之前最近的一句"
+        );
+        finish_speech_area_edit(&mut studio, false);
+
+        // 播放头越过所有台词时取最后一句可用台词，仍然可以进入。
+        studio.playback_ms = 4600;
+        studio.selected_dialogue_id = None;
+        assert!(start_speech_area_edit(&mut studio));
+        assert_eq!(
+            studio.speech_area_edit.as_ref().unwrap().line_id,
+            2
+        );
+        finish_speech_area_edit(&mut studio, false);
+        studio.selected_dialogue_id = Some(2);
+
+        assert!(start_speech_area_edit(&mut studio));
+        assert_eq!(studio.mode, ReplayMode::Paused);
+        assert_eq!(
+            studio.playback_ms, 3000,
+            "预览暂停到台词时刻"
+        );
+        assert!(
+            studio.live_editing_enabled,
+            "带团视窗解锁"
+        );
+
+        follow_speech_area_edit_camera(
+            &mut studio,
+            Some(Vec3::new(0.5, 0.0, 0.5)),
+            Some(Quat::IDENTITY),
+        );
+        {
+            let replay = studio.replay.as_ref().unwrap();
+            assert_eq!(replay.dialogue[1].position_cells, [
+                2, 0, 2
+            ]);
+            assert_eq!(
+                replay.dialogue[0].position_cells,
+                [3, 0, 3],
+                "其他台词不受影响"
+            );
+        }
+
+        finish_speech_area_edit(&mut studio, true);
+        assert!(studio.speech_area_edit.is_none());
+        assert!(!studio.live_editing_enabled);
+        let replay = studio.replay.as_ref().unwrap();
+        assert_eq!(replay.dialogue[1].position_cells, [
+            2, 0, 2
+        ]);
+        assert!(replay.dialogue[1].snapshot_recorded);
+        assert!(!replay.dialogue[1].metadata_estimated);
+        let frame = replay
+            .camera
+            .iter()
+            .find(|frame| frame.time_ms == 3000)
+            .expect("台词时刻的镜头关键帧");
+        assert_eq!(frame.translation, [0.5, 0.0, 0.5]);
+        assert_eq!(
+            frame.rotation,
+            Quat::IDENTITY.to_array()
+        );
+        assert_eq!(studio.timeline_revision, 1);
+        assert!(studio.pending_replay_autosave);
+        assert!(studio.status.contains("已保存"));
+    }
+
+    #[test]
+    fn speech_area_edit_discard_restores_the_original_cue_exactly() {
+        let mut first = positioned_dialogue(1, 0, 0, [3, 0, 3]);
+        first.time_ms = 1000;
+        first.duration_ms = 1500;
+        let mut second = positioned_dialogue(2, 0, 2, [5, 0, 5]);
+        second.time_ms = 3000;
+        second.duration_ms = 1500;
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(test_replay(vec![first, second]));
+        studio.selected_dialogue_id = Some(2);
+        studio.mode = ReplayMode::Paused;
+        studio.live_editing_enabled = true;
+
+        assert!(start_speech_area_edit(&mut studio));
+        assert!(
+            studio
+                .speech_area_edit
+                .as_ref()
+                .unwrap()
+                .restore_live_editing
+        );
+        follow_speech_area_edit_camera(
+            &mut studio,
+            Some(Vec3::new(1.0, 0.0, 1.0)),
+            Some(Quat::IDENTITY),
+        );
+        assert_eq!(
+            studio.replay.as_ref().unwrap().dialogue[1].position_cells,
+            [4, 0, 4]
+        );
+
+        finish_speech_area_edit(&mut studio, false);
+        assert!(studio.speech_area_edit.is_none());
+        assert!(
+            studio.live_editing_enabled,
+            "恢复进入前的解锁状态"
+        );
+        let replay = studio.replay.as_ref().unwrap();
+        assert_eq!(replay.dialogue[1].position_cells, [
+            5, 0, 5
+        ]);
+        assert!(replay.dialogue[1].snapshot_recorded);
+        assert!(!replay.dialogue[1].metadata_estimated);
+        assert!(
+            replay.camera.is_empty(),
+            "放弃时不得写入镜头关键帧"
+        );
+        assert_eq!(studio.timeline_revision, 0);
+        assert!(!studio.pending_replay_autosave);
+        assert!(studio.status.contains("未保存"));
+    }
+
+    #[test]
+    fn speech_area_edit_session_invalidates_on_recording_and_missing_lines() {
+        let mut line = positioned_dialogue(1, 0, 0, [3, 0, 3]);
+        line.time_ms = 1000;
+        line.duration_ms = 1500;
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(test_replay(vec![line]));
+        studio.selected_dialogue_id = Some(1);
+        studio.mode = ReplayMode::Paused;
+        assert!(start_speech_area_edit(&mut studio));
+        assert!(speech_area_edit_session_valid(&studio));
+
+        studio.mode = ReplayMode::Recording;
+        assert!(!speech_area_edit_session_valid(&studio));
+        studio.mode = ReplayMode::Paused;
+        studio.replay.as_mut().unwrap().dialogue[0].included = false;
+        assert!(!speech_area_edit_session_valid(&studio));
+        // 失效后放弃：会话清空、解锁状态还原。
+        finish_speech_area_edit(&mut studio, false);
+        assert!(studio.speech_area_edit.is_none());
+    }
+
+    #[test]
+    fn rename_replay_speaker_rewrites_every_line_of_that_speaker() {
+        let mut first = test_dialogue_for_speaker(7);
+        first.line_id = 1;
+        first.name = "玩家".into();
+        first.role = "战士".into();
+        let mut second = test_dialogue_for_speaker(7);
+        second.line_id = 2;
+        second.name = "玩家".into();
+        let mut other = test_dialogue_for_speaker(9);
+        other.line_id = 3;
+        other.name = "队友".into();
+        let mut replay = test_replay(vec![first, second, other]);
+
+        assert!(rename_replay_speaker(
+            &mut replay,
+            7,
+            "柳絮",
+            "刺客"
+        ));
+        assert_eq!(replay.dialogue[0].name, "柳絮");
+        assert_eq!(replay.dialogue[0].role, "刺客");
+        assert_eq!(replay.dialogue[1].name, "柳絮");
+        assert_eq!(replay.dialogue[1].role, "刺客");
+        assert_eq!(
+            replay.dialogue[2].name, "队友",
+            "其他发言人不受影响"
+        );
+
+        // 相同名称与角色：无操作。
+        assert!(!rename_replay_speaker(
+            &mut replay,
+            7,
+            "柳絮",
+            "刺客"
+        ));
+        // 空名称由窗口层拦截，这里仅确认不匹配的 sender 无操作。
+        assert!(!rename_replay_speaker(
+            &mut replay,
+            123,
+            "无名",
+            ""
+        ));
+    }
+
+    #[test]
+    fn speaker_rename_window_applies_or_rejects_the_draft() {
+        let mut first = test_dialogue_for_speaker(7);
+        first.line_id = 1;
+        first.name = "玩家".into();
+        let mut second = test_dialogue_for_speaker(7);
+        second.line_id = 2;
+        second.name = "玩家".into();
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(test_replay(vec![first, second]));
+        studio.mode = ReplayMode::Paused;
+
+        open_speaker_rename(&mut studio, 7);
+        let draft = studio.speaker_rename.as_ref().unwrap();
+        assert_eq!(draft.original_name, "玩家");
+        assert_eq!(draft.name, "玩家");
+        assert_eq!(draft.sender_id, 7);
+
+        // 空名称拒绝提交，窗口保持打开。
+        studio.speaker_rename.as_mut().unwrap().name = "  ".into();
+        apply_speaker_rename(&mut studio);
+        assert!(studio.speaker_rename.is_some());
+        assert_eq!(
+            studio.replay.as_ref().unwrap().dialogue[0].name,
+            "玩家"
+        );
+        assert_eq!(studio.timeline_revision, 0);
+
+        // 正常应用：全部台词更新，修订与自动保存触发，草稿关闭。
+        let draft = studio.speaker_rename.as_mut().unwrap();
+        draft.name = "柳絮".into();
+        draft.role = "刺客".into();
+        apply_speaker_rename(&mut studio);
+        assert!(studio.speaker_rename.is_none());
+        let replay = studio.replay.as_ref().unwrap();
+        assert_eq!(replay.dialogue[0].name, "柳絮");
+        assert_eq!(replay.dialogue[0].role, "刺客");
+        assert_eq!(replay.dialogue[1].name, "柳絮");
+        assert_eq!(studio.timeline_revision, 1);
+        assert!(studio.pending_replay_autosave);
+        assert!(studio.status.contains("已将 玩家（7）重命名为 柳絮"));
+
+        // 名称与角色都没有变化时直接关闭，不触发修订。
+        open_speaker_rename(&mut studio, 7);
+        apply_speaker_rename(&mut studio);
+        assert!(studio.speaker_rename.is_none());
+        assert_eq!(studio.timeline_revision, 1);
+    }
+
+    #[test]
     fn ship_trajectory_interpolates_and_holds_pose() {
         let trajectory = ReplayShipTrajectory {
             ship_id: "ship-1".to_owned(),
@@ -20850,6 +22191,213 @@ mod tests {
             "unchanged line B keeps its cached audio at the shifted index"
         );
         assert!(!speech.onnx_cache.contains_key(&(7, 1)));
+    }
+
+    #[test]
+    fn editing_one_lines_text_keeps_other_lines_cached_audio() {
+        let mut replay = test_replay(vec![
+            test_dialogue(0, 1_000, DialogueSide::Right),
+            test_dialogue(1_000, 1_000, DialogueSide::Right),
+            test_dialogue(2_000, 1_000, DialogueSide::Right),
+        ]);
+        for (index, line) in replay.dialogue.iter_mut().enumerate() {
+            line.line_id = index as u64 + 1;
+        }
+        replay.created_at_unix_ms = 7;
+        let mut speech = PreviewSpeechController::default();
+        speech
+            .prepare_onnx_replay(&replay, 1.0, 0, &[], &HashSet::new())
+            .unwrap();
+        speech.onnx_cache.insert((7, 0), (vec![1], 0.8));
+        speech.onnx_cache.insert((7, 1), (vec![2], 0.8));
+        speech.onnx_cache.insert((7, 2), (vec![3], 0.8));
+
+        // 用户只改中间一句的字幕（批量编辑器同样会拉伸时长并平移轨道）。
+        replay.dialogue[1].text = "改后的台词".into();
+        replay.dialogue[1].speech_text = None;
+        recompile_edited_replay_dialogue(&mut replay);
+        extend_replay_for_speech(&mut replay);
+        speech
+            .prepare_onnx_replay(&replay, 1.0, 1, &[], &HashSet::new())
+            .unwrap();
+
+        assert_eq!(
+            speech.onnx_cache.get(&(7, 0)),
+            Some(&(vec![1], 0.8)),
+            "未编辑台词的音频必须保留"
+        );
+        assert_eq!(
+            speech.onnx_cache.get(&(7, 2)),
+            Some(&(vec![3], 0.8)),
+            "未编辑台词的音频必须保留"
+        );
+        assert!(
+            !speech.onnx_cache.contains_key(&(7, 1)),
+            "被编辑的那一句才需要重新生成"
+        );
+    }
+
+    #[test]
+    fn speech_insert_places_the_chosen_speaker_after_the_target_line() {
+        let mut first = test_dialogue_for_speaker(7);
+        first.line_id = 1;
+        first.name = "甲".into();
+        first.time_ms = 0;
+        first.duration_ms = 1_000;
+        first.position_cells = [3, 0, 3];
+        first.area = "区域 1".into();
+        first.snapshot_recorded = true;
+        let mut second = test_dialogue_for_speaker(8);
+        second.line_id = 2;
+        second.name = "乙".into();
+        second.time_ms = 1_270;
+        second.duration_ms = 1_000;
+        second.position_cells = [5, 0, 5];
+        second.area = "区域 1".into();
+        second.snapshot_recorded = true;
+        let mut third = test_dialogue_for_speaker(7);
+        third.line_id = 3;
+        third.name = "甲".into();
+        third.time_ms = 2_540;
+        third.duration_ms = 1_000;
+        third.position_cells = [9, 0, 9];
+        third.area = "区域 1".into();
+        third.snapshot_recorded = true;
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(test_replay(vec![first, second, third]));
+        // 台词时间轴按播放区块顺序重排：三句都在区块 1 里。
+        studio.replay.as_mut().unwrap().area_blocks = vec![ReplayAreaBlock {
+            id: 1,
+            area: "区域 1".to_owned(),
+            line_ids: vec![1, 2, 3],
+        }];
+        studio.mode = ReplayMode::Paused;
+
+        open_speech_insert_after(&mut studio, 2);
+        let draft = studio.speech_insert.as_ref().unwrap();
+        assert_eq!(draft.after_line_id, 2);
+        assert_eq!(
+            draft.sender_id, 8,
+            "默认发言人沿用目标台词"
+        );
+        studio.speech_insert.as_mut().unwrap().sender_id = 7;
+        studio.speech_insert.as_mut().unwrap().text = "插入的台词".into();
+
+        assert!(apply_speech_insert(&mut studio, None));
+        assert!(studio.speech_insert.is_none());
+        let replay = studio.replay.as_ref().unwrap();
+        assert_eq!(replay.dialogue.len(), 4);
+        let inserted_id = replay
+            .dialogue
+            .iter()
+            .map(|line| line.line_id)
+            .max()
+            .unwrap();
+        let inserted = replay
+            .dialogue
+            .iter()
+            .find(|line| line.line_id == inserted_id)
+            .unwrap();
+        assert_eq!(inserted.sender_id, 7);
+        assert_eq!(inserted.name, "甲");
+        assert_eq!(inserted.text, "插入的台词");
+        assert_eq!(
+            inserted.position_cells,
+            [9, 0, 9],
+            "沿用所选发言人（甲）最新的台词位置"
+        );
+        assert_eq!(inserted.side, DialogueSide::Right);
+        assert!(inserted.snapshot_recorded);
+        assert!(!inserted.metadata_estimated);
+        assert_eq!(inserted.area, "区域 1");
+        let second = replay
+            .dialogue
+            .iter()
+            .find(|line| line.line_id == 2)
+            .unwrap();
+        let third = replay
+            .dialogue
+            .iter()
+            .find(|line| line.line_id == 3)
+            .unwrap();
+        assert_eq!(
+            inserted.time_ms,
+            second.time_ms + second.duration_ms + HISTORY_DIALOGUE_GAP_MS,
+            "时间轴重排后紧跟目标台词"
+        );
+        assert_eq!(
+            third.time_ms,
+            inserted.time_ms + inserted.duration_ms + HISTORY_DIALOGUE_GAP_MS,
+            "后续台词被自动顺延"
+        );
+        let block = &replay.area_blocks[0];
+        assert_eq!(
+            block.line_ids,
+            vec![1, 2, inserted_id, 3],
+            "区块内顺序紧跟目标台词"
+        );
+        assert_eq!(
+            studio.selected_dialogue_id,
+            Some(inserted.line_id)
+        );
+        assert_eq!(studio.timeline_revision, 1);
+        assert!(studio.pending_replay_autosave);
+        assert!(studio.status.contains("已插入 甲 的台词"));
+    }
+
+    #[test]
+    fn speech_insert_rejects_empty_text_and_recording() {
+        let mut line = test_dialogue_for_speaker(7);
+        line.line_id = 1;
+        line.time_ms = 0;
+        line.duration_ms = 1_000;
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(test_replay(vec![line]));
+        studio.mode = ReplayMode::Paused;
+        open_speech_insert_after(&mut studio, 1);
+        studio.speech_insert.as_mut().unwrap().text = "   ".into();
+        assert!(!apply_speech_insert(&mut studio, None));
+        assert_eq!(
+            studio.replay.as_ref().unwrap().dialogue.len(),
+            1
+        );
+        assert!(
+            studio.speech_insert.is_some(),
+            "空台词时窗口保持打开"
+        );
+
+        studio.speech_insert.as_mut().unwrap().text = "内容".into();
+        studio.mode = ReplayMode::Recording;
+        assert!(!apply_speech_insert(&mut studio, None));
+        assert_eq!(
+            studio.replay.as_ref().unwrap().dialogue.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn speech_area_edit_falls_back_to_the_line_at_the_playhead() {
+        let mut first = test_dialogue_for_speaker(7);
+        first.line_id = 1;
+        first.time_ms = 0;
+        first.duration_ms = 1_000;
+        let mut second = test_dialogue_for_speaker(7);
+        second.line_id = 2;
+        second.time_ms = 1_270;
+        second.duration_ms = 1_000;
+        let mut studio = ReplayStudio::default();
+        studio.replay = Some(test_replay(vec![first, second]));
+        studio.selected_dialogue_id = None;
+        studio.mode = ReplayMode::Paused;
+        studio.playback_ms = 1_300;
+
+        assert!(start_speech_area_edit(&mut studio));
+        assert_eq!(
+            studio.speech_area_edit.as_ref().unwrap().line_id,
+            2,
+            "现场编辑入口无需时间轴选中，退回播放头当前句"
+        );
+        assert_eq!(studio.selected_dialogue_id, Some(2));
     }
 
     #[test]

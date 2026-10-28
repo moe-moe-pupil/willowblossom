@@ -97,7 +97,10 @@ except Exception as error:
 
 def style_embedding(text):
     # BERT 位置编码上限 512：超长台词必须截断，否则张量尺寸不匹配直接崩溃。
-    max_positions = int(getattr(style_encoder.config, "max_position_embeddings", 512))
+    # StyleEncoder 不保存 config；位置上限要从它内部的 BERT 模型上取。
+    max_positions = int(
+        getattr(style_encoder.bert.config, "max_position_embeddings", 512)
+    )
     encoded = tokenizer(
         text,
         return_tensors="pt",

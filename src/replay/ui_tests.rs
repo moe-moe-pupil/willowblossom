@@ -49,19 +49,22 @@ use serde_json::{
 use voxxelmaxx::prelude::Grid;
 
 use super::{
+    inspector::selected_dialogue_inspector,
+    speaker_rename_window,
+    speech_area_edit_window,
+    timeline::replay_timeline_ui,
+    ui_render::EguiFrameRenderer,
+    workspace::{
+        workspace_header,
+        workspace_preview,
+        ReplayWorkspaceTab,
+    },
+    DialogueSide,
     ReplayMode,
     ReplayPlayerMovementHistory,
     ReplayShipTrajectoryHistory,
     ReplayStudio,
     TrpgVoxelGrid,
-    inspector::selected_dialogue_inspector,
-    timeline::replay_timeline_ui,
-    ui_render::EguiFrameRenderer,
-    workspace::{
-        ReplayWorkspaceTab,
-        workspace_header,
-        workspace_preview,
-    },
 };
 
 fn replay_ui_context() -> Context {
@@ -247,6 +250,12 @@ impl TimelineHarness {
                         timeline_panel.response.rect,
                     ));
                     workspace_preview(ui, &mut self.studio);
+                    if self.studio.speech_area_edit.is_some() {
+                        speech_area_edit_window(&self.context, &mut self.studio);
+                    }
+                    if self.studio.speaker_rename.is_some() {
+                        speaker_rename_window(&self.context, &mut self.studio);
+                    }
                 } else {
                     replay_timeline_ui(
                         ui,
@@ -995,4 +1004,155 @@ fn workspace_tabs_click_and_preview_remains_inside_resized_docks() {
     }
     harness.button("返回主界面");
     assert!(!harness.studio.panel_open);
+}
+
+#[test]
+fn inspector_speaker_combo_swaps_the_whole_identity() {
+    let mut harness = TimelineHarness::new();
+    {
+        let replay = harness.studio.replay.as_mut().unwrap();
+        replay.dialogue[1].sender_id = 8;
+        replay.dialogue[1].name = "队员".into();
+    }
+    harness.workspace = true;
+    harness.size = vec2(1500.0, 900.0);
+    for _ in 0..3 {
+        harness.advance(Vec::new(), Modifiers::NONE);
+    }
+    harness.click(harness.clip(1).center());
+    harness.button("编辑台词");
+
+    // 打开发言人下拉并选择 玩家（7）· 玩家。
+    harness.button("队员（8）");
+    harness.advance(Vec::new(), Modifiers::NONE);
+    harness.button("玩家（7）· 玩家");
+
+    let line = &harness.studio.replay.as_ref().unwrap().dialogue[1];
+    assert_eq!(line.sender_id, 7);
+    assert_eq!(line.name, "玩家");
+    assert_eq!(line.role, "玩家");
+    assert_eq!(line.side, DialogueSide::Right);
+    assert_eq!(
+        harness.studio.replay.as_ref().unwrap().dialogue[0].sender_id,
+        7,
+        "其他台词不受影响"
+    );
+    assert_eq!(harness.studio.timeline_revision, 1);
+    assert!(harness.studio.status.contains("已将发言人改为 玩家"));
+    assert_eq!(
+        harness.studio.selected_dialogue_id,
+        Some(2)
+    );
+}
+
+#[test]
+fn first_person_speech_area_edit_asks_to_save_or_exit_without_saving() {
+    let mut harness = TimelineHarness::new();
+    harness.workspace = true;
+    harness.size = vec2(1500.0, 900.0);
+    for _ in 0..3 {
+        harness.advance(Vec::new(), Modifiers::NONE);
+    }
+    harness.click(harness.clip(0).center());
+    harness.button("编辑台词");
+    let before = harness.snapshot();
+
+    harness.button("第一人称修改发言区域");
+    assert_eq!(harness.studio.mode, ReplayMode::Paused);
+    assert_eq!(
+        harness.studio.playback_ms, 1000,
+        "预览暂停到台词时刻"
+    );
+    assert!(harness.studio.live_editing_enabled);
+    assert_eq!(
+        harness
+            .studio
+            .speech_area_edit
+            .as_ref()
+            .map(|session| session.line_id),
+        Some(1)
+    );
+
+    harness.advance(Vec::new(), Modifiers::NONE);
+    assert!(
+        has_text(&harness.output, "第一人称发言区域编辑"),
+        "HUD 窗口在全屏会话里可见"
+    );
+    harness.button("结束操作");
+    harness.advance(Vec::new(), Modifiers::NONE);
+    assert!(has_text(
+        &harness.output,
+        "是否保存并应用？"
+    ));
+
+    harness.button("不保存退出");
+    assert!(harness.studio.speech_area_edit.is_none());
+    assert!(!harness.studio.live_editing_enabled);
+    assert_eq!(
+        harness.snapshot(),
+        before,
+        "无保存退出必须完整恢复进入前的回放项目"
+    );
+}
+
+#[test]
+fn speaker_rename_window_applies_the_new_name_to_every_line() {
+    let mut harness = TimelineHarness::new();
+    harness.workspace = true;
+    harness.size = vec2(1500.0, 900.0);
+    for _ in 0..3 {
+        harness.advance(Vec::new(), Modifiers::NONE);
+    }
+    harness.click(harness.clip(0).center());
+    harness.button("编辑台词");
+    let before = harness.snapshot();
+
+    harness.button("重命名");
+    harness.advance(Vec::new(), Modifiers::NONE);
+    assert!(
+        has_text(&harness.output, "重命名发言人"),
+        "重命名窗口在检查器按钮点击后打开"
+    );
+    assert!(
+        has_text(&harness.output, "玩家（7）· 2 句台词"),
+        "窗口预填当前显示名与台词数"
+    );
+    assert!(harness.studio.speaker_rename.is_some());
+
+    // 通过草稿模拟输入，再点击应用。
+    harness.studio.speaker_rename.as_mut().unwrap().name = "柳絮".into();
+    harness.advance(Vec::new(), Modifiers::NONE);
+    harness.button("应用");
+
+    assert!(harness.studio.speaker_rename.is_none());
+    let replay = harness.studio.replay.as_ref().unwrap();
+    assert!(replay.dialogue.iter().all(|line| line.name == "柳絮"));
+    assert_eq!(harness.studio.timeline_revision, 1);
+    assert!(harness.studio.status.contains("已将 玩家（7）重命名为 柳絮"));
+
+    // 撤销路径：重命名前后的项目快照可通过时间轴历史以外的方式对比。
+    assert_ne!(harness.snapshot(), before);
+}
+
+#[test]
+fn speaker_rename_window_cancel_keeps_every_name() {
+    let mut harness = TimelineHarness::new();
+    harness.workspace = true;
+    harness.size = vec2(1500.0, 900.0);
+    for _ in 0..3 {
+        harness.advance(Vec::new(), Modifiers::NONE);
+    }
+    harness.click(harness.clip(0).center());
+    harness.button("编辑台词");
+    let before = harness.snapshot();
+
+    harness.button("重命名");
+    harness.advance(Vec::new(), Modifiers::NONE);
+    harness.studio.speaker_rename.as_mut().unwrap().name = "改名".into();
+    harness.advance(Vec::new(), Modifiers::NONE);
+    harness.button("取消");
+
+    assert!(harness.studio.speaker_rename.is_none());
+    assert_eq!(harness.snapshot(), before);
+    assert_eq!(harness.studio.timeline_revision, 0);
 }
