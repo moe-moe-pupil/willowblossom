@@ -1446,6 +1446,8 @@ pub(crate) struct ReplayStudio {
     /// 请求进入第一人称发言区域编辑；在下一帧开头统一处理，
     /// 保证点击后的同一渲染周期内工作台就会切换到会话画面。
     speech_area_edit_requested: bool,
+    /// 现场编辑全屏操控时是否临时显示回放面板（角色移动/位置帧等）。
+    live_edit_panels_shown: bool,
     /// 当前激活的顶边栏自定义分段视图；None 表示标准工作台视图。
     active_custom_tab: Option<u64>,
     /// 时间轴拖动移动/分段变更后立即触发一次自动保存。
@@ -1643,6 +1645,7 @@ impl Default for ReplayStudio {
             speaker_rename: None,
             speech_insert: None,
             speech_area_edit_requested: false,
+            live_edit_panels_shown: false,
             active_custom_tab: None,
             pending_replay_autosave: false,
             live_movement_user_id: None,
@@ -4116,6 +4119,16 @@ fn apply_replay_camera(
             With<VoxelViewportCamera>,
             Without<VoxelPlayerStandee>,
             Without<VoxelSpaceship>,
+            Without<GameCamera>,
+        ),
+    >,
+    game_cameras: Query<
+        &Transform,
+        (
+            With<GameCamera>,
+            Without<VoxelViewportCamera>,
+            Without<VoxelPlayerStandee>,
+            Without<VoxelSpaceship>,
         ),
     >,
     mut standees: Query<
@@ -4150,9 +4163,16 @@ fn apply_replay_camera(
         return;
     }
     if studio.live_editing_enabled {
-        // 现场编辑：把镜头交还平时的带团视窗（DM 第一人称/自由相机），
-        // 不再每帧钉在回放关键帧轨道上；关闭现场编辑后轨道自动恢复。
+        // 现场编辑：合成预览实时跟随带团第一人称视窗（DM 视角/接管
+        // 视角），不再停留在旧轨道画面上；关闭现场编辑后轨道自动恢复。
         // 遮挡淡出在上面已随本系统关闭，方便编辑时看清场景。
+        if let (Ok(mut camera), Ok(pose)) = (
+            camera.single_mut(),
+            game_cameras.single(),
+        ) {
+            camera.translation = pose.translation;
+            camera.rotation = pose.rotation;
+        }
         return;
     }
     let Some(replay) = studio.replay.as_ref() else { return };
@@ -4245,6 +4265,27 @@ fn replay_studio_ui(
             start_speech_area_edit(&mut studio);
         }
     }
+    // Ctrl+Shift+S：保存现场编辑/覆录/台词位置，退回合成预览工作台。
+    let save_return_shortcut = egui::KeyboardShortcut::new(
+        egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        egui::Key::S,
+    );
+    if studio.panel_open && ctx.input_mut(|input| input.consume_shortcut(&save_return_shortcut)) {
+        if studio.speech_area_edit.is_some() {
+            finish_speech_area_edit(&mut studio, true);
+        }
+        if studio.live_movement_punch_in.is_some() {
+            finish_live_movement_take(&mut studio, None);
+        } else if studio.live_ship_punch_in.is_some() {
+            finish_live_ship_take(&mut studio, None);
+        }
+        if studio.live_editing_enabled {
+            studio.live_editing_enabled = false;
+            studio.live_edit_panels_shown = false;
+            studio.pending_replay_autosave = true;
+            studio.status = "已保存并退回合成预览".into();
+        }
+    }
     let (avatar_textures, cached_memory) = &mut ui_cache;
     let mut occlusion_opacity = occlusion_fade.as_ref().map_or(0.0, |fade| fade.opacity);
     let mut occlusion_cast_width_cells = occlusion_fade.as_ref().map_or(
@@ -4280,6 +4321,8 @@ fn replay_studio_ui(
 
     studio.preview_rect = None;
     if studio.panel_open && !capture_active.0 {
+        let live_fullscreen =
+            studio.live_editing_enabled && !studio.live_edit_panels_shown;
         if studio.speech_area_edit.is_some() {
             if !speech_area_edit_session_valid(&studio) {
                 finish_speech_area_edit(&mut studio, false);
@@ -4299,6 +4342,11 @@ fn replay_studio_ui(
                 if let Some(cached_memory) = cached_memory.as_mut() {
                     persist_ui_memory_after_interaction(ctx, cached_memory);
                 }
+            }
+        } else if live_fullscreen {
+            live_edit_fullscreen_hud(ctx, &mut studio);
+            if let Some(cached_memory) = cached_memory.as_mut() {
+                persist_ui_memory_after_interaction(ctx, cached_memory);
             }
         } else {
             let mut workspace_ui = egui::Ui::new(
@@ -7146,6 +7194,10 @@ fn replay_live_edit_panel(
             playback_active && !take_active,
             egui::Checkbox::new(&mut studio.live_editing_enabled, "解锁场景与接管工具"),
         );
+        if live_toggle.clicked() {
+            // 开启现场编辑即进入全屏第一人称操控，回放面板交给 HUD 召回。
+            studio.live_edit_panels_shown = false;
+        }
         live_toggle.on_hover_text("解锁后可在回放画面里使用现有体素、爆炸、角色接管和飞船接管工具，镜头也会交还你平时的第一人称带团视窗（WASD 行走、常规工具编辑）；关闭后回到回放镜头轨道。项目编辑不会保存成战役现场。");
         if !playback_active {
             ui.small("先点击“播放”，再在这里现场修改。");
@@ -10301,6 +10353,82 @@ fn speech_area_edit_window(ctx: &egui::Context, studio: &mut ReplayStudio) {
                 });
                 ui.small("保存会把当前位置写为发言区域、把移动后的镜头写入该台词时刻；不保存则恢复原状退出。");
             }
+        });
+}
+
+/// 现场编辑全屏操控的 HUD：覆录保存、台词位置同步入口与面板召回。
+fn live_edit_fullscreen_hud(ctx: &egui::Context, studio: &mut ReplayStudio) {
+    let take_active = replay_has_live_take(studio);
+    egui::Window::new("现场编辑")
+        .id(egui::Id::new("replay-live-edit-fullscreen"))
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::RIGHT_TOP, [-16.0, 56.0])
+        .show(ctx, |ui| {
+            if take_active {
+                ui.colored_label(
+                    egui::Color32::from_rgb(225, 90, 70),
+                    format!(
+                        "● 正在覆录 · 播放头 {}",
+                        format_time(studio.playback_ms)
+                    ),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("保存本次录制").clicked() {
+                        if studio.live_movement_punch_in.is_some() {
+                            finish_live_movement_take(studio, None);
+                        } else if studio.live_ship_punch_in.is_some() {
+                            finish_live_ship_take(studio, None);
+                        }
+                    }
+                    if ui.button("取消本次录制").clicked() {
+                        cancel_live_replay_take(studio);
+                    }
+                });
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(80, 190, 120),
+                    format!(
+                        "● 现场编辑 · 播放头 {}",
+                        format_time(studio.playback_ms)
+                    ),
+                );
+                if ui
+                    .button("第一人称修改发言区域")
+                    .on_hover_text("全屏走到目标位置，把播放头这句台词的发言位置与镜头改到那里；结束时可保存或放弃")
+                    .clicked()
+                {
+                    start_speech_area_edit(studio);
+                }
+            }
+            ui.separator();
+            if ui
+                .button(if studio.live_edit_panels_shown {
+                    "隐藏回放面板"
+                } else {
+                    "显示回放面板"
+                })
+                .on_hover_text("临时显示回放面板，使用角色移动、位置帧与爆炸等回放控件")
+                .clicked()
+            {
+                studio.live_edit_panels_shown = !studio.live_edit_panels_shown;
+            }
+            if ui
+                .button("结束现场编辑并保存")
+                .on_hover_text("Ctrl+Shift+S：结束现场编辑（自动保存覆录与台词），退回合成预览工作台")
+                .clicked()
+            {
+                if studio.live_movement_punch_in.is_some() {
+                    finish_live_movement_take(studio, None);
+                } else if studio.live_ship_punch_in.is_some() {
+                    finish_live_ship_take(studio, None);
+                }
+                studio.live_editing_enabled = false;
+                studio.live_edit_panels_shown = false;
+                studio.pending_replay_autosave = true;
+                studio.status = "已保存并退回合成预览".into();
+            }
+            ui.small("WASD 行走，可使用物品栏与工具；Ctrl+Shift+S 快速保存并退回。");
         });
 }
 
@@ -17557,15 +17685,23 @@ mod tests {
                 VoxelViewportCamera,
             ))
             .id();
+        app.world_mut().spawn((
+            Transform::from_xyz(1.0, 2.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
+            GameCamera,
+        ));
         app.update();
-        // 现场编辑开启：回放关键帧不得覆写 DM 相机（第一人称带团视窗）。
+        // 现场编辑开启：合成预览实时跟随 DM 第一人称相机。
         let pose = app
             .world()
             .entity(camera_entity)
             .get::<Transform>()
             .unwrap()
             .clone();
-        assert_eq!(pose.translation, Vec3::new(100.0, 50.0, 25.0));
+        assert_eq!(
+            pose.translation,
+            Vec3::new(1.0, 2.0, 3.0),
+            "合成预览跟随带团第一人称视窗"
+        );
 
         // 关闭现场编辑后，回放镜头轨道恢复接管。
         app.world_mut()

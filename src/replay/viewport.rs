@@ -54,9 +54,11 @@ pub(super) fn update_replay_preview_viewport(
     contexts: Query<&EguiOutput, With<PrimaryEguiContext>>,
     mut cameras: Query<&mut Camera, With<VoxelViewportCamera>>,
 ) {
-    // 第一人称修改发言区域：预览相机让位，全屏显示真实带团第一人称画面。
-    let session_active = studio.speech_area_edit.is_some();
-    let viewport = if studio.panel_open && !capture_active.0 && !session_active {
+    // 第一人称操控（发言区域会话 / 现场编辑全屏）：预览相机让位，
+    // 全屏显示真实带团第一人称画面。
+    let fullscreen = studio.speech_area_edit.is_some()
+        || (studio.live_editing_enabled && !studio.live_edit_panels_shown);
+    let viewport = if studio.panel_open && !capture_active.0 && !fullscreen {
         studio.preview_rect.and_then(|rect| {
             let window = windows.single().ok()?;
             let pixels_per_point = contexts.single().ok()?.pixels_per_point;
@@ -76,7 +78,7 @@ pub(super) fn update_replay_preview_viewport(
         ) {
             camera.viewport = viewport.clone();
         }
-        let should_render = !(studio.panel_open && session_active);
+        let should_render = !(studio.panel_open && fullscreen);
         if camera.is_active != should_render {
             camera.is_active = should_render;
         }
